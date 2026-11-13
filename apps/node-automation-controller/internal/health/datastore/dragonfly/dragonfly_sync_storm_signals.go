@@ -97,7 +97,7 @@ func (p *dragonflyReplicaSyncStormCheck) evalLinkSeries(
 		if ns == "" || name == "" {
 			continue
 		}
-		if downscaledMemberPod(ns, name, downscaled) {
+		if kube.DownscaledMemberPod(ns, name, downscaled) {
 			continue // parked cluster — not storm evidence
 		}
 		key := ns + "/" + name

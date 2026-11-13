@@ -13,9 +13,11 @@ the inversion point), no knowledge of any consumer.
 | `lex.go` | Expression tokenizer (typed `tokKind`, string escapes, based/decimal number literals) |
 | `parser.go` | `{{ }}`/`{% %}`/`{# #}` split + statement AST (set/for/if) |
 | `parser_expr.go` | Expression parser — precedence: ternary → or → and → not → compare → `~` → add → mul → unary → postfix; `parseCallArgs` shared by filter/call |
-| `expr.go` | Expression AST + `eval`; `evalCallArgs` (kwargs map nil when empty); `binOp` binary-operator engine |
+| `expr.go` | Expression AST + `eval`; `evalCallArgs` (kwargs map nil when empty) |
+| `binop.go` | `binOp` binary-operator engine |
 | `render.go` | Statement nodes (`set`/`for`/`if`), `scope`, for-loop unpack rules |
-| `value.go` | Coercions (`Truthy`, `ToInt`, `toFloat`), iteration (`ToIter`), numeric compare core (`numEq`/`numCmp`), walk budgets |
+| `value.go` | Coercions (`Truthy`, `ToInt`, `toFloat`), iteration (`ToIter`), walk budgets |
+| `num.go` | Numeric machinery — `asInt64`/`numMag`/`magCmp` exact compares, int64 fast paths, `numEq`/`numCmp`/`minMaxLess` |
 | `methods.go` | Attr/index lookup, bound-method dispatch, deep equality, mapping view |
 | `stringify.go` | `Stringify`/`writeStringify` (python repr) + `writeJSONAt` (`to_json` writer) — one `*strings.Builder` threaded through |
 | `filters.go` | Filter dispatch (`applyFilter`) + scalar/string/codec/regex cases, `parseMaxBytes` input cap |

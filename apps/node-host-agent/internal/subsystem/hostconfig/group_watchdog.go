@@ -66,7 +66,7 @@ func (c *cyc) groupWatchdog() {
 	if c.vb("api_lb_enabled") && c.worker() {
 		cp := c.v("cp_endpoint")
 		var keep []string
-		for _, e := range strings.Fields(fb) {
+		for e := range strings.FieldsSeq(fb) {
 			if !strings.HasPrefix(e, cp+":6443=") {
 				keep = append(keep, e)
 			}
@@ -372,8 +372,17 @@ func (c *cyc) ctrlDropIn(varName, file string, render func(string) []byte) {
 		}
 		return
 	}
+	// The value renders verbatim into a systemd assignment
+	// (MemoryMax=/Environment=GOMEMLIMIT=/CPUWeight=) — a control
+	// byte (a newline first of all) would splice extra directives
+	// systemd applies wholesale, exactly the LimitNOFILE injection
+	// shape. Refuse → the drop-in is not written this cycle.
+	v := fmt.Sprint(val)
+	if !c.cfgScalar(varName+"["+c.r.cfg.NodeName+"]", v) {
+		return
+	}
 	_ = r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
-	if ch, _ := r.writeManaged(path, render(fmt.Sprint(val)), 0o644); ch {
+	if ch, _ := r.writeManaged(path, render(v), 0o644); ch {
 		r.daemonReload(c.ctx)
 	}
 }

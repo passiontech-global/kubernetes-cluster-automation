@@ -25,9 +25,10 @@ type CtrConfig struct {
 	IngestStaleAge time.Duration
 	MaxTaskClean   int // wedged ctr task dir cap per cycle (31)
 	MaxShimKill    int // orphan shim kill cap per cycle (31)
-	// MetaJournalFn is the KR3 journal probe — `journalctl
-	// -u k0sworker -u containerd --since "3 minutes ago"`. nil →
-	// Systemd.ExecCombined default; a nil Systemd leaves the journal
+	// MetaJournalFn is the KR3 journal probe — the cycle-shared
+	// journal snapshot (`journalctl -u k0sworker -u containerd`,
+	// fetched once per cycle through e.JournalOnce). nil → the
+	// cycle-shared snapshot default; a nil Systemd leaves the journal
 	// half of the check inconclusive (the orphan-shim half still runs).
 	MetaJournalFn func(ctx context.Context) (string, error)
 }

@@ -137,6 +137,11 @@ type testServer struct {
 	opts sshServerOpts
 	quit chan struct{}
 
+	// execSeen signals each accepted exec command (cap 16,
+	// non-blocking send) — tests that must cancel a wedged call wait
+	// for it instead of sleeping past a guessed delay.
+	execSeen chan string
+
 	mu   sync.Mutex
 	cmds []string
 }
@@ -162,7 +167,8 @@ func newTestSSHServerOpts(t *testing.T, clientKeyPath string,
 		PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 			return &ssh.Permissions{}, nil
 		},
-	}, opts: opts, quit: make(chan struct{})}
+	}, opts: opts, quit: make(chan struct{}),
+		execSeen: make(chan string, 16)}
 	s.cfg.AddHostKey(hostSigner)
 	s.ln, err = net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -258,6 +264,10 @@ func (s *testServer) serveSession(srv ssh.Channel,
 		s.mu.Lock()
 		s.cmds = append(s.cmds, cmd)
 		s.mu.Unlock()
+		select {
+		case s.execSeen <- cmd:
+		default:
+		}
 		for sub, stderr := range s.opts.failOn {
 			if strings.HasPrefix(cmd, sub) {
 				_, _ = srv.Stderr().Write([]byte(stderr))

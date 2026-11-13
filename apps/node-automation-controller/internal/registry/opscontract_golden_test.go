@@ -14,7 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 
@@ -357,7 +357,7 @@ func gatherFamilies(t *testing.T) []string {
 	for _, mf := range mfs {
 		out = append(out, mf.GetName())
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 

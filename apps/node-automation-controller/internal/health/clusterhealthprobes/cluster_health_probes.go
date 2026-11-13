@@ -173,13 +173,11 @@ type clusterHealthProber struct {
 // here instead of silently dropping the check (see
 // check_modules.go).
 func newClusterHealthProber(d shared.Deps, cfg probefw.Config) (*clusterHealthProber, error) {
-	// NodeReader is the manager's cached client; a nil Mgr (the
-	// literally-constructed test Deps shape shared.Deps documents)
-	// leaves it nil — the documented fall-back-to-ListNodes posture.
-	var nodeReader kube.CachedNodeReader
-	if d.Mgr != nil {
-		nodeReader = d.Mgr.GetClient()
-	}
+	// NodeReader is the manager's cached client via Deps.CachedClient —
+	// a nil Mgr (the literally-constructed test Deps shape shared.Deps
+	// documents) returns nil — the documented fall-back-to-ListNodes
+	// posture.
+	nodeReader := kube.CachedNodeReader(d.CachedClient())
 	deps := probefw.NewDeps(d.Name, d.CS, d.Dyn, nodeReader, cfg)
 	deps.Maintenance = d.Maintenance
 	// The metadata client feeds ListPartialOrFallback's preferred
@@ -341,6 +339,18 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 			"error", err)
 		return nil // cancelled ctx is not a run error — bail silently
 	}
+
+	// Post-sweep mutation guard: re-verify every census memo the
+	// sweep loaded against its load-time fingerprint — the residue
+	// the per-read guard cannot observe (a census object mutated in
+	// place AFTER its memo's last read). Panic contract, same as the
+	// per-read guard: a mutated shared census is a bug, never a
+	// verdict. No-op outside a test binary — production never arms
+	// EnableSnapshotVerify, so the sweep pays nothing here; under
+	// probetest the overlay's read-only contract is enforced on the
+	// WHOLE prober run, not just the per-check tests that call
+	// probetest.VerifySweep themselves.
+	probefw.VerifySweepSnapshotUnmutated(ctx)
 
 	// Report in roster order — the ops contract's deterministic
 	// series/log ordering — regardless of the order the pool

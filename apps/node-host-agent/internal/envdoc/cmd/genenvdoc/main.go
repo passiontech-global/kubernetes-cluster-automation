@@ -21,7 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envdoc/scan"
@@ -161,7 +161,7 @@ func writeEnvDoc(root, out string, c scan.Contract, gates []scan.Gate) error {
 	for dir := range refs.PackageRefs {
 		dirs = append(dirs, dir)
 	}
-	sort.Strings(dirs)
+	slices.Sort(dirs)
 	for _, dir := range dirs {
 		byVar := refs.PackageRefs[dir]
 		names := make([]string, 0, len(byVar))
@@ -173,7 +173,7 @@ func writeEnvDoc(root, out string, c scan.Contract, gates []scan.Gate) error {
 		if len(names) == 0 {
 			continue
 		}
-		sort.Strings(names)
+		slices.Sort(names)
 		// The leading \n in the ### line IS the section separator —
 		// one blank line after the heading and between packages.
 		fmt.Fprintf(&b, "\n### `%s`\n\n", dir)
@@ -183,7 +183,7 @@ func writeEnvDoc(root, out string, c scan.Contract, gates []scan.Gate) error {
 			for f, ln := range files {
 				sites = append(sites, fmt.Sprintf("%s:%d", f, ln))
 			}
-			sort.Strings(sites)
+			slices.Sort(sites)
 			fmt.Fprintf(&b, "- `%s` — `%s`\n", v, strings.Join(sites, ", "))
 		}
 	}
@@ -212,7 +212,7 @@ func renderGates(b *strings.Builder, c scan.Contract, gates []scan.Gate) {
 			unwired = append(unwired, v)
 		}
 	}
-	sort.Strings(unwired)
+	slices.Sort(unwired)
 	for _, g := range gates {
 		emitRow(b, g.EnvFlag, g.Name, g.Default)
 	}

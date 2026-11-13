@@ -48,13 +48,14 @@ const (
 // — plumbed from Verdict.Active's own `now` so the window and the
 // verdict memo age on ONE clock (fake-clock tests pin both).
 func nodeCordonEvidence(ctx context.Context, cs kubernetes.Interface,
-	now time.Time) ([]string, error) {
+	nodeReader kube.CachedNodeReader, now time.Time) ([]string, error) {
 	// A node cordoned for longer than the active window with no
 	// other maintenance signal is a static cordon, not a drain.
 	// maintenanceNodeList prefers the sweep's memoized census when
-	// a MaintenanceSnapshotProvider rides the ctx — the mutex's
-	// per-TTL re-evaluation then costs zero extra reads.
-	nodes, err := maintenanceNodeList(ctx, cs)
+	// a MaintenanceSnapshotProvider rides the ctx, then the
+	// Verdict's informer-backed reader when wired — the mutex's
+	// per-TTL re-evaluation then costs zero apiserver reads.
+	nodes, err := maintenanceNodeList(ctx, cs, nodeReader)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes (maintenance mutex): %w", err)
 	}
@@ -243,11 +244,22 @@ func MaintenanceActive(ctx context.Context, cs kubernetes.Interface, dyn dynamic
 // 45m cordon window and the verdict memo age on ONE clock, and
 // fake-clock tests can pin the freshness verdict instead of racing
 // time.Now (a cordoned node is only evidence for 45m — a test built
-// around wall-clock time.Now flakes at exactly that boundary).
+// around wall-clock time.Now flakes at exactly that boundary). It is
+// the reader-less shape: the node census takes the direct
+// clientset path.
 func MaintenanceActiveWithClock(ctx context.Context, cs kubernetes.Interface,
 	dyn dynamic.Interface, now time.Time) (bool, string, error) {
+	return maintenanceActive(ctx, cs, dyn, nil, now)
+}
+
+// maintenanceActive is MaintenanceActiveWithClock plus the optional
+// informer-backed node reader Verdict.Active threads down from its
+// NodeReader field — nil keeps the direct read.
+func maintenanceActive(ctx context.Context, cs kubernetes.Interface,
+	dyn dynamic.Interface, nodeReader kube.CachedNodeReader,
+	now time.Time) (bool, string, error) {
 	for _, signal := range []func() ([]string, error){
-		func() ([]string, error) { return nodeCordonEvidence(ctx, cs, now) },
+		func() ([]string, error) { return nodeCordonEvidence(ctx, cs, nodeReader, now) },
 		func() ([]string, error) { return KuredLockEvidence(ctx, cs) },
 		func() ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
 		func() ([]string, error) { return Medik8sRemediationEvidence(ctx, dyn) },

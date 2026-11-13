@@ -10,10 +10,8 @@ package scylla
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/go-logr/logr"
-	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 
@@ -85,11 +83,6 @@ func memberDesyncFindings(svcs []corev1.Service,
 func (p *scyllaHealthCheck) memberStallFindings(ctx context.Context,
 	log logr.Logger, pods []corev1.Pod, pending map[string]scyllaFinding,
 	inconclusive map[string]bool) {
-	type stallScan struct {
-		pod    *corev1.Pod
-		reason string
-		err    error
-	}
 	var troubled []*corev1.Pod
 	for i := range pods {
 		pod := &pods[i]
@@ -97,39 +90,25 @@ func (p *scyllaHealthCheck) memberStallFindings(ctx context.Context,
 			troubled = append(troubled, pod)
 		}
 	}
-	scans := make([]stallScan, len(troubled))
-	g := errgroup.Group{}
-	g.SetLimit(scyllaStallLogWorkers)
-	for j, pod := range troubled {
-		g.Go(func() (err error) {
-			// A panic in one pod's log scan reads as that pod's
-			// inconclusive scan — never a process crash.
-			defer func() {
-				if r := recover(); r != nil {
-					scans[j] = stallScan{pod: pod,
-						err: fmt.Errorf("log scan panicked: %v", r)}
-				}
-			}()
-			reason, lerr := p.scyllaStallLogHit(ctx, pod)
-			scans[j] = stallScan{pod: pod, reason: reason, err: lerr}
-			return nil
+	scans := kube.ScanPodLogs(ctx, p.CS, troubled, scyllaStallLogWorkers,
+		func(ctx context.Context, pod *corev1.Pod) (string, error) {
+			return p.scyllaStallLogHit(ctx, pod)
 		})
-	}
-	_ = g.Wait()
-	for _, s := range scans {
-		if s.err != nil {
+	for j, pod := range troubled {
+		s := scans[j]
+		if s.Err != nil {
 			log.Info("WARN: scylla log fetch failed — stall signature inconclusive",
-				"pod", s.pod.Namespace+"/"+s.pod.Name, "error", s.err)
-			inconclusive[s.pod.Namespace+"/"+s.pod.Name+"/"+string(s.pod.UID)] = true
+				"pod", pod.Namespace+"/"+pod.Name, "error", s.Err)
+			inconclusive[pod.Namespace+"/"+pod.Name+"/"+string(pod.UID)] = true
 			continue
 		}
-		if s.reason == "" {
+		if s.Value == "" {
 			continue
 		}
-		pending["stall/"+s.pod.Namespace+"/"+s.pod.Name+"/"+string(s.pod.UID)+"/"+s.reason] =
+		pending["stall/"+pod.Namespace+"/"+pod.Name+"/"+string(pod.UID)+"/"+s.Value] =
 			scyllaFinding{
-				ns: s.pod.Namespace, cluster: s.pod.Labels[scyllaClusterLabel],
-				reason: s.reason,
+				ns: pod.Namespace, cluster: pod.Labels[scyllaClusterLabel],
+				reason: s.Value,
 			}
 	}
 }

@@ -207,11 +207,16 @@ func (s *Server) Close() error {
 	s.closed = true
 	s.mu.Unlock()
 	var first error
-	if ln != nil {
-		first = ln.Close()
-	}
-	if err := s.srv.Close(); first == nil {
+	// srv.Close FIRST: it closes the listener internally and waits
+	// for in-flight handlers; closing ln first made srv.Close's own
+	// accept loop surface spurious net.ErrClosed errors.
+	if err := s.srv.Close(); err != nil {
 		first = err
+	}
+	if ln != nil {
+		if err := ln.Close(); first == nil {
+			first = err
+		}
 	}
 	return first
 }

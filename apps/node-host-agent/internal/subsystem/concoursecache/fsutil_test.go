@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -105,5 +106,32 @@ func TestNodeDepsLockBytesFreedUsesBlocks(t *testing.T) {
 	if got := testutil.ToFloat64(p.bytesFreed); got != want {
 		t.Fatalf("bytesFreed = %v, want the allocated footprint %v "+
 			"(apparent size %d)", got, want, fi.Size())
+	}
+}
+
+// TestEntryBlocksSparseNeverFallsBackToApparent: a sparse file's
+// st.Blocks is 0 — the pre-fix `ok && st.Blocks > 0` guard fell back
+// to apparent Size() exactly there, so a single huge sparse file
+// inflated the trim accumulator past the size marks in one step.
+// Blocks×512 is returned whenever the stat is syscall-backed, 0
+// included; only a non-syscall Sys() (the never-in-practice branch)
+// falls back.
+func TestEntryBlocksSparseNeverFallsBackToApparent(t *testing.T) {
+	p := ccSparseFile(t, filepath.Join(t.TempDir(), "sparse"), 0)
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no syscall.Stat_t on this platform")
+	}
+	if st.Blocks == 0 {
+		t.Skip("filesystem did not honor sparseness — nothing to assert")
+	}
+	want := uint64(st.Blocks) * 512
+	if got := entryBlocks(fi); got != want {
+		t.Fatalf("entryBlocks = %d want %d (apparent size %d)",
+			got, want, fi.Size())
 	}
 }

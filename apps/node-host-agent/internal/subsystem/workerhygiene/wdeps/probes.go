@@ -8,12 +8,15 @@
 package wdeps
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -48,9 +51,9 @@ var kubeletMetricsClient = func() *http.Client {
 }()
 
 // kubeletMetricsGet is the KubeletMetricsFn default — GET url with
-// the SA bearer, return the body (4MiB cap — kubelet /metrics is a
-// few hundred KiB; a blowout body is discarded, never slurped).
-// Non-200 is an error: the scrape verdict is unreadable, not "zero".
+// the SA bearer, return the body lines the syncloop check parses
+// (kubelet_pleg_* + storage_operation_errors_total). Non-200 is an
+// error: the scrape verdict is unreadable, not "zero".
 func kubeletMetricsGet(ctx context.Context, url, bearer string,
 	timeout time.Duration) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
@@ -71,9 +74,43 @@ func kubeletMetricsGet(ctx context.Context, url, bearer string,
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return "", fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
+	return scanKubeletMetrics(resp.Body)
+}
+
+// kubeletMetricPrefixes are the exposition families parsePLEGMetrics
+// switches on — a multi-MiB /metrics scrape collapses to a few KiB
+// before it becomes a string. The 4MiB kept-lines budget mirrors the
+// old body cap.
+var kubeletMetricPrefixes = [][]byte{
+	[]byte("kubelet_pleg_"),
+	[]byte("storage_operation_errors_total"),
+}
+
+// scanKubeletMetrics streams the /metrics body through a 64 KiB
+// bufio.Scanner keeping only the parsed families — line-oriented
+// filtering is exact: parsePLEGMetrics keys each line on the sample
+// name before '{', and HELP/TYPE comment lines never match the
+// prefixes.
+func scanKubeletMetrics(r io.Reader) (string, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), 64<<10)
+	var kept []string
+	size := 0
+	for sc.Scan() {
+		ln := sc.Bytes()
+		for _, p := range kubeletMetricPrefixes {
+			if bytes.HasPrefix(ln, p) {
+				kept = append(kept, string(ln))
+				size += len(ln) + 1
+				if size >= 4<<20 {
+					return strings.Join(kept, "\n"), nil
+				}
+				break
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
 		return "", err
 	}
-	return string(b), nil
+	return strings.Join(kept, "\n"), nil
 }

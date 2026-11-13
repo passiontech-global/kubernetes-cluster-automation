@@ -81,7 +81,7 @@ func procStatCPUSums(path string) (steal, total uint64, ok bool) {
 	if err != nil {
 		return 0, 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 2 || f[0] != "cpu" {
 			continue

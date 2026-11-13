@@ -17,7 +17,7 @@
 // netlink.NewHandleAt (vishvananda/netns) — the kernel keeps the
 // socket in that ns, so the calling thread NEVER carries a foreign
 // netns between calls. The raw NETLINK_SOCK_DIAG dump in
-// sockstat_linux.go still needs a scoped setns; InNetNS runs it on
+// sockdiag_linux.go still needs a scoped setns; InNetNS runs it on
 // a dedicated OS thread that is quarantined (never UnlockOSThread)
 // when the restore fails or fn panics — a dirty M returned to the
 // scheduler pool would hand the host netns to unrelated goroutines.
@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -57,6 +58,24 @@ func SameNetNS(pid int) (bool, error) {
 	return os.SameFile(self, other), nil
 }
 
+// sameNetNS1 memoizes SameNetNS(1) for the process lifetime — every
+// caller here targets pid 1 (host init under hostPID:true), and a
+// pod's hostNetwork status is fixed at start, so the two /proc stat
+// reads per InNetNS/routeHandle call re-bought the same verdict
+// every 15s cycle. sync.OnceValues caches the (bool, error) pair;
+// an error result is sticky exactly like a pod whose netns view
+// broke mid-run would be.
+var sameNetNS1 = sync.OnceValues(func() (bool, error) { return SameNetNS(1) })
+
+// sameNetNSFor resolves the pid-1 verdict through the cache; other
+// pids stat fresh.
+func sameNetNSFor(pid int) (bool, error) {
+	if pid == 1 {
+		return sameNetNS1()
+	}
+	return SameNetNS(pid)
+}
+
 // InNetNS runs fn with the calling thread's network namespace set
 // to pid's — a no-op wrapper when already shared. fn executes on a
 // dedicated goroutine locked to its OS thread for the setns window;
@@ -66,7 +85,7 @@ func SameNetNS(pid int) (bool, error) {
 // foreign-netns M never re-enters the scheduler pool — leaking one
 // thread is cheaper than polluting every goroutine that lands on it.
 func InNetNS(pid int, fn func() error) error {
-	same, err := SameNetNS(pid)
+	same, err := sameNetNSFor(pid)
 	if err != nil {
 		return err
 	}
@@ -130,7 +149,7 @@ func InNetNS(pid int, fn func() error) error {
 // then live in the target ns permanently, so Routes/Rules/Links/
 // LinkByName never touch the calling thread's netns at all.
 func routeHandle(pid int) (*netlink.Handle, error) {
-	same, err := SameNetNS(pid)
+	same, err := sameNetNSFor(pid)
 	if err != nil {
 		return nil, err
 	}

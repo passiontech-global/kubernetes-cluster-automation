@@ -349,6 +349,18 @@ type sweepSnapshot struct {
 	leaseIndex   memo[map[types.NamespacedName]*coordinationv1.Lease]
 	serviceIndex memo[map[types.NamespacedName]*corev1.Service]
 
+	// Lazy ns/name indexes over the workload censuses — see
+	// snapshot_index.go. Built on the FIRST by-key lookup (not on
+	// census load: checks that never resolve a single workload pay
+	// nothing) and dropped WITH their census via the same resets
+	// list, so an invalidation can never leave a stale index behind.
+	deploymentsIdx  censusIndex[appsv1.Deployment]
+	statefulSetsIdx censusIndex[appsv1.StatefulSet]
+	daemonSetsIdx   censusIndex[appsv1.DaemonSet]
+	replicaSetsIdx  censusIndex[metav1.PartialObjectMetadata]
+	cronJobsIdx     censusIndex[batchv1.CronJob]
+	jobsIdx         censusIndex[batchv1.Job]
+
 	// AllUnstructured memoizes per GVR instead of per field — see
 	// the type comment above. Each entry is a full memo[T] so one
 	// GVR's LIST serializes on ITS OWN lock: the parallel check
@@ -410,6 +422,9 @@ func newSweepSnapshot(ctx context.Context) *sweepSnapshot {
 		s.replicaSets.reset, s.cronJobs.reset, s.jobs.reset, s.pdbs.reset,
 		s.nodeZones.reset, s.podNodes.reset,
 		s.leaseIndex.reset, s.serviceIndex.reset,
+		s.deploymentsIdx.reset, s.statefulSetsIdx.reset,
+		s.daemonSetsIdx.reset, s.replicaSetsIdx.reset,
+		s.cronJobsIdx.reset, s.jobsIdx.reset,
 		s.resetUnstructs,
 	}
 	return s

@@ -608,7 +608,7 @@ func TestFanoutBoundsConcurrency(t *testing.T) {
 		},
 	}
 	var resources []concourse.Resource
-	for i := 0; i < fanoutWorkers*4; i++ {
+	for i := range fanoutWorkers * 4 {
 		resources = append(resources, concourse.Resource{
 			Pipeline: "p1", Name: fmt.Sprintf("r%d", i),
 			Type: "git", Repo: "org/repo",
@@ -647,7 +647,7 @@ func TestFanoutSemaphoreSharedAcrossDeliveries(t *testing.T) {
 	}
 	h := New(testSecret, b)
 	var resources []concourse.Resource
-	for i := 0; i < fanoutWorkers; i++ {
+	for i := range fanoutWorkers {
 		resources = append(resources, concourse.Resource{
 			Pipeline: "p1", Name: fmt.Sprintf("r%d", i),
 			Type: "git", Repo: "org/repo",
@@ -655,12 +655,10 @@ func TestFanoutSemaphoreSharedAcrossDeliveries(t *testing.T) {
 	}
 	b.resources = resources
 	var wg sync.WaitGroup
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 3 {
+		wg.Go(func() {
 			h.dispatch(resources, "d", "push", "org/repo")
-		}()
+		})
 	}
 	wg.Wait()
 	if got := stats.maxInflight(); got > fanoutWorkers {
@@ -775,7 +773,7 @@ func TestWaitDrainsInFlightFanout(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status=%d want 202", rec.Code)
 	}
-	h.Wait(context.Background()) // exported drain path — same as main's shutdown
+	h.Wait(t.Context()) // exported drain path — same as main's shutdown
 	if got := stats.calls(); got != 2 {
 		t.Fatalf("check calls=%d want 2 after Wait", got)
 	}
@@ -816,7 +814,7 @@ func TestWaitCannotRaceFanoutRegistration(t *testing.T) {
 
 		waitDone := make(chan struct{})
 		go func() {
-			h.Wait(context.Background())
+			h.Wait(t.Context())
 			close(waitDone)
 		}()
 		// The fan-out is already registered (Add ran before the
@@ -870,7 +868,7 @@ func TestFanoutBudgetReleasesQueuedTargets(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		h.Wait(context.Background())
+		h.Wait(t.Context())
 		close(done)
 	}()
 	select {
@@ -925,7 +923,7 @@ func TestWaitBudgetExpiresWithInFlightFanout(t *testing.T) {
 	}
 
 	close(release) // the parked POSTs land
-	if got := h.Wait(context.Background()); got != 0 {
+	if got := h.Wait(t.Context()); got != 0 {
 		t.Fatalf("dropped=%d want 0 once the stuck checks finish", got)
 	}
 }
@@ -1034,11 +1032,11 @@ func TestAdmissionRefusalsReturn503(t *testing.T) {
 		h := New(testSecret, &fakeBackend{})
 		// Saturate the admission semaphore — every slot held means
 		// the next authenticated delivery is refused, not queued.
-		for i := 0; i < maxInflightRequests; i++ {
+		for range maxInflightRequests {
 			h.reqSem <- struct{}{}
 		}
 		defer func() {
-			for i := 0; i < maxInflightRequests; i++ {
+			for range maxInflightRequests {
 				<-h.reqSem
 			}
 		}()

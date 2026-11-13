@@ -86,7 +86,7 @@ func (c *Collector) maybeRestoreClocksource() {
 		return
 	}
 	available := map[string]bool{}
-	for _, f := range strings.Fields(string(availB)) {
+	for f := range strings.FieldsSeq(string(availB)) {
 		available[f] = true
 	}
 	if !available["kvm-clock"] {

@@ -8,27 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
 )
-
-// pinnedKCMArgs mirrors hostmetrics' defaultExpectedKCMArgs — the
-// repo-pinned controllerManager.extraArgs key set. Duplicated here
-// so the report tests stay self-contained (the ops package cannot
-// see hostmetrics' unexported default); the default-resolution
-// coverage lives in hostmetrics' driftcli_test.go.
-var pinnedKCMArgs = []string{
-	"concurrent-deployment-syncs",
-	"concurrent-gc-syncs",
-	"concurrent-replicaset-syncs",
-	"kube-api-burst",
-	"kube-api-qps",
-	"leader-elect-lease-duration",
-	"leader-elect-renew-deadline",
-	"leader-elect-retry-period",
-	"node-monitor-grace-period",
-	"node-monitor-period",
-	"terminated-pod-gc-threshold",
-}
 
 func write(t *testing.T, path, content string) {
 	t.Helper()
@@ -38,13 +19,13 @@ func write(t *testing.T, path, content string) {
 }
 
 // cleanK0sYAML renders a k0s.yaml whose controllerManager.extraArgs
-// matches pinnedKCMArgs exactly — the only shape that produces zero
-// missing-key findings.
+// matches k0sconfig.DefaultExpectedKCMArgs exactly — the only shape
+// that produces zero missing-key findings.
 func cleanK0sYAML(extraKeys ...string) string {
 	var b strings.Builder
 	b.WriteString("apiVersion: k0s.k0sproject.io/v1beta1\n" +
 		"kind: ClusterConfig\nspec:\n  controllerManager:\n    extraArgs:\n")
-	for _, k := range pinnedKCMArgs {
+	for _, k := range k0sconfig.DefaultExpectedKCMArgs {
 		b.WriteString("      " + k + ": \"5\"\n")
 	}
 	for _, k := range extraKeys {
@@ -55,7 +36,7 @@ func cleanK0sYAML(extraKeys ...string) string {
 
 // driftCLI runs runCheck against temp files and returns
 // (exit code, output).
-func driftCLI(t *testing.T, cfg hostmetrics.K0sDriftConfig) (int, string) {
+func driftCLI(t *testing.T, cfg k0sconfig.K0sDriftConfig) (int, string) {
 	t.Helper()
 	var out bytes.Buffer
 	code := runCheck(context.Background(), cfg, &out)
@@ -80,10 +61,10 @@ func TestRunCheckClean(t *testing.T) {
 	config := filepath.Join(dir, "k0s.yaml")
 	write(t, unit, "[Unit]\n")
 	write(t, config, cleanK0sYAML())
-	code, out := driftCLI(t, hostmetrics.K0sDriftConfig{
+	code, out := driftCLI(t, k0sconfig.K0sDriftConfig{
 		ConfigFile:   config,
 		UnitFile:     unit,
-		ExpectedKeys: pinnedKCMArgs,
+		ExpectedKeys: k0sconfig.DefaultExpectedKCMArgs,
 		RemovedFlags: []string{"concurrent-service-syncs"},
 	})
 	if code != 0 {
@@ -102,10 +83,10 @@ func TestRunCheckFindings(t *testing.T) {
 	// Removed flag + a bogus extra key inside the otherwise-clean set.
 	write(t, config,
 		cleanK0sYAML("concurrent-service-syncs", "bogus-extra-flag"))
-	code, out := driftCLI(t, hostmetrics.K0sDriftConfig{
+	code, out := driftCLI(t, k0sconfig.K0sDriftConfig{
 		ConfigFile:   config,
 		UnitFile:     unit,
-		ExpectedKeys: pinnedKCMArgs,
+		ExpectedKeys: k0sconfig.DefaultExpectedKCMArgs,
 		RemovedFlags: []string{"concurrent-service-syncs"},
 	})
 	if code != 1 {
@@ -134,10 +115,10 @@ func TestRunCheckMissingKey(t *testing.T) {
 	write(t, config,
 		"apiVersion: k0s.k0sproject.io/v1beta1\nkind: ClusterConfig\n"+
 			"spec:\n  controllerManager:\n    extraArgs: {}\n")
-	code, out := driftCLI(t, hostmetrics.K0sDriftConfig{
+	code, out := driftCLI(t, k0sconfig.K0sDriftConfig{
 		ConfigFile:   config,
 		UnitFile:     unit,
-		ExpectedKeys: pinnedKCMArgs,
+		ExpectedKeys: k0sconfig.DefaultExpectedKCMArgs,
 		RemovedFlags: []string{"concurrent-service-syncs"},
 	})
 	if code != 1 {
@@ -155,10 +136,10 @@ func TestRunCheckUnreadable(t *testing.T) {
 	config := filepath.Join(dir, "k0s.yaml")
 	write(t, unit, "[Unit]\n")
 	// Missing file → unreadable drift.
-	code, out := driftCLI(t, hostmetrics.K0sDriftConfig{
+	code, out := driftCLI(t, k0sconfig.K0sDriftConfig{
 		ConfigFile:   config,
 		UnitFile:     unit,
-		ExpectedKeys: pinnedKCMArgs,
+		ExpectedKeys: k0sconfig.DefaultExpectedKCMArgs,
 		RemovedFlags: []string{"concurrent-service-syncs"},
 	})
 	if code != 1 || !strings.Contains(out, "DRIFT") {
@@ -166,10 +147,10 @@ func TestRunCheckUnreadable(t *testing.T) {
 	}
 	// Unparseable → same finding.
 	write(t, config, "  {not: [valid: yaml\n")
-	code, out = driftCLI(t, hostmetrics.K0sDriftConfig{
+	code, out = driftCLI(t, k0sconfig.K0sDriftConfig{
 		ConfigFile:   config,
 		UnitFile:     unit,
-		ExpectedKeys: pinnedKCMArgs,
+		ExpectedKeys: k0sconfig.DefaultExpectedKCMArgs,
 		RemovedFlags: []string{"concurrent-service-syncs"},
 	})
 	if code != 1 || !strings.Contains(out, "DRIFT") {
@@ -182,10 +163,10 @@ func TestRunCheckNotAController(t *testing.T) {
 	// No unit file → the gate skips the check entirely (worker
 	// nodes carry a differently-shaped k0s.yaml — running there
 	// would report phantom missing-key drift).
-	code, out := driftCLI(t, hostmetrics.K0sDriftConfig{
+	code, out := driftCLI(t, k0sconfig.K0sDriftConfig{
 		ConfigFile:   filepath.Join(dir, "k0s.yaml"),
 		UnitFile:     filepath.Join(dir, "k0scontroller.service"),
-		ExpectedKeys: pinnedKCMArgs,
+		ExpectedKeys: k0sconfig.DefaultExpectedKCMArgs,
 		RemovedFlags: []string{"concurrent-service-syncs"},
 	})
 	if code != 0 {
@@ -203,7 +184,7 @@ func TestRunCheckCustomSets(t *testing.T) {
 	write(t, unit, "[Unit]\n")
 	write(t, config,
 		"spec:\n  controllerManager:\n    extraArgs:\n      a: \"1\"\n      dead-flag: \"2\"\n")
-	code, out := driftCLI(t, hostmetrics.K0sDriftConfig{
+	code, out := driftCLI(t, k0sconfig.K0sDriftConfig{
 		ConfigFile:   config,
 		UnitFile:     unit,
 		ExpectedKeys: []string{"a", "b"},
@@ -256,7 +237,7 @@ func TestCmdEndToEndFlags(t *testing.T) {
 	code := Cmd(context.Background(), []string{
 		"--config", config,
 		"--unit-file", unit,
-		"--expected-keys", strings.Join(pinnedKCMArgs, ","),
+		"--expected-keys", strings.Join(k0sconfig.DefaultExpectedKCMArgs, ","),
 		"--removed-flags", "concurrent-service-syncs",
 	})
 	if code != 0 {
@@ -268,7 +249,7 @@ func TestCmdEndToEndFlags(t *testing.T) {
 	code = Cmd(context.Background(), []string{
 		"--config", config,
 		"--unit-file", unit,
-		"--expected-keys", strings.Join(pinnedKCMArgs, ","),
+		"--expected-keys", strings.Join(k0sconfig.DefaultExpectedKCMArgs, ","),
 		"--removed-flags", "concurrent-service-syncs",
 	})
 	if code != 1 {
@@ -304,10 +285,10 @@ func TestRunCheckCanceledCtx(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var out bytes.Buffer
-	code := runCheck(ctx, hostmetrics.K0sDriftConfig{
+	code := runCheck(ctx, k0sconfig.K0sDriftConfig{
 		ConfigFile:   "/nonexistent/k0s.yaml",
 		UnitFile:     "/nonexistent/k0scontroller.service",
-		ExpectedKeys: pinnedKCMArgs,
+		ExpectedKeys: k0sconfig.DefaultExpectedKCMArgs,
 	}, &out)
 	if code != 1 {
 		t.Fatalf("canceled ctx exit=%d want 1", code)

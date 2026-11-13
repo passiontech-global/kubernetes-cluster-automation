@@ -26,7 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -131,7 +131,7 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	}
 	// Budget spent atomically BEFORE signalling (rate_spend parity —
 	// a failed signal still consumed it).
-	sort.Ints(holderPids) // deterministic signal order, same convention as dnsStale sort
+	slices.Sort(holderPids) // deterministic signal order, same convention as dnsStale sort
 	for _, pid := range holderPids {
 		if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGHUP); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(

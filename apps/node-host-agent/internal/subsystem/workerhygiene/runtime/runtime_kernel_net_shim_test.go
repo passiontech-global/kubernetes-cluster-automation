@@ -20,7 +20,9 @@ import (
 
 func writeNetstat(t *testing.T, procDir string, drops, ovfl int64) {
 	t.Helper()
-	dir := filepath.Join(procDir, "net")
+	// The check reads <ProcRoot>/1/net/netstat (init's netns, not the
+	// pod's) — the fixture plants the file where the reader looks.
+	dir := filepath.Join(procDir, "1", "net")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}

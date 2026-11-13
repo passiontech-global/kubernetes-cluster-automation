@@ -233,7 +233,7 @@ type apiServerEndpointGuard struct {
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		mgr, cs := d.Mgr, d.CS
-		g := &apiServerEndpointGuard{cs: cs, dyn: d.Dyn, queue: d.Name, nodeReader: d.Mgr.GetClient(), backends: map[string]*backendProbeState{}}
+		g := &apiServerEndpointGuard{cs: cs, dyn: d.Dyn, queue: d.Name, nodeReader: d.CachedClient(), backends: map[string]*backendProbeState{}}
 		g.probeFn = g.probe
 		g.log = mgr.GetLogger().WithName(g.queue)
 		// Dedicated dynamic client filtering the "v1 Endpoints is

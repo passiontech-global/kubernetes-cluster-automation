@@ -37,7 +37,7 @@ func TestHasRemediationOrOutOfServiceTaint(t *testing.T) {
 			tainted("node.medik8s.io/out-of-service"), true},
 		{"SNR per-rule remediation taint",
 			tainted("remediation.medik8s.io/kernel-deadlock"), true},
-		{"unschedulable out-of-service taint", tainted(TaintNodeUnschedulable), true},
+		{"unschedulable out-of-service taint", tainted(UnschedulableTaintKey), true},
 		// Prefix match must not over-match a lookalike key.
 		{"near-miss prefix is not SNR", tainted("remediation.medik8s.ioX/foo"), false},
 	} {
@@ -58,7 +58,7 @@ func TestHasRemediationTaintExcludesOutOfService(t *testing.T) {
 		"node.kubernetes.io/out-of-service",
 		"node.medik8s.io/out-of-service",
 		"remediation.medik8s.io/kernel-deadlock",
-		TaintNodeUnschedulable,
+		UnschedulableTaintKey,
 	} {
 		if HasRemediationTaint(tainted(key)) {
 			t.Fatalf("HasRemediationTaint(%q) = true — fence taints must stay out", key)
@@ -92,7 +92,7 @@ func TestHasRemediationOrFenceTaint(t *testing.T) {
 			tainted("remediation.medik8s.io/kernel-deadlock"), true},
 		// The cordon marker itself must NOT exempt — it is the
 		// evidence NodeActivelyCordoned ages.
-		{"unschedulable cordon taint alone", tainted(TaintNodeUnschedulable), false},
+		{"unschedulable cordon taint alone", tainted(UnschedulableTaintKey), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := HasRemediationOrFenceTaint(tc.node); got != tc.want {

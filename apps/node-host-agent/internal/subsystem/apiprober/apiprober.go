@@ -293,8 +293,11 @@ type Prober struct {
 	duration      prometheus.Gauge
 }
 
-// New returns a Prober, building the TLS client from the credential
-// config unless Config.HTTPClient is injected, and registers metrics.
+// New returns a Prober and registers metrics. The CA-backed TLS
+// client builds LAZILY on first use — guard.conf (and its ca_file)
+// may not exist yet when the agent starts on an api-lb VM, and a
+// construction-time load made New fail and held the whole subsystem
+// out until an agent restart (see probeClient/refreshClient).
 func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 	cfg.applyDefaults()
 	if cfg.Mode != ModeDryRun && cfg.Mode != ModeEnforce {
@@ -315,13 +318,9 @@ func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 		// explicit opt-in, mirrors curl -sk
 		p.client = &http.Client{Transport: baseTransport(
 			&tls.Config{InsecureSkipVerify: true})}
-	} else {
-		cl, key, err := caClient(cfg.CAFile)
-		if err != nil {
-			return nil, err
-		}
-		p.client, p.caKey = cl, key
 	}
+	// The CA-backed case leaves p.client nil — refreshGuard →
+	// refreshClient builds it on the first cycle once the CA exists.
 	// Seed the effective knobs (and pick up any GuardSrc-carried
 	// CA that differs from the startup one) so every method sees a
 	// resolved view before the first Cycle.

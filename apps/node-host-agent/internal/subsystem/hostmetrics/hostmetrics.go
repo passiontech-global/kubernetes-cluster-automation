@@ -102,7 +102,7 @@ package hostmetrics
 
 import (
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -410,7 +410,7 @@ func (c *Collector) WriteTextfile(dir string) error {
 		}
 		series[meta.name] = append(series[meta.name], sb.String())
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 
 	var b promfile.Builder
 	for _, name := range names {
@@ -420,7 +420,7 @@ func (c *Collector) WriteTextfile(dir string) error {
 		}
 		b.HeaderType(name, metaByName[name].help, typ)
 		samples := series[name]
-		sort.Strings(samples)
+		slices.Sort(samples)
 		// Dedupe identical sample lines — a duplicated series makes
 		// the textfile collector reject the WHOLE file (the same
 		// constraint prom_emit's `emitted` bookkeeping guarded).

@@ -88,7 +88,6 @@ func (p *linkerdH2StreamGuardCheck) linkerdH2LogSignals(ctx context.Context,
 // for the indexed results slice.
 type logSignals struct {
 	storm, identity bool
-	err             error
 }
 
 // linkerdSuspectPods pre-filters the log scan through Prometheus:

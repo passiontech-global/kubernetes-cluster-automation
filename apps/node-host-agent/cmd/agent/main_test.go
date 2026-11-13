@@ -252,10 +252,11 @@ func disableAllSubsystems(t *testing.T) {
 // subtests share — ephemeral addrs, version "v", namespace "ns" —
 // with node/pod/standalone varying per subtest. standaloneFlag
 // stays a separate parameter: it is a CLI switch, not an
-// agent.Config field.
+// agent.Config field. The returned *systemd.Client is dropped:
+// these tests only assert the wiring report, never run unit actions.
 func testBuildAgentConfig(nodeName, podName string,
 	standalone bool) (agent.Config, wireReport) {
-	return buildAgentConfig(agent.Config{
+	cfg, report, _ := buildAgentConfig(agent.Config{
 		NodeName:    nodeName,
 		PodName:     podName,
 		Namespace:   "ns",
@@ -263,6 +264,7 @@ func testBuildAgentConfig(nodeName, podName string,
 		MetricsAddr: "127.0.0.1:0",
 		ProbeAddr:   "127.0.0.1:0",
 	}, standalone)
+	return cfg, report
 }
 
 func subsystemNames(cfg agent.Config) []string {

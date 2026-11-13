@@ -60,7 +60,7 @@ type deadNodeSweeper struct {
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		s := &deadNodeSweeper{cs: d.CS, dyn: d.Dyn, queue: d.Name,
-			nodeReader: d.Mgr.GetClient(), now: shared.SystemClock}
+			nodeReader: d.CachedClient(), now: shared.SystemClock}
 		s.probeFn = s.probe
 		return shared.AddPeriodic(d.Mgr, s.queue, 5*time.Minute, s.run)
 	})

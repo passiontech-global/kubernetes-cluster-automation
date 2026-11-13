@@ -137,7 +137,15 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	// Declare every EnterFrom/ExitFrom producer id this subsystem can
 	// emit — the journal owner plus the two pod-teardown latch
 	// holders — so a post-restart ExitFrom seeds only live owners.
-	d.State.RegisterActiveOwner(journalwatch.OwnerWorkerHygiene)
+	// The journal owner only registers where its unit exists: on a
+	// pure controller node there is no k0sworker journal, the checks
+	// gate off (inactive unit) and no healthy read ever releases a
+	// seeded hold — the stale state-journal-unreadable episode then
+	// stays pinned until the janitor's 24h reap. nil Systemd (tests,
+	// unwired agent) can't answer → register.
+	if cfg.Systemd == nil || cfg.Systemd.UnitExists("k0sworker.service") {
+		d.State.RegisterActiveOwner(journalwatch.OwnerWorkerHygiene)
+	}
 	d.State.RegisterActiveOwner(wdeps.CheckTeardown)
 	d.State.RegisterActiveOwner(wdeps.CheckCtrTasks)
 	// Streak contract lives in journalwatch.NewUnreadableTrackerForOwner:

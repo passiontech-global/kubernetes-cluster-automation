@@ -101,6 +101,12 @@ func (s *Store) rateOKInLocked(dir, name string, interval time.Duration) bool {
 	if dir == "" {
 		dir = s.Dir
 	}
+	// Clean BOTH sides of the spend key: callers spell the same dir
+	// differently across cycles ("x/" vs "x", "a/b/../b"), and the
+	// RAM lastSpent key is dir+name verbatim — an uncleaned spelling
+	// would miss the RAM mirror and re-open a just-spent budget
+	// (filepath.Join alone cleans the FILE path, not the key).
+	dir = filepath.Clean(dir)
 	last := s.Epoch(filepath.Join(dir, name))
 	if ram := s.shared.lastSpent[rateSpendKey(dir, name)]; ram > last {
 		last = ram
@@ -132,10 +138,14 @@ func (s *Store) RateSpendIn(dir, name string) {
 // s.shared.mu. The RAM lastSpent stamp lands BEFORE the disk write:
 // an ENOSPC/EROFS WriteEpochFile failure must still consume the
 // budget, or RateOKIn keeps passing and the gated action storms.
+// The dir is Cleaned to the same spelling rateOKInLocked keys with —
+// a differently-spelled dir would write a mirror the checker never
+// sees.
 func (s *Store) rateSpendInLocked(dir, name string) {
 	if dir == "" {
 		dir = s.Dir
 	}
+	dir = filepath.Clean(dir)
 	now := s.Now().Unix()
 	if s.shared.lastSpent == nil {
 		s.shared.lastSpent = map[string]int64{}

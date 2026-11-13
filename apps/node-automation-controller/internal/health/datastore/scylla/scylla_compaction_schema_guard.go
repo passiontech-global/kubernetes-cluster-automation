@@ -16,7 +16,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -283,7 +283,7 @@ func scyllaLabelValue(line, key string) (string, bool) {
 	if lb < 0 || rb <= lb {
 		return "", false
 	}
-	for _, kv := range strings.Split(line[lb+1:rb], ",") {
+	for kv := range strings.SplitSeq(line[lb+1:rb], ",") {
 		k, v, ok := strings.Cut(strings.TrimSpace(kv), "=")
 		if ok && k == key {
 			return strings.Trim(v, `"`), true
@@ -435,7 +435,7 @@ func (p *scyllaCompactionSchemaGuardCheck) Run(ctx context.Context) probefw.Resu
 		for v := range distinct {
 			vs = append(vs, strconv.FormatFloat(v, 'f', -1, 64))
 		}
-		sort.Strings(vs)
+		slices.Sort(vs)
 		splitRep.Find(fmt.Sprintf("%s versions=[%s]", ck, strings.Join(vs, ",")))
 	}
 

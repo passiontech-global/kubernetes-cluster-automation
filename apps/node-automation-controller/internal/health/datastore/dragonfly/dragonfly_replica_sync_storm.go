@@ -126,7 +126,7 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 	// A list failure fails open: the signatures keep their normal
 	// posture.
 	crs, err := p.AllUnstructured(ctx, kube.GVRDragonfly)
-	downscaled, err := downscaledClusterCRs(crs, err)
+	downscaled, err := kube.DownscaledClusterCRs(crs, err)
 	if err != nil {
 		log.Info("WARN: list dragonflies failed — downscaler awareness off",
 			"error", err)

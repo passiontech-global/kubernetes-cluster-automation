@@ -7,7 +7,6 @@
 package pinnedworkload
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -58,7 +57,7 @@ func baseDSSpec(cs kubernetes.Interface) DaemonSetSpec {
 func getDS(t *testing.T, cs *fake.Clientset) *appsv1.DaemonSet {
 	t.Helper()
 	ds, err := cs.AppsV1().DaemonSets("kube-system").
-		Get(context.Background(), "agent", metav1.GetOptions{})
+		Get(t.Context(), "agent", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get agent: %v", err)
 	}
@@ -80,7 +79,7 @@ func forbidDSPatch(cs *fake.Clientset, patched *bool) {
 // nil error on the 15m requeue.
 func TestDaemonSetSpecNotFound(t *testing.T) {
 	res, err := baseDSSpec(fake.NewSimpleClientset()).
-		Reconcile(context.Background())
+		Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -97,7 +96,7 @@ func TestDaemonSetSpecGetError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	_, err := baseDSSpec(cs).Reconcile(context.Background())
+	_, err := baseDSSpec(cs).Reconcile(t.Context())
 	if err == nil {
 		t.Fatal("expected error when the daemonset get fails")
 	}
@@ -114,7 +113,7 @@ func TestDaemonSetSpecNoDrift(t *testing.T) {
 
 	s := baseDSSpec(cs)
 	s.Drifted = func(*appsv1.DaemonSet) bool { return false }
-	res, err := s.Reconcile(context.Background())
+	res, err := s.Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -137,7 +136,7 @@ func TestDaemonSetSpecMissingContainerSkips(t *testing.T) {
 	var patched bool
 	forbidDSPatch(cs, &patched)
 
-	res, err := baseDSSpec(cs).Reconcile(context.Background())
+	res, err := baseDSSpec(cs).Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -160,7 +159,7 @@ func TestDaemonSetSpecUnsettledSkips(t *testing.T) {
 
 	s := baseDSSpec(cs)
 	s.Settled = func(*appsv1.DaemonSet) bool { return false }
-	res, err := s.Reconcile(context.Background())
+	res, err := s.Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -178,7 +177,7 @@ func TestDaemonSetSpecAppliesPatch(t *testing.T) {
 	cs := fake.NewSimpleClientset(pinnedDS())
 	s := baseDSSpec(cs)
 	s.Settled = func(*appsv1.DaemonSet) bool { return true }
-	res, err := s.Reconcile(context.Background())
+	res, err := s.Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -196,7 +195,7 @@ func TestDaemonSetSpecAppliesPatch(t *testing.T) {
 func TestDaemonSetSpecNilSettledPatches(t *testing.T) {
 	cs := fake.NewSimpleClientset(pinnedDS())
 	s := baseDSSpec(cs) // Settled stays nil
-	if _, err := s.Reconcile(context.Background()); err != nil {
+	if _, err := s.Reconcile(t.Context()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := getDS(t, cs).Spec.Template.Spec.PriorityClassName; got !=
@@ -213,7 +212,7 @@ func TestDaemonSetSpecPatchError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	_, err := baseDSSpec(cs).Reconcile(context.Background())
+	_, err := baseDSSpec(cs).Reconcile(t.Context())
 	if err == nil {
 		t.Fatal("expected error when the drift patch fails")
 	}
@@ -243,7 +242,7 @@ func TestDaemonSetSpecCachedReadConfirmSkipsSettled(t *testing.T) {
 	s.Drifted = func(ds *appsv1.DaemonSet) bool {
 		return ds.Spec.Template.Spec.PriorityClassName == "system-node-critical"
 	}
-	res, err := s.Reconcile(context.Background())
+	res, err := s.Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -274,7 +273,7 @@ func TestDaemonSetSpecCachedReadConfirmPatchesDrift(t *testing.T) {
 	s.Drifted = func(ds *appsv1.DaemonSet) bool {
 		return ds.Spec.Template.Spec.PriorityClassName == "system-node-critical"
 	}
-	if _, err := s.Reconcile(context.Background()); err != nil {
+	if _, err := s.Reconcile(t.Context()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if patches != 1 {

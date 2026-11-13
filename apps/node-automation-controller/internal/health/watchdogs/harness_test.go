@@ -25,6 +25,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewMeshControlPlaneCheck,
 	NewObservabilityPipelineGuardCheck,
 	NewOnePasswordConnectSyncCheck,
+	NewAPIServerRelistStormCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

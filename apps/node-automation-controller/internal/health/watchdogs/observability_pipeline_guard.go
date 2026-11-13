@@ -24,11 +24,10 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
@@ -200,33 +199,27 @@ func (p *observabilityPipelineCheck) emitDegradedEvent(
 	ctx context.Context, log logr.Logger, component, desc string) {
 
 	now := p.Now()
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			// The component rides the name (underscores are not
-			// DNS-1123 — map them to dashes): one sweep can degrade
-			// several components and every emission shares this
-			// sweep's `now` — without the component in the name the
-			// second Create hits 409 AlreadyExists.
-			Name: fmt.Sprintf("observability-pipeline.%s.%x",
-				strings.ReplaceAll(component, "_", "-"), now.UnixNano()),
-			Namespace: obsPipelineEventNS,
-		},
-		EventTime:           metav1.NewMicroTime(now),
-		Reason:              obsPipelineEventReason,
-		Note:                fmt.Sprintf("observability pipeline component %s degraded: %s — alerts and logs may be silently lost", component, desc),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-automation-controller",
-		ReportingInstance:   p.Name,
-		Action:              obsPipelineEventReason,
+	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
+		// The component rides the name (underscores are not
+		// DNS-1123 — map them to dashes): one sweep can degrade
+		// several components and every emission shares this
+		// sweep's `now` — without the component in the name the
+		// second Create hits 409 AlreadyExists.
+		Name: fmt.Sprintf("observability-pipeline.%s.%x",
+			strings.ReplaceAll(component, "_", "-"), now.UnixNano()),
+		Namespace: obsPipelineEventNS,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "monitoring.coreos.com/v1",
 			Kind:       "Prometheus",
 			Namespace:  obsPipelineEventNS,
 			Name:       "kube-prometheus-stack-prometheus",
 		},
-	}
-	if _, err := p.CS.EventsV1().Events(obsPipelineEventNS).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
+		Reason: obsPipelineEventReason,
+		Note: fmt.Sprintf("observability pipeline component %s degraded: %s — alerts and logs may be silently lost",
+			component, desc),
+		ReportingInstance: p.Name,
+		Now:               now,
+	}); err != nil {
 		log.Info("WARN: ObservabilityPipelineDegraded event create failed (RBAC?)",
 			"component", component, "error", err)
 		return

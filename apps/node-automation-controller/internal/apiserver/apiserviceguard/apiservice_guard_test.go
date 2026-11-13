@@ -1,7 +1,6 @@
 package apiserviceguard
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -82,7 +81,7 @@ func asgUnblockCS(ns, group, svcName, svcShort string, nsAge time.Duration, podN
 		objs = append(objs, asgBackendPod(ns, name, svcShort))
 	}
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	return cs
 }
 
@@ -371,12 +370,6 @@ func asgBackendPod(ns, name, app string) *corev1.Pod {
 	}
 }
 
-func asgPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
-	t.Helper()
-	_, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
-	return err == nil
-}
-
 // The full wedge signature — protected-namespace APIService
 // Available=False >=15m AND a namespace Terminating >=15m whose
 // condition names the API group — restarts the backing pods.
@@ -394,7 +387,7 @@ func TestAPIServiceGuardUnblockRestartsBackingPods(t *testing.T) {
 	// survivor waits for the next cooldown window.
 	evicted := 0
 	for _, name := range []string{"ms-0", "ms-1"} {
-		if !asgPodExists(t, cs, "kube-system", name) {
+		if !testutil.PodExists(t, cs, "kube-system", name) {
 			evicted++
 		}
 	}
@@ -421,7 +414,7 @@ func TestAPIServiceGuardUnblockYoungTerminatingSkipped(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+	if !testutil.PodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("backing pod deleted although the namespace only just started terminating")
 	}
 }
@@ -438,14 +431,14 @@ func TestAPIServiceGuardUnblockStandaloneRestarts(t *testing.T) {
 		testutil.Namespace("keda"),
 		asgBackendSvc("keda", "keda-operator", "keda-operator"),
 		asgBackendPod("keda", "keda-operator-0", "keda-operator"))
-	emulateEviction(cs) // the heal evicts through policy/v1
+	testutil.EmulateEviction(cs) // the heal evicts through policy/v1
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if asgPodExists(t, cs, "keda", "keda-operator-0") {
+	if testutil.PodExists(t, cs, "keda", "keda-operator-0") {
 		t.Fatal("standalone-unblock: backing pod not restarted")
 	}
 	if !asgExists(t, dyn, "v1beta1.external.metrics.k8s.io") {
@@ -469,7 +462,7 @@ func TestAPIServiceGuardUnblockStandaloneTooYoungSkipped(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "keda", "keda-operator-0") {
+	if !testutil.PodExists(t, cs, "keda", "keda-operator-0") {
 		t.Fatal("backing pod deleted below the 30m standalone bar")
 	}
 }
@@ -489,7 +482,7 @@ func TestAPIServiceGuardUnblockWrongGroupSkipped(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+	if !testutil.PodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("backing pod deleted for an unrelated API group")
 	}
 }
@@ -508,7 +501,7 @@ func TestAPIServiceGuardUnblockStandaloneFallbackOnUnrelatedWedge(t *testing.T) 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if asgPodExists(t, cs, "kube-system", "ms-0") {
+	if testutil.PodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("unrelated wedged namespace masked the standalone unblock")
 	}
 	if _, stamped := g.unblockHealer.standaloneUnblocked.Last("v1beta1.metrics.k8s.io"); !stamped {
@@ -531,14 +524,14 @@ func TestAPIServiceGuardUnblockOperatorsNamespace(t *testing.T) {
 		testutil.Namespace("operators"),
 		asgBackendSvc("operators", "keda-operator-metrics-apiserver", "keda-operator-metrics-apiserver"),
 		asgBackendPod("operators", "keda-metrics-apiserver-0", "keda-operator-metrics-apiserver"))
-	emulateEviction(cs) // the heal evicts through policy/v1
+	testutil.EmulateEviction(cs) // the heal evicts through policy/v1
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if asgPodExists(t, cs, "operators", "keda-metrics-apiserver-0") {
+	if testutil.PodExists(t, cs, "operators", "keda-metrics-apiserver-0") {
 		t.Fatal("operators-backed APIService skipped — namespace not protected")
 	}
 }
@@ -556,7 +549,7 @@ func TestAPIServiceGuardUnblockNonProtectedSkipped(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "custom-ns", "custom-0") {
+	if !testutil.PodExists(t, cs, "custom-ns", "custom-0") {
 		t.Fatal("non-protected APIService backend restarted — scope violated")
 	}
 }
@@ -573,7 +566,7 @@ func TestAPIServiceGuardUnblockHealthySkipped(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+	if !testutil.PodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("backing pod deleted for a sub-threshold APIService failure")
 	}
 }
@@ -611,7 +604,7 @@ func TestAPIServiceGuardUnblockCooldownPrunesOnListError(t *testing.T) {
 	t0 := time.Now().Add(-apiServiceUnblockCooldown - time.Minute)
 	u.unblocked.Stamp(key, t0)
 	snap := &apiServiceSnapshot{g: g, err: errors.New("list apiservices boom")}
-	if err := u.sweepUnblock(context.Background(), snap); err == nil {
+	if err := u.sweepUnblock(t.Context(), snap); err == nil {
 		t.Fatal("expected the apiservices list error to surface")
 	}
 	// CooledDown judged AT a point inside the (now-gone) stamp's window:
@@ -645,7 +638,7 @@ func TestAPIServiceGuardUnblockTerminatingPodsSkipped(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "kube-system", "ms-term") {
+	if !testutil.PodExists(t, cs, "kube-system", "ms-term") {
 		t.Fatal("terminating backing pod deleted — must be skipped as a target")
 	}
 	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); stamped {
@@ -668,17 +661,17 @@ func TestAPIServiceGuardUnblockDeletesOnlyLivePods(t *testing.T) {
 		term,
 		asgBackendPod("kube-system", "ms-live", "metrics-server"),
 	)
-	emulateEviction(cs) // the heal evicts through policy/v1
+	testutil.EmulateEviction(cs) // the heal evicts through policy/v1
 	dyn := asgDynFake(apiSvc)
 	g := asgGuard(cs, dyn)
 
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "kube-system", "ms-term") {
+	if !testutil.PodExists(t, cs, "kube-system", "ms-term") {
 		t.Fatal("terminating backing pod deleted — must be skipped as a target")
 	}
-	if asgPodExists(t, cs, "kube-system", "ms-live") {
+	if testutil.PodExists(t, cs, "kube-system", "ms-live") {
 		t.Fatal("live backing pod not restarted")
 	}
 	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); !stamped {
@@ -745,7 +738,7 @@ func TestAPIServiceGuardUnblockFullNameReferenceNoMatch(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+	if !testutil.PodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("full-name corpus reference matched the candidate group — pod restarted off stale evidence")
 	}
 	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); stamped {
@@ -780,7 +773,7 @@ func TestAPIServiceGuardUnblockPDBRefusalDefers(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+	if !testutil.PodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("PDB-refused backing pod was evicted anyway")
 	}
 	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); stamped {

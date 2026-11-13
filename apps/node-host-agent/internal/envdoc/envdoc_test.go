@@ -23,7 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 
@@ -121,7 +121,7 @@ func TestEnvDocCoversContract(t *testing.T) {
 		for v := range res.Referenced {
 			vars = append(vars, v)
 		}
-		sort.Strings(vars)
+		slices.Sort(vars)
 		for _, v := range vars {
 			if !doc[v] {
 				t.Errorf("%s (read at %s) is not documented in ENV.md — "+
@@ -135,7 +135,7 @@ func TestEnvDocCoversContract(t *testing.T) {
 		for v := range doc {
 			vars = append(vars, v)
 		}
-		sort.Strings(vars)
+		slices.Sort(vars)
 		for _, v := range vars {
 			if !c.Values[v] {
 				t.Errorf("ENV.md documents %s but envnames declares no "+

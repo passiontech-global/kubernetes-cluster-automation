@@ -71,15 +71,24 @@ func (r *Runner) Name() string { return r.name }
 // max(3*interval + budget, LivenessFloor) and stamps it at the START
 // and END of every run — the start stamp is the startup grace that
 // lets a legitimately long first cycle finish, the end stamp keeps
-// the cadence honest. A hung fn stops stamping and /healthz reports
-// 503 once ITS OWN budget is exceeded (a panicking fn under
-// EverySafe is recovered inside fn, so the stamp still lands: a
-// crash-looping cycle is alive, a wedged one is not). Outside a
-// supervised ctx the beat is nil and stamping is a no-op.
+// the cadence honest. The beat is unregistered when Run returns, so
+// a restarted loop's replacement beat starts fresh instead of
+// inheriting the dead run's last stamp. A hung fn stops stamping and
+// /healthz reports 503 once ITS OWN budget is exceeded (a panicking
+// fn under EverySafe is recovered inside fn, so the stamp still
+// lands: a crash-looping cycle is alive, a wedged one is not).
+// Outside a supervised ctx the beat is nil and stamping is a no-op.
 func (r *Runner) Run(ctx context.Context) {
 	var beat *Beat
 	if l := LivenessFrom(ctx); l != nil {
 		beat = l.RegisterLoop(r.name, r.interval, r.budget)
+		// The beat must not outlive the loop: Run exits on ctx
+		// cancel (shutdown) or — under the supervisor's restart —
+		// on a fn panic unwinding past the ticker, and a beat left
+		// registered keeps its last stamp forever. Unregistering on
+		// the way out keeps exactly the wedged case 503: a loop
+		// hung INSIDE fn never reaches this defer.
+		defer l.Unregister(beat)
 	}
 	stampLoop(beat)
 	r.fn(ctx)

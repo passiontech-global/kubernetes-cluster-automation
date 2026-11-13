@@ -12,17 +12,16 @@
 // headers, signature verification, payload parsing and the
 // pre-index filters. The post-verification half (index ensure, repo
 // match, the zero-match refresh retry and the detached fan-out) lives
-// in dispatch.go.
+// in dispatch.go; the shared response/log-safety helpers live in
+// respond.go.
 package handler
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,11 +71,23 @@ const (
 // bodyPool recycles the request-body buffers of the four handled
 // event types — each delivery can hold up to maxBodyBytes, and
 // webhook volume is far higher than GC would reclaim them at. Buffers
-// are Reset before Put so a pooled 8 MiB slab never leaks stale body
-// bytes into the next delivery.
+// are Reset before Put so a pooled slab never leaks stale body bytes
+// into the next delivery. New preallocates 16 KiB — the typical
+// delivery size — so steady-state traffic stops growing pooled
+// buffers; on Put, buffers over 64 KiB are dropped to GC instead of
+// being recycled, so one huge delivery cannot pin an 8 MiB-class
+// slab in the pool for the process lifetime.
 var bodyPool = sync.Pool{
-	New: func() any { return new(bytes.Buffer) },
+	New: func() any {
+		b := new(bytes.Buffer)
+		b.Grow(16 << 10)
+		return b
+	},
 }
+
+// maxPooledBodyCap is the largest buffer bodyPool recycles: a delivery
+// that forced the buffer past this size hands its slab back to GC.
+const maxPooledBodyCap = 64 << 10
 
 // Backend is the slice of the Concourse client the handler needs —
 // an interface so tests can substitute a fake ATC. The index entry
@@ -313,7 +324,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf.Reset()
 	defer func() {
 		buf.Reset()
-		bodyPool.Put(buf)
+		if buf.Cap() <= maxPooledBodyCap {
+			bodyPool.Put(buf)
+		}
 	}()
 	if _, err := io.Copy(buf, http.MaxBytesReader(w, r.Body, maxBodyBytes)); err != nil {
 		h.failBodyRead(w, r, delivery, event, eventMetric, err)
@@ -390,100 +403,4 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Signature verified, payload parsed and actionable — hand the
 	// delivery to the index/match/fan-out half (dispatch.go).
 	h.accept(w, r, delivery, event, eventMetric, wantType, p)
-}
-
-// failBodyRead maps a body-read failure onto the delivery metric and
-// the HTTP status — shared by the buffered and streaming verify
-// paths so their 413/400 ordering can never drift apart. "Body over
-// maxBodyBytes" (the sender's fault -> 413) and a transport failure
-// like a client disconnect (-> 400) both surface as a read error —
-// split them on MaxBytesError.
-func (h *Handler) failBodyRead(w http.ResponseWriter, r *http.Request,
-	delivery, event, eventMetric string, err error) {
-	var maxErr *http.MaxBytesError
-	if errors.As(err, &maxErr) {
-		deliveriesTotal.WithLabelValues(eventMetric, "payload_too_large").Inc()
-		logger().Warn("webhook rejected: body exceeds size limit",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", eventMetric, "error", err,
-			"status", http.StatusRequestEntityTooLarge)
-		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
-	} else {
-		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
-		logger().Warn("webhook rejected: body read failed",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", eventMetric, "error", err,
-			"status", http.StatusBadRequest)
-		http.Error(w, "bad request", http.StatusBadRequest)
-	}
-}
-
-// rejectSignature is the shared 401 for a well-formed signature that
-// does not verify — buffered and streaming paths alike.
-func (h *Handler) rejectSignature(w http.ResponseWriter, r *http.Request,
-	delivery, eventMetric string) {
-	deliveriesTotal.WithLabelValues(eventMetric, "unauthorized").Inc()
-	logger().Warn("webhook rejected: signature mismatch",
-		"remote_addr", r.RemoteAddr,
-		"delivery", delivery, "event", eventMetric,
-		"status", http.StatusUnauthorized)
-	http.Error(w, "invalid signature", http.StatusUnauthorized)
-}
-
-// logSafe bounds an unauthenticated header value for logging: GitHub
-// delivery GUIDs are 36-char hex+hyphen UUIDs, so anything outside the
-// safe alphabet is dropped and anything longer than a UUID is
-// truncated — a hostile peer cannot echo arbitrary (or long, or
-// control-laden) bytes into the log stream before the HMAC check
-// rejects them. Legit IDs survive intact for correlation.
-func logSafe(s string) string {
-	const maxLen = 64
-	n := len(s)
-	if n > maxLen {
-		n = maxLen
-	}
-	// Fast path — the overwhelmingly common case: every byte already
-	// sits in the safe ASCII alphabet, so the string can be returned
-	// (truncated) with zero allocation instead of strings.Map's rune
-	// walk building a fresh string.
-	i := 0
-	for ; i < n; i++ {
-		c := s[i]
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' ||
-			c >= 'A' && c <= 'Z' || c == '-' || c == '.' || c == '_') {
-			break
-		}
-	}
-	if i == n {
-		return s[:n]
-	}
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
-			r == '-', r == '.', r == '_':
-			return r
-		default:
-			// Invalid UTF-8 decodes to RuneError and lands here too.
-			return -1
-		}
-	}, s[:n])
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-// writeSkipped acknowledges an authenticated delivery that was
-// filtered before the index lookup — 200 (not 202) with the skip
-// reason so operators can tell "matched nothing" from "never
-// checked".
-func writeSkipped(w http.ResponseWriter, reason string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"matched": 0,
-		"skipped": reason,
-	})
 }

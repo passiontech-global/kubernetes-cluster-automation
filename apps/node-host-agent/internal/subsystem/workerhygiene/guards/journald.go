@@ -45,6 +45,10 @@ const (
 type JournaldCheck struct {
 	d  *wdeps.Deps
 	ig *journalwatch.Integrity
+	// once is the cycle-shared k0sworker snapshot handle (05/06's
+	// e.JournalOnce), swapped in at Run — nil (hand-built envs) falls
+	// back to a direct JournalFn read.
+	once func() string
 }
 
 // newJournaldIntegrity wires the shared pipeline to this check's
@@ -52,7 +56,8 @@ type JournaldCheck struct {
 // JournalAnyFn seams at CALL time (tests re-stub them after New);
 // StreakNeeded and the remedy transport freeze at construction —
 // ApplyDefaults has already filled both by the time initChecks runs.
-func newJournaldIntegrity(d *wdeps.Deps) *journalwatch.Integrity {
+func newJournaldIntegrity(c *JournaldCheck) *journalwatch.Integrity {
+	d := c.d
 	var remedy func(ctx context.Context, args ...string) (string, error)
 	if d.Cfg.Systemd != nil {
 		sd := d.Cfg.Systemd
@@ -61,12 +66,26 @@ func newJournaldIntegrity(d *wdeps.Deps) *journalwatch.Integrity {
 		}
 	}
 	return journalwatch.NewIntegrity(journalwatch.IntegrityConfig{
-		// The runner's shared -10min k0sworker snapshot (05/06):
+		// The runner's shared -10min k0sworker snapshot (05/06) —
 		// `journalctl -u k0sworker.service --since "-10 min"
-		// --no-pager` with stderr folded in by the seam, so a
+		// --no-pager`, stderr folded in by the seam, so a
 		// corrupt-file notice survives even a non-zero exit and
-		// still counts here.
+		// still counts here. Read through the CYCLE-SHARED handle
+		// (Run swaps in e.JournalOnce) so 05/06 and this check
+		// answer from ONE journald fork per cycle instead of two
+		// identical ones — journald is slow on CPU-starved nodes
+		// and two windows could disagree. A blank/failed snapshot
+		// falls through to the direct seam read: the runner folds
+		// exec errors away, and THIS check must still see them
+		// (an exec failure reads as journal-unreadable/inconclusive,
+		// never as a quiet unit or corruption evidence). A
+		// hand-built env without the snapshot always direct-reads.
 		Probe: func(ctx context.Context) (string, error) {
+			if c.once != nil {
+				if out := c.once(); strings.TrimSpace(out) != "" {
+					return out, nil
+				}
+			}
 			return d.Cfg.Seams.Host.JournalFn(ctx)
 		},
 		// Only OUTPUT evidence counts as corruption: an exec-level
@@ -147,6 +166,10 @@ func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckJournald) {
 		return
 	}
+	// Bind THIS cycle's shared k0sworker snapshot (05/06's
+	// e.JournalOnce) — nil in hand-built envs keeps the direct seam
+	// read.
+	c.once = e.JournalOnce
 	v := c.ig.Classify(ctx)
 	// journal-unreadable accounting: a "corrupt" notice means
 	// journald ANSWERED (A5's remedy owns that path) — only a read

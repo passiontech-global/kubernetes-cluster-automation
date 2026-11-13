@@ -8,7 +8,9 @@ import (
 	"fmt"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -132,6 +134,30 @@ func compactCRDConversion(crd *unstructured.Unstructured) unstructured.Unstructu
 		// here: the snapshot contract is read-only, and the alias is
 		// exactly the data the compact object exists to keep.
 		_ = unstructured.SetNestedField(out.Object, conv, "spec", "conversion")
+	}
+	return out
+}
+
+// compactCRDFromTyped is compactCRDConversion's twin for objects read
+// from the manager's CRD informer cache (typed, schema-stripped with
+// .spec.conversion preserved by the cache transform): it produces the
+// SAME compact shape — metadata.name plus the whole spec.conversion
+// subtree — so every consumer (CRDConversionServiceKey, NestedInt64
+// port reads, GetName) sees identical data whichever source served
+// the census. The unstructured conversion materializes only the
+// conversion subtree, never the stripped schema bulk.
+func compactCRDFromTyped(
+	crd *apiextensionsv1.CustomResourceDefinition) unstructured.Unstructured {
+
+	out := unstructured.Unstructured{Object: map[string]any{}}
+	out.SetName(crd.Name)
+	if crd.Spec.Conversion != nil {
+		conv, err := runtime.DefaultUnstructuredConverter.ToUnstructured(
+			crd.Spec.Conversion)
+		if err == nil && len(conv) > 0 {
+			_ = unstructured.SetNestedField(out.Object, conv,
+				"spec", "conversion")
+		}
 	}
 	return out
 }

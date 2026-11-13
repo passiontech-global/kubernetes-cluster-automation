@@ -116,13 +116,13 @@ func parseGuardConf(data []byte) (GuardDefaults, error) {
 	// the primary already acts via BackendName, so only the rest are
 	// companions (double-applying an enable/disable is a no-op but
 	// logs and metrics would double-count it).
-	for _, b := range strings.Fields(vars["HAPROXY_BACKENDS"]) {
+	for b := range strings.FieldsSeq(vars["HAPROXY_BACKENDS"]) {
 		if b == "" || b == g.BackendName {
 			continue
 		}
 		g.CompanionBackends = append(g.CompanionBackends, b)
 	}
-	for _, e := range strings.Fields(vars["API_BACKENDS"]) {
+	for e := range strings.FieldsSeq(vars["API_BACKENDS"]) {
 		if sb, ok := parseStaticBackend(e); ok {
 			g.StaticBackends = append(g.StaticBackends, sb)
 		}

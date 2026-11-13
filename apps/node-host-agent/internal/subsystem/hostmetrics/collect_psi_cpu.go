@@ -48,7 +48,7 @@ func (c *Collector) psiAvg60() (float64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) == 0 || f[0] != "some" {
 			continue
@@ -297,7 +297,7 @@ func psiAvg60Full(path string) (some, full float64, someOK, fullOK bool) {
 	if err != nil {
 		return 0, 0, false, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) == 0 || (f[0] != "some" && f[0] != "full") {
 			continue
@@ -334,7 +334,7 @@ func vmstatCounters(path string, keys ...string) map[string]uint64 {
 	if err != nil {
 		return out
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) != 2 || !want[f[0]] {
 			continue

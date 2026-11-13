@@ -4,6 +4,8 @@
 // self-contained). Ops contract — the values are byte-stable.
 package kube
 
+import corev1 "k8s.io/api/core/v1"
+
 const (
 	// LinkerdProxyContainer is the sidecar container name linkerd
 	// injection adds — a pod carrying it in containers OR
@@ -21,3 +23,25 @@ const (
 	// can never impersonate the health signal.
 	LinkerdInjectorWebhook = "linkerd-proxy-injector.linkerd.io"
 )
+
+// PodIsMeshed reports whether the pod spec carries the linkerd-proxy
+// in containers OR initContainers. Linkerd >=1.12 native sidecars
+// inject the proxy as an init container (the kernel keeps it running
+// after the container's PID 1 exits), so a Containers-only scan —
+// what PodSpecHasContainer does — misses every natively injected pod.
+// Mesh-membership checks (nethealth linkerd guards, unmeshed
+// auditors) must use this; PodSpecHasContainer stays for
+// patch-eligibility checks that need a real container entry.
+func PodIsMeshed(ps *corev1.PodSpec) bool {
+	for i := range ps.Containers {
+		if ps.Containers[i].Name == LinkerdProxyContainer {
+			return true
+		}
+	}
+	for i := range ps.InitContainers {
+		if ps.InitContainers[i].Name == LinkerdProxyContainer {
+			return true
+		}
+	}
+	return false
+}

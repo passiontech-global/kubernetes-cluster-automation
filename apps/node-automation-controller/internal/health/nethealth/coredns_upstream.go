@@ -8,7 +8,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -167,7 +167,7 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 	for key := range flagged {
 		flaggedKeys = append(flaggedKeys, key)
 	}
-	sort.Strings(flaggedKeys) // deterministic pick for the one-per-cycle heal
+	slices.Sort(flaggedKeys) // deterministic pick for the one-per-cycle heal
 	for _, key := range flaggedKeys {
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
@@ -260,7 +260,7 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 	for key := range flagged {
 		flaggedKeys = append(flaggedKeys, key)
 	}
-	sort.Strings(flaggedKeys) // deterministic pick for the one-per-cycle heal
+	slices.Sort(flaggedKeys) // deterministic pick for the one-per-cycle heal
 	for _, key := range flaggedKeys {
 		detail := flagged[key]
 		parts := strings.SplitN(key, "/", 2)

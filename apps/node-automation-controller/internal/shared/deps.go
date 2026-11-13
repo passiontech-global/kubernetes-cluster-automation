@@ -8,6 +8,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
@@ -70,10 +71,29 @@ type Deps struct {
 	// gate in the process memoizes on (platform/maintenance.Verdict)
 	// — modules and the sweep share it so a drain in flight is
 	// evaluated once per Verdict TTL cluster-wide, not once per
-	// module. Nil (tests, StubManager wiring) leaves each consumer's
-	// own fallback verdict in place.
+	// module. main.go wires it with NodeReader set to the manager's
+	// cached client, so the mutex's node census rides the informer
+	// instead of a direct apiserver LIST per TTL. Nil (tests,
+	// StubManager wiring) leaves each consumer's own fallback verdict
+	// in place.
 	Maintenance *maintenance.Verdict
 	Log         logr.Logger
 	Disabled    bool
 	CheckRegs   []CheckReg
+}
+
+// CachedClient returns the manager's informer-backed read client —
+// the client.Reader every CachedNodeReader/CachedObjectReader seam
+// accepts. A nil Mgr (literally-constructed test Deps, the shape
+// this file documents) returns nil instead of dereferencing: the
+// reader seams treat nil as "no cache wired" and fall back to the
+// direct clientset, so Setup keeps working on fixtures that never
+// built a manager. This is the one sanctioned accessor for the
+// cached read client — a bare d.Mgr.GetClient() skips the guard and
+// panics Setup on exactly those fixtures.
+func (d Deps) CachedClient() client.Client {
+	if d.Mgr == nil {
+		return nil
+	}
+	return d.Mgr.GetClient()
 }

@@ -40,12 +40,30 @@ const maxIndentWidth = 10_000
 // unbounded CPU/memory sink.
 const parseMaxBytes = 4 << 20 // 4 MiB
 
-// floatToInt64 converts only finite, int64-range floats — Go's
+// hexish reports whether s looks like a hex number (0x/0X prefix,
+// after python's sign/whitespace conventions): strconv.ParseFloat
+// accepts "0x1p-2"-style hex floats python's float() rejects, so the
+// |int decimal fallback must skip them.
+func hexish(s string) bool {
+	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(s), "+"), "-"))
+	return len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')
+}
+
+// floatToInt64 converts NaN/±Inf-free floats into int64: Go's
 // int64() on NaN/±Inf or an out-of-range value yields platform
-// garbage (typically MinInt64), which |int must never return:
-// callers fall back to the filter's default instead.
+// garbage (typically MinInt64), which |int must never return.
+// Finite underflow below MinInt64 clamps to MinInt64 (python
+// int(-1e300) is a huge negative int, not a failure); overflow above
+// MaxInt64 and the non-finites report false — callers fall back to
+// the filter's default instead.
 func floatToInt64(f float64) (int64, bool) {
-	if math.IsNaN(f) || math.IsInf(f, 0) || f < math.MinInt64 || f >= math.MaxInt64 {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	if f <= math.MinInt64 {
+		return math.MinInt64, true
+	}
+	if f >= math.MaxInt64 {
 		return 0, false
 	}
 	return int64(f), true
@@ -193,12 +211,22 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			if err == nil {
 				return i, nil
 			}
-			if f, err := strconv.ParseFloat(t, 64); err == nil {
-				// NaN/±Inf/out-of-int64-range floats used to
-				// truncate into platform garbage (usually
-				// MinInt64) — the default is the honest answer.
-				if i, ok := floatToInt64(f); ok {
-					return i, nil
+			// The float fallback is a base-10 decimal convenience:
+			// int("1.5") → 1. With base != 10 (int("1.5", 16) is a
+			// ValueError in python), and never for a hex string —
+			// Go's ParseFloat accepts "0x1p-2"-style hex floats
+			// python's float() rejects, and int("0x10", 16) parses
+			// the digits via ParseInt above anyway.
+			if base == 10 && !hexish(t) {
+				if f, err := strconv.ParseFloat(t, 64); err == nil {
+					// NaN/±Inf/out-of-int64-range floats used to
+					// truncate into platform garbage — the
+					// default is the honest answer for those,
+					// while finite underflow clamps (see
+					// floatToInt64).
+					if i, ok := floatToInt64(f); ok {
+						return i, nil
+					}
 				}
 			}
 		default:

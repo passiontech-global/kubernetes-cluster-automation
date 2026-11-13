@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
@@ -126,7 +127,7 @@ func (c *Client) cliListUnits(ctx context.Context, patterns []string) ([]UnitInf
 			err, strings.TrimSpace(out))
 	}
 	var units []UnitInfo
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -162,6 +163,6 @@ func (c *Client) cliListUnits(ctx context.Context, patterns []string) ([]UnitInf
 // journal means zero hits, and a fetch failure is logged, never
 // fatal).
 func (c *Client) Journal(ctx context.Context, unit, since string) (string, error) {
-	return c.ExecCombined(ctx, "journalctl",
-		"-u", unit, "--since", since, "--no-pager")
+	argv := journalwatch.UnitWindowArgv(unit, since)
+	return c.ExecCombined(ctx, argv[0], argv[1:]...)
 }

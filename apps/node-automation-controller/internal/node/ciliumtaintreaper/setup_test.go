@@ -4,7 +4,6 @@
 package ciliumtaintreaper
 
 import (
-	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -55,7 +54,7 @@ func TestSetupSweepFixedKey(t *testing.T) {
 		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 	defer q.ShutDown()
 	for _, name := range []string{"n1", "n2", "n3"} {
-		h.Create(context.Background(), event.CreateEvent{
+		h.Create(t.Context(), event.CreateEvent{
 			Object: testutil.Node(name, corev1.ConditionTrue, nil)}, q)
 	}
 	if q.Len() != 1 {
@@ -105,9 +104,9 @@ func TestSetupCiliumTaintReaperWatches(t *testing.T) {
 	nq := workqueue.NewTypedRateLimitingQueue(
 		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 	defer nq.ShutDown()
-	nodeH.Create(context.Background(), event.CreateEvent{
+	nodeH.Create(t.Context(), event.CreateEvent{
 		Object: testutil.Node("n1", corev1.ConditionTrue, nil)}, nq)
-	nodeH.Create(context.Background(), event.CreateEvent{
+	nodeH.Create(t.Context(), event.CreateEvent{
 		Object: testutil.Node("n2", corev1.ConditionFalse, nil)}, nq)
 	if nq.Len() != 1 {
 		t.Fatalf("2-node burst enqueued %d requests, want 1 (set-collapse)", nq.Len())
@@ -127,7 +126,7 @@ func TestSetupCiliumTaintReaperWatches(t *testing.T) {
 	// The pod watch enqueues the same fixed sweep key as the Node
 	// watch — the reconcile ignores the request name, so collapsing
 	// pod events onto it keeps one queued item per trigger burst.
-	h.Create(context.Background(), event.CreateEvent{
+	h.Create(t.Context(), event.CreateEvent{
 		Object: ciliumPod("n7", corev1.PodRunning, true)}, q)
 	if q.Len() != 1 {
 		t.Fatalf("pod event enqueued %d requests, want 1", q.Len())
@@ -139,7 +138,7 @@ func TestSetupCiliumTaintReaperWatches(t *testing.T) {
 	q.Done(item)
 
 	// An unscheduled pod (no spec.nodeName) enqueues nothing.
-	h.Create(context.Background(), event.CreateEvent{Object: &corev1.Pod{}}, q)
+	h.Create(t.Context(), event.CreateEvent{Object: &corev1.Pod{}}, q)
 	if q.Len() != 0 {
 		t.Fatalf("nodeless pod enqueued %d requests, want 0", q.Len())
 	}

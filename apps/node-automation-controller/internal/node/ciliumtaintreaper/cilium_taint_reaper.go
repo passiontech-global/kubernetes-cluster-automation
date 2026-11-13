@@ -39,8 +39,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
-const ciliumNotReadyTaint = "node.cilium.io/agent-not-ready"
-
 type ciliumTaintReaper struct {
 	cs kubernetes.Interface
 	// nodeReader is the informer-backed node read — the sweep's
@@ -146,7 +144,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 	// list, the same cost the old per-node lookups had.
 	var tainted []*corev1.Node
 	for i := range nodes {
-		if kube.HasTaint(nodes[i].Spec.Taints, ciliumNotReadyTaint) {
+		if kube.HasTaint(nodes[i].Spec.Taints, kube.TaintCiliumAgentNotReady) {
 			tainted = append(tainted, &nodes[i])
 		}
 	}
@@ -216,11 +214,32 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 			}
 		}
 		if healthy != nil {
+			// Live confirmation before the destructive write: the
+			// cache verdict above rides the informer and can lag the
+			// apiserver (the Node and Pod watches are independent —
+			// a mid-rollout pod replacement lands in one before the
+			// other), so re-GET the agent on the direct clientset
+			// immediately before removing the taint and require the
+			// SAME pod (UID), still non-terminating and still
+			// healthy (ciliumPodHealthy re-checks the termination
+			// timestamp alongside Running+Ready). Any divergence
+			// keeps the taint — the safe direction, and the next
+			// sweep re-evaluates on fresher cache.
+			live, err := r.cs.CoreV1().Pods(healthy.Namespace).
+				Get(ctx, healthy.Name, metav1.GetOptions{})
+			if err != nil || live.UID != healthy.UID || !ciliumPodHealthy(live) {
+				log.Info("SKIP: live agent diverged from cached verdict -> taint kept",
+					"node", node.Name, "pod", healthy.Name,
+					"getErr", err != nil,
+					"uidMatch", err == nil && live.UID == healthy.UID,
+					"healthy", err == nil && ciliumPodHealthy(live))
+				continue
+			}
 			log.Info("REAP: agent healthy but stale taint -> removing",
 				"node", node.Name, "pod", healthy.Name)
-			if err := kube.UntaintNode(ctx, r.cs, node.Name, ciliumNotReadyTaint); err != nil {
+			if err := kube.UntaintNode(ctx, r.cs, node.Name, kube.TaintCiliumAgentNotReady); err != nil {
 				return ctrl.Result{}, fmt.Errorf("remove taint %s on node %s: %w",
-					ciliumNotReadyTaint, node.Name, err)
+					kube.TaintCiliumAgentNotReady, node.Name, err)
 			}
 			reaped++
 		} else {
@@ -242,7 +261,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 func ciliumStaleTaints(n *corev1.Node) []corev1.Taint {
 	var out []corev1.Taint
 	for _, t := range n.Spec.Taints {
-		if t.Key == ciliumNotReadyTaint {
+		if t.Key == kube.TaintCiliumAgentNotReady {
 			out = append(out, t)
 		}
 	}

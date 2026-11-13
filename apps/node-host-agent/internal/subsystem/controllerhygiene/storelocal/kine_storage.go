@@ -250,7 +250,7 @@ var reCheckpointRow = regexp.MustCompile(`^\s*(\d+)\|(\d+)\|(\d+)`)
 // pinning the WAL), so the exit code alone reads a no-op checkpoint
 // as success and the WAL keeps growing behind a "ok" cycle.
 func walCheckpointBusy(out string) bool {
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		if m := reCheckpointRow.FindStringSubmatch(strings.TrimSpace(ln)); m != nil {
 			return m[1] == "1"
 		}
@@ -349,7 +349,7 @@ func sqlite3KineLargeObjects(ctx context.Context, dbPath string) ([]KineLargeObj
 			err, strings.TrimSpace(out))
 	}
 	var rows []KineLargeObject
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
 		}

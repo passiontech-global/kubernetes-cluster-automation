@@ -27,6 +27,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -73,8 +74,12 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 	now := j.now.Now()
 
 	// All lists land before any series is emitted — a failed later
-	// list must not leave the gauge half-populated for an hour.
-	// (The PVC read is the shared per-run census — see pvcCensus.)
+	// list must not leave the gauge half-populated for an hour, so
+	// every census materializes before mark() runs (the PVC read is
+	// the shared per-run census — see pvcCensus). Namespaces list
+	// TYPED and stay full objects: the audit reads .spec.finalizers
+	// — the list the namespace controller actually drains — which
+	// metadata lists do not carry.
 	nss, err := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Namespaces(j.cs))
@@ -85,9 +90,12 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 	if err != nil {
 		return fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
-	vas, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.VolumeAttachments(j.cs))
+	// VolumeAttachments read metadata-only: name, DeletionTimestamp
+	// and finalizers are the audit's entire field set.
+	vas, err := kube.ListPartialOrFallback(ctx, j.meta, j.cs, j.dyn,
+		storagev1.SchemeGroupVersion.WithResource("volumeattachments"),
+		metav1.NamespaceAll,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 	if err != nil {
 		return fmt.Errorf("list volumeattachments: %w", err)
 	}
@@ -172,24 +180,29 @@ type pvcUseProbe struct {
 // pods still reference" pod scan (claimedPVCNames and the
 // unstickPVCProtection probe are identical reads) — the census pays
 // the PVC list once per run and hands both duties one claims map.
-// A nil census (a test driving a single duty) builds a private one —
-// same reads, just unshared.
+// The PVC read is metadata-only (ListPartialOrFallback): every field
+// both duties touch — labels, ownerRefs, finalizers, timestamps,
+// UID, and the ResourceVersion the unstick patch carries — is
+// ObjectMeta, so the census pays PartialObjectMetadata bytes instead
+// of full claim bodies. A nil census (a test driving a single duty)
+// builds a private one — same reads, just unshared.
 type pvcCensus struct {
-	pvcs     []corev1.PersistentVolumeClaim
+	pvcs     []metav1.PartialObjectMetadata
 	pvcsErr  error
 	pvcsSet  bool
 	nsClaims map[string]pvcUseProbe
 }
 
-// listPVCs returns the shared cluster-wide PVC list, listing on first
-// call only.
+// listPVCs returns the shared cluster-wide PVC metadata census,
+// listing on first call only.
 func (c *pvcCensus) listPVCs(ctx context.Context,
-	j *failedJobsJanitor) ([]corev1.PersistentVolumeClaim, error) {
+	j *failedJobsJanitor) ([]metav1.PartialObjectMetadata, error) {
 	if !c.pvcsSet {
 		c.pvcsSet = true
-		c.pvcs, c.pvcsErr = kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.PersistentVolumeClaims(j.cs, metav1.NamespaceAll))
+		c.pvcs, c.pvcsErr = kube.ListPartialOrFallback(ctx, j.meta, j.cs, j.dyn,
+			corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"),
+			metav1.NamespaceAll,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize})
 	}
 	return c.pvcs, c.pvcsErr
 }
@@ -220,7 +233,7 @@ func (c *pvcCensus) claims() map[string]pvcUseProbe {
 // Returns true only when the finalizer patch landed — the caller
 // uses it to skip the stuck gauge for a PVC that is now draining.
 func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
-	pvc *corev1.PersistentVolumeClaim, cache map[string]pvcUseProbe) bool {
+	pvc *metav1.PartialObjectMetadata, cache map[string]pvcUseProbe) bool {
 	log := logf.FromContext(ctx)
 	pr, ok := cache[pvc.Namespace]
 	if !ok {

@@ -21,6 +21,7 @@ package nodecond
 
 import (
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -307,6 +308,7 @@ type CoordVerdict struct {
 // hatch). ok=false on absent/empty/unparseable input: callers treat
 // a stamp they cannot read as no stamp at all, never as now.
 func ParseAnnoTime(raw string) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return time.Time{}, false
 	}
@@ -316,7 +318,12 @@ func ParseAnnoTime(raw string) (time.Time, bool) {
 	if t, err := time.Parse(time.RFC3339, raw); err == nil {
 		return t, true
 	}
-	if ts, err := strconv.ParseInt(raw, 10, 64); err == nil {
+	// Bare unix seconds — but only a plausible epoch: a stamp past
+	// 2100 is almost certainly misspelled (e.g. milliseconds pasted
+	// as seconds, which once locked maintenance until year 57836),
+	// and a non-positive value is never a real stamp.
+	if ts, err := strconv.ParseInt(raw, 10, 64); err == nil &&
+		ts > 0 && ts <= 4102444800 {
 		return time.Unix(ts, 0), true
 	}
 	return time.Time{}, false

@@ -56,7 +56,7 @@ func fluentBitDS(generation, observed int64, desired, updated int32) *appsv1.Dae
 
 func getPipelineSecret(t *testing.T, cs *fake.Clientset) *corev1.Secret {
 	t.Helper()
-	s, err := cs.CoreV1().Secrets(fluentNS).Get(context.Background(), pipelineName, metav1.GetOptions{})
+	s, err := cs.CoreV1().Secrets(fluentNS).Get(t.Context(), pipelineName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get secret: %v", err)
 	}
@@ -65,7 +65,7 @@ func getPipelineSecret(t *testing.T, cs *fake.Clientset) *corev1.Secret {
 
 func getFluentBitDS(t *testing.T, cs *fake.Clientset) *appsv1.DaemonSet {
 	t.Helper()
-	ds, err := cs.AppsV1().DaemonSets(fluentNS).Get(context.Background(), "fluent-bit", metav1.GetOptions{})
+	ds, err := cs.AppsV1().DaemonSets(fluentNS).Get(t.Context(), "fluent-bit", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get daemonset: %v", err)
 	}
@@ -91,7 +91,7 @@ func rolledHash(s *corev1.Secret) string {
 func TestFluentBitRollerSecretAbsent(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	r := newRoller(cs)
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestFluentBitRollerNoDrift(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
@@ -137,7 +137,7 @@ func TestFluentBitRollerRollsOnDrift(t *testing.T) {
 				testutil.Node("n2", corev1.ConditionTrue, nil),
 				fluentBitDS(2, 2, 3, 3))
 			r := newRoller(cs)
-			res, err := r.Reconcile(context.Background(), reconcile.Request{})
+			res, err := r.Reconcile(t.Context(), reconcile.Request{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -180,7 +180,7 @@ func TestFluentBitRollerSkipsOnNotReadyNode(t *testing.T) {
 		testutil.Node("n2", corev1.ConditionFalse, nil),
 		fluentBitDS(2, 2, 3, 3))
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
@@ -218,7 +218,7 @@ func TestFluentBitRollerSkipsDuringMaintenance(t *testing.T) {
 		cordonedRollerNode("n1"),
 		fluentBitDS(2, 2, 3, 3))
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
@@ -241,7 +241,7 @@ func TestFluentBitRollerSkipsWhileDSUnsettled(t *testing.T) {
 				testutil.Node("n1", corev1.ConditionTrue, nil),
 				ds)
 			r := newRoller(cs)
-			if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+			if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 				t.Fatal(err)
 			}
 			if got := dsRestartedAt(getFluentBitDS(t, cs)); got != "" {
@@ -268,7 +268,7 @@ func TestFluentBitRollerResourceVersionFallback(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
@@ -295,7 +295,7 @@ func TestFluentBitRollerFallbackNoReroll(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil),
 		fluentBitDS(2, 2, 3, 3))
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
@@ -310,7 +310,7 @@ func TestFluentBitRollerFallbackNoReroll(t *testing.T) {
 	if patches != 1 {
 		t.Fatalf("daemonset patch count = %d, want 1", patches)
 	}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	patches = 0
@@ -338,7 +338,7 @@ func TestFluentBitRollerFleetAlreadyRolledStampsSecretOnly(t *testing.T) {
 		ds)
 	r := newRoller(cs)
 	before := len(cs.Actions())
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	var dsPatches, secretPatches int
@@ -376,13 +376,13 @@ func TestFluentBitRollerStampFailureDoesNotReroll(t *testing.T) {
 	r := newRoller(cs)
 	// Sweep 1: healthy roll — the restart patch embeds h1 on the pod
 	// template and the stamp lands.
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	// Fluent-operator regenerates the config mid-incident: fresh drift.
 	sec := getPipelineSecret(t, cs)
 	sec.Annotations[kube.AnnoFluentConfigHash] = "h2"
-	if _, err := cs.CoreV1().Secrets(fluentNS).Update(context.Background(), sec,
+	if _, err := cs.CoreV1().Secrets(fluentNS).Update(t.Context(), sec,
 		metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestFluentBitRollerStampFailureDoesNotReroll(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("secrets is forbidden")
 		})
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected the failing stamp to error the reconcile")
 	}
 	if got := getFluentBitDS(t, cs).Spec.Template.Annotations[kube.AnnoRolledConfigHash]; got != "h2" {
@@ -400,7 +400,7 @@ func TestFluentBitRollerStampFailureDoesNotReroll(t *testing.T) {
 	// Sweep 3 (and every sweep after): the DS already carries h2 —
 	// stamp-only, the fleet stays untouched.
 	before := len(cs.Actions())
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected the still-failing stamp to error again")
 	}
 	var dsPatches, stampAttempts int
@@ -452,7 +452,7 @@ func TestFluentBitRollerSecretGetError(t *testing.T) {
 			return true, nil, errors.New("etcd wedged")
 		})
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the secret get fails")
 	}
 }
@@ -465,7 +465,7 @@ func TestFluentBitRollerNodeListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -478,7 +478,7 @@ func TestFluentBitRollerDSGetError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the daemonset get fails")
 	}
 }
@@ -493,7 +493,7 @@ func TestFluentBitRollerRestartPatchErrorKeepsDriftMarker(t *testing.T) {
 			return true, nil, errors.New("patch rejected")
 		})
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the restart patch fails")
 	}
 	if got := rolledHash(getPipelineSecret(t, cs)); got != "" {
@@ -511,7 +511,7 @@ func TestFluentBitRollerStatePatchError(t *testing.T) {
 			return true, nil, errors.New("secret patch rejected")
 		})
 	r := newRoller(cs)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the state patch fails")
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {
@@ -571,7 +571,7 @@ func TestFluentBitRollerCachedDriftConfirmSkipsSettled(t *testing.T) {
 	r := newRoller(cs)
 	r.secretReader = &cacheReader{sec: stale}
 	r.now = func() time.Time { return now }
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -593,7 +593,7 @@ func TestFluentBitRollerCachedDriftConfirmRolls(t *testing.T) {
 	r := newRoller(cs)
 	r.secretReader = &cacheReader{sec: stale}
 	r.now = func() time.Time { return now }
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if got := dsRestartedAt(getFluentBitDS(t, cs)); got == "" {

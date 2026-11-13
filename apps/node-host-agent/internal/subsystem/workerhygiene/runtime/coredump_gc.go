@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -83,7 +83,7 @@ func (c *CoredumpGCCheck) coredumpGC() {
 	}
 	// Oldest first — a capped sweep drains the oldest evidence
 	// deterministically instead of ReadDir-order.
-	sort.Slice(stale, func(i, j int) bool { return stale[i].mod.Before(stale[j].mod) })
+	slices.SortFunc(stale, func(a, b coreFile) int { return a.mod.Compare(b.mod) })
 	removed := 0
 	for _, f := range stale {
 		if removed >= coredumpSweepMax {

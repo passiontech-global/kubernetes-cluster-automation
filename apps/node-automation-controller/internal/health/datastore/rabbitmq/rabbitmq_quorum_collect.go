@@ -46,7 +46,7 @@ func collectRabbitCensus(ctx context.Context, d *probefw.Deps,
 		return nil, err
 	}
 	crs, err := d.AllUnstructured(ctx, kube.GVRRabbitMQCluster)
-	downscaled, err := downscaledClusterCRs(crs, err)
+	downscaled, err := kube.DownscaledClusterCRs(crs, err)
 	if err != nil {
 		log.Info("WARN: list rabbitmqclusters failed — downscaler awareness off",
 			"error", err)
@@ -60,7 +60,7 @@ func collectRabbitCensus(ctx context.Context, d *probefw.Deps,
 	for i := range pods {
 		pod := &pods[i]
 		if !isRabbitMQPod(pod) ||
-			downscaledMemberPod(pod.Namespace, pod.Name, downscaled) {
+			kube.DownscaledMemberPod(pod.Namespace, pod.Name, downscaled) {
 			continue
 		}
 		c.byName[pod.Namespace+"/"+pod.Name] = pod
@@ -157,7 +157,7 @@ func rabbitAlarmFindings(ctx context.Context, d *probefw.Deps,
 				continue
 			}
 			if podName != "" &&
-				downscaledMemberPod(ns, podName, c.downscaled) {
+				kube.DownscaledMemberPod(ns, podName, c.downscaled) {
 				continue // parked cluster — stale series, not quorum evidence
 			}
 			key := ns + "/" + podName
@@ -218,7 +218,7 @@ func rabbitLeaderlessFindings(ctx context.Context, d *probefw.Deps,
 		if sumByPod[ns+"/"+podName] != 0 {
 			continue // at least one queue leadership role held — healthy
 		}
-		if downscaledMemberPod(ns, podName, c.downscaled) {
+		if kube.DownscaledMemberPod(ns, podName, c.downscaled) {
 			continue // parked cluster — stale series, not quorum evidence
 		}
 		key := ns + "/" + podName
@@ -289,7 +289,7 @@ func rabbitSkewFindings(ctx context.Context, d *probefw.Deps,
 		if maxTermByCluster[ck]-s.Value < 2 {
 			continue
 		}
-		if downscaledMemberPod(ns, podName, c.downscaled) {
+		if kube.DownscaledMemberPod(ns, podName, c.downscaled) {
 			continue
 		}
 		key := ns + "/" + podName

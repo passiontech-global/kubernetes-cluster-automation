@@ -14,7 +14,7 @@ package gitops
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -254,7 +254,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		if len(reasons) == 0 {
 			continue
 		}
-		sort.Strings(reasons)
+		slices.Sort(reasons)
 		reason := strings.Join(reasons, "+")
 		rep.Emit(argoCDAppStuckGauge, ns+"/"+name+"/"+reason,
 			[]string{ns, name, reason},

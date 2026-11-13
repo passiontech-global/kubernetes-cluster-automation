@@ -19,7 +19,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/crypto/ssh"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -115,17 +114,15 @@ type scriptedWatcher struct{ n atomic.Int32 }
 
 func (w *scriptedWatcher) Changed() bool { return w.n.Add(1) == 2 }
 
-// waitDials polls the fake dialer until at least one dial lands.
+// waitDials waits on the fake dialer's dial-notification channel
+// until at least one dial lands.
 func waitDials(t *testing.T, d *fakeDialer) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(d.dials()) > 0 {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
+	select {
+	case <-d.dialCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no dials within deadline: %v", d.dials())
 	}
-	t.Fatalf("no dials within deadline: %v", d.dials())
 }
 
 // TestRunSyncTickerDrivesCycle: with the lease held and the
@@ -210,8 +207,7 @@ func TestLeaseLoopRecoversPanic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	done := make(chan struct{})
 	go func() { defer close(done); s.leaseLoop(ctx) }()
 	select {
@@ -235,20 +231,20 @@ func TestLeaseLoopDropsFullCycleSignal(t *testing.T) {
 	s.cfg.RenewInterval = cfg.RenewInterval
 	s.cycleCh <- struct{}{} // fill the 1-slot buffer
 
+	// The first iteration renews (creating the lease) and hits the
+	// drop branch — the create reactor's signal proves the lease
+	// exists, so no polling on the fake clientset. The reactor arms
+	// BEFORE the loop starts: PrependReactor is not synchronized
+	// against concurrent fake-clientset calls.
+	created := leaseTouchCh(cs, "create")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); s.leaseLoop(ctx) }()
 
-	// The first iteration renews (creating the lease) and hits the
-	// drop branch — poll for the created lease, then stop the loop.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		_, err := cs.CoordinationV1().Leases("node-ops").
-			Get(ctx, "node-host-agent-hubsync", metav1.GetOptions{})
-		if err == nil {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
+	select {
+	case <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leaseLoop never created the lease")
 	}
 	cancel()
 	select {

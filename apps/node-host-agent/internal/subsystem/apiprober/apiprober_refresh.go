@@ -7,6 +7,7 @@
 package apiprober
 
 import (
+	"net/http"
 	"os"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
@@ -101,17 +102,48 @@ func (p *Prober) refreshClient() {
 	}
 	cl, key, err := caClient(p.eff.caFile)
 	if err != nil {
+		if p.client == nil {
+			// Lazy build still failing — the CA has not landed yet
+			// (hostconfig renders guard.conf after agent start).
+			// Warn and retry next cycle; probes in between report
+			// probe-side errors.
+			logger().Warn("apiprober: CA load failed — no probe client yet",
+				"ca", p.eff.caFile, "error", err)
+			return
+		}
 		logger().Error("apiprober: CA load failed — keeping previous TLS client",
 			"ca", p.eff.caFile, "error", err)
 		return
 	}
 	p.caStat = statKey
 	if key != p.caKey {
-		p.client.CloseIdleConnections() // drop the rotated client's pool
+		if p.client != nil {
+			p.client.CloseIdleConnections() // drop the rotated client's pool
+		}
 		p.client, p.caKey = cl, key
-		logger().Info("apiprober: rebuilt TLS client — effective CA changed",
+		logger().Info("apiprober: built TLS client — effective CA loaded",
 			"ca", p.eff.caFile)
 	}
+}
+
+// probeClient returns the probe HTTP client, building it on first
+// use — refreshClient runs per Cycle, but a probe issued before the
+// CA exists (or with the stat-gate deciding the bundle is unchanged
+// while the client was never built) must not nil-pointer. A CA-load
+// failure here classifies probe-side (TLS trust) — it is never
+// apiserver evidence.
+func (p *Prober) probeClient() (*http.Client, error) {
+	if p.client != nil {
+		return p.client, nil
+	}
+	cl, key, err := caClient(p.eff.caFile)
+	if err != nil {
+		return nil, err
+	}
+	p.client, p.caKey = cl, key
+	logger().Info("apiprober: TLS client built on first probe — CA landed",
+		"ca", p.eff.caFile)
+	return p.client, nil
 }
 
 func firstNonEmpty(a, b string) string {

@@ -284,7 +284,15 @@ func TestEnforcePermsUnreadable(t *testing.T) {
 
 	p := ccPruner(t, nil)
 	p.enforcePerms(sc, logger()) // must not panic; sc itself is chmod'd
-	if fi, err := os.Stat(sc); err != nil || fi.Mode().Perm() != 0o777 {
-		t.Fatalf("sc perm = %v — root-level invariant not enforced", fi)
+	// The fd-based pass opens sc O_NOFOLLOW before fchmod — as root
+	// (production) the open succeeds and the invariant lands; an
+	// unprivileged run cannot open a 0000 dir at all and the pass
+	// degrades to the Debug-logged skip (never a panic).
+	if os.Geteuid() == 0 {
+		if fi, err := os.Stat(sc); err != nil || fi.Mode().Perm() != 0o777 {
+			t.Fatalf("sc perm = %v — root-level invariant not enforced", fi)
+		}
+	} else if fi, err := os.Stat(sc); err != nil || fi.Mode().Perm() != 0o000 {
+		t.Fatalf("sc perm = %v — unprivileged run should leave it alone", fi)
 	}
 }

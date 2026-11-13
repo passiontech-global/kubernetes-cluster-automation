@@ -38,6 +38,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Cache Go module + build caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('mise.toml', '**/go.mod', '**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-
+
+      # .moon/cache holds moon's task cache + the per-project
+      # golangci-lint caches (content-addressed, safe to share across
+      # runs). Rolling restore-key: restore the freshest cache, save a
+      # new entry per run — LRU eviction caps growth.
+      - name: Cache moon workspace cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .moon/cache
+          key: moon-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: moon-${{ runner.os }}-
+
       - name: Check go.work is in sync
         # Nothing else guards go.work: every CI go build runs GOWORK=off
         # (deps resolve per-module), so a stale workspace file never
@@ -95,21 +115,46 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Cache Go module + build caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('mise.toml', '**/go.mod', '**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-
+
+      # Same rolling-key scheme as the PR job above.
+      - name: Cache moon workspace cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .moon/cache
+          key: moon-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: moon-${{ runner.os }}-
+
       - name: Check go.work is in sync
         run: |
           env -u GOWORK go work sync
           git diff --exit-code -- go.work go.work.sum
 
       - name: Lint and vet main
-        run: moon run :format :vet :lint :lint-dockerfile :test :build
+        run: moon run :format :vet :lint :lint-dockerfile
+
+      # App :test/:build runs live in the release workflows (and the PR
+      # job's affected-only `moon ci`); without this step a main push
+      # touching only the leaf libs would never run their test suites.
+      - name: Test leaf libs
+        run: moon run hostkit:test jinja:test
 
   # Build every app image WITHOUT pushing. The release workflows only
   # fire on app-path changes, so nothing else exercises the Dockerfiles
   # (or the root .dockerignore they depend on) before merge. Mirrors the
-  # release path exactly: root build context, buildkit (the runner
-  # default; the RUN --mount=type=cache layers require it), module mode
-  # (go.work is dockerignored). No registry login — nothing is pushed;
-  # main-push coverage comes from the release builds themselves.
+  # release path: root build context, buildx/buildkit (the RUN
+  # --mount=type=cache layers require it), module mode (go.work is
+  # dockerignored). No registry login — nothing is pushed; main-push
+  # coverage comes from the release builds themselves. GHA registry
+  # cache keeps a cold Dockerfile from rebuilding every Go layer on
+  # each PR, scoped per app so matrix legs never poison each other.
   docker-build:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -121,7 +166,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
       - name: Build image (no push)
-        env:
-          APP: ${{ matrix.app }}
-        run: docker build -t "kca-$APP:ci" -f "apps/$APP/Dockerfile" .
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: apps/${{ matrix.app }}/Dockerfile
+          push: false
+          tags: kca-${{ matrix.app }}:ci
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,scope=${{ matrix.app }},mode=max

@@ -13,7 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -82,23 +82,32 @@ func (w *DirWatcher) fingerprint() string {
 					"dir", d, "path", p, "error", err)
 				return nil
 			}
-			if e.IsDir() {
-				return nil
-			}
 			// Kubelet's ConfigMap/Secret volume mounts materialize as
 			// dot-prefixed entries — the `..data` symlink and its
 			// `..2026_*` timestamped target dirs. They are mount
 			// plumbing, not watched content: hashing them both
 			// churns the fingerprint on every sync and follows the
 			// symlink into a directory readFile can never serve.
-			if strings.HasPrefix(e.Name(), ".") {
+			// A dot-PREFIXED DIRECTORY is pruned wholesale
+			// (filepath.SkipDir — descending would hash the rotated
+			// timestamp dir's files and re-trigger every watched
+			// group on each kubelet symlink rotation); a dot-named
+			// file is just skipped. The root itself is exempt — a
+			// deliberately dot-named watched dir must stay watchable.
+			if p != d && strings.HasPrefix(e.Name(), ".") {
+				if e.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if e.IsDir() {
 				return nil
 			}
 			files = append(files, p)
 			return nil
 		})
 	}
-	sort.Strings(files)
+	slices.Sort(files)
 	w.fpMu.Lock()
 	defer w.fpMu.Unlock()
 	next := make(map[string]dirWatchFile, len(files))

@@ -3,7 +3,7 @@
 // plus the human-readable DRIFT / REMOVED-FLAG report and the 0/1
 // exit mapping.
 //
-// The scan itself is hostmetrics.ScanK0sDrift — the same
+// The scan itself is k0sconfig.ScanK0sDrift — the same
 // removed-flag / extra-key / missing-key findings the
 // node_k0s_config_drift collector exports, computed on THIS node's
 // /etc/k0s/k0s.yaml. Exit 0 clean (or not a k0s controller), 1 on
@@ -21,8 +21,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/ops/opsx"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
 )
 
 // Cmd is the `check-k0s-drift` subcommand entrypoint: flag parsing +
@@ -55,7 +55,7 @@ func Cmd(ctx context.Context, args []string) int {
 	if provided["removed-flags"] {
 		rem = splitCSV(*removed)
 	}
-	return runCheck(ctx, hostmetrics.K0sDriftConfig{
+	return runCheck(ctx, k0sconfig.K0sDriftConfig{
 		ConfigFile:   *config,
 		UnitFile:     *unit,
 		ExpectedKeys: exp,
@@ -67,7 +67,7 @@ func Cmd(ctx context.Context, args []string) int {
 // REMOVED-FLAG line per finding in the shell script's phrasing.
 // Returns the process exit code: 0 when clean (or the node is not a
 // k0s controller), 1 on any drift.
-func runCheck(ctx context.Context, cfg hostmetrics.K0sDriftConfig,
+func runCheck(ctx context.Context, cfg k0sconfig.K0sDriftConfig,
 	out io.Writer) int {
 	// The scan itself is a fast file read — honoring the signal ctx
 	// is an upfront cancellation gate.
@@ -75,7 +75,7 @@ func runCheck(ctx context.Context, cfg hostmetrics.K0sDriftConfig,
 		fmt.Fprintln(os.Stderr, "check-k0s-drift:", err)
 		return opsx.ExitRuntime
 	}
-	scan := hostmetrics.ScanK0sDrift(cfg)
+	scan := k0sconfig.ScanK0sDrift(cfg)
 	cfg = scan.Config // print the normalized (defaults-applied) paths
 	if scan.NotController {
 		_, _ = fmt.Fprintf(out, "check-k0s-drift: %s absent — "+
@@ -135,7 +135,7 @@ func runCheck(ctx context.Context, cfg hostmetrics.K0sDriftConfig,
 // "flag provided empty" (empty set honored).
 func splitCSV(s string) []string {
 	out := []string{}
-	for _, p := range strings.Split(s, ",") {
+	for p := range strings.SplitSeq(s, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}

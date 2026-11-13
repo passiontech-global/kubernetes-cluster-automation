@@ -56,7 +56,7 @@ func (p *Prober) discover(ctx context.Context) ([]backend, error) {
 	}
 	var header map[string]int
 	var backends []backend
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if line == "" {
 			continue

@@ -60,7 +60,7 @@ func repackBinPath(ctx context.Context, d *kdeps.Deps, pg string) (string, error
 			continue
 		}
 		listed++
-		for _, e := range strings.Split(out, "\n") {
+		for e := range strings.SplitSeq(out, "\n") {
 			e = strings.TrimSpace(e)
 			if e == "" || (root.prefix != "" && !strings.HasPrefix(e, root.prefix)) {
 				continue
@@ -143,7 +143,7 @@ func (m *Maint) repackHeadroom(ctx context.Context, pg, user, pass string,
 	}
 	// df --output=avail prints a header line then the number.
 	var lastLine string
-	for _, l := range strings.Split(strings.TrimSpace(df), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(df), "\n") {
 		lastLine = strings.TrimSpace(l)
 	}
 	free, err = strconv.ParseInt(lastLine, 10, 64)

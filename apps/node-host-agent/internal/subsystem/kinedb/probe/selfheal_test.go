@@ -377,14 +377,17 @@ func TestReapStuckSessionsQueryFail(t *testing.T) {
 
 // The terminate path counts one 't' per killed backend — including
 // the single-trailing-'t' reply where the text ends without a
-// newline (boolToInt's reason to exist).
+// newline, and NOT double-counting a lone "t\n" (the old
+// "count t\n + bare-t fallback" bug).
 func TestReapStuckSessionsTerminateCounts(t *testing.T) {
 	for _, tc := range []struct {
 		out  string
 		want int64
 	}{
 		{"t\nt\nt\n", 3},
-		{"t", 1}, // single backend, -tA no trailing newline
+		{"t", 1},   // single backend, -tA no trailing newline
+		{"t\n", 1}, // single backend with trailing newline — was 2
+		{"", 0},
 	} {
 		k, fr, _ := fixture(t, []testutil.ExecRule{
 			{Substr: "pg_terminate_backend", Out: tc.out},
@@ -395,13 +398,14 @@ func TestReapStuckSessionsTerminateCounts(t *testing.T) {
 		if got := k.d.M.IdleTermTotal; got != tc.want {
 			t.Fatalf("out=%q total=%d want %d", tc.out, got, tc.want)
 		}
-		if len(notes) != 1 || !strings.Contains(notes[0], "reaped") {
+		if tc.want > 0 &&
+			(len(notes) != 1 || !strings.Contains(notes[0], "reaped")) {
 			t.Fatalf("out=%q notes=%v", tc.out, notes)
 		}
+		if tc.want == 0 && len(notes) != 0 {
+			t.Fatalf("out=%q notes=%v — want silent zero", tc.out, notes)
+		}
 		_ = fr
-	}
-	if boolToInt(true) != 1 || boolToInt(false) != 0 {
-		t.Fatal("boolToInt broken")
 	}
 }
 

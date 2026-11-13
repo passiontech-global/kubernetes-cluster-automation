@@ -68,10 +68,12 @@ type TempEtcd interface {
 }
 
 // TempEtcdStarter spawns `<k0s>/bin/etcd` with the captured live
-// flags, redirecting output to logPath — the script's
-// `/var/lib/k0s/bin/etcd "${FLAGS[@]}" >/tmp/etcd-standalone.log 2>&1 &`.
+// flags, redirecting output to a fresh O_EXCL 0600 log inside a
+// 0700 dir created under logParent — the hardened stand-in for the
+// script's `>/tmp/etcd-standalone.log` (a predictable shared-/tmp
+// name is a symlink/FIFO plant and fs.protected_regular=2 target).
 type TempEtcdStarter func(ctx context.Context, bin string,
-	args []string, logPath string) (TempEtcd, error)
+	args []string, logParent string) (TempEtcd, error)
 
 // Config carries the rescue inputs — every field test-injectable.
 type Config struct {

@@ -130,7 +130,11 @@ type wireReport struct {
 // --standalone CLI switch; the NODE_HOST_AGENT_STANDALONE env is
 // OR-ed in so either spelling selects standalone mode — it is NOT a
 // Config field because agent.Config is also the runtime's contract.
-func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wireReport) {
+// The returned *systemd.Client belongs to the CALLER's lifetime —
+// main defers Close for the whole daemon run (a defer here would
+// close the client the moment wiring returned, before any subsystem
+// ever ran a systemctl).
+func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wireReport, *systemd.Client) {
 
 	// Standalone = on-host systemd mode (API LB VMs, interdc hubs,
 	// the kine DB VM): the enable-set inverts — every subsystem
@@ -168,7 +172,6 @@ func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wire
 	// argv prefix the exec wrappers used to pay a fork for.
 	sdClient := systemd.New(systemd.Config{HostRoot: hostRoot,
 		ScrubSystemdEnv: true})
-	defer sdClient.Close()
 
 	// One clientset for the whole process: each NewForConfig builds
 	// its own http.Transport + TLS pool, so sweeper, workerhygiene
@@ -250,7 +253,7 @@ func buildAgentConfig(cfg agent.Config, standaloneFlag bool) (agent.Config, wire
 
 	cfg.Registry = reg
 	cfg.Subsystems = w.subsystems
-	return cfg, report
+	return cfg, report, sdClient
 }
 
 func main() {
@@ -303,7 +306,7 @@ func main() {
 	podName := envx.String("POD_NAME", "")
 	namespace := envx.String("POD_NAMESPACE", "")
 
-	cfg, report := buildAgentConfig(agent.Config{
+	cfg, report, sdClient := buildAgentConfig(agent.Config{
 		NodeName:    nodeName,
 		PodName:     podName,
 		Namespace:   namespace,
@@ -312,6 +315,11 @@ func main() {
 		ProbeAddr:   probeAddr,
 		PprofAddr:   pprofAddr,
 	}, standaloneFlag)
+	// Daemon-lifetime Close: the systemd client backs every
+	// subsystem's unit actions for as long as the agent runs, so the
+	// D-Bus connection is torn down only when Run returns (the old
+	// buildAgentConfig-scoped defer closed it before the first cycle).
+	defer sdClient.Close()
 	a := agent.New(cfg)
 
 	// The enabled set is an operator's first question when a check

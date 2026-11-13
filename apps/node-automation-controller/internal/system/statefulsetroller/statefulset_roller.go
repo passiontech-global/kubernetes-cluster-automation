@@ -130,7 +130,7 @@ func Setup(d shared.Deps) error {
 		prom := newDragonflyPromSeam()
 		r := &statefulSetOnDeleteRoller{
 			verdict: d.Maintenance, cs: d.CS, dyn: d.Dyn, queue: d.Name,
-			nodeReader: d.Mgr.GetClient(), now: shared.SystemClock, prom: prom}
+			nodeReader: d.CachedClient(), now: shared.SystemClock, prom: prom}
 		// Surface the gate's wiring once at registration — an inert
 		// gate (no endpoint) must be visible to the operator.
 		logf.Log.WithName(d.Name).Info("registered",
@@ -142,52 +142,60 @@ func Setup(d shared.Deps) error {
 func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	// Page the cluster-wide list — an unbounded List forces etcd to
-	// serialize every StatefulSet into one response; 500-per-page
-	// keeps each request cheap at fleet scale.
-	stsItems, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.StatefulSets(r.cs, metav1.NamespaceAll))
-	if err != nil {
-		return fmt.Errorf("list statefulsets: %w", err)
-	}
-
+	// Page the cluster-wide list and keep ONLY the due candidates:
+	// the drift filter needs spec/status (metadata lists cannot serve
+	// it), but everything else — spec, status, annotations — is dead
+	// weight for the ~99% of StatefulSets not opted in or not
+	// drifting, so each page's objects die with the page and the
+	// sweep retains full objects only for the handful it may roll.
+	// An unbounded List forces etcd to serialize every StatefulSet
+	// into one response; 500-per-page keeps each request cheap at
+	// fleet scale.
 	now := r.now.Now()
+	// The ledger key carries the updateRevision: a new revision
+	// mid-window lands on a FRESH key, so Observe opens a new
+	// continuity window and the 30m settle clock restarts — drift
+	// elapsed on the old template says nothing about how long the
+	// new one has been drifting. The stale old-revision key falls
+	// out of driftSince via the prune below.
+	type candidate struct {
+		sts appsv1.StatefulSet // full object, due candidates only
+		key string
+	}
+	var due []candidate
 	// drifting collects the "ns/name" keys whose revision drift held
 	// THIS cycle — the prune pass below treats anything else in
 	// driftSince as settled, gone, or de-opted.
 	drifting := map[string]bool{}
-	type candidate struct {
-		idx int
-		key string
-	}
-	var due []candidate
-	for i := range stsItems {
-		sts := &stsItems[i]
-		// The ledger key carries the updateRevision: a new revision
-		// mid-window lands on a FRESH key, so Observe opens a new
-		// continuity window and the 30m settle clock restarts —
-		// drift elapsed on the old template says nothing about how
-		// long the new one has been drifting. The stale old-revision
-		// key falls out of driftSince via the prune below.
-		key := sts.Namespace + "/" + sts.Name + "@" + sts.Status.UpdateRevision
-		if sts.Spec.UpdateStrategy.Type != "OnDelete" ||
-			!stsAutoRollOptedIn(sts) ||
-			sts.Status.UpdateRevision == "" ||
-			sts.Status.UpdateRevision == sts.Status.CurrentRevision {
-			continue // not opted in, not OnDelete, or no drift
-		}
-		drifting[key] = true
-		first, tracked := r.driftSince.Observe(key, now)
-		if !tracked {
-			// First sighting — the ledger just opened the
-			// continuity window; the roller waits out the full
-			// 30m before acting.
-			continue
-		}
-		if now.Sub(first) >= stsOnDeleteDriftMin {
-			due = append(due, candidate{idx: i, key: key})
-		}
+	err := kube.ListEach(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.StatefulSets(r.cs, metav1.NamespaceAll),
+		func(page []appsv1.StatefulSet) error {
+			for i := range page {
+				sts := &page[i]
+				key := sts.Namespace + "/" + sts.Name + "@" + sts.Status.UpdateRevision
+				if sts.Spec.UpdateStrategy.Type != "OnDelete" ||
+					!stsAutoRollOptedIn(sts) ||
+					sts.Status.UpdateRevision == "" ||
+					sts.Status.UpdateRevision == sts.Status.CurrentRevision {
+					continue // not opted in, not OnDelete, or no drift
+				}
+				drifting[key] = true
+				first, tracked := r.driftSince.Observe(key, now)
+				if !tracked {
+					// First sighting — the ledger just opened the
+					// continuity window; the roller waits out the full
+					// 30m before acting.
+					continue
+				}
+				if now.Sub(first) >= stsOnDeleteDriftMin {
+					due = append(due, candidate{sts: *sts, key: key})
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return fmt.Errorf("list statefulsets: %w", err)
 	}
 	r.driftSince.Prune(func(k string) bool { return drifting[k] })
 	if len(due) == 0 {
@@ -217,7 +225,7 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 
 	rolled := 0
 	for _, d := range due {
-		sts := &stsItems[d.idx]
+		sts := &d.sts
 		didRoll, err := r.rollOne(ctx, sts, now, log)
 		if err != nil {
 			// Per-STS failures must not starve the rest — tolerated
@@ -345,33 +353,48 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 
 	// Gate 2: every PDB in the namespace selecting this pod must
 	// allow a disruption — a 0 means the workload is already at its
-	// floor and eviction would refuse the delete anyway. Paged like
-	// the StatefulSet list above.
-	pdbItems, err := kube.ListAll(ctx,
+	// floor and eviction would refuse the delete anyway. Streamed
+	// pages like the StatefulSet census: only the matching verdicts
+	// (a skip or a block) survive the visit, the PDB bodies die with
+	// their page.
+	blocked := false
+	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.PodDisruptionBudgets(r.cs, sts.Namespace))
+		kube.PodDisruptionBudgets(r.cs, sts.Namespace),
+		func(page []policyv1.PodDisruptionBudget) error {
+			for i := range page {
+				pdb := &page[i]
+				sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+				if err != nil {
+					log.Info("WARN: PDB selector unparseable — treating as matching (fail closed)",
+						"pdb", pdb.Namespace+"/"+pdb.Name, "error", err)
+					sel = labels.Everything()
+				}
+				if !sel.Matches(labels.Set(candidate.Labels)) {
+					continue
+				}
+				if pdb.Status.DisruptionsAllowed < 1 {
+					// blocked sticky-fails the gate; the log keeps the
+					// legacy first-match-only shape (the old loop
+					// returned at the first blocking PDB).
+					if !blocked {
+						log.Info("skip: matching PDB allows no disruption",
+							"statefulset", sts.Namespace+"/"+sts.Name,
+							"pdb", pdb.Name,
+							"disruptionsAllowed", pdb.Status.DisruptionsAllowed)
+						blocked = true
+					}
+					continue
+				}
+			}
+			return nil
+		})
 	if err != nil {
 		return false, fmt.Errorf("list poddisruptionbudgets in %s (safety gate): %w",
 			sts.Namespace, err)
 	}
-	for i := range pdbItems {
-		pdb := &pdbItems[i]
-		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
-		if err != nil {
-			log.Info("WARN: PDB selector unparseable — treating as matching (fail closed)",
-				"pdb", pdb.Namespace+"/"+pdb.Name, "error", err)
-			sel = labels.Everything()
-		}
-		if !sel.Matches(labels.Set(candidate.Labels)) {
-			continue
-		}
-		if pdb.Status.DisruptionsAllowed < 1 {
-			log.Info("skip: matching PDB allows no disruption",
-				"statefulset", sts.Namespace+"/"+sts.Name,
-				"pdb", pdb.Name,
-				"disruptionsAllowed", pdb.Status.DisruptionsAllowed)
-			return false, nil
-		}
+	if blocked {
+		return false, nil
 	}
 
 	// Maintenance mutex — the cluster-wide cordon/kured/autopilot

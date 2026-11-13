@@ -140,6 +140,66 @@ func (l *lease) renew(ctx context.Context) (bool, time.Time, error) {
 	}
 }
 
+// leaseLoop is the dedicated lease heartbeater (BUG-H3): acquire or
+// renew every RenewInterval on its own goroutine, decoupled from
+// Cycle, so a slow WAN sync can't drop the 60s lease. A fresh hold
+// kicks an immediate converge through cycleCh.
+func (s *Syncer) leaseLoop(ctx context.Context) {
+	defer func() {
+		// Same single-flight reasoning as the feeder panic-recovery
+		// in controllerhygiene — a defect here must not kill the
+		// daemon, and a dead renewer fails safe (the lease lapses
+		// rather than two pods holding it).
+		if r := recover(); r != nil {
+			s.cfg.Log.Error("hubsync: lease loop panicked — heartbeats stop, lease will lapse",
+				"panic", r)
+		}
+	}()
+	for {
+		if s.ensureKey() && s.renewLease(ctx) && s.freshHold() {
+			select {
+			case s.cycleCh <- struct{}{}:
+			default:
+			}
+		}
+		t := time.NewTimer(s.cfg.RenewInterval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// leaseHeld reports whether we still own the converge singleton —
+// the flag must be set AND the claim must not have lapsed. The
+// expiry half is what actually prevents split-brain: `held` is only
+// refreshed by renewLease, so a stalled renewer (dead apiserver conn
+// before the op timeouts, a panicked loop) leaves it true forever —
+// while the real Lease lapses and a second pod takes over. Cycle
+// re-checks this before EVERY target, not just at cycle start.
+func (s *Syncer) leaseHeld() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.held && s.cfg.Clock.Now().Before(s.leaseExpiresAt)
+}
+
+// freshHold reports whether the lease is held but no cycle ran yet
+// since acquisition — the "converge immediately" trigger.
+func (s *Syncer) freshHold() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.held && !s.syncedWhileHeld
+}
+
+// markSynced records that a cycle ran while holding the lease.
+func (s *Syncer) markSynced() {
+	s.mu.Lock()
+	s.syncedWhileHeld = true
+	s.mu.Unlock()
+}
+
 // renewLease wraps lease.renew: keeps s.held state + the claim's
 // expiry, clears the synced-once latch on loss, logs transient errors.
 func (s *Syncer) renewLease(ctx context.Context) bool {

@@ -57,6 +57,47 @@ func TestCoreDNSPanics(t *testing.T) {
 		}
 	})
 
+	t.Run("scrape timestamp is not the count", func(t *testing.T) {
+		// OpenMetrics lines can carry a trailing timestamp — the
+		// value is always the SECOND field; reading the last field
+		// mistook the timestamp for the panic count.
+		w, _ := newWatchdog(200,
+			"coredns_panics_total 5 1731450000000\ncoredns_panics_total{pod=\"a\"} 2 1731450000000\n", nil)
+		if sum, ok := w.panics(ctx, "10.9.9.9"); !ok || sum != 7 {
+			t.Fatalf("sum=%v ok=%v, want 7/true", sum, ok)
+		}
+	})
+
+	t.Run("prefix-sharing metric names do not count", func(t *testing.T) {
+		// The match must end at a name boundary (' ' or '{') — a
+		// different metric sharing the prefix must contribute zero.
+		w, _ := newWatchdog(200,
+			"coredns_panics_total_something 99\ncoredns_panics_total_b{pod=\"a\"} 1\ncoredns_panics_total 3\n", nil)
+		if sum, ok := w.panics(ctx, "10.9.9.9"); !ok || sum != 3 {
+			t.Fatalf("sum=%v ok=%v, want 3/true", sum, ok)
+		}
+	})
+
+	t.Run("NaN and Inf values are rejected", func(t *testing.T) {
+		w, _ := newWatchdog(200,
+			"coredns_panics_total NaN\ncoredns_panics_total +Inf\ncoredns_panics_total -Inf\ncoredns_panics_total 6\n", nil)
+		if sum, ok := w.panics(ctx, "10.9.9.9"); !ok || sum != 6 {
+			t.Fatalf("sum=%v ok=%v, want 6/true", sum, ok)
+		}
+	})
+
+	t.Run("body over the 4MiB scan cap is invalid not partial", func(t *testing.T) {
+		// A body at the cap ends the scan cleanly at the cut — a
+		// partial document's sum must never read as known (it would
+		// understate panics, the silent-stale direction).
+		filler := strings.Repeat("# padding\n", 100)
+		body := filler + "coredns_panics_total 9\n" + strings.Repeat("x", 5*1024*1024)
+		w, _ := newWatchdog(200, body, nil)
+		if _, ok := w.panics(ctx, "10.9.9.9"); ok {
+			t.Fatal("truncated-over-cap scrape reported a known sum")
+		}
+	})
+
 	t.Run("no panic lines is zero not unknown", func(t *testing.T) {
 		w, _ := newWatchdog(200, "# HELP x\nother_metric 9\n", nil)
 		if sum, ok := w.panics(ctx, "10.9.9.9"); !ok || sum != 0 {

@@ -65,7 +65,7 @@ func (p *Probe) pgbouncerCreds(ctx context.Context, pgb string,
 // is a PREFIX of a longer name (`admin_users_extra`) fails the `=`
 // check and is skipped — both preserved here.
 func iniListValue(ini, key string) string {
-	for _, ln := range strings.Split(ini, "\n") {
+	for ln := range strings.SplitSeq(ini, "\n") {
 		ln = strings.TrimSuffix(ln, "\r")
 		if !strings.HasPrefix(ln, key) {
 			continue
@@ -91,7 +91,7 @@ func iniListValue(ini, key string) string {
 // quoted span yields "".
 func userlistPassword(userlist, user string) string {
 	prefix := `"` + user + `"`
-	for _, ln := range strings.Split(userlist, "\n") {
+	for ln := range strings.SplitSeq(userlist, "\n") {
 		ln = strings.TrimSuffix(ln, "\r")
 		if !strings.HasPrefix(ln, prefix) {
 			continue

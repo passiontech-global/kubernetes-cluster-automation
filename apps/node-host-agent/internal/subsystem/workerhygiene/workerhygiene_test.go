@@ -296,14 +296,12 @@ func TestRateTrySpendAtomic(t *testing.T) {
 	const n = 8
 	var wins atomic.Int64
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			if e.H.State.RateTrySpend("last-restart", e.H.Cfg.MinRestartInterval) {
 				wins.Add(1)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if got := wins.Load(); got != 1 {

@@ -28,7 +28,7 @@ func TestListAllUnstructuredPagesAndRewraps(t *testing.T) {
 	)
 	gvr := corev1.SchemeGroupVersion.WithResource("namespaces")
 
-	list, err := ListAllUnstructured(context.Background(),
+	list, err := ListAllUnstructured(t.Context(),
 		dyn.Resource(gvr), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("ListAllUnstructured: %v", err)
@@ -48,7 +48,7 @@ func TestListAllUnstructuredPagesAndRewraps(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("list boom")
 		})
-	if list, err = ListAllUnstructured(context.Background(),
+	if list, err = ListAllUnstructured(t.Context(),
 		dyn.Resource(gvr), metav1.ListOptions{}); err == nil || list != nil {
 		t.Fatalf("failed list = (%v, %v), want (nil, error)", list, err)
 	}
@@ -65,7 +65,7 @@ func TestListFirstGVR(t *testing.T) {
 	real := apierrors.NewForbidden(schema.GroupResource{Group: "x.io", Resource: "foos"}, "", errors.New("rbac"))
 
 	t.Run("first candidate answers", func(t *testing.T) {
-		items, gvr, err := ListFirstGVR(context.Background(),
+		items, gvr, err := ListFirstGVR(t.Context(),
 			[]schema.GroupVersionResource{gvrA, gvrB},
 			func(_ context.Context, g schema.GroupVersionResource) (string, error) {
 				if g != gvrA {
@@ -80,7 +80,7 @@ func TestListFirstGVR(t *testing.T) {
 	})
 
 	t.Run("benign miss falls through to next GVR", func(t *testing.T) {
-		items, gvr, err := ListFirstGVR(context.Background(),
+		items, gvr, err := ListFirstGVR(t.Context(),
 			[]schema.GroupVersionResource{gvrA, gvrB},
 			func(_ context.Context, g schema.GroupVersionResource) (string, error) {
 				if g == gvrA {
@@ -95,7 +95,7 @@ func TestListFirstGVR(t *testing.T) {
 	})
 
 	t.Run("real error still falls through — later success wins", func(t *testing.T) {
-		items, gvr, err := ListFirstGVR(context.Background(),
+		items, gvr, err := ListFirstGVR(t.Context(),
 			[]schema.GroupVersionResource{gvrA, gvrB},
 			func(_ context.Context, g schema.GroupVersionResource) (string, error) {
 				if g == gvrA {
@@ -110,7 +110,7 @@ func TestListFirstGVR(t *testing.T) {
 	})
 
 	t.Run("all benign returns the first benign error", func(t *testing.T) {
-		_, _, err := ListFirstGVR(context.Background(),
+		_, _, err := ListFirstGVR(t.Context(),
 			[]schema.GroupVersionResource{gvrA, gvrB},
 			func(context.Context, schema.GroupVersionResource) (string, error) {
 				return "", benign
@@ -121,7 +121,7 @@ func TestListFirstGVR(t *testing.T) {
 	})
 
 	t.Run("real error beats benign misses", func(t *testing.T) {
-		_, _, err := ListFirstGVR(context.Background(),
+		_, _, err := ListFirstGVR(t.Context(),
 			[]schema.GroupVersionResource{gvrA, gvrB},
 			func(_ context.Context, g schema.GroupVersionResource) (string, error) {
 				if g == gvrA {
@@ -135,7 +135,7 @@ func TestListFirstGVR(t *testing.T) {
 	})
 
 	t.Run("empty candidates is a caller bug", func(t *testing.T) {
-		if _, _, err := ListFirstGVR(context.Background(),
+		if _, _, err := ListFirstGVR(t.Context(),
 			nil, func(context.Context, schema.GroupVersionResource) (string, error) {
 				return "", nil
 			}); err == nil {
@@ -163,7 +163,7 @@ func TestListFirstUnstructured(t *testing.T) {
 	gvrA := corev1.SchemeGroupVersion.WithResource("secrets")
 	gvrB := corev1.SchemeGroupVersion.WithResource("namespaces")
 
-	list, gvr, err := ListFirstUnstructured(context.Background(), dyn,
+	list, gvr, err := ListFirstUnstructured(t.Context(), dyn,
 		[]schema.GroupVersionResource{gvrA, gvrB}, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("ListFirstUnstructured: %v", err)

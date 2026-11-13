@@ -6,20 +6,52 @@ import "fmt"
 
 // filterUnique keeps the first occurrence of each element —
 // membership is deepEq (whose scalar arm is numEq), so 1 and 1.0
-// dedupe together.
+// dedupe together. All-plain-string inputs take the O(N) hash-set
+// path: deepEq on two plain strings is plain equality, so first-seen
+// dedupe through a set is semantics-free — anything else (1 vs 1.0,
+// mixed shapes) stays on the deepEq scan.
 func filterUnique(v any) (any, error) {
-	return &List{appendUnique(nil, ToIter(v))}, nil
+	items := ToIter(v)
+	if allPlainStrings(items) {
+		seen := make(map[string]struct{}, len(items))
+		var out []any
+		for _, it := range items {
+			s := it.(string)
+			if _, dup := seen[s]; !dup {
+				seen[s] = struct{}{}
+				out = append(out, it)
+			}
+		}
+		return &List{out}, nil
+	}
+	return &List{appendUnique(nil, items)}, nil
 }
 
 // filterDifference drops every element that deep-equals a member of
-// the exclusion list (args[0]).
+// the exclusion list (args[0]). Both operands all-plain-string →
+// hash-set membership (equality, like deepEq's string arm); the
+// deepEq scan would be O(len(v)×len(excl)).
 func filterDifference(v any, args []any) (any, error) {
 	var excl []any
 	if len(args) > 0 {
 		excl = ToIter(args[0])
 	}
+	items := ToIter(v)
+	if allPlainStrings(items) && allPlainStrings(excl) {
+		drop := make(map[string]struct{}, len(excl))
+		for _, e := range excl {
+			drop[e.(string)] = struct{}{}
+		}
+		var out []any
+		for _, it := range items {
+			if _, hit := drop[it.(string)]; !hit {
+				out = append(out, it)
+			}
+		}
+		return &List{out}, nil
+	}
 	var out []any
-	for _, it := range ToIter(v) {
+	for _, it := range items {
 		if !containsDeepEq(excl, it) {
 			out = append(out, it)
 		}
@@ -29,13 +61,55 @@ func filterDifference(v any, args []any) (any, error) {
 
 // filterUnion is the ansible set union: unique elements across ALL
 // operands — the seed operand's own duplicates collapse too,
-// keeping the first occurrence of each value.
+// keeping the first occurrence of each value. Every operand
+// all-plain-string → one shared hash set across the sweep.
 func filterUnion(v any, args []any) (any, error) {
-	out := appendUnique(nil, ToIter(v))
-	for _, a := range args {
-		out = appendUnique(out, ToIter(a))
+	seed := ToIter(v)
+	rest := make([][]any, len(args))
+	allStrings := allPlainStrings(seed)
+	for i, a := range args {
+		rest[i] = ToIter(a)
+		if allStrings && !allPlainStrings(rest[i]) {
+			allStrings = false
+		}
+	}
+	if allStrings {
+		seen := make(map[string]struct{}, len(seed))
+		var out []any
+		add := func(items []any) {
+			for _, it := range items {
+				s := it.(string)
+				if _, dup := seen[s]; !dup {
+					seen[s] = struct{}{}
+					out = append(out, it)
+				}
+			}
+		}
+		add(seed)
+		for _, items := range rest {
+			add(items)
+		}
+		return &List{out}, nil
+	}
+	out := appendUnique(nil, seed)
+	for _, items := range rest {
+		out = appendUnique(out, items)
 	}
 	return &List{out}, nil
+}
+
+// allPlainStrings reports whether every element is exactly the
+// string type — the gate for the O(N) hash-set dedupe fast paths.
+// A named string type (or any non-string) disqualifies the input so
+// membership keeps running through deepEq, byte-for-byte the old
+// semantics.
+func allPlainStrings(items []any) bool {
+	for _, it := range items {
+		if _, ok := it.(string); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // appendUnique appends every item of items not already present in
@@ -96,15 +170,15 @@ func filterItems2Dict(v any, args []any, kw map[string]any) (any, error) {
 	items := ToIter(v)
 	m := NewOMapCap(len(items))
 	for _, it := range items {
-		// asMapping accepts *OMap AND the Go-native maps a
-		// vars-file decode produces — items2dict over YAML data
-		// must not silently drop plain-map entries.
-		om, ok := asMapping(it)
-		if !ok {
+		// mapLookup accepts *OMap AND the Go-native maps a vars-file
+		// decode produces — items2dict over YAML data must not
+		// silently drop plain-map entries. Two single-key probes, so
+		// the sorted view asMapping builds per item is pure waste.
+		if !isMappingValue(it) {
 			continue
 		}
-		k, _ := om.get(keyName)
-		val, _ := om.get(valueName)
+		k, _ := mapLookup(it, keyName)
+		val, _ := mapLookup(it, valueName)
 		m.Set(Stringify(k), val)
 	}
 	return m, nil

@@ -240,7 +240,7 @@ func parseFor(stmt string) (*forNode, error) {
 	}
 	inIdx := inIdxs[0]
 	var names []string
-	for _, nm := range strings.Split(restStmt[:inIdx], ",") {
+	for nm := range strings.SplitSeq(restStmt[:inIdx], ",") {
 		nm = strings.TrimSpace(nm)
 		// A garbage loop name (`x y` from a missing comma) binds at
 		// render time and reads back as Undefined — body `{{ x }}`

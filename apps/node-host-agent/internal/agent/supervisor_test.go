@@ -53,15 +53,26 @@ func TestSuperviseHealthyRun(t *testing.T) {
 type ladderSubsystem struct {
 	calls     atomic.Int32
 	firstDone chan struct{}
+	// restarted signals the SECOND Run's entry (cap 1, non-blocking
+	// send — later entries are irrelevant to the single waiter).
+	restarted chan struct{}
 }
 
 func (s *ladderSubsystem) Name() string { return "ladder" }
 
 func (s *ladderSubsystem) Run(ctx context.Context) {
 	if s.calls.Add(1) == 1 {
+		// Load-bearing real-time scenario: the run must outlive the
+		// supervisor's initial backoff for superviseHealthyRun to
+		// keep the ladder where it is — there is no fake clock for
+		// the supervisor's production timers.
 		time.Sleep(superviseBackoffInitial + 300*time.Millisecond)
 		close(s.firstDone)
 		return
+	}
+	select {
+	case s.restarted <- struct{}{}:
+	default:
 	}
 	<-ctx.Done()
 }
@@ -73,24 +84,25 @@ func (s *ladderSubsystem) Run(ctx context.Context) {
 // backoff (≥ backoff − 15%).
 func TestSuperviseWaitsFullBackoffAfterRunOutlivingBackoff(t *testing.T) {
 	a := New(Config{})
-	sub := &ladderSubsystem{firstDone: make(chan struct{})}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	sub := &ladderSubsystem{
+		firstDone: make(chan struct{}),
+		restarted: make(chan struct{}, 1),
+	}
+	ctx := t.Context()
 	go a.superviseSubsystem(ctx, sub)
 
 	<-sub.firstDone // the first Run outlived the armed timer
 	ended := time.Now()
 
 	// The second Run must start — but no earlier than the shortest
-	// jittered wait (backoff ±15% → ≥ backoff*17/20). The 20ms poll
-	// granularity is noise against a 4.25s floor.
+	// jittered wait (backoff ±15% → ≥ backoff*17/20). Waiting on the
+	// subsystem's own restarted signal instead of polling: the 10s
+	// guard is only the give-up bound.
 	var restartedAt time.Time
-	for deadline := ended.Add(10 * time.Second); time.Now().Before(deadline); {
-		if sub.calls.Load() >= 2 {
-			restartedAt = time.Now()
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	select {
+	case <-sub.restarted:
+		restartedAt = time.Now()
+	case <-time.After(10 * time.Second):
 	}
 	if restartedAt.IsZero() {
 		t.Fatal("supervisor never restarted the subsystem")

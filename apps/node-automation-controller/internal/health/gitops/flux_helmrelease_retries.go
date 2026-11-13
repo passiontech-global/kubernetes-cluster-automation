@@ -21,6 +21,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -229,9 +230,21 @@ func fluxHRReadyStrings(obj *unstructured.Unstructured) (status, reason, message
 // heal.AllowedVPersisted, the sibling kustomization nudge's gate):
 // only after the cooldown clears do the maintenance mutex + global
 // heal budget evaluate (fail closed) — a reconcile nudge during a
-// drain churns the release exactly like any other heal. The write
-// side stays hand-rolled: StampPersisted emits a single-annotation
-// patch and this heal needs requestedAt AND forceAt stamped together.
+// drain churns the release exactly like any other heal.
+//
+// The write side is heal.StampPersistedMulti — the source-nudge
+// shape, replacing the hand-rolled patch that bypassed the sweep
+// overlay: a landed patch is recorded via kube.RecordAnnoPatch so
+// same-sweep readers resolve the fresh stamp through
+// EffectiveAnno/AnnoTimeCtx instead of the pre-patch census copy,
+// the ledger stamp stays delivered-only (a failed patch never
+// starts a cooldown), and a re-stamp can never overwrite a warm
+// cooldown — the gate above holds the wider-of window before any
+// stamp is issued, and StampPersistedMulti's only error source is
+// the PATCH itself (the annotation map is three RFC3339 strings —
+// its marshal cannot fail), so no grant is ever burned before the
+// API send and a failed patch keeps its spent grant (the
+// attempted-mutation rule).
 func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Logger,
 	gvr schema.GroupVersionResource, hr *unstructured.Unstructured,
 	key string, now time.Time) {
@@ -246,29 +259,27 @@ func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Log
 	if !proceed {
 		return
 	}
-	token := now.UTC().Format(time.RFC3339)
-	patch, err := kube.MergePatchAnnos(map[string]any{
-		kube.AnnoFluxRequestedAt: token,
-		kube.AnnoFluxForceAt:     token,
-		// resetAt clears RetriesExceeded/Stalled on
-		// helm-controller >= v0.37.0 — the requestedAt/forceAt
-		// pair alone is deduped away once the retry counter is
-		// spent (same triple helmrelease-unlocker stamps).
-		kube.AnnoFluxResetAt: token,
-	})
-	if err != nil {
-		metrics.IncError(p.Name)
-		log.Error(err, "marshal hr retry patch failed", "hr", key)
-		return
-	}
-	if _, err := p.Dyn.Resource(gvr).Namespace(hr.GetNamespace()).
-		Patch(ctx, hr.GetName(), types.MergePatchType, patch,
-			metav1.PatchOptions{}); err != nil {
+	if err := heal.StampPersistedMulti(ctx, hr,
+		func(ctx context.Context, data []byte) error {
+			_, err := p.Dyn.Resource(gvr).Namespace(hr.GetNamespace()).
+				Patch(ctx, hr.GetName(), types.MergePatchType, data,
+					metav1.PatchOptions{})
+			return err
+		},
+		// requestedAt asks for a reconcile, forceAt skips the
+		// artifact-cache freshness check (same pair the flux CLI
+		// `reconcile --with-source` writes), and resetAt clears the
+		// exhausted retry counter — helm-controller >= v0.37.0
+		// ignores requestedAt/forceAt on a RetriesExceeded/Stalled
+		// HR without it (flux-reset-at). One atomic merge patch, the
+		// same triple helmrelease-unlocker stamps.
+		[]string{kube.AnnoFluxRequestedAt, kube.AnnoFluxForceAt,
+			kube.AnnoFluxResetAt},
+		&p.hrRetryHealed, ck, now); err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "helmrelease retry patch failed", "hr", key)
 		return
 	}
-	p.hrRetryHealed.Stamp(ck, now)
 	log.Info("patched helmrelease reconcile annotations",
-		"hr", key, "requestedAt", token)
+		"hr", key, "requestedAt", now.UTC().Format(time.RFC3339))
 }

@@ -212,13 +212,11 @@ func (h *Handler) dispatch(resources []concourse.Resource,
 	var wg sync.WaitGroup
 	var checked atomic.Int64
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for res := range jobs {
 				checked.Add(h.checkOne(ctx, res, delivery))
 			}
-		}()
+		})
 	}
 	for _, res := range resources {
 		jobs <- res

@@ -224,7 +224,7 @@ type plegSample struct {
 // bucket counts carry the fast/slow split.
 func parsePLEGMetrics(body string) plegSample {
 	var s plegSample
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		if line == "" || line[0] == '#' {
 			continue
 		}

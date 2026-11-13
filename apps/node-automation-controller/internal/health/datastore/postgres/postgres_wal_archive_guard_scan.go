@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -126,40 +125,24 @@ func (s *walGuardSweep) scanPodLogs(ctx context.Context) error {
 		}
 		scanIdx = append(scanIdx, i)
 	}
-	type logScan struct {
-		reason string
-		err    error
-	}
-	scans := make([]logScan, len(scanIdx))
-	g := errgroup.Group{}
-	g.SetLimit(postgresWALLogWorkers)
+	scanPods := make([]*corev1.Pod, len(scanIdx))
 	for j, i := range scanIdx {
-		pod := pods[i]
-		g.Go(func() (err error) {
-			// A panic in one pod's log scan reads as that pod's
-			// inconclusive scan — never a process crash.
-			defer func() {
-				if r := recover(); r != nil {
-					scans[j] = logScan{
-						err: fmt.Errorf("log scan panicked: %v", r)}
-				}
-			}()
-			reason, lerr := s.p.pgWALLogHit(ctx, &pod)
-			scans[j] = logScan{reason: reason, err: lerr}
-			return nil // tolerated sub-failure — applied below
-		})
+		scanPods[j] = &pods[i]
 	}
-	_ = g.Wait()
+	scans := kube.ScanPodLogs(ctx, s.p.CS, scanPods, postgresWALLogWorkers,
+		func(ctx context.Context, pod *corev1.Pod) (string, error) {
+			return s.p.pgWALLogHit(ctx, pod)
+		})
 	for j, i := range scanIdx {
 		pod := &pods[i]
 		key := pod.Namespace + "/" + pod.Name
-		if scans[j].err != nil {
+		if scans[j].Err != nil {
 			s.log.Info("WARN: postgres log fetch failed — WAL signature inconclusive",
-				"pod", key, "error", scans[j].err)
+				"pod", key, "error", scans[j].Err)
 			continue
 		}
-		if scans[j].reason != "" {
-			s.emit(pod.Namespace, postgresClusterOf(pod), scans[j].reason)
+		if scans[j].Value != "" {
+			s.emit(pod.Namespace, postgresClusterOf(pod), scans[j].Value)
 		}
 	}
 	return nil

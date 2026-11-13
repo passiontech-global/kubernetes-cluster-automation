@@ -35,7 +35,9 @@
 //
 // Layout: this file holds the shared keys/state, the Setup + run
 // entry point and the paged-list helpers; schedule_audit.go the
-// per-Schedule rot checks, everest_audit.go the backup-posture-audit Percona
+// per-Schedule rot checks, db_backup_audit.go the shared backup-posture-audit
+// sweep skeleton both product audits drive through their config rows,
+// everest_audit.go the backup-posture-audit Percona
 // Everest audit, cnpg_audit.go the cnpg-backup-audit CloudNativePG backup
 // audit, inflight_pvb_audit.go the velero-inflight-audit wedged-transfer
 // audit + PVB cleanup (+ cnpg-backup-audit DataUpload/DataDownload scan),
@@ -191,10 +193,11 @@ const (
 type pausedKey struct{ namespace, schedule string }
 type backupKey struct{ namespace, schedule, reason string }
 
-// everestKey identifies one DBBackupUnhealthy series — the label
-// triple (namespace, DatabaseCluster name, reason) needed to delete
-// it again once the cluster's backup posture recovers.
-type everestKey struct{ namespace, cluster, reason string }
+// dbBackupKey identifies one DBBackupUnhealthy series — the label
+// triple (namespace, cluster, reason) needed to delete it again once
+// the subject's backup posture recovers. Shared by the everest and
+// cnpg rows of the db_backup_audit.go table.
+type dbBackupKey struct{ namespace, cluster, reason string }
 
 // repoKey identifies one VeleroRepoUnhealthy series — the label
 // triple (namespace, BackupRepository name, reason) of the backup-health
@@ -240,16 +243,16 @@ type veleroBackupAuditor struct {
 	// delete, and a controller restart re-arms it (biased to
 	// under-page, never to alert on an unmeasurable pause).
 	firstSeenPaused state.FirstSeenLedger
-	// seenEverest: series ledger for DBBackupUnhealthy — an
-	// everestKey the sweep stops re-asserting gets
+	// seenEverest: series ledger for DBBackupUnhealthy — a
+	// dbBackupKey the sweep stops re-asserting gets
 	// DeleteLabelValues'd so a recovered or deleted
 	// DatabaseCluster never pins the gauge.
-	seenEverest state.GaugeLedger[everestKey]
+	seenEverest state.GaugeLedger[dbBackupKey]
 	// seenCNPG: series ledger for the cnpg-backup-audit CNPG half of
 	// DBBackupUnhealthy — its own ledger so the Everest sweep's
 	// prune never deletes CNPG series (the two audits assert
 	// disjoint key sets on the same gauge vec).
-	seenCNPG state.GaugeLedger[everestKey]
+	seenCNPG state.GaugeLedger[dbBackupKey]
 	// seenDataMovement: series ledger for the cnpg-backup-audit
 	// DataUpload/DataDownload wedge gauge — keys "kind/ns/name".
 	seenDataMovement state.GaugeLedger[string]
@@ -364,7 +367,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		a.seenStuckBackup.Prune(metrics.VeleroBackupStuck.DeleteLabelValues)
 		a.seenWedgedPVB.Prune(metrics.VeleroPodVolumeBackupWedged.DeleteLabelValues)
 		a.seenWedgedPVR.Prune(metrics.VeleroPodVolumeRestoreWedged.DeleteLabelValues)
-		a.seenDataMovement.Prune(veleroDataMovementWedgedGauge.DeleteLabelValues)
+		a.seenDataMovement.Prune(metrics.VeleroDataMovementWedged.DeleteLabelValues)
 		a.firstSeenPaused.Prune(func(string) bool { return false })
 		a.firstSeenRepoNotReady.Prune(func(string) bool { return false })
 		log.Info("skip: velero CRDs not installed")

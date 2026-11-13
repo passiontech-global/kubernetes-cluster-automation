@@ -37,7 +37,7 @@ func (r *cacheGetReader) Get(_ context.Context, key client.ObjectKey,
 }
 
 func TestGetDeploymentCached(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "apps", Name: "web"}}
 	cs := fake.NewSimpleClientset(dep)
@@ -66,7 +66,7 @@ func TestGetDeploymentCached(t *testing.T) {
 }
 
 func TestGetDaemonSetCached(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "kube-system", Name: "konnectivity-agent"}}
 	cs := fake.NewSimpleClientset(ds)
@@ -87,7 +87,7 @@ func TestGetDaemonSetCached(t *testing.T) {
 }
 
 func TestGetSecretCached(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "passiontech-pipeline", Name: "creds"}}
 	cs := fake.NewSimpleClientset(sec)

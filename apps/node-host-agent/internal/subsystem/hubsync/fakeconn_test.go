@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -113,7 +113,7 @@ func (f *fakeConn) Run(_ context.Context, cmd string) (string, error) {
 		// "Is a directory"), exit 1 when any path failed.
 		var b strings.Builder
 		failed := false
-		for _, q := range strings.Split(strings.TrimPrefix(exec, "sha256sum "), " ") {
+		for q := range strings.SplitSeq(strings.TrimPrefix(exec, "sha256sum "), " ") {
 			if q == "" {
 				continue
 			}
@@ -161,7 +161,7 @@ func (f *fakeConn) Run(_ context.Context, cmd string) (string, error) {
 				ns = append(ns, path.Base(d)+"/")
 			}
 		}
-		sort.Strings(ns)
+		slices.Sort(ns)
 		return strings.Join(ns, "\n"), nil
 	case strings.HasPrefix(exec, "find "):
 		// `find <dir> -maxdepth 1 -type f -name '.*.tmp*' -mmin +15
@@ -176,7 +176,7 @@ func (f *fakeConn) Run(_ context.Context, cmd string) (string, error) {
 				ns = append(ns, path.Base(p))
 			}
 		}
-		sort.Strings(ns)
+		slices.Sort(ns)
 		return strings.Join(ns, "\n"), nil
 	case strings.HasPrefix(exec, "rm -f "):
 		p := unshq(strings.TrimPrefix(exec, "rm -f "))
@@ -218,10 +218,16 @@ type fakeDialer struct {
 	conns   map[string]*fakeConn // by target IP — created lazily
 	dialSeq []string             // IPs in dial order
 	err     map[string]error     // optional per-IP dial failure
+	// dialCh signals each recorded dial (cap 64, non-blocking send)
+	// so tests wait on the observed call instead of polling dials().
+	dialCh chan string
 }
 
 func newFakeDialer() *fakeDialer {
-	return &fakeDialer{conns: map[string]*fakeConn{}}
+	return &fakeDialer{
+		conns:  map[string]*fakeConn{},
+		dialCh: make(chan string, 64),
+	}
 }
 
 func (d *fakeDialer) Dial(_ context.Context, t Target) (Conn, error) {
@@ -231,6 +237,10 @@ func (d *fakeDialer) Dial(_ context.Context, t Target) (Conn, error) {
 		return nil, err
 	}
 	d.dialSeq = append(d.dialSeq, t.IP)
+	select {
+	case d.dialCh <- t.IP:
+	default:
+	}
 	c, ok := d.conns[t.IP]
 	if !ok {
 		c = newFakeConn()

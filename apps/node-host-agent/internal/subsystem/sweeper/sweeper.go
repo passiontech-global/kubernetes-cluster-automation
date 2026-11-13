@@ -58,6 +58,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
@@ -253,12 +254,12 @@ func (s *Sweeper) mountPoints() ([]string, error) {
 		return nil, err
 	}
 	var mounts []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
-		mounts = append(mounts, unescapeMountField(fields[1]))
+		mounts = append(mounts, procfs.UnescapeMountPath(fields[1]))
 	}
 	return mounts, nil
 }
@@ -277,18 +278,6 @@ func mountedInside(dir string, mounts []string) bool {
 		}
 	}
 	return false
-}
-
-// unescapeMountField decodes the octal escapes /proc/*/mounts applies
-// to mount paths (space→\040, tab→\011, newline→\012, backslash→\134).
-func unescapeMountField(s string) string {
-	r := strings.NewReplacer(
-		`\134`, `\`,
-		`\040`, " ",
-		`\011`, "\t",
-		`\012`, "\n",
-	)
-	return r.Replace(s)
 }
 
 // apiCtx returns a per-call apiserver context with RequestTimeout —

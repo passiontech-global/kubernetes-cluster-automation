@@ -5,7 +5,7 @@
 package topology
 
 import (
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
@@ -45,7 +45,7 @@ func UniqSorted(in []string) []string {
 			out = append(out, x)
 		}
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 

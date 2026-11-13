@@ -138,11 +138,9 @@ func Setup(d shared.Deps) error {
 			MinReplicas:     cfg.minReplicas,
 			NodesPerReplica: cfg.nodesPerReplica,
 		}.WatchNodes(b, "coredns-patcher-sweep")
-		r := &corednsPatcher{cs: d.CS, nodeReader: d.Mgr.GetClient(), zoneWhen: cfg.zoneWhen,
-			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica}
-		if d.Mgr != nil {
-			r.reader = d.Mgr.GetClient()
-		}
+		r := &corednsPatcher{cs: d.CS, nodeReader: d.CachedClient(), zoneWhen: cfg.zoneWhen,
+			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica,
+			reader: d.CachedClient()}
 		// CountReconcile owns the returned-error accounting — one
 		// IncError per non-nil Reconcile return; the reconcile body
 		// never IncErrors an error it returns.

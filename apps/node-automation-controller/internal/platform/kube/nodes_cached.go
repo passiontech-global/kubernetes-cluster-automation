@@ -4,9 +4,12 @@
 // every reconciler that watches &corev1.Node{} keeps that informer
 // warm — yet the read paths still paid a full apiserver LIST per
 // sweep. ListNodesCached routes the read-only censuses through the
-// cache client instead; confirm-before-act reads (TaintNode/
-// UntaintNode re-Get, maintenance-mutex verdicts) stay on the direct
-// clientset — this helper never replaces them.
+// cache client instead; the only cache-adjacent reads that stay on
+// the direct clientset are the confirm-before-act re-Gets
+// (TaintNode/UntaintNode) — the maintenance-mutex verdict's node
+// census rides the cache too since Verdict.NodeReader carries the
+// informer client, while every destructive act still re-confirms
+// live.
 package kube
 
 import (

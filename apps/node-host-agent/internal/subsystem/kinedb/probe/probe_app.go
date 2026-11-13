@@ -148,7 +148,7 @@ func (p *Probe) probeLogScan(ctx context.Context, pgb string,
 	}
 	res.logScanned = true
 	var n int64
-	for _, l := range strings.Split(logs, "\n") {
+	for l := range strings.SplitSeq(logs, "\n") {
 		if rePGBLogErr.MatchString(l) {
 			n++ // grep -c parity: matching LINES, not occurrences
 		}

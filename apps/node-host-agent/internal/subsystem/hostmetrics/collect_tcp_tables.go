@@ -1,22 +1,22 @@
-// collect_tcp_tables.go — kernel TCP table census: the
-// /proc/net/tcp{,6} + sock_diag state scan, per-tuple hotspot
-// emission and the ephemeral-port width gauge. Split out of
+// collect_tcp_tables.go — kernel TCP table census: the 1-pass
+// NETLINK_SOCK_DIAG read behind the state histogram + per-tuple
+// hot-spot emission and the ephemeral-port width gauge. Split out of
 // collect_filefd_sockstat.go — the fd/sockstat/netstat counters
-// stay there; this file owns the connection-table evidence.
+// stay there; this file owns the connection-table evidence. The
+// census's ONE dump also feeds CLOSE_WAIT and the tuple hot-spot
+// (collectSockstat calls into it), replacing the /proc/net/tcp{,6}
+// text scan those used to run.
 
 package hostmetrics
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/hex"
-	"fmt"
-	"net"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 )
 
 // tcpStateNames maps the kernel idiag_state ids the sock_diag dump
@@ -34,19 +34,27 @@ var tcpStateNames = []struct {
 	{10, "listen"}, {11, "closing"},
 }
 
-// collectTCPStates emits the NETLINK_SOCK_DIAG per-state histogram
+// collectTCPCensus emits the one-dump NETLINK_SOCK_DIAG census
 // through the netlinkx seam — pid 1 is the host init under
 // hostPID:true, the same convention every /proc/1/net read in this
-// file follows. A failed dump emits nothing: inconclusive, never a
+// file follows: the per-state histogram, the CLOSE_WAIT gauge and
+// the per-tuple hot-spot gauges all fold from the same
+// TCPCensus. A failed dump emits nothing: inconclusive, never a
 // fabricated zero census.
-func (c *Collector) collectTCPStates(ch chan<- prometheus.Metric) {
-	states, err := c.cfg.TCPStatesFn(1)
+func (c *Collector) collectTCPCensus(ch chan<- prometheus.Metric) {
+	census, err := c.cfg.TCPCensusFn(1)
 	if err != nil {
 		return
 	}
+	// conntrack-port-pressure: the CLOSE_WAIT count rides the same
+	// dump — it must emit even when the sockstat file itself is
+	// absent, exactly as the /proc-table read did.
+	ch <- prometheus.MustNewConstMetric(descTCPCloseWaitSocks,
+		prometheus.GaugeValue, float64(census.States[0x08]), c.cfg.NodeName)
+	c.emitPerTupleHotspot(ch, census.PerTuple)
 	for _, s := range tcpStateNames {
 		ch <- prometheus.MustNewConstMetric(descSockTCPState,
-			prometheus.GaugeValue, float64(states[s.id]),
+			prometheus.GaugeValue, float64(census.States[s.id]),
 			c.cfg.NodeName, s.name)
 	}
 }
@@ -80,120 +88,13 @@ func ephemeralPortWidth(path string) float64 {
 // gauge looks healthy.
 const hotTupleSockets = 40000
 
-// hexSockAddr decodes a /proc/net/tcp address column — 8 or 32 hex
-// chars (IPv4/IPv6, little-endian per u32 word) + ":port" — into
-// host order "a.b.c.d:port" / "[v6]:port". An unparseable column
-// yields the raw string (never a metric value fabricated from a
-// guess).
-func hexSockAddr(s string) string {
-	host, port, found := strings.Cut(s, ":")
-	if !found {
-		return s
-	}
-	raw, err := hex.DecodeString(host)
-	if err != nil || (len(raw) != 4 && len(raw) != 16) {
-		return s
-	}
-	pn, err := strconv.ParseUint(port, 16, 16)
-	if err != nil {
-		return s
-	}
-	if len(raw) == 4 {
-		return fmt.Sprintf("%d.%d.%d.%d:%d", raw[3], raw[2], raw[1], raw[0], pn)
-	}
-	// tcp6 prints the 16 in6_addr bytes as four u32 words, EACH in
-	// host (little-endian) byte order — the same per-word shuffle
-	// the v4 column gets, applied inside every 4-byte group. A
-	// contiguous decode yields a wrong address (::1 reads back as
-	// ::100:0), so reverse each word before handing to net.IP.
-	var v6 [16]byte
-	for i := 0; i < 4; i++ {
-		v6[i*4+0] = raw[i*4+3]
-		v6[i*4+1] = raw[i*4+2]
-		v6[i*4+2] = raw[i*4+1]
-		v6[i*4+3] = raw[i*4+0]
-	}
-	return fmt.Sprintf("[%s]:%d", net.IP(v6[:]).String(), pn)
-}
-
-// hexNibble decodes one hex digit without a string conversion —
-// the st column parse stays allocation-free like the field split.
-func hexNibble(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	}
-	return 0, false
-}
-
-// tcpTableScan is one streaming pass over the /proc/net/tcp{,6}
-// socket tables: per-state totals (the CLOSE_WAIT count) and the
-// per-remote-endpoint counts (the roadmap A6 tuple hot-spot).
-// ok=false when NO table read at all — a single readable family
-// still counts (an IPv6-less host legitimately lacks tcp6).
-//
-// Zero-alloc discipline: fields split off sc.Bytes() (subslice
-// views, never strings.Fields' per-line allocation), the st column
-// parses nibble-by-nibble, and perTuple keys on the RAW rem_address
-// column — the map-key string conversion copies only for NEW
-// endpoints, so a 200k-socket table costs ~endpoint-count
-// allocations, not socket-count. hexSockAddr decode is deferred to
-// emit time and runs only for endpoints past hotTupleSockets.
-func tcpTableScan(paths ...string) (stateCounts map[byte]int,
-	perTuple map[string]int, ok bool) {
-	stateCounts = map[byte]int{}
-	perTuple = map[string]int{}
-	for _, p := range paths {
-		f, err := os.Open(p)
-		if err != nil {
-			continue
-		}
-		ok = true
-		sc := bufio.NewScanner(f)
-		first := true
-		for sc.Scan() {
-			if first {
-				first = false
-				continue // column header
-			}
-			fields := bytes.Fields(sc.Bytes())
-			if len(fields) < 4 || len(fields[3]) > 2 {
-				continue
-			}
-			// st is a <=2-digit hex byte — ParseUint's string
-			// conversion would allocate per line; the nibble
-			// loop does not.
-			var st uint64
-			bad := false
-			for _, c := range fields[3] {
-				v, ok := hexNibble(c)
-				if !ok {
-					bad = true
-					break
-				}
-				st = st<<4 | uint64(v)
-			}
-			if bad || st > 0xff {
-				continue // malformed line — never emit junk
-			}
-			stateCounts[byte(st)]++
-			perTuple[string(fields[2])]++
-		}
-		_ = f.Close()
-	}
-	return stateCounts, perTuple, ok
-}
-
 // emitPerTupleHotspot publishes the per-endpoint socket counts:
 // the max-tuple gauge every readable scrape, plus a labelled gauge
 // per endpoint past hotTupleSockets only (the 40k roadmap
 // threshold — bounded series, and an un-hot node keeps its
-// exposition flat). perTuple keys are the scan's RAW rem_address
-// columns; hexSockAddr decode runs here, only for the hot few.
+// exposition flat). perTuple keys are the census dump's RAW
+// daddr+dport bytes; netlinkx.DiagEndpoint decode runs here, only
+// for the hot few.
 func (c *Collector) emitPerTupleHotspot(ch chan<- prometheus.Metric,
 	perTuple map[string]int) {
 	max := 0
@@ -204,7 +105,7 @@ func (c *Collector) emitPerTupleHotspot(ch chan<- prometheus.Metric,
 		if n > hotTupleSockets {
 			ch <- prometheus.MustNewConstMetric(descTCPPerTupleHot,
 				prometheus.GaugeValue, float64(n), c.cfg.NodeName,
-				hexSockAddr(dst))
+				netlinkx.DiagEndpoint(dst))
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(descTCPPerTupleMax,

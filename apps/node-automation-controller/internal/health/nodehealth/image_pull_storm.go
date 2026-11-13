@@ -7,7 +7,7 @@ package nodehealth
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -178,11 +178,11 @@ func (p *imagePullStormCheck) Run(ctx context.Context) probefw.Result {
 	if len(offenders) == 0 {
 		return probefw.Result{Pass: true}
 	}
-	sort.Slice(offenders, func(i, j int) bool {
-		if offenders[i].ns != offenders[j].ns {
-			return offenders[i].ns < offenders[j].ns
+	slices.SortFunc(offenders, func(a, b offender) int {
+		if c := strings.Compare(a.ns, b.ns); c != 0 {
+			return c
 		}
-		return offenders[i].name < offenders[j].name
+		return strings.Compare(a.name, b.name)
 	})
 	var summary []string
 	for i, o := range offenders {

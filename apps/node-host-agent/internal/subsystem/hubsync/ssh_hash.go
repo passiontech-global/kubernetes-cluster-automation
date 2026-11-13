@@ -122,7 +122,7 @@ func sha256sumChunks(paths []string) []string {
 // per-file error notes for absent paths, warnings) carries no hash
 // shape and is skipped.
 func parseSHA256Lines(out string, sums map[string]string) {
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if len(ln) < 66 || ln[64] != ' ' || !isHexHash(ln[:64]) {
 			continue
@@ -148,7 +148,7 @@ func isHexHash(s string) bool {
 // directoryReport scans sha256sum's combined output for its per-file
 // "Is a directory" note and returns the offending path.
 func directoryReport(out string) (string, bool) {
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if rest, ok := strings.CutPrefix(ln, "sha256sum: "); ok {
 			if p, ok := strings.CutSuffix(rest, ": Is a directory"); ok && p != "" {

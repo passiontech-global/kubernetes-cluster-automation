@@ -395,7 +395,7 @@ func (f *Fixture) LogLines() string {
 // needle.
 func (f *Fixture) CountLogLines(needle string) int {
 	n := 0
-	for _, l := range strings.Split(f.LogLines(), "\n") {
+	for l := range strings.SplitSeq(f.LogLines(), "\n") {
 		if strings.Contains(l, needle) {
 			n++
 		}

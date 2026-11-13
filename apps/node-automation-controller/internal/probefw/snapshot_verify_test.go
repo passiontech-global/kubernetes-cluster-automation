@@ -7,7 +7,6 @@
 package probefw
 
 import (
-	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -24,7 +23,7 @@ func TestVerifySweepSnapshotUnmutatedClean(t *testing.T) {
 	cs := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "ns", Name: "p", UID: "u1"}})
 	d := &Deps{CS: cs}
-	sctx := WithSweepSnapshot(context.Background())
+	sctx := WithSweepSnapshot(t.Context())
 
 	if _, err := d.AllPods(sctx); err != nil {
 		t.Fatal(err)
@@ -46,7 +45,7 @@ func TestVerifySweepSnapshotUnmutatedCatchesLateMutation(t *testing.T) {
 	cs := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Namespace: "ns", Name: "p", UID: "u1"}})
 	d := &Deps{CS: cs}
-	sctx := WithSweepSnapshot(context.Background())
+	sctx := WithSweepSnapshot(t.Context())
 
 	pods, err := d.AllPods(sctx)
 	if err != nil {
@@ -70,7 +69,7 @@ func TestVerifySweepSnapshotUnmutatedCatchesLateMutation(t *testing.T) {
 // already saw fresh data, there is nothing memoized to check.
 func TestVerifySweepSnapshotUnmutatedNoSnapshot(t *testing.T) {
 	EnableSnapshotVerify()
-	VerifySweepSnapshotUnmutated(context.Background()) // must not panic
+	VerifySweepSnapshotUnmutated(t.Context()) // must not panic
 }
 
 // PodNodes filters tombstoned pods on EVERY read: the memoized
@@ -89,7 +88,7 @@ func TestPodNodesExcludesTombstonedPods(t *testing.T) {
 		Spec: corev1.PodSpec{NodeName: "w2"},
 	}
 	d := &Deps{CS: fake.NewSimpleClientset(p, q)}
-	sctx := WithSweepSnapshot(context.Background())
+	sctx := WithSweepSnapshot(t.Context())
 
 	m, err := d.PodNodes(sctx)
 	if err != nil {

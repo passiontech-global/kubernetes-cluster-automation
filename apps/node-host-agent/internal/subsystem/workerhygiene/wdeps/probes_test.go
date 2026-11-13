@@ -197,7 +197,8 @@ func TestKubeletMetricsGet(t *testing.T) {
 		if r.URL.Query().Get("slow") == "1" {
 			time.Sleep(300 * time.Millisecond)
 		}
-		_, _ = io.WriteString(w, "# HELP kubelet metrics\nkubelet_running_pods 7\n")
+		_, _ = io.WriteString(w, "# HELP kubelet metrics\n"+
+			"kubelet_pleg_last_seen_seconds 1.7\nkubelet_running_pods 7\n")
 	}))
 	defer srv.Close()
 
@@ -205,8 +206,13 @@ func TestKubeletMetricsGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	if !strings.Contains(body, "kubelet_running_pods 7") {
+	if !strings.Contains(body, "kubelet_pleg_last_seen_seconds 1.7") {
 		t.Fatalf("body=%q", body)
+	}
+	// The scan keeps only the parsed families — a multi-MiB scrape
+	// collapses to the PLEG/storage lines before it becomes a string.
+	if strings.Contains(body, "kubelet_running_pods 7") {
+		t.Fatalf("unparsed family leaked through the scan: %q", body)
 	}
 	authMu.Lock()
 	auth := gotAuth

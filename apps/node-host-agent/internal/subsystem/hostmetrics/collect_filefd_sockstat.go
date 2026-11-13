@@ -29,11 +29,9 @@ const (
 	defaultNetstatFile = "/proc/1/net/netstat"
 	defaultSNMPFile    = "/proc/1/net/snmp"
 	// conntrack-port-pressure sources: the ephemeral source-port range the
-	// sockstat saturation ratio divides by, and the per-socket
-	// tables the CLOSE_WAIT count scans (host netns via /proc/1).
+	// sockstat saturation ratio divides by. (The CLOSE_WAIT/tuple
+	// tables ride the TCPCensusFn netlink dump.)
 	defaultLocalPortRangeFile = "/proc/sys/net/ipv4/ip_local_port_range"
-	defaultProcNetTCP         = "/proc/1/net/tcp"
-	defaultProcNetTCP6        = "/proc/1/net/tcp6"
 	// defaultEphemeralPortWidth is the kernel's stock
 	// ip_local_port_range span (32768-60999) — the fallback when
 	// the sysctl itself can't be read (hostconfig widens it to
@@ -297,23 +295,16 @@ func (c *Collector) collectUserNS(ch chan<- prometheus.Metric) {
 // emits only when its key parsed — a node missing a section keeps
 // that series absent rather than 0.
 func (c *Collector) collectSockstat(ch chan<- prometheus.Metric) {
-	// conntrack-port-pressure: the CLOSE_WAIT count comes from the per-socket
-	// tables, NOT sockstat — it must emit even when the sockstat
-	// file itself is absent, so it runs before the early return.
-	// ok=false only when NO family table read (a node with neither
-	// file is inconclusive, not empty). The same single pass feeds
-	// the roadmap A6 per-tuple hot-spot gauges (a whole-table second
-	// scan on a busy node is 100k+ lines of IO for nothing).
-	if stateCounts, perTuple, ok := tcpTableScan(
-		c.cfg.ProcNetTCP, c.cfg.ProcNetTCP6); ok {
-		ch <- prometheus.MustNewConstMetric(descTCPCloseWaitSocks,
-			prometheus.GaugeValue, float64(stateCounts[0x08]), c.cfg.NodeName)
-		c.emitPerTupleHotspot(ch, perTuple)
-	}
-	// The sock_diag census is independent of the /proc tables — it
-	// must emit (or stay absent) regardless of the file reads, so
-	// it runs before the sockstat file's early return too.
-	c.collectTCPStates(ch)
+	// One 1-pass NETLINK_SOCK_DIAG census (state histogram + CLOSE_WAIT
+	// + the roadmap A6 per-tuple hot-spot) replaces the per-cycle
+	// /proc/net/tcp{,6} table scan AND the two-socket-per-family dump
+	// it used to sit next to — the dump reply already carries the
+	// per-socket state and remote endpoint, so a busy node saves a
+	// 100k+-line /proc read per cycle. The census is independent of
+	// the sockstat file — it must emit (or stay absent) regardless of
+	// the file read, so it runs before the sockstat file's early
+	// return.
+	c.collectTCPCensus(ch)
 	f, err := os.Open(c.cfg.SockstatFile)
 	if err != nil {
 		return
@@ -408,7 +399,7 @@ func parseNetstatPairs(data string) map[string]map[string]float64 {
 	out := map[string]map[string]float64{}
 	var pending string
 	var pendingKeys []string
-	for _, line := range strings.Split(data, "\n") {
+	for line := range strings.SplitSeq(data, "\n") {
 		f := strings.Fields(line)
 		if len(f) < 2 {
 			continue

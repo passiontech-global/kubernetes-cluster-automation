@@ -96,12 +96,6 @@ func upReadySlice() *discoveryv1.EndpointSlice {
 	}
 }
 
-func upPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
-	t.Helper()
-	_, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
-	return err == nil
-}
-
 // upSeed builds the audit-sweep clientset: the baseline kube-system
 // (unlabeled) and meshed (inject=enabled) namespaces, then thirdNS
 // (nil omits it) and the scenario objects the test varies — each
@@ -238,14 +232,14 @@ func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"), upPod("meshed", "web-b"), upPod("meshed", "web-c"))
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	a, g := upGuard(cs)
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
 	deleted := 0
 	for _, n := range []string{"web-a", "web-b", "web-c"} {
-		if !upPodExists(t, cs, "meshed", n) {
+		if !testutil.PodExists(t, cs, "meshed", n) {
 			deleted++
 		}
 	}
@@ -275,7 +269,7 @@ func TestUnmeshedRemediationSkipsCircuitBrokenInjector(t *testing.T) {
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted while the injector is circuit-broken")
 	}
 }
@@ -295,7 +289,7 @@ func TestUnmeshedRemediationSkipsIgnorePolicyInjector(t *testing.T) {
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted while the injector fails open (Ignore)")
 	}
 }
@@ -311,7 +305,7 @@ func TestUnmeshedRemediationSkipsDeadEndpoints(t *testing.T) {
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted with 0 ready injector endpoints")
 	}
 }
@@ -329,7 +323,7 @@ func TestUnmeshedInjectorHealthRequiresExactName(t *testing.T) {
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted — a lookalike webhook name satisfied injector health")
 	}
 }
@@ -346,7 +340,7 @@ func TestUnmeshedRemediationDisabledByEnv(t *testing.T) {
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted with remediation disabled")
 	}
 }
@@ -373,7 +367,7 @@ func TestUnmeshedRemediationRequiresOwnerAndAge(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, n := range []string{"fresh", "orphan", "bare-owner"} {
-		if !upPodExists(t, cs, "meshed", n) {
+		if !testutil.PodExists(t, cs, "meshed", n) {
 			t.Fatalf("pod %s deleted — age/owner gate failed", n)
 		}
 	}
@@ -404,7 +398,7 @@ func TestUnmeshedRemediationSkipsTerminatingAndMirror(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, n := range []string{"terminating", "mirror"} {
-		if !upPodExists(t, cs, "meshed", n) {
+		if !testutil.PodExists(t, cs, "meshed", n) {
 			t.Fatalf("pod %s deleted — terminating/mirror skip failed", n)
 		}
 	}
@@ -478,7 +472,7 @@ func TestUnmeshedRemediationDeleteUIDPrecondition(t *testing.T) {
 	if gotUID == nil {
 		t.Fatal("eviction missing the UID precondition")
 	}
-	if upPodExists(t, cs, "meshed", "web-a") {
+	if testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod still exists — eviction never landed")
 	}
 }
@@ -514,7 +508,7 @@ func TestUnmeshedRemediationCapsDeleteAttempts(t *testing.T) {
 			evictions, unmeshedDeleteAttempts)
 	}
 	for i := 0; i < 8; i++ {
-		if !upPodExists(t, cs, "meshed", fmt.Sprintf("web-%d", i)) {
+		if !testutil.PodExists(t, cs, "meshed", fmt.Sprintf("web-%d", i)) {
 			t.Fatalf("pod web-%d deleted through the failing reactor", i)
 		}
 	}
@@ -558,10 +552,10 @@ func TestUnmeshedRemediationPDBRefusalDefers(t *testing.T) {
 	if !refused {
 		t.Fatal("web-a eviction never attempted")
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("PDB-refused pod was deleted anyway")
 	}
-	if upPodExists(t, cs, "meshed", "web-b") {
+	if testutil.PodExists(t, cs, "meshed", "web-b") {
 		t.Fatal("PDB refusal on web-a must not block web-b's eviction")
 	}
 	// The refusal is a deferral — web-b's eviction counted, web-a's
@@ -611,7 +605,7 @@ func TestUnmeshedRemediationMaintenanceDefers(t *testing.T) {
 	if evictions != 0 {
 		t.Fatalf("eviction attempted during maintenance: %d", evictions)
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted during maintenance")
 	}
 }
@@ -640,12 +634,12 @@ func TestUnmeshedRemediationStaticCordonDoesNotDefer(t *testing.T) {
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
 		upPod("meshed", "web-a"))
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	a, g := upGuard(cs)
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if upPodExists(t, cs, "meshed", "web-a") {
+	if testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("static cordon held the mutex — remediation must not defer")
 	}
 }
@@ -669,7 +663,7 @@ func TestUnmeshedRemediationKuredLockDefers(t *testing.T) {
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted while kured holds the reboot lock")
 	}
 }
@@ -691,7 +685,7 @@ func TestUnmeshedRemediationAutopilotPlanDefers(t *testing.T) {
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatal(err)
 	}
-	if !upPodExists(t, cs, "meshed", "web-a") {
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
 		t.Fatal("pod deleted while an autopilot plan is in flight")
 	}
 }

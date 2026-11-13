@@ -1,6 +1,7 @@
 package probee
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -433,6 +434,77 @@ func TestHTTPBodyInsecureReadError(t *testing.T) {
 		})}
 	if _, err := HTTPBodyInsecure(context.Background(),
 		"http://probe.invalid/", 5*time.Second, client); err == nil {
+		t.Fatal("body read error must propagate")
+	}
+}
+
+func TestHTTPBodyStreamInsecureKeepsFilteredLines(t *testing.T) {
+	body := "# HELP workqueue_depth Depth.\n" +
+		"workqueue_depth{name=\"a\"} 3\n" +
+		"  konnectivity_network_proxy_server_ready_backend_connections 2\n" +
+		"unrelated_metric 1\n" +
+		"leader_election_master_status 1\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	defer srv.Close()
+	// The kept-lines join preserves the raw padded konn line so the
+	// trim-then-match parsers see exactly what the full body gave;
+	// HELP and unrelated families never survive.
+	kept := [][]byte{[]byte("workqueue_"), []byte("leader_election_master_status"),
+		[]byte("konnectivity_network_proxy_server_ready_backend_connections")}
+	out, err := HTTPBodyStreamInsecure(context.Background(), srv.URL,
+		5*time.Second, func(ln []byte) bool {
+			ln = bytes.TrimLeft(ln, " \t")
+			for _, p := range kept {
+				if bytes.HasPrefix(ln, p) {
+					return true
+				}
+			}
+			return false
+		}, 4<<20)
+	if err != nil {
+		t.Fatalf("stream read: %v", err)
+	}
+	want := "workqueue_depth{name=\"a\"} 3\n" +
+		"  konnectivity_network_proxy_server_ready_backend_connections 2\n" +
+		"leader_election_master_status 1"
+	if out != want {
+		t.Fatalf("kept=%q want %q", out, want)
+	}
+}
+
+func TestHTTPBodyStreamInsecureBudgetAndError(t *testing.T) {
+	// The kept-lines budget stops the scan — no error, partial kept.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for i := 0; i < 100; i++ {
+			_, _ = io.WriteString(w, "keep_me 1\n")
+		}
+	}))
+	defer srv.Close()
+	out, err := HTTPBodyStreamInsecure(context.Background(), srv.URL,
+		5*time.Second, func(ln []byte) bool { return true }, 10)
+	if err != nil {
+		t.Fatalf("budget hit must not error: %v", err)
+	}
+	// Each "keep_me 1" line counts len+1 = the whole 10-byte budget —
+	// exactly one line lands before the scan stops.
+	if out != "keep_me 1" {
+		t.Fatalf("budget not honored: kept %q", out)
+	}
+
+	// A body read error propagates.
+	client := &http.Client{Transport: rtFunc(
+		func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       failReadBody{},
+				Request:    r,
+			}, nil
+		})}
+	if _, err := HTTPBodyStreamInsecure(context.Background(),
+		"http://probe.invalid/", 5*time.Second,
+		func([]byte) bool { return true }, 4<<20, client); err == nil {
 		t.Fatal("body read error must propagate")
 	}
 }

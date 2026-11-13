@@ -25,8 +25,15 @@ const ctrMetaOrphanMinAge = 15 * time.Minute
 
 // ctrMetaJournalWindow is the KR3 journal lookback — corruption
 // signatures only need the recent window; a stale hit from days ago
-// must not latch.
+// must not latch. Only the hand-built-env fork fallback still uses
+// it (the live probe rides the cycle-shared 10m snapshot).
 const ctrMetaJournalWindow = "3 minutes ago"
+
+// ctrMetaProbeTimeout is the containerd socket dial budget — the
+// kubelet A4 hang probe's unixSockProbeTimeout parity (5s): a
+// wedged listener stops accepting and the dial deadline is the
+// verdict.
+const ctrMetaProbeTimeout = 5 * time.Second
 
 // ctrMetaCorruptRe is the KR3 journal signature set — bbolt/meta.db
 // corruption phrases containerd logs when its bolt store won't open.
@@ -40,7 +47,7 @@ var ctrMetaCorruptRe = regexp.MustCompile(
 // altStateKey — a corrupt store survives k0sworker restarts, so the
 // NHC→SNR path needs the latch, not just a restart):
 //
-//   - journalctl -u k0sworker -u containerd --since "3 minutes ago"
+//   - the cycle-shared k0sworker journal snapshot (e.JournalOnce)
 //     matching the bbolt/meta.db corruption signatures, and
 //   - containerd-shim-runc-v2 processes reparented to PID 1 whose
 //     k8s.io task dir still exists but whose init has been dead
@@ -64,12 +71,27 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	evidence := ""
+	// The journal probe rides the CYCLE-SHARED k0sworker snapshot
+	// (e.JournalOnce — built at most once per cycle, and only when a
+	// consumer actually pulls it) instead of forking its own
+	// `journalctl -u k0sworker -u containerd --since "3 minutes ago"`
+	// every cycle: the bbolt/meta.db corruption signatures come out
+	// of k0sworker's own journal when k0s supervises containerd, and
+	// the shared 10-minute window still only covers the recent
+	// past. MetaJournalFn overrides for tests; the old two-unit fork
+	// stays the last fallback for hand-built envs with no snapshot.
 	journalFn := c.d.Cfg.Ctr.MetaJournalFn
-	if journalFn == nil && c.d.Cfg.Systemd != nil {
-		journalFn = func(ctx context.Context) (string, error) {
-			return c.d.Cfg.Systemd.ExecCombined(ctx, "journalctl",
-				"-u", "k0sworker.service", "-u", "containerd.service",
-				"--since", ctrMetaJournalWindow, "--no-pager")
+	if journalFn == nil {
+		if e.JournalOnce != nil {
+			journalFn = func(context.Context) (string, error) {
+				return e.JournalOnce(), nil
+			}
+		} else if c.d.Cfg.Systemd != nil {
+			journalFn = func(ctx context.Context) (string, error) {
+				return c.d.Cfg.Systemd.ExecCombined(ctx, "journalctl",
+					"-u", "k0sworker.service", "-u", "containerd.service",
+					"--since", ctrMetaJournalWindow, "--no-pager")
+			}
 		}
 	}
 	if journalFn != nil {
@@ -109,14 +131,15 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 const ctrMetaDBRel = "containerd/io.containerd.metadata.v1.bolt/meta.db"
 
 // measureMetaDBSize stats the bbolt store and publishes its size on
-// node_agent_ctr_metadb_bytes (containerd-meta-guard), then times the lightest
-// metadata read containerd serves — `k0s ctr -n k8s.io namespaces
-// ls -q` — onto node_agent_ctr_meta_probe_latency_seconds (selfheal-alert-coverage). A
-// meta.db whose freelist fragmented under churn answers this probe
-// in seconds before it starts failing task operations outright —
-// the latency series is the early-warning the size gauge cannot
-// give. A missing file or a failed probe leaves the last value —
-// never a fake 0.
+// node_agent_ctr_metadb_bytes (containerd-meta-guard), then times the
+// lightest reachability probe containerd serves — a connect+close on
+// the daemon's grpc unix socket (d.Cfg.CtrSocket, the same path the
+// kubelet A4 hang probe dials) — onto
+// node_agent_ctr_meta_probe_latency_seconds (selfheal-alert-coverage).
+// A containerd that stops accepting — wedged accept loop, restart
+// mid-flight, a meta.db so broken the daemon never came up — stops
+// answering here first. A missing file or a failed probe leaves the
+// last value — never a fake 0.
 func (c *CtrMetaCheck) measureMetaDBSize(ctx context.Context) {
 	fi, err := os.Stat(filepath.Join(
 		c.d.Cfg.K0sDataDir, ctrMetaDBRel))
@@ -126,18 +149,18 @@ func (c *CtrMetaCheck) measureMetaDBSize(ctx context.Context) {
 	c.measureMetaProbeLatency(ctx)
 }
 
-// measureMetaProbeLatency times one `k0s ctr namespaces ls -q`
-// round-trip through the Ctr.ExecOut seam. The command touches only
-// the namespace index — the cheapest possible meta.db read — so its
-// wall time tracks bbolt page-fetch latency, not payload size. An
-// exec error or a nil seam leaves the previous reading in place.
+// measureMetaProbeLatency times one connect+close round-trip on the
+// containerd grpc socket through the shared ProbeUnixSock seam. The
+// probe touches only the socket's accept queue — no ctr fork, no
+// RPC — so its wall time tracks daemon liveness/accept latency. A
+// nil seam or dial error leaves the previous reading in place.
 func (c *CtrMetaCheck) measureMetaProbeLatency(ctx context.Context) {
-	if c.d.Cfg.Seams.Ctr.ExecOut == nil {
+	if c.d.Cfg.Seams.Probe.ProbeUnixSock == nil {
 		return
 	}
 	start := c.d.Cfg.Seams.Host.Clock.Now()
-	if _, err := c.d.Cfg.Seams.Ctr.ExecOut(ctx,
-		"k0s", "ctr", "-n", "k8s.io", "namespaces", "ls", "-q"); err != nil {
+	if err := c.d.Cfg.Seams.Probe.ProbeUnixSock(ctx,
+		c.d.Cfg.CtrSocket, ctrMetaProbeTimeout); err != nil {
 		return
 	}
 	c.d.CtrMetaProbeLatencySec =

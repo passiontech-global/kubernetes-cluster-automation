@@ -63,7 +63,7 @@ func cgroupStatDying(path string) (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) == 2 && f[0] == "nr_dying_descendants" {
 			if v, err := strconv.ParseInt(f[1], 10, 64); err == nil {

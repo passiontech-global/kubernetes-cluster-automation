@@ -355,7 +355,7 @@ func (w *cfTunnelProxyWatchdog) podLogWedged(ctx context.Context,
 // edge errors) still mean wedged, one alone never does.
 func cloudflaredLogsWedged(logs string) bool {
 	edgeErrs := 0
-	for _, line := range strings.Split(logs, "\n") {
+	for line := range strings.SplitSeq(logs, "\n") {
 		l := strings.ToLower(line)
 		if strings.Contains(l, "couldn't start tunnel") ||
 			strings.Contains(l, "serve tunnel error") {

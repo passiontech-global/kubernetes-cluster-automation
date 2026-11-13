@@ -1,7 +1,6 @@
 package konnectivitypatcher
 
 import (
-	"context"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -37,12 +36,12 @@ func TestKonnectivityPatcher(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(ds)
 	r := &konnectivityPatcher{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
 	got, err := cs.AppsV1().DaemonSets("kube-system").
-		Get(context.Background(), "konnectivity-agent", metav1.GetOptions{})
+		Get(t.Context(), "konnectivity-agent", metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +56,7 @@ func TestKonnectivityPatcher(t *testing.T) {
 	}
 
 	// Second pass is a no-op (already drift-free).
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("second reconcile: %v", err)
 	}
 }
@@ -76,11 +75,11 @@ func TestKonnectivityPatcherSkipsRollout(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(ds)
 	r := &konnectivityPatcher{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	got, _ := cs.AppsV1().DaemonSets("kube-system").
-		Get(context.Background(), "konnectivity-agent", metav1.GetOptions{})
+		Get(t.Context(), "konnectivity-agent", metav1.GetOptions{})
 	if got.Spec.Template.Spec.PriorityClassName != "" {
 		t.Fatal("patched during an unsettled rollout — should have skipped")
 	}

@@ -401,9 +401,7 @@ func deleteAll(ctx context.Context, client *http.Client, base string,
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for p := range jobs {
 				good, detail := deleteOne(ctx, client, base, p)
 				mu.Lock()
@@ -417,7 +415,7 @@ func deleteAll(ctx context.Context, client *http.Client, base string,
 				}
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	for _, p := range paths {
 		select {

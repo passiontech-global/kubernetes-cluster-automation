@@ -5,7 +5,6 @@
 package testhelp
 
 import (
-	"context"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,7 +21,7 @@ func TestNewMetaClientListsPartialMetadata(t *testing.T) {
 	gvr := schema.GroupVersionResource{
 		Group: "apps", Version: "v1", Resource: "replicasets"}
 	list, err := meta.Resource(gvr).Namespace("ns1").List(
-		context.Background(), metav1.ListOptions{})
+		t.Context(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("metadata list: %v", err)
 	}

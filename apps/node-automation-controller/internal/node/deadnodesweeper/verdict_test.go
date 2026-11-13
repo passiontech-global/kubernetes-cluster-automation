@@ -59,49 +59,49 @@ func TestProbeErrDeadEvidence(t *testing.T) {
 		err  error
 		dead bool
 	}{
-		{"nil is not evidence", context.Background(), nil, false},
+		{"nil is not evidence", t.Context(), nil, false},
 
 		// Per-request timeout (the probe's own 8s budget): nothing
 		// answered the tunnel hop — dead evidence.
-		{"bare probe deadline", context.Background(), context.DeadlineExceeded, true},
-		{"deadline wrapped in url.Error", context.Background(), transportErr(context.DeadlineExceeded), true},
+		{"bare probe deadline", t.Context(), context.DeadlineExceeded, true},
+		{"deadline wrapped in url.Error", t.Context(), transportErr(context.DeadlineExceeded), true},
 		// ...but only while the ambient sweep context is alive.
 		{"sweep context canceled", canceledCtx(), context.DeadlineExceeded, false},
 		{"sweep context canceled, transport-shaped", canceledCtx(), transportErr(syscall.ECONNRESET), false},
 
 		// Controller↔apiserver transport failures — the kubelet
 		// cannot cause these; a broken controller path fences nothing.
-		{"dial refused to apiserver", context.Background(), transportErr(os.NewSyscallError("connect", syscall.ECONNREFUSED)), false},
-		{"connection reset", context.Background(), transportErr(os.NewSyscallError("read", syscall.ECONNRESET)), false},
-		{"host unreachable", context.Background(), transportErr(os.NewSyscallError("connect", syscall.EHOSTUNREACH)), false},
-		{"io.EOF — connection torn down", context.Background(), fmt.Errorf("read body: %w", io.EOF), false},
-		{"unexpected EOF mid-response", context.Background(), fmt.Errorf("chunked read: %w", io.ErrUnexpectedEOF), false},
+		{"dial refused to apiserver", t.Context(), transportErr(os.NewSyscallError("connect", syscall.ECONNREFUSED)), false},
+		{"connection reset", t.Context(), transportErr(os.NewSyscallError("read", syscall.ECONNRESET)), false},
+		{"host unreachable", t.Context(), transportErr(os.NewSyscallError("connect", syscall.EHOSTUNREACH)), false},
+		{"io.EOF — connection torn down", t.Context(), fmt.Errorf("read body: %w", io.EOF), false},
+		{"unexpected EOF mid-response", t.Context(), fmt.Errorf("chunked read: %w", io.ErrUnexpectedEOF), false},
 
 		// RBAC and rate limit: the apiserver answered — the kubelet
 		// question was never delivered.
-		{"forbidden proxy subresource", context.Background(), apierrors.NewForbidden(
+		{"forbidden proxy subresource", t.Context(), apierrors.NewForbidden(
 			schema.GroupResource{Resource: "nodes"}, "w1", errors.New("proxy denied")), false},
-		{"unauthorized", context.Background(), apierrors.NewUnauthorized("bad token"), false},
-		{"rate limited (429)", context.Background(), apierrors.NewTooManyRequests("slow down", 30), false},
+		{"unauthorized", t.Context(), apierrors.NewUnauthorized("bad token"), false},
+		{"rate limited (429)", t.Context(), apierrors.NewTooManyRequests("slow down", 30), false},
 
 		// Proxy 5xx naming the kubelet hop — the apiserver answered
 		// and said the kubelet endpoint did not.
-		{"proxy 500 with reach-service marker", context.Background(), proxyErr(500,
+		{"proxy 500 with reach-service marker", t.Context(), proxyErr(500,
 			"error trying to reach service: dial tcp 10.0.0.7:10250: connect: connection refused"), true},
-		{"proxy 502 with connection refused marker", context.Background(), proxyErr(502,
+		{"proxy 502 with connection refused marker", t.Context(), proxyErr(502,
 			"error trying to reach service: dial tcp 10.0.0.7:10250: connect: connection refused"), true},
-		{"proxy 503 with no route to host marker", context.Background(), proxyErr(503,
+		{"proxy 503 with no route to host marker", t.Context(), proxyErr(503,
 			"error trying to reach service: dial tcp 10.0.0.7:10250: no route to host"), true},
-		{"proxy 504 with i/o timeout marker", context.Background(), proxyErr(504,
+		{"proxy 504 with i/o timeout marker", t.Context(), proxyErr(504,
 			"error trying to reach service: dial tcp 10.0.0.7:10250: i/o timeout"), true},
 		// ...but a 5xx that does NOT name the kubelet hop is the
 		// apiserver's own trouble.
-		{"proxy 500 without markers", context.Background(), proxyErr(500,
+		{"proxy 500 without markers", t.Context(), proxyErr(500,
 			"runtime error: index out of range"), false},
-		{"proxy 503 busy, no markers", context.Background(), apierrors.NewServiceUnavailable("apiserver proxy busy"), false},
-		{"plain error with marker but no status", context.Background(), errors.New("error trying to reach service"), false},
+		{"proxy 503 busy, no markers", t.Context(), apierrors.NewServiceUnavailable("apiserver proxy busy"), false},
+		{"plain error with marker but no status", t.Context(), errors.New("error trying to reach service"), false},
 
-		{"opaque apiserver error", context.Background(), errors.New("malformed response"), false},
+		{"opaque apiserver error", t.Context(), errors.New("malformed response"), false},
 		{"context canceled (shutdown)", canceledCtx(), context.Canceled, false},
 	}
 	for _, tc := range cases {
@@ -172,7 +172,7 @@ func TestProbeErrDeadEvidenceRealShapes(t *testing.T) {
 	t.Run("per-request timeout is dead evidence while the sweep context lives", func(t *testing.T) {
 		// The kubeletHealthzTimeout shape: nothing answered inside the
 		// request's own budget, the sweep context still alive.
-		probeCtx, probeCtxCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		probeCtx, probeCtxCancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
 		defer probeCtxCancel()
 		_, err := kube.KubeletHealthz(probeCtx, testutil.ProbeClientset(t,
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -190,7 +190,7 @@ func TestProbeErrDeadEvidenceRealShapes(t *testing.T) {
 		// The sweep-level shape is "DeadlineExceeded with the AMBIENT
 		// context alive" — here the deadline belongs to the request,
 		// so the classifier must see a live ambient ctx as alive.
-		if !probeErrDeadEvidence(context.Background(), err) {
+		if !probeErrDeadEvidence(t.Context(), err) {
 			t.Fatalf("per-request deadline must be dead evidence, got inconclusive for: %v (%T)", err, err)
 		}
 		// The same deadline with the sweep ctx ALSO done is shutdown

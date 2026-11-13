@@ -113,20 +113,22 @@ func (p *Probe) reapStuckSessions(ctx context.Context, pg, user, pass string,
 		note(fmt.Sprintf("reap-sessions-fail: %v", err))
 		return
 	}
-	// -tA returns one 't' per terminated backend.
-	if n := strings.Count(out, "t\n") + boolToInt(strings.TrimSpace(out) == "t"); n > 0 {
+	// -tA returns one 't' per terminated backend — and a trailing
+	// newline on every row. Counting "t\n" substrings PLUS a bare
+	// "t" fallback double-counted a single termination ("t\n" has
+	// both): count non-empty lines instead.
+	n := 0
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	if n > 0 {
 		p.d.M.IdleTxTerm.Add(float64(n))
 		p.d.M.IdleTermTotal += int64(n) // textfile mirror of the counter
 		note(fmt.Sprintf("reaped %d stuck kine session(s)", n))
 		logger().Warn("kinedb: terminated stuck kine sessions", "count", n)
 	}
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // activeBackendQueries counts backends currently running a query on

@@ -72,14 +72,12 @@ func (n *Deps) ProbeNebulaOverlay(ctx context.Context,
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, t := range targets {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			ok, rtt := n.Ping(ctx, t, count, wait, false)
 			mu.Lock()
 			results[t] = PingResult{ok, rtt}
 			mu.Unlock()
-		}()
+		})
 	}
 	wg.Wait()
 	return targets, results

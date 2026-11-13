@@ -12,14 +12,27 @@ import (
 	"net/http/pprof"
 )
 
+// Handlers returns the standard net/http/pprof handlers keyed by the
+// path each must be mounted at, so callers can attach them to their
+// own mux (or httpx-injected handler) without importing
+// net/http/pprof themselves. The returned map is a fresh copy per
+// call; mutating it does not affect Register or other callers.
+func Handlers() map[string]http.Handler {
+	return map[string]http.Handler{
+		"/debug/pprof/":        http.HandlerFunc(pprof.Index),
+		"/debug/pprof/cmdline": http.HandlerFunc(pprof.Cmdline),
+		"/debug/pprof/profile": http.HandlerFunc(pprof.Profile),
+		"/debug/pprof/symbol":  http.HandlerFunc(pprof.Symbol),
+		"/debug/pprof/trace":   http.HandlerFunc(pprof.Trace),
+	}
+}
+
 // Register mounts the standard net/http/pprof handlers on mux under
 // /debug/pprof/ — the index plus the cmdline, profile, symbol and
 // trace endpoints. Call once at startup on the mux the debug
 // listener serves.
 func Register(mux *http.ServeMux) {
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	for path, h := range Handlers() {
+		mux.Handle(path, h)
+	}
 }

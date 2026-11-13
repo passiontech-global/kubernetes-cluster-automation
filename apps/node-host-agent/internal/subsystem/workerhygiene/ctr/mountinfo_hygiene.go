@@ -29,6 +29,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
@@ -87,10 +88,21 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	// The containerd task map is the "no ctr container references
 	// it" verdict; an incomplete map (a root unlistable) makes the
-	// pod-volume group unverifiable → fail closed.
-	tasks, tasksComplete := map[string][]wdeps.CtrTask{}, false
-	if e.TasksOnce != nil {
-		tasks, tasksComplete = e.TasksOnce()
+	// pod-volume group unverifiable → fail closed. Lazily resolved:
+	// the map only matters when a pod-volume mount line actually
+	// shows up (and only when the apiserver answered), so a cycle
+	// with no pod-volume candidates never builds it.
+	var tasks map[string][]wdeps.CtrTask
+	tasksComplete := false
+	tasksFetched := false
+	tasksOnce := func() (map[string][]wdeps.CtrTask, bool) {
+		if !tasksFetched {
+			tasksFetched = true
+			if e.TasksOnce != nil {
+				tasks, tasksComplete = e.TasksOnce()
+			}
+		}
+		return tasks, tasksComplete
 	}
 
 	seen := map[string]bool{} // marker ids still candidates
@@ -98,15 +110,14 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	capLogged := false        // the reap-cap suspect line logs once per cycle
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 
-	for _, ln := range strings.Split(string(data), "\n") {
+	for ln := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(ln)
 		if len(f) < 5 {
 			continue
 		}
-		mount := unescapeMountPoint(f[4]) // field 5 is the mount point
-		switch {
-		case strings.HasPrefix(mount, hostTaskRoot+"/") &&
-			strings.HasSuffix(mount, "/rootfs"):
+		mount := procfs.UnescapeMountPath(f[4]) // field 5 is the mount point
+		if strings.HasPrefix(mount, hostTaskRoot+"/") &&
+			strings.HasSuffix(mount, "/rootfs") {
 			id := filepath.Base(strings.TrimSuffix(mount, "/rootfs"))
 			if id == "" || id == "." || id == "/" {
 				continue
@@ -147,8 +158,15 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				reaped++
 				c.d.State.ClearBudget(marker)
 			}
-		case podVolEligible && tasksComplete &&
-			strings.HasPrefix(mount, hostPodsDir+"/"):
+			continue
+		}
+		if !podVolEligible {
+			continue // an inconclusive LIST must never rehome a volume
+		}
+		if !strings.HasPrefix(mount, hostPodsDir+"/") {
+			continue
+		}
+		{
 			rel := strings.TrimPrefix(mount, hostPodsDir+"/")
 			// The mount point must sit under the pod's volumes tree:
 			// <uid>/volumes/<plugin>/<vol>.
@@ -160,8 +178,14 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			if uid == "" || podLive[uid] {
 				continue
 			}
-			if _, ok := tasks[uid]; ok {
+			taskMap, _ := tasksOnce()
+			if _, ok := taskMap[uid]; ok {
 				continue // a containerd task still references the pod
+			}
+			// An incomplete map makes the pod-volume group
+			// unverifiable → fail closed.
+			if !tasksComplete {
+				continue
 			}
 			// Staleness evidence is the pod dir's own mtime — the
 			// spec's "pod dir stale > 30m" gate.
@@ -203,18 +227,10 @@ func taskDirListed(root, id string) bool {
 	return err == nil
 }
 
-// unescapeMountPoint decodes the kernel's octal escapes in
-// mountinfo fields ("\\040" space, "\\011" tab, "\\012" newline,
-// "\\134" backslash) — pod/volume names may contain spaces.
-func unescapeMountPoint(s string) string {
-	r := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
-	return r.Replace(s)
-}
-
 // countLines counts non-empty mountinfo lines.
 func countLines(data []byte) int {
 	n := 0
-	for _, ln := range strings.Split(string(data), "\n") {
+	for ln := range strings.SplitSeq(string(data), "\n") {
 		if strings.TrimSpace(ln) != "" {
 			n++
 		}

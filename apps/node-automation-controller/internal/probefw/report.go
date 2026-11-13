@@ -24,7 +24,6 @@ package probefw
 
 import (
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -120,7 +119,7 @@ func (r *SweepReport) Findings() []string {
 // builds and for heal loops that iterate findings.
 func (r *SweepReport) Sorted() []string {
 	out := slices.Clone(r.findings)
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
@@ -150,7 +149,7 @@ func (r *SweepReport) Verdict(whyPrefix, joinSep string) Result {
 		}
 		return Result{Pass: true}
 	}
-	sort.Strings(r.findings)
+	slices.Sort(r.findings)
 	return Result{
 		Infra: r.firstErr,
 		Why:   whyPrefix + strings.Join(r.findings, joinSep),

@@ -56,7 +56,7 @@ func (c *volumeAttachmentCleaner) pruneVanishedNodes(nodeByName map[string]*core
 func (c *volumeAttachmentCleaner) nodeFencedDead(ctx context.Context,
 	node *corev1.Node, livePods map[string]podListProbe, now time.Time) bool {
 	log := logf.FromContext(ctx)
-	if !kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+	if !kube.HasTaint(node.Spec.Taints, kube.TaintNodeOutOfService) {
 		return false // not fenced — NotReady alone is never a verdict
 	}
 	if kube.NodeReady(node) {

@@ -218,6 +218,9 @@ func (c *cyc) groupKineService() {
 		url:    url,
 		sum:    sum,
 		staged: r.hp(binPath),
+		// The staged file IS the dest binary — it must land
+		// executable, not at the 0644 staging default.
+		downloadMode: 0o755,
 		downloadErr: func(c *cyc, err error) {
 			c.err("kine.service: kine binary download", "url", url, "error", err)
 		},

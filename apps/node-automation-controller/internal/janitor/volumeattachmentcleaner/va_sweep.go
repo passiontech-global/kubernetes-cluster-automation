@@ -300,7 +300,7 @@ func (c *volumeAttachmentCleaner) confirmTarget(ctx context.Context,
 		// LIVE pod list so its Status.VolumesInUse/VolumesAttached
 		// (and the pod census) decide, never the stale copy.
 		if kube.NodeReady(live) &&
-			!kube.HasTaint(live.Spec.Taints, vaOutOfServiceTaint) {
+			!kube.HasTaint(live.Spec.Taints, kube.TaintNodeOutOfService) {
 			return c.stuckReadyUnused(ctx, t.va, liveNodes,
 				liveNodePods, cyc.pvcPVs, cyc.pvNames, log), nil
 		}

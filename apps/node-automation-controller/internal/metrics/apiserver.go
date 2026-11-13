@@ -88,6 +88,18 @@ var WebhookHeartbeatResourceExposed = prometheus.NewGaugeVec(prometheus.GaugeOpt
 	Help: "1 while the fail-closed webhook's rules intercept nodes/status, pods/status, pods/eviction, or leases and its namespaceSelector still matches the critical self-healing namespaces.",
 }, []string{"kind", "name", "webhook", "resource"})
 
+// CRDConversionWebhookUnhealthy marks (1) each CustomResourceDefinition
+// whose spec.conversion webhook backend is measurably broken — a
+// single-check series of the admission-webhook-guard CRD conversion
+// breaker (Wave 5.1 consolidated out of the module file into the
+// apiserver domain file). reason carries the verdict
+// (missing_service|zero_endpoints|tls_probe_failed); the series
+// disappears once the backend is healthy again.
+var CRDConversionWebhookUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_crd_conversion_webhook_unhealthy",
+	Help: "1 while the CRD's spec.conversion webhook backend is unhealthy (missing_service|zero_endpoints|tls_probe_failed).",
+}, []string{"crd", "service", "reason"})
+
 // ---------------------------------------------------------------------------
 // Operations metrics — cluster-health check series.
 // ---------------------------------------------------------------------------
@@ -141,6 +153,7 @@ var apiserverCollectors = []prometheus.Collector{
 	APIServiceUnavailable,
 	UnmeshedPods, UnmeshedPodsRecreatedTotal,
 	APIServiceUnblockHealsTotal,
+	CRDConversionWebhookUnhealthy,
 }
 
 func init() {

@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -44,7 +44,7 @@ func ciliumUnhealthySubsystems(body []byte) []string {
 		}
 	}
 	walk("", v)
-	sort.Strings(bad)
+	slices.Sort(bad)
 	return bad
 }
 
@@ -202,13 +202,13 @@ func (c *CiliumEnvoyCheck) killCiliumEnvoy(tasks []wdeps.CtrTask, why string) {
 // cds/lds/rds AND the name ends in update_rejected.
 func ParseEnvoyXDSRejected(body []byte) uint64 {
 	var total uint64
-	for _, line := range strings.Split(string(body), "\n") {
+	for line := range strings.SplitSeq(string(body), "\n") {
 		name, val, ok := strings.Cut(line, ":")
 		if !ok || !strings.HasSuffix(strings.TrimSpace(name), "update_rejected") {
 			continue
 		}
 		match := false
-		for _, seg := range strings.Split(name, ".") {
+		for seg := range strings.SplitSeq(name, ".") {
 			if seg == "cds" || seg == "lds" || seg == "rds" {
 				match = true
 				break

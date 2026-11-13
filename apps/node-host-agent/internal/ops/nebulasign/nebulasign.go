@@ -318,7 +318,7 @@ func signAll(ctx context.Context, certBin string, cfg signConfig, jobs []signJob
 // host.pub slurp — all produce the same output.
 func stripPubArmor(s string) string {
 	var b strings.Builder
-	for _, line := range strings.Split(s, "\n") {
+	for line := range strings.SplitSeq(s, "\n") {
 		line = strings.TrimSpace(line)
 		// Armor lines start with "-----" (-----BEGIN/END ...-----).
 		// Base64 content can legitimately contain "BEGIN"/"END" as

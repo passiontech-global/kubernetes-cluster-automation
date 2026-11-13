@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -56,7 +56,7 @@ func (s *Syncer) syncDir(ctx context.Context, c Conn, localDir, remoteDir, mode 
 		}
 		names = append(names, e.Name())
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	rpaths := make([]string, len(names))
 	for i := range names {
 		rpaths[i] = path.Join(remoteDir, names[i])
@@ -116,7 +116,7 @@ func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, n
 	for _, n := range names {
 		local[n] = true
 	}
-	for _, rname := range strings.Split(out, "\n") {
+	for rname := range strings.SplitSeq(out, "\n") {
 		rname = strings.TrimSpace(rname)
 		if rname == "" || local[rname] || strings.HasSuffix(rname, "/") ||
 			strings.HasPrefix(rname, ".") {
@@ -154,7 +154,7 @@ func (s *Syncer) sweepTmpOrphans(ctx context.Context, c Conn, dir string) error 
 			"dir", dir, "error", err)
 		return nil
 	}
-	for _, name := range strings.Split(out, "\n") {
+	for name := range strings.SplitSeq(out, "\n") {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue

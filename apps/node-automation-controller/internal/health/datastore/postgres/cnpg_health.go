@@ -347,7 +347,7 @@ func cnpgFencedInstanceList(cr *unstructured.Unstructured) []string {
 	raw, _ := kube.NestedString(
 		cr.Object, "metadata", "annotations", cnpgFencedInstancesAnno)
 	var out []string
-	for _, s := range strings.Split(raw, ",") {
+	for s := range strings.SplitSeq(raw, ",") {
 		if s = strings.TrimSpace(s); s != "" {
 			out = append(out, s)
 		}

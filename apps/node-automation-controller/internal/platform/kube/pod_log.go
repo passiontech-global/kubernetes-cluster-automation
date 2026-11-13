@@ -14,10 +14,12 @@ package kube
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -120,10 +122,58 @@ func ReadPodLogTail(ctx context.Context, cs kubernetes.Interface,
 	if err != nil {
 		return false, err
 	}
-	for _, line := range strings.Split(data, "\n") {
+	for line := range strings.SplitSeq(data, "\n") {
 		if match(line) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// PodLogScan is one pod's fan-out result: the scan's value (a matched
+// reason string, collected markers, ...) and its error. A fetch/read
+// failure lands in Err — the caller logs it per pod rather than
+// reading "no match" as clean (the inconclusive-not-healthy posture
+// every log-scanning check documents); Err is never wrapped, so
+// callers can apierrors-classify it exactly as ReadPodLogTail
+// returned it.
+type PodLogScan[T any] struct {
+	Value T
+	Err   error
+}
+
+// ScanPodLogs fans a bounded worker pool over pods, fetching each
+// pod's bounded log tail through the caller's scan closure (which
+// composes PodLogOpts + the per-line match itself) and collecting the
+// indexed results — out[i] corresponds to pods[i]. Each fetch is a
+// kubelet round-trip (the sweep's slowest read), so the pool spawns
+// at most min(workers, len(pods)) goroutines instead of one per
+// candidate; the result slice is written only at the worker's own
+// index, so no locking beyond the errgroup barrier. A panic inside
+// one pod's scan reads as that pod's inconclusive scan — never a
+// process crash. The pool does NOT cancel sibling scans on an error:
+// every pod's verdict is collected (the caller decides per pod).
+func ScanPodLogs[T any](ctx context.Context, cs kubernetes.Interface,
+	pods []*corev1.Pod, workers int,
+	scan func(ctx context.Context, pod *corev1.Pod) (T, error)) []PodLogScan[T] {
+
+	out := make([]PodLogScan[T], len(pods))
+	var g errgroup.Group
+	g.SetLimit(workers)
+	for i := range pods {
+		pod := pods[i]
+		g.Go(func() error {
+			defer func() {
+				if r := recover(); r != nil {
+					out[i] = PodLogScan[T]{
+						Err: fmt.Errorf("pod log scan panicked: %v", r)}
+				}
+			}()
+			v, err := scan(ctx, pod)
+			out[i] = PodLogScan[T]{Value: v, Err: err}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return out
 }

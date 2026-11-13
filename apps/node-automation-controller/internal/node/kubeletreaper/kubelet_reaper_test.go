@@ -82,7 +82,7 @@ func TestKubeletReaperDefersTaintUnderOpenCircuit(t *testing.T) {
 	now := time.Now()
 	krConfigureBreaker(t, "kubelet-liveness-reaper", "w1", now)
 	r := krReaper(cs, now)
-	if err := r.sweep(context.Background(), n, false); err != nil {
+	if err := r.sweep(t.Context(), n, false); err != nil {
 		t.Fatalf("open circuit must defer, not error: %v", err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -100,7 +100,7 @@ func TestKubeletReaperFreshCircuitTaints(t *testing.T) {
 	heal.ConfigureTargetBreaker(3, time.Hour)
 	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
 	r := krReaper(cs, now)
-	if err := r.sweep(context.Background(), n, false); err != nil {
+	if err := r.sweep(t.Context(), n, false); err != nil {
 		t.Fatal(err)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -117,7 +117,7 @@ func TestKubeletReaperHealthyProbeClearsHistory(t *testing.T) {
 	now := time.Now()
 	krConfigureBreaker(t, "kubelet-liveness-reaper", "w1", now)
 	r := krReaper(cs, now)
-	if err := r.sweep(context.Background(), n, true); err != nil {
+	if err := r.sweep(t.Context(), n, true); err != nil {
 		t.Fatal(err)
 	}
 	if ok, _ := heal.TryAcquireTarget("kubelet-liveness-reaper", "w1",
@@ -150,7 +150,7 @@ func TestKubeletReaperRunListError(t *testing.T) {
 			return true, nil, errors.New("apiserver down")
 		})
 	r := krRunReaper(cs, time.Now(), func(context.Context, string) bool { return true })
-	if err := r.run(context.Background()); err == nil {
+	if err := r.run(t.Context()); err == nil {
 		t.Fatal("node list failure must return an error")
 	}
 }
@@ -177,7 +177,7 @@ func TestKubeletReaperRunAbortsWhenNoProbeSucceeds(t *testing.T) {
 			mu.Unlock()
 			return false
 		})
-	if err := r.run(context.Background()); err != nil {
+	if err := r.run(t.Context()); err != nil {
 		t.Fatalf("all-fail run must absorb, not error: %v", err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -223,7 +223,7 @@ func TestKubeletReaperRunTaintsOnlyTheDeadWorker(t *testing.T) {
 	now := time.Now()
 	r := krRunReaper(cs, now,
 		func(_ context.Context, node string) bool { return node == "w-ok" })
-	if err := r.run(context.Background()); err != nil {
+	if err := r.run(t.Context()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	// w-dead already carried the taint -> kept (no lease renewal).
@@ -263,12 +263,12 @@ func TestKubeletReaperRunAbsorbsSweepErrors(t *testing.T) {
 	// One healthy node keeps anyOK true so the sweep runs at all —
 	// zero successes would abort before any per-node decision.
 	wOK := testutil.Node("w-ok", corev1.ConditionTrue, nil)
-	if _, err := cs.CoreV1().Nodes().Create(context.Background(), wOK, metav1.CreateOptions{}); err != nil {
+	if _, err := cs.CoreV1().Nodes().Create(t.Context(), wOK, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	r := krRunReaper(cs, time.Now(),
 		func(_ context.Context, node string) bool { return node == "w-ok" })
-	if err := r.run(context.Background()); err != nil {
+	if err := r.run(t.Context()); err != nil {
 		t.Fatalf("sweep error must be absorbed into a nil return: %v", err)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w-dead").Spec.Taints, kubeletReaperTaint) {

@@ -41,43 +41,48 @@ type failedJobTarget struct {
 func (j *failedJobsJanitor) sweepFailedJobs(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 
-	jobs, err := kube.ListAll(ctx,
+	// Streamed pages, not a materialized cluster-wide job slice: the
+	// filter pass needs Status.Conditions (metadata-only lists cannot
+	// serve it), but it only ever extracts the tiny failedJobTarget
+	// tuples — each page's objects die with the page instead of
+	// pinning every Job in the cluster until the deletes run.
+	var targets []failedJobTarget
+	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Jobs(j.cs, metav1.NamespaceAll))
+		kube.Jobs(j.cs, metav1.NamespaceAll),
+		func(page []batchv1.Job) error {
+			for i := range page {
+				job := &page[i]
+				if job.DeletionTimestamp != nil {
+					continue // already terminating — a second delete just burns a cap slot
+				}
+				var failedAt *metav1.Time
+				for ci := range job.Status.Conditions {
+					c := &job.Status.Conditions[ci]
+					if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue && !c.LastTransitionTime.IsZero() {
+						failedAt = &c.LastTransitionTime
+						break
+					}
+				}
+				if failedAt == nil {
+					continue // not failed, or no timestamp — keep
+				}
+				age := j.now.Now().Sub(failedAt.Time)
+				if age <= failedJobMaxAge {
+					continue
+				}
+				targets = append(targets, failedJobTarget{
+					ns:       job.Namespace,
+					name:     job.Name,
+					uid:      job.UID,
+					ageHours: int(age.Hours()),
+				})
+			}
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("list jobs: %w", err)
 	}
-
-	var targets []failedJobTarget
-	for i := range jobs {
-		job := &jobs[i]
-		if job.DeletionTimestamp != nil {
-			continue // already terminating — a second delete just burns a cap slot
-		}
-		var failedAt *metav1.Time
-		for ci := range job.Status.Conditions {
-			c := &job.Status.Conditions[ci]
-			if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue && !c.LastTransitionTime.IsZero() {
-				failedAt = &c.LastTransitionTime
-				break
-			}
-		}
-		if failedAt == nil {
-			continue // not failed, or no timestamp — keep
-		}
-		age := j.now.Now().Sub(failedAt.Time)
-		if age <= failedJobMaxAge {
-			continue
-		}
-		targets = append(targets, failedJobTarget{
-			ns:       job.Namespace,
-			name:     job.Name,
-			uid:      job.UID,
-			ageHours: int(age.Hours()),
-		})
-	}
-	// Release the cluster-wide job slice before issuing Delete calls.
-	jobs = nil
 
 	deleted, failed, capped := reap.Sweep(ctx, log, targets, reap.Options[failedJobTarget]{
 		// The cap bounds delete attempts (failed deletes churn the

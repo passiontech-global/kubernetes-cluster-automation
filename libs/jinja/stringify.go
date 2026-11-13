@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Stringify renders v in python repr style: True/False/None,
@@ -195,17 +197,55 @@ func writeJSONAt(v any, b *strings.Builder, depth int, steps *int) error {
 	case Undefined:
 		b.WriteString("null")
 		return nil
-	default:
-		// Scalars (and non-jinja container types) marshal exactly
-		// as encoding/json handled them before — including HTML
-		// escaping and json.Marshaler support.
-		bb, err := json.Marshal(v)
-		if err != nil {
-			return err
-		}
-		b.Write(bb)
-		return nil
 	}
+
+	// Scalar fast path — the engine's scalar shapes written straight
+	// into b, byte-identical to what json.Marshal emits for them but
+	// with no intermediate []byte (and no reflect walk) per node.
+	switch s := v.(type) {
+	case nil:
+		b.WriteString("null")
+		return nil
+	case bool:
+		if s {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
+		return nil
+	case string:
+		writeJSONString(s, b)
+		return nil
+	case int64:
+		b.WriteString(strconv.FormatInt(s, 10))
+		return nil
+	case float64:
+		if writeJSONFloat(b, s) {
+			return nil
+		}
+		// NaN/±Inf defer to the generic encoder below so its exact
+		// UnsupportedValueError stays the observable failure.
+	case int, int8, int16, int32, uint, uint8, uint16, uint32, uint64:
+		// Every Go integer width marshals as plain decimal, exactly
+		// what json.Marshal prints for these kinds.
+		if i, ok := asInt64(s); ok {
+			b.WriteString(strconv.FormatInt(i, 10))
+			return nil
+		}
+		if u, ok := asUint64(s); ok {
+			b.WriteString(strconv.FormatUint(u, 10))
+			return nil
+		}
+	}
+	// Non-jinja container types (and the scalars the fast path
+	// defers) marshal exactly as encoding/json handled them before —
+	// including HTML escaping and json.Marshaler support.
+	bb, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b.Write(bb)
+	return nil
 }
 
 // writeJSONMap emits {"k":v,...} walking keys in the given order.
@@ -215,11 +255,7 @@ func writeJSONMap(keys []string, get func(string) any, b *strings.Builder, depth
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		kb, err := json.Marshal(k)
-		if err != nil {
-			return err
-		}
-		b.Write(kb)
+		writeJSONString(k, b)
 		b.WriteByte(':')
 		if err := writeJSONAt(get(k), b, depth+1, steps); err != nil {
 			return err
@@ -241,4 +277,125 @@ func writeJSONList(items []any, b *strings.Builder, depth int, steps *int) error
 	}
 	b.WriteByte(']')
 	return nil
+}
+
+// jsonHTMLSafe marks the ASCII bytes json.Marshal's HTML-escaped
+// string encoder passes through verbatim: 0x20–0x7F minus `"`, `&`,
+// `<`, `>` and `\` (encoding/json's htmlSafeSet under its default
+// escapeHTML=true). Bytes ≥ 0x80 never index it — they go through
+// the UTF-8 decode path.
+var jsonHTMLSafe = func() [utf8.RuneSelf]bool {
+	var set [utf8.RuneSelf]bool
+	for c := 0x20; c < utf8.RuneSelf; c++ {
+		set[c] = true
+	}
+	for _, c := range []byte{'"', '&', '<', '>', '\\'} {
+		set[c] = false
+	}
+	return set
+}()
+
+const jsonHexDigits = "0123456789abcdef"
+
+// writeJSONString writes s as a JSON string exactly as
+// encoding/json's default (HTML-escaping) encoder does — `<`/`>`/`&`
+// as \u003c/\u003e/\u0026, \u2028/\u2029 escaped for JSONP safety,
+// control chars short-escaped (\n \r \t \b \f) or \u00XX, invalid
+// UTF-8 bytes as \ufffd, everything else verbatim. Straight into b:
+// no intermediate []byte per string.
+func writeJSONString(s string, b *strings.Builder) {
+	b.WriteByte('"')
+	start := 0
+	for i := 0; i < len(s); {
+		if c := s[i]; c < utf8.RuneSelf {
+			if jsonHTMLSafe[c] {
+				i++
+				continue
+			}
+			if start < i {
+				b.WriteString(s[start:i])
+			}
+			b.WriteByte('\\')
+			switch c {
+			case '\\', '"':
+				b.WriteByte(c)
+			case '\b':
+				b.WriteByte('b')
+			case '\f':
+				b.WriteByte('f')
+			case '\n':
+				b.WriteByte('n')
+			case '\r':
+				b.WriteByte('r')
+			case '\t':
+				b.WriteByte('t')
+			default:
+				b.WriteString(`u00`)
+				b.WriteByte(jsonHexDigits[c>>4])
+				b.WriteByte(jsonHexDigits[c&0xF])
+			}
+			i++
+			start = i
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			if start < i {
+				b.WriteString(s[start:i])
+			}
+			// The invalid byte becomes the replacement CHARACTER in
+			// raw UTF-8 (ef bf bd) — this toolchain's encoder writes
+			// the rune itself, not the old \\ufffd escape.
+			b.WriteRune(utf8.RuneError)
+			i += size
+			start = i
+			continue
+		}
+		// U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR)
+		// are valid JSON but break JSONP — escaped unconditionally,
+		// like encoding/json.
+		if r == '\u2028' || r == '\u2029' {
+			if start < i {
+				b.WriteString(s[start:i])
+			}
+			b.WriteString(`\u202`)
+			b.WriteByte(jsonHexDigits[r&0xF])
+			i += size
+			start = i
+		} else {
+			i += size
+		}
+	}
+	if start < len(s) {
+		b.WriteString(s[start:])
+	}
+	b.WriteByte('"')
+}
+
+// writeJSONFloat writes f exactly as encoding/json's floatEncoder
+// does: shortest round-trip form, 'f' while |f| ∈ [1e-6, 1e21),
+// shortest 'e' outside that window with the exponent's leading zero
+// stripped (e-09 → e-9). Reports false for NaN/±Inf — those have no
+// JSON form and defer to the generic encoder for its exact
+// UnsupportedValueError.
+func writeJSONFloat(b *strings.Builder, f float64) bool {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return false
+	}
+	format := byte('f')
+	if abs := math.Abs(f); abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
+	}
+	var scratch [32]byte
+	out := strconv.AppendFloat(scratch[:0], f, format, -1, 64)
+	if format == 'e' {
+		// clean up e-09 to e-9
+		n := len(out)
+		if n >= 4 && out[n-4] == 'e' && out[n-3] == '-' && out[n-2] == '0' {
+			out[n-2] = out[n-1]
+			out = out[:n-1]
+		}
+	}
+	b.Write(out)
+	return true
 }

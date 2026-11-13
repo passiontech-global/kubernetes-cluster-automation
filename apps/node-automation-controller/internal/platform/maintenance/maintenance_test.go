@@ -75,7 +75,7 @@ func TestNodeCordonEvidenceFreshOnly(t *testing.T) {
 	fresh := maintenanceCordoned("w1", 10*time.Minute)
 	stale := maintenanceCordoned("w2", 2*time.Hour)
 	cs := fake.NewSimpleClientset(fresh, stale)
-	ev, err := nodeCordonEvidence(context.Background(), cs, time.Now())
+	ev, err := nodeCordonEvidence(t.Context(), cs, nil, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestNodeCordonEvidenceListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	if _, err := nodeCordonEvidence(ctx, cs, time.Now()); err == nil {
+	if _, err := nodeCordonEvidence(ctx, cs, nil, time.Now()); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -104,14 +104,14 @@ func TestNodeCordonEvidenceUsesInjectedClock(t *testing.T) {
 	base := time.Now()
 	n := maintenanceCordoned("w1", 10*time.Minute) // TimeAdded = base-10m
 	cs := fake.NewSimpleClientset(n)
-	ev, err := nodeCordonEvidence(ctx, cs, base)
+	ev, err := nodeCordonEvidence(ctx, cs, nil, base)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(ev, []string{"node w1 actively cordoned"}) {
 		t.Fatalf("at base the cordon is fresh evidence, got %v", ev)
 	}
-	ev, err = nodeCordonEvidence(ctx, cs, base.Add(46*time.Minute))
+	ev, err = nodeCordonEvidence(ctx, cs, nil, base.Add(46*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestMedik8sRemediationEvidencePagesThroughObjects(t *testing.T) {
 // evaluation), and a fresh evaluation past the TTL sees it. An error
 // verdict is sticky for the window too — the fail-closed contract.
 func TestVerdictActiveMemoizesWithinTTL(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	cs := fake.NewSimpleClientset()
 	dyn := maintenanceDynFake()
 	base := time.Now()
@@ -488,7 +488,7 @@ func TestVerdictActiveMemoizesWithinTTL(t *testing.T) {
 // looping targets does not re-pay three failing API reads per target,
 // and the fail-closed error never silently clears.
 func TestVerdictActiveSticksErrorWithinTTL(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	cs := fake.NewSimpleClientset()
 	base := time.Now()
 
@@ -578,7 +578,7 @@ func TestMedik8sTargetNodeLongestPrefix(t *testing.T) {
 // — stamping is the dedicated runnable's job. A fresh cordon holds
 // the verdict and the fake clientset must record ZERO writes.
 func TestVerdictActiveIsReadOnly(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	n := maintenanceCordoned("w1", time.Minute)
 	cs := fake.NewSimpleClientset(n)
 	dyn := maintenanceDynFake()

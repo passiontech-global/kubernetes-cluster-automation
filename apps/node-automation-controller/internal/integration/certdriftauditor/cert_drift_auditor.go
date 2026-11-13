@@ -106,9 +106,8 @@ const (
 	// this module's audit target; the namespace and the Deployment
 	// come from the shared kube topology identifiers (LinkerdNS,
 	// LinkerdIdentityName).
-	linkerdIssuerSecret      = "linkerd-identity-issuer"
-	linkerdIssuerRolloutAnno = "kubectl.kubernetes.io/restartedAt"
-	linkerdIssuerCooldown    = 30 * time.Minute
+	linkerdIssuerSecret   = "linkerd-identity-issuer"
+	linkerdIssuerCooldown = 30 * time.Minute
 )
 
 // certificateGVR resolves a Certificate's spec.secretName — the only

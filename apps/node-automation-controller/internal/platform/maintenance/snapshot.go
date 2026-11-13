@@ -70,13 +70,15 @@ func maintenanceSnapshotFrom(ctx context.Context) MaintenanceSnapshotProvider {
 
 // maintenanceNodeList returns the node census for the mutex evidence
 // paths — the provider's sweep-memoized read when installed, else the
-// direct paged list every non-sweep caller always made.
-func maintenanceNodeList(ctx context.Context,
-	cs kubernetes.Interface) ([]corev1.Node, error) {
+// informer-backed ListNodesCached when a reader is wired (nil reader
+// falls back to the direct paged list inside ListNodesCached, the
+// shape every non-sweep, reader-less caller always made).
+func maintenanceNodeList(ctx context.Context, cs kubernetes.Interface,
+	nodeReader kube.CachedNodeReader) ([]corev1.Node, error) {
 	if p := maintenanceSnapshotFrom(ctx); p != nil {
 		return p.Nodes(ctx)
 	}
-	return kube.ListNodes(ctx, cs)
+	return kube.ListNodesCached(ctx, nodeReader, cs)
 }
 
 // maintenanceDaemonSet finds one DaemonSet for the kured-lock read —

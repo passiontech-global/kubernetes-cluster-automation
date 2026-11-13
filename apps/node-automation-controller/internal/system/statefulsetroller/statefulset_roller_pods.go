@@ -48,23 +48,33 @@ func (r *statefulSetOnDeleteRoller) ownedPods(ctx context.Context,
 		return nil, fmt.Errorf("parse selector of statefulset %s/%s: %w",
 			sts.Namespace, sts.Name, err)
 	}
-	list, err := kube.ListAll(ctx, metav1.ListOptions{
+	// The apiserver pre-filters by the STS's own spec.selector
+	// (without it every STS would drag the whole namespace's pod list
+	// across the wire per sweep, paged at DefaultListPageSize so the
+	// read stays cheap at fleet scale); the controller
+	// ownerReference decides inside the page visit (name+kind, not
+	// UID: fake clients and hand-built fixtures rarely carry matching
+	// UIDs) and each page's non-owned pods die with it.
+	var out []*corev1.Pod
+	err = kube.ListEach(ctx, metav1.ListOptions{
 		LabelSelector: sel.String(),
 		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(r.cs, sts.Namespace))
+	}, kube.Pods(r.cs, sts.Namespace),
+		func(page []corev1.Pod) error {
+			for i := range page {
+				p := &page[i]
+				if !p.DeletionTimestamp.IsZero() {
+					continue
+				}
+				ref := metav1.GetControllerOf(p)
+				if ref != nil && ref.Kind == "StatefulSet" && ref.Name == sts.Name {
+					out = append(out, p)
+				}
+			}
+			return nil
+		})
 	if err != nil {
 		return nil, fmt.Errorf("list pods in %s: %w", sts.Namespace, err)
-	}
-	var out []*corev1.Pod
-	for i := range list {
-		p := &list[i]
-		if !p.DeletionTimestamp.IsZero() {
-			continue
-		}
-		ref := metav1.GetControllerOf(p)
-		if ref != nil && ref.Kind == "StatefulSet" && ref.Name == sts.Name {
-			out = append(out, p)
-		}
 	}
 	return out, nil
 }

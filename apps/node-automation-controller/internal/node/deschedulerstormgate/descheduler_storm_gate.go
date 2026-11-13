@@ -198,7 +198,7 @@ func Setup(d shared.Deps) error {
 	// no informer.
 	return shared.SetupNoConfig(d, func() error {
 		r := &deschedulerStormGate{
-			maintVerdict: d.Maintenance, cs: d.CS, nodeReader: d.Mgr.GetClient(), dyn: d.Dyn, now: shared.SystemClock,
+			maintVerdict: d.Maintenance, cs: d.CS, nodeReader: d.CachedClient(), dyn: d.Dyn, now: shared.SystemClock,
 			recorder: d.Mgr.GetEventRecorder(d.Name)}
 		if r.maintVerdict == nil {
 			// Tests wire Deps literally (Maintenance unset): fall

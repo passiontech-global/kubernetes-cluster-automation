@@ -82,7 +82,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -322,14 +322,14 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 			due = append(due, key)
 		}
 	}
-	sort.Strings(due)
+	slices.Sort(due)
 	var stallDue []string
 	for key := range stalled {
 		if stalledFor, _ := u.stall.firstSeen.Seen(key, now); stalledFor >= helmStuckThreshold {
 			stallDue = append(stallDue, key)
 		}
 	}
-	sort.Strings(stallDue)
+	slices.Sort(stallDue)
 
 	// The superseded-secret prune, the helm-controller health gate
 	// and the Kustomization list are independent duties — a failure

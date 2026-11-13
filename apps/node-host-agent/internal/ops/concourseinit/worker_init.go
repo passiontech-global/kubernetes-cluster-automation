@@ -21,6 +21,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
@@ -52,7 +54,7 @@ type Config struct {
 	// Test seams — nil selects the production implementation.
 	listSubvols  func(ctx context.Context, dir string) ([]string, error)
 	deleteSubvol func(ctx context.Context, path string) error
-	chown        func(name string, uid, gid int) error
+	chown        func(name string, fd int, uid, gid int) error
 }
 
 func (c *Config) applyDefaults() {
@@ -85,7 +87,9 @@ func (c *Config) applyDefaults() {
 		c.deleteSubvol = btrfsDeleteSubvol
 	}
 	if c.chown == nil {
-		c.chown = os.Chown
+		c.chown = func(_ string, fd, uid, gid int) error {
+			return unix.Fchown(fd, uid, gid)
+		}
 	}
 }
 
@@ -165,7 +169,18 @@ func WorkerInit(ctx context.Context, cfg Config) error {
 	// irrelevant — the chmod below forces it — but pass the final
 	// mode anyway for the dirs mkdir itself creates.
 	for _, d := range ScaffoldCacheDirs {
-		if err := os.MkdirAll(filepath.Join(sc, d), cfg.Mode); err != nil {
+		sd := filepath.Join(sc, d)
+		// A symlink planted at a scaffold path must not survive the
+		// mkdir as a redirect: MkdirAll would no-op through it and
+		// the perm pass below would land on the target. rm -rf in
+		// wipeExcept already removed non-dot links, but a dotfile-
+		// style or race-planted link gets the same treatment here.
+		if fi, err := os.Lstat(sd); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			if err := os.Remove(sd); err != nil {
+				return fmt.Errorf("remove scaffold symlink %s: %w", sd, err)
+			}
+		}
+		if err := os.MkdirAll(sd, cfg.Mode); err != nil {
 			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
 	}
@@ -204,22 +219,44 @@ func WorkerInit(ctx context.Context, cfg Config) error {
 		}
 		targets = append(targets, p)
 	}
-	// Residual TOCTOU window, documented not closed: the Lstat above
-	// proved the entry was not a symlink AT CHECK TIME, but
-	// chown/chmod re-resolve the path — an actor able to swap a
-	// verified entry for a symlink in between could still redirect
-	// the dereference. Closing it for real needs openat2/…AT_SYMLINK_
-	// NOFOLLOW + fchown/fchmod on the held fd; the init runs as root
-	// before task containers start, so the window is accepted (same
-	// residual the script's chown/chmod carried).
+	// fd-based enforcement closes the documented swap window: open
+	// O_NOFOLLOW (a swapped-in symlink fails the open instead of
+	// being dereferenced), fstat to confirm the fd is a plain dir or
+	// regular file, then chown/chmod on the held fd — the path is
+	// never re-resolved after the check. Top-level cache entries may
+	// legitimately be regular files (loose tool state), so both
+	// S_IFDIR and S_IFREG pass; anything else (device, fifo, link)
+	// is refused.
 	for _, t := range targets {
+		fd, err := unix.Open(t,
+			unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return fmt.Errorf("open %s (nofollow): %w", t, err)
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			_ = unix.Close(fd)
+			return fmt.Errorf("fstat %s: %w", t, err)
+		}
+		switch st.Mode & unix.S_IFMT {
+		case unix.S_IFDIR, unix.S_IFREG:
+		default:
+			_ = unix.Close(fd)
+			return fmt.Errorf("%s: not a dir or regular file (mode %o)",
+				t, st.Mode&unix.S_IFMT)
+		}
 		if cfg.OwnerUID >= 0 || cfg.OwnerGID >= 0 {
-			if err := cfg.chown(t, cfg.OwnerUID, cfg.OwnerGID); err != nil {
+			if err := cfg.chown(t, fd, cfg.OwnerUID, cfg.OwnerGID); err != nil {
+				_ = unix.Close(fd)
 				return fmt.Errorf("chown %s: %w", t, err)
 			}
 		}
-		if err := os.Chmod(t, cfg.Mode); err != nil {
+		if err := unix.Fchmod(fd, uint32(cfg.Mode)); err != nil {
+			_ = unix.Close(fd)
 			return fmt.Errorf("chmod %s: %w", t, err)
+		}
+		if err := unix.Close(fd); err != nil {
+			return fmt.Errorf("close %s: %w", t, err)
 		}
 	}
 
@@ -239,6 +276,12 @@ func WorkerInit(ctx context.Context, cfg Config) error {
 		if src, err = os.Executable(); err != nil {
 			return fmt.Errorf("resolve wrapper source: %w", err)
 		}
+		// A binary deleted while running (upgrade + exec of the new
+		// build, or a tmpfs BinaryPluginDir) reports
+		// "/path/runc (deleted)" via /proc/self/exe — copying that
+		// literal path fails. Strip the kernel annotation; the fd
+		// still reads the live inode.
+		src = strings.TrimSuffix(src, " (deleted)")
 	}
 	if err := copyFileAtomic(src,
 		filepath.Join(cfg.RuncDir, "runc"), 0o755); err != nil {
@@ -291,7 +334,7 @@ func btrfsListSubvols(ctx context.Context, dir string) ([]string, error) {
 		return nil, nil
 	}
 	var vols []string
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if f := strings.Fields(line); len(f) >= 9 {
 			vols = append(vols, f[8]) // awk $9
 		}

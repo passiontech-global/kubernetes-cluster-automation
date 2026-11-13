@@ -15,16 +15,31 @@ import (
 // renameFallbackLogged remembers which paths already warned about the
 // direct-write fallback — one line per path per process (a
 // bind-mounted hosts file takes the fallback on every render and
-// would spam the log).
-var renameFallbackLogged sync.Map
+// would spam the log). The map is size-capped at
+// renameFallbackLogCap distinct paths: past the cap, new paths log
+// nothing (the map is only a log de-duplicator, never worth unbounded
+// growth on hosts with churny target paths).
+const renameFallbackLogCap = 1024
+
+var (
+	renameFallbackMu     sync.Mutex
+	renameFallbackLogged = make(map[string]bool)
+)
 
 // warnRenameFallback emits the once-per-path fallback warning.
 func warnRenameFallback(path string, err error) {
-	if _, logged := renameFallbackLogged.LoadOrStore(path, true); !logged {
-		logx.For("fsx").Warn("atomic rename refused (bind-mounted "+
-			"target?) — falling back to direct fsync'd write",
-			"path", path, "error", err)
+	renameFallbackMu.Lock()
+	if _, logged := renameFallbackLogged[path]; !logged {
+		if len(renameFallbackLogged) >= renameFallbackLogCap {
+			renameFallbackMu.Unlock()
+			return
+		}
+		renameFallbackLogged[path] = true
 	}
+	renameFallbackMu.Unlock()
+	logx.For("fsx").Warn("atomic rename refused (bind-mounted "+
+		"target?) — falling back to direct fsync'd write",
+		"path", path, "error", err)
 }
 
 // WriteFileAtomic writes content via a tmp file in the same dir +
@@ -48,7 +63,15 @@ func warnRenameFallback(path string, err error) {
 // write+fsync on the target: the crash-atomicity is lost but the
 // write actually lands — strictly better than never writing at all.
 func WriteFileAtomic(path, content string) error {
-	err := WriteFile(path, []byte(content), Opts{
+	return writeFileAtomic(path, []byte(content))
+}
+
+// writeFileAtomic is the bytes-taking core WriteFileAtomic and
+// WriteFileAtomicBytes share: the same stage+rename Opts, the same
+// EBUSY/EXDEV fallback to a direct fsync'd write. One payload copy,
+// paid only when the caller holds a string.
+func writeFileAtomic(path string, data []byte) error {
+	err := WriteFile(path, data, Opts{
 		Stage:   StageTempPattern(".tmp-" + filepath.Base(path) + "-*"),
 		Mode:    0o644,
 		DirSync: true,
@@ -60,7 +83,28 @@ func WriteFileAtomic(path, content string) error {
 		return err
 	}
 	warnRenameFallback(path, err)
-	return WriteFileDirect(path, content)
+	return writeFileDirectBytes(path, data)
+}
+
+// writeFileDirectBytes is WriteFileDirect for a []byte payload — the
+// fallback twin of the string form: same open/truncate, same
+// write-then-fsync error precedence (Close's error surfaces only
+// when write and sync succeeded).
+func writeFileDirectBytes(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	var werr error
+	if _, err := f.Write(data); err != nil {
+		werr = err
+	} else if err := f.Sync(); err != nil {
+		werr = err
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	return werr
 }
 
 // WriteFileDirect writes content straight onto path with an fsync —
@@ -84,9 +128,29 @@ func WriteFileDirect(path, content string) error {
 	return werr
 }
 
+// WriteFileDirectNoSync is WriteFileDirect minus the fsync — the
+// WriteFileAtomicNoSync fallback when rename(2) is refused: a NoSync
+// writer must not sneak a Sync() onto the bind-mount branch either.
+func WriteFileDirectNoSync(path, content string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	var werr error
+	if _, err := f.WriteString(content); err != nil {
+		werr = err
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	return werr
+}
+
 // WriteFileAtomicBytes is WriteFileAtomic for callers holding []byte.
+// The payload passes straight through — no []byte→string→[]byte round
+// trip, so a byte-slice writer pays no conversion copies at all.
 func WriteFileAtomicBytes(path string, data []byte) error {
-	return WriteFileAtomic(path, string(data))
+	return writeFileAtomic(path, data)
 }
 
 // WriteFileAtomicNoSync is WriteFileAtomic minus the durability
@@ -107,5 +171,8 @@ func WriteFileAtomicNoSync(path, content string) error {
 		return err
 	}
 	warnRenameFallback(path, err)
-	return WriteFileDirect(path, content)
+	// The fallback must honor NoSync too — WriteFileDirect would
+	// sneak the fsync this family exists to skip back onto every
+	// bind-mounted .prom render.
+	return WriteFileDirectNoSync(path, content)
 }

@@ -12,6 +12,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kubeutil"
 )
 
 // Sweep executes one cleanup cycle. All fail-closed decisions are
@@ -207,8 +209,13 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 				continue
 			}
 			apiCtx, cancel = s.apiCtx(ctx)
+			// UID precondition: between the vetting GET and this
+			// delete the PV could be recreated under the same
+			// pvc-<uuid> name — the precondition refuses to kill
+			// the replacement (kubeutil parity with every other
+			// delete site).
 			err = s.cfg.Client.CoreV1().PersistentVolumes().
-				Delete(apiCtx, name, metav1.DeleteOptions{})
+				Delete(apiCtx, name, kubeutil.UIDDeleteOptions(pv.UID, ""))
 			cancel()
 			if err != nil {
 				log.Info("SKIP: delete pv failed", "dir", name, "error", err)

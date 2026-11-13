@@ -15,12 +15,11 @@ package nats
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -258,14 +257,10 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 // logScan runs the log-marker scan on Running members old enough
 // for their JetStream startup to have settled — a fetch/read
 // failure is inconclusive, not healthy (warn + skip). The fetches
-// run through a bounded worker pool (max natsLogScanWorkers
-// concurrent kubelet log streams); results apply serially below.
+// run through the shared kube.ScanPodLogs bounded worker pool (max
+// natsLogScanWorkers concurrent kubelet log streams); results apply
+// serially below in scanKeys order.
 func (s *natsSweep) logScan(ctx context.Context) {
-	type logScan struct {
-		key    string
-		reason string
-		err    error
-	}
 	scanKeys := make([]string, 0, len(s.census.memberByName))
 	for key, pod := range s.census.memberByName {
 		if pod.Status.Phase != corev1.PodRunning ||
@@ -274,24 +269,15 @@ func (s *natsSweep) logScan(ctx context.Context) {
 		}
 		scanKeys = append(scanKeys, key)
 	}
-	sort.Strings(scanKeys)
-	scans := make([]logScan, len(scanKeys))
-	g := errgroup.Group{}
-	g.SetLimit(natsLogScanWorkers)
+	slices.Sort(scanKeys)
+	pods := make([]*corev1.Pod, len(scanKeys))
 	for j, key := range scanKeys {
-		pod := s.census.memberByName[key]
-		g.Go(func() (err error) {
-			// A panic in one pod's log scan must not kill the sweep —
-			// it reads as that pod's inconclusive scan (err slot),
-			// never a process crash.
-			defer func() {
-				if r := recover(); r != nil {
-					scans[j] = logScan{key: key,
-						err: fmt.Errorf("log scan panicked: %v", r)}
-				}
-			}()
+		pods[j] = s.census.memberByName[key]
+	}
+	scans := kube.ScanPodLogs(ctx, s.p.CS, pods, natsLogScanWorkers,
+		func(ctx context.Context, pod *corev1.Pod) (string, error) {
 			reason := ""
-			hit, lerr := kube.ReadPodLogTail(ctx, s.p.CS, pod, kube.PodLogOpts{
+			hit, err := kube.ReadPodLogTail(ctx, s.p.CS, pod, kube.PodLogOpts{
 				TailLines:    probefw.DefaultTailLines,
 				SinceSeconds: 900,
 				MaxBytes:     probefw.LogMaxBytes,
@@ -303,22 +289,19 @@ func (s *natsSweep) logScan(ctx context.Context) {
 				}
 				return false
 			})
-			if lerr == nil && !hit {
+			if err == nil && !hit {
 				reason = "" // clean tail — no marker
 			}
-			scans[j] = logScan{key: key, reason: reason, err: lerr}
-			return nil
+			return reason, err
 		})
-	}
-	_ = g.Wait()
-	for _, scan := range scans {
-		if scan.err != nil {
+	for j, scan := range scans {
+		if scan.Err != nil {
 			s.log.Info("WARN: nats pod log tail failed — wedge evidence inconclusive",
-				"pod", scan.key, "error", scan.err)
+				"pod", scanKeys[j], "error", scan.Err)
 			continue
 		}
-		if scan.reason != "" {
-			s.addReason(scan.key, scan.reason, false)
+		if scan.Value != "" {
+			s.addReason(scanKeys[j], scan.Value, false)
 		}
 	}
 }
@@ -361,7 +344,7 @@ func (s *natsSweep) emitPodFindings() {
 		if len(live) == 0 {
 			continue
 		}
-		sort.Strings(live)
+		slices.Sort(live)
 		reason := strings.Join(live, "+")
 		s.rep.Emit(natsJetstreamUnhealthyGauge, key+"/"+reason,
 			[]string{pod.Namespace, pod.Name, reason},

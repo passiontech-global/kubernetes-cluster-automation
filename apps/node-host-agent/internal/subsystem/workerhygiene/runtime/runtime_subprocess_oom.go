@@ -84,7 +84,7 @@ func cgroupInitPID(scopeDir string) (int, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -109,7 +109,7 @@ func oomMemStatMiB(scopeDir string) string {
 		return ""
 	}
 	vals := map[string]uint64{}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) != 2 {
 			continue

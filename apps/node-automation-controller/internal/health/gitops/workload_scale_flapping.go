@@ -18,7 +18,7 @@ package gitops
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -249,7 +249,9 @@ func (p *workloadScaleFlappingCheck) Run(ctx context.Context) probefw.Result {
 		// Direction changes are order-sensitive — sort by the
 		// event's freshest timestamp so a re-emitted event lands by
 		// its latest observation, not its birth.
-		sort.Slice(evs, func(i, j int) bool { return evs[i].t.Before(evs[j].t) })
+		slices.SortFunc(evs, func(a, b scaleFlapEvent) int {
+			return a.t.Compare(b.t)
+		})
 		flips := 0
 		for i := 1; i < len(evs); i++ {
 			if evs[i].up == evs[i-1].up {

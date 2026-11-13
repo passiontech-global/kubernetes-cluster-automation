@@ -58,7 +58,7 @@ func newWatchdog(t *testing.T, objs ...runtime.Object) (*leaseLossWatchdog,
 
 func TestWatchdogForeignHolderCancels(t *testing.T) {
 	w, stolen, cancelled := newWatchdog(t, leaseObj("pod-b_5678"))
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- w.Start(ctx) }()
@@ -82,7 +82,7 @@ func TestWatchdogForeignHolderCancels(t *testing.T) {
 
 func TestWatchdogSelfHolderKeepsRunning(t *testing.T) {
 	w, stolen, cancelled := newWatchdog(t, leaseObj("pod-a_1234"))
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- w.Start(ctx) }()
@@ -110,7 +110,7 @@ func TestWatchdogEmptyAndMissingLeaseSafe(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w, _, cancelled := newWatchdog(t, tc.objs...)
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			done := make(chan error, 1)
 			go func() { done <- w.Start(ctx) }()
@@ -134,7 +134,7 @@ func TestWatchdogReadErrorIsNotLoss(t *testing.T) {
 		func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, context.DeadlineExceeded
 		})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- w.Start(ctx) }()

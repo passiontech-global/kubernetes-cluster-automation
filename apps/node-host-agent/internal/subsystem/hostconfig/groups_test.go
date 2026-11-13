@@ -463,7 +463,7 @@ func TestDownloadSweepsTmpOnShaMismatch(t *testing.T) {
 	r := newTestReconciler(t, t.TempDir())
 	dst := filepath.Join(r.cfg.HostRoot, "dl/x.tgz")
 	if err := r.download(context.Background(), srv.URL+"/x.tgz", dst,
-		strings.Repeat("0", 64)); err == nil {
+		strings.Repeat("0", 64), 0o644); err == nil {
 		t.Fatal("expected sha256 mismatch")
 	}
 	if hostExists(r, "/dl/x.tgz.dl") {

@@ -5,7 +5,6 @@
 package fileconf
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,8 +17,7 @@ import (
 func TestDirWatcherPollChangedEdge(t *testing.T) {
 	dir := t.TempDir()
 	w := &DirWatcher{Dirs: []string{dir}, Period: 5 * time.Millisecond}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go w.Poll(ctx)
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -79,6 +77,61 @@ func TestDirWatcherChangedWithoutPoll(t *testing.T) {
 	}
 	if w.Changed() {
 		t.Fatal("Changed fired twice for the same file without Poll")
+	}
+}
+
+// TestDirWatcherSkipsKubeletRotationDirs: kubelet ConfigMap/Secret
+// rotation materializes `..data` -> `..2026_<ts>` plumbing under the
+// watched dir — mount plumbing, not content. The dot-prefixed DIRS
+// and everything inside them must stay out of the fingerprint:
+// descending into a fresh timestamp dir re-triggered every watched
+// hostconfig group on each kubelet symlink rotation.
+func TestDirWatcherSkipsKubeletRotationDirs(t *testing.T) {
+	dir := t.TempDir()
+	write := func(p, b string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(dir, "config"), "real content\n")
+	write(filepath.Join(dir, "..2026_01_01_00_00_00", "config"), "rotated v1\n")
+	if err := os.Symlink("..2026_01_01_00_00_00", filepath.Join(dir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &DirWatcher{Dirs: []string{dir}}
+	if !w.Changed() {
+		t.Fatal("first Changed should report a difference vs empty baseline")
+	}
+	if w.Changed() {
+		t.Fatal("second Changed on an unchanged tree should be false")
+	}
+
+	// kubelet rotation: a NEW timestamp dir lands and ..data repoints
+	// to it. Without the SkipDir prune this moved the fingerprint and
+	// fired an edge.
+	write(filepath.Join(dir, "..2026_02_02_00_00_00", "config"), "rotated v2\n")
+	if err := os.Remove(filepath.Join(dir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..2026_02_02_00_00_00", filepath.Join(dir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	if w.Changed() {
+		t.Fatal("kubelet rotation plumbing must not fire a change edge")
+	}
+
+	// Control: a REAL watched file changing still fires exactly once.
+	write(filepath.Join(dir, "config"), "real content v2\n")
+	if !w.Changed() {
+		t.Fatal("real file change must still fire an edge")
+	}
+	if w.Changed() {
+		t.Fatal("Changed fired twice for one real change")
 	}
 }
 
@@ -183,8 +236,7 @@ func TestDirWatcherUnreadableFileExcluded(t *testing.T) {
 func TestDirWatcherDefaultPeriod(t *testing.T) {
 	dir := t.TempDir()
 	w := &DirWatcher{Dirs: []string{dir}}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	done := make(chan struct{})
 	go func() { defer close(done); w.Poll(ctx) }()
 	select {

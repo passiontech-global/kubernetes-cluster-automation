@@ -227,3 +227,29 @@ func buildKubeClients(cfg *rest.Config) (*kubeClients, error) {
 		probeCS: probeCS, probeDyn: probeDyn,
 		probeMeta: probeMeta}, nil
 }
+
+// managerConfig is the config ctrl.NewManager gets: a COPY of the
+// tuned cfg (CopyConfig shares the RateLimiter and the base
+// *http.Transport by reference, so the ONE-bucket/ONE-transport
+// posture of tuneClientConfig holds) with AcceptContentTypes set so
+// the manager's informer cache and cached client NEGOTIATE protobuf:
+// every informer LIST/WATCH and every cached-client read decodes
+// 5-10x faster and transfers several times less than JSON, and the
+// apiserver still answers with JSON wherever no protobuf scheme is
+// registered — protobuf is offered, never forced.
+//
+// This lives on the MANAGER's config only, and deliberately NOT on
+// the shared base cfg: buildKubeClients copies cfg for the direct
+// pair, and the DYNAMIC clients must not inherit the accept header —
+// they read CRD-backed kinds (helmreleases, cert-manager,
+// externalsecrets, medik8s, cilium) whose unstructured decode has no
+// protobuf shape, the same reason directCfg keeps the JSON default
+// for dyn (see buildKubeClients). The typed direct/probe clientsets
+// already force protobuf on the send side via ContentType and are
+// left untouched.
+func managerConfig(cfg *rest.Config) *rest.Config {
+	mgrCfg := rest.CopyConfig(cfg)
+	mgrCfg.AcceptContentTypes =
+		"application/vnd.kubernetes.protobuf,application/json"
+	return mgrCfg
+}

@@ -106,7 +106,11 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 		// merge key).
 		hasMerge := false
 		for i := 0; i+1 < len(n.Content); i += 2 {
-			if isYAMLMergeKey(n.Content[i]) {
+			kn, err := yamlScalarKey(n.Content[i])
+			if err != nil {
+				return nil, err
+			}
+			if isYAMLMergeKey(kn) {
 				hasMerge = true
 				break
 			}
@@ -115,13 +119,21 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 		if hasMerge {
 			explicit = make(map[string]bool, len(n.Content)/2)
 			for i := 0; i+1 < len(n.Content); i += 2 {
-				if !isYAMLMergeKey(n.Content[i]) {
-					explicit[n.Content[i].Value] = true
+				kn, err := yamlScalarKey(n.Content[i])
+				if err != nil {
+					return nil, err
+				}
+				if !isYAMLMergeKey(kn) {
+					explicit[kn.Value] = true
 				}
 			}
 		}
 		for i := 0; i+1 < len(n.Content); i += 2 {
-			kn, vn := n.Content[i], n.Content[i+1]
+			kn, err := yamlScalarKey(n.Content[i])
+			if err != nil {
+				return nil, err
+			}
+			vn := n.Content[i+1]
 			if isYAMLMergeKey(kn) {
 				if err := yamlMergeInto(m, vn, explicit, depth+1, steps); err != nil {
 					return nil, err
@@ -192,6 +204,23 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported yaml node kind %v", n.Kind)
 	}
+}
+
+// yamlScalarKey resolves a mapping key to its scalar node: an alias
+// used in key position (*k: val) dereferences to its anchor, and a
+// non-scalar key (mapping/sequence) errors instead of silently
+// becoming the empty string.
+func yamlScalarKey(kn *yaml3.Node) (*yaml3.Node, error) {
+	if kn != nil && kn.Kind == yaml3.AliasNode {
+		kn = kn.Alias
+	}
+	if kn == nil {
+		return nil, errors.New("yaml: missing mapping key node")
+	}
+	if kn.Kind != yaml3.ScalarNode {
+		return nil, fmt.Errorf("yaml: mapping key is not a scalar (kind %v)", kn.Kind)
+	}
+	return kn, nil
 }
 
 // isYAMLMergeKey reports whether kn is a `<<` merge key. yaml.v3 tags

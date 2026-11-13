@@ -1033,7 +1033,7 @@ func rolloutAnno(t *testing.T, cs kubernetes.Interface) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return d.Spec.Template.Annotations[linkerdIssuerRolloutAnno]
+	return d.Spec.Template.Annotations[kube.RestartedAtAnno]
 }
 
 // cordonedNode builds a node with a timestamp-less unschedulable taint

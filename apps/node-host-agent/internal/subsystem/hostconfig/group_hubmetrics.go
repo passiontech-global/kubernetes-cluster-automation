@@ -7,6 +7,7 @@ package hostconfig
 import (
 	"context"
 	"fmt"
+	"os"
 	pathpkg "path"
 	"regexp"
 	"strings"
@@ -129,12 +130,13 @@ func (c *cyc) hubMetricsNodeExporter() {
 // over ~15KB/s needs minutes (the 2026-09-24 hub-converge run failed
 // on the default ~10s read timeout). A Config.HTTPTimeout ABOVE the
 // floor still wins.
-func (r *Reconciler) nexpDownload(ctx context.Context, url, dst, wantSHA256 string) error {
+func (r *Reconciler) nexpDownload(ctx context.Context, url, dst, wantSHA256 string,
+	mode os.FileMode) error {
 	to := r.cfg.HTTPTimeout
 	if to < 300*time.Second {
 		to = 300 * time.Second
 	}
-	return downloadFile(ctx, url, dst, wantSHA256, to)
+	return downloadFile(ctx, url, dst, wantSHA256, mode, to)
 }
 
 // hubMetricsExtraPorts — hub_metrics_extra_ports from cluster.yaml

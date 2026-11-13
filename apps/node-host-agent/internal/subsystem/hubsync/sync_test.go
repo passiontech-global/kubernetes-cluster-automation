@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -339,17 +339,22 @@ func TestRunLeaseGatesSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Foreign lease is fresh → no converge dials. Every renew tick
+	// leaseGets the object, so the reactor's signals are the
+	// renewer's observable heartbeat: 20 ticks with zero dials bound
+	// the absence by tick count, not by a 300ms wall-clock glance.
+	touches := leaseTouchCh(cs, "get")
+	ctx := t.Context()
 	go s.Run(ctx)
-
-	// Foreign lease is fresh → no converge dials.
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(dialer.dials()) > 0 {
-			t.Fatal("dialed while foreign lease held")
+	for range 20 {
+		select {
+		case <-touches:
+		case <-time.After(2 * time.Second):
+			t.Fatal("renewer stopped polling the lease")
 		}
-		time.Sleep(5 * time.Millisecond)
+	}
+	if got := dialer.dials(); len(got) > 0 {
+		t.Fatal("dialed while foreign lease held")
 	}
 	// Age the foreign lease past expiry → takeover + converge.
 	rt = metav1.NewMicroTime(time.Now().Add(-time.Hour))
@@ -360,27 +365,30 @@ func TestRunLeaseGatesSync(t *testing.T) {
 		Update(ctx, l, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(dialer.dials()) > 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("no converge after foreign lease expired")
+	waitDials(t, dialer)
 }
 
 // panicWatcher panics on the Changed() call numbers in panicOn —
 // each panic unwinds Run while the supervisor ctx stays live
 // (agent.go's recover + re-invoke parity), letting the test walk one
-// Syncer through several Run entries on a single ctx.
+// Syncer through several Run entries on a single ctx. sig, when set,
+// mirrors every call number (buffered, non-blocking) so tests can
+// WAIT for a given call instead of sleeping through one.
 type panicWatcher struct {
 	calls   atomic.Int32
 	panicOn map[int32]bool
+	sig     chan int32
 }
 
 func (w *panicWatcher) Changed() bool {
-	if w.panicOn[w.calls.Add(1)] {
+	n := w.calls.Add(1)
+	if w.sig != nil {
+		select {
+		case w.sig <- n:
+		default:
+		}
+	}
+	if w.panicOn[n] {
 		panic("watcher panic")
 	}
 	return false
@@ -395,20 +403,21 @@ func (w *panicWatcher) Changed() bool {
 // heartbeating while NO Run was executing — Spawn's stop is never
 // called so the 60s Lease survives the supervisor's restart backoff.
 func TestRunLeaseLoopSingleFlight(t *testing.T) {
-	var spawns, updates atomic.Int32
+	var spawns atomic.Int32
 	cs := testutil.FakeKube()
-	cs.PrependReactor("update", "leases",
-		func(k8stesting.Action) (bool, runtime.Object, error) {
-			updates.Add(1)
-			return false, nil, nil // fall through to the default tracker
-		})
 	cfg := testConfig(t, cs, newFakeDialer(), []byte("bin"))
 	cfg.RenewInterval = 5 * time.Millisecond
 	cfg.SyncInterval = time.Hour
 	cfg.WatchInterval = 5 * time.Millisecond // tick Run can die on
 	// Call 1 = entry #1's baseline seed, call 3 = entry #2's first
-	// watch tick (call 2 is its seed) — entry #3 runs clean.
-	cfg.Watcher = &panicWatcher{panicOn: map[int32]bool{1: true, 3: true}}
+	// watch tick (call 2 is its seed) — entry #3 runs clean. The sig
+	// channel mirrors the call numbers so the test can WAIT for
+	// entry #3's progress instead of sleeping through it.
+	watcher := &panicWatcher{
+		panicOn: map[int32]bool{1: true, 3: true},
+		sig:     make(chan int32, 64),
+	}
+	cfg.Watcher = watcher
 	cfg.SpawnFn = func(ctx context.Context, name string,
 		fn func(context.Context)) func() {
 		spawns.Add(1)
@@ -420,6 +429,11 @@ func TestRunLeaseLoopSingleFlight(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// The update reactor arms BEFORE any Run entry — PrependReactor
+	// is unsynchronized against concurrent fake-clientset calls, so
+	// it must never race the already-running renewer.
+	touches := leaseTouchCh(cs, "update")
 
 	// Supervisor parity: agent.go recovers the panic and re-invokes
 	// Run on the same ctx; done closes when Run exits.
@@ -449,20 +463,29 @@ func TestRunLeaseLoopSingleFlight(t *testing.T) {
 
 	// The backoff window: NO Run is executing, yet the renewer bound
 	// to ctx keeps heartbeating — the lease-continuity half of the
-	// fix (a defer-stop() would lapse the Lease right here).
-	pre := updates.Load()
-	deadline := time.Now().Add(2 * time.Second)
-	for updates.Load() == pre {
-		if time.Now().After(deadline) {
-			t.Fatal("renewer died with Run — the Lease would lapse mid-backoff")
+	// fix (a defer-stop() would lapse the Lease right here). Drain
+	// the signals buffered while entries ran, so the next signal
+	// provably comes from the window itself.
+	for drained := false; !drained; {
+		select {
+		case <-touches:
+		default:
+			drained = true
 		}
-		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-touches:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renewer died with Run — the Lease would lapse mid-backoff")
 	}
 
 	// Entry #3 — the restart proper: Run blocks in its select again
-	// but the once must suppress a second renewer.
+	// but the once must suppress a second renewer. Run's seed (call
+	// #4) precedes the leaseOnce CAS, and its first watch tick (call
+	// #5) follows it — so once call #5 lands, a wrongly-stacked
+	// renewer would already be counted. No wall-clock absence probe.
 	done := runEntry()
-	time.Sleep(50 * time.Millisecond)
+	awaitCall(t, watcher.sig, 5)
 	if got := spawns.Load(); got != 1 {
 		t.Fatalf("three Run entries spawned %d heartbeaters, want 1", got)
 	}
@@ -471,6 +494,41 @@ func TestRunLeaseLoopSingleFlight(t *testing.T) {
 }
 
 // --- helpers ---
+
+// leaseTouchCh wires a reactor on cs that signals every Lease API
+// call of the given verb ("get"/"update"/"create") — the fake
+// clientset's observable heartbeat. Tests bound absence windows by
+// tick COUNT (the renewer touches the Lease once per RenewInterval)
+// instead of wall time.
+func leaseTouchCh(cs *fake.Clientset, verb string) <-chan struct{} {
+	ch := make(chan struct{}, 64)
+	cs.PrependReactor(verb, "leases",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+			return false, nil, nil // fall through to the default tracker
+		})
+	return ch
+}
+
+// awaitCall drains the watcher's mirrored call channel until a call
+// numbered ≥ want lands — earlier calls are still queued in the
+// buffer, so they are consumed on the way.
+func awaitCall(t *testing.T, calls <-chan int32, want int32) {
+	t.Helper()
+	for {
+		select {
+		case n := <-calls:
+			if n >= want {
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("watcher call #%d never happened", want)
+		}
+	}
+}
 
 // assertOpOrder checks each want appears in ops in order.
 func assertOpOrder(t *testing.T, ops []string, want ...string) {
@@ -492,7 +550,7 @@ func labelKey(kvs ...string) string {
 	for i := 0; i+1 < len(kvs); i += 2 {
 		parts = append(parts, kvs[i]+"="+kvs[i+1])
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	return strings.Join(parts, ",")
 }
 
@@ -513,7 +571,7 @@ func gatherVec(t *testing.T, reg *prometheus.Registry, name string) map[string]f
 			for _, l := range m.GetLabel() {
 				parts = append(parts, l.GetName()+"="+l.GetValue())
 			}
-			sort.Strings(parts) // dto labels arrive name-sorted; keep the key canonical
+			slices.Sort(parts) // dto labels arrive name-sorted; keep the key canonical
 			key := strings.Join(parts, ",")
 			switch {
 			case m.Counter != nil:
@@ -801,29 +859,23 @@ func TestRunWaitsForKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Key absent → no converge dials. Nothing in the loop touches
+	// the Lease while ensureKey gates (no per-tick signal exists),
+	// so the absence window stays wall-bounded — but waiting on the
+	// fake dialer's notification channel fails fast instead of
+	// polling blind: a wrong dial surfaces the instant it happens.
+	ctx := t.Context()
 	go s.Run(ctx)
-
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(dialer.dials()) > 0 {
-			t.Fatal("dialed while converge key absent")
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case ip := <-dialer.dialCh:
+		t.Fatalf("dialed %s while converge key absent", ip)
+	case <-time.After(200 * time.Millisecond):
 	}
 	// The secret lands — next renew tick must pick it up.
 	if err := os.WriteFile(cfg.SSHKeyPath, []byte("key"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(dialer.dials()) > 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("no converge after the key materialized")
+	waitDials(t, dialer)
 }
 
 // TestSplitUserHostPort: proxyjump "user@host:port" keeps its port —
@@ -1120,7 +1172,7 @@ func TestSHA256sumChunks(t *testing.T) {
 		if len(ch) > sha256sumCmdChunk {
 			t.Fatalf("chunk %d is %d bytes, budget %d", i, len(ch), sha256sumCmdChunk)
 		}
-		for _, q := range strings.Split(ch, " ") {
+		for q := range strings.SplitSeq(ch, " ") {
 			seen[unshq(q)]++
 		}
 	}

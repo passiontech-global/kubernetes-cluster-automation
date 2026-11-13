@@ -35,13 +35,18 @@ func zsrJobOwner() metav1.OwnerReference {
 
 // zsrPod builds a Running Job pod with one app container (terminated
 // `termAgo` ago, exit `exitCode`) and one linkerd-proxy sidecar still
-// Running.
+// Running. The batch.kubernetes.io/job-name label is part of the
+// fixture contract: the reaper's census filters on it server-side and
+// client-go v0.37's typed fake APPLIES label selectors (field
+// selectors stay ignored), so an unlabeled fixture would vanish from
+// every List.
 func zsrPod(ns, name string, termAgo time.Duration, exitCode int32) *corev1.Pod {
 	p := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: ns, Name: name, UID: types.UID("uid-" + name),
 			OwnerReferences:   []metav1.OwnerReference{zsrJobOwner()},
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+			Labels:            map[string]string{batchv1JobNameLabel: "job-x"},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
@@ -75,12 +80,6 @@ func zsrPod(ns, name string, termAgo time.Duration, exitCode int32) *corev1.Pod 
 		},
 	}
 	return p
-}
-
-func zsrPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
-	t.Helper()
-	_, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
-	return err == nil
 }
 
 type zsrShutdownProbe struct {
@@ -117,14 +116,14 @@ func TestZombieSidecarGraceThenDelete(t *testing.T) {
 	if len(probe.calls) != 1 || probe.calls[0] != "10.0.0.9" {
 		t.Fatalf("/shutdown calls = %v, want [10.0.0.9]", probe.calls)
 	}
-	if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("pod deleted on the graceful cycle — must survive one /shutdown")
 	}
 
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("pod still alive after the graceful cycle — should be reaped")
 	}
 	if got := ptestutil.ToFloat64(
@@ -148,7 +147,7 @@ func TestZombieSidecarShutdownFailureDeletesNow(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("pod survived a failed /shutdown — should delete immediately")
 	}
 	if got := ptestutil.ToFloat64(
@@ -179,7 +178,7 @@ func TestZombieSidecarHonoredShutdownNotReaped(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("pod deleted after honoring /shutdown")
 	}
 	if len(r.poked) != 0 {
@@ -347,7 +346,7 @@ func TestZombieSidecarDeleteUIDPrecondition(t *testing.T) {
 	if gotUID == nil || *gotUID != pod.UID {
 		t.Fatalf("delete missing the UID precondition: %v", gotUID)
 	}
-	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("zombie pod not reaped")
 	}
 }
@@ -400,7 +399,7 @@ func TestZombieSidecarJobNotCompleteKept(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("exit-0 pod deleted while its Job was still incomplete — would re-run the Job")
 	}
 }
@@ -417,7 +416,7 @@ func TestZombieSidecarJobCompleteReaped(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("pod kept although its Job already completed")
 	}
 }
@@ -431,7 +430,7 @@ func TestZombieSidecarNonZeroExitReaped(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("non-zero-exit pod kept — Job gate must not apply")
 	}
 }
@@ -465,7 +464,7 @@ func TestZombieSidecarProxyFallbackOnDirectFailure(t *testing.T) {
 	if proxyCalls != 1 {
 		t.Fatalf("proxy fallback calls = %d, want 1", proxyCalls)
 	}
-	if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("pod deleted on the graceful-proxy cycle — must survive one shutdown")
 	}
 	if !r.poked[zombieKey(pod)] {
@@ -475,7 +474,7 @@ func TestZombieSidecarProxyFallbackOnDirectFailure(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("pod still alive after the graceful cycle — should be reaped")
 	}
 	if proxyCalls != 1 {
@@ -505,7 +504,7 @@ func TestZombieSidecarProxyFallbackNoPodIP(t *testing.T) {
 	if proxyCalls != 1 {
 		t.Fatalf("proxy fallback calls = %d, want 1", proxyCalls)
 	}
-	if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+	if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 		t.Fatal("pod deleted on the graceful cycle")
 	}
 }
@@ -534,7 +533,7 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 		if err := r.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 			t.Fatal("pod reaped on the graceful cycle")
 		}
 		// Cycle 2+: the shutdown attempt already ran, but deleting the
@@ -545,7 +544,7 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 			t.Fatal("backoffLimit=0 zombie reaped while Job incomplete — instant BackoffLimitExceeded")
 		}
 	})
@@ -565,7 +564,7 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 			t.Fatal("backoffLimit=0 zombie reaped while Job incomplete")
 		}
 	})
@@ -591,7 +590,7 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 		if err := r.run(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		if testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 			t.Fatal("backoffLimit=0 zombie kept after Job completion recorded")
 		}
 	})
@@ -608,7 +607,7 @@ func TestZombieSidecarBackoffLimitZeroReap(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if !zsrPodExists(t, cs, "jobs", "job-x-abcde") {
+		if !testutil.PodExists(t, cs, "jobs", "job-x-abcde") {
 			t.Fatal("backoffLimit=3 zombie reaped — Job could respawn it")
 		}
 	})
@@ -857,7 +856,7 @@ func TestZombieSidecarZeroValueLiteralLazyArm(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatalf("zero-value reaper run: %v", err)
 	}
-	if zsrPodExists(t, cs, "jobs", "lazy-xyz") {
+	if testutil.PodExists(t, cs, "jobs", "lazy-xyz") {
 		t.Fatal("zombie survived the single lazy-armed cycle")
 	}
 	if got := ptestutil.ToFloat64(

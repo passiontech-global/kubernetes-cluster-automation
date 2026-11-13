@@ -175,7 +175,11 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 		}
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	resp, err := p.client.Do(req)
+	client, err := p.probeClient()
+	if err != nil {
+		return 0, failTLS, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, classifyTransport(err), err
 	}

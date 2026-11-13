@@ -6,9 +6,10 @@
 // self-contained product checks moved to subpackages — nats
 // (nats-jetstream-health), scylla (scylla-cluster-health,
 // scylla-compaction-schema-guard), percona (percona-cluster-quorum),
-// postgres (postgres-wal-archive-guard + the CNPG signatures), olm
-// (olm-subscription-health), pvc (pvc-resize-stall-guard), rabbitmq
+// postgres (postgres-wal-archive-guard + the CNPG signatures), rabbitmq
 // (rabbitmq-quorum-health, rabbitmq-suspended-listener) and dragonfly
-// (dragonfly-replica-sync-storm). Each reports on the shared
-// kuberhealthy_check series under its own check name.
+// (dragonfly-replica-sync-storm). The PV/PVC checks live under
+// health/storage and the OLM checks under health/gitops/olm. Each
+// reports on the shared kuberhealthy_check series under its own check
+// name.
 package datastore

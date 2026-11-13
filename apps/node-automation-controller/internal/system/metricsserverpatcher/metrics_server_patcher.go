@@ -120,10 +120,10 @@ func Setup(d shared.Deps) error {
 			MinReplicas:     cfg.minReplicas,
 			NodesPerReplica: cfg.nodesPerReplica,
 		}.WatchNodes(b, "metrics-server-patcher-sweep")
-		r := &metricsServerPatcher{cs: d.CS, nodeReader: d.Mgr.GetClient(),
+		r := &metricsServerPatcher{cs: d.CS, nodeReader: d.CachedClient(),
 			// Reader wires the informer cache for the drift Get — same seam
 			// as corednspatcher; nil (stub manager) falls back to direct CS.
-			reader:      d.Mgr.GetClient(),
+			reader:      d.CachedClient(),
 			minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica}
 		// CountReconcile owns the returned-error accounting — one
 		// IncError per non-nil Reconcile return; the reconcile body

@@ -55,11 +55,6 @@ func HasTaint(taints []corev1.Taint, key string) bool {
 	return false
 }
 
-// UnschedulableTaintKey is the taint the cordon path stamps alongside
-// spec.unschedulable — its TimeAdded is the only clock for "how long
-// has this cordon been live".
-const UnschedulableTaintKey = "node.kubernetes.io/unschedulable"
-
 // nodeCordonActiveMaxAge is how old a cordon may be before it reads as
 // deliberate static state rather than a drain in flight.
 const nodeCordonActiveMaxAge = 45 * time.Minute

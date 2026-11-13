@@ -11,7 +11,7 @@
 // metadata/spec annotations are rewritten/stripped by fluent-operator
 // within seconds, and Flux reverts anything it manages. The one
 // exception is the pod-template stamp the restart patch itself
-// carries (see restartWithHashPatch): a best-effort idempotence
+// carries (see kube.RestartTemplatePatchAnnos): a best-effort idempotence
 // marker — if fluent-operator strips it we merely fall back to the
 // unconditional re-roll the marker exists to prevent, never worse.
 //
@@ -23,10 +23,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -98,11 +96,8 @@ var onlyPipelineSecret = predicate.NewPredicateFuncs(func(o client.Object) bool 
 // registration entirely.
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
-		r := &fluentBitRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock, verdict: d.Maintenance}
-		if d.Mgr != nil {
-			r.secretReader = d.Mgr.GetClient()
-			r.nodeReader = d.Mgr.GetClient()
-		}
+		r := &fluentBitRoller{cs: d.CS, dyn: d.Dyn, queue: d.Name, now: shared.SystemClock,
+			verdict: d.Maintenance, secretReader: d.CachedClient(), nodeReader: d.CachedClient()}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			For(&corev1.Secret{}, builder.WithPredicates(onlyPipelineSecret)).
@@ -174,7 +169,8 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	}
 
 	// Idempotence short-circuit: the restart patch stamps the hash it
-	// rolls FOR onto the pod template (restartWithHashPatch), so a
+	// rolls FOR onto the pod template (kube.RestartTemplatePatchAnnos),
+	// so a
 	// live DS already carrying today's hash means this config was
 	// already rolled out and only the secret stamp failed afterwards
 	// (RBAC regression, patch rejections). Re-running the full roll
@@ -223,12 +219,11 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 
 	// kubectl rollout restart equivalent. The stamp must land on the
 	// POD TEMPLATE — kube.MergePatchAnnos only covers top-level
-	// metadata.annotations, so kube.RestartTemplatePatch renders the
-	// nested doc (same shared builder stale_recover.go uses), and
-	// restartWithHashPatch embeds AnnoRolledConfigHash=<hash> into the
-	// same pod-template map: one patch, one generation bump, and the
-	// marker the idempotence short-circuit at the top of Reconcile
-	// reads.
+	// metadata.annotations, so kube.RestartTemplatePatchAnnos renders
+	// the nested doc with AnnoRolledConfigHash=<hash> embedded in the
+	// same pod-template annotation map: one patch, one generation
+	// bump, and the marker the idempotence short-circuit at the top
+	// of Reconcile reads.
 	//
 	// Maintenance mutex — a LIVE-workload mutation (rolling every
 	// fluent-bit pod), so per AGENTS.md it gates on the
@@ -251,10 +246,8 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 			"daemonset", "fluent-system/fluent-bit")
 		return res, nil
 	}
-	restartPatch, err := restartWithHashPatch(r.now.Now(), hash)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("render restart patch: %w", err)
-	}
+	restartPatch := kube.RestartTemplatePatchAnnos(r.now.Now(),
+		map[string]string{kube.AnnoRolledConfigHash: hash})
 	if _, err := r.cs.AppsV1().DaemonSets("fluent-system").Patch(ctx, "fluent-bit",
 		types.StrategicMergePatchType, restartPatch, metav1.PatchOptions{}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("rollout-restart patch daemonset fluent-system/fluent-bit: %w", err)
@@ -275,36 +268,6 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	log.Info("ROLL: restarted fluent-bit for config",
 		"daemonset", "fluent-system/fluent-bit", "hash", hash)
 	return res, nil
-}
-
-// restartWithHashPatch renders the rollout-restart patch and embeds
-// the config hash the restart rolls FOR into the same pod-template
-// annotation map — one patch, one generation bump. The embedded stamp
-// is the idempotence marker: if the secret stamp after the restart
-// keeps failing (RBAC regression, patch rejections), the short-circuit
-// at the top of Reconcile sees the live DS already carrying the hash
-// and retries the stamp alone instead of re-rolling the whole fleet
-// every ~30m sweep, forever. kube.RestartTemplatePatch stays the shape
-// authority: its output is decoded, extended and re-encoded — the
-// stale_recover.go precedent for callers needing more keys in one
-// document.
-func restartWithHashPatch(ts time.Time, hash string) ([]byte, error) {
-	var doc map[string]any
-	if err := json.Unmarshal(kube.RestartTemplatePatch(ts), &doc); err != nil {
-		return nil, fmt.Errorf("decode restart template patch: %w", err)
-	}
-	// Walk the documented shape defensively: the helper owns the doc
-	// and may legitimately grow — a shape change must surface as a
-	// reconcile error, not a panic in the destructive-patch path.
-	spec, _ := doc["spec"].(map[string]any)
-	tmpl, _ := spec["template"].(map[string]any)
-	meta, _ := tmpl["metadata"].(map[string]any)
-	annos, _ := meta["annotations"].(map[string]any)
-	if annos == nil {
-		return nil, errors.New("restart template patch: unexpected shape (missing pod-template annotations)")
-	}
-	annos[kube.AnnoRolledConfigHash] = hash
-	return json.Marshal(doc)
 }
 
 // pipelineDrift extracts the drift pair from one read of the
@@ -335,7 +298,7 @@ func secretDataHash(sec *corev1.Secret) string {
 	for k := range sec.Data {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	h := sha256.New()
 	for _, k := range keys {
 		// NUL separators keep "ab"+"c" distinct from "a"+"bc".

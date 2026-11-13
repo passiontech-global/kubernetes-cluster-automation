@@ -24,7 +24,9 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/circuitbreaker"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -73,7 +75,7 @@ func cwGuardProber(cs *fake.Clientset, now *time.Time,
 // reason) tuple.
 func cwUnhealthy(crd, svc, reason string) float64 {
 	return ptestutil.ToFloat64(
-		circuitbreaker.CRDConversionWebhookUnhealthy.WithLabelValues(crd, svc, reason))
+		metrics.CRDConversionWebhookUnhealthy.WithLabelValues(crd, svc, reason))
 }
 
 // cwCleanup drops every unhealthy series a test may have emitted for
@@ -83,7 +85,7 @@ func cwCleanup(t *testing.T, crd, svc string) {
 	t.Cleanup(func() {
 		for _, reason := range []string{
 			circuitbreaker.CRDReasonMissingService, circuitbreaker.CRDReasonZeroEndpoints, circuitbreaker.CRDReasonTLSProbeFailed} {
-			circuitbreaker.CRDConversionWebhookUnhealthy.DeleteLabelValues(crd, svc, reason)
+			metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues(crd, svc, reason)
 		}
 	})
 }
@@ -139,7 +141,7 @@ func TestCRDConversionUnhealthyZeroEndpoints(t *testing.T) {
 	}
 	for _, reason := range []string{
 		circuitbreaker.CRDReasonMissingService, circuitbreaker.CRDReasonZeroEndpoints, circuitbreaker.CRDReasonTLSProbeFailed} {
-		if circuitbreaker.CRDConversionWebhookUnhealthy.DeleteLabelValues(
+		if metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues(
 			"healthy.example.com", "conv/live-svc", reason) {
 			t.Fatalf("healthy backend produced a %s series", reason)
 		}
@@ -161,7 +163,7 @@ func TestCRDConversionUnhealthyTLSProbeFailedBounces(t *testing.T) {
 		wgEndpointSlice("conv", "live-svc", 1, 0),
 		wgPod("conv", "conv-old", 48*time.Hour),
 		wgPod("conv", "conv-new", time.Hour))
-	emulateEviction(cs) // the bounce evicts through policy/v1
+	testutil.EmulateEviction(cs) // the bounce evicts through policy/v1
 	now := time.Unix(1_700_000_000, 0)
 	// live-svc's endpoint (10.10.0.1) answers so the census is not
 	// monitor-blind; conv-svc's (10.20.0.x) fail every handshake.
@@ -303,7 +305,7 @@ func TestCRDConversionUnhealthySeriesPrunedOnRecovery(t *testing.T) {
 	if err := g.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if circuitbreaker.CRDConversionWebhookUnhealthy.DeleteLabelValues(
+	if metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues(
 		"widgets.example.com", "conv/conv-svc", "missing_service") {
 		t.Fatal("recovered backend must prune the unhealthy series, not park it")
 	}
@@ -334,7 +336,7 @@ func TestCRDConversionHealthyBackendQuiet(t *testing.T) {
 		{"widgets.example.com", "conv/conv-svc", circuitbreaker.CRDReasonTLSProbeFailed},
 		{"no-conv.example.com", "conv/none-svc", circuitbreaker.CRDReasonMissingService},
 	} {
-		if circuitbreaker.CRDConversionWebhookUnhealthy.DeleteLabelValues(tc[0], tc[1], tc[2]) {
+		if metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues(tc[0], tc[1], tc[2]) {
 			t.Fatalf("unexpected %s series for %s", tc[2], tc[0])
 		}
 	}

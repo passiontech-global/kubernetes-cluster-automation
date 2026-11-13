@@ -19,11 +19,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 )
 
-// journalSinceLayout is the journalctl --since timestamp format —
-// the "2006-01-02 15:04:05" wall-clock contract the shell probes and
-// the systemd.Client.Journal argv share.
-const journalSinceLayout = "2006-01-02 15:04:05"
-
 // journalRead returns the unit journal window since `since` —
 // `timeout 15 journalctl -u <unit> --since <ts> --no-pager` parity
 // over the HostExecFn seam. stderr is folded in (combined=true) so
@@ -33,9 +28,9 @@ const journalSinceLayout = "2006-01-02 15:04:05"
 func (d *Deps) journalRead(ctx context.Context, unit string, since time.Time) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
 	defer cancel()
-	return d.Cfg.HostExecFn(cctx, true, 0, "journalctl",
-		"-u", unit, "--since",
-		since.Format(journalSinceLayout), "--no-pager")
+	argv := journalwatch.UnitWindowArgv(unit,
+		since.Format(journalwatch.SinceLayout))
+	return d.Cfg.HostExecFn(cctx, true, 0, argv[0], argv[1:]...)
 }
 
 // journalAnyRead is the unfiltered second probe used to classify an
@@ -46,8 +41,8 @@ func (d *Deps) journalRead(ctx context.Context, unit string, since time.Time) (s
 func (d *Deps) journalAnyRead(ctx context.Context) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
 	defer cancel()
-	return d.Cfg.HostExecFn(cctx, true, 0,
-		"journalctl", "-n", "1", "--no-pager")
+	argv := journalwatch.AnyLineArgv()
+	return d.Cfg.HostExecFn(cctx, true, 0, argv[0], argv[1:]...)
 }
 
 // JournalText returns the unit journal since `since`, mapping errors

@@ -54,6 +54,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -187,14 +188,22 @@ func main() {
 	transport.MaxIdleConns = 64
 	transport.MaxConnsPerHost = 32
 
+	concourseURL := envx.String("CONCOURSE_URL", "http://concourse-web:8080")
 	client := &concourse.Client{
-		BaseURL:      envx.String("CONCOURSE_URL", "http://concourse-web:8080"),
+		BaseURL:      concourseURL,
 		Team:         envx.String("CONCOURSE_TEAM", "main"),
 		User:         user,
 		Password:     password,
 		WebhookToken: os.Getenv("CI_WEBHOOK_TOKEN"),
-		HTTP:         &http.Client{Timeout: 15 * time.Second, Transport: transport},
-		IndexTTL:     time.Minute,
+		HTTP: &http.Client{
+			Timeout: 15 * time.Second,
+			// The check-webhook URL carries ?webhook_token= — a
+			// 30x to another host would replay the credential
+			// there. Follow same-origin redirects only.
+			CheckRedirect: concourse.SameOriginRedirectPolicy(concourseURL),
+			Transport:     transport,
+		},
+		IndexTTL: time.Minute,
 	}
 
 	wh := handler.New(os.Getenv("GITHUB_WEBHOOK_SECRET"), client)
@@ -300,20 +309,33 @@ func main() {
 	case <-ctx.Done():
 	}
 
-	// Shutdown: drain both listeners (10s), then the fan-out wait
-	// (Handler.waitBudget, 15s). Total ~25s worst case — under the
-	// pod's 30s SIGKILL grace period, so the process exits on its own
-	// terms instead of being killed with check POSTs half-written.
+	// Shutdown: flip readiness OFF first — the pod must leave the
+	// load-balancer's targets before connections drain, or new
+	// deliveries land on a listener that is about to close. Then
+	// drain both listeners in PARALLEL (10s public, 5s internal),
+	// then the fan-out wait (Handler.waitBudget, 15s). Total ~25s
+	// worst case — under the pod's 30s SIGKILL grace period, so the
+	// process exits on its own terms instead of being killed with
+	// check POSTs half-written.
 	logger().Info("shutdown signal received — draining connections")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := publicSrv.Shutdown(shutdownCtx); err != nil {
-		logger().Warn("graceful shutdown failed — connections dropped",
-			"error", err)
-	}
-	if err := internalSrv.Shutdown(shutdownCtx); err != nil {
-		logger().Warn("metrics server shutdown failed", "error", err)
-	}
-	cancel()
+	ready.Store(false)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := publicSrv.Shutdown(shutdownCtx); err != nil {
+			logger().Warn("graceful shutdown failed — connections dropped",
+				"error", err)
+		}
+	})
+	wg.Go(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := internalSrv.Shutdown(shutdownCtx); err != nil {
+			logger().Warn("metrics server shutdown failed", "error", err)
+		}
+	})
+	wg.Wait()
 	// srv.Shutdown only drains listeners and request handlers — the
 	// detached fan-out goroutines outlive the requests that spawned
 	// them. Wait (budgeted) for the last check POST to land before

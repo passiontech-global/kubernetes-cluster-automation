@@ -16,12 +16,19 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 )
+
+// maxListRVBody caps one RV-probe response read. With the
+// PartialObjectMetadataList negotiation above the payload is a few
+// KiB even on big-object endpoints; the cap is a runaway guard, not
+// the hard 1 MiB truncation that used to fail the probe.
+const maxListRVBody = 4 << 20
 
 // EnsureClient lazily builds the mTLS HTTP client the first time the
 // credential source exists — the per-run `[ -f admin.crt ]` gate of
@@ -207,6 +214,14 @@ func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64,
 	if err != nil {
 		return 0, false
 	}
+	// Metadata-only negotiation: a limit=1 response no longer carries
+	// spec/status, so one huge object can never truncate the probe —
+	// the old hard 1 MiB cut made exactly that a permanent
+	// "rv probe failed" on big-object endpoints. Servers without the
+	// feature fall back to the plain List envelope, which
+	// probee.ListResourceVersion decodes identically.
+	req.Header.Set("Accept", "application/json;as=PartialObjectMetadataList;"+
+		"v=v1alpha1;g=meta.k8s.io,application/json")
 	resp, err := client.Do(req)
 	if err != nil {
 		logger().Warn("controllerhygiene: rv probe failed",
@@ -215,7 +230,7 @@ func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64,
 		return 0, false
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxListRVBody))
 	if err != nil {
 		return 0, false
 	}
@@ -226,16 +241,8 @@ func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64,
 			"status", resp.StatusCode)
 		return 0, false
 	}
-	var list struct {
-		Metadata struct {
-			ResourceVersion string `json:"resourceVersion"`
-		} `json:"metadata"`
-	}
-	if err := json.Unmarshal(body, &list); err != nil {
-		return 0, false
-	}
-	rv, err := strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)
-	if err != nil {
+	rv, ok := probee.ListResourceVersion(body)
+	if !ok {
 		return 0, false
 	}
 	return rv, true

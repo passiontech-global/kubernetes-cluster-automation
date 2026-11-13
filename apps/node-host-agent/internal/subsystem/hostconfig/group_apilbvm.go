@@ -114,13 +114,9 @@ func (c *cyc) groupAPILBVM() {
 	// prereqs — best-effort like ansible failed_when: false. runLong:
 	// apt on a slow-egress infra VM outlives the interactive budget.
 	// dpkg-query gates the install: converge used to fork apt every
-	// cycle even with socat+curl already satisfied.
-	var missing []string
-	for _, p := range []string{"socat", "curl"} {
-		if !c.dpkgInstalled(ctx, p) {
-			missing = append(missing, p)
-		}
-	}
+	// cycle even with socat+curl already satisfied — and the two
+	// status probes share one dpkg-query fork now (Wave-4).
+	missing := c.dpkgMissing(ctx, "socat", "curl")
 	if len(missing) > 0 {
 		argv := append([]string{"apt-get", "install", "-y"}, missing...)
 		_, _ = r.runLong(ctx, "env", append(

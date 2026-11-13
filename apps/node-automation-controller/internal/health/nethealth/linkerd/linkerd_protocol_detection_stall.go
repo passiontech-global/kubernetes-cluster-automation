@@ -111,7 +111,7 @@ func (p *linkerdProtocolDetectionStallCheck) Run(ctx context.Context) probefw.Re
 		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
-		if !kube.PodSpecHasContainer(&pod.Spec, kube.LinkerdProxyContainer) {
+		if !kube.PodIsMeshed(&pod.Spec) {
 			continue
 		}
 		missing := missingBinaryPorts(pod)

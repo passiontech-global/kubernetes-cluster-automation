@@ -40,7 +40,7 @@ func (p *Probe) hygieneBackendXmin(ctx context.Context, pg, user, pass string,
 		return
 	}
 	h.xminSeen = true // a successful read answers for BOTH views
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		f := strings.Split(strings.TrimSpace(line), "|")
 		if len(f) < 2 {
 			continue

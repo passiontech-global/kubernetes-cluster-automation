@@ -13,12 +13,17 @@ on:
     paths:
       - "apps/webhook-dispatcher/**"
       # Only the hostkit subpackages this app actually imports
-      # (envdoc/envx/httpx/logx) — see the controller workflow for
+      # (envx/httpx/logx) — see the controller workflow for
       # why the blanket libs/hostkit/** glob is avoided.
-      - "libs/hostkit/envdoc/**"
+      # envdoc is test-only tooling (excluded by go list -deps ./cmd/...).
+      # Enforced by internal/releaseglob (go list -deps vs this list).
       - "libs/hostkit/envx/**"
       - "libs/hostkit/httpx/**"
       - "libs/hostkit/logx/**"
+      # Subpackage globs don't match module files — the module's dep
+      # graph changes fire releases too.
+      - "libs/hostkit/go.mod"
+      - "libs/hostkit/go.sum"
       - ".moon/**"
       - "mise.toml"
       - ".dockerignore"
@@ -49,7 +54,7 @@ jobs:
     uses: ./.github/workflows/release-app.yml
     with:
       app: webhook-dispatcher
-      lib_paths: "libs/hostkit/envdoc/** libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/logx/**"
+      lib_paths: "libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/logx/**"
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
     secrets: inherit

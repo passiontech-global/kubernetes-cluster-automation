@@ -52,7 +52,7 @@ func (c *SystemdSessionCheck) Name() string { return wdeps.CheckSystemdSessions 
 // sessionState returns the STATE= value of a logind session file —
 // "" when unreadable or absent.
 func sessionState(data []byte) string {
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if v, ok := strings.CutPrefix(line, "STATE="); ok {
 			return strings.TrimSpace(v)
 		}

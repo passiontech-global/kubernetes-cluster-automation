@@ -23,6 +23,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewArgoCDAppStuckCheck,
 	NewFluxHRRetriesCheck,
 	NewKargoPromotionHealthCheck,
+	NewKedaScaledObjectGuardCheck,
 	NewFluxKustomizationHealthCheck,
 	NewWorkloadScaleFlappingCheck,
 	NewImagePullSecretAuditorCheck,

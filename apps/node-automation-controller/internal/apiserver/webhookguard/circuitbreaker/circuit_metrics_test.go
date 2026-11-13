@@ -104,7 +104,7 @@ func cbFixture(t *testing.T, extra ...runtime.Object) (*guardstate.Guard, *Break
 	dyn := testutil.NewDynWithCRDs(crd)
 	objs := append([]runtime.Object{}, extra...)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	g := &guardstate.Guard{
 		CS:  cs,
 		Dyn: dyn,
@@ -154,18 +154,18 @@ func TestSweepCRDConversionBackendsVerdicts(t *testing.T) {
 		t.Cleanup(func() {
 			for _, reason := range []string{
 				CRDReasonMissingService, CRDReasonZeroEndpoints, CRDReasonTLSProbeFailed} {
-				CRDConversionWebhookUnhealthy.DeleteLabelValues(crdName, svcKey, reason)
+				metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues(crdName, svcKey, reason)
 			}
 		})
 	}
 	seriesCount := func(t *testing.T) int {
 		t.Helper()
-		return ptestutil.CollectAndCount(CRDConversionWebhookUnhealthy)
+		return ptestutil.CollectAndCount(metrics.CRDConversionWebhookUnhealthy)
 	}
 	seriesFor := func(t *testing.T, reason string) float64 {
 		t.Helper()
 		return ptestutil.ToFloat64(
-			CRDConversionWebhookUnhealthy.WithLabelValues(crdName, svcKey, reason))
+			metrics.CRDConversionWebhookUnhealthy.WithLabelValues(crdName, svcKey, reason))
 	}
 
 	t.Run("missing service", func(t *testing.T) {
@@ -255,9 +255,9 @@ func TestSweepCRDConversionBackendsVerdicts(t *testing.T) {
 		g, b := cbFixture(t)
 		// Last sweep's verdict for this CRD.
 		k := crdConversionKey{crd: crdName, service: svcKey, reason: CRDReasonZeroEndpoints}
-		b.crdUnhealthyEmitted.Set(CRDConversionWebhookUnhealthy, 1, k,
+		b.crdUnhealthyEmitted.Set(metrics.CRDConversionWebhookUnhealthy, 1, k,
 			k.crd, k.service, k.reason)
-		b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
+		b.crdUnhealthyEmitted.Prune(metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues)
 		snap := &guardstate.Snapshot{G: g, CRDErr: errors.New("crd boom"), UnhealthyNodes: map[string]bool{}}
 		if err := b.SweepCRDConversionBackends(ctx, snap); err == nil {
 			t.Fatal("CRD list failure must surface as an error")
@@ -275,10 +275,10 @@ func TestSweepCRDConversionBackendsVerdicts(t *testing.T) {
 		liveK := crdConversionKey{crd: crdName, service: svcKey, reason: CRDReasonZeroEndpoints}
 		deadK := crdConversionKey{crd: "retired.example.com", service: "backend/old-svc", reason: CRDReasonZeroEndpoints}
 		for _, k := range []crdConversionKey{liveK, deadK} {
-			b.crdUnhealthyEmitted.Set(CRDConversionWebhookUnhealthy, 1, k,
+			b.crdUnhealthyEmitted.Set(metrics.CRDConversionWebhookUnhealthy, 1, k,
 				k.crd, k.service, k.reason)
 		}
-		b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
+		b.crdUnhealthyEmitted.Prune(metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues)
 
 		// The CRD list succeeded (snap.CRDs carries the live CRD) but
 		// the node census failed: carry-forward keeps the live CRD's
@@ -301,7 +301,7 @@ func TestSweepCRDConversionBackendsVerdicts(t *testing.T) {
 		if got := seriesFor(t, CRDReasonZeroEndpoints); got != 1 {
 			t.Fatalf("live CRD series must carry forward, got %v", got)
 		}
-		if CRDConversionWebhookUnhealthy.DeleteLabelValues("retired.example.com", "backend/old-svc", CRDReasonZeroEndpoints) {
+		if metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues("retired.example.com", "backend/old-svc", CRDReasonZeroEndpoints) {
 			t.Fatal("retired CRD series must be forgotten, not carried")
 		}
 		if _, ok := b.crdUnhealthyEmitted.Last()[deadK]; ok {
@@ -334,9 +334,9 @@ func TestSweepCRDConversionBackendsVerdicts(t *testing.T) {
 		g, b := cbFixture(t, svc, eps(true))
 		g.EndpointProber = func(context.Context, string, int32) bool { return true }
 		k := crdConversionKey{crd: crdName, service: svcKey, reason: CRDReasonTLSProbeFailed}
-		b.crdUnhealthyEmitted.Set(CRDConversionWebhookUnhealthy, 1, k,
+		b.crdUnhealthyEmitted.Set(metrics.CRDConversionWebhookUnhealthy, 1, k,
 			k.crd, k.service, k.reason)
-		b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
+		b.crdUnhealthyEmitted.Prune(metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues)
 		cs := g.CS.(*fake.Clientset)
 		cs.PrependReactor("get", "services",
 			func(ktesting.Action) (bool, runtime.Object, error) {

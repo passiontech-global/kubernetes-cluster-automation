@@ -75,7 +75,7 @@ func (a *Agent) sdNotifyLoop(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		if !a.probeHealthy(client, probeURL) {
+		if !a.probeHealthy(ctx, client, probeURL) {
 			logger().Warn("sd_notify: probe mux unhealthy — skipping WATCHDOG=1")
 			continue
 		}
@@ -109,15 +109,21 @@ func (a *Agent) probeSelfURL() string {
 // probeHealthy gates the watchdog feed: the ready flag must hold AND
 // the probe mux must answer /healthz 200 — the HTTP round-trip is
 // what proves the mux isn't accept-wedged (a bare flag read can't
-// see that).
-func (a *Agent) probeHealthy(client *http.Client, probeURL string) bool {
+// see that). The daemon ctx rides the request: a cancelled agent
+// aborts the self-probe at once instead of hanging the STOPPING path
+// for the client timeout.
+func (a *Agent) probeHealthy(ctx context.Context, client *http.Client, probeURL string) bool {
 	if !a.ready.Load() {
 		return false
 	}
 	if probeURL == "" {
 		return true
 	}
-	resp, err := client.Get(probeURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}

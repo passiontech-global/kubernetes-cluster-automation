@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -49,7 +50,21 @@ type routeEventFilter struct {
 	tables map[uint32]bool
 	prefs  map[uint32]bool
 	nebIf  uint32
+	// nebIfFn re-resolves the dev ifindex; wired by nebulaRouteFilter
+	// so a rebuilt nebula dev (tun recreate renumbers the ifindex)
+	// refreshes instead of leaving the whole socket session matching
+	// the DEAD index. nil (hand-built test filters) keeps nebIf as
+	// constructed.
+	nebIfFn func() uint32
+	// nebIfAt throttles the re-resolve to one sysfs read per interval.
+	nebIfAt time.Time
 }
+
+// nebIfRefresh is how stale the armed ifindex may get — a tun
+// recreate between refreshes is caught by the next datagram (dev
+// churn emits route traffic), so the interval only bounds sysfs
+// reads during long delete bursts.
+const nebIfRefresh = 30 * time.Second
 
 // nebulaRouteFilter builds the filter once per socket session —
 // cheap: a couple of map writes plus one sysfs read. The ifindex
@@ -77,6 +92,13 @@ func (n *NetHealth) nebulaRouteFilter() *routeEventFilter {
 	}
 	f.tables[pub] = true
 	f.nebIf = nebulaIfindex(n.cfg.sysClassNet, wd.NebulaDev)
+	// Re-resolve hook: the session survives nebula dev recreation, so
+	// the ifindex is refreshed lazily per datagram (see refreshNebIf)
+	// — the sysClassNet view and the dev name are fixed for the
+	// process lifetime, only the kernel's numbering moves.
+	dev, sysNet := wd.NebulaDev, n.cfg.sysClassNet
+	f.nebIfFn = func() uint32 { return nebulaIfindex(sysNet, dev) }
+	f.nebIfAt = time.Now()
 	return f
 }
 
@@ -106,6 +128,7 @@ func nebulaIfindex(dir, dev string) uint32 {
 // can't be proven NOT to be a nebula delete, so it counts); the
 // DELROUTE/DELRULE decode below is the nebula policy.
 func (f *routeEventFilter) scanDeleteEvents(buf []byte) bool {
+	f.refreshNebIf()
 	return routewatch.ScanMessages(buf,
 		func(typ uint16, payload []byte) bool {
 			switch typ {
@@ -116,6 +139,20 @@ func (f *routeEventFilter) scanDeleteEvents(buf []byte) bool {
 			}
 			return false
 		})
+}
+
+// refreshNebIf re-resolves the dev ifindex when the armed one is
+// stale — a rebuilt nebula dev (tun recreate) renumbers the ifindex
+// while the socket session (and this filter) survives, and a filter
+// armed once per session would match the DEAD index forever. The
+// re-read throttles to one sysfs read per nebIfRefresh; nil fn
+// (hand-built filters) is inert.
+func (f *routeEventFilter) refreshNebIf() {
+	if f.nebIfFn == nil || time.Since(f.nebIfAt) < nebIfRefresh {
+		return
+	}
+	f.nebIfAt = time.Now()
+	f.nebIf = f.nebIfFn()
 }
 
 // delRouteRelevant decodes an RTM_DELROUTE payload (struct rtmsg +

@@ -51,7 +51,7 @@ func TestCircuitPatchUnmeasurableRefFreezesRecovery(t *testing.T) {
 	b := &Breaker{}
 	kind, cfg := guardstate.KindMutating, "mwc-url"
 	urlHook, noRefHook := "rewired.example.com", "noref.example.com"
-	ignore := wgFP(admissionv1.Ignore) // the tripped state, externally re-asserted
+	ignore := new(admissionv1.Ignore) // the tripped state, externally re-asserted
 	views := []hookView{
 		// URL clientConfig — no Service ref at all.
 		{name: urlHook, fp: ignore},

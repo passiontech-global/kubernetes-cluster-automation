@@ -142,7 +142,7 @@ func Setup(d shared.Deps) error {
 			verdict:    d.Maintenance,
 			cs:         d.CS,
 			dyn:        d.Dyn,
-			nodeReader: d.Mgr.GetClient(),
+			nodeReader: d.CachedClient(),
 			queue:      d.Name,
 			now:        shared.SystemClock,
 			namespaces: cfg.namespaces,
@@ -233,7 +233,7 @@ func partitionEvictNamespaces() map[string]struct{} {
 		raw = partitionPodNS
 	}
 	out := make(map[string]struct{})
-	for _, ns := range strings.Split(raw, ",") {
+	for ns := range strings.SplitSeq(raw, ",") {
 		if ns = strings.TrimSpace(ns); ns != "" {
 			out[ns] = struct{}{}
 		}

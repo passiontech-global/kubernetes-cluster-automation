@@ -54,7 +54,7 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 
 func selectAttrKey(v any, path string) any {
 	cur := v
-	for _, seg := range strings.Split(path, ".") {
+	for seg := range strings.SplitSeq(path, ".") {
 		cur = getAttr(cur, seg)
 		if _, u := cur.(Undefined); u {
 			return cur

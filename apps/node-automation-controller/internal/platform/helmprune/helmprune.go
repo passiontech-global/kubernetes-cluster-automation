@@ -29,8 +29,9 @@
 package helmprune
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
@@ -195,8 +196,8 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 		if hooks.Excess != nil {
 			hooks.Excess(k.ns, k.name, len(superseded), maxSuperseded)
 		}
-		sort.Slice(superseded, func(i, j int) bool {
-			return superseded[i].v < superseded[j].v
+		slices.SortFunc(superseded, func(a, b supersededSecret) int {
+			return cmp.Compare(a.v, b.v)
 		})
 		toDelete := excess
 		for _, cand := range superseded {

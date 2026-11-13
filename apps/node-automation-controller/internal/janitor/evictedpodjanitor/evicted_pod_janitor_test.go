@@ -1,7 +1,6 @@
 package evictedpodjanitor
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -36,20 +35,6 @@ func epjPod(ns, name string, phase corev1.PodPhase, reason string, age time.Dura
 	}
 }
 
-// epjPodExists reports whether a pod still exists in the fake cluster.
-func epjPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
-	t.Helper()
-	_, err := cs.CoreV1().Pods(ns).Get(context.Background(), name, metav1.GetOptions{})
-	if err == nil {
-		return true
-	}
-	if apierrors.IsNotFound(err) {
-		return false
-	}
-	t.Fatalf("get pod %s/%s: %v", ns, name, err)
-	return false
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -71,16 +56,16 @@ func TestEvictedPodJanitorReasonSet(t *testing.T) {
 		epjPod("a", "no-reason", corev1.PodFailed, "", 72*time.Hour))
 	cs := fake.NewSimpleClientset(objs...)
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 9; i++ {
-		if epjPodExists(t, cs, "a", fmt.Sprintf("doomed-%d", i)) {
+		if testutil.PodExistsStrict(t, cs, "a", fmt.Sprintf("doomed-%d", i)) {
 			t.Fatalf("doomed-%d not deleted", i)
 		}
 	}
 	for _, name := range []string{"other-reason", "no-reason"} {
-		if !epjPodExists(t, cs, "a", name) {
+		if !testutil.PodExistsStrict(t, cs, "a", name) {
 			t.Fatalf("pod %s wrongly deleted", name)
 		}
 	}
@@ -96,10 +81,10 @@ func TestEvictedPodJanitorCapTen(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(objs...)
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	remaining, err := cs.CoreV1().Pods("a").List(context.Background(), metav1.ListOptions{})
+	remaining, err := cs.CoreV1().Pods("a").List(t.Context(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,10 +102,10 @@ func TestEvictedPodJanitorSkipsTerminating(t *testing.T) {
 	terminating.DeletionTimestamp = &now
 	cs := fake.NewSimpleClientset(terminating)
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if !epjPodExists(t, cs, "a", "terminating") {
+	if !testutil.PodExistsStrict(t, cs, "a", "terminating") {
 		t.Fatal("terminating pod was deleted")
 	}
 }
@@ -134,11 +119,11 @@ func TestEvictedPodJanitorKeepsNonFailedAndYoung(t *testing.T) {
 		epjPod("a", "pending", corev1.PodPending, "", 72*time.Hour),
 		epjPod("a", "young-evicted", corev1.PodFailed, "Evicted", 30*time.Minute))
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"running", "succeeded", "pending", "young-evicted"} {
-		if !epjPodExists(t, cs, "a", name) {
+		if !testutil.PodExistsStrict(t, cs, "a", name) {
 			t.Fatalf("pod %s wrongly deleted", name)
 		}
 	}
@@ -151,11 +136,11 @@ func TestEvictedPodJanitorMultipleNamespaces(t *testing.T) {
 		epjPod("ns-a", "old-evicted-a", corev1.PodFailed, "Evicted", 2*time.Hour),
 		epjPod("ns-b", "old-evicted-b", corev1.PodFailed, "NodeLost", 48*time.Hour))
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	for _, p := range [][2]string{{"ns-a", "old-evicted-a"}, {"ns-b", "old-evicted-b"}} {
-		if epjPodExists(t, cs, p[0], p[1]) {
+		if testutil.PodExistsStrict(t, cs, p[0], p[1]) {
 			t.Fatalf("old evicted pod %s/%s not deleted", p[0], p[1])
 		}
 	}
@@ -181,13 +166,13 @@ func TestEvictedPodJanitorUsesFinishedAt(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset(fresh, old)
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if !epjPodExists(t, cs, "a", "old-pod-fresh-eviction") {
+	if !testutil.PodExistsStrict(t, cs, "a", "old-pod-fresh-eviction") {
 		t.Fatal("freshly evicted pod deleted — finishedAt ignored")
 	}
-	if epjPodExists(t, cs, "a", "old-pod-old-eviction") {
+	if testutil.PodExistsStrict(t, cs, "a", "old-pod-old-eviction") {
 		t.Fatal("old eviction not reaped")
 	}
 }
@@ -209,13 +194,13 @@ func TestEvictedPodJanitorDeleteUIDPrecondition(t *testing.T) {
 			return false, nil, nil // fall through to the tracker
 		})
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if gotUID == nil || *gotUID != pod.UID {
 		t.Fatalf("delete missing the UID precondition: %v", gotUID)
 	}
-	if epjPodExists(t, cs, "a", "old-evicted") {
+	if testutil.PodExistsStrict(t, cs, "a", "old-evicted") {
 		t.Fatal("old evicted pod not deleted")
 	}
 }
@@ -236,13 +221,13 @@ func TestEvictedPodJanitorFieldSelector(t *testing.T) {
 			return false, nil, nil // fall through to the tracker
 		})
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if want := "status.phase=" + string(corev1.PodFailed); gotFields != want {
 		t.Fatalf("list field selector = %q, want %q", gotFields, want)
 	}
-	if epjPodExists(t, cs, "a", "old-evicted") {
+	if testutil.PodExistsStrict(t, cs, "a", "old-evicted") {
 		t.Fatal("old evicted pod not deleted")
 	}
 }
@@ -255,7 +240,7 @@ func TestEvictedPodJanitorListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err == nil {
+	if err := j.run(t.Context()); err == nil {
 		t.Fatal("expected error when the pods list fails")
 	}
 }
@@ -277,7 +262,7 @@ func TestEvictedPodJanitorDeleteErrorTolerated(t *testing.T) {
 			return true, nil, errors.New("delete rejected")
 		})
 	j := &evictedPodJanitor{cs: cs}
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatalf("pod delete failures must not error the run: %v", err)
 	}
 	if got := atomic.LoadInt32(&attempts); got != int32(evictedPodCap) {
@@ -297,13 +282,13 @@ func TestEvictedPodJanitorDeleteNotFoundNotMetered(t *testing.T) {
 		})
 	j := &evictedPodJanitor{cs: cs, queue: "evicted-pod-janitor"}
 	before := testutil.QueueErrorCount(t, "evicted-pod-janitor")
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if got := testutil.QueueErrorCount(t, "evicted-pod-janitor") - before; got != 0 {
 		t.Fatalf("NotFound race metered as an error: delta = %v, want 0", got)
 	}
-	if !epjPodExists(t, cs, "a", "old-evicted") {
+	if !testutil.PodExistsStrict(t, cs, "a", "old-evicted") {
 		t.Fatal("pod vanished despite the rejected delete")
 	}
 }
@@ -320,7 +305,7 @@ func TestEvictedPodJanitorDeleteConflictNotMetered(t *testing.T) {
 		})
 	j := &evictedPodJanitor{cs: cs, queue: "evicted-pod-janitor"}
 	before := testutil.QueueErrorCount(t, "evicted-pod-janitor")
-	if err := j.run(context.Background()); err != nil {
+	if err := j.run(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if got := testutil.QueueErrorCount(t, "evicted-pod-janitor") - before; got != 0 {

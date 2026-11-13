@@ -1,7 +1,6 @@
 package nodelabeler
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -61,7 +60,7 @@ func TestNodeLabelerWorkerRoleVariants(t *testing.T) {
 		testutil.Node("w2", corev1.ConditionTrue, nil),
 	)
 	r := &nodeLabeler{cs: cs, configPath: filepath.Join(t.TempDir(), "labels.txt")}
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +88,7 @@ func TestNodeLabelerWorkerRoleVariants(t *testing.T) {
 func TestNodeLabelerMissingConfigFile(t *testing.T) {
 	cs := fake.NewSimpleClientset(testutil.Node("w1", corev1.ConditionTrue, nil))
 	r := &nodeLabeler{cs: cs, configPath: filepath.Join(t.TempDir(), "no-such-labels.txt")}
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +107,7 @@ func TestNodeLabelerMissingConfigFile(t *testing.T) {
 func TestNodeLabelerEmptyConfigFile(t *testing.T) {
 	cs := fake.NewSimpleClientset(testutil.Node("w1", corev1.ConditionTrue, nil))
 	r := &nodeLabeler{cs: cs, configPath: writeLabelsFile(t, "")}
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +147,7 @@ key-without-equals-sign-and-no-nodes
 	)
 	r := &nodeLabeler{cs: cs, queue: "node-labeler", configPath: cfg}
 	before := testutil.QueueErrorCount(t, "node-labeler")
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,14 +205,14 @@ func TestNodeLabelerIdempotent(t *testing.T) {
 	cs := fake.NewSimpleClientset(testutil.Node("w1", corev1.ConditionTrue, nil))
 	r := &nodeLabeler{cs: cs, configPath: cfg}
 
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if first := nodePatchActions(cs); first != 2 { // worker role + workload label
 		t.Fatalf("expected 2 patches on first pass, got %d", first)
 	}
 
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if n := nodePatchActions(cs); n != 2 {
@@ -230,7 +229,7 @@ func TestNodeLabelerListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &nodeLabeler{cs: cs, configPath: filepath.Join(t.TempDir(), "labels.txt")}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -249,7 +248,7 @@ func TestNodeLabelerWorkerPatchErrorContinues(t *testing.T) {
 			return false, nil, nil
 		})
 	r := &nodeLabeler{cs: cs, configPath: filepath.Join(t.TempDir(), "labels.txt")}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("per-node patch failures must not error the reconcile: %v", err)
 	}
 	if _, ok := testutil.GetNode(t, cs, "w2").Labels[workerRoleLabel]; !ok {
@@ -275,7 +274,7 @@ func TestNodeLabelerLabelsFilePatchErrorContinues(t *testing.T) {
 			return false, nil, nil
 		})
 	r := &nodeLabeler{cs: cs, configPath: cfg}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("per-node patch failures must not error the reconcile: %v", err)
 	}
 	if got := testutil.GetNode(t, cs, "w2").Labels["passiontech.dev/workload"]; got != "app" {
@@ -297,7 +296,7 @@ func TestNodeLabelerInMemoryLabelsUpdated(t *testing.T) {
 		cs := fake.NewSimpleClientset(
 			testutil.Node("w1", corev1.ConditionTrue, map[string]string{workerRoleLabel: ""}))
 		r := &nodeLabeler{cs: cs, configPath: cfg}
-		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
 		// The patch budget is the observable: the duplicate row must
@@ -311,7 +310,7 @@ func TestNodeLabelerInMemoryLabelsUpdated(t *testing.T) {
 		cfg := writeLabelsFile(t, "node-role.kubernetes.io/worker= w1\n")
 		cs := fake.NewSimpleClientset(testutil.Node("w1", corev1.ConditionTrue, nil))
 		r := &nodeLabeler{cs: cs, configPath: cfg}
-		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
 		// Worker sweep patches first, mirrors into the snapshot; the
@@ -327,7 +326,7 @@ func TestNodeLabelerInMemoryLabelsUpdated(t *testing.T) {
 		cs := fake.NewSimpleClientset(
 			testutil.Node("w1", corev1.ConditionTrue, map[string]string{workerRoleLabel: ""}))
 		r := &nodeLabeler{cs: cs, configPath: cfg}
-		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
 		if n := nodePatchActions(cs); n != 2 {
@@ -350,7 +349,7 @@ func TestNodeLabelerReadFileErrorMetered(t *testing.T) {
 	r := &nodeLabeler{cs: cs, queue: "node-labeler", configPath: cfg}
 	before := testutil.QueueErrorCount(t, "node-labeler")
 
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("read failure must not error the reconcile: %v", err)
 	}
 	if got := testutil.QueueErrorCount(t, "node-labeler") - before; got != 1 {

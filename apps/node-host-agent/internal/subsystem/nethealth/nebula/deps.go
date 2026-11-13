@@ -99,7 +99,12 @@ type Deps struct {
 	// LinkAddrs lists the addresses on one netns link — the
 	// netlinkx read behind hasIPv4Addr (the `ip -o addr show dev`
 	// replacement; callers pass pid 1 for the host netns).
-	LinkAddrs                func(pid int, name string) ([]netlink.Addr, error)
+	LinkAddrs func(pid int, name string) ([]netlink.Addr, error)
+	// Rules dumps pid's policy-routing rules — the netlinkx.Rules
+	// read behind CheckNebulaDirectTCP (the per-cycle
+	// `ip rule list pref 1499` fork replacement; pid 1 = host
+	// netns). Writes stay on the IP seam — netlinkx is read-only.
+	Rules                    func(pid int) ([]netlink.Rule, error)
 	StateExit                func(name string)
 	UnitEnabledActive        func(ctx context.Context, unit string) bool
 	NebulaUpExists           func(wd *watchdogconf.Config) bool

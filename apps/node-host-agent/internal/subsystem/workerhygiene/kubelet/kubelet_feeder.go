@@ -375,15 +375,14 @@ func WithDefaultAPIPort(addr string) string {
 // clears a lingering failed state so the following restart is a clean
 // start, not a retry of a queued failed job. Best-effort: an error is
 // logged, never fatal; a nil Systemd client (unwired agent/tests) is
-// a no-op.
+// a no-op. Rides the shared client's zero-fork D-Bus ResetFailedUnit
+// (the systemctl fallback only on connection-level failure).
 func resetFailedK0sWorker(d *wdeps.Deps, ctx context.Context) {
 	if d.Cfg.Systemd == nil {
 		return
 	}
-	if out, err := d.Cfg.Systemd.Exec(ctx,
-		"systemctl", "reset-failed", "k0sworker.service"); err != nil {
+	if err := d.Cfg.Systemd.ResetFailed(ctx, "k0sworker.service"); err != nil {
 		d.State.AppendLog(fmt.Sprintf(
-			"kubelet-remediate: reset-failed k0sworker failed: %v (%s)",
-			err, strings.TrimSpace(out)))
+			"kubelet-remediate: reset-failed k0sworker failed: %v", err))
 	}
 }

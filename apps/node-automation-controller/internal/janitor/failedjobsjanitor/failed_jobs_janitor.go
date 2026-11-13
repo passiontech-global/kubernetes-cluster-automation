@@ -29,6 +29,7 @@ import (
 
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -49,6 +50,14 @@ type failedJobsJanitor struct {
 	// (their owner cannot be verified); every typed sweep is
 	// unaffected. main.go always wires the manager's dynamic client.
 	dyn dynamic.Interface
+	// meta feeds kube.ListPartialOrFallback for the census reads that
+	// only need ObjectMeta (the shared cluster PVC census, the
+	// VolumeAttachment stuck audit): PartialObjectMetadata carries
+	// labels, ownerRefs, finalizers, timestamps and the UID/RV the
+	// deletes and patches key on, at a fraction of the bytes. Nil in
+	// tests — ListPartialOrFallback's typed fallbacks serve the same
+	// objects identically.
+	meta metadata.Interface
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -73,6 +82,7 @@ func Setup(d shared.Deps) error {
 		j := &failedJobsJanitor{
 			cs:    d.CS,
 			dyn:   d.Dyn,
+			meta:  d.Meta,
 			queue: d.Name,
 			now:   shared.SystemClock,
 		}

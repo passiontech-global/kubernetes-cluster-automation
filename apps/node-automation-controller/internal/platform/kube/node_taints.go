@@ -10,11 +10,33 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// TaintNodeUnschedulable is the well-known NoSchedule taint
+// UnschedulableTaintKey is the well-known NoSchedule taint
 // `kubectl taint nodes <n> node.kubernetes.io/unschedulable:NoSchedule`
 // places — the "out of service" marker that complements
-// spec.Unschedulable (which cordon alone sets).
-const TaintNodeUnschedulable = "node.kubernetes.io/unschedulable"
+// spec.Unschedulable (which cordon alone sets). Its TimeAdded is the
+// only clock for "how long has this cordon been live" (node.go).
+const UnschedulableTaintKey = "node.kubernetes.io/unschedulable"
+
+// External-contract taint keys — owned by tooling outside this
+// controller (Cilium, the dead-node sweeper's fencing class, medik8s
+// SNR); values are ops contracts and must never change. The internal
+// passiontech.dev/* remediation keys live in annos.go.
+const (
+	// TaintCiliumAgentNotReady is the NoSchedule taint the Cilium
+	// agent stamps on its node until the local cilium pod reports
+	// ready — the stale copy ciliumtaintreaper reaps once the pod
+	// is verifiably healthy.
+	TaintCiliumAgentNotReady = "node.cilium.io/agent-not-ready"
+	// TaintNodeOutOfService is the fencing taint the dead-node
+	// sweeper (and any operator following the SIG-Storage
+	// out-of-service convention) stamps to keep workloads off a
+	// dead node — volumeattachmentcleaner treats it as the "keep
+	// the VA" fence for the same reason.
+	TaintNodeOutOfService = "node.kubernetes.io/out-of-service"
+	// TaintMedik8sOutOfService is medik8s SelfNodeRemediation's
+	// fencing twin of TaintNodeOutOfService.
+	TaintMedik8sOutOfService = "node.medik8s.io/out-of-service"
+)
 
 // outOfServiceTaintKeys are the fencing taints the dead-node
 // sweeper and the medik8s SelfNodeRemediation operator stamp when
@@ -24,8 +46,8 @@ const TaintNodeUnschedulable = "node.kubernetes.io/unschedulable"
 // of them exactly like a remediation-tainted one: fenced, not
 // healthy.
 var outOfServiceTaintKeys = []string{
-	"node.kubernetes.io/out-of-service", // deadnodesweeper fence
-	"node.medik8s.io/out-of-service",    // medik8s SNR fence
+	TaintNodeOutOfService,    // deadnodesweeper fence
+	TaintMedik8sOutOfService, // medik8s SNR fence
 }
 
 // remediationMedik8sTaintPrefix covers the per-rule taints the
@@ -96,7 +118,7 @@ func hasRemediationOrOutOfServiceTaint(n *corev1.Node, includeUnschedulable bool
 				return true
 			}
 		}
-		if (includeUnschedulable && t.Key == TaintNodeUnschedulable) ||
+		if (includeUnschedulable && t.Key == UnschedulableTaintKey) ||
 			strings.HasPrefix(t.Key, remediationMedik8sTaintPrefix) {
 			return true
 		}

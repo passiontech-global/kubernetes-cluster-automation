@@ -23,7 +23,7 @@ import "strings"
 // inside quotes is literal.
 func ParseShellKV(data string) map[string]string {
 	vars := map[string]string{}
-	for _, line := range strings.Split(data, "\n") {
+	for line := range strings.SplitSeq(data, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

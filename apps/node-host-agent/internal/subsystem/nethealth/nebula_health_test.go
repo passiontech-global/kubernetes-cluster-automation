@@ -380,7 +380,7 @@ func TestMinRTTKeepsSmallestSample(t *testing.T) {
 // --- nebula-direct-tcp: the pref-1499 bypass-rule guard ---
 
 // directTCPEnv wires a host with the nebula script deployed (the
-// check's only deployment gate) and empty rule listings.
+// check's only deployment gate) and an empty netlink rule dump.
 func directTCPEnv(t *testing.T) *env {
 	t.Helper()
 	e := fixture(t, &watchdogconf.Config{NebulaNet: "interdc"})
@@ -388,15 +388,19 @@ func directTCPEnv(t *testing.T) *env {
 	e.n.cfg.HostRoot = root
 	testutil.WriteFile(t, filepath.Join(root, "etc/nebula/interdc/nebula-up.sh"),
 		"#!/bin/bash\nexit 0\n")
-	e.host.On("rule list pref 1499", "")
+	// The listing rides the rulesFn netlink seam now (writes stay on
+	// the scripted host): empty table by default.
+	e.n.cfg.rulesFn = func(int) ([]netlink.Rule, error) { return nil, nil }
 	return e
 }
 
-// An unanswerable `ip rule list pref 1499` aborts the cycle — rules
-// must never be re-added on a blind read.
+// An unanswerable policy-rules dump aborts the cycle — rules must
+// never be re-added on a blind read.
 func TestDirectTCPRuleListFailureAborts(t *testing.T) {
 	e := directTCPEnv(t)
-	e.host.FailOn("rule list pref 1499", errCmdFail)
+	e.n.cfg.rulesFn = func(int) ([]netlink.Rule, error) {
+		return nil, errCmdFail
+	}
 	e.n.checkNebulaDirectTCP(context.Background())
 	if e.host.Ran("rule add pref 1499") {
 		t.Fatalf("rule added on a failed listing: %v", e.host.Cmds())
@@ -426,12 +430,16 @@ func TestDirectTCPSkipsInvalidPorts(t *testing.T) {
 	}
 }
 
-// A port whose rule already shows in the listing is not re-added;
-// a missing sibling port still is (the fold-in keeps one listing).
+// A port whose rule already shows in the dump is not re-added;
+// a missing sibling port still is (the fold-in keeps one dump).
 func TestDirectTCPSkipsPresentRules(t *testing.T) {
 	e := directTCPEnv(t)
-	e.host.On("rule list pref 1499",
-		"1499:\tfrom all ipproto tcp dport 22 lookup main\n")
+	e.n.cfg.rulesFn = func(int) ([]netlink.Rule, error) {
+		return []netlink.Rule{{
+			Priority: 1499,
+			Dport:    &netlink.RulePortRange{Start: 22, End: 22},
+		}}, nil
+	}
 	e.n.cfg.NebulaDirectTCPPorts = []int{22, 6443}
 	e.n.checkNebulaDirectTCP(context.Background())
 	if e.host.Ran("dport 22") {

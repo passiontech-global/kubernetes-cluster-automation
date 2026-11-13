@@ -11,6 +11,8 @@ import (
 
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // verdictTTL is how long a Verdict reuses one MaintenanceActive
@@ -35,6 +37,16 @@ type Verdict struct {
 	held bool
 	why  string
 	err  error
+	// NodeReader backs the node census the active-cordon signal (a)
+	// reads — the manager's informer-backed client (mgr.GetClient),
+	// wired at the ONE production construction site (main.go's
+	// shared.Deps, the same CachedNodeReader posture
+	// clusterhealthprobes uses). The verdict is a read-only query by
+	// contract, so the watch-fresh cache read is exactly the
+	// sanctioned census class; nil (tests, literally-built fixtures,
+	// the per-module fallback verdicts) keeps the direct ListNodes
+	// read — ListNodesCached's documented nil-reader fallback.
+	NodeReader kube.CachedNodeReader
 }
 
 // Active returns the maintenance verdict, evaluating
@@ -63,7 +75,7 @@ func (v *Verdict) Active(ctx context.Context, cs kubernetes.Interface,
 	mctx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), maintenanceEvalTimeout)
 	defer cancel()
-	v.held, v.why, v.err = MaintenanceActiveWithClock(mctx, cs, dyn, now)
+	v.held, v.why, v.err = maintenanceActive(mctx, cs, dyn, v.NodeReader, now)
 	v.at = now
 	// READ-ONLY by contract: a "does maintenance hold?" query must
 	// never patch Nodes as a side effect — heal gates call Active

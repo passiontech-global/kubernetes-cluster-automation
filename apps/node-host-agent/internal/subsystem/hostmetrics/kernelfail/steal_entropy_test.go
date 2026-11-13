@@ -121,7 +121,7 @@ func TestStealEntropyPromGauges(t *testing.T) {
 	prom = testutil.ReadFile(t, filepath.Join(textfileDirOverride,
 		stealEntropyPromName))
 	got := ""
-	for _, ln := range strings.Split(prom, "\n") {
+	for ln := range strings.SplitSeq(prom, "\n") {
 		if strings.HasPrefix(ln, "node_agent_cpu_steal_ratio ") {
 			got = strings.TrimPrefix(ln, "node_agent_cpu_steal_ratio ")
 		}

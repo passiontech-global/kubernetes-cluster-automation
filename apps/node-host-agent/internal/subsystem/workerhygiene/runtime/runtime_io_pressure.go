@@ -90,7 +90,7 @@ func isWholeDisk(name string) bool {
 // but extra trailing fields (discards, flush) must not matter.
 func parseDiskstats(data []byte) map[string]diskIOStat {
 	out := map[string]diskIOStat{}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 14 || !isWholeDisk(f[2]) {
 			continue
@@ -132,7 +132,7 @@ func psiIOFullAvgs(d *wdeps.Deps) (avg60, avg300 float64, ok bool) {
 	if err != nil {
 		return 0, 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 3 || f[0] != "full" {
 			continue

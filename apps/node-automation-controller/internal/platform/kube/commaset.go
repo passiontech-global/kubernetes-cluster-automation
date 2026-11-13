@@ -12,7 +12,7 @@ import "strings"
 // empty or absent value yields an empty set.
 func ParseCommaSet(s string) map[string]bool {
 	out := map[string]bool{}
-	for _, n := range strings.Split(s, ",") {
+	for n := range strings.SplitSeq(s, ",") {
 		if n = strings.TrimSpace(n); n != "" {
 			out[n] = true
 		}

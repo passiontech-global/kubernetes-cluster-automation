@@ -99,8 +99,7 @@ func TestSdNotifyLoopStopsFeedingWhenProbeDead(t *testing.T) {
 	sdWatchdogInterval = 20 * time.Millisecond
 	defer func() { sdWatchdogInterval = orig }()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go a.sdNotifyLoop(ctx)
 	if got := waitMsg(t, msgs); got != "READY=1\n" {
 		t.Fatalf("first datagram=%q want READY=1", got)
@@ -158,12 +157,12 @@ func TestProbeSelfURL(t *testing.T) {
 // each failing input in isolation.
 func TestProbeHealthy(t *testing.T) {
 	a := New(Config{NodeName: "node-a"})
-	if a.probeHealthy(http.DefaultClient, "") {
+	if a.probeHealthy(context.Background(), http.DefaultClient, "") {
 		t.Fatal("unready agent reported healthy")
 	}
 	a.ready.Store(true)
 	// "" URL = unparseable ProbeAddr → the flag alone is the verdict.
-	if !a.probeHealthy(http.DefaultClient, "") {
+	if !a.probeHealthy(context.Background(), http.DefaultClient, "") {
 		t.Fatal("empty probeURL must fall back to the ready flag")
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -174,16 +173,16 @@ func TestProbeHealthy(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	if !a.probeHealthy(srv.Client(), srv.URL+"/healthz") {
+	if !a.probeHealthy(context.Background(), srv.Client(), srv.URL+"/healthz") {
 		t.Fatal("200 healthz reported unhealthy")
 	}
-	if a.probeHealthy(srv.Client(), srv.URL+"/wedged") {
+	if a.probeHealthy(context.Background(), srv.Client(), srv.URL+"/wedged") {
 		t.Fatal("500 healthz reported healthy")
 	}
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	deadURL := dead.URL
 	dead.Close()
-	if a.probeHealthy(dead.Client(), deadURL+"/healthz") {
+	if a.probeHealthy(context.Background(), dead.Client(), deadURL+"/healthz") {
 		t.Fatal("dead probe mux reported healthy")
 	}
 }

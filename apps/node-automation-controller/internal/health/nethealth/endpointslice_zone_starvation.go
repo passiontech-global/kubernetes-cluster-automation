@@ -28,8 +28,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	eventsv1 "k8s.io/api/events/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -240,31 +238,25 @@ func (p *endpointSliceZoneStarvationCheck) emitStarvedEvent(
 	ctx context.Context, log logr.Logger, ns, svc, zone string) {
 
 	now := p.Now()
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			// The zone rides the name: one sweep can starve several
-			// zones of the same Service, and every emission shares
-			// this sweep's `now` — without the zone in the name the
-			// second Create hits 409 AlreadyExists.
-			Name:      fmt.Sprintf("%s.%s.%x", svc, zone, now.UnixNano()),
-			Namespace: ns,
-		},
-		EventTime:           metav1.NewMicroTime(now),
-		Reason:              starvedEventReason,
-		Note:                fmt.Sprintf("topology-aware Service has no ready endpoint hinted for zone %s — consumers there fall back to random endpoints (same-zone preference lost)", zone),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-automation-controller",
-		ReportingInstance:   p.Name,
-		Action:              starvedEventReason,
+	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
+		// The zone rides the name: one sweep can starve several
+		// zones of the same Service, and every emission shares
+		// this sweep's `now` — without the zone in the name the
+		// second Create hits 409 AlreadyExists.
+		Name:      fmt.Sprintf("%s.%s.%x", svc, zone, now.UnixNano()),
+		Namespace: ns,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Service",
 			Namespace:  ns,
 			Name:       svc,
 		},
-	}
-	if _, err := p.CS.EventsV1().Events(ns).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
+		Reason: starvedEventReason,
+		Note: fmt.Sprintf("topology-aware Service has no ready endpoint hinted for zone %s — consumers there fall back to random endpoints (same-zone preference lost)",
+			zone),
+		ReportingInstance: p.Name,
+		Now:               now,
+	}); err != nil {
 		log.Info("WARN: EndpointSliceZoneHintStarved event create failed (RBAC?)",
 			"service", ns+"/"+svc, "zone", zone, "error", err)
 		return

@@ -92,8 +92,12 @@ func Sha256FileOK(path, wantHex string) bool {
 // atomically: tmp file + sha256 verify + fsync + rename + dir fsync,
 // partial tmp swept on every failure path. The response is capped at
 // maxArtifactBytes — a body that crosses the cap fails the download
-// and is never staged to disk beyond the one probing byte.
-func DownloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time.Duration) error {
+// and is never staged to disk beyond the one probing byte. mode is
+// the FINAL file's permission bits, pinned before the rename: a
+// staged-in-place binary (kine at /usr/local/bin/kine) used to land
+// at the hardwired 0644 and stay non-executable until a later chmod.
+func DownloadFile(ctx context.Context, url, dst, wantSHA256 string,
+	mode os.FileMode, timeout time.Duration) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -150,7 +154,7 @@ func DownloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time
 	// rename makes the directory entry itself durable (a crash
 	// between rename and sync can lose the installed file).
 	return fsx.Promote(f, dst, fsx.Opts{
-		Mode:      0o644,
+		Mode:      mode,
 		DirSync:   true,
 		AfterSync: pagecache.Drop,
 	})

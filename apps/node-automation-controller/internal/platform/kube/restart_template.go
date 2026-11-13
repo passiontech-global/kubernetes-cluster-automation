@@ -31,13 +31,29 @@ const RestartedAtAnno = "kubectl.kubernetes.io/restartedAt"
 // adds a metadata-level cooldown stamp) keeps its own outer doc and
 // reads this shape as the spec.template half.
 func RestartTemplatePatch(ts time.Time) []byte {
+	return RestartTemplatePatchAnnos(ts, nil)
+}
+
+// RestartTemplatePatchAnnos renders RestartTemplatePatch's shape with
+// EXTRA pod-template annotations folded into the same metadata map —
+// the callers that used to decode the base doc, walk spec/template/
+// metadata/annotations defensively and re-encode (fluent-bit's
+// config-hash idempotence stamp, coreDNS's combined doc) render in
+// one call now. Annotation keys marshal alphabetically — the same
+// deterministic order json.Marshal gave the decode-extend-reencode
+// dance. The stamp is always RFC3339 UTC; marshalling a string-only
+// map cannot fail, so the []byte-only signature is safe.
+func RestartTemplatePatchAnnos(ts time.Time, extra map[string]string) []byte {
+	annos := make(map[string]any, len(extra)+1)
+	annos[RestartedAtAnno] = ts.UTC().Format(time.RFC3339)
+	for k, v := range extra {
+		annos[k] = v
+	}
 	payload, err := json.Marshal(map[string]any{
 		"spec": map[string]any{
 			"template": map[string]any{
 				"metadata": map[string]any{
-					"annotations": map[string]any{
-						RestartedAtAnno: ts.UTC().Format(time.RFC3339),
-					},
+					"annotations": annos,
 				},
 			},
 		},

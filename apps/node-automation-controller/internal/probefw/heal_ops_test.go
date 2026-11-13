@@ -6,7 +6,6 @@
 package probefw
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -53,7 +52,7 @@ func safePodDeleteDeps(cs *fake.Clientset) *Deps {
 }
 
 func TestSafePodDeleteGuardPaths(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 
 	t.Run("unowned pod never deleted", func(t *testing.T) {
@@ -120,7 +119,7 @@ func TestSafePodDeleteGuardPaths(t *testing.T) {
 }
 
 func TestSafePodDeleteHealsWithSiblingProof(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 	pod := ownedPod("apps", "web-1", "u1", true, false)
 	sibling := ownedPod("apps", "web-2", "u2", true, false)
@@ -142,7 +141,7 @@ func TestSafePodDeleteHealsWithSiblingProof(t *testing.T) {
 }
 
 func TestSafePodDeleteTwoSiblingPosture(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 	// min=2 is the safe-evict posture (linkerd identity): the census
 	// must hold the stalled pod itself — one OTHER Ready sibling
@@ -176,7 +175,7 @@ func bouncePod(ns, name string) *corev1.Pod {
 }
 
 func TestBounceOperatorPodGateDefers(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 	pod := bouncePod("olm", "olm-operator-abc")
 	cs := fake.NewSimpleClientset(pod)
@@ -209,7 +208,7 @@ func TestBounceOperatorPodGateDefers(t *testing.T) {
 }
 
 func TestBounceOperatorPodListErrorDefers(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 	cs := fake.NewSimpleClientset()
 	cs.PrependReactor("list", "pods",
@@ -225,7 +224,7 @@ func TestBounceOperatorPodListErrorDefers(t *testing.T) {
 }
 
 func TestBounceOperatorPodDeletesAndStamps(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 	target := bouncePod("olm", "olm-operator-abc")
 	other := bouncePod("olm", "catalog-operator-def")
@@ -269,7 +268,7 @@ func TestBounceOperatorPodDeletesAndStamps(t *testing.T) {
 }
 
 func TestBounceOperatorPodNilPickTakesAll(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 	a := bouncePod("opns", "op-1")
 	b := bouncePod("opns", "op-2")
@@ -303,7 +302,7 @@ func TestDeletePodHealRefundsOnQuorumDenial(t *testing.T) {
 	p2 := ownedPod("apps", "web-2", "u2", true, false)
 	cs := fake.NewSimpleClientset(&p1, &p2)
 	d := safePodDeleteDeps(cs)
-	sctx := WithSweepSnapshot(context.Background())
+	sctx := WithSweepSnapshot(t.Context())
 	now := time.Now()
 
 	if !d.DeletePodHeal(sctx, logr.Discard(), "check-a", "t1", &p1,
@@ -338,7 +337,7 @@ func TestBounceOperatorPodRefundsOnceOnAllDeferred(t *testing.T) {
 	p2 := ownedPod("ops", "op-2", "u2", true, false)
 	cs := fake.NewSimpleClientset(&p1, &p2)
 	d := safePodDeleteDeps(cs)
-	sctx := WithSweepSnapshot(context.Background())
+	sctx := WithSweepSnapshot(t.Context())
 	now := time.Now()
 
 	// Spend the shared workload slot up front — both bounce targets
@@ -372,7 +371,7 @@ func TestBounceOperatorPodDeliveredKeepsGrant(t *testing.T) {
 	p2 := ownedPod("ops", "op-2", "u2", true, false)
 	cs := fake.NewSimpleClientset(&p1, &p2)
 	d := safePodDeleteDeps(cs)
-	sctx := WithSweepSnapshot(context.Background())
+	sctx := WithSweepSnapshot(t.Context())
 	now := time.Now()
 
 	// Only p1 is picked — its delete delivers (the first reservation

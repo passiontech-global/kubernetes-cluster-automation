@@ -10,7 +10,7 @@ package watchdogs
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -282,9 +282,8 @@ func (p *operatorWorkqueueCheck) leaderPods(ctx context.Context, op operatorTarg
 	// the survivor was the real holder the signature stays up and
 	// the next post-cooldown sweep deletes it.
 	if len(pods) > 1 {
-		sort.Slice(pods, func(i, j int) bool {
-			return pods[i].CreationTimestamp.
-				Before(&pods[j].CreationTimestamp)
+		slices.SortFunc(pods, func(a, b *corev1.Pod) int {
+			return a.CreationTimestamp.Compare(b.CreationTimestamp.Time)
 		})
 		return []corev1.Pod{*pods[0]}, nil
 	}

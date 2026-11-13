@@ -1,7 +1,6 @@
 package testutil
 
 import (
-	"context"
 	"testing"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -30,7 +29,7 @@ func TestNewDynamicClientListsKnownCRDs(t *testing.T) {
 	hrV2beta2 := dynObj("helm.toolkit.fluxcd.io/v2beta2", "HelmRelease", "apps", "hr-old")
 	plan := dynObj("autopilot.k0sproject.io/v1beta2", "Plan", "", "upgrade-1")
 	dyn := NewDynamicClient(cert, hrV2beta2, plan)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	certs, err := dyn.Resource(schema.GroupVersionResource{
 		Group: "cert-manager.io", Version: "v1", Resource: "certificates",
@@ -71,7 +70,7 @@ func TestNewDynamicClientListsUnseededGVR(t *testing.T) {
 	dyn := NewDynamicClient()
 	list, err := dyn.Resource(schema.GroupVersionResource{
 		Group: "cilium.io", Version: "v2", Resource: "ciliumidentities",
-	}).List(context.Background(), metav1.ListOptions{})
+	}).List(t.Context(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list ciliumidentities: %v", err)
 	}
@@ -84,7 +83,7 @@ func TestNewDynamicClientListsUnseededGVR(t *testing.T) {
 // tracker stores under the same GVR the module code uses.
 func TestNewDynamicClientCreateGet(t *testing.T) {
 	dyn := NewDynamicClient()
-	ctx := context.Background()
+	ctx := t.Context()
 	gvr := schema.GroupVersionResource{
 		Group: "external-secrets.io", Version: "v1beta1", Resource: "externalsecrets",
 	}
@@ -112,7 +111,7 @@ func TestNewDynamicClientTypedSeed(t *testing.T) {
 	dyn := NewDynamicClient(lease)
 	list, err := dyn.Resource(schema.GroupVersionResource{
 		Group: "coordination.k8s.io", Version: "v1", Resource: "leases",
-	}).Namespace("kube-system").List(context.Background(), metav1.ListOptions{})
+	}).Namespace("kube-system").List(t.Context(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list leases: %v", err)
 	}

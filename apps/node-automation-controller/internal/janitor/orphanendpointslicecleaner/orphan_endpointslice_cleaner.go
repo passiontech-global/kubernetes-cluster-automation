@@ -41,10 +41,12 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -82,6 +84,13 @@ type orphanEndpointSliceCleaner struct {
 	// dyn is accepted for Setup-signature parity with the other
 	// janitor modules — EndpointSlices are typed via cs.DiscoveryV1().
 	dyn dynamic.Interface
+	// meta feeds kube.ListPartialOrFallback: both censuses this sweep
+	// makes (Services existence, EndpointSlice candidates) read only
+	// ObjectMeta — names, labels, age, UID — so production lists
+	// PartialObjectMetadata and skips the resource payloads entirely.
+	// Nil in tests; ListPartialOrFallback's typed fallback serves the
+	// same objects identically.
+	meta metadata.Interface
 	// now is the clock seam — tests pin it so the >15m age gate
 	// is deterministic. nil → time.Now.
 	now shared.Clock
@@ -99,8 +108,8 @@ type orphanEndpointSliceCleaner struct {
 // entirely — same contract as volumeattachment-cleaner.
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
-		c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, queue: d.Name,
-			now: shared.SystemClock}
+		c := &orphanEndpointSliceCleaner{cs: d.CS, dyn: d.Dyn, meta: d.Meta,
+			queue: d.Name, now: shared.SystemClock}
 		return shared.AddPeriodic(d.Mgr, c.queue, orphanEndpointSliceInterval, c.run)
 	})
 }
@@ -112,31 +121,32 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	// "deleted" truth. An error or an empty list aborts the run —
 	// every cluster has at least the default/kubernetes Service, so
 	// an empty answer is an apiserver/RBAC flap, never a real state.
-	svcCount := 0
-	services := map[string]bool{}
-	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Services(c.cs, metav1.NamespaceAll),
-		func(items []corev1.Service) error {
-			for _, s := range items {
-				services[s.Namespace+"/"+s.Name] = true
-			}
-			svcCount += len(items)
-			return nil
-		})
+	// Metadata-only census: the map keys off namespace/name — no
+	// Service body is ever read.
+	svcs, err := kube.ListPartialOrFallback(ctx, c.meta, c.cs, c.dyn,
+		corev1.SchemeGroupVersion.WithResource("services"), metav1.NamespaceAll,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 	if err != nil {
 		return fmt.Errorf("list services (API flap) — abort: %w", err)
 	}
-	if svcCount == 0 {
+	if len(svcs) == 0 {
 		return errors.New("empty service list (API flap) — abort")
+	}
+	services := make(map[string]bool, len(svcs))
+	for i := range svcs {
+		services[svcs[i].Namespace+"/"+svcs[i].Name] = true
 	}
 
 	// Server-side label filter; the in-code check stays because
-	// fake clientsets ignore ListOptions selectors.
-	slices, err := kube.ListAll(ctx, metav1.ListOptions{
-		LabelSelector: discoveryv1.LabelServiceName,
-		Limit:         kube.DefaultListPageSize,
-	}, kube.EndpointSlices(c.cs, metav1.NamespaceAll))
+	// fake clientsets ignore ListOptions selectors. Metadata-only:
+	// the candidate pass reads labels, deletion/creation timestamps,
+	// ns/name/UID — all ObjectMeta.
+	slices, err := kube.ListPartialOrFallback(ctx, c.meta, c.cs, c.dyn,
+		discoveryv1.SchemeGroupVersion.WithResource("endpointslices"),
+		metav1.NamespaceAll, metav1.ListOptions{
+			LabelSelector: discoveryv1.LabelServiceName,
+			Limit:         kube.DefaultListPageSize,
+		})
 	if err != nil {
 		return fmt.Errorf("list endpointslices: %w", err)
 	}
@@ -240,6 +250,24 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 			return nil
 		},
 		OnError: func(log logr.Logger, t target, err error) {
+			// Benign delete races are not run errors: NotFound — the
+			// vetted slice was already gone (a sibling janitor, the
+			// previous sweep's delete, or kube-controller-manager
+			// catching up removed it first); Conflict — the UID
+			// precondition caught a same-named slice RECREATED
+			// between the census and the delete, exactly the TOCTOU
+			// window the precondition exists to close. Both mean the
+			// object we vetted is no longer the one on the cluster:
+			// log and move on WITHOUT IncError (a recreated slice
+			// re-arms its own streak under its new UID key, so the
+			// ledger needs no reset here).
+			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+				log.Info("SKIP: orphan endpointslice gone/recreated before delete (benign race)",
+					"endpointslice", t.ns+"/"+t.name,
+					"notFound", apierrors.IsNotFound(err),
+					"conflict", apierrors.IsConflict(err))
+				return
+			}
 			log.Error(err, "orphan endpointslice delete failed",
 				"endpointslice", t.ns+"/"+t.name)
 			metrics.IncError(c.queue)

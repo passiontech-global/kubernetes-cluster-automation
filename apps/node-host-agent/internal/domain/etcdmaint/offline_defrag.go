@@ -14,8 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 )
 
@@ -80,11 +78,13 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 		return werr
 	}
 
-	// Fixed log path like the script's /tmp/etcd-standalone.log —
-	// survives the run for post-mortem and never accumulates tempdirs.
-	logPath := filepath.Join(os.TempDir(), "etcd-standalone.log")
-	_, _ = fmt.Fprintf(r.out, ">>> standalone etcd log: %s\n", logPath)
-	tmp, terr := r.cfg.StartTempEtcd(ctx, r.etcdBin, flags, logPath)
+	// The starter creates a private 0700 dir + O_EXCL 0600 log under
+	// this parent (never a fixed /tmp/etcd-standalone.log — see
+	// startTempEtcdExec). The file survives the run for post-mortem.
+	_, _ = fmt.Fprintf(r.out,
+		">>> standalone etcd log: %s/etcd-standalone-*/etcd-standalone-*.log\n",
+		os.TempDir())
+	tmp, terr := r.cfg.StartTempEtcd(ctx, r.etcdBin, flags, os.TempDir())
 	if terr != nil {
 		return fmt.Errorf("start standalone etcd: %w", terr)
 	}
@@ -143,32 +143,43 @@ func (t *tempEtcdProc) Wait() error {
 }
 
 // startTempEtcdExec is the default TempEtcdStarter: etcd's stdout and
-// stderr land in logPath like the script's /tmp/etcd-standalone.log.
-// CommandContext (not a bare Command) means a cancelled ctx also
-// kills the standalone — it holds the data-dir lock, and leaving it
-// would block the deferred `systemctl start` from recovering etcd.
+// stderr land in a fresh log file under parentDir (the script's
+// /tmp/etcd-standalone.log role). CommandContext (not a bare Command)
+// means a cancelled ctx also kills the standalone — it holds the
+// data-dir lock, and leaving it would block the deferred
+// `systemctl start` from recovering etcd.
+//
+// The log is NOT a fixed, predictable name under the shared /tmp
+// opened as root: a pre-planted symlink/fifo at that path races the
+// O_TRUNC (clobbering the link target) and fs.protected_regular=2
+// makes the root-owned open EACCES outright. Instead a fresh 0700
+// dir is created (MkdirTemp — a name no attacker can pre-plant) and
+// the log opened with os.CreateTemp's O_EXCL semantics inside it,
+// chmod'd 0600 — etcd output carries peer URLs/flags and must not
+// be world-readable.
 func startTempEtcdExec(ctx context.Context, bin string,
-	args []string, logPath string) (TempEtcd, error) {
-	// logPath is a predictable name under the shared /tmp opened as
-	// root — a pre-planted symlink would have O_TRUNC clobber its
-	// target before the Chmod below ever runs. Two layers: the
-	// Lstat gives a diagnosable refusal, and O_NOFOLLOW closes the
-	// plant-between-check-and-open race.
-	if fi, err := os.Lstat(logPath); err == nil &&
-		fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("temp etcd log %s is a symlink — refusing",
-			logPath)
+	args []string, parentDir string) (TempEtcd, error) {
+	if parentDir == "" {
+		parentDir = os.TempDir()
 	}
-	f, err := os.OpenFile(logPath,
-		os.O_CREATE|os.O_WRONLY|os.O_TRUNC|unix.O_NOFOLLOW, 0o600)
+	d, err := os.MkdirTemp(parentDir, "etcd-standalone-")
 	if err != nil {
 		return nil, err
 	}
-	// 0o600 only applies on O_CREATE — a leftover log from a prior
-	// run keeps its old mode. Force it: the etcd output can carry
-	// peer URLs/flags and must not stay world-readable.
+	// MkdirTemp creates 0700 already; the Chmod re-asserts it in
+	// case a umask/override weakened the parent's semantics.
+	if err := os.Chmod(d, 0o700); err != nil {
+		_ = os.Remove(d)
+		return nil, err
+	}
+	f, err := os.CreateTemp(d, "etcd-standalone-*.log")
+	if err != nil {
+		_ = os.Remove(d)
+		return nil, err
+	}
 	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
+		_ = os.RemoveAll(d)
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)

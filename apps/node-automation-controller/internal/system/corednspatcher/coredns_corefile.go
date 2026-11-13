@@ -188,7 +188,7 @@ func stripCorefileComment(line string) string {
 // bare `denial` token anywhere in the body — a zone arg such as
 // `denial.example.com` lands as a single field and cannot collide.
 func corefileBlockHasDenial(inner string) bool {
-	for _, f := range strings.Fields(inner) {
+	for f := range strings.FieldsSeq(inner) {
 		if f == "denial" {
 			return true
 		}

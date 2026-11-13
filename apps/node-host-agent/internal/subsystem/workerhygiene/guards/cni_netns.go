@@ -87,14 +87,28 @@ func liveNetnsInodes(d *wdeps.Deps, pids []int) map[uint64]bool {
 // netnsHeldByLiveTask reports whether any containerd task with a
 // live init pid still sits inside the netns inode — the
 // containerd-side half of the orphan-sandbox-netns orphan verdict (a live task
-// pins the sandbox netns even when the /proc sweep raced it).
-func netnsHeldByLiveTask(d *wdeps.Deps, tasks map[string][]wdeps.CtrTask,
-	ino uint64) bool {
+// pins the sandbox netns even when the /proc sweep raced it). Task
+// init.pids the cycle's StatsOnce snapshot already parsed were part
+// of the same pid sweep liveNetnsInodes built `live` from — their
+// ns/net verdict is already in that map, so only raced pids absent
+// from the snapshot pay a fresh stat. e (and its StatsOnce) may be
+// nil in hand-built test envs — every task then takes the fresh
+// stat, the pre-StatsOnce behavior.
+func netnsHeldByLiveTask(d *wdeps.Deps, e *wdeps.CycleEnv,
+	tasks map[string][]wdeps.CtrTask, ino uint64) bool {
 
 	for _, ts := range tasks {
 		for _, t := range ts {
 			if !t.Live || t.PID <= 0 {
 				continue
+			}
+			if e != nil && e.StatsOnce != nil {
+				if _, parsed := e.StatsOnce()[t.PID]; parsed {
+					// Covered by the same-cycle sweep — a dead pid
+					// holds nothing, a live one is already in
+					// `live`; no fresh stat can change that.
+					continue
+				}
 			}
 			if tino, ok := netnsInode(d.Proc.File(t.PID, "ns", "net")); ok &&
 				tino == ino {
@@ -196,7 +210,7 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// live task" unverifiable → fail closed, retry next cycle.
 		if e.TasksOnce != nil {
 			tasks, complete := e.TasksOnce()
-			if !complete || netnsHeldByLiveTask(c.d, tasks, ino2) {
+			if !complete || netnsHeldByLiveTask(c.d, e, tasks, ino2) {
 				continue
 			}
 		}

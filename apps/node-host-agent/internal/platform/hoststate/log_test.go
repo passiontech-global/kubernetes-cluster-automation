@@ -83,14 +83,12 @@ func TestAppendLogConcurrentRotationLosesNoGeneration(t *testing.T) {
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for g := range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			for j := range linesEach {
 				s.AppendLog(line + fmt.Sprintf(" g%02d j%03d", g, j))
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

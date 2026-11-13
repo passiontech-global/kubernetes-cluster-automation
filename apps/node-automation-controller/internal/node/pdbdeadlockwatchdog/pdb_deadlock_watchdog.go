@@ -108,7 +108,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		w := &pdbDeadlockWatchdog{
 			cs:         d.CS,
-			nodeReader: d.Mgr.GetClient(),
+			nodeReader: d.CachedClient(),
 			now:        shared.SystemClock,
 			queue:      d.Name,
 		}

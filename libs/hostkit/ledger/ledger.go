@@ -30,15 +30,18 @@ import (
 
 // CooldownSet tracks the last action stamp per key.
 type CooldownSet struct {
-	mu   sync.Mutex
+	mu   sync.RWMutex
 	last map[string]time.Time
 }
 
 // CooledDown reports whether key was stamped inside cooldown of now.
 // An unstamped key is never cooled down.
 func (c *CooldownSet) CooledDown(key string, cooldown time.Duration, now time.Time) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Reads dominate writes (every check consults the shared ledger
+	// per sweep, only the acting one stamps) — a read lock keeps
+	// concurrent lookups off each other.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	last, ok := c.last[key]
 	return ok && now.Sub(last) < cooldown
 }
@@ -90,8 +93,8 @@ func (c *CooldownSet) Prune(keep func(key string, last time.Time) bool) int {
 // internals. Mutating the returned map does not affect the ledger;
 // write through Stamp/Forget.
 func (c *CooldownSet) Entries() map[string]time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return maps.Clone(c.last)
 }
 
@@ -122,8 +125,8 @@ func (c *CooldownSet) PruneExpired(now time.Time, maxAge time.Duration) int {
 // the single-key read for "when did this one fire" diagnostics;
 // Entries() is for bulk inspection only (it copies the whole map).
 func (c *CooldownSet) Last(key string) (time.Time, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	t, ok := c.last[key]
 	return t, ok
 }

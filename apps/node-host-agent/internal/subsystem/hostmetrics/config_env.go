@@ -1,6 +1,7 @@
 package hostmetrics
 
 import (
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
@@ -54,9 +55,9 @@ func ConfigFromEnv(d EnvDeps) Config {
 		envx.StringKnob(envnames.EnvNebulaIface, &cfg.NebulaIface, defaultNebulaIface),
 		envx.StringKnob(envnames.EnvHostRouteFile, &cfg.RouteFile, defaultRouteFile),
 		envx.StringKnob(envnames.EnvK0sConfig, &cfg.K0sConfigFile,
-			hostPath(defaultK0sConfigFile)),
+			hostPath(k0sconfig.DefaultConfigFile)),
 		envx.StringKnob(envnames.EnvK0sUnit, &cfg.K0sUnitFile,
-			hostPath(defaultK0sUnitFile)),
+			hostPath(k0sconfig.DefaultUnitFile)),
 		envx.StringKnob(envnames.EnvNebulaCert, &cfg.NebulaCertFile,
 			hostPath("/etc/nebula/"+d.NebulaNet+"/host.crt")),
 		// empty env → nil → applyDefaults' expected key set.

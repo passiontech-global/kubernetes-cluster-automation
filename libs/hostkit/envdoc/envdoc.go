@@ -180,6 +180,22 @@ func ScanTree(opts Options) (Result, error) {
 		res.Referenced[value] = site(fset, pos)
 	}
 
+	// One fileScan + rangeVisitor reused across the whole walk: the
+	// fields a dir/file changes are reset in place, and the visitor
+	// is one allocation for the run instead of one per AST node
+	// (every Walk step used to escape-allocate a fresh rangeVisitor).
+	// Scan output is untouched — every reset field was per-dir or
+	// per-file state before, and the frame push/pop discipline is
+	// identical (see rangeVisitor).
+	scan := &fileScan{
+		res:        &res,
+		allowRawOS: opts.AllowRawOS,
+		helpers:    helpers,
+		site:       site,
+		record:     record,
+	}
+	visitor := &rangeVisitor{s: scan}
+
 	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -203,29 +219,25 @@ func ScanTree(opts Options) (Result, error) {
 			continue
 		}
 
-		consts := PackageStringConsts(files)
+		scan.fset = fset
+		scan.consts = PackageStringConsts(files)
 		dirAbs, err := filepath.Abs(dir)
 		if err != nil {
 			return res, fmt.Errorf("envdoc: abs dir %s: %w", dir, err)
 		}
-		inRegistry := registryAbs != "" && dirAbs == registryAbs
-		inEnvx := dirAbs == envxDirAbs
+		scan.inRegistry = registryAbs != "" && dirAbs == registryAbs
+		scan.inEnvx = dirAbs == envxDirAbs
 
 		for _, f := range files {
-			s := &fileScan{
-				fset:       fset,
-				res:        &res,
-				consts:     consts,
-				inEnvx:     inEnvx,
-				inRegistry: inRegistry,
-				allowRawOS: opts.AllowRawOS,
-				helpers:    helpers,
-				site:       site,
-				record:     record,
-			}
-			s.envxName, s.envxDot = importLocalName(f, EnvxImportPath)
-			s.osName, _ = importLocalName(f, "os")
-			ast.Walk(&rangeVisitor{s: s}, f)
+			scan.envxName, scan.envxDot = importLocalName(f, EnvxImportPath)
+			scan.osName, _ = importLocalName(f, "os")
+			// Reset the per-file walk state instead of re-allocating
+			// the scan (and a visitor per AST node) for every file —
+			// the stack slices are balanced-empty between walks, so a
+			// truncate keeps the backing arrays for reuse.
+			scan.stack = scan.stack[:0]
+			visitor.pushed = visitor.pushed[:0]
+			ast.Walk(visitor, f)
 		}
 	}
 
@@ -266,25 +278,34 @@ type fileScan struct {
 // RangeStmt's frame can be pushed on entry and popped on exit —
 // ast.Inspect has no exit hook, and a file-level variable set (the
 // bug this replaces) let a loop variable's coverage leak onto
-// same-named identifiers anywhere later in the file. `pushed`
-// records whether THIS node's inspect pushed a frame, so a
-// RangeStmt binding no identifiers cannot pop an outer frame.
+// same-named identifiers anywhere later in the file. One instance is
+// reused for a whole ScanTree run: each enter appends the node's
+// pushed flag and each matching Visit(nil) pops it, so the
+// enter/exit events stay paired LIFO exactly like the old
+// one-visitor-per-node chain — a node's flag sits on top for the
+// whole span of its subtree walk. `pushed` records the flag for
+// every node still open, so a RangeStmt binding no identifiers
+// cannot pop an outer frame.
 type rangeVisitor struct {
 	s      *fileScan
-	pushed bool
+	pushed []bool
 }
 
 func (v *rangeVisitor) Visit(n ast.Node) ast.Visitor {
 	if n == nil {
 		// Walk calls Visit(nil) on the visitor a node returned after
-		// that node's children — pop the frame THIS node pushed.
-		if v.pushed && len(v.s.stack) > 0 {
-			v.s.stack = v.s.stack[:len(v.s.stack)-1]
+		// that node's children — unwind the matching enter event and
+		// pop the frame if THAT node pushed one.
+		if last := len(v.pushed) - 1; last >= 0 {
+			if v.pushed[last] && len(v.s.stack) > 0 {
+				v.s.stack = v.s.stack[:len(v.s.stack)-1]
+			}
+			v.pushed = v.pushed[:last]
 		}
 		return nil
 	}
-	pushed := v.s.inspect(n)
-	return &rangeVisitor{s: v.s, pushed: pushed}
+	v.pushed = append(v.pushed, v.s.inspect(n))
+	return v
 }
 
 // inspect handles the node types the scan cares about and reports

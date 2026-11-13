@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -106,23 +105,42 @@ func NormalizeRepo(s string) string {
 	// Lowercase and strip the trailing ".git" up front: the host
 	// match and the suffix strip are both case-sensitive, and an
 	// upper-cased "GitHub.COM"/"Repo.GIT" must still normalize.
+	// TrimRight (not a single TrimSuffix) so "org/repo//" does not
+	// keep a stray trailing slash past the host strip below.
 	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimRight(s, "/")
 	s = strings.TrimSuffix(s, ".git")
-	i := strings.Index(s, "github.com")
-	if i < 0 {
-		return s
+	// Scan every occurrence of "github.com": the FIRST literal match
+	// is not necessarily the host — "github.com.evil.com/git@github.com:org/repo"
+	// has a lookalike in front of a real host. The first occurrence
+	// that passes the boundary check wins; if none does, every match
+	// was part of a longer hostname or of a path, and the input must
+	// NOT collapse to "org/repo".
+	for i := strings.Index(s, "github.com"); i >= 0; {
+		// Host boundary: start of string, or right after the scheme
+		// separator or a user marker — and the host must be followed
+		// by the path separator ("/") or the scp separator (":").
+		atHost := i == 0 ||
+			strings.HasSuffix(s[:i], "://") || strings.HasSuffix(s[:i], "@")
+		rest := s[i+len("github.com"):]
+		if atHost && rest != "" && (rest[0] == '/' || rest[0] == ':') {
+			return normalizeRepoRest(s[:i], rest)
+		}
+		next := i + len("github.com")
+		j := strings.Index(s[next:], "github.com")
+		if j < 0 {
+			break
+		}
+		i = next + j
 	}
-	// Host boundary: start of string, or right after the scheme
-	// separator or a user marker — and the host must be followed by
-	// the path separator ("/") or the scp separator (":"). A match
-	// failing either test is mid-string and stays untouched.
-	atHost := i == 0 ||
-		strings.HasSuffix(s[:i], "://") || strings.HasSuffix(s[:i], "@")
-	rest := s[i+len("github.com"):]
-	if !atHost || rest == "" || (rest[0] != '/' && rest[0] != ':') {
-		return s
-	}
+	return s
+}
+
+// normalizeRepoRest strips the host's separator (scp colon, or an
+// embedded :port on URL forms) and returns the trailing path.
+// prefix is everything before the host match; rest starts at the
+// "/" or ":" that confirmed the host boundary.
+func normalizeRepoRest(prefix, rest string) string {
 	if rest[0] == ':' {
 		rest = rest[1:]
 		// What the colon means depends on the syntax around the
@@ -135,7 +153,6 @@ func NormalizeRepo(s string) string {
 		//     first segment is an org, not a port.
 		// Scp-like = a user@ part ahead of the host with no "//"
 		// authority marker before it.
-		prefix := s[:i]
 		scpLike := strings.ContainsRune(prefix, '@') &&
 			!strings.Contains(prefix, "//")
 		if !scpLike {
@@ -160,9 +177,10 @@ const fetchIndexWorkers = 8
 // fetchIndex lists the team's pipelines, then each pipeline's
 // resources, keeping only resources whose source points at a repo.
 // prev is the caller's snapshot of the current index, taken under
-// c.mu before the fetch started. The per-pipeline listings run in
-// parallel (bounded by fetchIndexWorkers); results stay in pipeline
-// order so the index is deterministic.
+// c.mu before the fetch started; it is only read here. The
+// per-pipeline listings run on at most min(fetchIndexWorkers,
+// len(pipelines)) workers; results stay in pipeline order so the
+// index is deterministic.
 func (c *Client) fetchIndex(ctx context.Context,
 	prev []Resource) ([]Resource, error) {
 	start := time.Now()
@@ -223,69 +241,79 @@ func (c *Client) fetchIndex(ctx context.Context,
 	// the whole TTL.
 	lost := make([]string, len(pipelines))
 	failed := make([]bool, len(pipelines))
-	sem := make(chan struct{}, fetchIndexWorkers)
+	// Bounded worker pool: spawn at most min(fetchIndexWorkers,
+	// len(pipelines)) goroutines — one per pipeline is wasted on
+	// small teams, and every goroutine beyond the semaphore bound
+	// was just parked on the channel anyway. Each worker pulls a
+	// pipeline index off jobs and writes its result slot; results
+	// stay indexed by pipeline, so order and dedup are unchanged.
+	workers := min(fetchIndexWorkers, len(pipelines))
+	jobs := make(chan int)
 	var wg sync.WaitGroup
-	for i, p := range pipelines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			var resources []struct {
-				Name   string `json:"name"`
-				Type   string `json:"type"`
-				Source source `json:"source"`
-			}
-			path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
-			if varsQuery[i] != "" {
-				path += "?" + varsQuery[i]
-			}
-			if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
-				var se *statusError
-				if errors.As(err, &se) && se.status == http.StatusNotFound {
-					// The pipeline was deleted between the pipeline
-					// listing and this fetch — it has no resources.
-					// Carrying prevByPipeline entries over would keep
-					// ghost resources of a dead pipeline in the index.
+	for range workers {
+		wg.Go(func() {
+			for i := range jobs {
+				p := pipelines[i]
+				var resources []struct {
+					Name   string `json:"name"`
+					Type   string `json:"type"`
+					Source source `json:"source"`
+				}
+				path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
+				if varsQuery[i] != "" {
+					path += "?" + varsQuery[i]
+				}
+				if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
+					var se *statusError
+					if errors.As(err, &se) && se.status == http.StatusNotFound {
+						// The pipeline was deleted between the pipeline
+						// listing and this fetch — it has no resources.
+						// Carrying prevByPipeline entries over would keep
+						// ghost resources of a dead pipeline in the index.
+						return
+					}
+					// One unreadable pipeline must not lose the whole
+					// index — and must not lose its own resources either:
+					// retain the previous index's entries for it (the
+					// pipeline still exists — only its listing failed).
+					// Pipelines truly gone drop out via the pipeline list
+					// itself, not through this path. The carry-over key
+					// includes the vars fragment — resources of a
+					// re-instanced pipeline under different vars must
+					// not leak into the new instance's index.
+					carryKey := p.Name + "\x00" + varsQuery[i]
+					results[i] = append(results[i], prevByPipeline[carryKey]...)
+					failed[i] = true
+					if len(prevByPipeline[carryKey]) == 0 {
+						// Nothing to carry over — the new index would
+						// silently lack this pipeline's resources.
+						lost[i] = p.Name
+					}
+					logger().Warn("pipeline resource listing failed — keeping last-known resources",
+						"concourse_url", c.safeBaseURL(), "team", c.Team,
+						"pipeline", p.Name, "error", err)
 					return
 				}
-				// One unreadable pipeline must not lose the whole
-				// index — and must not lose its own resources either:
-				// retain the previous index's entries for it (the
-				// pipeline still exists — only its listing failed).
-				// Pipelines truly gone drop out via the pipeline list
-				// itself, not through this path. The carry-over key
-				// includes the vars fragment — resources of a
-				// re-instanced pipeline under different vars must
-				// not leak into the new instance's index.
-				carryKey := p.Name + "\x00" + varsQuery[i]
-				results[i] = append(results[i], prevByPipeline[carryKey]...)
-				failed[i] = true
-				if len(prevByPipeline[carryKey]) == 0 {
-					// Nothing to carry over — the new index would
-					// silently lack this pipeline's resources.
-					lost[i] = p.Name
+				for _, r := range resources {
+					repo := NormalizeRepo(sourceRepo(r.Source))
+					if repo == "" {
+						continue
+					}
+					results[i] = append(results[i], Resource{
+						Pipeline:          p.Name,
+						Name:              r.Name,
+						Type:              r.Type,
+						Repo:              repo,
+						InstanceVarsQuery: varsQuery[i],
+					})
 				}
-				logger().Warn("pipeline resource listing failed — keeping last-known resources",
-					"concourse_url", c.safeBaseURL(), "team", c.Team,
-					"pipeline", p.Name, "error", err)
-				return
 			}
-			for _, r := range resources {
-				repo := NormalizeRepo(sourceRepo(r.Source))
-				if repo == "" {
-					continue
-				}
-				results[i] = append(results[i], Resource{
-					Pipeline:          p.Name,
-					Name:              r.Name,
-					Type:              r.Type,
-					Repo:              repo,
-					InstanceVarsQuery: varsQuery[i],
-				})
-			}
-		}()
+		})
 	}
+	for i := range pipelines {
+		jobs <- i
+	}
+	close(jobs)
 	wg.Wait()
 
 	// A pipeline whose listing failed with no last-known resources to
@@ -360,7 +388,9 @@ func instanceVarsQuery(vars map[string]any) string {
 		return ""
 	}
 	pairs := flattenInstanceVars(vars)
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].ref < pairs[j].ref })
+	slices.SortFunc(pairs, func(a, b instanceVarPair) int {
+		return strings.Compare(a.ref, b.ref)
+	})
 	var b strings.Builder
 	for _, p := range pairs {
 		v, err := json.Marshal(p.value)

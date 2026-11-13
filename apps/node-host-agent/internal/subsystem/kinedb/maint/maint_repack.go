@@ -141,6 +141,16 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		res.heapBytes <= m.d.Cfg.RepackMinHeapBytes {
 		return
 	}
+	// A previously interrupted pg_repack (client kill / orphaned
+	// session reaped above) leaves its trigger + repack.log_<oid> /
+	// repack.table_<oid> shadow objects behind. Until the extension
+	// is dropped they pin disk and can wedge every later repack, so
+	// clear the leftovers BEFORE the headroom gate — otherwise the
+	// gate measures a heap inflated by the very debris we are about
+	// to remove and skips the repair that would free it. The DROP
+	// rides a 5s lock_timeout so a busy table aborts the cleanup
+	// instead of stalling the maint budget; the next window retries.
+	m.dropRepackLeftovers(ctx, pg, user, pass, note)
 	// kinedb-maintenance item 3: repack shadows the heap + WAL churn — require
 	// free >= 2.5*(heap+wal) on the data fs first; otherwise run
 	// only a VACUUM (ANALYZE) and warn (repack would fill the disk).
@@ -214,4 +224,24 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		res.repackState = "fail"
 		note(fmt.Sprintf("repack-fail: %v", err))
 	}
+}
+
+// dropRepackLeftovers clears the debris a killed pg_repack leaves
+// behind: the repack_trigger on the target table plus the
+// repack.log_<oid> / repack.table_<oid> shadow tables. DROP
+// EXTENSION ... CASCADE removes the extension and everything its
+// scripts created. lock_timeout caps each lock wait at 5s so a
+// table under live write traffic fails the cleanup fast instead of
+// queueing behind it for the maint budget. Best-effort: a failure
+// only notes — the repack attempt below recreates the extension
+// (CREATE EXTENSION IF NOT EXISTS) anyway.
+func (m *Maint) dropRepackLeftovers(ctx context.Context, pg, user, pass string,
+	note func(string)) {
+	script := "SET lock_timeout = '5s';\n" +
+		"DROP EXTENSION IF EXISTS pg_repack CASCADE;"
+	if _, err := m.d.PsqlScript(ctx, pg, user, pass, script); err != nil {
+		note(fmt.Sprintf("repack-leftover-cleanup-fail: %v", err))
+		return
+	}
+	note("repack leftovers cleared (DROP EXTENSION pg_repack CASCADE)")
 }

@@ -108,7 +108,7 @@ func TestSAPubFingerprintMissingFile(t *testing.T) {
 	if !strings.Contains(string(data), "# TYPE "+pki.SAPubMetric) {
 		t.Fatalf("header missing:\n%s", data)
 	}
-	for _, l := range strings.Split(string(data), "\n") {
+	for l := range strings.SplitSeq(string(data), "\n") {
 		if strings.HasPrefix(l, pki.SAPubMetric+"{") ||
 			strings.HasPrefix(l, pki.SAPubMetric+" ") {
 			t.Fatalf("fake sample emitted for a missing sa.pub:\n%s", data)

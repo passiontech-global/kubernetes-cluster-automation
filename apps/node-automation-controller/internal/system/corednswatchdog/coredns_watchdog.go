@@ -30,7 +30,7 @@ package corednswatchdog
 import (
 	"context"
 	"net/http"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -221,7 +221,7 @@ func (w *coreDNSWatchdog) dnsLayerProbe(ctx context.Context, podIP map[string]st
 		}
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	type dnsVerdict struct {
 		ips []string
 		err error
@@ -257,10 +257,7 @@ func Setup(d shared.Deps) error {
 			queue:   d.Name,
 			now:     shared.SystemClock,
 		}
-		if d.Mgr != nil {
-			w.nodeReader = d.Mgr.GetClient()
-			w.podReader = d.Mgr.GetClient()
-		}
+		w.nodeReader, w.podReader = d.CachedClient(), d.CachedClient()
 		w.logHitFn = w.logHit
 		w.dnsFn = w.dnsProbe
 		w.panicsFn = w.panics
@@ -421,7 +418,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	for name := range stale {
 		suspects = append(suspects, name)
 	}
-	sort.Strings(suspects)
+	slices.Sort(suspects)
 	log.Info("STALE coredns replicas — dead watch or panic",
 		"stale", len(suspects), "total", len(podIP), "pods", suspects)
 	return w.recover(ctx, suspects, podUID, len(podIP))

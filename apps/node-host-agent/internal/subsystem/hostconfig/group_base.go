@@ -62,13 +62,12 @@ func (c *cyc) groupBase() {
 		[]byte("# Managed by node-config-agent - BBR for the interdc trunk path\ntcp_bbr\n"), 0o644); ch {
 		changed = true
 	}
-	if _, err := r.run(ctx, "modprobe", "tcp_bbr"); err != nil {
-		c.err("base: modprobe failed — BBR unavailable until the module loads",
-			"module", "tcp_bbr", "error", err)
-	}
-	if _, err := r.run(ctx, "modprobe", "nf_conntrack"); err != nil {
-		c.err("base: modprobe failed — conntrack sysctls may not apply",
-			"module", "nf_conntrack", "error", err)
+	// One `modprobe -a` fork loads both modules — the loads are
+	// idempotent and both suspects share the merged failure line
+	// (the captured error names the failing module).
+	if _, err := r.run(ctx, "modprobe", "-a", "tcp_bbr", "nf_conntrack"); err != nil {
+		c.err("base: modprobe failed — BBR/conntrack may not apply",
+			"modules", "tcp_bbr,nf_conntrack", "error", err)
 	}
 	if changed {
 		r.actions.WithLabelValues("sysctl --system").Inc()

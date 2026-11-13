@@ -7,7 +7,7 @@ package reap
 
 import (
 	"context"
-	"sort"
+	"slices"
 
 	"github.com/go-logr/logr"
 )
@@ -80,8 +80,14 @@ func Sweep[T any](ctx context.Context, log logr.Logger, items []T,
 	opts Options[T]) (deleted, failed int, capped bool) {
 
 	if opts.Less != nil {
-		sort.SliceStable(items, func(i, j int) bool {
-			return opts.Less(items[i], items[j])
+		slices.SortStableFunc(items, func(a, b T) int {
+			if opts.Less(a, b) {
+				return -1
+			}
+			if opts.Less(b, a) {
+				return 1
+			}
+			return 0
 		})
 	}
 	for i := range items {

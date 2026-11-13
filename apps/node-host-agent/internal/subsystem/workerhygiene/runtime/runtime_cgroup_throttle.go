@@ -77,7 +77,7 @@ func psiFullAvg60File(path string) (float64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 3 || f[0] != "full" {
 			continue
@@ -103,7 +103,7 @@ func cgroupEventsValue(path, key string) (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) == 2 && f[0] == key {
 			if v, err := strconv.ParseInt(f[1], 10, 64); err == nil {

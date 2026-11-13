@@ -152,17 +152,17 @@ func TestSweepFlipsOnlyBootEntries(t *testing.T) {
 	cs := k8sfake.NewClientset(cfg)
 	snap := &guardstate.Snapshot{G: &guardstate.Guard{CS: cs}}
 	var err error
-	snap.VWC, err = cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(context.Background(), metav1.ListOptions{})
+	snap.VWC, err = cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(t.Context(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("seed list: %v", err)
 	}
 
-	if err := Sweep(context.Background(), snap); err != nil {
+	if err := Sweep(t.Context(), snap); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 
 	got, err := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(
-		context.Background(), cfg.Name, metav1.GetOptions{})
+		t.Context(), cfg.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get after sweep: %v", err)
 	}
@@ -250,14 +250,14 @@ func TestSweepIdempotent(t *testing.T) {
 		snap := &guardstate.Snapshot{G: &guardstate.Guard{CS: cs}}
 		// Production takes a FRESH snapshot every sweep — the stale
 		// list here would re-report the pre-sweep Fail policies.
-		snap.VWC, _ = cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(context.Background(), metav1.ListOptions{})
+		snap.VWC, _ = cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(t.Context(), metav1.ListOptions{})
 		return snap
 	}
-	if err := Sweep(context.Background(), list()); err != nil {
+	if err := Sweep(t.Context(), list()); err != nil {
 		t.Fatalf("first sweep: %v", err)
 	}
 	cs.ClearActions()
-	if err := Sweep(context.Background(), list()); err != nil {
+	if err := Sweep(t.Context(), list()); err != nil {
 		t.Fatalf("second sweep: %v", err)
 	}
 	for _, a := range cs.Actions() {
@@ -272,7 +272,7 @@ func TestSweepListErrorFailsLoud(t *testing.T) {
 		G:      &guardstate.Guard{CS: k8sfake.NewClientset()},
 		VWCErr: context.DeadlineExceeded,
 	}
-	if err := Sweep(context.Background(), snap); err == nil {
+	if err := Sweep(t.Context(), snap); err == nil {
 		t.Fatal("snapshot list error must surface, not silently skip the run")
 	}
 }
@@ -282,12 +282,12 @@ func TestGateOffRegistersNothing(t *testing.T) {
 	cfg := vwc()
 	cs := k8sfake.NewClientset(cfg)
 	snap := &guardstate.Snapshot{G: &guardstate.Guard{CS: cs}}
-	snap.VWC, _ = cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(context.Background(), metav1.ListOptions{})
+	snap.VWC, _ = cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().List(t.Context(), metav1.ListOptions{})
 
 	if Enabled() {
 		t.Fatalf("gate: Enabled() = true with %s=false", FailOpenGate)
 	}
-	if err := Sweep(context.Background(), snap); err != nil {
+	if err := Sweep(t.Context(), snap); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 	for _, a := range cs.Actions() {
@@ -325,7 +325,7 @@ func TestPatchFailureDoesNotCount(t *testing.T) {
 	snap := &guardstate.Snapshot{G: &guardstate.Guard{CS: cs}}
 	snap.VWC = &admissionv1.ValidatingWebhookConfigurationList{Items: []admissionv1.ValidatingWebhookConfiguration{*cfg}}
 
-	err := Sweep(context.Background(), snap)
+	err := Sweep(t.Context(), snap)
 	if err == nil {
 		t.Fatal("patch failure must surface as a sweep error")
 	}

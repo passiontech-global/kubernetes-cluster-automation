@@ -89,7 +89,12 @@ func TestSSHConnRunCancelKillsLink(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(80 * time.Millisecond)
+		// Cancel exactly when the server accepts the exec — the call
+		// is wedged from that instant, no guessed delay needed.
+		select {
+		case <-srv.execSeen:
+		case <-time.After(2 * time.Second):
+		}
 		cancel()
 	}()
 	out, err := conn.Run(ctx, "sha256sum /f")
@@ -100,12 +105,19 @@ func TestSSHConnRunCancelKillsLink(t *testing.T) {
 
 // gateReader blocks Read until its gate closes, then fails — it
 // simulates a slow/broken local source so Write's copy goroutine is
-// still parked when the cancel lands.
+// still parked when the cancel lands. entered, when set, closes the
+// moment Read is reached — the deterministic "copy goroutine parked"
+// signal.
 type gateReader struct {
-	gate chan struct{}
+	gate    chan struct{}
+	entered chan struct{}
 }
 
 func (g *gateReader) Read([]byte) (int, error) {
+	if g.entered != nil {
+		close(g.entered) // one-shot: the copy goroutine reached Read
+		g.entered = nil
+	}
 	<-g.gate
 	return 0, io.ErrClosedPipe
 }
@@ -121,13 +133,14 @@ func TestSSHConnWriteCancelKillsLink(t *testing.T) {
 	conn, _ := dialLive(t, key, srv.port(), "")
 
 	ctx, cancel := context.WithCancel(context.Background())
+	entered := make(chan struct{})
 	gate := make(chan struct{})
 	go func() {
-		time.Sleep(80 * time.Millisecond)
+		<-entered // Write's copy goroutine is parked in gateReader.Read
 		cancel()
 		close(gate)
 	}()
-	err := conn.Write(ctx, "/dst/file", &gateReader{gate: gate})
+	err := conn.Write(ctx, "/dst/file", &gateReader{gate: gate, entered: entered})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("write err=%v want context.Canceled", err)
 	}

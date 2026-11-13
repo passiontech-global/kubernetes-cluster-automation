@@ -68,7 +68,14 @@ func ParseCiliumEncryptPeers(out string) (int, bool) {
 // fail-safe direction (it can only blunt a partial-drift signal,
 // never produce the repeated false kill an overcount causes).
 func readyNodeCount(d *wdeps.Deps, ctx context.Context) int {
-	list, err := d.Cfg.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	// ResourceVersion "0": serve the LIST from the apiserver's watch
+	// cache — expected-peer counting is a best-effort scan the drift
+	// guard re-evaluates every cycle (verdicts ride confirm windows,
+	// so a cache-lag view moves nothing on its own), and the
+	// per-cycle quorum read + etcd fan-out is skipped.
+	list, err := d.Cfg.Client.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+		ResourceVersion: "0",
+	})
 	if err != nil {
 		return 0
 	}

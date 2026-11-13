@@ -7,6 +7,7 @@ package guardstate
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/http/httptest"
 	"strings"
@@ -107,7 +108,7 @@ func TestReadyEndpointCounts(t *testing.T) {
 			if snap.UnhealthyNodes == nil {
 				snap.UnhealthyNodes = map[string]bool{}
 			}
-			got, err := g.readyEndpointCounts(context.Background(), snap)
+			got, err := g.readyEndpointCounts(t.Context(), snap)
 			if tc.nodesErr != nil {
 				if err == nil {
 					t.Fatal("expected nodes error to skip the census")
@@ -130,15 +131,7 @@ func TestReadyEndpointCounts(t *testing.T) {
 }
 
 func gsMapsEqual(got, want map[string]int) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for k, v := range want {
-		if got[k] != v {
-			return false
-		}
-	}
-	return true
+	return maps.Equal(got, want)
 }
 
 func TestWebhookBackendServices(t *testing.T) {
@@ -318,15 +311,15 @@ func TestTCPTLSEndpointProber(t *testing.T) {
 	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
 		t.Fatal(err)
 	}
-	if !tcpTLSEndpointProber(context.Background(), host, port) {
+	if !tcpTLSEndpointProber(t.Context(), host, port) {
 		t.Fatal("probe against a live TLS server must succeed")
 	}
 	// Nothing listening on the port — probe fails fast.
-	if tcpTLSEndpointProber(context.Background(), "127.0.0.1", 1) {
+	if tcpTLSEndpointProber(t.Context(), "127.0.0.1", 1) {
 		t.Fatal("probe against a closed port must fail")
 	}
 	// Cancelled context short-circuits.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	if tcpTLSEndpointProber(ctx, host, port) {
 		t.Fatal("probe with cancelled context must fail")
@@ -339,7 +332,7 @@ func TestTCPTLSEndpointProber(t *testing.T) {
 // "every probed IP failed the handshake" and stamps the brownout
 // ledgers with a false verdict.
 func TestProbeCancellationNotRecordedUnresponsive(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	prober := func(context.Context, string, int32) bool {
 		cancel() // the run budget expires mid-probe
@@ -412,7 +405,7 @@ func TestProbePoolBounded(t *testing.T) {
 	}
 	snap := &Snapshot{
 		G:   g,
-		Ctx: context.Background(),
+		Ctx: t.Context(),
 		MWC: &admissionv1.MutatingWebhookConfigurationList{
 			Items: []admissionv1.MutatingWebhookConfiguration{{
 				ObjectMeta: metav1.ObjectMeta{Name: "pool-mwc"},

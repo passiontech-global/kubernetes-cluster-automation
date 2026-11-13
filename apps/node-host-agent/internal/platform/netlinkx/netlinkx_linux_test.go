@@ -5,6 +5,7 @@ package netlinkx
 import (
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -54,11 +55,11 @@ func TestSockstatLive(t *testing.T) {
 	}
 }
 
-// TestTCPStatesLive creates real TCP sockets in the current netns
-// (a listener plus an established pair) and asserts the diag dump
-// counts them — exercises the whole nlmsghdr/inet_diag_msg parse
-// against the live kernel, not a fixture.
-func TestTCPStatesLive(t *testing.T) {
+// TestTCPTablesLive creates real TCP sockets in the current netns
+// (a listener plus an established pair) and asserts the 1-pass diag
+// census counts them — exercises the whole nlmsghdr/inet_diag_msg
+// parse against the live kernel, not a fixture.
+func TestTCPTablesLive(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skipf("no loopback: %v", err)
@@ -85,17 +86,28 @@ func TestTCPStatesLive(t *testing.T) {
 		t.Fatal("accept timeout")
 	}
 
-	states, err := TCPStates(os.Getpid())
+	census, err := TCPTables(os.Getpid())
 	if err != nil {
-		t.Fatalf("TCPStates: %v", err)
+		t.Fatalf("TCPTables: %v", err)
 	}
 	// 1 = TCP_ESTABLISHED. The listener is LISTEN(10); the pair is
 	// ESTABLISHED — assert at least the established count grew.
-	if states[1] < 2 {
-		t.Fatalf("expected >=2 ESTABLISHED sockets, got %v", states)
+	if census.States[1] < 2 {
+		t.Fatalf("expected >=2 ESTABLISHED sockets, got %v", census.States)
 	}
-	if states[10] < 1 {
-		t.Fatalf("expected >=1 LISTEN socket, got %v", states)
+	if census.States[10] < 1 {
+		t.Fatalf("expected >=1 LISTEN socket, got %v", census.States)
+	}
+	// The established pair's remote endpoint (127.0.0.1:<port>) must
+	// be in the per-tuple table and render through DiagEndpoint.
+	found := false
+	for key := range census.PerTuple {
+		if end := DiagEndpoint(key); strings.HasPrefix(end, "127.0.0.1:") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("loopback endpoint missing from PerTuple: %v", census.PerTuple)
 	}
 }
 

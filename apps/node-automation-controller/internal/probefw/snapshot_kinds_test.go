@@ -81,7 +81,7 @@ func newKindCounters(t *testing.T) *kindCounters {
 	countListReactor(cs, "statefulsets", &k.sts)
 	countListReactor(cs, "deployments", &k.deps)
 	countListReactor(cs, "daemonsets", &k.ds)
-	k.ctx = WithSweepSnapshot(context.Background())
+	k.ctx = WithSweepSnapshot(t.Context())
 	return k
 }
 
@@ -155,7 +155,7 @@ func TestSnapshotMemoizesErrorPerKind(t *testing.T) {
 			})
 	}
 	d := &Deps{CS: cs}
-	ctx := WithSweepSnapshot(context.Background())
+	ctx := WithSweepSnapshot(t.Context())
 
 	_, err1 := d.AllEvents(ctx)
 	_, err2 := d.AllEvents(ctx)
@@ -186,7 +186,7 @@ func TestInvalidateNodesForcesCSRead(t *testing.T) {
 	reader := &countingNodeReader{nodes: []corev1.Node{
 		{ObjectMeta: metav1.ObjectMeta{Name: "w1"}}}}
 	d := &Deps{CS: cs, NodeReader: reader}
-	ctx := WithSweepSnapshot(context.Background())
+	ctx := WithSweepSnapshot(t.Context())
 
 	// First read goes through the informer cache reader — the normal
 	// sweep posture.
@@ -274,7 +274,7 @@ func TestInvalidateEndpointSlices(t *testing.T) {
 	countListReactor(cs, "endpointslices", &sliceLists)
 	countListReactor(cs, "services", &svcLists)
 	d := &Deps{CS: cs}
-	ctx := WithSweepSnapshot(context.Background())
+	ctx := WithSweepSnapshot(t.Context())
 
 	if _, err := d.AllEndpointSlices(ctx); err != nil {
 		t.Fatal(err)
@@ -324,7 +324,7 @@ func TestSnapshotMemoizesDynamicReads(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) { fluxLists++; return false, nil, nil })
 
 	d := &Deps{CS: fake.NewSimpleClientset(), Dyn: dyn}
-	ctx := WithSweepSnapshot(context.Background())
+	ctx := WithSweepSnapshot(t.Context())
 
 	crdList, err := d.AllUnstructured(ctx, crdGVR)
 	if err != nil {
@@ -365,7 +365,7 @@ func TestSnapshotMemoizesDynamicReads(t *testing.T) {
 // every snapshot failure, so all CRD-reading checks read ONE failure.
 func TestSnapshotNilDynErrors(t *testing.T) {
 	d := &Deps{CS: fake.NewSimpleClientset()}
-	ctx := WithSweepSnapshot(context.Background())
+	ctx := WithSweepSnapshot(t.Context())
 	if _, err := d.AllUnstructured(ctx, schema.GroupVersionResource{Resource: "plans"}); err == nil {
 		t.Fatal("AllUnstructured with nil Dyn must error")
 	}
@@ -379,15 +379,13 @@ func TestSnapshotParallelSameKindReadsMemoizeOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, 8)
 	for i := range errs {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			events, err := k.d.AllEvents(k.ctx)
 			errs[i] = err
 			if err == nil && len(events) != 2 {
 				errs[i] = fmt.Errorf("reader %d got %d events, want 2", i, len(events))
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 	for _, err := range errs {
@@ -445,7 +443,7 @@ func TestAllUnstructuredFirst(t *testing.T) {
 	t.Run("first serving GVR wins", func(t *testing.T) {
 		d, lists := newDeps(t, hr)
 		items, gvr, err := d.AllUnstructuredFirst(
-			WithSweepSnapshot(context.Background()), []schema.GroupVersionResource{hrV2, hrV2beta2})
+			WithSweepSnapshot(t.Context()), []schema.GroupVersionResource{hrV2, hrV2beta2})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -476,7 +474,7 @@ func TestAllUnstructuredFirst(t *testing.T) {
 				return false, nil, nil
 			})
 		items, gvr, err := d.AllUnstructuredFirst(
-			WithSweepSnapshot(context.Background()), []schema.GroupVersionResource{hrV2beta2, hrV2})
+			WithSweepSnapshot(t.Context()), []schema.GroupVersionResource{hrV2beta2, hrV2})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -498,7 +496,7 @@ func TestAllUnstructuredFirst(t *testing.T) {
 						Resource: "helmreleases"}, "")
 			})
 		_, _, err := d.AllUnstructuredFirst(
-			WithSweepSnapshot(context.Background()), []schema.GroupVersionResource{hrV2beta2, hrV2})
+			WithSweepSnapshot(t.Context()), []schema.GroupVersionResource{hrV2beta2, hrV2})
 		if !apierrors.IsNotFound(err) {
 			t.Fatalf("all-absent error = %v, want NotFound", err)
 		}
@@ -519,7 +517,7 @@ func TestAllUnstructuredFirst(t *testing.T) {
 				}
 			})
 		_, _, err := d.AllUnstructuredFirst(
-			WithSweepSnapshot(context.Background()), []schema.GroupVersionResource{hrV2beta2, hrV2})
+			WithSweepSnapshot(t.Context()), []schema.GroupVersionResource{hrV2beta2, hrV2})
 		if err == nil || apierrors.IsNotFound(err) {
 			t.Fatalf("mixed-failure error = %v, want the real (non-NotFound) error", err)
 		}

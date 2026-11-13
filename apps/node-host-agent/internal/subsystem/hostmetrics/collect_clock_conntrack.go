@@ -103,7 +103,7 @@ func (c *Collector) collectClocksource(ch chan<- prometheus.Metric) {
 	var degraded bool
 	if availErr == nil {
 		available := map[string]bool{}
-		for _, f := range strings.Fields(string(availB)) {
+		for f := range strings.FieldsSeq(string(availB)) {
 			available[f] = true
 		}
 		// Degraded only when a fast clock the hardware COULD offer

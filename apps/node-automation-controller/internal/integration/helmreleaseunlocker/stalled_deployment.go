@@ -10,7 +10,7 @@ package helmreleaseunlocker
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -76,7 +76,7 @@ func (u *helmReleaseUnlocker) stalledDeployment(ctx context.Context,
 	case 1:
 		return found, "", nil
 	default:
-		sort.Strings(candidates)
+		slices.Sort(candidates)
 		return nil, fmt.Sprintf(
 			"ambiguous stalled workload — %d ProgressDeadlineExceeded Deployments in ns %s (%s)",
 			len(candidates), releaseNS, strings.Join(candidates, ",")), nil

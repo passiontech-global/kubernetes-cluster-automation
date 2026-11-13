@@ -140,7 +140,7 @@ func TestInstantQuerySuccess(t *testing.T) {
 	// ?query=… escape round-trip on the wire.
 	const query = `max by (node) (rate(load15{job="node"}[5m]))`
 	got, err := (&Client{HTTP: srv.Client()}).InstantQuery(
-		context.Background(), srv.URL, query)
+		t.Context(), srv.URL, query)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestInstantQueryErrors(t *testing.T) {
 			}))
 			defer srv.Close()
 			_, err := (&Client{HTTP: srv.Client()}).InstantQuery(
-				context.Background(), srv.URL, "up")
+				t.Context(), srv.URL, "up")
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 				t.Fatalf("err = %v, want substring %q", err, c.wantErr)
 			}
@@ -206,7 +206,7 @@ func TestInstantQuerySkipsMalformedSamples(t *testing.T) {
 	defer srv.Close()
 
 	got, err := (&Client{HTTP: srv.Client()}).InstantQuery(
-		context.Background(), srv.URL, "up")
+		t.Context(), srv.URL, "up")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestInstantQueryTimeout(t *testing.T) {
 	defer srv.Close()
 
 	_, err := (&Client{HTTP: srv.Client(), Timeout: 5 * time.Millisecond}).InstantQuery(
-		context.Background(), srv.URL, "up")
+		t.Context(), srv.URL, "up")
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want deadline exceeded", err)
 	}
@@ -241,7 +241,7 @@ func TestInstantQueryNilHTTPUsesDefaultClient(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got, err := (&Client{HTTP: nil}).InstantQuery(context.Background(), srv.URL, "up")
+	got, err := (&Client{HTTP: nil}).InstantQuery(t.Context(), srv.URL, "up")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestInstantQueryTruncationDetected(t *testing.T) {
 	defer srv.Close()
 
 	_, err := (&Client{HTTP: srv.Client()}).InstantQuery(
-		context.Background(), srv.URL, "up")
+		t.Context(), srv.URL, "up")
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("err = %v, want a truncation error", err)
 	}
@@ -286,7 +286,7 @@ func TestInstantQuerySkipsNonFiniteSamples(t *testing.T) {
 	defer srv.Close()
 
 	got, err := (&Client{HTTP: srv.Client()}).InstantQuery(
-		context.Background(), srv.URL, "up")
+		t.Context(), srv.URL, "up")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // exchangeStub builds a dnsExchangeFn serving per-transport results;
@@ -128,16 +130,16 @@ func TestCoreDNSWatchdogLayer2TransportFailGoesStale(t *testing.T) {
 	if got := w.streak.Count("cdns-a"); got != 1 {
 		t.Fatalf("first run streak=%d, want 1", got)
 	}
-	if !cdnsPodExists(t, cs, "cdns-a") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("pod deleted on streak 1")
 	}
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if cdnsPodExists(t, cs, "cdns-a") {
+	if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("TCP-wedged pod not deleted after streak max")
 	}
-	if !cdnsPodExists(t, cs, "cdns-b") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-b") {
 		t.Fatal("healthy pod deleted")
 	}
 }

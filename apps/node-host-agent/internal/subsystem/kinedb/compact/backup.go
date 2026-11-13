@@ -49,9 +49,17 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 		res.backupValid {
 		return // fresh and valid — nothing to create
 	}
-	if err := os.MkdirAll(g.d.Cfg.BackupDir, 0o750); err != nil {
+	// 0700, not the historical 0750-group view: every dump contains
+	// the full postgres cluster (pg_dumpall-equivalent secrets —
+	// roles, passwords hashes) and must be root/postgres-only.
+	if err := os.MkdirAll(g.d.Cfg.BackupDir, 0o700); err != nil {
 		note(fmt.Sprintf("backup-mkdir-fail: %v", err))
 		return
+	}
+	// mode only applies on create — force an inherited 0750 dir to
+	// 0700 before anything lands in it.
+	if err := os.Chmod(g.d.Cfg.BackupDir, 0o700); err != nil {
+		note(fmt.Sprintf("backup-dir-chmod-fail: %v", err))
 	}
 	// Stale/absent: only create when the fs has headroom.
 	if st, err := g.d.Cfg.StatFSFn(g.d.Cfg.BackupDir); err != nil ||
@@ -94,6 +102,13 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 	if _, err := g.d.ExecLong(ctx, []string{g.d.Cfg.Runtime, "cp",
 		pg + ":" + tmp, destTmp}, ""); err != nil {
 		note(fmt.Sprintf("backup-cp-fail: %v", err))
+		_ = os.Remove(destTmp)
+	} else if err := os.Chmod(destTmp, 0o600); err != nil {
+		// chmod BEFORE the rename publishes: the cp inherits the
+		// container-root umask (often 0644) and a world-readable
+		// kine dump leaks the cluster's secret material for a whole
+		// retention window.
+		note(fmt.Sprintf("backup-chmod-fail: %v", err))
 		_ = os.Remove(destTmp)
 	} else if err := os.Rename(destTmp, dest); err != nil {
 		note(fmt.Sprintf("backup-rename-fail: %v", err))

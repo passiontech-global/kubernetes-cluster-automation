@@ -6,7 +6,6 @@
 package probefw
 
 import (
-	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -30,7 +29,7 @@ func TestPodsInAndPodsMatching(t *testing.T) {
 			Labels: map[string]string{"app": "web"}}},
 	)
 	d := &Deps{CS: cs}
-	ctx := WithSweepSnapshot(context.Background())
+	ctx := WithSweepSnapshot(t.Context())
 
 	in, err := d.PodsIn(ctx, "apps")
 	if err != nil {
@@ -78,7 +77,7 @@ func TestAllNamespaces(t *testing.T) {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "terminating"}},
 	)
 	d := &Deps{CS: cs}
-	ctx := WithSweepSnapshot(context.Background())
+	ctx := WithSweepSnapshot(t.Context())
 
 	ns, err := d.AllNamespaces(ctx)
 	if err != nil {

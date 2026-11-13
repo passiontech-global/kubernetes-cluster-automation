@@ -165,7 +165,9 @@ func fakeDiscoveryAPIServer(t *testing.T) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{"kind":"APIGroupList","apiVersion":"v1","groups":[`+
 			`{"name":"apps","versions":[{"groupVersion":"apps/v1","version":"v1"}],`+
-			`"preferredVersion":{"groupVersion":"apps/v1","version":"v1"}}]}`)
+			`"preferredVersion":{"groupVersion":"apps/v1","version":"v1"}},`+
+			`{"name":"apiextensions.k8s.io","versions":[{"groupVersion":"apiextensions.k8s.io/v1","version":"v1"}],`+
+			`"preferredVersion":{"groupVersion":"apiextensions.k8s.io/v1","version":"v1"}}]}`)
 	})
 	mux.HandleFunc("GET /api/v1", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -177,6 +179,12 @@ func fakeDiscoveryAPIServer(t *testing.T) *httptest.Server {
 			`{"name":"daemonsets","singularName":"","namespaced":true,"kind":"DaemonSet","verbs":["get","list","watch"]},`+
 			`{"name":"deployments","singularName":"","namespaced":true,"kind":"Deployment","verbs":["get","list","watch"]}]}`)
 	})
+	// The CRD informer's discovery + census surface (cluster-scoped).
+	mux.HandleFunc("GET /apis/apiextensions.k8s.io/v1", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"apiextensions.k8s.io/v1","resources":[`+
+			`{"name":"customresourcedefinitions","singularName":"","namespaced":false,"kind":"CustomResourceDefinition","verbs":["get","list","watch"]}]}`)
+	})
 	// Informer List/Watch traffic — the only other calls the manager
 	// makes (all module work is tick-gated well past the test window).
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -187,6 +195,8 @@ func fakeDiscoveryAPIServer(t *testing.T) *httptest.Server {
 			apiVersion, kind = "apps/v1", "DaemonSetList"
 		case strings.HasSuffix(r.URL.Path, "/deployments"):
 			apiVersion, kind = "apps/v1", "DeploymentList"
+		case strings.HasSuffix(r.URL.Path, "/customresourcedefinitions"):
+			apiVersion, kind = "apiextensions.k8s.io/v1", "CustomResourceDefinitionList"
 		case strings.HasSuffix(r.URL.Path, "/secrets"):
 			apiVersion, kind = "v1", "SecretList"
 		case strings.HasSuffix(r.URL.Path, "/configmaps"):

@@ -351,27 +351,37 @@ func TestNewTLSClientBranches(t *testing.T) {
 	garbage := filepath.Join(t.TempDir(), "ca.crt")
 	testutil.WriteFile(t, garbage, "not a pem")
 
-	// Verify-TLS + unreadable CA bundle → New fails fast.
-	_, err := New(Config{InsecureTLS: false, CAFile: garbage},
+	// Verify-TLS + unreadable CA bundle → New succeeds LAZILY now
+	// (guard.conf may not exist at agent start); the failure
+	// surfaces on the first cycle's refreshClient/probe instead,
+	// and the probe client stays unbuilt.
+	p, err := New(Config{InsecureTLS: false, CAFile: garbage},
 		prometheus.NewRegistry())
-	if err == nil || !strings.Contains(err.Error(), "load CA") {
-		t.Fatalf("New(verify, bad CA) err=%v want 'load CA'", err)
+	if err != nil {
+		t.Fatalf("New(verify, bad CA) must build lazily, err=%v", err)
+	}
+	if p.client != nil {
+		t.Fatal("bad CA must leave the probe client unbuilt")
+	}
+	if _, err := p.probeClient(); err == nil ||
+		!strings.Contains(err.Error(), "load CA") {
+		t.Fatalf("probeClient(bad CA) err=%v want 'load CA'", err)
 	}
 
 	// InsecureTLS → the CA file is never consulted.
-	p, err := New(Config{InsecureTLS: true, CAFile: garbage},
+	p2, err := New(Config{InsecureTLS: true, CAFile: garbage},
 		prometheus.NewRegistry())
-	if err != nil || p == nil {
-		t.Fatalf("New(insecure) = %v, %v", p, err)
+	if err != nil || p2 == nil {
+		t.Fatalf("New(insecure) = %v, %v", p2, err)
 	}
 
 	// An injected HTTPClient overrides all TLS material entirely.
-	p, err = New(Config{
+	p3, err := New(Config{
 		HTTPClient: newAPIStub(t).srv.Client(),
 		CAFile:     garbage, // must be ignored
 	}, prometheus.NewRegistry())
-	if err != nil || p.client == nil {
-		t.Fatalf("New(injected client) = %v, %v", p, err)
+	if err != nil || p3.client == nil {
+		t.Fatalf("New(injected client) = %v, %v", p3, err)
 	}
 }
 
@@ -571,5 +581,44 @@ func TestRefreshClientRebuildsOnCARotation(t *testing.T) {
 	p.refreshClient()
 	if p.client != rotated {
 		t.Fatal("identical CA must not rebuild the client")
+	}
+}
+
+// TestNewLazyCAAfterGuardConfLands: guard.conf (and its ca_file) does
+// not exist when the agent starts on a fresh api-lb VM — New must not
+// fail (the old construction-time load held the whole subsystem out
+// until restart), and the first refresh AFTER the CA lands must build
+// the probe client.
+func TestNewLazyCAAfterGuardConfLands(t *testing.T) {
+	srv := httptest.NewTLSServer(
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(srv.Close)
+	pemFile := filepath.Join(t.TempDir(), "guard", "ca.pem") // parent absent too
+
+	p, err := New(Config{InsecureTLS: false, CAFile: pemFile},
+		prometheus.NewRegistry())
+	if err != nil {
+		t.Fatalf("New with a not-yet-existing CA failed: %v", err)
+	}
+	if p.client != nil {
+		t.Fatal("CA-backed client must build lazily, not at construction")
+	}
+
+	// hostconfig renders the CA; the next cycle's refresh builds.
+	der := srv.TLS.Certificates[0].Certificate[0]
+	if err := os.MkdirAll(filepath.Dir(pemFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pemFile,
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.refreshClient()
+	if p.client == nil {
+		t.Fatal("CA landed but refreshClient did not build the probe client")
+	}
+	// The lazy build must also serve probes issued between cycles.
+	if c, err := p.probeClient(); err != nil || c != p.client {
+		t.Fatalf("probeClient = %v, %v — want the built client", c, err)
 	}
 }

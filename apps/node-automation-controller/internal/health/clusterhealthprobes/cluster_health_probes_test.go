@@ -22,13 +22,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/dragonfly"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/nats"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/olm"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/percona"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/postgres"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/pvc"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/rabbitmq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore/scylla"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/gitops/olm"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cloudflared"
@@ -36,12 +35,13 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/linkerd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/liqo"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth/leases"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth/localpv"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nodehealth/sprawl"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/storage/localpv"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/storage/pvc"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs/leases"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs/sprawl"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -123,7 +123,7 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: postgres.CheckNamePostgresWALArchiveGuard, New: postgres.NewPostgresWALArchiveGuardCheck},
 		{Name: scylla.CheckNameScyllaCompactionSchemaGuard, New: scylla.NewScyllaCompactionSchemaGuardCheck},
 		{Name: nats.CheckNameNatsJetstreamHealth, New: nats.NewNatsJetstreamHealthCheck},
-		{Name: nodehealth.CheckNameKedaScaledObjectGuard, New: nodehealth.NewKedaScaledObjectGuardCheck},
+		{Name: gitops.CheckNameKedaScaledObjectGuard, New: gitops.NewKedaScaledObjectGuardCheck},
 		{Name: gateway.CheckNameGatewayRouteHealth, New: gateway.NewGatewayRouteHealthCheck},
 		{Name: leases.CheckNameControllerLeaseGuard, New: leases.NewControllerLeaseGuardCheck},
 		{Name: pvc.CheckNamePVCResizeStallGuard, New: pvc.NewPVCResizeStallGuardCheck},
@@ -159,7 +159,7 @@ func TestRunEmitsAllChecksPassing(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	if err := p.run(context.Background()); err != nil {
+	if err := p.run(t.Context()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	for _, check := range []string{
@@ -191,7 +191,7 @@ func TestRunFailGrowsStaleness(t *testing.T) {
 	p.LookupHost = func(context.Context, string) ([]string, error) {
 		return nil, errors.New("SERVFAIL")
 	}
-	if err := p.run(context.Background()); err != nil {
+	if err := p.run(t.Context()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	if v, _ := probetest.HealthGauge(t, ported.CheckNameDNS, "FAIL"); v != 1 {
@@ -232,7 +232,7 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	}
 	before := errCount()
 
-	if err := p.run(context.Background()); err != nil {
+	if err := p.run(t.Context()); err != nil {
 		t.Fatalf("partial infra failure must not fail the cycle: %v", err)
 	}
 	if v, _ := probetest.HealthGauge(t, ported.CheckNamePodRestarts, "FAIL"); v != 1 {
@@ -284,7 +284,7 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 // DNS probe cancels mid-sweep to simulate the shutdown landing inside
 // the first check.
 func TestRunAbortEmitsNothing(t *testing.T) {
-	cctx, cancel := context.WithCancel(context.Background())
+	cctx, cancel := context.WithCancel(t.Context())
 	p := testProber(fake.NewSimpleClientset())
 	p.LookupHost = func(context.Context, string) ([]string, error) {
 		cancel() // SIGTERM lands mid-sweep
@@ -403,7 +403,7 @@ func TestRunShrunkRosterPrunesLastPass(t *testing.T) {
 		p.lastPass[name] = seeded
 	}
 
-	if err := p.run(context.Background()); err != nil {
+	if err := p.run(t.Context()); err != nil {
 		t.Fatalf("full-roster run: %v", err)
 	}
 	if _, ok := p.lastPass[gitops.CheckNameImagePullSecretAuditor]; !ok {
@@ -413,7 +413,7 @@ func TestRunShrunkRosterPrunesLastPass(t *testing.T) {
 	// Shrink the roster the way a future dynamic registry would:
 	// only the first two checks (DNS, HTTP content) survive.
 	p.checks = p.checks[:2]
-	if err := p.run(context.Background()); err != nil {
+	if err := p.run(t.Context()); err != nil {
 		t.Fatalf("shrunk-roster run: %v", err)
 	}
 	if _, ok := p.lastPass[gitops.CheckNameImagePullSecretAuditor]; ok {
@@ -487,7 +487,7 @@ func TestRunBoundedParallelism(t *testing.T) {
 		map[string]string{"queue": p.Name}); m != nil {
 		runErrsBefore = m.GetCounter().GetValue()
 	}
-	if err := p.run(context.Background()); err != nil {
+	if err := p.run(t.Context()); err != nil {
 		t.Fatalf("parallel run: %v", err)
 	}
 	for i, c := range checks {

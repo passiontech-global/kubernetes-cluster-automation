@@ -60,7 +60,7 @@ func procBootEpoch() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if rest, ok := strings.CutPrefix(line, "btime "); ok {
 			return strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
 		}

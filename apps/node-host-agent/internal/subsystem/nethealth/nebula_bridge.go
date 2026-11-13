@@ -63,6 +63,9 @@ func newNebulaDeps(n *NetHealth) *nebula.Deps {
 		LinkAddrs: func(pid int, name string) ([]netlink.Addr, error) {
 			return n.cfg.linkAddrsFn(pid, name)
 		},
+		Rules: func(pid int) ([]netlink.Rule, error) {
+			return n.cfg.rulesFn(pid)
+		},
 		StateExit:                n.stateExit,
 		UnitEnabledActive:        n.unitEnabledActive,
 		NebulaUpExists:           n.nebulaUpExists,

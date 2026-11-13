@@ -4,6 +4,7 @@
 package probee
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -186,6 +187,51 @@ func HTTPBodyInsecure(ctx context.Context, url string, timeout time.Duration,
 			}
 			return string(b), nil
 		})
+}
+
+// HTTPBodyStreamInsecure streams the response body line-by-line
+// through a 64 KiB bufio.Scanner, keeping only the lines keep()
+// accepts, up to budget bytes of KEPT output. The multi-MiB
+// /metrics scrapes collapse to the few KiB their parsers actually
+// read before they become strings (the streamed kubelet-metrics
+// reader pattern). Deliberately NO status check and no whole-body
+// cap — the same verdict surface HTTPBodyInsecure gave (a non-200
+// body still parses); the kept-lines budget replaces the
+// whole-body cap, so a huge scrape with tiny kept families no
+// longer errors the parse away. A scanner error (a single line
+// over the 64 KiB buffer) is returned as an error — a line that
+// big is a malformed scrape, not parseable evidence.
+func HTTPBodyStreamInsecure(ctx context.Context, url string,
+	timeout time.Duration, keep func(line []byte) bool, budget int,
+	client ...*http.Client) (string, error) {
+	return httpGet(ctx, clientOrDefault(client, insecureClient), url, "", timeout,
+		func(resp *http.Response) (string, error) {
+			return scanKeptLines(resp.Body, keep, budget)
+		})
+}
+
+// scanKeptLines is the streaming half of HTTPBodyStreamInsecure:
+// one pass, kept lines joined with "\n" (the parsers split on it
+// exactly like the old full-body reads did).
+func scanKeptLines(r io.Reader, keep func([]byte) bool, budget int) (string, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), 64<<10)
+	var kept []string
+	size := 0
+	for sc.Scan() {
+		ln := sc.Bytes()
+		if keep(ln) {
+			kept = append(kept, string(ln))
+			size += len(ln) + 1
+			if size >= budget {
+				break
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(kept, "\n"), nil
 }
 
 // BodyOK GETs url and reports whether the trimmed body is exactly

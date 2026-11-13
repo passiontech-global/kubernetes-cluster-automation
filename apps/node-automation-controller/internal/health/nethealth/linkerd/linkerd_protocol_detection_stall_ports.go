@@ -7,7 +7,7 @@
 package linkerd
 
 import (
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -33,7 +33,7 @@ var linkerdBinaryPorts = map[int]bool{
 // expanded — annotation values are small.
 func parsePortSet(s string) map[int]bool {
 	out := map[int]bool{}
-	for _, part := range strings.Split(s, ",") {
+	for part := range strings.SplitSeq(s, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
@@ -107,6 +107,6 @@ func missingBinaryPorts(pod *corev1.Pod) []int {
 			}
 		}
 	}
-	sort.Ints(missing)
+	slices.Sort(missing)
 	return missing
 }

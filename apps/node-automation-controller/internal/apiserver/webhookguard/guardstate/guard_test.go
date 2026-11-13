@@ -46,7 +46,7 @@ func TestTakeSnapshot(t *testing.T) {
 		Dyn: testhelp.NewDynWithCRDs(crd),
 		Now: func() time.Time { return time.Unix(1_700_000_000, 0) },
 	}
-	snap := g.TakeSnapshot(context.Background())
+	snap := g.TakeSnapshot(t.Context())
 	if snap.NSErr != nil || snap.MWCErr != nil || snap.VWCErr != nil || snap.CRDErr != nil || snap.NodesErr != nil {
 		t.Fatalf("unexpected snapshot errors: ns=%v mwc=%v vwc=%v crd=%v nodes=%v",
 			snap.NSErr, snap.MWCErr, snap.VWCErr, snap.CRDErr, snap.NodesErr)
@@ -69,7 +69,7 @@ func TestTakeSnapshot(t *testing.T) {
 
 	// A nil dynamic client records the CRD list as skipped, not fatal.
 	gNoDyn := &Guard{CS: cs}
-	snap = gNoDyn.TakeSnapshot(context.Background())
+	snap = gNoDyn.TakeSnapshot(t.Context())
 	if snap.CRDErr == nil {
 		t.Fatal("nil dyn must record a CRDErr")
 	}
@@ -141,7 +141,7 @@ func TestReadyCountsMemoized(t *testing.T) {
 		probes++
 		return true
 	}}
-	snap := g.TakeSnapshot(context.Background())
+	snap := g.TakeSnapshot(t.Context())
 	snap.MWC = mwc
 
 	first, err := snap.ReadyCounts()

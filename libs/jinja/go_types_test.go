@@ -162,6 +162,40 @@ func TestYAMLScalarEdgeCases(t *testing.T) {
 	}
 }
 
+// An alias used in KEY position (*k: val) resolves to its anchor's
+// value, and a non-scalar key errors instead of silently decoding as
+// the empty string.
+func TestYAMLAliasKeyDecode(t *testing.T) {
+	v, err := DecodeYAML([]byte("base: &k anchorname\nderived: *k\n*k: fromalias\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	om, ok := v.(*OMap)
+	if !ok {
+		t.Fatalf("DecodeYAML = %T, want *OMap", v)
+	}
+	for k, want := range map[string]any{
+		"base":       "anchorname",
+		"derived":    "anchorname",
+		"anchorname": "fromalias",
+	} {
+		got, dup := om.Get(k)
+		if !dup {
+			t.Fatalf("decoded mapping missing key %q", k)
+		}
+		if got != want {
+			t.Fatalf("yaml %q = %#v want %#v", k, got, want)
+		}
+	}
+
+	// A mapping/sequence in key position must error, not become "".
+	for _, doc := range []string{"? [a, b]\n: v\n", "? {x: 1}\n: v\n"} {
+		if _, err := DecodeYAML([]byte(doc)); err == nil {
+			t.Fatalf("DecodeYAML(%q) succeeded — want non-scalar-key error", doc)
+		}
+	}
+}
+
 // for-unpack on a mapping errors for ANY arity > 1 (previously only
 // == 2 was caught up-front; >= 3 leaked a confusing item error).
 func TestForUnpackMappingArity(t *testing.T) {
@@ -195,5 +229,41 @@ func TestFormatSpecClamped(t *testing.T) {
 	// "1." + up to 10000 fraction digits
 	if len(got) < 9000 {
 		t.Fatalf("format precision clamp len = %d, want ~10001", len(got))
+	}
+}
+
+// uint64/uint values past MaxInt64 compare, order and negate
+// exactly — they used to fail asInt64 and fall through to a float64
+// (or a "not a number" bucket), flipping {{ u > 99 }} to False.
+func TestUint64BeyondMaxInt64(t *testing.T) {
+	ctx := map[string]any{
+		"u":  uint64(math.MaxInt64) + 1,
+		"ub": uint64(1) << 63,
+		"i":  int64(-1),
+		"f":  float64(99),
+	}
+	cases := map[string]string{
+		`{{ u > 99 }}`:                   "True",
+		`{{ u > 99.5 }}`:                 "True",
+		`{{ u < 18446744073709551615 }}`: "True",
+		`{{ u == ub }}`:                  "True",
+		`{{ u > i }}`:                    "True",
+		`{{ i < u }}`:                    "True",
+		`{{ u + 1 }}`:                    "9223372036854775809",
+		`{{ u - 1 }}`:                    "9223372036854775807",
+		`{{ u * 3 }}`:                    "2.7670116110564327e+19", // > uint64 max → float promotion
+		`{{ u - ub }}`:                   "0",
+		`{{ -u }}`:                       "-9223372036854775808", // exactly -2^63
+		`{{ [u, 5] | min }}`:             "5",
+		`{{ [5, u] | sort | first }}`:    "5",
+	}
+	for tpl, want := range cases {
+		got, err := Render(tpl, ctx, nil)
+		if err != nil {
+			t.Fatalf("render %q: %v", tpl, err)
+		}
+		if got != want {
+			t.Fatalf("render %q = %q want %q", tpl, got, want)
+		}
 	}
 }

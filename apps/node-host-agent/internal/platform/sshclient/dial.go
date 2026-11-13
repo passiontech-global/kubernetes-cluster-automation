@@ -229,13 +229,19 @@ func (c Config) Handshake(ctx context.Context, nc, carrier net.Conn,
 	if err := carrier.SetDeadline(dl); err != nil {
 		c.log().Warn("sshclient: ssh handshake unbounded — SetDeadline unsupported",
 			"addr", addr, "error", err)
+	} else {
+		// Clear on EVERY exit path, error ones included: nc is the
+		// failed hop's chanConn (jump case) and gets closed below,
+		// but carrier is the shared bastion conn — a deadline left
+		// armed on it would kill every later channel muxed over the
+		// bastion once the handshake budget expired.
+		defer func() { _ = carrier.SetDeadline(time.Time{}) }()
 	}
 	conn, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
 	if err != nil {
 		_ = nc.Close()
 		return nil, err
 	}
-	_ = carrier.SetDeadline(time.Time{})
 	return ssh.NewClient(conn, chans, reqs), nil
 }
 

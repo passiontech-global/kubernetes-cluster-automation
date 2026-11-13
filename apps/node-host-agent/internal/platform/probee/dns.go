@@ -25,7 +25,7 @@ func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) boo
 	id := uint16(time.Now().UnixNano())
 	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
 	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
-	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+	for label := range strings.SplitSeq(strings.TrimSuffix(name, "."), ".") {
 		if label == "" {
 			continue
 		}
@@ -64,7 +64,7 @@ func DNSQueryTCP(ctx context.Context, addr, name string, timeout time.Duration) 
 	id := uint16(time.Now().UnixNano())
 	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
 	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
-	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+	for label := range strings.SplitSeq(strings.TrimSuffix(name, "."), ".") {
 		if label == "" {
 			continue
 		}

@@ -255,8 +255,7 @@ func TestKubeletWatchWedgeYoungAndDirsSkipped(t *testing.T) {
 	}
 	// Terminating / Succeeded / Failed are skipped entirely.
 	term := e.AssignedPod("term", wdepstest.UIDC, 30*time.Minute)
-	ts := metav1.NewTime(e.Now.Add(-time.Minute))
-	term.DeletionTimestamp = &ts
+	term.DeletionTimestamp = new(metav1.NewTime(e.Now.Add(-time.Minute)))
 	if _, err := e.CS.CoreV1().Pods("default").Create(context.Background(), term, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}

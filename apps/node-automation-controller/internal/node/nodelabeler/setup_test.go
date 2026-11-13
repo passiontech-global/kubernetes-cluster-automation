@@ -4,7 +4,6 @@
 package nodelabeler
 
 import (
-	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -42,7 +41,7 @@ func TestSetupSweepFixedKey(t *testing.T) {
 		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 	defer q.ShutDown()
 	for _, name := range []string{"n1", "n2", "n3"} {
-		h.Create(context.Background(), event.CreateEvent{
+		h.Create(t.Context(), event.CreateEvent{
 			Object: testutil.Node(name, corev1.ConditionTrue, nil)}, q)
 	}
 	if q.Len() != 1 {

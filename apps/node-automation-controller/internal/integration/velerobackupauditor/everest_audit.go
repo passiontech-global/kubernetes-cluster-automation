@@ -5,26 +5,54 @@
 // failed / stuck / stale / missing postures exported on
 // DBBackupUnhealthy{namespace,cluster,reason}. Clusters without the
 // Everest CRDs no-op quietly, same contract as the Velero half.
+// The sweep skeleton (list/404/index/skip/zero-backup/emit/prune)
+// lives in db_backup_audit.go — this file is the Everest row of that
+// table plus the product-specific reason functions.
 package velerobackupauditor
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
 // backup-posture-audit — Everest (Percona) DatabaseCluster backup auditor
 // ---------------------------------------------------------------------------
+
+// everestDBBackupAudit is the backup-posture-audit Everest row of the
+// db_backup_audit.go table: the DatabaseCluster/DatabaseClusterBackup
+// GVR pair, the always-list backup gating, the spec.dbClusterName
+// owner field, the backup-enabled-and-not-paused skip predicate and
+// the status.state reasons functions.
+var everestDBBackupAudit = dbBackupAudit{
+	primaryGVR:     everestDBClusterGVR,
+	backupGVR:      everestDBBackupGVR,
+	primaryListErr: "list everest databaseclusters",
+	backupListErr:  "list everest databaseclusterbackups",
+	listBackups: func(*unstructured.UnstructuredList) bool {
+		// everest reads DatabaseClusterBackups regardless of the
+		// cluster list — the primary result is non-nil past the
+		// 404/NoMatch switch either way.
+		return true
+	},
+	ownerPath: []string{"spec", "dbClusterName"},
+	identity: func(dc *unstructured.Unstructured) (string, string, bool) {
+		ns, name := dc.GetNamespace(), dc.GetName()
+		// Only clusters that opted into backups AND are not paused —
+		// a paused cluster's stale backups are deliberate, not rot.
+		enabled, _ := kube.NestedBool(dc.Object, "spec", "backup", "enabled")
+		paused, _ := kube.NestedBool(dc.Object, "spec", "paused")
+		return ns, name, !enabled || paused
+	},
+	reasons:      everestBackupReasons,
+	hasGood:      everestHasSucceeded,
+	unhealthyMsg: "everest databasecluster backup unhealthy",
+}
 
 // auditEverestBackups evaluates every unpaused DatabaseCluster with
 // spec.backup.enabled against its DatabaseClusterBackups (matched on
@@ -41,98 +69,7 @@ import (
 // without the Everest CRDs 404/NoMatch on the list — a quiet no-op,
 // same contract as the Velero half of this module.
 func (a *veleroBackupAuditor) auditEverestBackups(ctx context.Context) error {
-	a.seenEverest.Begin() // drop any aborted sweep's leftover emissions
-	log := logf.FromContext(ctx)
-
-	clusters, err := a.veleroList(ctx, everestDBClusterGVR)
-	switch {
-	case err == nil:
-		// proceed below
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		// Everest operator not installed — current stays empty so the
-		// prune below still clears any stale series.
-		clusters = &unstructured.UnstructuredList{}
-	default:
-		return fmt.Errorf("list everest databaseclusters: %w", err)
-	}
-
-	var backups *unstructured.UnstructuredList
-	if clusters != nil {
-		backups, err = a.veleroList(ctx, everestDBBackupGVR)
-		switch {
-		case err == nil:
-			// proceed
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-			backups = nil // backup CRD absent — clusters audit as "no backups"
-		default:
-			return fmt.Errorf("list everest databaseclusterbackups: %w", err)
-		}
-	}
-
-	// Index backups by owning DatabaseCluster ("ns/name") once —
-	// each cluster then judges only its own history.
-	byCluster := map[string][]*unstructured.Unstructured{}
-	if backups != nil {
-		for i := range backups.Items {
-			b := &backups.Items[i]
-			owner, _ := kube.NestedString(b.Object, "spec", "dbClusterName")
-			if owner == "" {
-				continue
-			}
-			key := b.GetNamespace() + "/" + owner
-			byCluster[key] = append(byCluster[key], b)
-		}
-	}
-
-	now := a.now.Now()
-	for i := range clusters.Items {
-		dc := &clusters.Items[i]
-		ns, name := dc.GetNamespace(), dc.GetName()
-		// Only clusters that opted into backups AND are not paused —
-		// a paused cluster's stale backups are deliberate, not rot.
-		enabled, _ := kube.NestedBool(dc.Object, "spec", "backup", "enabled")
-		paused, _ := kube.NestedBool(dc.Object, "spec", "paused")
-		if !enabled || paused {
-			continue
-		}
-		clusterBackups := byCluster[ns+"/"+name]
-		reasons := everestBackupReasons(clusterBackups, now)
-		// zero-backup-guard — same zero-backup blind spot as the Velero
-		// Schedule check: a backup-enabled DatabaseCluster older
-		// than 36h with ZERO DatabaseClusterBackups is silently
-		// unprotected. Caller-side because the age clock belongs to
-		// the cluster, not the (empty) backup list.
-		if len(clusterBackups) == 0 {
-			dcCreated := dc.GetCreationTimestamp()
-			if !dcCreated.IsZero() &&
-				now.Sub(dcCreated.Time) > veleroMissingBackupMaxAge {
-				reasons = append(reasons, "missing")
-			}
-		} else if !everestHasSucceeded(clusterBackups) {
-			// selfheal-alert-coverage Schrödinger's-backup: backup objects EXIST but
-			// none ever reached state=Succeeded — every attempt
-			// failed (or is wedged in Running) and the in-list
-			// stale check, which keys on the newest SUCCEEDED,
-			// sees nothing. Past the 36h horizon the cluster is
-			// effectively unprotected. Caller-side because the
-			// age clock is the DatabaseCluster's.
-			dcCreated := dc.GetCreationTimestamp()
-			if !dcCreated.IsZero() &&
-				now.Sub(dcCreated.Time) > veleroMissingBackupMaxAge {
-				reasons = append(reasons, "stale")
-			}
-		}
-		for _, reason := range reasons {
-			k := everestKey{ns, name, reason}
-			a.seenEverest.Set(metrics.DBBackupUnhealthy, 1, k, ns, name, reason)
-			log.Info("everest databasecluster backup unhealthy",
-				"cluster", ns+"/"+name, "reason", reason,
-				"backups", len(clusterBackups))
-		}
-	}
-
-	a.seenEverest.Prune(metrics.DBBackupUnhealthy.DeleteLabelValues)
-	return nil
+	return a.auditDBBackups(ctx, &a.seenEverest, everestDBBackupAudit)
 }
 
 // everestBackupReasons evaluates one DatabaseCluster's backup list

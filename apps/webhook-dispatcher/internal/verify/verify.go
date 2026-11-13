@@ -89,7 +89,7 @@ func HasValidSignatureFormat(secret, sigHeader string) bool {
 	if !ok || len(got) != sha256.Size*2 {
 		return false
 	}
-	for i := 0; i < len(got); i++ {
+	for i := range len(got) {
 		c := got[i]
 		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
 			return false

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -76,4 +77,60 @@ func CountRecentEvents(ctx context.Context, cs kubernetes.Interface,
 			return nil
 		})
 	return count, err
+}
+
+// WarningEvent describes one events.k8s.io/v1 Warning Event — the
+// exact shape every check emitter hand-rolled (Regarding + Action,
+// deprecated corev1.Event fields unset, ReportingController pinned
+// to this controller's name). Name/Namespace compose per site: one
+// sweep can fire several events on different objects sharing one
+// `now`, so every caller keeps its uniqueness suffix
+// (object.hex-now, svc.zone.hex-now, prefix-timestamp) instead of
+// the helper inventing one.
+type WarningEvent struct {
+	// Name is the full event object name — caller-composed so the
+	// per-site uniqueness conventions survive verbatim.
+	Name string
+	// Namespace is the POST collection namespace — events.k8s.io/v1
+	// is namespaced, so this must be a real namespace (regarding's,
+	// or "default" for cluster-scoped regarding objects).
+	Namespace string
+	// Regarding references the object the event is about.
+	Regarding corev1.ObjectReference
+	// Reason doubles as Action (every emitter stamped Action=Reason).
+	Reason string
+	// Note is the human message.
+	Note string
+	// ReportingInstance is the emitting check/module name.
+	ReportingInstance string
+	// Now is the emission clock — EventTime and the caller's Name
+	// suffix must read from the same instant.
+	Now time.Time
+}
+
+// EmitWarningEvent creates one events.k8s.io/v1 Warning Event from
+// we — the single shared emit path replacing the hand-rolled
+// eventsv1.Event literals. Returns the create error so the caller
+// keeps its own failure posture (log-only best-effort, or IncError —
+// the zone-starvation relist-vs-relist split); a success returns nil
+// and the caller logs its EVENT line.
+func EmitWarningEvent(ctx context.Context, cs kubernetes.Interface,
+	we WarningEvent) error {
+
+	ev := &eventsv1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      we.Name,
+			Namespace: we.Namespace,
+		},
+		EventTime:           metav1.NewMicroTime(we.Now),
+		Reason:              we.Reason,
+		Note:                we.Note,
+		Type:                corev1.EventTypeWarning,
+		ReportingController: "node-automation-controller",
+		ReportingInstance:   we.ReportingInstance,
+		Action:              we.Reason,
+		Regarding:           we.Regarding,
+	}
+	_, err := cs.EventsV1().Events(we.Namespace).Create(ctx, ev, metav1.CreateOptions{})
+	return err
 }

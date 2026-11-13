@@ -17,7 +17,7 @@ import (
 // FirstLine returns the first non-blank trimmed line of psql -tA
 // output ("" when there is none).
 func FirstLine(out string) string {
-	for _, l := range strings.Split(out, "\n") {
+	for l := range strings.SplitSeq(out, "\n") {
 		if strings.TrimSpace(l) != "" {
 			return strings.TrimSpace(l)
 		}
@@ -82,7 +82,7 @@ func ParseQuad(out string) (a, b, c, d int64, err error) {
 // legitimately contain them.
 func EnvValue(data, key string) string {
 	prefix := key + "="
-	for _, l := range strings.Split(data, "\n") {
+	for l := range strings.SplitSeq(data, "\n") {
 		l = strings.TrimSpace(l)
 		l = strings.TrimPrefix(l, "export ")
 		if !strings.HasPrefix(l, prefix) {
@@ -151,7 +151,7 @@ func ReasonOrDash(s string) string {
 // it; empty/blank lines are skipped.
 func ParseGIDs(out string) []string {
 	var gids []string
-	for _, l := range strings.Split(out, "\n") {
+	for l := range strings.SplitSeq(out, "\n") {
 		l = strings.TrimSpace(l)
 		if l == "" {
 			continue

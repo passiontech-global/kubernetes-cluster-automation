@@ -71,6 +71,13 @@ import (
 const (
 	zombieSidecarReaperInterval = 5 * time.Minute
 
+	// batchv1JobNameLabel is the server-side pod filter: the label the
+	// Job controller stamps on every pod it creates (k8s ≥1.27 naming;
+	// the legacy "job-name" twin carries the same value). Zombies are
+	// Job-owned by definition, so the apiserver drops every non-Job
+	// pod before it is ever serialized.
+	batchv1JobNameLabel = "batch.kubernetes.io/job-name"
+
 	// zombieShutdownCapPerCycle bounds the graceful sidecar shutdown
 	// attempts per sweep: each attempt is up to two sequential
 	// network hops with 2s timeouts (the direct pod-IP dial, then
@@ -133,17 +140,18 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 		r.poked = map[string]bool{}
 	}
 
-	// Server-side phase filter — zombies are always Running; the
-	// in-code phase check stays for fake clients (field selectors
-	// are ignored there).
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		FieldSelector: "status.phase=Running",
-		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(r.cs, metav1.NamespaceAll))
-	if err != nil {
-		return fmt.Errorf("list pods: %w", err)
-	}
-
+	// Server-side filters — zombies are always Running pods of a Job,
+	// and every Job-created pod carries the batch.kubernetes.io/job-name
+	// label the Job controller stamps (k8s ≥1.27 label policy), so the
+	// apiserver pre-filters both server-side and the census stops
+	// deserializing the whole cluster's pods to throw most away. The
+	// in-code phase + ownerReference checks stay — fake clientsets
+	// ignore FIELD selectors (labels ARE filtered by the v0.37 typed
+	// fake, so test fixtures carry the label) and zombiePod's
+	// qualification is fail-closed.
+	// The qualification/shutdown walk runs INSIDE the page visit:
+	// each page's pod bodies die with it, and only the vetted
+	// zombieTargets (plus the poked ledger) survive the tick.
 	now := r.now.Now()
 	seen := map[string]bool{} // qualifying keys this cycle
 
@@ -163,50 +171,60 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 	// is two sequential 2s-timeout hops). The poked branch makes no
 	// network call and never counts.
 	shutdownAttempts, shutdownSkipped := 0, 0
-	for i := range pods {
-		p := &pods[i]
-		sidecar := r.zombiePod(p, now)
-		if sidecar == "" {
-			continue
-		}
-		key := zombieKey(p)
-		seen[key] = true
-		if r.poked[key] {
-			// Already sent the admin quit call last cycle and the
-			// pod STILL qualifies — the sidecar ignored the
-			// graceful path, so the pod itself goes away (subject
-			// to the Job-completion gate in Confirm).
-			targets = append(targets, zombieTarget{pod: p, key: key,
-				reason: "still stuck after sidecar shutdown"})
-			continue
-		}
-		if shutdownAttempts >= zombieShutdownCapPerCycle {
-			// Past the cap: no dial, no poked stamp — the pod keeps
-			// its graceful cycle for the next sweep, unmodified.
-			shutdownSkipped++
-			continue
-		}
-		shutdownAttempts++
-		// Graceful path: direct pod-IP admin call, then the apiserver
-		// pods/<name>:<port>/proxy fallback when the direct dial is
-		// unreachable (netpol) or the pod has no IP (sidecar-shutdown-fallback). A pod
-		// with no podIP skips straight to the proxy attempt.
-		err := r.shutdownPod(ctx, p, sidecar)
-		if err != nil {
-			// Both shutdown paths failed — graceful is impossible,
-			// so the pod goes to the delete step; the
-			// jobAllowsReap gate inside Confirm decides whether
-			// the Job may spare it (BUG-C1 / backoffLimit).
-			targets = append(targets, zombieTarget{pod: p, key: key,
-				reason: fmt.Sprintf("sidecar shutdown failed: %v", err)})
-			continue
-		}
-		r.poked[key] = true
-		log.Info("SHUTDOWN: asked zombie sidecar to exit",
-			"pod", p.Namespace+"/"+p.Name, "podIP", p.Status.PodIP,
-			"sidecar", sidecar)
+	err := kube.ListEach(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase=Running",
+		LabelSelector: batchv1JobNameLabel,
+		Limit:         kube.DefaultListPageSize,
+	}, kube.Pods(r.cs, metav1.NamespaceAll),
+		func(page []corev1.Pod) error {
+			for i := range page {
+				p := &page[i]
+				sidecar := r.zombiePod(p, now)
+				if sidecar == "" {
+					continue
+				}
+				key := zombieKey(p)
+				seen[key] = true
+				if r.poked[key] {
+					// Already sent the admin quit call last cycle and the
+					// pod STILL qualifies — the sidecar ignored the
+					// graceful path, so the pod itself goes away (subject
+					// to the Job-completion gate in Confirm).
+					targets = append(targets, zombieTarget{pod: p, key: key,
+						reason: "still stuck after sidecar shutdown"})
+					continue
+				}
+				if shutdownAttempts >= zombieShutdownCapPerCycle {
+					// Past the cap: no dial, no poked stamp — the pod keeps
+					// its graceful cycle for the next sweep, unmodified.
+					shutdownSkipped++
+					continue
+				}
+				shutdownAttempts++
+				// Graceful path: direct pod-IP admin call, then the apiserver
+				// pods/<name>:<port>/proxy fallback when the direct dial is
+				// unreachable (netpol) or the pod has no IP (sidecar-shutdown-fallback). A pod
+				// with no podIP skips straight to the proxy attempt.
+				err := r.shutdownPod(ctx, p, sidecar)
+				if err != nil {
+					// Both shutdown paths failed — graceful is impossible,
+					// so the pod goes to the delete step; the
+					// jobAllowsReap gate inside Confirm decides whether
+					// the Job may spare it (BUG-C1 / backoffLimit).
+					targets = append(targets, zombieTarget{pod: p, key: key,
+						reason: fmt.Sprintf("sidecar shutdown failed: %v", err)})
+					continue
+				}
+				r.poked[key] = true
+				log.Info("SHUTDOWN: asked zombie sidecar to exit",
+					"pod", p.Namespace+"/"+p.Name, "podIP", p.Status.PodIP,
+					"sidecar", sidecar)
+			}
+			return nil
+		})
+	if err != nil {
+		return fmt.Errorf("list pods: %w", err)
 	}
-	pods = nil
 
 	deleted, _, _ := reap.Sweep(ctx, log, targets, reap.Options[zombieTarget]{
 		// The Job-completion gate still applies on every delete

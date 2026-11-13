@@ -53,7 +53,7 @@ func TestReplicaPinWantDisabledSkipsList(t *testing.T) {
 			listed = true
 			return true, nil, errors.New("must not be called")
 		})
-	got, err := (ReplicaPin{}).Want(context.Background(), cs)
+	got, err := (ReplicaPin{}).Want(t.Context(), cs)
 	if err != nil || got != 0 {
 		t.Fatalf("Want=(%d, %v), want (0, nil)", got, err)
 	}
@@ -87,7 +87,7 @@ func TestReplicaPinWant(t *testing.T) {
 					fmt.Sprintf("n%d", i), corev1.ConditionTrue, nil))
 			}
 			cs := fake.NewSimpleClientset(objs...)
-			got, err := tc.pin.Want(context.Background(), cs)
+			got, err := tc.pin.Want(t.Context(), cs)
 			if err != nil {
 				t.Fatalf("want: %v", err)
 			}
@@ -107,7 +107,7 @@ func TestReplicaPinWantListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	got, err := (ReplicaPin{MinReplicas: 4, NodesPerReplica: 1}).
-		Want(context.Background(), cs)
+		Want(t.Context(), cs)
 	if err == nil {
 		t.Fatal("expected error when the node list fails")
 	}

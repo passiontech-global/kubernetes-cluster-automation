@@ -151,10 +151,12 @@ func (p *hostKeyPolicy) verify(hostname string, key ssh.PublicKey) error {
 	}
 
 	// 2. Operator known_hosts — listed hosts are enforced; an
-	//    unknown host or absent/unparseable file falls through to
-	//    TOFU.
+	//    unknown host falls through to TOFU. A PARSE failure of the
+	//    file is a hard reject (fail closed): an unreadable trust
+	//    store must not silently downgrade every dial to first-use
+	//    TOFU — that is the window a MITM records the key in.
 	if p.knownHostsPath != "" {
-		accepted, err := p.checkKnownHosts(hostname, key)
+		accepted, err := p.checkKnownHosts(hostname, key, p.dialPort(hostname))
 		if err != nil {
 			return err
 		}
@@ -165,7 +167,7 @@ func (p *hostKeyPolicy) verify(hostname string, key ssh.PublicKey) error {
 
 	// 3. Persistent TOFU.
 	if p.tofuPath != "" {
-		return p.checkTOFU(host, key)
+		return p.checkTOFU(host, key, p.dialPort(hostname))
 	}
 
 	// 4. Explicit insecure opt-out — last resort, audit-logged by
@@ -190,26 +192,30 @@ func (p *hostKeyPolicy) knownHostsPresent() bool {
 // checkKnownHosts runs the OpenSSH known_hosts callback for path.
 // accepted=true means the file vouched for the key — verify stops.
 // accepted=false means "no authoritative answer" (host unlisted, or
-// the file missing/unparseable) and the chain continues to TOFU;
-// a non-nil error is a real mismatch and rejects. A missing file is
-// skipped — the secret mount may not exist yet and TOFU still covers
-// first contact.
+// the file missing) and the chain continues to TOFU; a non-nil error
+// is a real mismatch or an unparseable store and rejects. A missing
+// file is skipped — the secret mount may not exist yet and TOFU
+// still covers first contact. port is the port the DIAL carried
+// (per-target override or the converge knob — see dialPort):
+// knownhosts matches entries port-exactly.
 func (p *hostKeyPolicy) checkKnownHosts(hostname string,
-	key ssh.PublicKey) (bool, error) {
+	key ssh.PublicKey, port int) (bool, error) {
 	if !p.knownHostsPresent() {
 		return false, nil
 	}
 	cb, kerr := knownhosts.New(p.knownHostsPath)
 	if kerr != nil {
-		p.log.Warn("hubsync: known_hosts parse failed — skipping file",
-			"path", p.knownHostsPath, "error", kerr)
-		return false, nil
+		// Fail closed: the operator pinned trust in a file we cannot
+		// read — skipping it would fall through to TOFU and treat
+		// every pinned host as first contact.
+		return false, fmt.Errorf("hubsync: known_hosts parse failed — refusing "+
+			"(fail closed): %w", kerr)
 	}
 	// knownhosts requires BOTH args in host:port form and matches
 	// entries port-exactly — build the addr from the normalized
-	// host + configured port.
+	// host + the dialed port.
 	addrPort := net.JoinHostPort(normalizeSSHHost(hostname),
-		strconv.Itoa(p.port))
+		strconv.Itoa(port))
 	err := cb(addrPort, hostPortAddr(addrPort), key)
 	if err == nil {
 		return true, nil
@@ -225,8 +231,9 @@ func (p *hostKeyPolicy) checkKnownHosts(hostname string,
 // checkTOFU validates against <StateDir>/hubsync_known_hosts and
 // records first-seen keys. The file is itself a known_hosts database
 // (knownhosts.Line output), so later verifies — and operators with
-// ssh-keygen — read it natively.
-func (p *hostKeyPolicy) checkTOFU(host string, key ssh.PublicKey) error {
+// ssh-keygen — read it natively. port is the port the DIAL carried:
+// entries are port-exact like the operator file.
+func (p *hostKeyPolicy) checkTOFU(host string, key ssh.PublicKey, port int) error {
 	p.tofuMu.Lock()
 	defer p.tofuMu.Unlock()
 
@@ -237,7 +244,7 @@ func (p *hostKeyPolicy) checkTOFU(host string, key ssh.PublicKey) error {
 		}
 		// Feed host:port — entries were written under the same
 		// port-exact matching the operator file uses.
-		addrPort := net.JoinHostPort(host, strconv.Itoa(p.port))
+		addrPort := net.JoinHostPort(host, strconv.Itoa(port))
 		err = cb(addrPort, hostPortAddr(addrPort), key)
 		if err == nil {
 			return nil
@@ -256,11 +263,14 @@ func (p *hostKeyPolicy) checkTOFU(host string, key ssh.PublicKey) error {
 	// First contact (or a host new to the file): append the key
 	// atomically — tmp+rename in the same dir, 0600 so the trust
 	// store is not world-readable. The pattern is port-exact like
-	// OpenSSH: plain host on :22, "[host]:port" otherwise.
+	// OpenSSH: plain host on :22, "[host]:port" otherwise — and the
+	// port recorded is the one the dial used, NOT the converge knob
+	// (a per-target ":2222" host previously got a ":22" pattern no
+	// later verify of that host could ever match).
 	pattern := host
-	if p.port != 22 {
+	if port != 22 {
 		pattern = "[" + strings.Trim(host, "[]") + "]:" +
-			strconv.Itoa(p.port)
+			strconv.Itoa(port)
 	}
 	line := knownhosts.Line([]string{pattern}, key) + "\n"
 	if err := appendFileAtomic(p.tofuPath, []byte(line), 0o600); err != nil {
@@ -272,6 +282,22 @@ func (p *hostKeyPolicy) checkTOFU(host string, key ssh.PublicKey) error {
 			"file", p.tofuPath)
 	}
 	return nil
+}
+
+// dialPort resolves the port trust must key on for this dial: the
+// hostname's own ":port" suffix when it carried one (the per-target
+// override SplitUserHost produced), else the converge-wide knob.
+// known_hosts entries and TOFU patterns are port-exact — checking a
+// :2222 dial as :22 would miss its operator pin and record the key
+// under the wrong port.
+func (p *hostKeyPolicy) dialPort(hostname string) int {
+	if _, port, err := net.SplitHostPort(hostname); err == nil {
+		if v, perr := strconv.Atoi(strings.Trim(port, "[]")); perr == nil &&
+			v > 0 && v <= 65535 {
+			return v
+		}
+	}
+	return p.port
 }
 
 // hostPortAddr is a net.Addr whose String() is already "host:port" —
@@ -318,6 +344,14 @@ func appendFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	// Sync before rename: the trust store must survive a crash
+	// between append and crash-restore — a torn/absent entry would
+	// re-arm TOFU first-contact for a host whose key already
+	// changed (fsx.Promote parity for this bespoke tmp+rename tail).
+	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return err
 	}

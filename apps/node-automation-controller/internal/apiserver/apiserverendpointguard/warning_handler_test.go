@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"k8s.io/client-go/rest"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 func TestEndpointsWarningClient(t *testing.T) {
@@ -15,7 +17,7 @@ func TestEndpointsWarningClient(t *testing.T) {
 	// A shared client over a filtered config is reused as-is — no
 	// second transport for zero behavioral gain.
 	filtered := rest.CopyConfig(cfg)
-	filtered.WarningHandler = NewWarningHandler()
+	filtered.WarningHandler = kube.NewWarningHandler()
 	stub, err := endpointsWarningClient(filtered, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -46,15 +48,4 @@ func TestEndpointsWarningClient(t *testing.T) {
 	if got == nil {
 		t.Fatal("nil dyn must build a dynamic client")
 	}
-}
-
-// NewWarningHandler returns the guard's own filter type — the shape
-// main type-asserts onto the shared rest.Config.
-func TestNewWarningHandlerType(t *testing.T) {
-	h := NewWarningHandler()
-	if _, ok := h.(endpointGuardWarnings); !ok {
-		t.Fatalf("NewWarningHandler = %T, want endpointGuardWarnings", h)
-	}
-	var _ rest.WarningHandler = h
-
 }

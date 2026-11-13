@@ -5,13 +5,47 @@ package concoursecache
 
 import (
 	"cmp"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
+
+// enforceDirPermsFD applies uid/gid + mode to a directory WITHOUT
+// re-resolving the path: the dir is opened O_NOFOLLOW (a swapped-in
+// symlink fails the open instead of being dereferenced), fstat'd to
+// confirm the fd still is a plain directory, then Fchown/Fchmod run
+// on the held fd. The Lstat-then-Chown pattern had a swap window —
+// on a CI-controlled 0777 tree an actor can replace a verified
+// entry with `<entry> -> /etc` between the check and the chmod,
+// turning the root perm pass into a host-file privilege gadget.
+func enforceDirPermsFD(path string, uid, gid int, mode os.FileMode) error {
+	fd, err := unix.Open(path,
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer func() { _ = f.Close() }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("%s: not a directory (mode %o)", path, st.Mode&unix.S_IFMT)
+	}
+	if uid >= 0 || gid >= 0 {
+		if err := unix.Fchown(fd, uid, gid); err != nil {
+			return err
+		}
+	}
+	return unix.Fchmod(fd, uint32(mode))
+}
 
 // isDir is the script's `[ -d "$d" ]` guard — but Lstat, not Stat:
 // unlike the worker-container original, this pruner resolves on the
@@ -30,10 +64,13 @@ type cacheFile struct {
 }
 
 // entryBlocks is the du -sk contribution of one walked entry:
-// allocated blocks (st_blocks×512), falling back to apparent size —
-// sparse files measure like du does.
+// allocated blocks (st_blocks×512). A sparse file's st.Blocks is 0
+// and that is exactly what du counts for it — falling back to
+// apparent size here would let one huge sparse file inflate a trim
+// accumulator past the size marks in a single step (the totals it is
+// compared against are all block-based, so units must never mix).
 func entryBlocks(info os.FileInfo) uint64 {
-	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Blocks > 0 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		return uint64(st.Blocks) * 512
 	}
 	return uint64(info.Size())

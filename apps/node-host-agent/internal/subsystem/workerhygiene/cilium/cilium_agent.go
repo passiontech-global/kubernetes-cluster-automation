@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
@@ -217,7 +217,7 @@ func (c *CiliumCheck) CheckBPFMaps(ctx context.Context) {
 		c.d.CycleResult(wdeps.CheckCiliumBPF, "ok")
 		return
 	}
-	sort.Strings(over)
+	slices.Sort(over)
 	c.d.State.Enter(latchdefs.LatchCiliumBPFMapPressure, strings.Join(over, " "))
 	c.d.CycleResult(wdeps.CheckCiliumBPF, "ok")
 }

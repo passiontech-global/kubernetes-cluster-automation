@@ -86,7 +86,7 @@ var chronycSystemTimeRe = regexp.MustCompile(
 func parseChronycTracking(out string) (float64, bool, bool) {
 	var off float64
 	found := false
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		if m := chronycSystemTimeRe.FindStringSubmatch(ln); m != nil {
 			v, err := strconv.ParseFloat(m[1], 64)
 			if err != nil {

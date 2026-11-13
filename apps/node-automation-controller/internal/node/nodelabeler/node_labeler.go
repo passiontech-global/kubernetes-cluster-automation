@@ -88,7 +88,7 @@ var nodeLabelChanges = predicate.Funcs{
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg labelerConfig) error {
 		logf.Log.WithName(d.Name).Info("registered", "configPath", cfg.configPath)
-		r := &nodeLabeler{cs: d.CS, nodeReader: d.Mgr.GetClient(), queue: d.Name, configPath: cfg.configPath}
+		r := &nodeLabeler{cs: d.CS, nodeReader: d.CachedClient(), queue: d.Name, configPath: cfg.configPath}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the
@@ -181,7 +181,7 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 		return res, nil
 	}
 	// (c) each line: <key=val> <node1> <node2> ...
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		// '#' starts a comment anywhere on the line — full-line
 		// comments and trailing "n1 n2 # why" notes alike. Neither a
 		// label key=value nor a node name can contain '#', so cutting

@@ -186,14 +186,12 @@ func (p *Pruner) enforcePerms(sc string, log *slog.Logger) {
 			"dir", sc, "error", err)
 	}
 	for _, t := range targets {
-		if p.cfg.OwnerUID >= 0 || p.cfg.OwnerGID >= 0 {
-			if err := os.Chown(t, p.cfg.OwnerUID, p.cfg.OwnerGID); err != nil {
-				log.Debug("chown failed — perm invariant not enforced",
-					"path", t, "error", err)
-			}
-		}
-		if err := os.Chmod(t, p.cfg.Mode); err != nil {
-			log.Debug("chmod failed — perm invariant not enforced",
+		// fd-based: open O_NOFOLLOW + Fchown/Fchmod on the held fd —
+		// the Lstat above only proved no symlink AT CHECK TIME;
+		// os.Chown/os.Chmod would re-resolve the path and follow a
+		// swapped-in link.
+		if err := enforceDirPermsFD(t, p.cfg.OwnerUID, p.cfg.OwnerGID, p.cfg.Mode); err != nil {
+			log.Debug("perm invariant not enforced",
 				"path", t, "error", err)
 		}
 	}

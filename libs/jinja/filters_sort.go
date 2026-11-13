@@ -90,9 +90,9 @@ func sortKeyOf(el any, attribute string, caseSensitive bool) (any, error) {
 		return el, nil
 	}
 	var keys []any
-	for _, attr := range strings.Split(attribute, ",") {
+	for attr := range strings.SplitSeq(attribute, ",") {
 		cur := el
-		for _, seg := range strings.Split(attr, ".") {
+		for seg := range strings.SplitSeq(attr, ".") {
 			var next any
 			if allDigits(seg) {
 				i, _ := strconv.ParseInt(seg, 10, 64)
@@ -174,13 +174,9 @@ type sortKey struct {
 func sortKeyRank(v any) int {
 	switch {
 	case isNum(v):
-		return 0
-	}
-	if _, ok := asUint64(v); ok {
-		// A uint64 (or uint on 64-bit) past MaxInt64 fails asInt64,
-		// so isNum calls it a non-number — but it IS one and must
-		// sort in the numeric rank, not with the Stringify-compared
-		// "other" bucket where it misordered against ints.
+		// Covers uint64/uint past MaxInt64 too (isNum checks
+		// asUint64) — they sort in the numeric rank, not with the
+		// Stringify-compared "other" bucket.
 		return 0
 	}
 	if _, ok := v.(string); ok {

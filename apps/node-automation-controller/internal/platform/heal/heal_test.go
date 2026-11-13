@@ -224,31 +224,12 @@ func TestDeletePodNilHeals(t *testing.T) {
 	}
 }
 
-// emulateEviction teaches the fake clientset the apiserver's
-// pods/eviction contract — same emulation shape as every domain
-// package's copy: the fake tracker records a pods/eviction CREATE
-// but never deletes the pod, so tests asserting the pod is gone wire
-// the delete themselves. PDB budget enforcement stays apiserver-side.
-func emulateEviction(cs *fake.Clientset) {
-	cs.PrependReactor("create", "pods",
-		func(a ktesting.Action) (bool, runtime.Object, error) {
-			ca, ok := a.(ktesting.CreateAction)
-			if !ok || ca.GetSubresource() != "eviction" {
-				return false, nil, nil // a real pod create — let the tracker take it
-			}
-			ev := ca.GetObject().(*policyv1.Eviction)
-			return true, ev, cs.Tracker().Delete(
-				corev1.SchemeGroupVersion.WithResource("pods"),
-				ca.GetNamespace(), ev.Name)
-		})
-}
-
 // A delivered eviction stamps the ledger and removes the pod — the
 // same delivered-only contract DeletePod pins.
 func TestEvictPodStampsOnDelivery(t *testing.T) {
 	p := pod("ns1", "op-abc-1", "uid-1", corev1.PodRunning, time.Now())
 	cs := fake.NewSimpleClientset(p)
-	emulateEviction(cs)
+	testhelp.EmulateEviction(cs)
 	var heals state.CooldownSet
 	now := time.Now()
 

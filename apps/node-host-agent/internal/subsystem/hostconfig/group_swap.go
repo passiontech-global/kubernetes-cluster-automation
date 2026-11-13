@@ -122,7 +122,7 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 	// exact NAME-column match — a substring probe would mark /swapfile
 	// active just because /swapfile-kine is listed (independent files).
 	active := false
-	for _, name := range strings.Split(activeOut, "\n") {
+	for name := range strings.SplitSeq(activeOut, "\n") {
 		if strings.TrimSpace(name) == path {
 			active = true
 			break

@@ -86,10 +86,10 @@ func (f *Feeder) Run(ctx context.Context) {
 	defer f.d.Feeding.Set(0)
 
 	mainPID := f.waitMainPID(ctx, unit)
-	if mainPID == "" {
+	if mainPID == 0 {
 		return // ctx cancelled while waiting
 	}
-	f.d.State.AppendLog(fmt.Sprintf("feeder: start %s.MainPID=%s interval=%ds url=%s",
+	f.d.State.AppendLog(fmt.Sprintf("feeder: start %s.MainPID=%d interval=%ds url=%s",
 		unit, mainPID, int(fcfg.Interval.Seconds()), fcfg.ProbeURL))
 
 	fails := 0
@@ -101,12 +101,13 @@ func (f *Feeder) Run(ctx context.Context) {
 	defer timer.Stop()
 	for {
 		// MainPID drift: readable-and-different → the instance we
-		// tracked ended. Re-arm grace like a fresh feeder unit
-		// (PartOf restart parity). An EMPTY read is a transient
-		// systemctl failure — never counts as an instance change.
-		if now := f.unitProp(ctx, unit, "MainPID"); now != "" && now != mainPID {
+		// tracked ended (MainPID 0 = the unit lost its main
+		// process). Re-arm grace like a fresh feeder unit (PartOf
+		// restart parity). A read ERROR is a transient probe
+		// failure — never counts as an instance change.
+		if now, err := f.d.MainPID(ctx, unit); err == nil && now != mainPID {
 			f.d.State.AppendLog(fmt.Sprintf(
-				"feeder: %s.MainPID changed (%s -> %s) — instance ended, re-arming grace",
+				"feeder: %s.MainPID changed (%d -> %d) — instance ended, re-arming grace",
 				unit, mainPID, now))
 			mainPID = now
 			fails = 0
@@ -177,20 +178,20 @@ func (f *Feeder) Run(ctx context.Context) {
 	}
 }
 
-// waitMainPID polls systemctl show -p MainPID until a non-zero pid is
-// readable — the feeder start-time `exit 0 + Restart=always retry`
-// mapped into an in-process wait.
-func (f *Feeder) waitMainPID(ctx context.Context, unit string) string {
+// waitMainPID polls the shared systemd client's MainPID property
+// read until a non-zero pid is readable — the feeder start-time
+// `exit 0 + Restart=always retry` mapped into an in-process wait.
+func (f *Feeder) waitMainPID(ctx context.Context, unit string) uint32 {
 	timer := time.NewTimer(f.d.Cfg.Feeder.Interval)
 	defer timer.Stop()
 	for {
-		if mp := f.unitProp(ctx, unit, "MainPID"); mp != "" && mp != "0" {
+		if mp, err := f.d.MainPID(ctx, unit); err == nil && mp != 0 {
 			return mp
 		}
 		timer.Reset(f.d.Cfg.Feeder.Interval)
 		select {
 		case <-ctx.Done():
-			return ""
+			return 0
 		case <-timer.C:
 		}
 	}

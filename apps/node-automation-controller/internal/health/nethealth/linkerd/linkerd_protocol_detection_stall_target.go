@@ -4,8 +4,6 @@ import (
 	"context"
 
 	"github.com/go-logr/logr"
-	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,13 +27,12 @@ func (p *linkerdProtocolDetectionStallCheck) resolveLinkerdTemplate(ctx context.
 	ns := pod.Namespace
 	switch ref.Kind {
 	case "ReplicaSet":
-		rsList, rsErr := p.AllReplicaSets(ctx)
+		rs, rsErr := p.ReplicaSet(ctx, ns, ref.Name)
 		if rsErr != nil {
 			log.Info("WARN: linkerd heal — replicaset census failed",
 				"rs", ns+"/"+ref.Name, "error", rsErr)
 			return nil, false
 		}
-		rs := findReplicaSetMeta(rsList, ns, ref.Name)
 		if rs == nil {
 			log.Info("WARN: linkerd heal — replicaset not in the census",
 				"rs", ns+"/"+ref.Name)
@@ -72,43 +69,16 @@ func (p *linkerdProtocolDetectionStallCheck) resolveLinkerdTemplate(ctx context.
 		if dref.Kind != "Deployment" {
 			return nil, false
 		}
-		depList, depErr := p.AllDeployments(ctx)
-		if depErr != nil {
-			log.Info("WARN: linkerd heal — deployment census failed",
-				"deployment", ns+"/"+dref.Name, "error", depErr)
-			return nil, false
-		}
-		dep := findDeployment(depList, ns, dref.Name)
-		if dep == nil {
-			log.Info("WARN: linkerd heal — deployment not in the census",
-				"deployment", ns+"/"+dref.Name)
-			return nil, false
-		}
-		return &linkerdTemplateTarget{dep, "deployment", ns, dep.Name,
-			kube.EffectiveTemplateAnnos(ctx, dep, dep.Spec.Template.Annotations), false}, true
+		return p.deploymentTarget(ctx, log, ns, dref.Name)
 	case "Deployment":
-		depList, depErr := p.AllDeployments(ctx)
-		if depErr != nil {
-			log.Info("WARN: linkerd heal — deployment census failed",
-				"deployment", ns+"/"+ref.Name, "error", depErr)
-			return nil, false
-		}
-		dep := findDeployment(depList, ns, ref.Name)
-		if dep == nil {
-			log.Info("WARN: linkerd heal — deployment not in the census",
-				"deployment", ns+"/"+ref.Name)
-			return nil, false
-		}
-		return &linkerdTemplateTarget{dep, "deployment", ns, dep.Name,
-			kube.EffectiveTemplateAnnos(ctx, dep, dep.Spec.Template.Annotations), false}, true
+		return p.deploymentTarget(ctx, log, ns, ref.Name)
 	case "StatefulSet":
-		stsList, stsErr := p.AllStatefulSets(ctx)
+		sts, stsErr := p.StatefulSet(ctx, ns, ref.Name)
 		if stsErr != nil {
 			log.Info("WARN: linkerd heal — statefulset census failed",
 				"statefulset", ns+"/"+ref.Name, "error", stsErr)
 			return nil, false
 		}
-		sts := findStatefulSet(stsList, ns, ref.Name)
 		if sts == nil {
 			log.Info("WARN: linkerd heal — statefulset not in the census",
 				"statefulset", ns+"/"+ref.Name)
@@ -117,13 +87,12 @@ func (p *linkerdProtocolDetectionStallCheck) resolveLinkerdTemplate(ctx context.
 		return &linkerdTemplateTarget{sts, "statefulset", ns, sts.Name,
 			kube.EffectiveTemplateAnnos(ctx, sts, sts.Spec.Template.Annotations), false}, true
 	case "DaemonSet":
-		dsList, dsErr := p.AllDaemonSets(ctx)
+		ds, dsErr := p.DaemonSet(ctx, ns, ref.Name)
 		if dsErr != nil {
 			log.Info("WARN: linkerd heal — daemonset census failed",
 				"daemonset", ns+"/"+ref.Name, "error", dsErr)
 			return nil, false
 		}
-		ds := findDaemonSet(dsList, ns, ref.Name)
 		if ds == nil {
 			log.Info("WARN: linkerd heal — daemonset not in the census",
 				"daemonset", ns+"/"+ref.Name)
@@ -132,13 +101,12 @@ func (p *linkerdProtocolDetectionStallCheck) resolveLinkerdTemplate(ctx context.
 		return &linkerdTemplateTarget{ds, "daemonset", ns, ds.Name,
 			kube.EffectiveTemplateAnnos(ctx, ds, ds.Spec.Template.Annotations), false}, true
 	case "Job":
-		jobList, jobErr := p.AllJobs(ctx)
+		job, jobErr := p.Job(ctx, ns, ref.Name)
 		if jobErr != nil {
 			log.Info("WARN: linkerd heal — job census failed",
 				"job", ns+"/"+ref.Name, "error", jobErr)
 			return nil, false
 		}
-		job := findJob(jobList, ns, ref.Name)
 		if job == nil {
 			log.Info("WARN: linkerd heal — job not in the census",
 				"job", ns+"/"+ref.Name)
@@ -147,13 +115,12 @@ func (p *linkerdProtocolDetectionStallCheck) resolveLinkerdTemplate(ctx context.
 		return &linkerdTemplateTarget{job, "job", ns, job.Name,
 			kube.EffectiveTemplateAnnos(ctx, job, job.Spec.Template.Annotations), false}, true
 	case "CronJob":
-		cjList, cjErr := p.AllCronJobs(ctx)
+		cj, cjErr := p.CronJob(ctx, ns, ref.Name)
 		if cjErr != nil {
 			log.Info("WARN: linkerd heal — cronjob census failed",
 				"cronjob", ns+"/"+ref.Name, "error", cjErr)
 			return nil, false
 		}
-		cj := findCronJob(cjList, ns, ref.Name)
 		if cj == nil {
 			log.Info("WARN: linkerd heal — cronjob not in the census",
 				"cronjob", ns+"/"+ref.Name)
@@ -167,56 +134,24 @@ func (p *linkerdProtocolDetectionStallCheck) resolveLinkerdTemplate(ctx context.
 	}
 }
 
-func findDeployment(items []appsv1.Deployment, ns, name string) *appsv1.Deployment {
-	for i := range items {
-		if items[i].Namespace == ns && items[i].Name == name {
-			return &items[i]
-		}
-	}
-	return nil
-}
+// deploymentTarget resolves the named Deployment through the sweep's
+// indexed census lookup — the snapshot equivalent of a per-name GET,
+// O(1) after the first resolution instead of a linear census walk
+// per resolved pod.
+func (p *linkerdProtocolDetectionStallCheck) deploymentTarget(
+	ctx context.Context, log logr.Logger, ns, name string) (*linkerdTemplateTarget, bool) {
 
-func findStatefulSet(items []appsv1.StatefulSet, ns, name string) *appsv1.StatefulSet {
-	for i := range items {
-		if items[i].Namespace == ns && items[i].Name == name {
-			return &items[i]
-		}
+	dep, depErr := p.Deployment(ctx, ns, name)
+	if depErr != nil {
+		log.Info("WARN: linkerd heal — deployment census failed",
+			"deployment", ns+"/"+name, "error", depErr)
+		return nil, false
 	}
-	return nil
-}
-
-func findDaemonSet(items []appsv1.DaemonSet, ns, name string) *appsv1.DaemonSet {
-	for i := range items {
-		if items[i].Namespace == ns && items[i].Name == name {
-			return &items[i]
-		}
+	if dep == nil {
+		log.Info("WARN: linkerd heal — deployment not in the census",
+			"deployment", ns+"/"+name)
+		return nil, false
 	}
-	return nil
-}
-
-func findReplicaSetMeta(items []metav1.PartialObjectMetadata, ns, name string) *metav1.PartialObjectMetadata {
-	for i := range items {
-		if items[i].Namespace == ns && items[i].Name == name {
-			return &items[i]
-		}
-	}
-	return nil
-}
-
-func findCronJob(items []batchv1.CronJob, ns, name string) *batchv1.CronJob {
-	for i := range items {
-		if items[i].Namespace == ns && items[i].Name == name {
-			return &items[i]
-		}
-	}
-	return nil
-}
-
-func findJob(items []batchv1.Job, ns, name string) *batchv1.Job {
-	for i := range items {
-		if items[i].Namespace == ns && items[i].Name == name {
-			return &items[i]
-		}
-	}
-	return nil
+	return &linkerdTemplateTarget{dep, "deployment", ns, dep.Name,
+		kube.EffectiveTemplateAnnos(ctx, dep, dep.Spec.Template.Annotations), false}, true
 }

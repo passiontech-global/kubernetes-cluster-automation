@@ -1,7 +1,6 @@
 package shared
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -28,7 +27,7 @@ func TestEmitCircuitOpenEvent(t *testing.T) {
 	emitCircuitOpenEvent(cs, "coredns-stale-watchdog", "worker-7",
 		"3 heals in 30m")
 
-	events, err := cs.EventsV1().Events("default").List(context.Background(), metav1.ListOptions{})
+	events, err := cs.EventsV1().Events("default").List(t.Context(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}

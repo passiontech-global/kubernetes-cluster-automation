@@ -6,7 +6,6 @@
 package heal
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -39,7 +38,7 @@ func TestAllowedVPersistedStampDefersBeforeMutex(t *testing.T) {
 	obj := allowedPersistedObj()
 	var ledger state.CooldownSet
 
-	proceed, unverifiable := AllowedVPersisted(context.Background(),
+	proceed, unverifiable := AllowedVPersisted(t.Context(),
 		logr.Discard(), nil, fake.NewSimpleClientset(), nil,
 		&ledger, obj, "passiontech.dev/last-heal", "k", time.Hour, now)
 	if proceed || unverifiable {
@@ -58,7 +57,7 @@ func TestAllowedVPersistedLedgerHalfDefers(t *testing.T) {
 	var ledger state.CooldownSet
 	ledger.Stamp("k", now.Add(-time.Minute))
 
-	proceed, unverifiable := AllowedVPersisted(context.Background(),
+	proceed, unverifiable := AllowedVPersisted(t.Context(),
 		logr.Discard(), nil, fake.NewSimpleClientset(), nil,
 		&ledger, obj, "passiontech.dev/last-heal", "k", time.Hour, now)
 	if proceed || unverifiable {
@@ -77,7 +76,7 @@ func TestAllowedVPersistedNilObjFoldsToAllowedV(t *testing.T) {
 
 	var cooled state.CooldownSet
 	cooled.Stamp("k", now.Add(-time.Minute))
-	if proceed, unver := AllowedVPersisted(context.Background(),
+	if proceed, unver := AllowedVPersisted(t.Context(),
 		logr.Discard(), nil, cs, nil, &cooled, nil,
 		"passiontech.dev/last-heal", "k", time.Hour, now); proceed || unver {
 		t.Fatalf("cooled ledger via nil obj = (%v,%v), want (false,false)",
@@ -85,7 +84,7 @@ func TestAllowedVPersistedNilObjFoldsToAllowedV(t *testing.T) {
 	}
 	// An empty annoKey is the same fold — nothing to read off the
 	// object — even with the object present.
-	if proceed, unver := AllowedVPersisted(context.Background(),
+	if proceed, unver := AllowedVPersisted(t.Context(),
 		logr.Discard(), nil, cs, nil, &cooled, allowedPersistedObj(),
 		"", "k", time.Hour, now); proceed || unver {
 		t.Fatalf("empty annoKey = (%v,%v), want (false,false)",
@@ -94,7 +93,7 @@ func TestAllowedVPersistedNilObjFoldsToAllowedV(t *testing.T) {
 	// Clear ledger: the gate falls through to the mutex, whose nil
 	// dyn evaluation is unverifiable — the AllowedV verdict pair.
 	var fresh state.CooldownSet
-	if proceed, unver := AllowedVPersisted(context.Background(),
+	if proceed, unver := AllowedVPersisted(t.Context(),
 		logr.Discard(), nil, cs, nil, &fresh, nil,
 		"passiontech.dev/last-heal", "k", time.Hour, now); proceed || !unver {
 		t.Fatalf("clear ledger via nil obj = (%v,%v), want (false,true)",
@@ -112,7 +111,7 @@ func TestAllowedVPersistedClearGateProceeds(t *testing.T) {
 		now.Add(-2 * time.Hour).UTC().Format(time.RFC3339)
 	var ledger state.CooldownSet
 
-	proceed, unverifiable := AllowedVPersisted(context.Background(),
+	proceed, unverifiable := AllowedVPersisted(t.Context(),
 		logr.Discard(), &maintenance.Verdict{}, fake.NewSimpleClientset(),
 		testhelp.NewDynamicClient(), &ledger, obj,
 		"passiontech.dev/last-heal", "k", time.Hour, now)

@@ -7,9 +7,9 @@
 package probefw
 
 import (
-	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -235,7 +235,7 @@ func TestPromQuery(t *testing.T) {
 	d := NewDeps("", nil, nil, nil, Config{})
 	d.HTTPClient = srv.Client()
 	d.Prom.HTTP = d.HTTPClient
-	samples, err := d.PromQuery(context.Background(), `up{job="x"}`)
+	samples, err := d.PromQuery(t.Context(), `up{job="x"}`)
 	if err != nil {
 		t.Fatalf("PromQuery: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestPromQueryUnresolvableEndpoint(t *testing.T) {
 	t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", "")
 	d := &Deps{HTTPClient: &http.Client{}, Cfg: Config{
 		HTTPContent: HTTPContentConfig{URL: "no-scheme"}}}
-	if _, err := d.PromQuery(context.Background(), "up"); err == nil {
+	if _, err := d.PromQuery(t.Context(), "up"); err == nil {
 		t.Fatal("PromQuery with unresolvable endpoint = nil error")
 	}
 }
@@ -293,12 +293,12 @@ func TestDeletePodHealDeletesAndStamps(t *testing.T) {
 	d := &Deps{Name: "test-queue", CS: cs, Dyn: testhelp.NewDynamicClient()}
 	now := time.Now()
 
-	d.DeletePodHeal(context.Background(), logr.Discard(),
+	d.DeletePodHeal(t.Context(), logr.Discard(),
 		"mesh-watchdog", "linkerd/linkerd-destination-abc",
 		pod, time.Hour, now)
 
 	if _, err := cs.CoreV1().Pods(pod.Namespace).
-		Get(context.Background(), pod.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		Get(t.Context(), pod.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("pod not deleted (get err = %v)", err)
 	}
 	if _, ok := d.Heals.Last(
@@ -317,12 +317,12 @@ func TestDeletePodHealHonorsCooldown(t *testing.T) {
 	d.Heals.Stamp(SelfHealKey("mesh-watchdog", "linkerd/linkerd-destination-abc"),
 		now.Add(-time.Minute))
 
-	d.DeletePodHeal(context.Background(), logr.Discard(),
+	d.DeletePodHeal(t.Context(), logr.Discard(),
 		"mesh-watchdog", "linkerd/linkerd-destination-abc",
 		pod, time.Hour, now)
 
 	if _, err := cs.CoreV1().Pods(pod.Namespace).
-		Get(context.Background(), pod.Name, metav1.GetOptions{}); err != nil {
+		Get(t.Context(), pod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatalf("pod deleted inside cooldown (get err = %v)", err)
 	}
 }
@@ -334,12 +334,12 @@ func TestDeletePodHealFailsClosedWhenUnverifiable(t *testing.T) {
 	// the heal must defer rather than delete blind.
 	d := &Deps{Name: "test-queue", CS: cs}
 
-	d.DeletePodHeal(context.Background(), logr.Discard(),
+	d.DeletePodHeal(t.Context(), logr.Discard(),
 		"mesh-watchdog", "linkerd/linkerd-destination-abc",
 		pod, time.Hour, time.Now())
 
 	if _, err := cs.CoreV1().Pods(pod.Namespace).
-		Get(context.Background(), pod.Name, metav1.GetOptions{}); err != nil {
+		Get(t.Context(), pod.Name, metav1.GetOptions{}); err != nil {
 		t.Fatalf("pod deleted while mutex unverifiable (get err = %v)", err)
 	}
 }
@@ -354,7 +354,7 @@ func TestDeletePodHealFailedDeleteLeavesNoStamp(t *testing.T) {
 	d := &Deps{Name: "test-queue", CS: cs, Dyn: testhelp.NewDynamicClient()}
 	now := time.Now()
 
-	d.DeletePodHeal(context.Background(), logr.Discard(),
+	d.DeletePodHeal(t.Context(), logr.Discard(),
 		"mesh-watchdog", "linkerd/linkerd-destination-abc",
 		pod, time.Hour, now)
 
@@ -374,23 +374,18 @@ func TestMergeAnnoPatchLocally(t *testing.T) {
 
 	// A merge-patch doc: set two keys, delete one — applied to the
 	// listed copy exactly like the apiserver merge would.
-	MergeAnnoPatchLocally(context.Background(), pod, []byte(
+	MergeAnnoPatchLocally(t.Context(), pod, []byte(
 		`{"metadata":{"annotations":{"new":"v","over":"new","del":null}}}`))
 
 	want := map[string]string{"keep": "1", "new": "v", "over": "new"}
 	got := pod.GetAnnotations()
-	if len(got) != len(want) {
-		t.Fatalf("annotations = %v, want %v", got, want)
-	}
-	for k, v := range want {
-		if got[k] != v {
-			t.Fatalf("annotations[%q] = %q, want %q (all: %v)", k, got[k], v, got)
-		}
+	if !maps.Equal(got, want) {
+		t.Fatalf("annotations = %v, want %v (all: %v)", got, want, got)
 	}
 
 	// A nil annotation map materializes on first write.
 	bare := &corev1.Pod{}
-	MergeAnnoPatchLocally(context.Background(), bare, []byte(
+	MergeAnnoPatchLocally(t.Context(), bare, []byte(
 		`{"metadata":{"annotations":{"k":"v"}}}`))
 	if bare.GetAnnotations()["k"] != "v" {
 		t.Fatalf("nil-map annotations = %v", bare.GetAnnotations())
@@ -399,7 +394,7 @@ func TestMergeAnnoPatchLocally(t *testing.T) {
 	// Malformed payloads are ignored — the input is always
 	// kube.MergePatchAnnos output, but a bad read must never corrupt
 	// the listed copy.
-	MergeAnnoPatchLocally(context.Background(), pod, []byte(`{not json`))
+	MergeAnnoPatchLocally(t.Context(), pod, []byte(`{not json`))
 	if pod.GetAnnotations()["new"] != "v" {
 		t.Fatal("malformed patch mutated the object")
 	}
@@ -434,7 +429,7 @@ func TestWhyFold(t *testing.T) {
 // (clear here) and proceeds. nil obj/empty annoKey collapses to the
 // plain ledger+mutex gate.
 func TestHealAllowedPersisted(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	now := time.Now()
 	log := logr.Discard()
 	newDeps := func(cs *fake.Clientset) *Deps {

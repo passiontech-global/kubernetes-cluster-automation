@@ -857,6 +857,21 @@ func TestEventNoteTruncationStaysValidUTF8(t *testing.T) {
 	if !utf8.ValidString(evs[0].Note) {
 		t.Fatalf("Note is not valid UTF-8: %q", evs[0].Note)
 	}
+
+	// Below the cap too: the scrub is not truncation-gated — a short
+	// garbage line used to store invalid UTF-8 verbatim, fail the
+	// create, and re-emit forever (the syncLogEvents/npd loop).
+	if err := e.r.emitEvent(context.Background(), "Z",
+		"short\xff\xfe garbage line", "Warning"); err != nil {
+		t.Fatalf("emit failed: %v", err)
+	}
+	evs = eventsByReason(t, e, "Z")
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	if !utf8.ValidString(evs[0].Note) {
+		t.Fatalf("short Note is not valid UTF-8: %q", evs[0].Note)
+	}
 }
 
 // --- log-tail mechanics ---

@@ -63,6 +63,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          # Release job holds contents:write + packages:write. Nothing
+          # here runs `git push` (tags are created locally, auth for
+          # gh/docker steps rides GH_TOKEN), so the checkout-scoped
+          # credential in .git/config is dead weight and attack
+          # surface — drop it.
+          persist-credentials: false
 
       - name: Install toolchain (go + git-cliff + ko + moon pinned in mise.toml)
         uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
@@ -128,6 +134,18 @@ jobs:
             grep -Eq "$semver_re" <<<"${1#v}"
           }
 
+          # App-scoped tag pattern for git-cliff. The shared root
+          # cliff.toml carries a broad union pattern, but --bumped-version
+          # echoes the bump in the newest tag matching the pattern — with
+          # the union that could be ANOTHER app's tag reachable in the
+          # range, deriving this app's version from a foreign number.
+          # Override per app (legacy_v_tags also admits bare "vX.Y.Z").
+          if [ "$LEGACY_V_TAGS" = "true" ]; then
+            tag_pat="^($APP/)?v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$"
+          else
+            tag_pat="^$APP/v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$"
+          fi
+
           if [ -n "$version_in" ]; then
             # Accept both "v0.1.0" and "<app>/v0.1.0" spellings.
             rel_version="${version_in##*/}"
@@ -141,7 +159,8 @@ jobs:
             # created on a multi-commit push whose HEAD did not touch
             # apps/$APP/** is never filtered out by --include-path.
             bumped=$(git-cliff --bumped-version \
-              --config "apps/$APP/cliff.toml" \
+              --config "cliff.toml" \
+              --tag-pattern "$tag_pat" \
               --include-path "apps/$APP/**" \
               "${lib_path_args[@]}" \
               "$last_tag..HEAD")
@@ -225,7 +244,8 @@ jobs:
           fi
 
           git-cliff --unreleased --tag "$rel_tag" \
-            --config "apps/$APP/cliff.toml" \
+            --config "cliff.toml" \
+            --tag-pattern "$tag_pat" \
             --include-path "apps/$APP/**" \
             "${lib_path_args[@]}" \
             "$last_tag..HEAD" > changelog.md

@@ -611,7 +611,7 @@ func TestCiliumIdentityAuditorActiveIdentitiesGauge(t *testing.T) {
 	if err := a.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := promtestutil.ToFloat64(ciliumActiveIdentities); got != 2 {
+	if got := promtestutil.ToFloat64(metrics.CiliumActiveIdentities); got != 2 {
 		t.Fatalf("active identities gauge = %v, want 2", got)
 	}
 }
@@ -675,7 +675,7 @@ func TestCiliumIdentityAuditorHighCardinalityWarn(t *testing.T) {
 	if err := a.run(lctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := promtestutil.ToFloat64(ciliumActiveIdentities); got != ciliumActiveIdentityWarn+1 {
+	if got := promtestutil.ToFloat64(metrics.CiliumActiveIdentities); got != ciliumActiveIdentityWarn+1 {
 		t.Fatalf("active identities gauge = %v, want %d", got, ciliumActiveIdentityWarn+1)
 	}
 	joined := strings.Join(logs, "\n")

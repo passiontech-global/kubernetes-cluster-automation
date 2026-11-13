@@ -44,8 +44,9 @@ type workspacePVCRef struct {
 // tekton.dev/taskRun, shipwright.io/buildRun and
 // buildrun.shipwright.io/name labels (the two Shipwright spellings
 // both appear in the wild — the annotation-style label is what the
-// controller stamps on generated resources).
-func workspacePVCRefs(pvc *corev1.PersistentVolumeClaim) []workspacePVCRef {
+// controller stamps on generated resources). All of it is ObjectMeta,
+// so the census's PartialObjectMetadata objects feed it directly.
+func workspacePVCRefs(pvc *metav1.PartialObjectMetadata) []workspacePVCRef {
 	var refs []workspacePVCRef
 	seen := map[workspacePVCRef]bool{}
 	add := func(kind, name string) {
@@ -141,30 +142,36 @@ func (j *failedJobsJanitor) runRefDone(ctx context.Context, ns string,
 // pvc-protection finalizer a pre-provisioned claim does.
 func (j *failedJobsJanitor) claimedPVCNames(ctx context.Context,
 	ns string) (map[string]bool, error) {
-	pods, err := kube.ListAll(ctx,
+	claims := map[string]bool{}
+	// Streamed pages — the scan only accumulates claim names, so each
+	// page's pod bodies die with the page (needs Spec.Volumes +
+	// Status.Phase, so metadata lists cannot serve it).
+	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Pods(j.cs, ns))
+		kube.Pods(j.cs, ns),
+		func(page []corev1.Pod) error {
+			for i := range page {
+				p := &page[i]
+				if p.Status.Phase == corev1.PodSucceeded ||
+					p.Status.Phase == corev1.PodFailed {
+					continue
+				}
+				for _, v := range p.Spec.Volumes {
+					switch {
+					case v.PersistentVolumeClaim != nil:
+						claims[v.PersistentVolumeClaim.ClaimName] = true
+					case v.Ephemeral != nil:
+						// The ephemeral controller names the claim
+						// <pod>-<volume>; treating it as unclaimed could strip
+						// its protection finalizer while the pod still mounts it.
+						claims[p.Name+"-"+v.Name] = true
+					}
+				}
+			}
+			return nil
+		})
 	if err != nil {
 		return nil, err
-	}
-	claims := map[string]bool{}
-	for i := range pods {
-		p := &pods[i]
-		if p.Status.Phase == corev1.PodSucceeded ||
-			p.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		for _, v := range p.Spec.Volumes {
-			switch {
-			case v.PersistentVolumeClaim != nil:
-				claims[v.PersistentVolumeClaim.ClaimName] = true
-			case v.Ephemeral != nil:
-				// The ephemeral controller names the claim
-				// <pod>-<volume>; treating it as unclaimed could strip
-				// its protection finalizer while the pod still mounts it.
-				claims[p.Name+"-"+v.Name] = true
-			}
-		}
 	}
 	return claims, nil
 }

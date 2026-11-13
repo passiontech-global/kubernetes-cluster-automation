@@ -278,37 +278,29 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 				rep.InfraErr(fmt.Errorf("taint %s: %w", n.Name, err))
 				continue
 			}
+			// The mutation landed — stamp the fence cooldown so a
+			// restart (or the next sweep's HealAllowed) honors the
+			// window this grant already spent.
+			c.Heals.Stamp(CheckNameApiserverNodeReachability+"/fence/"+n.Name, now)
 			c.InvalidateNodes(ctx) // taint census is stale — next sweep must see it
 			rep.Find("ACTION: fenced apiserver-dark node " + n.Name)
 			log.Info("ACTION: fenced apiserver-dark node",
 				"node", n.Name, "taint", kube.TaintApiserverUnreachable)
 		} else if hasTaint && !wasDark {
-			// Same gate for the restorative untaint — a recovered
-			// node's fence release is still a node mutation.
-			if allowed, reason := heal.TryAcquireTarget(
-				CheckNameApiserverNodeReachability, n.Name, now); !allowed {
-				log.Info("DEFER: heal target circuit open — unfence skipped",
-					"node", n.Name, "reason", reason)
-				continue
-			}
-			proceed, unverifiable := c.HealAllowed(ctx, log, &c.Heals,
-				CheckNameApiserverNodeReachability+"/unfence/"+n.Name,
-				darkHealCool, now)
-			if unverifiable {
-				rep.InfraErr(fmt.Errorf(
-					"maintenance verdict unverifiable — unfence %s deferred", n.Name))
-				continue
-			}
-			if !proceed {
-				log.Info("heal gate deferred apiserver-dark unfence",
-					"node", n.Name)
-				continue
-			}
+			// Recovery is not a mutation budget item: the LIVE probe
+			// just proved reachability, so the untaint is bookkeeping
+			// against evidence, not a speculative heal. Spending
+			// TryAcquireTarget/HealAllowed here burned breaker credit
+			// on healthy nodes — three recoveries inside an hour
+			// locked the target circuit for 2h with the fence still
+			// on. Untaint directly; RecordTargetHealthy then clears
+			// any residual breaker history the dark episode left.
 			if err := kube.UntaintNode(ctx, c.Deps.CS, n.Name,
 				kube.TaintApiserverUnreachable); err != nil {
 				rep.InfraErr(fmt.Errorf("untaint %s: %w", n.Name, err))
 				continue
 			}
+			heal.RecordTargetHealthy(CheckNameApiserverNodeReachability, n.Name)
 			c.InvalidateNodes(ctx) // untaint census is stale too
 			// Recovery is NOT an action finding — rep.Find would
 			// report the sweep as flagged on the very sweep the
@@ -349,14 +341,12 @@ func (c *apiserverNodeReachabilityCheck) probeAll(ctx context.Context,
 	jobs := make(chan string)
 	results := make(chan result, len(candidates))
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range workers {
+		wg.Go(func() {
 			for name := range jobs {
 				results <- result{node: name, ok: c.probeSafe(ctx, name)}
 			}
-		}()
+		})
 	}
 	go func() {
 		for i := range candidates {

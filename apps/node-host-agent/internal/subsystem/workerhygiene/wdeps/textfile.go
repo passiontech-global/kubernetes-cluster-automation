@@ -233,7 +233,7 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 		"Unused dentries in the kernel dentry slab (/proc/sys/fs/dentry-state nr_unused) — negative-dentry pressure.",
 		float64(d.Series.DentryUnusedCount))
 	b.Gauge("node_agent_ctr_meta_probe_latency_seconds",
-		"Wall time of the lightweight `k0s ctr namespaces ls -q` metadata probe — bbolt freelist fragmentation shows up here first.",
+		"Wall time of the lightweight containerd UNIX-socket metadata probe — bbolt freelist fragmentation shows up here first.",
 		d.Series.CtrMetaProbeLatencySec)
 	// kernel-net-shim-hygiene series — kernel socket/softnet drop
 	// counters (raw accumulating values straight out of /proc) and

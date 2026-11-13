@@ -197,9 +197,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	results := make(chan probeVerdict, len(probeKeys))
 	var wg sync.WaitGroup
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for key := range jobs {
 				ok := false
 				for _, ip := range ready.ProbeIPs[key] {
@@ -216,7 +214,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 				}
 				results <- probeVerdict{key: key, responsive: ok}
 			}
-		}()
+		})
 	}
 	for _, key := range probeKeys {
 		jobs <- key

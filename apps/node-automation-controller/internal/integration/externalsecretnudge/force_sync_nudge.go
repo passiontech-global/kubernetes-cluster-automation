@@ -53,6 +53,15 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	// reaper share it, and it must not outlive the pass (a Secret
 	// written between passes must be re-read).
 	n.secretReads = map[string]secretRead{}
+	// Release the per-pass caches when the pass ends — secretIndex
+	// holds the whole Secret metadata census of every ES namespace,
+	// pinned for the full 10-minute idle window otherwise. Deferred
+	// so an early CRD-removal/error return releases them too.
+	defer func() {
+		n.secretReads = nil
+		n.secretIndex = nil
+		n.secretIndexOK = nil
+	}()
 	list, esGVR, err := n.listES(ctx)
 	if err != nil {
 		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {

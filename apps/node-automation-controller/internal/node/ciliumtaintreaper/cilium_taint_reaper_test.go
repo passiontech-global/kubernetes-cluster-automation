@@ -19,7 +19,7 @@ import (
 )
 
 var ciliumStaleTaint = corev1.Taint{
-	Key:    ciliumNotReadyTaint,
+	Key:    kube.TaintCiliumAgentNotReady,
 	Effect: corev1.TaintEffectNoSchedule,
 }
 
@@ -36,10 +36,10 @@ func TestCiliumTaintReaperNoPodKeepsTaint(t *testing.T) {
 	// from the DaemonSet, node draining, ...) — never reap blind.
 	cs, r := reaperClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint))
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("taint removed with no cilium pod on the node")
 	}
 }
@@ -50,10 +50,10 @@ func TestCiliumTaintReaperUnreadyPodKeepsTaint(t *testing.T) {
 	pod.Status.Conditions[0].Status = corev1.ConditionFalse
 	cs, r := reaperClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint), pod)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("taint removed while agent Ready=False")
 	}
 }
@@ -66,10 +66,10 @@ func TestCiliumTaintReaperTerminatingPodKeepsTaint(t *testing.T) {
 	pod.DeletionTimestamp = &now
 	cs, r := reaperClientset(
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint), pod)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("taint removed while agent is terminating")
 	}
 }
@@ -90,13 +90,13 @@ func TestCiliumTaintReaperSweepsWholeCluster(t *testing.T) {
 		testutil.Node("n2", corev1.ConditionTrue, nil, ciliumStaleTaint),
 		testutil.Node("n3", corev1.ConditionTrue, nil),
 		healthy, unready)
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("n1: stale taint not reaped despite healthy agent")
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "n2").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n2").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("n2: taint removed while its agent is unready")
 	}
 	if got := testutil.GetNode(t, cs, "n3").Spec.Taints; len(got) != 0 {
@@ -118,10 +118,10 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		cs, r := reaperClientset(
 			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 			unready, healthy)
-		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
-		if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 			t.Fatal("taint kept though a healthy agent runs on the node")
 		}
 	})
@@ -136,10 +136,10 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		cs, r := reaperClientset(
 			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 			terminating, healthy)
-		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
-		if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 			t.Fatal("taint kept though a healthy agent runs on the node")
 		}
 	})
@@ -153,10 +153,10 @@ func TestCiliumTaintReaperAnyHealthyPodReaps(t *testing.T) {
 		cs, r := reaperClientset(
 			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 			a, b)
-		if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 			t.Fatal(err)
 		}
-		if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+		if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 			t.Fatal("taint removed with no healthy agent on the node")
 		}
 	})
@@ -170,10 +170,10 @@ func TestCiliumTaintReaperPodOnOtherNodeDoesNotCount(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
 		testutil.Node("n2", corev1.ConditionTrue, nil),
 		ciliumPod("n2", corev1.PodRunning, true))
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("taint reaped by a cilium pod on a different node")
 	}
 }
@@ -188,10 +188,10 @@ func TestCiliumTaintReaperPodListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &ciliumTaintReaper{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the cilium pod list fails")
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("taint removed despite the failed pod list")
 	}
 }
@@ -200,7 +200,7 @@ func TestCiliumTaintReaperPodListError(t *testing.T) {
 // entries, in order, duplicates included.
 func TestCiliumStaleTaints(t *testing.T) {
 	other := corev1.Taint{Key: "dedicated", Value: "db", Effect: corev1.TaintEffectNoSchedule}
-	dup := corev1.Taint{Key: ciliumNotReadyTaint, Effect: corev1.TaintEffectNoExecute}
+	dup := corev1.Taint{Key: kube.TaintCiliumAgentNotReady, Effect: corev1.TaintEffectNoExecute}
 
 	// No cilium taint -> empty projection (unrelated taints don't count).
 	plain := testutil.Node("n1", corev1.ConditionTrue, nil, other)
@@ -211,7 +211,7 @@ func TestCiliumStaleTaints(t *testing.T) {
 	// One cilium taint + an unrelated one -> exactly the cilium entry.
 	mixed := testutil.Node("n2", corev1.ConditionTrue, nil, ciliumStaleTaint, other)
 	got := ciliumStaleTaints(mixed)
-	if len(got) != 1 || got[0].Key != ciliumNotReadyTaint {
+	if len(got) != 1 || got[0].Key != kube.TaintCiliumAgentNotReady {
 		t.Fatalf("expected only the cilium taint, got %+v", got)
 	}
 
@@ -233,7 +233,7 @@ func TestCiliumTaintReaperNodeListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &ciliumTaintReaper{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -249,10 +249,10 @@ func TestCiliumTaintReaperUntaintError(t *testing.T) {
 			return true, nil, errors.New("patch rejected")
 		})
 	r := &ciliumTaintReaper{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the untaint patch fails")
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("taint removed despite the rejected patch")
 	}
 }
@@ -297,9 +297,14 @@ func (s *stubPodReader) List(_ context.Context, list client.ObjectList, opts ...
 func TestCiliumTaintReaperPodReadViaInformerCache(t *testing.T) {
 	healthy := *ciliumPod("n1", corev1.PodRunning, true)
 	cs := fake.NewSimpleClientset(
-		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint))
-	// The direct path must never be consulted while the cache seam is
-	// wired: any pod list against the clientset is a bug.
+		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
+		&healthy)
+	// The verdict's pod CENSUS must never ride a direct pod LIST while
+	// the cache seam is wired — any pod list against the clientset is
+	// a bug. The one sanctioned direct read is the pre-untaint
+	// confirmation GET (live UID + health re-check on the clientset
+	// the destructive write uses), which this fixture serves from the
+	// tracker.
 	cs.PrependReactor("list", "pods",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("direct pod list must not run when the cache seam is wired")
@@ -307,7 +312,7 @@ func TestCiliumTaintReaperPodReadViaInformerCache(t *testing.T) {
 	pr := &stubPodReader{pods: []corev1.Pod{healthy}}
 	r := &ciliumTaintReaper{cs: cs, podReader: pr}
 
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if pr.lists != 1 {
@@ -319,7 +324,7 @@ func TestCiliumTaintReaperPodReadViaInformerCache(t *testing.T) {
 	}
 	// The destructive write went through the direct clientset: the
 	// stale taint is gone from the fake's node.
-	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("stale taint not reaped through the direct clientset")
 	}
 }
@@ -332,10 +337,62 @@ func TestCiliumTaintReaperCachePodError(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint))
 	r := &ciliumTaintReaper{cs: cs,
 		podReader: &stubPodReader{err: errors.New("cache boom")}}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the informer-cache pod read fails")
 	}
-	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, ciliumNotReadyTaint) {
+	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
 		t.Fatal("taint must survive a failed pod read")
 	}
+}
+
+// The TOCTOU guard: the cache verdict can lag the apiserver (the
+// Node and Pod watches are independent — a mid-rollout pod
+// replacement lands in one before the other), so the live
+// pre-untaint GET is the final word. A cached healthy pod whose live
+// counterpart vanished, was replaced (UID moved), or is terminating
+// must NOT reap the taint — the next sweep re-evaluates on fresher
+// cache.
+func TestCiliumTaintReaperLiveDivergenceKeepsTaint(t *testing.T) {
+	cached := *ciliumPod("n1", corev1.PodRunning, true)
+	cached.UID = "uid-cache"
+
+	run := func(t *testing.T, live ...runtime.Object) *fake.Clientset {
+		t.Helper()
+		cs := fake.NewSimpleClientset(append([]runtime.Object{
+			testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
+		}, live...)...)
+		r := &ciliumTaintReaper{cs: cs,
+			podReader: &stubPodReader{pods: []corev1.Pod{cached}}}
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		return cs
+	}
+
+	t.Run("live pod gone", func(t *testing.T) {
+		cs := run(t)
+		if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
+			t.Fatal("taint reaped from a cache entry whose live pod is gone")
+		}
+	})
+
+	t.Run("live pod replaced — UID moved", func(t *testing.T) {
+		live := *ciliumPod("n1", corev1.PodRunning, true)
+		live.UID = "uid-live"
+		cs := run(t, &live)
+		if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
+			t.Fatal("taint reaped though the live GET resolved a different pod")
+		}
+	})
+
+	t.Run("live pod terminating", func(t *testing.T) {
+		live := *ciliumPod("n1", corev1.PodRunning, true)
+		live.UID = "uid-cache"
+		now := metav1.Now()
+		live.DeletionTimestamp = &now
+		cs := run(t, &live)
+		if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
+			t.Fatal("taint reaped though the live agent is terminating")
+		}
+	})
 }

@@ -1,7 +1,6 @@
 package kube
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -61,13 +60,13 @@ func TestCountRecentEvents(t *testing.T) {
 		fresh("other", "ev-5", "Preempted"))
 	// ev-4's last observed hit is stale — outside the window.
 	stale, _ := cs.CoreV1().Events("apps").Get(
-		context.Background(), "ev-4", metav1.GetOptions{})
+		t.Context(), "ev-4", metav1.GetOptions{})
 	stale.LastTimestamp = metav1.NewTime(now.Add(-30 * time.Minute))
 	if _, err := cs.CoreV1().Events("apps").Update(
-		context.Background(), stale, metav1.UpdateOptions{}); err != nil {
+		t.Context(), stale, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := CountRecentEvents(context.Background(), cs,
+	got, err := CountRecentEvents(t.Context(), cs,
 		"Preempted", 5*time.Minute, now)
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +89,7 @@ func TestCountRecentEventsSkipsFutureTimestamp(t *testing.T) {
 		LastTimestamp: metav1.NewTime(now.Add(time.Hour)),
 	}
 	cs := fake.NewSimpleClientset(future)
-	got, err := CountRecentEvents(context.Background(), cs,
+	got, err := CountRecentEvents(t.Context(), cs,
 		"Preempted", 5*time.Minute, now)
 	if err != nil {
 		t.Fatal(err)

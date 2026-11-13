@@ -145,7 +145,7 @@ func parseDNSEntry(entry string) (DNSEntry, bool) {
 		port = "443"
 	}
 	var ips []string
-	for _, c := range strings.Split(cands, ",") {
+	for c := range strings.SplitSeq(cands, ",") {
 		if c = strings.TrimSpace(c); c != "" {
 			ips = append(ips, c)
 		}

@@ -43,8 +43,8 @@ func Sockstat(int) (SockstatV4, SockstatV6, error) {
 	return SockstatV4{}, SockstatV6{}, errNotLinux
 }
 
-// TCPStates refuses off Linux.
-func TCPStates(int) (map[uint8]int, error) { return nil, errNotLinux }
+// TCPTables refuses off Linux.
+func TCPTables(int) (TCPCensus, error) { return TCPCensus{}, errNotLinux }
 
 // DestroyListenersOnPort refuses off Linux.
 func DestroyListenersOnPort(int, uint16) (int, error) { return 0, errNotLinux }

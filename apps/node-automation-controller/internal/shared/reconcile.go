@@ -8,6 +8,7 @@ package shared
 
 import (
 	"context"
+	"fmt"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -30,9 +31,24 @@ type countedReconciler struct {
 
 // Reconcile runs fn and owns the returned-error accounting exactly
 // the way Periodic.Start does: one IncError per non-nil error
-// return.
-func (r countedReconciler) Reconcile(ctx context.Context, req reconcile.Request) (ctrl.Result, error) {
-	res, err := r.fn(ctx, req)
+// return. A panic inside fn folds into the same accounting —
+// controller-runtime does NOT recover Reconcile panics by default
+// (builder.RecoverPanic is opt-in and none of the watch reconcilers
+// set it), so one module's nil dereference would take down the
+// whole 32-module process. Same posture as Periodic.runOnce: panic →
+// plain run error + IncError, never propagate; no stack captured —
+// the queue counter + the reconciler-error log already attribute
+// the failure. Returning the error (not swallowing it) keeps the
+// workqueue's exponential backoff alive, so a panicking reconcile
+// retries instead of silently dropping the key.
+func (r countedReconciler) Reconcile(ctx context.Context, req reconcile.Request) (res ctrl.Result, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			metrics.IncError(r.queue)
+			res, err = ctrl.Result{}, fmt.Errorf("panic in reconcile: %v", recovered)
+		}
+	}()
+	res, err = r.fn(ctx, req)
 	if err != nil {
 		metrics.IncError(r.queue)
 	}

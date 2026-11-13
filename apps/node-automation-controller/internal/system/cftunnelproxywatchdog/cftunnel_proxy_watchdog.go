@@ -251,6 +251,11 @@ func (w *cfTunnelProxyWatchdog) run(ctx context.Context) error {
 	// (see podCensus); rebuilt here so last sweep's deletes and
 	// creations never leak into this pass's verdicts.
 	w.podCensus = &podCensus{lists: map[string]nsPodList{}}
+	// Release it when the sweep ends: the census holds every listed
+	// pod of every watched namespace, and between cycles (nil
+	// census) podsInNS lazily re-arms — holding the lists for the
+	// whole idle window pinned memory nothing reads.
+	defer func() { w.podCensus = nil }()
 	resynced, err := w.resyncUnreadyProxies(ctx)
 	if err != nil {
 		return err

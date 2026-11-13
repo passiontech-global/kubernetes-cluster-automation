@@ -9,10 +9,8 @@ import (
 	"strings"
 	"time"
 
-	policyv1 "k8s.io/api/policy/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kubeutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -49,7 +47,7 @@ func psiMemoryFullAvg60(d *wdeps.Deps) (float64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 3 || f[0] != "full" {
 			continue
@@ -90,7 +88,7 @@ func readMeminfo(d *wdeps.Deps) memInfo {
 	}
 	var total, avail, slab, slabRec, pageTables int64
 	var sawTotal, sawAvail bool
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 2 {
 			continue
@@ -264,7 +262,7 @@ func podCgroupRel(d *wdeps.Deps, pid int, uid string) string {
 		return ""
 	}
 	want := "pod" + strings.ReplaceAll(uid, "-", "_")
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if !strings.HasPrefix(line, "0::") {
 			continue
 		}
@@ -408,13 +406,10 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// parity). policy/v1 Eviction — NOT a raw pod delete: the
 	// apiserver enforces the victim's PodDisruptionBudget
 	// atomically, so a PDB-protected pod is refused instead of
-	// silently disrupted.
-	ev := &policyv1.Eviction{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      victim.Name,
-			Namespace: victim.Namespace,
-		},
-	}
+	// silently disrupted. The UID precondition closes the
+	// listing→evict race: a same-name pod is a different object and
+	// the apiserver refuses (kubeutil.EvictPodV1).
+	ev := kubeutil.EvictPodV1(victim)
 	c.d.State.AppendLog(fmt.Sprintf(
 		"ACTION: psi-memory-thrash evicted pod %s/%s - mem=%d bytes, psi_full_avg60=%.1f mem_free=%.3f",
 		victim.Namespace, victim.Name, mem, avg60, free))

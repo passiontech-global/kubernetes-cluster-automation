@@ -55,16 +55,26 @@ func (b *dbusBackend) dbusJob(ctx context.Context, unit, method string) error {
 	// cancels Conn.Context() on Close or transport loss — and drop
 	// the stored conn so the next call rebuilds instead of waiting
 	// on signals a dead conn can never deliver.
+	//
+	// done closes when dbusJob returns (job landed, ctx cancelled or
+	// transport death observed) — the watcher goroutines select on it
+	// so a LIVE connection does not leave one parked goroutine per
+	// job watching a transport that never dies.
 	transportDead := make(chan struct{}, 1)
+	done := make(chan struct{})
+	defer close(done)
 	for _, raw := range []*godbus.Conn{rawSys, rawSig} {
 		if raw == nil {
 			continue
 		}
 		go func(c *godbus.Conn) {
-			<-c.Context().Done()
 			select {
-			case transportDead <- struct{}{}:
-			default:
+			case <-c.Context().Done():
+				select {
+				case transportDead <- struct{}{}:
+				default:
+				}
+			case <-done:
 			}
 		}(raw)
 	}

@@ -135,7 +135,7 @@ func parseShowPools(out, dbName string) (poolStats, bool) {
 	var hdr map[string]int
 	var st poolStats
 	seen := false
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

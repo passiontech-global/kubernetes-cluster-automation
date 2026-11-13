@@ -68,7 +68,7 @@ func renewRec() resourcelock.LeaderElectionRecord {
 func TestReleaseGuardSkipsForeignHolder(t *testing.T) {
 	inner := &fakeLock{holder: "pod-b_5678"}
 	l := &releaseGuardedLock{Interface: inner}
-	if err := l.Update(context.Background(), releaseRec()); err != nil {
+	if err := l.Update(t.Context(), releaseRec()); err != nil {
 		t.Fatalf("guarded release returned error: %v", err)
 	}
 	if len(inner.updates) != 0 {
@@ -79,7 +79,7 @@ func TestReleaseGuardSkipsForeignHolder(t *testing.T) {
 func TestReleaseGuardAllowsOwnHolder(t *testing.T) {
 	inner := &fakeLock{holder: "pod-a_1234"}
 	l := &releaseGuardedLock{Interface: inner}
-	if err := l.Update(context.Background(), releaseRec()); err != nil {
+	if err := l.Update(t.Context(), releaseRec()); err != nil {
 		t.Fatalf("guarded release returned error: %v", err)
 	}
 	if len(inner.updates) != 1 {
@@ -90,7 +90,7 @@ func TestReleaseGuardAllowsOwnHolder(t *testing.T) {
 func TestReleaseGuardAllowsFreeLease(t *testing.T) {
 	inner := &fakeLock{holder: ""}
 	l := &releaseGuardedLock{Interface: inner}
-	if err := l.Update(context.Background(), releaseRec()); err != nil {
+	if err := l.Update(t.Context(), releaseRec()); err != nil {
 		t.Fatalf("guarded release on free lease returned error: %v", err)
 	}
 	if len(inner.updates) != 1 {
@@ -104,7 +104,7 @@ func TestReleaseGuardNeverTouchesRenew(t *testing.T) {
 	// pass through untouched).
 	inner := &fakeLock{holder: "pod-b_5678"}
 	l := &releaseGuardedLock{Interface: inner}
-	if err := l.Update(context.Background(), renewRec()); err != nil {
+	if err := l.Update(t.Context(), renewRec()); err != nil {
 		t.Fatalf("renew returned error: %v", err)
 	}
 	if len(inner.updates) != 1 {

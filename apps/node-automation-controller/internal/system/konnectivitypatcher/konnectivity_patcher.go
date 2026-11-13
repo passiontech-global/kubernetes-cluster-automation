@@ -63,10 +63,7 @@ var onlyKonnectivityDaemonSet = pinnedworkload.OnlyNamespacedName("kube-system",
 // setupModules into Disabled and this Setup needs no change.
 func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
-		r := &konnectivityPatcher{cs: d.CS}
-		if d.Mgr != nil {
-			r.reader = d.Mgr.GetClient()
-		}
+		r := &konnectivityPatcher{cs: d.CS, reader: d.CachedClient()}
 		// CountReconcile owns the returned-error accounting — one
 		// IncError per non-nil Reconcile return; the reconcile body
 		// never IncErrors an error it returns.

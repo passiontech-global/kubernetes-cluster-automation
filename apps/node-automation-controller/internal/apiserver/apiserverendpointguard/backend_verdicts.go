@@ -192,13 +192,11 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 	probed := make([]apiProbeResult, len(allIPs))
 	var wg sync.WaitGroup
 	for i, ip := range allIPs {
-		wg.Add(1)
-		go func(i int, ip string) {
-			defer wg.Done()
+		wg.Go(func() {
 			probeCtx, cancel := context.WithTimeout(ctx, endpointGuardProbeBudget)
 			defer cancel()
 			probed[i] = g.probeFn(probeCtx, ip)
-		}(i, ip)
+		})
 	}
 	wg.Wait()
 

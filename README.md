@@ -21,9 +21,9 @@ one app in this workspace, alongside the per-node host agent.
 ```
 .moon/                       moon workspace config + shared tasks
 apps/
-  node-automation-controller/  moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
-  node-host-agent/             moon project (own go.mod, cliff.toml, Dockerfile)
-  webhook-dispatcher/          moon project (own go.mod, cliff.toml, .ko.yaml, Dockerfile)
+  node-automation-controller/  moon project (own go.mod, .ko.yaml, Dockerfile)
+  node-host-agent/             moon project (own go.mod, Dockerfile)
+  webhook-dispatcher/          moon project (own go.mod, .ko.yaml, Dockerfile)
 libs/
   hostkit/                   shared leaf module (stdlib-only): envx, envdoc,
                              ledger, nodecond, fsx, httpx (+pprofx), logx, timex

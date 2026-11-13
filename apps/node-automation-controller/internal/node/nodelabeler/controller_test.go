@@ -1,7 +1,6 @@
 package nodelabeler
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,7 +27,7 @@ func TestNodeLabeler(t *testing.T) {
 			map[string]string{"node-role.kubernetes.io/worker": ""}),
 	)
 	r := &nodeLabeler{cs: cs, configPath: cfg}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 

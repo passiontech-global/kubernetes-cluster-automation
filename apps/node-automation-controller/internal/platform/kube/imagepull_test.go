@@ -5,7 +5,6 @@
 package kube
 
 import (
-	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -81,7 +80,7 @@ func TestCountImagePullStalledPods(t *testing.T) {
 		pullStalledPod("db", "healthy", "CrashLoopBackOff", ""),
 		pullStalledPod("kube-system", "fine", "", ""),
 	)
-	pods, namespaces, err := CountImagePullStalledPods(context.Background(), cs)
+	pods, namespaces, err := CountImagePullStalledPods(t.Context(), cs)
 	if err != nil {
 		t.Fatal(err)
 	}

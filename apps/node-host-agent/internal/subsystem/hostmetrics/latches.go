@@ -202,7 +202,7 @@ func (c *Collector) kernelKeysUsedRatio() (float64, bool) {
 	}
 	best := -1.0
 	seen := false
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		// uid: usage nkeys/nikeys qnkeys/maxkeys qnbytes/maxbytes —
 		// a real row always carries all five columns.

@@ -1,7 +1,6 @@
 package ciliumtaintreaper
 
 import (
-	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -24,7 +23,7 @@ func TestCiliumTaintReaper(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil, stale),
 		ciliumPod("n1", corev1.PodRunning, true))
 	r := &ciliumTaintReaper{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, stale.Key) {
@@ -36,7 +35,7 @@ func TestCiliumTaintReaper(t *testing.T) {
 		testutil.Node("n1", corev1.ConditionTrue, nil, stale),
 		ciliumPod("n1", corev1.PodPending, false))
 	r = &ciliumTaintReaper{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, stale.Key) {

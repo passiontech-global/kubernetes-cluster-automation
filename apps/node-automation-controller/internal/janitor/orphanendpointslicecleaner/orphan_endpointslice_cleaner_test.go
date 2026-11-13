@@ -9,6 +9,7 @@ import (
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -252,6 +253,48 @@ func TestOrphanEndpointSliceDeleteUIDPrecondition(t *testing.T) {
 	}
 	if oescSliceExists(t, cs, "apps", "gone-abc") {
 		t.Fatal("orphan slice not reaped")
+	}
+}
+
+// A benign delete race is not a run error: NotFound (the vetted
+// slice was already gone) and Conflict (the UID precondition caught
+// a same-named slice recreated between the census and the delete)
+// both mean the object we vetted is no longer on the cluster — the
+// sweep stays green, IncError stays silent, and the cleaned counter
+// does not credit a delete we did not deliver.
+func TestOrphanEndpointSliceBenignDeleteRaces(t *testing.T) {
+	for name, delErr := range map[string]error{
+		"notFound": apierrors.NewNotFound(
+			discoveryv1.Resource("endpointslices"), "gone-abc"),
+		"conflict": apierrors.NewConflict(
+			discoveryv1.Resource("endpointslices"), "gone-abc",
+			errors.New("object was modified")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			testutil.CleanupMetric(t, metrics.OrphanEndpointSlicesCleanedTotal, "apps")
+			slice := oescSlice("apps", "gone-abc", "gone", 30*time.Minute)
+			cs := fake.NewSimpleClientset(
+				oescService("default", "kubernetes"), slice)
+			cs.PrependReactor("delete", "endpointslices",
+				func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, delErr
+				})
+			c := oescCleaner(cs)
+			c.queue = "orphan-endpointslice-cleaner" // the IncError label the assertion reads
+			before := testutil.QueueErrorCount(t, c.queue)
+			for range 2 {
+				if err := c.run(ctx); err != nil {
+					t.Fatalf("benign race must not fail the run: %v", err)
+				}
+			}
+			if got := testutil.QueueErrorCount(t, c.queue); got != before {
+				t.Fatalf("benign delete race IncError'd: delta %v", got-before)
+			}
+			if got := ptestutil.ToFloat64(
+				metrics.OrphanEndpointSlicesCleanedTotal.WithLabelValues("apps")); got != 0 {
+				t.Fatalf("cleaned counter = %v on a refused delete, want 0", got)
+			}
+		})
 	}
 }
 

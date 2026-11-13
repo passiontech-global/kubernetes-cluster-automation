@@ -263,6 +263,32 @@ func (t *Tracker) Fails() int {
 // state (tests/debug — the on-disk latch is the caller's business).
 func (t *Tracker) Latched() bool { return t.latched }
 
+// SinceLayout is the journalctl --since wall-clock timestamp format —
+// the "2006-01-02 15:04:05" contract the unit-window readers share
+// (systemd.Client.Journal callers and the hygiene deps'
+// journalRead both stamp through it).
+const SinceLayout = "2006-01-02 15:04:05"
+
+// UnitWindowArgv builds the unit-journal window read —
+// `journalctl -u <unit> --since <since> --no-pager` — the ONE argv
+// shape behind every unit-scoped signature grep (platform/systemd's
+// Client.Journal, controllerhygiene's journalRead). The transport
+// must fold stderr into the output (combined capture): the
+// "No journal files" notice this package classifies is a journald
+// diagnostic on stderr, not journal content.
+func UnitWindowArgv(unit, since string) []string {
+	return []string{"journalctl", "-u", unit, "--since", since, "--no-pager"}
+}
+
+// AnyLineArgv is the unfiltered second probe — `journalctl -n 1
+// --no-pager` — that disambiguates a quiet unit window from
+// journald-level blindness (ClassifyRead's empty branch): journald
+// answering ANY line means the unit was merely quiet. Same
+// combined-capture requirement as UnitWindowArgv.
+func AnyLineArgv() []string {
+	return []string{"journalctl", "-n", "1", "--no-pager"}
+}
+
 // FilesGone reports whether journalctl output carries its
 // "No journal files were found." notice — journald cannot open the
 // journal storage although journalctl itself ran. On a read that

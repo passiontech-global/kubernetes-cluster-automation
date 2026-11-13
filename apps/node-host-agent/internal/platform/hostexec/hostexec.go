@@ -435,15 +435,21 @@ func Run(ctx context.Context, argv []string, stdin string) (stdout, stderr strin
 // the inherited environment — the way a secret (PGPASSWORD) reaches
 // `docker exec -e PGPASSWORD` without ever appearing on the child's
 // argv, where /proc/<pid>/cmdline would expose it to every process
-// on the host.
+// on the host. The composed environ is scrubbed of the sd_notify
+// variables (ScrubSystemdEnv): a child that inherits NOTIFY_SOCKET
+// on a standalone host sd_notifies back into OUR unit (systemd>=255
+// auto-sends EXIT_STATUS on exec) — the same hazard the
+// Config.ScrubSystemdEnv runners and RunCombinedEnv exist for.
 func RunEnv(ctx context.Context, env []string, argv []string, stdin string) (stdout, stderr string, err error) {
 	if len(argv) == 0 {
 		return "", "", errEmptyArgv
 	}
 	cmd := newCmd(ctx, argv)
+	child := os.Environ()
 	if env != nil {
-		cmd.Env = append(os.Environ(), env...)
+		child = append(child, env...)
 	}
+	cmd.Env = ScrubSystemdEnv(child)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}

@@ -16,6 +16,16 @@ func (c *cyc) groupBwAudit() {
 	dev := defStr(c.v("interdc_nebula_dev"), "neb1")
 	var in, out strings.Builder
 	for _, a := range c.t.BwAuditTargets {
+		// The values land verbatim inside an nft ruleset — an
+		// iifname/comment with a control byte or quote would splice
+		// arbitrary rules in. Refused values count via the gate and
+		// skip the whole ruleset (fail closed, partial renders never
+		// deploy).
+		if !c.cfgScalar("interdc_nebula_dev", dev) ||
+			!c.shIPCIDR("bwaudit addr "+a.Label, a.Addr) ||
+			!c.cfgScalar("bwaudit label "+a.Label, a.Label) {
+			return
+		}
 		fmt.Fprintf(&in, "        iifname \"%s\" ip saddr %s counter comment \"%s in-neb\"\n", dev, a.Addr, a.Label)
 		fmt.Fprintf(&out, "        oifname \"%s\" ip daddr %s counter comment \"%s out-neb\"\n", dev, a.Addr, a.Label)
 	}

@@ -84,7 +84,7 @@ func TestSweepSnapshotListsUnderSweepCtx(t *testing.T) {
 			Namespace: "apps", Name: "web-1"}})}
 	d := &Deps{CS: cs}
 
-	sweepCtx := WithSweepSnapshot(context.Background())
+	sweepCtx := WithSweepSnapshot(t.Context())
 	deadCheckCtx, cancel := context.WithCancel(sweepCtx)
 	cancel() // the check's PerCheck ctx already expired
 
@@ -118,7 +118,7 @@ func TestSweepSnapshotListsUnderSweepCtx(t *testing.T) {
 func TestDirectRunSnapshotUsesCallerCtx(t *testing.T) {
 	cs := &ctxCaptureCS{Interface: fake.NewSimpleClientset()}
 	d := &Deps{CS: cs}
-	if _, err := d.AllPods(context.Background()); err != nil {
+	if _, err := d.AllPods(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if !cs.podListHadCtx {
@@ -146,7 +146,7 @@ func TestInvalidatePodsKeepsOtherCensuses(t *testing.T) {
 			return false, nil, nil
 		})
 	d := &Deps{CS: cs}
-	sweepCtx := WithSweepSnapshot(context.Background())
+	sweepCtx := WithSweepSnapshot(t.Context())
 
 	if _, err := d.AllPods(sweepCtx); err != nil {
 		t.Fatal(err)
@@ -201,7 +201,7 @@ func TestPlacementJoinsMemoizeAndInvalidate(t *testing.T) {
 			return false, nil, nil
 		})
 	d := &Deps{CS: cs}
-	sweepCtx := WithSweepSnapshot(context.Background())
+	sweepCtx := WithSweepSnapshot(t.Context())
 
 	zones, err := d.NodeZones(sweepCtx)
 	if err != nil || zones["w1"] != "z1" {
@@ -256,7 +256,7 @@ func TestInvalidateLeasesDropsMemoAndIndex(t *testing.T) {
 			return false, nil, nil
 		})
 	d := &Deps{CS: cs}
-	sweepCtx := WithSweepSnapshot(context.Background())
+	sweepCtx := WithSweepSnapshot(t.Context())
 
 	got, err := d.Lease(sweepCtx, "kube-system", "cilium-l2announce-web-lb")
 	if err != nil || got == nil {
@@ -275,7 +275,7 @@ func TestInvalidateLeasesDropsMemoAndIndex(t *testing.T) {
 	// both the census and the index so the next Get re-fetches and
 	// sees the object gone.
 	if err := cs.CoordinationV1().Leases("kube-system").Delete(
-		context.Background(), "cilium-l2announce-web-lb",
+		t.Context(), "cilium-l2announce-web-lb",
 		metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}

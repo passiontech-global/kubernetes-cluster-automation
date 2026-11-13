@@ -50,7 +50,7 @@ package linkerd
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -240,7 +240,7 @@ func siblingErrRatios(group []outlierSample, pod string,
 // elements on even counts) — vals must be non-empty.
 func medianF64(vals []float64) float64 {
 	sorted := append([]float64{}, vals...)
-	sort.Float64s(sorted)
+	slices.Sort(sorted)
 	mid := len(sorted) / 2
 	if len(sorted)%2 == 1 {
 		return sorted[mid]

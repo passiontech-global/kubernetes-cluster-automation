@@ -1,7 +1,6 @@
 package metricsserverpatcher
 
 import (
-	"context"
 	"errors"
 	"os"
 	"strings"
@@ -103,7 +102,7 @@ func metricsServerDeployBare() *appsv1.Deployment {
 func getMetricsServerDeploy(t *testing.T, cs *fake.Clientset) *appsv1.Deployment {
 	t.Helper()
 	d, err := cs.AppsV1().Deployments("kube-system").
-		Get(context.Background(), "metrics-server", metav1.GetOptions{})
+		Get(t.Context(), "metrics-server", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get metrics-server: %v", err)
 	}
@@ -218,7 +217,7 @@ func TestMetricsServerPatcherAppliesPatch(t *testing.T) {
 	testutil.CaptureDeployPatch(cs, &got)
 
 	r := &metricsServerPatcher{cs: cs}
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -255,7 +254,7 @@ func TestMetricsServerPatcherScalesReplicas(t *testing.T) {
 	testutil.CaptureDeployPatch(cs, &got)
 
 	r := &metricsServerPatcher{cs: cs, minReplicas: 3, nodesPerReplica: 2}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if !strings.Contains(string(got), `"replicas":4`) {
@@ -280,7 +279,7 @@ func TestMetricsServerPatcherReplicasFloor(t *testing.T) {
 	testutil.CaptureDeployPatch(cs, &got)
 
 	r := &metricsServerPatcher{cs: cs, minReplicas: 3, nodesPerReplica: 1}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if !strings.Contains(string(got), `"replicas":3`) {
@@ -305,7 +304,7 @@ func TestMetricsServerPatcherScalingDisabledKeepsReplicas(t *testing.T) {
 	testutil.ForbidDeployPatch(cs, &patched)
 
 	r := &metricsServerPatcher{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err != nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if patched {
@@ -325,7 +324,7 @@ func TestMetricsServerPatcherNodeListError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &metricsServerPatcher{cs: cs, minReplicas: 3, nodesPerReplica: 1}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -342,7 +341,7 @@ func TestMetricsServerPatcherNoOpWhenCorrect(t *testing.T) {
 	testutil.ForbidDeployPatch(cs, &patched)
 
 	r := &metricsServerPatcher{cs: cs, minReplicas: 3, nodesPerReplica: 1}
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -366,7 +365,7 @@ func TestMetricsServerPatcherMissingContainerNoPatch(t *testing.T) {
 	testutil.ForbidDeployPatch(cs, &patched)
 
 	r := &metricsServerPatcher{cs: cs}
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -382,7 +381,7 @@ func TestMetricsServerPatcherMissingContainerNoPatch(t *testing.T) {
 func TestMetricsServerPatcherMissingDeployment(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	r := &metricsServerPatcher{cs: cs}
-	res, err := r.Reconcile(context.Background(), reconcile.Request{})
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -398,7 +397,7 @@ func TestMetricsServerPatcherGetError(t *testing.T) {
 			return true, nil, errors.New("api down")
 		})
 	r := &metricsServerPatcher{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the deployment get fails")
 	}
 }
@@ -410,7 +409,7 @@ func TestMetricsServerPatcherPatchError(t *testing.T) {
 			return true, nil, errors.New("patch rejected")
 		})
 	r := &metricsServerPatcher{cs: cs}
-	if _, err := r.Reconcile(context.Background(), reconcile.Request{}); err == nil {
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err == nil {
 		t.Fatal("expected error when the drift patch fails")
 	}
 }

@@ -5,11 +5,10 @@
 // control plane is killing the child (the supervisor respawns it).
 // Each cycle the probe checks the :8091/metrics scrape for
 // konnectivity_network_proxy_server_ready_backend_connections (the
-// gauge mirrors the value, -1 on scrape failure), the :8092/healthz
-// liveness endpoint and the agent UDS the worker-side
-// konnectivity-agents dial. A missing UDS or a zero-backend reading
-// for konnBadCyclesNeeded consecutive cycles — while at least one
-// Ready worker exists to serve — kills the child under the
+// gauge mirrors the value, -1 on scrape failure) and the agent UDS
+// the worker-side konnectivity-agents dial. A missing UDS or a
+// zero-backend reading for konnBadCyclesNeeded consecutive cycles —
+// while at least one Ready worker exists to serve — kills the child under the
 // last-konnectivity-server-restart 30-minute budget and the shared
 // Sig13.Mode gate (off = state only, dry-run = log, enforce = kill).
 // The probe rides the ungated-cycle slot dispatched from
@@ -26,7 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -37,7 +36,6 @@ import (
 
 const (
 	konnMetricsURL    = "http://127.0.0.1:8091/metrics"
-	konnHealthURL     = "http://127.0.0.1:8092/healthz"
 	konnReadyMetric   = "konnectivity_network_proxy_server_ready_backend_connections"
 	konnUDSRel        = "konnectivity-server/konnectivity-server.sock"
 	konnBadCyclesNeed = 3
@@ -55,9 +53,10 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 	} else {
 		d.KonnReadyBackends.Set(-1)
 	}
-	// The healthz endpoint is informational — an absent listener on
-	// an older konnectivity build is not evidence either way.
-	_ = d.Cfg.CPHealthFn(ctx, konnHealthURL)
+	// The ready-backends gauge and the agent UDS are the evidence —
+	// no healthz GET: it fed no verdict (an absent listener on an
+	// older konnectivity build was not evidence either way), so the
+	// per-cycle request was pure waste.
 	sock := filepath.Join(d.Cfg.K0sRunDir, konnUDSRel)
 	_, sockErr := os.Stat(sock)
 	bad := sockErr != nil || (ok && backends == 0)
@@ -127,7 +126,7 @@ func (c *FreezeCheck) konnReadyBackends(ctx context.Context) (float64, bool) {
 // absent (a build that exports no metric is inconclusive, not
 // "zero backends").
 func ParseKonnectivityReadyBackends(body string) (float64, bool) {
-	for _, ln := range strings.Split(body, "\n") {
+	for ln := range strings.SplitSeq(body, "\n") {
 		ln = strings.TrimSpace(ln)
 		if strings.HasPrefix(ln, "#") || !strings.HasPrefix(ln, konnReadyMetric) {
 			continue
@@ -153,7 +152,7 @@ func (c *FreezeCheck) konnectivityPID() int {
 	if err != nil {
 		return 0
 	}
-	sort.Ints(pids)
+	slices.Sort(pids)
 	for _, pid := range pids {
 		args := c.d.Proc.Cmdline(pid)
 		if len(args) == 0 {

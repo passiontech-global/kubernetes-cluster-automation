@@ -410,8 +410,15 @@ func TestParseAnnoTime(t *testing.T) {
 		{"rfc3339nano", now.Add(123 * time.Millisecond).Format(time.RFC3339Nano),
 			now.Add(123 * time.Millisecond), true},
 		{"unix seconds", "1700000000", time.Unix(1700000000, 0), true},
+		{"padded unix seconds", "  1700000000  ", time.Unix(1700000000, 0), true},
 		{"garbage", "manual-forever", time.Time{}, false},
-		{"negative unix", "-5", time.Unix(-5, 0), true},
+		{"negative unix", "-5", time.Time{}, false},
+		{"zero unix", "0", time.Time{}, false},
+		// Milliseconds pasted as seconds — used to lock maintenance
+		// until year 57836; anything past 2100 is rejected.
+		{"milliseconds as seconds", "1700000000000", time.Time{}, false},
+		{"one past 2100 bound", "4102444801", time.Time{}, false},
+		{"2100 bound accepted", "4102444800", time.Unix(4102444800, 0), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1085,6 +1085,13 @@ func unstickPVCs() *corev1.PersistentVolumeClaim {
 	}}
 }
 
+// unstickPVCMeta projects the fixture down to the PartialObjectMetadata
+// shape the audit's PVC census now carries (the typed object stays the
+// fake clientset's stored state).
+func unstickPVCMeta(pvc *corev1.PersistentVolumeClaim) *metav1.PartialObjectMetadata {
+	return &metav1.PartialObjectMetadata{ObjectMeta: pvc.ObjectMeta}
+}
+
 // claimPod builds a Running pod in apps mounting claimName.
 func claimPod(name, claimName string) *corev1.Pod {
 	return &corev1.Pod{
@@ -1148,7 +1155,7 @@ func TestUnstickPVCProtectionVerdicts(t *testing.T) {
 	podListReactor(cs, podListOK())
 	j := &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
 		now: func() time.Time { return now }}
-	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{})
+	j.unstickPVCProtection(ctx, unstickPVCMeta(pvc), map[string]pvcUseProbe{})
 	if f := pvcFinalizers(t, cs); len(f) != 0 {
 		t.Fatalf("unreferenced claim kept finalizers: %v", f)
 	}
@@ -1160,7 +1167,7 @@ func TestUnstickPVCProtectionVerdicts(t *testing.T) {
 	podListReactor(cs, podListOK(*claimPod("user", "data")))
 	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
 		now: func() time.Time { return now }}
-	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{})
+	j.unstickPVCProtection(ctx, unstickPVCMeta(pvc), map[string]pvcUseProbe{})
 	if f := pvcFinalizers(t, cs); len(f) == 0 {
 		t.Fatal("referenced claim lost its finalizer")
 	}
@@ -1174,7 +1181,7 @@ func TestUnstickPVCProtectionVerdicts(t *testing.T) {
 		podListOK(*claimPod("late", "data"))) // fresh: mounted
 	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
 		now: func() time.Time { return now }}
-	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{})
+	j.unstickPVCProtection(ctx, unstickPVCMeta(pvc), map[string]pvcUseProbe{})
 	if f := pvcFinalizers(t, cs); len(f) == 0 {
 		t.Fatal("claim mounted since the audit scan lost its finalizer")
 	}
@@ -1186,7 +1193,7 @@ func TestUnstickPVCProtectionVerdicts(t *testing.T) {
 	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
 		now: func() time.Time { return now }}
 	before := testutil.QueueErrorCount(t, "failed-jobs-janitor")
-	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{})
+	j.unstickPVCProtection(ctx, unstickPVCMeta(pvc), map[string]pvcUseProbe{})
 	if f := pvcFinalizers(t, cs); len(f) == 0 {
 		t.Fatal("fresh re-query failure lost the finalizer")
 	}
@@ -1204,8 +1211,8 @@ func TestUnstickPVCProtectionVerdicts(t *testing.T) {
 		now: func() time.Time { return now }}
 	cache := map[string]pvcUseProbe{}
 	before = testutil.QueueErrorCount(t, "failed-jobs-janitor")
-	j.unstickPVCProtection(ctx, pvc, cache)
-	j.unstickPVCProtection(ctx, pvc, cache)
+	j.unstickPVCProtection(ctx, unstickPVCMeta(pvc), cache)
+	j.unstickPVCProtection(ctx, unstickPVCMeta(pvc), cache)
 	if f := pvcFinalizers(t, cs); len(f) == 0 {
 		t.Fatal("census failure lost the finalizer")
 	}
@@ -1220,7 +1227,7 @@ func TestUnstickPVCProtectionVerdicts(t *testing.T) {
 	j = &failedJobsJanitor{cs: cs, queue: "failed-jobs-janitor",
 		now: func() time.Time { return now }}
 	before = testutil.QueueErrorCount(t, "failed-jobs-janitor")
-	j.unstickPVCProtection(ctx, pvc, map[string]pvcUseProbe{
+	j.unstickPVCProtection(ctx, unstickPVCMeta(pvc), map[string]pvcUseProbe{
 		"apps": {err: errors.New("cached list failure")}})
 	if f := pvcFinalizers(t, cs); len(f) == 0 {
 		t.Fatal("cached probe failure lost the finalizer")

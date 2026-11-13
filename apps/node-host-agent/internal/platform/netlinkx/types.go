@@ -32,3 +32,21 @@ type SockstatV6 struct {
 	FragInuse int
 	FragMem   int
 }
+
+// TCPCensus is one 1-pass NETLINK_SOCK_DIAG read — both halves the
+// per-cycle connection-table evidence used to pull from separate
+// transports (the per-family state dumps + the /proc/net/tcp{,6}
+// text scan):
+//
+//   - States: idiag_state → socket count across IPv4+IPv6 (the
+//     kernel ids 1=ESTABLISHED .. 12=TIME_WAIT, tcp_states.h).
+//   - PerTuple: daddr+BE-dport (raw bytes) → socket count — the
+//     per-remote-endpoint hot-spot table; DiagEndpoint renders a
+//     key for emission.
+//
+// An error return leaves both maps zeroed: inconclusive, never a
+// fabricated zero census.
+type TCPCensus struct {
+	States   map[uint8]int
+	PerTuple map[string]int
+}

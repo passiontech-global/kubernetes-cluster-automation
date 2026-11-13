@@ -14,13 +14,12 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
-	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // outlierDeployPod builds a Running+Ready Deployment member pod:
@@ -65,24 +64,6 @@ func wireProm(t *testing.T, p *probetest.Prober,
 	})
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
-}
-
-// emulateEviction teaches the fake clientset the apiserver's
-// pods/eviction contract — copied from the unmeshed/statefulset-
-// roller test harnesses (the tracker records the eviction CREATE
-// but never deletes the pod; PDB enforcement stays apiserver-side).
-func emulateEviction(cs *fake.Clientset) {
-	cs.PrependReactor("create", "pods",
-		func(a ktesting.Action) (bool, runtime.Object, error) {
-			ca, ok := a.(ktesting.CreateAction)
-			if !ok || ca.GetSubresource() != "eviction" {
-				return false, nil, nil
-			}
-			ev := ca.GetObject().(*policyv1.Eviction)
-			return true, ev, cs.Tracker().Delete(
-				corev1.SchemeGroupVersion.WithResource("pods"),
-				ca.GetNamespace(), ev.Name)
-		})
 }
 
 // outlierFixtures wires the canonical scene: outlier pod bad at
@@ -299,7 +280,7 @@ func TestLinkerdOutlierEvicted(t *testing.T) {
 	base := time.Now()
 	bad, sib1, sib2 := outlierFixtures()
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	p := testProber(cs)
 	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
@@ -336,7 +317,7 @@ func TestLinkerdOutlierInconclusiveSweepResetsPersistence(t *testing.T) {
 	base := time.Now()
 	bad, sib1, sib2 := outlierFixtures()
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	p := testProber(cs)
 	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
@@ -368,7 +349,7 @@ func TestLinkerdOutlierEvictDisabled(t *testing.T) {
 	base := time.Now()
 	bad, sib1, sib2 := outlierFixtures()
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	p := testProber(cs)
 	p.Cfg.Linkerd.OutlierEvictEnabled = false // kill switch
 	wireProm(t, p, outlierRPS(), outlierFails())
@@ -399,7 +380,7 @@ func TestLinkerdOutlierNoReadySiblingSurvives(t *testing.T) {
 	sib1 := outlierDeployPod("apps", "web", "h1", "web-sib1", false, owner)
 	sib2 := outlierDeployPod("apps", "web", "h1", "web-sib2", false, owner)
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	p := testProber(cs)
 	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
@@ -432,7 +413,7 @@ func TestLinkerdOutlierPDBBlocksEvict(t *testing.T) {
 		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
 	}
 	cs := fake.NewSimpleClientset(bad, sib1, sib2, pdb)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	p := testProber(cs)
 	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
@@ -458,7 +439,7 @@ func TestLinkerdOutlierControllerCooldown(t *testing.T) {
 	base := time.Now()
 	bad, sib1, sib2 := outlierFixtures()
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	p := testProber(cs)
 	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
@@ -506,7 +487,7 @@ func TestLinkerdOutlierYoungPodSurvives(t *testing.T) {
 	sib1 := outlierDeployPod("apps", "web", "h1", "web-sib1", true, owner)
 	sib2 := outlierDeployPod("apps", "web", "h1", "web-sib2", true, owner)
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	p := testProber(cs)
 	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())

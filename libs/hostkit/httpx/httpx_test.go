@@ -88,7 +88,7 @@ func TestShutdownDrainsInFlightRequest(t *testing.T) {
 	}()
 
 	<-started
-	if err := srv.Shutdown(context.Background()); err != nil {
+	if err := srv.Shutdown(t.Context()); err != nil {
 		t.Fatalf("Shutdown during in-flight request: %v", err)
 	}
 	res := <-resCh
@@ -198,7 +198,7 @@ func TestShutdownBeforeServeClosesListener(t *testing.T) {
 	// Shutdown BEFORE the first Serve — the bound listener must be
 	// released by teardown itself, and the later Serve must resolve
 	// nil on the already-closed server rather than accepting.
-	if err := srv.Shutdown(context.Background()); err != nil {
+	if err := srv.Shutdown(t.Context()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 	if got := srv.Addr(); got != "" {
@@ -221,7 +221,7 @@ func TestShutdownBeforeServeClosesListener(t *testing.T) {
 
 	// Repeated teardown is a no-op, and Serve-after-teardown resolves
 	// nil instead of accepting on the dead listener.
-	if err := srv.Shutdown(context.Background()); err != nil {
+	if err := srv.Shutdown(t.Context()); err != nil {
 		t.Fatalf("second Shutdown: %v", err)
 	}
 	if err := srv.Close(); err != nil {
@@ -333,7 +333,7 @@ func TestCloseRacesServe(t *testing.T) {
 		var wg sync.WaitGroup
 		for _, fn := range []func(){
 			func() { _ = srv.Close() },
-			func() { _ = srv.Shutdown(context.Background()) },
+			func() { _ = srv.Shutdown(t.Context()) },
 		} {
 			wg.Add(1)
 			go func(f func()) {

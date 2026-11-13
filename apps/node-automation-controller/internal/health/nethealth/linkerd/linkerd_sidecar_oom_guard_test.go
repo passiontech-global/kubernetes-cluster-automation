@@ -102,7 +102,7 @@ func deadlockPod(ns, name string, restarts int32) *corev1.Pod {
 						ExitCode: 0}},
 				},
 				{
-					Name: linkerdProxyContainer,
+					Name: "linkerd-proxy",
 					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
 						Reason: "PodInitializing"}},
 				},

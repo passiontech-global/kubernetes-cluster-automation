@@ -24,7 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -169,7 +169,7 @@ func ScanSource(root string, c Contract) (ScanResult, error) {
 			return ScanResult{}, fmt.Errorf("walk %s: %w", dirRoot, err)
 		}
 	}
-	sort.Strings(dirs)
+	slices.Sort(dirs)
 
 	res := ScanResult{
 		Referenced:  map[string]string{},

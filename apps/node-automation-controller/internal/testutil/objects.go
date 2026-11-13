@@ -17,6 +17,19 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
+)
+
+// Re-exports over platform/testhelp (dynamic.go documents why the
+// machinery lives at the platform leaf): EmulateEviction teaches the
+// fake clientset the apiserver's pods/eviction contract, and
+// PodExists/PodExistsStrict are the pod-presence probes the
+// eviction/heal module tests share.
+var (
+	EmulateEviction = testhelp.EmulateEviction
+	PodExists       = testhelp.PodExists
+	PodExistsStrict = testhelp.PodExistsStrict
 )
 
 // Node builds a *corev1.Node fixture with a single Ready condition —

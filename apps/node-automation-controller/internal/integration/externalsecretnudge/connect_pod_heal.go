@@ -8,7 +8,7 @@ package externalsecretnudge
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -75,7 +75,7 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	for key := range degraded {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys) // deterministic target when several pods degraded
+	slices.Sort(keys) // deterministic target when several pods degraded
 	for _, key := range keys {
 		if age, ok := n.syncDegradedSince.Seen(key, now); ok &&
 			age >= esConnectHealMinAge {

@@ -4,7 +4,7 @@
 package hostconfig
 
 import (
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
@@ -15,6 +15,7 @@ import (
 func (c *cyc) groupSecurity() {
 	r, ctx := c.r, c.ctx
 	if c.vb("fail2ban_enabled") {
+		freshInstall := false
 		if out, _ := r.run(ctx, "dpkg-query", "-W", "-f=${db:Status-Status}", "fail2ban"); out != "installed" {
 			// runLong: apt install on slow egress outlives the
 			// interactive budget. A failed install aborts the group
@@ -27,6 +28,7 @@ func (c *cyc) groupSecurity() {
 					"error", err)
 				return
 			}
+			freshInstall = true
 		}
 		b, err := r.render("fail2ban-cluster.conf.j2", c.tplCtx())
 		if err != nil {
@@ -44,7 +46,14 @@ func (c *cyc) groupSecurity() {
 		if ch || legacyRm {
 			r.restartService(ctx, "fail2ban.service")
 		}
-		_, _ = r.run(ctx, "fail2ban-client", "status", "sshd") // informational
+		// fail2ban-client is a fork + socket round-trip against
+		// fail2band — the post-verify only says anything right after
+		// the service came up (fresh install/enablement) or the jail
+		// just restarted; the steady-state cycle gains nothing from
+		// it (Wave-4 fork trim).
+		if freshInstall || ch || legacyRm {
+			_, _ = r.run(ctx, "fail2ban-client", "status", "sshd") // informational
+		}
 	} else if _, u := c.t.Vars.Get("fail2ban_enabled").(jinja.Undefined); !u {
 		// ansible: only when fail2ban_enabled is defined and false —
 		// remove the jail AND purge the package.
@@ -122,7 +131,7 @@ func (c *cyc) fail2banIgnoreIP() string {
 			mesh = append(mesh, ip)
 		}
 	}
-	sort.Strings(mesh)
+	slices.Sort(mesh)
 	parts := []string{"127.0.0.1/8", "::1"}
 	parts = append(parts, mesh...)
 	if ex := strings.TrimSpace(c.v("fail2ban_ignoreip_extra")); ex != "" && ex != "None" {

@@ -6,8 +6,9 @@
 package corednswatchdog
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 	"strconv"
 	"time"
 
@@ -49,9 +50,8 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 		log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
 		return "", nil
 	}
-	sort.Slice(svcItems, func(i, j int) bool {
-		return svcItems[i].CreationTimestamp.
-			After(svcItems[j].CreationTimestamp.Time)
+	slices.SortFunc(svcItems, func(a, b corev1.Service) int {
+		return -a.CreationTimestamp.Compare(b.CreationTimestamp.Time)
 	})
 	type svcCand struct {
 		ns, name string
@@ -63,7 +63,7 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 		n = 8
 	}
 	cands := make([]svcCand, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range svcItems[:n] {
 		s := &svcItems[i]
 		cands = append(cands, svcCand{
 			ns:      s.Namespace,
@@ -201,7 +201,7 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 	if len(cands) == 0 {
 		return "", nil
 	}
-	sort.Slice(cands, func(i, j int) bool { return cands[i].rv > cands[j].rv })
+	slices.SortFunc(cands, func(a, b cand) int { return cmp.Compare(b.rv, a.rv) })
 	if len(cands) > 8 {
 		cands = cands[:8]
 	}

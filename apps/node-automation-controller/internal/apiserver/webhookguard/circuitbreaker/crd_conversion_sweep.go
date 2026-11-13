@@ -54,7 +54,7 @@ func (s *crdConversionSweep) carryForward(live map[string]bool) {
 			s.b.crdUnhealthyEmitted.Emit(k, lv...)
 		}
 	}
-	s.b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
+	s.b.crdUnhealthyEmitted.Prune(metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues)
 }
 
 // loadInputs runs the sweep's fail-closed gates. proceed=false means
@@ -177,10 +177,10 @@ func (s *crdConversionSweep) evalCRDs(ctx context.Context) {
 			continue
 		}
 		k := crdConversionKey{crd: crd.GetName(), service: svcKey, reason: reason}
-		s.b.crdUnhealthyEmitted.Set(CRDConversionWebhookUnhealthy, 1,
+		s.b.crdUnhealthyEmitted.Set(metrics.CRDConversionWebhookUnhealthy, 1,
 			k, k.crd, k.service, k.reason)
 	}
-	s.b.crdUnhealthyEmitted.Prune(CRDConversionWebhookUnhealthy.DeleteLabelValues)
+	s.b.crdUnhealthyEmitted.Prune(metrics.CRDConversionWebhookUnhealthy.DeleteLabelValues)
 }
 
 // carryCRD re-asserts one CRD's last-emitted tuples — the per-CRD

@@ -168,6 +168,18 @@ func TestIntFloatDefaultKwargs(t *testing.T) {
 		{"{{ '' | default(default_value='dv', boolean=true) }}", "dv"},
 		{"{{ 0 | default(default_value='dv') }}", "0"}, // defined → kept
 		{"{{ '' | default('x', true) }}", "x"},         // positional unchanged
+		// base != 10 never takes the decimal-float fallback.
+		{"{{ '1.5' | int(0, 16) }}", "0"},
+		{"{{ 'ff' | int(0, 16) }}", "255"},
+		// Hex-float strings (Go ParseFloat accepts "0x1p-2",
+		// python float() does not) don't convert via the fallback.
+		{"{{ '0x1p-2' | int }}", "0"},
+		{"{{ '0x10' | int }}", "0"}, // no implicit base-0 parsing
+		// Underflow below MinInt64 clamps instead of using default.
+		{"{{ '-1e300' | int }}", "-9223372036854775808"},
+		{"{{ (0 - 1e300) | int }}", "-9223372036854775808"},
+		// Overflow above MaxInt64 stays a failure → default.
+		{"{{ 1e300 | int(default=7) }}", "7"},
 	}
 	for _, c := range cases {
 		out, err := Render(c.tpl, nil, nil)

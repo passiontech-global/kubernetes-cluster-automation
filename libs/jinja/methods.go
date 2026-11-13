@@ -165,11 +165,11 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 			return &List{out}, nil
 		}
 	case "get":
-		if mv, ok := asMapping(m.obj); ok {
+		if isMappingValue(m.obj) {
 			if len(args) == 0 {
 				return nil, errors.New("get: missing key argument")
 			}
-			if v, ok := mv.get(Stringify(args[0])); ok {
+			if v, ok := mapLookup(m.obj, Stringify(args[0])); ok {
 				return v, nil
 			}
 			if len(args) > 1 {
@@ -234,7 +234,7 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 
 func splitWS(s string) []any {
 	var out []any
-	for _, f := range strings.Fields(s) {
+	for f := range strings.FieldsSeq(s) {
 		out = append(out, f)
 	}
 	return out
@@ -301,20 +301,22 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 	// map[string]any and map[string]string — a vars-file OMap and a
 	// Go-native map with the same entries are the same value.
 	if lm, lok := asMapping(l); lok {
-		rm, rok := asMapping(r)
-		if !rok || lm.n != rm.n {
+		// The right side only answers per-key lookups — mapLookup
+		// skips the sorted view asMapping would build for it.
+		rn, rok := mappingLen(r)
+		if !rok || lm.n != rn {
 			return false
 		}
 		for _, k := range lm.keys {
 			lv, _ := lm.get(k)
-			rv, ok := rm.get(k)
+			rv, ok := mapLookup(r, k)
 			if !ok || !deepEqAt(lv, rv, depth+1, steps) {
 				return false
 			}
 		}
 		return true
 	}
-	if _, rok := asMapping(r); rok {
+	if isMappingValue(r) {
 		return false
 	}
 	switch lt := l.(type) {
@@ -350,10 +352,49 @@ type mappingView struct {
 
 // isMappingValue reports whether v is any mapping shape the engine
 // understands (*OMap, map[string]any, map[string]string) — used by
-// the for-loop unpack guards.
+// the for-loop unpack guards. A plain type switch: the predicate
+// must not build asMapping's sorted-key view just to say "yes".
 func isMappingValue(v any) bool {
-	_, ok := asMapping(v)
-	return ok
+	switch v.(type) {
+	case *OMap, map[string]any, map[string]string:
+		return true
+	}
+	return false
+}
+
+// mapLookup resolves one key on any mapping shape WITHOUT the
+// sorted-keys view asMapping builds — direct indexing sorts nothing
+// and allocates nothing on a hit, so single-key reads (`key in dict`,
+// .get(key)) stay O(1) however large the mapping. Typed-nil *OMap
+// reads as an empty map (Get is nil-receiver safe), matching
+// asMapping. The three shapes are exactly asMapping's.
+func mapLookup(v any, key string) (any, bool) {
+	switch t := v.(type) {
+	case *OMap:
+		return t.Get(key)
+	case map[string]any:
+		x, ok := t[key]
+		return x, ok
+	case map[string]string:
+		x, ok := t[key]
+		return x, ok
+	}
+	return nil, false
+}
+
+// mappingLen reports the entry count for any mapping shape — the
+// size half of mappingView, without building the sorted-key view.
+// False for every non-mapping.
+func mappingLen(v any) (int, bool) {
+	switch t := v.(type) {
+	case *OMap:
+		return t.Len(), true
+	case map[string]any:
+		return len(t), true
+	case map[string]string:
+		return len(t), true
+	}
+	return 0, false
 }
 
 func asMapping(v any) (mappingView, bool) {

@@ -219,8 +219,7 @@ func TestHighestRSSPodTiersAndRails(t *testing.T) {
 	}
 
 	term := psiPod("term", "app", wdepstest.UIDA, "")
-	now := metav1.Now()
-	term.DeletionTimestamp = &now
+	term.DeletionTimestamp = new(metav1.Now())
 	victim, _ = highestRSSPod(d3, []corev1.Pod{term}, []int{31})
 	if victim != nil {
 		t.Fatal("terminating pod must never be a victim")

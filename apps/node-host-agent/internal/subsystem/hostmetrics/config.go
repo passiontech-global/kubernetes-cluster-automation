@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
@@ -68,11 +69,9 @@ type Config struct {
 	MountinfoFile string
 	// LocalPortRangeFile is /proc/sys/net/ipv4/ip_local_port_range
 	// — the ephemeral source-port pool width the conntrack-port-pressure sockstat
-	// saturation ratio divides by; ProcNetTCP/ProcNetTCP6 are the
-	// /proc/1/net/tcp{,6} tables the CLOSE_WAIT count scans.
+	// saturation ratio divides by. (The CLOSE_WAIT/tuple tables moved
+	// to the TCPCensusFn netlink dump — no file path involved.)
 	LocalPortRangeFile string
-	ProcNetTCP         string
-	ProcNetTCP6        string
 	// NetstatFile is /proc/1/net/netstat (TcpExt counters) and
 	// SNMPFile /proc/1/net/snmp (Ip/Udp counters) — the kernel
 	// TCP/IP stack grey-failure series.
@@ -173,10 +172,11 @@ type Config struct {
 	// cpuMeasure replaces the real RUSAGE_THREAD busy-loop for
 	// tests: returns (ratio, wallSeconds, ok).
 	cpuMeasure func() (ratio, wall float64, ok bool)
-	// TCPStatesFn reads pid's netns TCP state histogram through
-	// NETLINK_SOCK_DIAG (netlinkx.TCPStates) — the sockstat
-	// domain's full-state census. nil → netlinkx.TCPStates.
-	TCPStatesFn func(pid int) (map[uint8]int, error)
+	// TCPCensusFn reads pid's netns one-pass NETLINK_SOCK_DIAG census
+	// (netlinkx.TCPTables) — the sockstat domain's full connection-table
+	// read: per-state histogram + per-tuple hot-spot in one dump.
+	// nil → netlinkx.TCPTables.
+	TCPCensusFn func(pid int) (netlinkx.TCPCensus, error)
 	// adjtimexFn reads kernel clock-sync state (H1) — seam for
 	// tests (default unix.Adjtimex).
 	adjtimexFn func(*unix.Timex) (int, error)
@@ -220,10 +220,10 @@ func (c *Config) applyDefaults() {
 		// HostRoot-joined — /host/etc/k0s/k0s.yaml in the pod,
 		// /etc/k0s/k0s.yaml standalone (EnvK0sConfig's env default
 		// gets the same hostPath() wrap in config_env.go).
-		c.K0sConfigFile = filepath.Join(c.HostRoot, defaultK0sConfigFile)
+		c.K0sConfigFile = filepath.Join(c.HostRoot, k0sconfig.DefaultConfigFile)
 	}
 	if c.K0sUnitFile == "" {
-		c.K0sUnitFile = filepath.Join(c.HostRoot, defaultK0sUnitFile)
+		c.K0sUnitFile = filepath.Join(c.HostRoot, k0sconfig.DefaultUnitFile)
 	}
 	if c.NebulaCertFile == "" {
 		c.NebulaCertFile = defaultNebulaCertFile
@@ -247,10 +247,10 @@ func (c *Config) applyDefaults() {
 		c.Clock = timex.NewCell(nil)
 	}
 	if len(c.RemovedFlags) == 0 {
-		c.RemovedFlags = defaultRemovedFlags
+		c.RemovedFlags = k0sconfig.DefaultRemovedFlags
 	}
 	if len(c.ExpectedKCMArgs) == 0 {
-		c.ExpectedKCMArgs = defaultExpectedKCMArgs
+		c.ExpectedKCMArgs = k0sconfig.DefaultExpectedKCMArgs
 	}
 	if c.ConntrackCountFile == "" {
 		c.ConntrackCountFile = defaultConntrackCountFile
@@ -270,12 +270,6 @@ func (c *Config) applyDefaults() {
 	if c.LocalPortRangeFile == "" {
 		c.LocalPortRangeFile = defaultLocalPortRangeFile
 	}
-	if c.ProcNetTCP == "" {
-		c.ProcNetTCP = defaultProcNetTCP
-	}
-	if c.ProcNetTCP6 == "" {
-		c.ProcNetTCP6 = defaultProcNetTCP6
-	}
 	if c.NetstatFile == "" {
 		c.NetstatFile = defaultNetstatFile
 	}
@@ -291,8 +285,8 @@ func (c *Config) applyDefaults() {
 	if c.statfsFn == nil {
 		c.statfsFn = unix.Statfs
 	}
-	if c.TCPStatesFn == nil {
-		c.TCPStatesFn = netlinkx.TCPStates
+	if c.TCPCensusFn == nil {
+		c.TCPCensusFn = netlinkx.TCPTables
 	}
 	if c.collectCacheTTL == 0 {
 		c.collectCacheTTL = collectSnapshotTTL

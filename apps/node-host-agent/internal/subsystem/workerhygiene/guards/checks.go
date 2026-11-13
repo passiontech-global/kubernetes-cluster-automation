@@ -37,7 +37,9 @@ func NewPSIThrash(d *wdeps.Deps) *PSIThrashCheck {
 
 // NewJournald returns the A5 journald-integrity probe.
 func NewJournald(d *wdeps.Deps) *JournaldCheck {
-	return &JournaldCheck{d: d, ig: newJournaldIntegrity(d)}
+	c := &JournaldCheck{d: d}
+	c.ig = newJournaldIntegrity(c)
+	return c
 }
 
 // NewSpegel returns the spegel-mirror spegel-mirror guard.

@@ -6,18 +6,16 @@
 // node_automation_crd_conversion_webhook_unhealthy per CRD
 // (missing_service|zero_endpoints|tls_probe_failed) and bounces the
 // oldest wedged backing pod through the same BounceCooldown ledger
-// and maintenance-mutex gate as the admission path. The gauge is a
-// single-check series, so it lives here (colocated var + init)
-// instead of internal/metrics. The per-sweep phases (input gates,
-// per-CRD eval, bounce dispatch) live in crd_conversion_sweep.go.
+// and maintenance-mutex gate as the admission path. The gauge lives
+// in internal/metrics (apiserver.go) as CRDConversionWebhookUnhealthy.
+// The per-sweep phases (input gates, per-CRD eval, bounce dispatch)
+// live in crd_conversion_sweep.go.
 package circuitbreaker
 
 import (
 	"context"
 
-	"github.com/prometheus/client_golang/prometheus"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 )
@@ -45,21 +43,6 @@ const (
 	// bounces.
 	CRDReasonTLSProbeFailed = "tls_probe_failed"
 )
-
-// CRDConversionWebhookUnhealthy marks (1) each CustomResourceDefinition
-// whose spec.conversion webhook backend is measurably broken — a
-// single-check series, so it lives here (colocated var + init)
-// instead of internal/metrics. reason carries the verdict
-// (missing_service|zero_endpoints|tls_probe_failed); the series
-// disappears once the backend is healthy again.
-var CRDConversionWebhookUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "node_automation_crd_conversion_webhook_unhealthy",
-	Help: "1 while the CRD's spec.conversion webhook backend is unhealthy (missing_service|zero_endpoints|tls_probe_failed).",
-}, []string{"crd", "service", "reason"})
-
-func init() {
-	ctrlmetrics.Registry.MustRegister(CRDConversionWebhookUnhealthy)
-}
 
 // crdConversionKey is the exact label tuple of the
 // CRDConversionWebhookUnhealthy gauge — the GaugeLedger key, same

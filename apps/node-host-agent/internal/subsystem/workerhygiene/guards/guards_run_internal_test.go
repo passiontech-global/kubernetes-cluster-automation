@@ -23,6 +23,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -800,11 +801,20 @@ func TestNetnsInodeHelpers(t *testing.T) {
 		"u2": {{UID: "u2", PID: 4243, Live: true}}, // unreadable ns
 		"u3": {{UID: "u3", PID: 4242, Live: false}},
 	}
-	if !netnsHeldByLiveTask(d, tasks, ino) {
+	if !netnsHeldByLiveTask(d, nil, tasks, ino) {
 		t.Fatal("live task inside the netns must hold it")
 	}
-	if netnsHeldByLiveTask(d, tasks, ino+999) {
+	if netnsHeldByLiveTask(d, nil, tasks, ino+999) {
 		t.Fatal("unrelated inode must not be held")
+	}
+	// A task init.pid covered by the cycle's StatsOnce snapshot is
+	// answered off the same-cycle sweep — no fresh ns/net stat (the
+	// still-linked ns/net below would match, proving the skip).
+	statsEnv := &wdeps.CycleEnv{StatsOnce: func() map[int]procfs.Stat {
+		return map[int]procfs.Stat{4242: {Fields: []string{"S"}}}
+	}}
+	if netnsHeldByLiveTask(d, statsEnv, tasks, ino) {
+		t.Fatal("StatsOnce-covered init.pid must skip the fresh stat")
 	}
 }
 

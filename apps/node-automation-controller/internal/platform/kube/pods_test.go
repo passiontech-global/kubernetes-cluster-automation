@@ -3,7 +3,6 @@
 package kube
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -220,17 +219,17 @@ func TestPodMergePatcher(t *testing.T) {
 	cs := fake.NewSimpleClientset(pod)
 	patch := PodMergePatcher(cs, pod)
 	data := []byte(`{"metadata":{"annotations":{"k":"v"}}}`)
-	if err := patch(context.Background(), data); err != nil {
+	if err := patch(t.Context(), data); err != nil {
 		t.Fatalf("patch failed: %v", err)
 	}
-	got, err := cs.CoreV1().Pods("ns").Get(context.Background(), "web", metav1.GetOptions{})
+	got, err := cs.CoreV1().Pods("ns").Get(t.Context(), "web", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get after patch: %v", err)
 	}
 	if got.Annotations["k"] != "v" {
 		t.Fatalf("annotation not applied: %v", got.Annotations)
 	}
-	if err := patch(context.Background(), []byte(`not json`)); err == nil {
+	if err := patch(t.Context(), []byte(`not json`)); err == nil {
 		t.Fatal("invalid patch data accepted")
 	}
 }

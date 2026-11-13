@@ -277,7 +277,7 @@ func (s *deadNodeSweeper) fenceNode(ctx context.Context, nodeName string,
 	// Failure here must not veto the taint decision.
 	s.logVolumeAttachments(ctx, nodeName, vac)
 
-	if err := kube.TaintNode(ctx, s.cs, nodeName, outOfServiceTaintKey,
+	if err := kube.TaintNode(ctx, s.cs, nodeName, kube.TaintNodeOutOfService,
 		outOfServiceTaintValue, corev1.TaintEffectNoExecute); err != nil {
 		log.Error(err, "out-of-service taint failed", "node", nodeName,
 			"stuckPods", count)

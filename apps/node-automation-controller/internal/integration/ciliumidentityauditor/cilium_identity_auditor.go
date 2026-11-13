@@ -63,20 +63,19 @@ package ciliumidentityauditor
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -113,23 +112,6 @@ const (
 	// the keys inflating the table (65k range exhaustion risk).
 	ciliumActiveIdentityWarn = 10000
 )
-
-var (
-	// ciliumActiveIdentities is the total CiliumIdentity count from
-	// the last successful list — the eBPF identity-table occupancy.
-	// Colocated single-check series: the integration-domain shared
-	// vectors live in internal/metrics, but a gauge only this
-	// module consumes stays with the check file (probefw parity).
-	ciliumActiveIdentities = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "node_automation_cilium_active_identities",
-		Help: "Total CiliumIdentity objects in the cluster — eBPF identity table occupancy.",
-	})
-)
-
-func init() {
-	ctrlmetrics.Registry.MustRegister(
-		ciliumActiveIdentities)
-}
 
 var (
 	ciliumIdentityGVR = kube.GVRCiliumIdentity
@@ -170,7 +152,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, gcEnabledFromEnv, func(gcEnabled bool) error {
 		a := &ciliumIdentityAuditor{
 			cs:         d.CS,
-			nodeReader: d.Mgr.GetClient(),
+			nodeReader: d.CachedClient(),
 			dyn:        d.Dyn,
 			gcEnabled:  gcEnabled,
 			now:        shared.SystemClock,
@@ -208,7 +190,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// one identity; the top keys are the workload attributes
 	// inflating the table).
 	totalIDs := len(ids)
-	ciliumActiveIdentities.Set(float64(totalIDs))
+	metrics.CiliumActiveIdentities.Set(float64(totalIDs))
 	if totalIDs > ciliumActiveIdentityWarn {
 		log.Info("CiliumIdentity count above warn threshold — top "+
 			"security-label keys by distinct values",
@@ -276,18 +258,27 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
 
-	eps, err := kube.ListAll(ctx,
+	// CiliumEndpoints are the FIRST API-side usage source. Streamed
+	// pages: only the identity-ID strings survive into the used set —
+	// CEP bodies (per-endpoint networking state, the fattest objects
+	// this sweep reads) die with their page instead of materializing
+	// as one cluster-wide unstructured slice. The spec-path read keeps
+	// the list full-object; metadata lists cannot see
+	// .spec.endpoints[].identity-id.
+	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.DynamicPage(a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll)))
+		kube.DynamicPage(a.dyn.Resource(ciliumEndpointGVR).Namespace(metav1.NamespaceAll)),
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				if id := endpointIdentityID(&page[i]); id != "" {
+					used[id] = struct{}{}
+				}
+			}
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("list ciliumendpoints: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
-	for i := range eps {
-		if id := endpointIdentityID(&eps[i]); id != "" {
-			used[id] = struct{}{}
-		}
-	}
-	eps = nil // used-map extracted — release before the next lists land
 
 	// CiliumEndpointSlice is the SECOND identity-usage source: on
 	// CES-enabled clusters the agent stops writing CiliumEndpoints
@@ -297,19 +288,21 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// simply does not run CES (fine); any other failure makes usage
 	// indeterminate — fail closed like the CEP/pod lists (a returned
 	// error aborts the run, so the GC path below is never reached on
-	// partial data).
-	slices, err := kube.ListAll(ctx,
+	// partial data). Streamed pages like the CEP read above.
+	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(a.dyn.Resource(ciliumEndpointSliceGVR).
-			Namespace(metav1.NamespaceAll)))
+			Namespace(metav1.NamespaceAll)),
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				for _, id := range sliceIdentityIDs(&page[i]) {
+					used[id] = struct{}{}
+				}
+			}
+			return nil
+		})
 	switch {
 	case err == nil:
-		for i := range slices {
-			for _, id := range sliceIdentityIDs(&slices[i]) {
-				used[id] = struct{}{}
-			}
-		}
-		slices = nil
 	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
 		// CES CRD absent or API version not served — CEP-only
 		// cluster, nothing to merge.
@@ -338,7 +331,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		log.Info("sweep done: identities clean", "total", len(idCreated))
 		return nil
 	}
-	sort.Strings(orphans)
+	slices.Sort(orphans)
 	sample := orphans
 	if len(sample) > ciliumOrphanSamples {
 		sample = sample[:ciliumOrphanSamples]

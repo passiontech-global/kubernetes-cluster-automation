@@ -109,12 +109,6 @@ func srPod(stsName string, ord int, revision string, readyAgo time.Duration) *co
 	}
 }
 
-func srPodExists(t *testing.T, cs *fake.Clientset, ns, name string) bool {
-	t.Helper()
-	_, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
-	return err == nil
-}
-
 func srRoller(cs *fake.Clientset, now time.Time) *statefulSetOnDeleteRoller {
 	return &statefulSetOnDeleteRoller{cs: cs,
 		// NewDynamicClient (not StubDyn): the maintenance mutex's
@@ -122,27 +116,6 @@ func srRoller(cs *fake.Clientset, now time.Time) *statefulSetOnDeleteRoller {
 		// defers fail-closed.
 		dyn: natestutil.NewDynamicClient(),
 		now: func() time.Time { return now }}
-}
-
-// emulateEviction teaches the fake clientset the apiserver's
-// pods/eviction contract: the fake tracker records a pods/eviction
-// CREATE but never deletes the pod (fixture.go only applies
-// same-type subresource writes, and an Eviction is not a Pod), so
-// tests asserting the pod is gone wire the delete themselves. PDB
-// budget enforcement is apiserver-only and stays untested here —
-// the gate-2 pre-check remains the observable contract.
-func emulateEviction(cs *fake.Clientset) {
-	cs.PrependReactor("create", "pods",
-		func(a ktesting.Action) (bool, runtime.Object, error) {
-			ca, ok := a.(ktesting.CreateAction)
-			if !ok || ca.GetSubresource() != "eviction" {
-				return false, nil, nil // a real pod create — let the tracker take it
-			}
-			ev := ca.GetObject().(*policyv1.Eviction)
-			return true, ev, cs.Tracker().Delete(
-				corev1.SchemeGroupVersion.WithResource("pods"),
-				ca.GetNamespace(), ev.Name)
-		})
 }
 
 // srNodes returns n Ready workers.
@@ -174,20 +147,20 @@ func TestStatefulSetRollerDeletesHighestStaleOrdinal(t *testing.T) {
 		srPod("db", 1, "rev-old", 30*time.Minute),
 		srPod("db", 2, "rev-new", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 
 	if err := r.run(ctx); err != nil { // seeds driftSince
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-1") {
+	if !natestutil.PodExists(t, cs, "apps", "db-1") {
 		t.Fatal("pod deleted before the 30m drift window")
 	}
 	r.now = func() time.Time { return t0.Add(31 * time.Minute) }
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs, "apps", "db-1") {
+	if natestutil.PodExists(t, cs, "apps", "db-1") {
 		t.Fatal("highest stale-ordinal pod not deleted")
 	}
 	// The roll must go through the eviction subresource (PDB budget
@@ -208,7 +181,7 @@ func TestStatefulSetRollerDeletesHighestStaleOrdinal(t *testing.T) {
 		t.Fatalf("pod actions: %d evictions, %d raw deletes — want 1/0", evicts, deletes)
 	}
 	for _, name := range []string{"db-0", "db-2"} {
-		if !srPodExists(t, cs, "apps", name) {
+		if !natestutil.PodExists(t, cs, "apps", name) {
 			t.Fatalf("pod %s wrongly deleted — only one roll per cycle", name)
 		}
 	}
@@ -234,7 +207,7 @@ func TestStatefulSetRollerRequiresOptIn(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("unannotated StatefulSet rolled")
 	}
 	if srTrackedCount(&r.driftSince) != 0 {
@@ -256,7 +229,7 @@ func TestStatefulSetRollerRequiresOnDelete(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("RollingUpdate StatefulSet rolled")
 	}
 }
@@ -277,7 +250,7 @@ func TestStatefulSetRollerCordonedNodeGate(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted while a node is cordoned")
 	}
 }
@@ -302,13 +275,13 @@ func TestStatefulSetRollerPDBGate(t *testing.T) {
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		pdb)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted while a matching PDB allows 0 disruptions")
 	}
 
@@ -326,7 +299,7 @@ func TestStatefulSetRollerPDBGate(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs, "apps", "db-0") {
+	if natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod not deleted once the PDB allows a disruption")
 	}
 }
@@ -355,7 +328,7 @@ func TestStatefulSetRollerPDBEmptySelectorGate(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted while an empty-selector PDB allows 0 disruptions")
 	}
 }
@@ -374,16 +347,16 @@ func TestStatefulSetRollerMissingRevisionLabel(t *testing.T) {
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		unlabeled)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs, "apps", "db-1") {
+	if natestutil.PodExists(t, cs, "apps", "db-1") {
 		t.Fatal("highest-ordinal unlabeled pod not deleted")
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("db-0 wrongly deleted — only one roll per cycle")
 	}
 }
@@ -406,16 +379,16 @@ func TestStatefulSetRollerTerminatingPodBlocksRoll(t *testing.T) {
 		srPod("db", 1, "rev-new", 30*time.Minute),
 		terminating)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod evicted while a member is still terminating — membership gate must hold")
 	}
-	if !srPodExists(t, cs, "apps", "db-2") {
+	if !natestutil.PodExists(t, cs, "apps", "db-2") {
 		t.Fatal("terminating pod double-deleted")
 	}
 }
@@ -431,13 +404,13 @@ func TestStatefulSetRollerPodTemplateAnnotationOptIn(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs, "apps", "db-0") {
+	if natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod not rolled — pod-template opt-in annotation ignored")
 	}
 }
@@ -459,7 +432,7 @@ func TestStatefulSetRollerNewestPodStabilityGate(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted while the newest member was still settling")
 	}
 }
@@ -481,7 +454,7 @@ func TestStatefulSetRollerAllReadyGate(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted while a member is not Ready")
 	}
 }
@@ -519,7 +492,7 @@ func TestStatefulSetRollerDriftReArms(t *testing.T) {
 	if _, ok := r.driftSince.Seen(srDBDriftKey, time.Now()); ok {
 		t.Fatal("settled drift still tracked")
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted after drift settled")
 	}
 }
@@ -591,7 +564,7 @@ func TestStatefulSetRollerNewRevisionResetsDriftClock(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	// rev-new drift observed a full window ago — under the old
 	// name-only key this sweep would roll immediately.
@@ -616,7 +589,7 @@ func TestStatefulSetRollerNewRevisionResetsDriftClock(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod rolled on a revision whose drift window just opened")
 	}
 	if _, ok := r.driftSince.Seen("apps/db@rev-newer", t0.Add(45*time.Minute)); !ok {
@@ -631,7 +604,7 @@ func TestStatefulSetRollerNewRevisionResetsDriftClock(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs, "apps", "db-0") {
+	if natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod not rolled after 30m of drift on the new revision")
 	}
 }
@@ -651,13 +624,13 @@ func TestStatefulSetRollerStaleUnreadyBlocksRoll(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, recent)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod rolled while a non-newest member was still settling")
 	}
 }
@@ -687,14 +660,14 @@ func TestStatefulSetRollerDefersOnImagePullStall(t *testing.T) {
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		stuck)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"db-0", "db-1"} {
-		if !srPodExists(t, cs, "apps", name) {
+		if !natestutil.PodExists(t, cs, "apps", name) {
 			t.Fatalf("pod %s deleted despite the image-pull defer gate", name)
 		}
 	}
@@ -760,13 +733,13 @@ func TestStatefulSetRollerAllPodsOnNewRevision(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, srPod("db", 0, "rev-new", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod evicted although every member is already on the new revision")
 	}
 }
@@ -783,13 +756,13 @@ func TestStatefulSetRollerFutureReadyTimestampSkips(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, future)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod evicted on a future-dated Ready transition")
 	}
 }
@@ -803,13 +776,13 @@ func TestStatefulSetRollerNilReplicasSkips(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod evicted with spec.replicas unset")
 	}
 }
@@ -851,7 +824,7 @@ func TestStatefulSetRollerPDBListError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.queue = "statefulset-ondelete-roller"
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
@@ -859,7 +832,7 @@ func TestStatefulSetRollerPDBListError(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatalf("PDB list failure must not fail the sweep: %v", err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod evicted although the PDB census was unreadable")
 	}
 	if d := natestutil.QueueErrorCount(t, r.queue) - before; d != 1 {
@@ -883,13 +856,13 @@ func TestStatefulSetRollerNonMatchingPDBAllowsRoll(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute), pdb)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs, "apps", "db-0") {
+	if natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("non-matching PDB blocked the roll")
 	}
 }
@@ -911,13 +884,13 @@ func TestStatefulSetRollerUnparseablePDBSelectorFailsClosed(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute), pdb)
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRoller(cs, t0)
 	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("unparseable-selector PDB did not fail closed")
 	}
 }
@@ -931,7 +904,7 @@ func TestStatefulSetRollerEvictError(t *testing.T) {
 	objs := srNodes(1)
 	objs = append(objs, sts, srPod("db", 0, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	cs.PrependReactor("create", "pods",
 		func(a ktesting.Action) (bool, runtime.Object, error) {
 			ca, ok := a.(ktesting.CreateAction)
@@ -947,7 +920,7 @@ func TestStatefulSetRollerEvictError(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatalf("evict failure must not fail the sweep: %v", err)
 	}
-	if !srPodExists(t, cs, "apps", "db-0") {
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted although the eviction was refused")
 	}
 	if d := natestutil.QueueErrorCount(t, r.queue) - before; d != 1 {
@@ -1068,7 +1041,7 @@ func TestStatefulSetRollerDragonflyUnsyncedGate(t *testing.T) {
 		srPod("cache", 0, "rev-old", 30*time.Minute),
 		srPod("cache", 1, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRollerWithProm(cs, t0, srv)
 
 	if err := r.run(ctx); err != nil { // seeds driftSince
@@ -1078,7 +1051,7 @@ func TestStatefulSetRollerDragonflyUnsyncedGate(t *testing.T) {
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if !srPodExists(t, cs, "apps", "cache-1") {
+	if !natestutil.PodExists(t, cs, "apps", "cache-1") {
 		t.Fatal("pod rolled while a replica's master link was down (mid-FULL-SYNC)")
 	}
 	if n := ptestutil.ToFloat64(metrics.StatefulSetOnDeleteDragonflyUnsyncedSkipped.
@@ -1095,13 +1068,13 @@ func TestStatefulSetRollerDragonflyUnsyncedGate(t *testing.T) {
 		srPod("db", 0, "rev-old", 30*time.Minute),
 		srPod("db", 1, "rev-old", 30*time.Minute))
 	cs2 := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs2)
+	natestutil.EmulateEviction(cs2)
 	r2 := srRollerWithProm(cs2, t0, srv)
 	r2.driftSince.Observe("apps/db@rev-new", t0.Add(-time.Hour))
 	if err := r2.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs2, "apps", "db-1") {
+	if natestutil.PodExists(t, cs2, "apps", "db-1") {
 		t.Fatal("non-dragonfly set blocked by the dragonfly gate")
 	}
 }
@@ -1120,13 +1093,13 @@ func TestStatefulSetRollerDragonflySyncedRollsAndOutageTolerated(t *testing.T) {
 		srPod("cache", 0, "rev-old", 30*time.Minute),
 		srPod("cache", 1, "rev-old", 30*time.Minute))
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	natestutil.EmulateEviction(cs)
 	r := srRollerWithProm(cs, t0, srvUp)
 	r.driftSince.Observe("apps/cache@rev-new", t0.Add(-time.Hour))
 	if err := r.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs, "apps", "cache-1") {
+	if natestutil.PodExists(t, cs, "apps", "cache-1") {
 		t.Fatal("roll deferred while every replica read master_link_status up")
 	}
 
@@ -1138,13 +1111,13 @@ func TestStatefulSetRollerDragonflySyncedRollsAndOutageTolerated(t *testing.T) {
 		srPod("cache", 0, "rev-old", 30*time.Minute),
 		srPod("cache", 1, "rev-old", 30*time.Minute))
 	cs2 := fake.NewSimpleClientset(objs2...)
-	emulateEviction(cs2)
+	natestutil.EmulateEviction(cs2)
 	r2 := srRollerWithProm(cs2, t0, srvDown)
 	r2.driftSince.Observe("apps/cache@rev-new", t0.Add(-time.Hour))
 	if err := r2.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if srPodExists(t, cs2, "apps", "cache-1") {
+	if natestutil.PodExists(t, cs2, "apps", "cache-1") {
 		t.Fatal("roll pinned by a Prometheus outage — the gate must tolerate it")
 	}
 }

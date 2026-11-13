@@ -7,7 +7,7 @@ package watchdogs
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -104,7 +104,7 @@ func (p *meshControlPlaneCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 	if len(ipamNodes) > 0 {
-		sort.Strings(ipamNodes)
+		slices.Sort(ipamNodes)
 		rep.Find("cilium_ipam_exhausted:" + strings.Join(ipamNodes, ","))
 		p.healComponentPod(ctx, log, "cilium-operator",
 			ciliumOperatorNS, ciliumOperatorPrefix, ciliumOpHealCooldown, now)

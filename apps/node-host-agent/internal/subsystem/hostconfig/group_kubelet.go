@@ -152,7 +152,7 @@ var t17EmrBlockRe = regexp.MustCompile(`(?m)^evictionMinimumReclaim:[^\n]*\n( +[
 func emrDump(s string) string {
 	var b strings.Builder
 	in := false
-	for _, ln := range strings.Split(s, "\n") {
+	for ln := range strings.SplitSeq(s, "\n") {
 		if strings.HasPrefix(ln, "evictionMinimumReclaim:") {
 			in = true
 			continue

@@ -376,7 +376,14 @@ func NewKube(nodeName string, cs kubernetes.Interface) *Coord {
 			// during an apiserver flap.
 			gctx, cancel := context.WithTimeout(ctx, StampTimeout)
 			defer cancel()
-			n, err := cs.CoreV1().Nodes().Get(gctx, nodeName, metav1.GetOptions{})
+			// ResourceVersion "0": serve the node read from the
+			// apiserver's watch cache — the annotation view is a
+			// read-only best-effort input re-read every cycle
+			// (heal/remedy decisions ride latch budgets, so
+			// watch-cache lag moves nothing on its own) and the
+			// per-cycle quorum read + etcd fan-out is skipped.
+			n, err := cs.CoreV1().Nodes().Get(gctx, nodeName,
+				metav1.GetOptions{ResourceVersion: "0"})
 			if err != nil {
 				return nil, err
 			}

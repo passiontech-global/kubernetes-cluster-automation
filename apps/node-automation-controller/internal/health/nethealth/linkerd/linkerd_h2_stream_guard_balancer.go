@@ -45,45 +45,51 @@ func init() {
 // healthy balancer view), not the wedge seed.
 const linkerdProxyOOMWindow = 30 * time.Minute
 
-// oomkilledFresh reports whether a Termination is an OOMKilled whose
-// FinishedAt lands inside linkerdProxyOOMWindow of now (a zero
-// FinishedAt is unverifiable — not evidence).
-func oomkilledFresh(t *corev1.ContainerStateTerminated, now time.Time) bool {
-	return t != nil && t.Reason == "OOMKilled" &&
-		!t.FinishedAt.IsZero() &&
-		now.Sub(t.FinishedAt.Time) <= linkerdProxyOOMWindow
+// linkerdProxyOOMKill is the ONE linkerd-proxy OOM scan both checks
+// share (check-specific windows): it walks the proxy's status in BOTH
+// maps — current State AND LastTerminationState, regular containers
+// AND init containers (an init OOM leaves the pod un-Ready with a
+// proxy that never started) — and reports whether the freshest
+// OOMKilled termination lands inside window of now, plus the proxy's
+// restart count for the event dedup key (a fresh kill bumps it,
+// re-arming the event). A zero FinishedAt is unverifiable — not
+// evidence. linkerd-h2-stream-guard uses it as the wedge seed, the
+// sidecar-oom-guard as its whole signature; container names are
+// unique across a pod, so the map order cannot change the verdict.
+func linkerdProxyOOMKill(pod *corev1.Pod, now time.Time,
+	window time.Duration) (int, bool) {
+
+	for _, statuses := range [][]corev1.ContainerStatus{
+		pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses,
+	} {
+		for i := range statuses {
+			cs := &statuses[i]
+			if cs.Name != kube.LinkerdProxyContainer {
+				continue
+			}
+			fresh := func(t *corev1.ContainerStateTerminated) bool {
+				return t != nil && t.Reason == "OOMKilled" &&
+					!t.FinishedAt.IsZero() &&
+					now.Sub(t.FinishedAt.Time) <= window
+			}
+			if fresh(cs.State.Terminated) ||
+				fresh(cs.LastTerminationState.Terminated) {
+				return int(cs.RestartCount), true
+			}
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
-// linkerdProxyOOMKilled reports whether the pod's linkerd-proxy
-// container (sidecar or init — an init OOM leaves the pod
-// un-Ready with a proxy that never started, same wedge seed) last
-// terminated on OOMKilled within linkerdProxyOOMWindow. An OOM'd
-// proxy restarts with an empty connection table and re-learns its
-// balancer view, which is exactly how a client-side dead-channel
-// lockout starts.
+// linkerdProxyOOMKilled is the h2 guard's boolean view of the shared
+// scan: the pod's proxy terminated OOMKilled within
+// linkerdProxyOOMWindow. An OOM'd proxy restarts with an empty
+// connection table and re-learns its balancer view, which is exactly
+// how a client-side dead-channel lockout starts.
 func linkerdProxyOOMKilled(pod *corev1.Pod, now time.Time) bool {
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.Name != kube.LinkerdProxyContainer {
-			continue
-		}
-		if oomkilledFresh(cs.State.Terminated, now) ||
-			oomkilledFresh(cs.LastTerminationState.Terminated, now) {
-			return true
-		}
-	}
-	// Init containers: linkerd injects the proxy as an init container
-	// on injection shapes that mesh traffic before the app starts —
-	// an OOM there wedges the pod before the sidecar ever reports.
-	for _, cs := range pod.Status.InitContainerStatuses {
-		if cs.Name != kube.LinkerdProxyContainer {
-			continue
-		}
-		if oomkilledFresh(cs.State.Terminated, now) ||
-			oomkilledFresh(cs.LastTerminationState.Terminated, now) {
-			return true
-		}
-	}
-	return false
+	_, ok := linkerdProxyOOMKill(pod, now, linkerdProxyOOMWindow)
+	return ok
 }
 
 // linkerdTargetService parses a linkerd target_addr label back to the

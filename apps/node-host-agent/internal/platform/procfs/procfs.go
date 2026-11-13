@@ -16,7 +16,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -99,7 +99,7 @@ func (f FS) EnvValue(pid int, key string) string {
 		return ""
 	}
 	prefix := key + "="
-	for _, e := range strings.Split(string(data), "\x00") {
+	for e := range strings.SplitSeq(string(data), "\x00") {
 		if v, ok := strings.CutPrefix(e, prefix); ok {
 			return v
 		}
@@ -245,7 +245,7 @@ func (f FS) FindByComm(name string) int {
 	if err != nil {
 		return 0
 	}
-	sort.Ints(pids) // lowest pid wins — pgrep | head -1 parity
+	slices.Sort(pids) // lowest pid wins — pgrep | head -1 parity
 	for _, pid := range pids {
 		if comm, ok := f.comm(pid); ok && comm == name {
 			return pid

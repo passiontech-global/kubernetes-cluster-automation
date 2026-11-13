@@ -55,6 +55,13 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 		enobufs := 0 // overruns seen on THIS socket — warn throttle
 		for {
 			nr, err := unix.Read(fd, buf)
+			if errors.Is(err, unix.EINTR) {
+				// Interrupted syscall (a signal landing in the
+				// blocking read) — the fd itself is fine; retrying
+				// keeps the session instead of tearing it down and
+				// paying the reopen+backoff for nothing.
+				continue
+			}
 			if errors.Is(err, unix.ENOBUFS) {
 				enobufs++
 				// Receive queue overrun: DEL events were dropped —

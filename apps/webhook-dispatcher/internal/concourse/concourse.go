@@ -120,6 +120,11 @@ type Client struct {
 	// index mutex (or observe a half-built state).
 	authOnce sync.Once
 	authPtr  atomic.Pointer[atcAuth]
+
+	// now is the internal clock — nil means time.Now. Seam for the
+	// index tests: they advance it instead of sleeping across real
+	// TTL/backoff windows. Production code leaves it nil.
+	now func() time.Time
 }
 
 // statusError carries the HTTP status of a failed ATC call so callers
@@ -162,6 +167,33 @@ func (c *Client) SafeBaseURL() string {
 }
 
 func (c *Client) safeBaseURL() string { return c.SafeBaseURL() }
+
+// SameOriginRedirectPolicy builds an http.Client CheckRedirect that
+// allows redirects only back to the origin of base. CheckWebhook
+// carries the CI webhook token in the query string, so a redirect to
+// another host (a 30x a compromised/misconfigured ATC or an inline
+// proxy emits) would replay the credential to that host — never
+// follow one. Same-origin redirects stay allowed: a web node may
+// legitimately route /api/v1/... through a path rewrite on its own
+// host.
+func SameOriginRedirectPolicy(base string) func(*http.Request, []*http.Request) error {
+	bu, err := url.Parse(base)
+	scheme, host := "", ""
+	if err == nil {
+		scheme, host = bu.Scheme, bu.Host
+	}
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if req.URL.Scheme != scheme || req.URL.Host != host {
+			return fmt.Errorf(
+				"refusing cross-origin redirect from %s to %s — webhook_token would leak",
+				via[len(via)-1].URL.Host, req.URL.Host)
+		}
+		return nil
+	}
+}
 
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
@@ -258,6 +290,10 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 			return stripURLError(err)
 		}
 		if resp.StatusCode == http.StatusUnauthorized && usedToken != "" && attempt == 0 {
+			// Drain (bounded) BEFORE closing so the keep-alive
+			// connection survives into the retry instead of being
+			// dropped by the transport over unconsumed bytes.
+			_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
 			_ = resp.Body.Close()
 			// Invalidate only the token THIS request carried — a
 			// fresher token another worker already minted survives.

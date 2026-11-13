@@ -128,6 +128,20 @@ func (c *cyc) groupAPILB() {
 	// unit template — the table dies with the LB.
 	nftChanged := false
 	if vip := c.t.Vars.StrDef("api_lb_vip_ip", ""); vip != "" {
+		// The ruleset interpolates vip + ports verbatim — a control
+		// byte or non-numeric port would splice arbitrary nft syntax
+		// (and the DNAT ships with the LB unit, so a poisoned render
+		// would load at every ExecStartPost). Refuse → the group
+		// stops this cycle, nothing deploys.
+		if !c.shIPCIDR("api_lb_vip_ip", vip) {
+			return
+		}
+		ports := c.apiLBDnatPorts()
+		for _, p := range ports {
+			if !c.shPort("api_lb_extra_lanes dnat port", p) {
+				return
+			}
+		}
 		// runLong: same slow-egress budget as the haproxy deb —
 		// and only when nftables isn't already installed (the
 		// dpkg-query gate keeps converge from forking apt every
@@ -140,7 +154,7 @@ func (c *cyc) groupAPILB() {
 			}
 		}
 		var rules strings.Builder
-		for _, p := range c.apiLBDnatPorts() {
+		for _, p := range ports {
 			fmt.Fprintf(&rules, "        ip daddr %s tcp dport %s dnat to 127.0.0.1:%s\n", vip, p, p)
 		}
 		nft := fmt.Sprintf(`# Managed by node-config-agent - root-netns DNAT %s -> 127.0.0.1

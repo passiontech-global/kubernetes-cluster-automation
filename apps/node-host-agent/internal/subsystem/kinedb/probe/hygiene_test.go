@@ -263,7 +263,7 @@ func TestProbeHygieneMultiXactQueryFailure(t *testing.T) {
 	if !strings.Contains(content, "# TYPE kine_db_multixact_age_transactions") {
 		t.Fatalf("header missing:\n%s", content)
 	}
-	for _, l := range strings.Split(content, "\n") {
+	for l := range strings.SplitSeq(content, "\n") {
 		if strings.HasPrefix(l, "kine_db_multixact_age_transactions ") {
 			t.Fatalf("fabricated a sample on query failure:\n%s", content)
 		}
@@ -692,7 +692,7 @@ func TestEmitXactTextfileHeadersWithoutSamples(t *testing.T) {
 		"kine_db_orphan_prepared_xacts",
 		"kine_db_large_object_bytes",
 	} {
-		for _, line := range strings.Split(content, "\n") {
+		for line := range strings.SplitSeq(content, "\n") {
 			if strings.HasPrefix(line, name+" ") {
 				t.Fatalf("sample %q emitted without aSeen flag:\n%s", line, content)
 			}
@@ -780,7 +780,7 @@ func TestProbeLargeKeysQueryFailure(t *testing.T) {
 	if !strings.Contains(content, "# HELP kine_db_large_object_bytes") {
 		t.Fatalf("header-only family missing:\n%s", content)
 	}
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		if strings.HasPrefix(line, "kine_db_large_object_bytes{") {
 			t.Fatalf("fabricated sample on census failure:\n%s", content)
 		}
@@ -815,7 +815,7 @@ func TestProbeLargeKeysEmptyAndEscaped(t *testing.T) {
 	if !strings.Contains(content, "# HELP kine_db_large_object_bytes") {
 		t.Fatalf("empty census dropped the family header:\n%s", content)
 	}
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		if strings.HasPrefix(line, "kine_db_large_object_bytes{") {
 			t.Fatalf("phantom sample on empty census:\n%s", content)
 		}

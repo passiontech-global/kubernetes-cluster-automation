@@ -10,7 +10,7 @@ package partitionevictor
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -178,7 +178,7 @@ func (s *partitionSweep) sortedFlagged() []string {
 	for name := range s.flagged {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names
 }
 
@@ -189,7 +189,7 @@ func (s *partitionSweep) sortedAction() []string {
 	for name := range s.action {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names
 }
 

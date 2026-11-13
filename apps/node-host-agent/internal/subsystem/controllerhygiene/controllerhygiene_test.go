@@ -197,7 +197,7 @@ func TestRunCycleDeadlineAbortsStall(t *testing.T) {
 func countLogLines(t *testing.T, e *env, needle string) int {
 	t.Helper()
 	n := 0
-	for _, l := range strings.Split(e.LogLines(), "\n") {
+	for l := range strings.SplitSeq(e.LogLines(), "\n") {
 		if strings.Contains(l, needle) {
 			n++
 		}

@@ -20,7 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
@@ -175,24 +174,10 @@ var dataMovementStuckPhases = map[string]bool{
 	"Canceling":  true,
 }
 
-// veleroDataMovementWedgedGauge marks (1) each DataUpload or
-// DataDownload stuck in an in-flight phase past the 6h window —
-// mark-only: unlike a PodVolumeBackup there is no provably-dead
-// node-agent thread to bounce a delete would safely restart, so the
-// wedged object pages and waits for operator/velero cleanup.
-var veleroDataMovementWedgedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "node_automation_velero_data_movement_wedged",
-	Help: "1 while a velero.io/v2alpha1 DataUpload/DataDownload is stuck in an in-flight phase (InProgress/Accepted/Prepared/Canceling) past 6h — cnpg-backup-audit.",
-}, []string{"namespace", "name", "kind"})
-
-func init() {
-	ctrlmetrics.Registry.MustRegister(veleroDataMovementWedgedGauge)
-}
-
 // auditDataMovement scans DataUpload and DataDownload objects for
 // wedged in-flight phases, marking
-// veleroDataMovementWedgedGauge{namespace,name,kind} and pruning the
-// series the moment the object resolves or is deleted. CRD absence
+// metrics.VeleroDataMovementWedged{namespace,name,kind} and pruning
+// the series the moment the object resolves or is deleted. CRD absence
 // (clusters without the data-mover CRDs installed) is a quiet no-op,
 // same contract as the rest of the module.
 func (a *veleroBackupAuditor) auditDataMovement(ctx context.Context) error {
@@ -225,14 +210,14 @@ func (a *veleroBackupAuditor) auditDataMovement(ctx context.Context) error {
 				continue
 			}
 			k := kind + "/" + u.GetNamespace() + "/" + u.GetName()
-			a.seenDataMovement.Set(veleroDataMovementWedgedGauge, 1, k,
+			a.seenDataMovement.Set(metrics.VeleroDataMovementWedged, 1, k,
 				u.GetNamespace(), u.GetName(), kind)
 			log.Info("velero data movement object wedged in-flight >6h",
 				"kind", kind, "object", u.GetNamespace()+"/"+u.GetName(),
 				"phase", phase)
 		}
 	}
-	a.seenDataMovement.Prune(veleroDataMovementWedgedGauge.DeleteLabelValues)
+	a.seenDataMovement.Prune(metrics.VeleroDataMovementWedged.DeleteLabelValues)
 	return nil
 }
 

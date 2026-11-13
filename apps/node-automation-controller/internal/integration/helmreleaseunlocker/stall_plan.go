@@ -9,9 +9,10 @@
 package helmreleaseunlocker
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -85,8 +86,8 @@ func (u *helmReleaseUnlocker) deadlockPlan(ctx context.Context,
 			"deployment %s/%s has %d ReplicaSets — no old/new pair to relieve",
 			dep.Namespace, dep.Name, len(owned)), nil
 	}
-	sort.Slice(owned, func(i, j int) bool {
-		return rsRevision(owned[i]) > rsRevision(owned[j])
+	slices.SortFunc(owned, func(a, b *appsv1.ReplicaSet) int {
+		return cmp.Compare(rsRevision(b), rsRevision(a))
 	})
 	newRS := owned[0]
 	if ptr.Deref(newRS.Spec.Replicas, 0) <= 0 {

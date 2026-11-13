@@ -159,7 +159,7 @@ func TestWorkerInitScaffoldPermOwnership(t *testing.T) {
 	var chowned []string
 	cfg := testConfig(t, func(c *Config) {
 		c.OwnerUID, c.OwnerGID = cacheOwner, cacheOwner
-		c.chown = func(name string, uid, gid int) error {
+		c.chown = func(name string, _ int, uid, gid int) error {
 			if uid != cacheOwner || gid != cacheOwner {
 				t.Fatalf("chown %s to %d:%d, want %d", name, uid, gid, cacheOwner)
 			}
@@ -348,7 +348,7 @@ func TestWorkerInitWorkDirIsFile(t *testing.T) {
 func TestWorkerInitChownErrorFails(t *testing.T) {
 	cfg := testConfig(t, func(c *Config) {
 		c.OwnerUID, c.OwnerGID = cacheOwner, cacheOwner
-		c.chown = func(string, int, int) error { return os.ErrPermission }
+		c.chown = func(string, int, int, int) error { return os.ErrPermission }
 	})
 	seedWorkDir(t, cfg.WorkDir)
 
@@ -487,14 +487,15 @@ func TestWorkerInitScaffoldMkdirFails(t *testing.T) {
 	}
 }
 
-// A symlink named like a keep-list dir survives the wipe (the name
-// match keeps it) but the chown/chmod pass skips it via Lstat —
-// dereferencing would chmod whatever host path it points at.
+// A symlink named like a keep-list dir is removed and replaced by a
+// real scaffold dir — the old Lstat-skip left the link in place,
+// where the perm pass could be swapped onto it (TOCTOU) and any
+// later MkdirAll would ride it onto the target.
 func TestWorkerInitSkipsPersistentSymlink(t *testing.T) {
 	var chowned []string
 	cfg := testConfig(t, func(c *Config) {
 		c.OwnerUID, c.OwnerGID = cacheOwner, cacheOwner
-		c.chown = func(name string, _, _ int) error {
+		c.chown = func(name string, _, _, _ int) error {
 			chowned = append(chowned, name)
 			return nil
 		}
@@ -508,14 +509,24 @@ func TestWorkerInitSkipsPersistentSymlink(t *testing.T) {
 	if err := WorkerInit(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	if slices.Contains(chowned, filepath.Join(sc, "go-mod")) {
-		t.Fatal("symlinked keep-list dir was chowned")
-	}
-	fi, err := os.Stat(outside)
+	// The link is gone; a real scaffold dir stands in its place.
+	fi, err := os.Lstat(filepath.Join(sc, "go-mod"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() == 0o777 {
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		t.Fatalf("go-mod = %v — want a real directory, not the link", fi.Mode())
+	}
+	// The chown saw only the recreated dir (by path, on an fd).
+	if !slices.Contains(chowned, filepath.Join(sc, "go-mod")) {
+		t.Fatal("recreated scaffold dir was not chowned")
+	}
+	// The link target is untouched.
+	to, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if to.Mode().Perm() == 0o777 {
 		t.Fatal("chmod dereferenced the symlink onto the target")
 	}
 }

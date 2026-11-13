@@ -533,40 +533,75 @@ func TestRunCanaryFailures(t *testing.T) {
 	}
 }
 
-// The standalone log path is predictable (/tmp/etcd-standalone.log)
-// and opened as root — a planted symlink must be refused BEFORE
-// O_TRUNC can clobber the target.
-func TestStartTempEtcdRejectsSymlinkLog(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "victim")
-	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+// The standalone log lives in a fresh unpredictable 0700 dir —
+// nothing pre-plantable at a fixed /tmp path is ever opened.
+func TestStartTempEtcdUsesPrivateTempDir(t *testing.T) {
+	parent := t.TempDir()
+	// A hostile fixed-path plant must simply never be touched.
+	link := filepath.Join(parent, "etcd-standalone.log")
+	if err := os.Symlink("/nonexistent-victim", link); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(dir, "etcd-standalone.log")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatal(err)
+	_, err := startTempEtcdExec(context.Background(),
+		"/nonexistent/etcd", nil, parent)
+	if err == nil {
+		t.Fatal("expected exec failure for missing etcd binary")
 	}
-	if _, err := startTempEtcdExec(context.Background(),
-		"/nonexistent/etcd", nil, link); err == nil {
-		t.Fatal("expected refusal for symlinked log path")
+	// The link was ignored (CreateTemp names its own file).
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("pre-existing entry disturbed: %v", err)
 	}
-	body, err := os.ReadFile(target)
+	ents, err := os.ReadDir(parent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "keep" {
-		t.Fatalf("symlink target clobbered: %q", body)
+	var logDir string
+	for _, e := range ents {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "etcd-standalone-") {
+			logDir = filepath.Join(parent, e.Name())
+		}
+	}
+	if logDir == "" {
+		t.Fatal("no private log dir created")
+	}
+	fi, err := os.Stat(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf("log dir mode %o want 0700", fi.Mode().Perm())
 	}
 }
 
-// A regular log path is created 0600 (the exec then fails on the
-// missing binary — this only proves the file side).
+// The log file itself is created O_EXCL (unpredictable name) 0600 —
+// the exec then fails on the missing binary; this only proves the
+// file side.
 func TestStartTempEtcdCreatesLog0600(t *testing.T) {
-	logPath := filepath.Join(t.TempDir(), "etcd-standalone.log")
+	parent := t.TempDir()
 	_, err := startTempEtcdExec(context.Background(),
-		"/nonexistent/etcd", nil, logPath)
+		"/nonexistent/etcd", nil, parent)
 	if err == nil {
 		t.Fatal("expected exec failure for missing etcd binary")
+	}
+	dents, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logPath string
+	for _, e := range dents {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "etcd-standalone-") {
+			sub, serr := os.ReadDir(filepath.Join(parent, e.Name()))
+			if serr != nil {
+				t.Fatal(serr)
+			}
+			if len(sub) != 1 {
+				t.Fatalf("want exactly one log file, got %d", len(sub))
+			}
+			logPath = filepath.Join(parent, e.Name(), sub[0].Name())
+		}
+	}
+	if logPath == "" {
+		t.Fatal("log file not created")
 	}
 	fi, err := os.Stat(logPath)
 	if err != nil {

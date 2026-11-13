@@ -253,9 +253,10 @@ func TestNoteJournalReadNoStorageNeverFires(t *testing.T) {
 
 func TestJournalSinceLayout(t *testing.T) {
 	// The wall-clock contract the shell probes share — the argv
-	// must carry the plain "2006-01-02 15:04:05" form.
+	// must carry the plain "2006-01-02 15:04:05" form. The const
+	// lives with the argv builders (platform/journalwatch).
 	ts := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
-	if got := ts.Format(journalSinceLayout); got != "2026-03-04 05:06:07" {
+	if got := ts.Format(journalwatch.SinceLayout); got != "2026-03-04 05:06:07" {
 		t.Fatalf("since layout rendered %q", got)
 	}
 }

@@ -18,6 +18,7 @@
 package cdeps
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"fmt"
@@ -233,12 +234,51 @@ func (s *Seams) applyDefaults(c *Config) {
 	}
 	if s.KCMMetricsFn == nil {
 		s.KCMMetricsFn = func(ctx context.Context, url string) (string, error) {
-			return probee.HTTPBodyInsecure(ctx, url, 8*time.Second)
+			// Streamed with the same 4 MiB bound the old whole-body
+			// cap carried — now a kept-lines budget, so a huge KCM
+			// scrape with tiny workqueue families parses instead of
+			// erroring the probe away.
+			return probee.HTTPBodyStreamInsecure(ctx, url, 8*time.Second,
+				keepKCMetricsLine, 4<<20)
 		}
 	}
 	if s.TLSCertFn == nil {
 		s.TLSCertFn = tlsDialCert
 	}
+}
+
+// kcmMetricsPrefixes are the exposition families the two
+// KCMMetricsFn consumers switch on — leader_election_master_status +
+// the workqueue trio (cp_freeze_heal's kcmLeaderRe/kcmWorkqueueRe
+// stall snapshot) and the konnectivity ready-backends gauge
+// (konnectivity_heal's konnReadyMetric; the literal lives here
+// because apiserver imports cdeps, never the reverse). A multi-MiB
+// KCM scrape collapses to these lines before it becomes a string.
+// Keeping a few same-prefix non-sample lines is parse-safe: the
+// regexes anchor and demand a value, and HELP/TYPE never matched
+// them.
+var kcmMetricsPrefixes = [][]byte{
+	[]byte("leader_election_master_status"),
+	[]byte("workqueue_depth"),
+	[]byte("workqueue_adds_total"),
+	[]byte("workqueue_retries_total"),
+	[]byte("konnectivity_network_proxy_server_ready_backend_connections"),
+}
+
+// keepKCMetricsLine is the KCMMetricsFn stream filter. The prefix
+// test runs on the leading-whitespace-trimmed line — the konn
+// parser trims before matching, so a (never-in-exposition) padded
+// line must survive the filter to reach it, while the kcm regexes'
+// ^ anchors simply fail on the re-joined padded line exactly as
+// they did on the full body.
+func keepKCMetricsLine(ln []byte) bool {
+	trimmed := bytes.TrimLeft(ln, " \t")
+	for _, p := range kcmMetricsPrefixes {
+		if bytes.HasPrefix(trimmed, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // statfsFreeBytes returns the free and total byte counts of the

@@ -42,7 +42,7 @@ func TestPortsGuardInetTableTightened(t *testing.T) {
 	// The blanket pod/VLAN accepts must stay gone — the ONLY pod-iface
 	// rules allowed are the dport-scoped hubble-peer exemptions.
 	for _, iface := range []string{`iifname "cilium*"`, `iifname "lxc*"`, `iifname "cali*"`} {
-		for _, line := range strings.Split(portsNFT, "\n") {
+		for line := range strings.SplitSeq(portsNFT, "\n") {
 			if strings.Contains(line, iface) && !strings.Contains(line, "tcp dport") {
 				t.Fatalf("ports guard still opens %s unscoped — the tenant-pod path the roadmap closes:\n%s",
 					iface, portsNFT)

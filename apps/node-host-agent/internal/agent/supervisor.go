@@ -65,11 +65,9 @@ func superviseHealthyRun(elapsed, backoff time.Duration) bool {
 // shutdown instead of abandoning the loops mid-flight.
 func (a *Agent) supervise(ctx context.Context, wg *sync.WaitGroup) {
 	for _, sub := range a.cfg.Subsystems {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			a.superviseSubsystem(ctx, sub)
-		}()
+		})
 	}
 }
 
@@ -85,10 +83,15 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	up := a.subUp.WithLabelValues(name)
 	restarts := a.restarts.WithLabelValues(name)
 	// Liveness registry: /healthz reads per-loop staleness while
-	// active is set — registered for the supervise goroutine's
-	// whole life so a subsystem that never reaches Run still gets
-	// judged on its run-entry stamp.
-	sb := &subBeat{live: cycle.NewLiveness()}
+	// active is set. The registry is RENEWED at the top of every
+	// Run attempt (atomic.Pointer — /healthz reads it
+	// concurrently), so a panic-recovered restart never inherits
+	// the dead run's stamps: their age would trip the staleness
+	// check ~15 minutes after every recovery and get a healthy
+	// agent killed. Runner loops additionally unregister their
+	// own beats on exit (cycle.Runner.Run); a genuinely hung loop
+	// — the one case that never exits — still reports stale.
+	sb := &subBeat{}
 	a.beats.Store(name, sb)
 	defer a.beats.Delete(name)
 	// Restart backoff doubles per early exit (5s → 5m cap) so a
@@ -124,6 +127,9 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 	}()
 	for {
 		began := time.Now()
+		// Fresh registry per attempt — the old one dies with the
+		// run that exited, stale stamps and all.
+		sb.live.Store(cycle.NewLiveness())
 		up.Set(1)
 		sb.active.Store(true)
 		// Run-entry stamp doubles as the startup grace: the first
@@ -131,7 +137,7 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		// /healthz can call the subsystem wedged. It lands on the
 		// shared fallback beat — Runner loops stamp their own
 		// beats from inside Run.
-		lctx := cycle.WithLiveness(ctx, sb.live)
+		lctx := cycle.WithLiveness(ctx, sb.live.Load())
 		cycle.Heartbeat(lctx)
 		done := make(chan struct{})
 		go func() {

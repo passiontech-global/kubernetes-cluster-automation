@@ -4,7 +4,7 @@
 package fileconf
 
 import (
-	"reflect"
+	"maps"
 	"testing"
 )
 
@@ -101,7 +101,7 @@ func TestParseShellKV(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ParseShellKV(tc.in)
-			if !reflect.DeepEqual(got, tc.want) {
+			if !maps.Equal(got, tc.want) {
 				t.Fatalf("ParseShellKV(%q)=%v want %v", tc.in, got, tc.want)
 			}
 		})

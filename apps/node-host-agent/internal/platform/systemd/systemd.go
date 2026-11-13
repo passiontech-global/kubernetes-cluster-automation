@@ -24,6 +24,7 @@
 //	systemctl is-active <u>        -> Active / IsActive
 //	systemctl show -p LoadState <u> -> Exists / UnitExists (WD_REQUIRES unit:<n>)
 //	systemctl show -p ActiveEnterTimestampMonotonic --value -> ActiveAge
+//	systemctl show -p MainPID --value        -> MainPID
 //	systemctl is-enabled <u>       -> Enabled / IsEnabled
 //	systemctl restart <u>          -> Restart
 //	systemctl stop <u>             -> Stop
@@ -38,6 +39,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -340,117 +342,31 @@ func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, err
 	return c.cliActiveAge(ctx, unit)
 }
 
-// Restart mirrors `systemctl restart <unit>`.
-func (c *Client) Restart(ctx context.Context, unit string) error {
+// MainPID mirrors `systemctl show -p MainPID --value <unit>` — the
+// unit's main process pid, 0 when the unit is inactive, masked or
+// not-found (systemctl answers 0 with exit 0 for all of those). A
+// probe failure (dbus down, systemctl missing) returns an error so
+// callers never read a failed probe as "pid 0".
+func (c *Client) MainPID(ctx context.Context, unit string) (uint32, error) {
 	if c.dbus != nil {
-		if err := c.dbus.dbusJob(ctx, unit, "restart"); err == nil {
-			return nil
-		} else if !c.dbusUnavailable(err) {
-			return err
+		pid, err := c.dbus.dbusMainPID(ctx, unit)
+		if err == nil {
+			return pid, nil
+		}
+		if !c.dbusUnavailable(err) {
+			return 0, err
 		}
 	}
-	out, err := c.systemctl(ctx, "restart", unit)
+	out, err := c.systemctl(ctx, "show", unit, "-p", "MainPID", "--value")
 	if err != nil {
-		return fmt.Errorf("systemctl restart %s: %w (%s)", unit, err,
-			strings.TrimSpace(out))
+		return 0, fmt.Errorf("systemctl show MainPID %s: %w", unit, err)
 	}
-	return nil
-}
-
-// Stop mirrors `systemctl stop <unit>` — the same blocking job-wait
-// contract as Restart (the D-Bus StopUnit job completion is awaited,
-// not just the enqueue). Fallback rules match Restart: only a
-// connection-level failure retries over systemctl, never a method-
-// level error (a stop that reported failure must not be re-issued
-// through a second transport).
-func (c *Client) Stop(ctx context.Context, unit string) error {
-	if c.dbus != nil {
-		if err := c.dbus.dbusJob(ctx, unit, "stop"); err == nil {
-			return nil
-		} else if !c.dbusUnavailable(err) {
-			return err
-		}
+	pid, perr := strconv.ParseUint(strings.TrimSpace(out), 10, 32)
+	if perr != nil {
+		return 0, fmt.Errorf("systemctl show MainPID %s: unparsable %q",
+			unit, strings.TrimSpace(out))
 	}
-	out, err := c.systemctl(ctx, "stop", unit)
-	if err != nil {
-		return fmt.Errorf("systemctl stop %s: %w (%s)", unit, err,
-			strings.TrimSpace(out))
-	}
-	return nil
-}
-
-// ReloadOrRestart mirrors `systemctl reload-or-restart <unit>`.
-func (c *Client) ReloadOrRestart(ctx context.Context, unit string) error {
-	if c.dbus != nil {
-		if err := c.dbus.dbusJob(ctx, unit, "reload-or-restart"); err == nil {
-			return nil
-		} else if !c.dbusUnavailable(err) {
-			return err
-		}
-	}
-	out, err := c.systemctl(ctx, "reload-or-restart", unit)
-	if err != nil {
-		return fmt.Errorf("systemctl reload-or-restart %s: %w (%s)",
-			unit, err, strings.TrimSpace(out))
-	}
-	return nil
-}
-
-// Signal mirrors `systemctl kill -s <sig> <unit>` — used to signal the
-// unit's main processes (e.g. SIGUSR1 coredns reload paths) without a
-// full restart.
-func (c *Client) Signal(ctx context.Context, unit, sig string) error {
-	if c.dbus != nil {
-		if err := c.dbus.dbusSignal(ctx, unit, sig); err == nil {
-			return nil
-		} else if !c.dbusUnavailable(err) {
-			return err
-		}
-	}
-	out, err := c.systemctl(ctx, "kill", "-s", sig, unit)
-	if err != nil {
-		return fmt.Errorf("systemctl kill -s %s %s: %w (%s)",
-			sig, unit, err, strings.TrimSpace(out))
-	}
-	return nil
-}
-
-// ResetFailed mirrors `systemctl reset-failed <unit>` for a single
-// named unit — the D-Bus ResetFailedUnit call. Callers holding a
-// glob (`reset-failed cri-*.scope`) resolve the unit set via
-// ListUnitsByPatterns first and call this per name, matching how
-// systemctl itself expands the pattern client-side.
-func (c *Client) ResetFailed(ctx context.Context, unit string) error {
-	if c.dbus != nil {
-		if err := c.dbus.dbusResetFailed(ctx, unit); err == nil {
-			return nil
-		} else if !c.dbusUnavailable(err) {
-			return err
-		}
-	}
-	out, err := c.systemctl(ctx, "reset-failed", unit)
-	if err != nil {
-		return fmt.Errorf("systemctl reset-failed %s: %w (%s)",
-			unit, err, strings.TrimSpace(out))
-	}
-	return nil
-}
-
-// DaemonReload mirrors `systemctl daemon-reload`.
-func (c *Client) DaemonReload(ctx context.Context) error {
-	if c.dbus != nil {
-		if err := c.dbus.dbusDaemonReload(ctx); err == nil {
-			return nil
-		} else if !c.dbusUnavailable(err) {
-			return err
-		}
-	}
-	out, err := c.systemctl(ctx, "daemon-reload")
-	if err != nil {
-		return fmt.Errorf("systemctl daemon-reload: %w (%s)", err,
-			strings.TrimSpace(out))
-	}
-	return nil
+	return uint32(pid), nil
 }
 
 // ListUnits mirrors `systemctl list-units --all --no-legend

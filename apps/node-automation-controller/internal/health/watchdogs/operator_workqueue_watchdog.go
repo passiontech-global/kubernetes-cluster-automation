@@ -9,7 +9,7 @@ package watchdogs
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -163,7 +163,7 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 			for r := range scan.reasonsFrozen {
 				reasons = append(reasons, r)
 			}
-			sort.Strings(reasons)
+			slices.Sort(reasons)
 			p.healOperatorLeader(ctx, log, op, lease, reasons, now)
 		}
 	}

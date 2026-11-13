@@ -277,20 +277,21 @@ func TestRouteGuardDebounceLoopBatches(t *testing.T) {
 	done := make(chan struct{})
 	var calls atomic.Int32
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		routeGuardDebounceLoop(ctx, events, done, 20*time.Millisecond, 0,
 			func(context.Context) { calls.Add(1) })
-	}()
-	// Burst of 5 events, 5ms apart (< 20ms window) → one restore.
-	for i := 0; i < 5; i++ {
+	})
+	// Burst of 5 events (buffered channel, sent unspaced) → one
+	// restore: every receive re-arms the same 20ms window, so the
+	// fire lands once, 20ms after the LAST event.
+	for range 5 {
 		events <- struct{}{}
-		time.Sleep(5 * time.Millisecond)
 	}
 	waitForCond(t, 2*time.Second, func() bool { return calls.Load() == 1 })
-	// A quiet gap then a single event → a second restore.
-	time.Sleep(60 * time.Millisecond)
+	// A quiet gap then a single event → a second restore. calls==1
+	// already proves the first window fired and the reconcile
+	// returned (it runs synchronously in the loop), so the next
+	// event opens a fresh window with no extra settling time.
 	events <- struct{}{}
 	waitForCond(t, 2*time.Second, func() bool { return calls.Load() == 2 })
 	cancel()
@@ -314,7 +315,9 @@ func TestRouteGuardDebounceLoopDoneAborts(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("debounce loop did not exit on done")
 	}
-	time.Sleep(20 * time.Millisecond)
+	// No settle time needed: the loop has RETURNED (finished closed),
+	// and it is the only goroutine that can reach reconcile — a
+	// pending timer tick it never consumed dies with it.
 	if calls.Load() != 0 {
 		t.Fatal("reconcile fired after done")
 	}
@@ -352,25 +355,35 @@ func TestRouteGuardDebounceLoopRateLimits(t *testing.T) {
 	events := make(chan struct{}, 16)
 	done := make(chan struct{})
 	var calls atomic.Int32
+	var firstAt, secondAt atomic.Int64
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		routeGuardDebounceLoop(ctx, events, done, 10*time.Millisecond,
-			80*time.Millisecond, func(context.Context) { calls.Add(1) })
-	}()
+			80*time.Millisecond, func(context.Context) {
+				if calls.Add(1) == 1 {
+					firstAt.Store(time.Now().UnixNano())
+				} else {
+					secondAt.Store(time.Now().UnixNano())
+				}
+			})
+	})
 	// First burst → immediate restore (no restore inside the window).
 	events <- struct{}{}
 	waitForCond(t, 2*time.Second, func() bool { return calls.Load() == 1 })
 
 	// Second burst inside the 80ms window → suppressed, not dropped:
-	// nothing fires now, one restore lands at the window's end.
+	// one restore lands at the window's end, no earlier than the min
+	// interval after the first. Checking the GAP between the two
+	// restores (≥ 60ms, safely under the 80ms window and far above
+	// the sub-millisecond fire a broken suppression would produce)
+	// pins both halves without a blind in-window sleep — a restore
+	// that fired at burst time would show a gap of ~0.
 	events <- struct{}{}
-	time.Sleep(30 * time.Millisecond)
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("restore fired inside min interval: calls=%d", got)
-	}
 	waitForCond(t, 2*time.Second, func() bool { return calls.Load() == 2 })
+	gap := time.Unix(0, secondAt.Load()).Sub(time.Unix(0, firstAt.Load()))
+	if gap < 60*time.Millisecond {
+		t.Fatalf("restore fired inside min interval: gap=%v", gap)
+	}
 	cancel()
 	wg.Wait()
 }
@@ -515,11 +528,9 @@ func TestRouteGuardEventDrivesRestore(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		e.n.routeGuard(ctx)
-	}()
+	})
 	// The monitor entry runs an up-front restore (bash parity).
 	waitForCond(t, 2*time.Second, func() bool { return restoredCount(e) >= 1 })
 
@@ -611,11 +622,9 @@ func TestRouteGuardBindFailureStillRestores(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		e.n.routeGuard(ctx)
-	}()
+	})
 	waitForCond(t, 2*time.Second, func() bool { return restoredCount(e) >= 1 })
 	waitForCond(t, 2*time.Second, func() bool {
 		return promtest.ToFloat64(e.n.cycles.WithLabelValues(
@@ -651,8 +660,18 @@ func TestRouteGuardRespawnsAfterExit(t *testing.T) {
 	}
 	defer func() { _ = unix.Close(fds[1]) }()
 	var opens atomic.Int32
+	stacked := make(chan struct{}, 1)
 	e.n.cfg.openRouteSocket = func() (int, error) {
-		opens.Add(1)
+		if opens.Add(1) > 1 {
+			// Any open beyond the first guard reaches here — the
+			// probe below only listens while exactly one guard is
+			// meant to exist; the legit respawn's signal stays
+			// buffered and unread.
+			select {
+			case stacked <- struct{}{}:
+			default:
+			}
+		}
 		return fds[0], nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -664,11 +683,15 @@ func TestRouteGuardRespawnsAfterExit(t *testing.T) {
 	waitForCond(t, 2*time.Second, func() bool { return opens.Load() >= 1 })
 
 	// A concurrent spawn attempt while the guard is alive must not
-	// stack a second guard.
+	// stack a second guard. Bounded absence probe: a stacked guard
+	// calls the fake within microseconds of the spawn, so this
+	// fails the moment the bug happens instead of after a blind
+	// sleep.
 	e.n.spawnRouteGuard(ctx)
-	time.Sleep(100 * time.Millisecond)
-	if got := opens.Load(); got != 1 {
-		t.Fatalf("routeGuard stacked a second guard: opens=%d", got)
+	select {
+	case <-stacked:
+		t.Fatal("routeGuard stacked a second guard")
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	cancel()
@@ -729,24 +752,29 @@ func TestRouteGuardNoScriptNeverOpensSocket(t *testing.T) {
 	e := fixture(t, &watchdogconf.Config{NebulaNet: "interdc"})
 	root := filepath.Dir(e.state)
 	e.n.cfg.HostRoot = root // no nebula-up.sh under root
-	opened := atomic.Bool{}
+	opened := make(chan struct{}, 1)
 	e.n.cfg.openRouteSocket = func() (int, error) {
-		opened.Store(true)
+		select {
+		case opened <- struct{}{}:
+		default:
+		}
 		return -1, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		e.n.routeGuard(ctx)
-	}()
-	time.Sleep(100 * time.Millisecond)
+	})
+	// Bounded absence probe: a wrong bind happens on the guard's
+	// first loop pass, so this fails the moment it does — the 100ms
+	// window is the same the blind sleep gave, minus the polling.
+	select {
+	case <-opened:
+		t.Fatal("socket bound without nebula-up.sh")
+	case <-time.After(100 * time.Millisecond):
+	}
 	cancel()
 	wg.Wait()
-	if opened.Load() {
-		t.Fatal("socket bound without nebula-up.sh")
-	}
 }
 
 // --- shared helpers ---
@@ -837,11 +865,9 @@ func TestRouteGuardSetnsDeadExits(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		e.n.routeGuard(ctx)
-	}()
+	})
 	waitForCond(t, 2*time.Second, func() bool {
 		return promtest.ToFloat64(e.n.cycles.WithLabelValues(
 			checkRouteGuard, "setns_dead")) >= 1
@@ -880,11 +906,9 @@ func TestRouteGuardBindFailureLoopRetries(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		e.n.routeGuard(ctx)
-	}()
+	})
 	waitForCond(t, 6*time.Second, func() bool {
 		return promtest.ToFloat64(e.n.cycles.WithLabelValues(
 			checkRouteGuard, "open_error")) >= 2
@@ -905,11 +929,9 @@ func TestRouteGuardDefaultOpen(t *testing.T) {
 	e.n.cfg.routeMinRestore = 20 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		e.n.routeGuard(ctx)
-	}()
+	})
 	// Any of the three environment outcomes must be observable —
 	// and none may hang or crash.
 	waitForCond(t, 3*time.Second, func() bool {

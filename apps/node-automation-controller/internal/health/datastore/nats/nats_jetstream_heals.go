@@ -10,7 +10,7 @@ package nats
 
 import (
 	"context"
-	"sort"
+	"slices"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -36,7 +36,7 @@ func (s *natsSweep) bounceWedged(ctx context.Context) {
 	for key := range s.podReasons {
 		bounceKeys = append(bounceKeys, key)
 	}
-	sort.Strings(bounceKeys)
+	slices.Sort(bounceKeys)
 	for _, key := range bounceKeys {
 		rs := s.podReasons[key]
 		pod := s.census.memberByName[key]

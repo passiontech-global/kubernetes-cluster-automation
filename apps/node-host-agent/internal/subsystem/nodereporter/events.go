@@ -151,17 +151,20 @@ func (r *Reporter) emitEvent(ctx context.Context, reason, note string, eventType
 	// maxEventNote bytes store an identical Note, so they must share
 	// one dedup entry — keying on the untruncated note would create
 	// distinct Events with identical content. The cut snaps back to
-	// a rune boundary and ToValidUTF8 strips any remaining invalid
-	// bytes: the apiserver stores Note as a UTF-8 string and rejects
-	// invalid input, so a garbage log line must not wedge its Event
-	// create permanently.
+	// a rune boundary. The UTF-8 scrub runs on EVERY branch, not just
+	// the truncated ones: the apiserver stores Note as a UTF-8 string
+	// and rejects invalid input, so a garbage log line shorter than
+	// the cap must not wedge its Event create permanently either
+	// (the unchecked branch made syncLogEvents/npd re-emit — and
+	// re-fail — the same line forever).
 	if len(note) > maxEventNote {
 		i := maxEventNote
 		for i > 0 && !utf8.RuneStart(note[i]) {
 			i--
 		}
-		note = strings.ToValidUTF8(note[:i], "")
+		note = note[:i]
 	}
+	note = strings.ToValidUTF8(note, "")
 	key := reason + "\x1f" + note
 
 	if e, ok := r.emittedEvts[key]; ok && now.Sub(e.at) <= r.cfg.EventDedupTTL {

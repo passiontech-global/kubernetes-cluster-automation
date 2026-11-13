@@ -19,7 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envdoc"
@@ -94,7 +94,7 @@ func TestEnvDocCoversSource(t *testing.T) {
 	for name := range where {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	t.Logf("scanned source: %d distinct env vars", len(names))
 
 	for _, name := range names {

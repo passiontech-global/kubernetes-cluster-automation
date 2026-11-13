@@ -89,9 +89,9 @@ const (
 	// vaDeleteCap bounds detach calls per cycle — a wrong verdict
 	// must never detach more than a handful of volumes at once.
 	vaDeleteCap = 10
-	// vaOutOfServiceTaint is the Kubernetes-native "node is fenced"
-	// signal — the same key dead-node-sweeper sets.
-	vaOutOfServiceTaint = "node.kubernetes.io/out-of-service"
+	// The node fence key is the shared kube.TaintNodeOutOfService —
+	// the Kubernetes-native "node is fenced" signal, the same key
+	// dead-node-sweeper sets.
 	// vaStuckTerminatingAge: a VA already carrying a DeletionTimestamp
 	// this long whose node is gone or fenced-and-empty is a wedged
 	// attach-detach cleanup — the external-attacher finalizer never
@@ -154,7 +154,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupNoConfig(d, func() error {
 		c := &volumeAttachmentCleaner{
 			cs:         d.CS,
-			nodeReader: d.Mgr.GetClient(),
+			nodeReader: d.CachedClient(),
 			queue:      d.Name,
 			now:        shared.SystemClock,
 		}

@@ -130,12 +130,17 @@ func (r *Runner) drainKmsg(st *kernelScanState) bool {
 	if err != nil {
 		return false
 	}
-	if res.First && !resume {
-		// First-ever open (or post-reboot): the ring holds the whole
-		// retained backlog — history, not news. Discard it and park
-		// the position at the tail so only NEW records classify.
-		// (A valid resume cursor skips by seq instead — those old
-		// records were already processed pre-restart.)
+	if res.Backlog && !resume {
+		// Backlog replay (first open, post-reboot, or a drain cut at
+		// the cap that will continue next tick): the ring holds
+		// retained history — discard and park at the tail so only
+		// NEW records classify. The gate is Backlog, not First:
+		// First fires on the first read alone, so a backlog bigger
+		// than one DrainCap replayed chunks 2..N as fresh records —
+		// re-emitting the whole retained ring as alert news on
+		// every agent start. (A valid resume cursor skips by seq
+		// instead — those old records were already processed
+		// pre-restart.)
 		// The cursor is only persisted once a parsed record anchors
 		// it (maxSeq>0): an empty ring on the first open has no tail
 		// to park at — writing seq=0 there would resume-from-0 after

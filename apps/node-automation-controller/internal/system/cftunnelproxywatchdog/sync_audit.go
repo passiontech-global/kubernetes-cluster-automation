@@ -10,27 +10,12 @@ import (
 	"context"
 	"strings"
 
-	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
-
-// node_automation_cftunnel_gateway_sync_error is 1 while the last
-// cfTunnelSyncErrClearAfter window saw a sync-error signature in the
-// controller's log tail, 0 otherwise (set once the first sweep
-// detects it — see auditControllerSyncErrors).
-var cftunnelGatewaySyncErrorGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "node_automation_cftunnel_gateway_sync_error",
-	Help: "1 while the cloudflare-tunnel-gateway-controller log tail (5m window) carries a tunnel-config sync error (failed to update tunnel configuration, 429, authentication error) — cf-gateway-sync-error.",
-}, []string{"namespace"})
-
-func init() {
-	ctrlmetrics.Registry.MustRegister(cftunnelGatewaySyncErrorGauge)
-}
 
 // ---------------------------------------------------------------------------
 // cf-gateway-sync-error — cloudflare-tunnel-gateway-controller sync-error audit.
@@ -90,14 +75,14 @@ func (w *cfTunnelProxyWatchdog) auditControllerSyncErrors(ctx context.Context) {
 	}
 	if errSeen {
 		w.syncErrLast.Stamp(w.namespace, now)
-		cftunnelGatewaySyncErrorGauge.WithLabelValues(w.namespace).Set(1)
+		metrics.CFTunnelGatewaySyncError.WithLabelValues(w.namespace).Set(1)
 		log.Info("gateway controller sync error detected",
 			"namespace", w.namespace, "pods", len(pods))
 		return
 	}
 	if _, stamped := w.syncErrLast.Last(w.namespace); stamped && readOK && !readFailed &&
 		!w.syncErrLast.CooledDown(w.namespace, cfTunnelSyncErrClearAfter, now) {
-		cftunnelGatewaySyncErrorGauge.WithLabelValues(w.namespace).Set(0)
+		metrics.CFTunnelGatewaySyncError.WithLabelValues(w.namespace).Set(0)
 		w.syncErrLast.Forget(w.namespace)
 		log.Info("gateway controller sync error cleared",
 			"namespace", w.namespace)

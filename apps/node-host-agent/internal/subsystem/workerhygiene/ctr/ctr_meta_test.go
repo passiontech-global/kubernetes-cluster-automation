@@ -75,8 +75,9 @@ func TestCtrMetaJournalErrorInconclusive(t *testing.T) {
 }
 
 // TestCtrMetaDefaultJournalViaSystemd: with no MetaJournalFn override
-// the probe rides the systemd ExecCombined seam — the SDReply fake
-// feeds the parser for real.
+// and a hand-built env (no cycle snapshot), the probe falls back to
+// the systemd ExecCombined seam — the SDReply fake feeds the parser
+// for real.
 func TestCtrMetaDefaultJournalViaSystemd(t *testing.T) {
 	e := fixture(t)
 	e.SDReply["journalctl"] = "containerd: bbolt: meta.db: Somethings wrong with freelist"
@@ -85,6 +86,59 @@ func TestCtrMetaDefaultJournalViaSystemd(t *testing.T) {
 		PidsOnce: func() []int { return nil }, WorkerActive: true})
 	if !strings.Contains(e.LogLines(t), "journal: ") {
 		t.Fatalf("journal evidence missing through the default seam:\n%s", e.LogLines(t))
+	}
+}
+
+// TestCtrMetaJournalViaCycleSnapshot: the live probe rides the
+// cycle-shared k0sworker snapshot (e.JournalOnce) — the corruption
+// signatures are matched from the cached snapshot without a second
+// journalctl fork.
+func TestCtrMetaJournalViaCycleSnapshot(t *testing.T) {
+	e := fixture(t)
+	snapshots := 0
+	c := wdepstest.Check[*ctr.CtrMetaCheck](e.H, wdeps.CheckCtrMeta)
+	cycle := &wdeps.CycleEnv{
+		PidsOnce: func() []int { return nil },
+		JournalOnce: func() string {
+			snapshots++
+			return "k0sworker: failed to loadmeta: invalid freelist page"
+		},
+		WorkerActive: true,
+	}
+	c.Run(context.Background(), cycle)
+	if !strings.Contains(e.LogLines(t), "journal: failed to loadmeta") {
+		t.Fatalf("journal evidence missing from the shared snapshot:\n%s", e.LogLines(t))
+	}
+	c.Run(context.Background(), cycle)
+	if snapshots != 2 {
+		t.Fatalf("snapshot built %d times across 2 cycles, want 2 (once per cycle)", snapshots)
+	}
+}
+
+// TestCtrMetaProbeLatencyDial: the latency gauge times the
+// containerd socket dial — the seam answers instantly and the
+// reading lands; a failed dial keeps the last value.
+func TestCtrMetaProbeLatencyDial(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Seams.Probe.ProbeUnixSock = func(context.Context, string, time.Duration) error {
+		return nil
+	}
+	c := wdepstest.Check[*ctr.CtrMetaCheck](e.H, wdeps.CheckCtrMeta)
+	c.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: func() []int { return nil }, WorkerActive: true})
+	if e.H.CtrMetaProbeLatencySec < 0 {
+		t.Fatalf("negative dial latency %v", e.H.CtrMetaProbeLatencySec)
+	}
+	// A failing dial keeps the previous reading in place.
+	e.H.Cfg.Seams.Probe.ProbeUnixSock = func(context.Context, string, time.Duration) error {
+		return errors.New("dial unix /run/k0s/containerd.sock: connect: refused")
+	}
+	prev := e.H.CtrMetaProbeLatencySec
+	c.Run(context.Background(), &wdeps.CycleEnv{
+		PidsOnce: func() []int { return nil }, WorkerActive: true})
+	if e.H.CtrMetaProbeLatencySec != prev {
+		t.Fatalf("failed dial rewrote the latency: %v → %v",
+			prev, e.H.CtrMetaProbeLatencySec)
 	}
 }
 

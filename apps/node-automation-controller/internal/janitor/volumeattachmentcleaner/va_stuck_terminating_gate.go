@@ -49,7 +49,7 @@ func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 	if !ok {
 		return true // node object gone — nothing left to detach from
 	}
-	if !kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+	if !kube.HasTaint(node.Spec.Taints, kube.TaintNodeOutOfService) {
 		// Ready-node unused-volume branch: the node rebooted back
 		// to Ready before attach-detach finished the detach, so the
 		// fencing taint never landed and the fenced gate below can
@@ -248,7 +248,7 @@ func (c *volumeAttachmentCleaner) stuckReadyUnused(ctx context.Context,
 
 	node, ok := nodeByName[va.Spec.NodeName]
 	if !ok || !kube.NodeReady(node) ||
-		kube.HasTaint(node.Spec.Taints, vaOutOfServiceTaint) {
+		kube.HasTaint(node.Spec.Taints, kube.TaintNodeOutOfService) {
 		return false
 	}
 	pvName := ptr.Deref(va.Spec.Source.PersistentVolumeName, "")

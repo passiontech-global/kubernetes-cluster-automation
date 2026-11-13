@@ -13,17 +13,21 @@ on:
     paths:
       - "apps/node-automation-controller/**"
       # Only the hostkit subpackages this app actually imports
-      # (envdoc/envx/httpx/ledger/nodecond/timex + transitive logx)
-      # — a blanket libs/hostkit/** would fire releases on
-      # fsx/jinja-side changes the controller never consumes,
-      # producing empty releases.
-      - "libs/hostkit/envdoc/**"
+      # (envx/httpx/ledger/nodecond/timex + transitive logx) — a blanket
+      # libs/hostkit/** would fire releases on fsx-side changes the
+      # controller never consumes, producing empty releases.
+      # envdoc is test-only tooling (excluded by go list -deps ./cmd/...).
+      # Enforced by internal/releaseglob (go list -deps vs this list).
       - "libs/hostkit/envx/**"
       - "libs/hostkit/httpx/**"
       - "libs/hostkit/ledger/**"
       - "libs/hostkit/logx/**"
       - "libs/hostkit/nodecond/**"
       - "libs/hostkit/timex/**"
+      # Subpackage globs don't match module files — the module's dep
+      # graph changes fire releases too.
+      - "libs/hostkit/go.mod"
+      - "libs/hostkit/go.sum"
       - ".moon/**"
       - "mise.toml"
       - ".dockerignore"
@@ -56,7 +60,7 @@ jobs:
       app: node-automation-controller
       # All seven hostkit subpackages the controller consumes, direct
       # or transitive (envx/nodecond/timex pull logx where they log).
-      lib_paths: "libs/hostkit/envdoc/** libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/ledger/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/**"
+      lib_paths: "libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/ledger/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/**"
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
       legacy_v_tags: true

@@ -99,35 +99,42 @@ func (j *failedJobsJanitor) sweepCompletedRuns(ctx context.Context) error {
 func (j *failedJobsJanitor) sweepCompletedRunKind(ctx context.Context,
 	gvr schema.GroupVersionResource, kind string) error {
 	log := logf.FromContext(ctx)
-	runs, err := kube.ListAll(ctx,
+	// Streamed pages: the TTL filter extracts only the tiny
+	// runTarget tuples (needs status conditions + completionTime, so
+	// metadata-only lists cannot serve it), and each page's run
+	// bodies die with the page — a four-figure terminal-run backlog
+	// no longer materializes as one unstructured slice.
+	now := j.now.Now()
+	var targets []runTarget
+	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.DynamicPage(j.dyn.Resource(gvr)))
+		kube.DynamicPage(j.dyn.Resource(gvr)),
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				r := &page[i]
+				if r.GetDeletionTimestamp() != nil || !runTerminal(r) {
+					continue
+				}
+				finishedAt, ok := runFinishedAt(r)
+				if !ok || now.Sub(finishedAt) <= completedRunTTL {
+					continue // resolved but undateable (keep) or inside TTL
+				}
+				targets = append(targets, runTarget{
+					kind:         kind,
+					ns:           r.GetNamespace(),
+					name:         r.GetName(),
+					uid:          r.GetUID(),
+					completedFor: now.Sub(finishedAt),
+				})
+			}
+			return nil
+		})
 	if err != nil {
 		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			return nil // operator not installed — nothing to reap
 		}
 		return fmt.Errorf("list %ss: %w", kind, err)
 	}
-	now := j.now.Now()
-	var targets []runTarget
-	for i := range runs {
-		r := &runs[i]
-		if r.GetDeletionTimestamp() != nil || !runTerminal(r) {
-			continue
-		}
-		finishedAt, ok := runFinishedAt(r)
-		if !ok || now.Sub(finishedAt) <= completedRunTTL {
-			continue // resolved but undateable (keep) or inside TTL
-		}
-		targets = append(targets, runTarget{
-			kind:         kind,
-			ns:           r.GetNamespace(),
-			name:         r.GetName(),
-			uid:          r.GetUID(),
-			completedFor: now.Sub(finishedAt),
-		})
-	}
-	runs = nil
 
 	deleted, _, capped := reap.Sweep(ctx, log, targets, reap.Options[runTarget]{
 		Cap: failedJobsDeleteCap,

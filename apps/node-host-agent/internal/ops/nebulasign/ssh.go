@@ -24,9 +24,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 )
@@ -35,16 +41,51 @@ import (
 // `cat /etc/nebula/<net>/host.pub` command — vars are operator input.
 var nebulaNetRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+// knownHostsVerify resolves the operator known_hosts file next to the
+// SSH client key — the documented trust source for converge-family
+// SSH traffic (ENV: NODE_HOST_AGENT_CONVERGE_SSH_KEY sits in a dir
+// with its known_hosts). An absent file means no trust material and
+// no verification: the historical tolerant dial stays, but a file
+// that EXISTS is enforced — an unlisted host or a key mismatch
+// fails the fetch closed.
+func knownHostsVerify(keyPath string) (func(hostname string, key ssh.PublicKey) error, error) {
+	p := filepath.Join(filepath.Dir(keyPath), "known_hosts")
+	if _, err := os.Stat(p); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // no trust material — tolerant parity
+		}
+		return nil, fmt.Errorf("stat %s: %w", p, err)
+	}
+	cb, err := knownhosts.New(p)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", p, err)
+	}
+	// knownhosts matches entries port-exactly in host:port form —
+	// the nebulasign fetch is hard-coded to port 22 (knownhosts
+	// keys off the host:port string; the addr is only formatting).
+	return func(hostname string, key ssh.PublicKey) error {
+		return cb(net.JoinHostPort(hostname, "22"),
+			&net.TCPAddr{Port: 22}, key)
+	}, nil
+}
+
 func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) (string, error) {
 	if j.IP == "" {
 		return "", errors.New("no ip in registry")
+	}
+	verify, err := knownHostsVerify(keyPath)
+	if err != nil {
+		return "", err
 	}
 	cfg := sshclient.Config{
 		KeyPath: keyPath,
 		Port:    22,
 		Timeout: 15 * time.Second,
-		// Log deliberately nil — the silent host-key tolerance of
-		// the old private dialer.
+		// Host key trust: a known_hosts file next to the SSH key
+		// pins every host it lists (mismatch and unlisted both
+		// reject); without it the documented rotating-infra-VM
+		// tolerance applies.
+		HostKeyVerify: verify,
 	}
 	link, err := cfg.Dial(ctx, j.SSHUser, j.IP, j.ProxyJump)
 	if err != nil {

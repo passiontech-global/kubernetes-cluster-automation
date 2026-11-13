@@ -11,7 +11,7 @@ package nodehealth
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -31,7 +31,7 @@ import (
 // ratio. Returns the updated cordoned-worker count.
 func (p *nodeHangCheck) uncordonCleared(ctx context.Context, log logr.Logger,
 	uncordon []string, cordoned int) int {
-	sort.Strings(uncordon)
+	slices.Sort(uncordon)
 	for _, name := range uncordon {
 		payload, err := kube.MergePatchAnnos(map[string]any{
 			nodeHangPreCordonAnno: nil, // merge-patch delete — lift our stamp
@@ -70,7 +70,7 @@ func (p *nodeHangCheck) uncordonCleared(ctx context.Context, log logr.Logger,
 // the auto-uncordon.
 func (p *nodeHangCheck) clearStaleStamps(ctx context.Context, log logr.Logger,
 	staleStamp []string) {
-	sort.Strings(staleStamp)
+	slices.Sort(staleStamp)
 	for _, name := range staleStamp {
 		payload, err := kube.MergePatchAnnos(map[string]any{
 			nodeHangPreCordonAnno: nil,

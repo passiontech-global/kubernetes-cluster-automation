@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"testing"
 	"time"
 
@@ -127,13 +128,8 @@ func TestPatchNodeLabelsMerge(t *testing.T) {
 
 	got := getNode(t, cs, "n1").Labels
 	want := map[string]string{"keep": "me", "old": "new", "added": "yes"}
-	if len(got) != len(want) {
-		t.Fatalf("labels = %v, want %v", got, want)
-	}
-	for k, v := range want {
-		if got[k] != v {
-			t.Fatalf("label %q = %q, want %q (all labels %v)", k, got[k], v, got)
-		}
+	if !maps.Equal(got, want) {
+		t.Fatalf("labels = %v, want %v (all labels %v)", got, want, got)
 	}
 }
 

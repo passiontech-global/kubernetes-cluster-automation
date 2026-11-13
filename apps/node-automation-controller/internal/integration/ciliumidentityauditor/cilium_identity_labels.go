@@ -5,8 +5,10 @@
 package ciliumidentityauditor
 
 import (
+	"cmp"
 	"fmt"
-	"sort"
+	"slices"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -42,11 +44,11 @@ func topSecurityLabelKeys(ids []unstructured.Unstructured, n int) []string {
 	for k, set := range values {
 		keys = append(keys, kv{k, len(set)})
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].n != keys[j].n {
-			return keys[i].n > keys[j].n
+	slices.SortFunc(keys, func(a, b kv) int {
+		if c := cmp.Compare(b.n, a.n); c != 0 {
+			return c
 		}
-		return keys[i].key < keys[j].key
+		return strings.Compare(a.key, b.key)
 	})
 	if len(keys) > n {
 		keys = keys[:n]

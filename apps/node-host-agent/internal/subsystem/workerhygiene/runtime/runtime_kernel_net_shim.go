@@ -152,16 +152,19 @@ func (c *KernelNetShimCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 }
 
 // tcpExtListenStats returns (ListenDrops, ListenOverflows, ok) from
-// <ProcRoot>/net/netstat — the file holds alternating "TcpExt:
+// <ProcRoot>/1/net/netstat — the file holds alternating "TcpExt:
 // <names>" / "TcpExt: <values>" line pairs; each pair maps column
-// name to value.
+// name to value. init's netns (not <ProcRoot>/net) is what the
+// counters describe: /proc/net is the READER's netns — inside the
+// DaemonSet pod that is the pod netns, whose drops say nothing about
+// the host's accept queues. hostPID makes /proc/1 the host init.
 func (c *KernelNetShimCheck) tcpExtListenStats() (int64, int64, bool) {
-	data, err := os.ReadFile(filepath.Join(c.d.Cfg.ProcRoot, "net", "netstat"))
+	data, err := os.ReadFile(filepath.Join(c.d.Cfg.ProcRoot, "1", "net", "netstat"))
 	if err != nil {
 		return 0, 0, false
 	}
 	var names []string
-	for _, ln := range strings.Split(string(data), "\n") {
+	for ln := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(ln)
 		if len(f) < 2 || f[0] != "TcpExt:" {
 			continue
@@ -199,7 +202,7 @@ func (c *KernelNetShimCheck) softnetStats() (int64, int64, bool) {
 	}
 	var drops, squeeze int64
 	seen := false
-	for _, ln := range strings.Split(string(data), "\n") {
+	for ln := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(ln)
 		if len(f) < 3 {
 			continue
@@ -247,7 +250,7 @@ func shimRSSBytes(d *wdeps.Deps, pid int) int64 {
 	if err != nil {
 		return 0
 	}
-	for _, ln := range strings.Split(string(data), "\n") {
+	for ln := range strings.SplitSeq(string(data), "\n") {
 		if !strings.HasPrefix(ln, "VmRSS:") {
 			continue
 		}

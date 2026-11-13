@@ -9,7 +9,6 @@ package certdriftauditor
 import (
 	"context"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"strings"
@@ -189,18 +188,14 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	case !proceed:
 		return
 	}
-	payload, err := json.Marshal(map[string]any{
-		"spec": map[string]any{"template": map[string]any{
-			"metadata": map[string]any{"annotations": map[string]string{
-				linkerdIssuerRolloutAnno: now.UTC().Format(time.RFC3339),
-			}},
-		}},
-	})
-	if err != nil {
-		return
-	}
+	// The rollout stamp rides the shared kube.RestartTemplatePatch
+	// builder — the same spec.template.metadata.annotations restartedAt
+	// document every restart-by-annotation module patches with
+	// (Strategy merge; containers merge by name, the template
+	// annotation triggers the rollout).
 	if _, err := a.cs.AppsV1().Deployments(kube.LinkerdNS).Patch(ctx, kube.LinkerdIdentityName,
-		types.StrategicMergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		types.StrategicMergePatchType, kube.RestartTemplatePatch(now),
+		metav1.PatchOptions{}); err != nil {
 		metrics.IncError(a.queue)
 		log.Error(err, "linkerd-identity rollout stamp failed")
 		return

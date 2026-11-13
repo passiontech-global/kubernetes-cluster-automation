@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -109,7 +108,7 @@ func (c *OverlayFSStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	for img := range seen {
 		images = append(images, img)
 	}
-	sort.Strings(images)
+	slices.Sort(images)
 	if !c.d.State.RateTrySpend("last-ctr-image-rm", wdeps.CtrImageRmInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: overlayfs-stale-mount image(s) %s - in rm cooldown (<15m), skip",

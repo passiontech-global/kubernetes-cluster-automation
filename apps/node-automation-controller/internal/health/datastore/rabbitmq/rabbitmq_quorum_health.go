@@ -7,7 +7,7 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -167,7 +167,7 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 		for r := range reasons {
 			rs = append(rs, r)
 		}
-		sort.Strings(rs)
+		slices.Sort(rs)
 		joined := strings.Join(rs, "+")
 		if strings.HasPrefix(key, "cluster/") {
 			// Cluster-level series carry no pod — the key is

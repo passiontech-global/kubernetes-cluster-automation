@@ -117,8 +117,7 @@ func aggregateTargets(t *topology.Topology) (targets []Target, dropped []string)
 			}
 			return
 		}
-		cp := nt
-		byIP[nt.IP] = &cp
+		byIP[nt.IP] = new(nt)
 		order = append(order, nt.IP)
 	}
 

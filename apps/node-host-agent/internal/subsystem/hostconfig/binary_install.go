@@ -56,7 +56,17 @@ type managedBinarySpec struct {
 
 	// download overrides the transport (nexpDownload's slow-egress
 	// timeout floor); nil = r.download (Config.HTTPTimeout).
-	download func(ctx context.Context, url, dst, wantSHA256 string) error
+	download func(ctx context.Context, url, dst, wantSHA256 string,
+		mode os.FileMode) error
+
+	// downloadMode is the permission bits the STAGED file lands with
+	// (converge.DownloadFile pins the final mode before the rename).
+	// 0 → 0644, right for tarballs/debs staged into DownloadDir; a
+	// staged-in-place binary (kine at /usr/local/bin/kine) sets
+	// 0755 — the old hardwired 0644 left the binary non-exec until
+	// the follow-up chmod, and a cycle dying in between left the
+	// unit unusable.
+	downloadMode os.FileMode
 
 	// downloadLine is the counted download-failure line, logged with
 	// the uniform (url, file, error) args. Sites whose line carries
@@ -118,9 +128,9 @@ type managedBinarySpec struct {
 //
 // Returns (changed, ok): changed=true when a fresh download happened
 // this call (kine restarts the unit on a new binary); ok=false when
-// the flow aborted on a refused staged copy, a failed prepare or a
-// failed download — the failure is already counted/logged, the
-// caller just stops.
+// the flow aborted on a refused staged copy, a failed prepare, a
+// failed download or a failed member install — the failure is
+// already counted/logged, the caller just stops.
 func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 	if sp.probe != nil && sp.probe(c) {
 		return false, true
@@ -137,7 +147,11 @@ func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 		if dl == nil {
 			dl = c.r.download
 		}
-		if err := dl(c.ctx, sp.url, local, sp.sum); err != nil {
+		mode := sp.downloadMode
+		if mode == 0 {
+			mode = 0o644
+		}
+		if err := dl(c.ctx, sp.url, local, sp.sum, mode); err != nil {
 			if sp.downloadErr != nil {
 				sp.downloadErr(c, err)
 			} else {
@@ -185,6 +199,10 @@ func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 		if mainErr == nil && sp.onInstalled != nil {
 			sp.onInstalled(c, local)
 		}
+		// A failed main member must read as NOT freshly-installed:
+		// callers gate restarts/converge steps on ok, and ok=true here
+		// let a missing binary pass as installed.
+		return changed, mainErr == nil
 	}
 	return changed, true
 }

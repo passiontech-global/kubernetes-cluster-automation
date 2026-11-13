@@ -7,3 +7,14 @@ stack: 'backend'
 project:
   title: 'hostkit'
   description: 'Shared host-agent toolkit (Go stdlib only): envx (env knobs/Mode/Knob tables), logx (named slog loggers), timex (settable clock). The mini-Jinja2 evaluator lives in libs/jinja.'
+
+# Canonical source inventory for the module. Moon's default globbing
+# already covers these for hostkit's own tasks; apps re-list the
+# root-relative equivalents per task in their moon.yml (fileGroups are
+# not visible cross-project) — keep those in sync when the module
+# grows a new subpackage or a non-Go source tree.
+fileGroups:
+  sources:
+    - '**/*.go'
+    - 'go.mod'
+    - 'go.sum'

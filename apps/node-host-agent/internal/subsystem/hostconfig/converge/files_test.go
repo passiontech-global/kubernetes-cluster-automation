@@ -159,18 +159,30 @@ func TestDownloadFile(t *testing.T) {
 	t.Run("downloads and creates parent dirs", func(t *testing.T) {
 		srv := newServer(t, http.StatusOK, payload)
 		dst := filepath.Join(t.TempDir(), "sub", "dir", "f.bin")
-		if err := DownloadFile(ctx, srv.URL, dst, "", 10*time.Second); err != nil {
+		if err := DownloadFile(ctx, srv.URL, dst, "", 0o644, 10*time.Second); err != nil {
 			t.Fatal(err)
 		}
 		if got := testutil.ReadFile(t, dst); got != payload {
 			t.Fatalf("content = %q", got)
+		}
+		// The explicit mode is the FINAL file's bits, pinned before
+		// the rename — not just the staging default.
+		if fi, err := os.Stat(dst); err != nil || fi.Mode().Perm() != 0o644 {
+			t.Fatalf("mode = %v err = %v, want 0644", fi, err)
+		}
+		dst755 := filepath.Join(t.TempDir(), "f755.bin")
+		if err := DownloadFile(ctx, srv.URL, dst755, "", 0o755, 10*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if fi, err := os.Stat(dst755); err != nil || fi.Mode().Perm() != 0o755 {
+			t.Fatalf("explicit 0755 mode = %v err = %v", fi, err)
 		}
 	})
 
 	t.Run("sha256 pin verified", func(t *testing.T) {
 		srv := newServer(t, http.StatusOK, payload)
 		dst := filepath.Join(t.TempDir(), "f.bin")
-		if err := DownloadFile(ctx, srv.URL, dst, strings.ToUpper(good), 10*time.Second); err != nil {
+		if err := DownloadFile(ctx, srv.URL, dst, strings.ToUpper(good), 0o644, 10*time.Second); err != nil {
 			t.Fatalf("correct pin rejected: %v", err)
 		}
 	})
@@ -179,7 +191,7 @@ func TestDownloadFile(t *testing.T) {
 		srv := newServer(t, http.StatusOK, payload)
 		dir := t.TempDir()
 		dst := filepath.Join(dir, "f.bin")
-		err := DownloadFile(ctx, srv.URL, dst, strings.Repeat("0", 64), 10*time.Second)
+		err := DownloadFile(ctx, srv.URL, dst, strings.Repeat("0", 64), 0o644, 10*time.Second)
 		if err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
 			t.Fatalf("err = %v, want sha256 mismatch", err)
 		}
@@ -194,7 +206,7 @@ func TestDownloadFile(t *testing.T) {
 	t.Run("non-200 status errors", func(t *testing.T) {
 		srv := newServer(t, http.StatusInternalServerError, "")
 		dst := filepath.Join(t.TempDir(), "f.bin")
-		err := DownloadFile(ctx, srv.URL, dst, "", 10*time.Second)
+		err := DownloadFile(ctx, srv.URL, dst, "", 0o644, 10*time.Second)
 		if err == nil || !strings.Contains(err.Error(), "HTTP 500") {
 			t.Fatalf("err = %v, want HTTP 500", err)
 		}
@@ -208,7 +220,7 @@ func TestDownloadFile(t *testing.T) {
 		url := srv.URL
 		srv.Close() // listener gone → connection refused
 		dst := filepath.Join(t.TempDir(), "f.bin")
-		if err := DownloadFile(ctx, url, dst, "", 5*time.Second); err == nil {
+		if err := DownloadFile(ctx, url, dst, "", 0o644, 5*time.Second); err == nil {
 			t.Fatal("expected a transport error")
 		}
 	})
@@ -378,7 +390,7 @@ func TestDownloadFileArtifactCap(t *testing.T) {
 
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "f.bin")
-	err := DownloadFile(context.Background(), srv.URL, dst, "", 10*time.Second)
+	err := DownloadFile(context.Background(), srv.URL, dst, "", 0o644, 10*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "exceeds the") {
 		t.Fatalf("err = %v, want the artifact-cap failure", err)
 	}
@@ -396,7 +408,7 @@ func TestDownloadFileArtifactCap(t *testing.T) {
 	}))
 	t.Cleanup(srv2.Close)
 	dst2 := filepath.Join(dir, "exact.bin")
-	if err := DownloadFile(context.Background(), srv2.URL, dst2, "", 10*time.Second); err != nil {
+	if err := DownloadFile(context.Background(), srv2.URL, dst2, "", 0o644, 10*time.Second); err != nil {
 		t.Fatalf("artifact at exactly the cap rejected: %v", err)
 	}
 	if got := testutil.ReadFile(t, dst2); got != exact {
@@ -413,7 +425,7 @@ func TestDownloadFileFailures(t *testing.T) {
 
 	t.Run("bad URL", func(t *testing.T) {
 		dst := filepath.Join(t.TempDir(), "f")
-		if err := DownloadFile(ctx, "http://bad url", dst, "", 5*time.Second); err == nil {
+		if err := DownloadFile(ctx, "http://bad url", dst, "", 0o644, 5*time.Second); err == nil {
 			t.Fatal("expected request-build error")
 		}
 	})
@@ -425,7 +437,7 @@ func TestDownloadFileFailures(t *testing.T) {
 		defer srv.Close()
 		dir := t.TempDir()
 		testutil.WriteFile(t, filepath.Join(dir, "blocker"), "x")
-		if err := DownloadFile(ctx, srv.URL, filepath.Join(dir, "blocker", "f"), "", 5*time.Second); err == nil {
+		if err := DownloadFile(ctx, srv.URL, filepath.Join(dir, "blocker", "f"), "", 0o644, 5*time.Second); err == nil {
 			t.Fatal("expected mkdir error")
 		}
 	})
@@ -440,7 +452,7 @@ func TestDownloadFileFailures(t *testing.T) {
 		if err := os.Mkdir(dst+".dl", 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := DownloadFile(ctx, srv.URL, dst, "", 5*time.Second); err == nil {
+		if err := DownloadFile(ctx, srv.URL, dst, "", 0o644, 5*time.Second); err == nil {
 			t.Fatal("expected stage-create error")
 		}
 	})
@@ -455,7 +467,7 @@ func TestDownloadFileFailures(t *testing.T) {
 		if err := os.Mkdir(dst, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := DownloadFile(ctx, srv.URL, dst, "", 5*time.Second); err == nil {
+		if err := DownloadFile(ctx, srv.URL, dst, "", 0o644, 5*time.Second); err == nil {
 			t.Fatal("expected rename error onto a directory")
 		}
 		if _, serr := os.Stat(dst + ".dl"); !os.IsNotExist(serr) {

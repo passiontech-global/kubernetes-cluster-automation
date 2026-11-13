@@ -4,7 +4,6 @@
 package probefw
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -131,7 +130,7 @@ func TestOwnerGone(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gone, resolved := OwnerGone(context.Background(), cs, "ns",
+			gone, resolved := OwnerGone(t.Context(), cs, "ns",
 				tc.ref, tc.kinds...)
 			if gone != tc.gone || resolved != tc.resolved {
 				t.Fatalf("OwnerGone = (%v,%v), want (%v,%v)",
@@ -147,7 +146,7 @@ func TestOwnerGoneAPIErrorFailsClosed(t *testing.T) {
 		func(action ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("apiserver boom")
 		})
-	gone, resolved := OwnerGone(context.Background(), cs, "ns",
+	gone, resolved := OwnerGone(t.Context(), cs, "ns",
 		&metav1.OwnerReference{Kind: "Pod", Name: "any"}, "Pod")
 	if gone || resolved {
 		t.Fatalf("OwnerGone = (%v,%v), want (false,false) on API error",

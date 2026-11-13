@@ -135,25 +135,77 @@ func Conditions(obj map[string]any, fields ...string) []Condition {
 		if !ok {
 			continue
 		}
-		cond := Condition{}
-		cond.Type, _ = NestedString(m, "type")
-		cond.Status, _ = NestedString(m, "status")
-		cond.Reason, _ = NestedString(m, "reason")
-		cond.Message, _ = NestedString(m, "message")
-		if ts, ok := NestedString(m, "lastTransitionTime"); ok {
-			if t, err := time.Parse(time.RFC3339, ts); err == nil {
-				cond.LastTransitionTime = t
-			}
-		}
-		// observedGeneration decodes through NestedNumber, not
-		// NestedInt64: apiserver-decoded objects carry int64, but
-		// hand-built test fixtures (and anything round-tripped
-		// through encoding/json) carry float64 — those must not
-		// read as "never reconciled".
-		cond.ObservedGeneration, _ = NestedNumber(m, "observedGeneration")
-		out = append(out, cond)
+		out = append(out, decodeCondition(m))
 	}
 	return out
+}
+
+// decodeCondition decodes one conditions-list entry map into a
+// Condition — the shared body of Conditions and ForEachCondition.
+// observedGeneration decodes through NestedNumber, not NestedInt64:
+// apiserver-decoded objects carry int64, but hand-built test fixtures
+// (and anything round-tripped through encoding/json) carry float64 —
+// those must not read as "never reconciled".
+func decodeCondition(m map[string]any) Condition {
+	cond := Condition{}
+	cond.Type, _ = NestedString(m, "type")
+	cond.Status, _ = NestedString(m, "status")
+	cond.Reason, _ = NestedString(m, "reason")
+	cond.Message, _ = NestedString(m, "message")
+	if ts, ok := NestedString(m, "lastTransitionTime"); ok {
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			cond.LastTransitionTime = t
+		}
+	}
+	cond.ObservedGeneration, _ = NestedNumber(m, "observedGeneration")
+	return cond
+}
+
+// ForEachCondition walks every well-formed entry of the conditions
+// list at path fields, decoding each IN PLACE — no []Condition slice
+// is materialized, so a per-object scan that only needs one or two
+// conditions (the gateway/target max-observedGeneration walks, the
+// OLM/ArgoCD status loops) stops allocating one decoded slice per
+// object per sweep. Non-map elements are skipped, never fatal; fn
+// returning false stops the walk early (the found-condition case —
+// callers that need exactly the first match prefer FindConditionAt /
+// ConditionOf, which wrap this with the same early stop).
+func ForEachCondition(obj map[string]any, fn func(Condition) bool,
+	fields ...string) {
+	raw, found := NestedSlice(obj, fields...)
+	if !found {
+		return
+	}
+	for _, c := range raw {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if !fn(decodeCondition(m)) {
+			return
+		}
+	}
+}
+
+// FindConditionAt is Conditions+FindCondition fused into one
+// zero-copy scan: the first condition of type condType at path
+// fields — ok=false when the type is absent, the identical verdict
+// FindCondition reports over the materialized slice. The heaviest
+// per-check pattern ("conditions[type=X].status==Y" over every
+// listed CR object) reads through this instead of building a
+// []Condition per object.
+func FindConditionAt(obj map[string]any, condType string,
+	fields ...string) (Condition, bool) {
+	var hit Condition
+	found := false
+	ForEachCondition(obj, func(c Condition) bool {
+		if c.Type == condType {
+			hit, found = c, true
+			return false
+		}
+		return true
+	}, fields...)
+	return hit, found
 }
 
 // FindCondition returns the first condition of type condType —
@@ -171,9 +223,10 @@ func FindCondition(conds []Condition, condType string) (Condition, bool) {
 // ConditionOf is the one-call form for the canonical location:
 // the named condition from obj's status.conditions — the shape
 // apiserviceguard's apiServiceUnavailableSince and every
-// "conditions[type=X].status==Y" check hand-rolls.
+// "conditions[type=X].status==Y" check hand-rolls. Rides
+// FindConditionAt's zero-copy scan (no []Condition slice per object).
 func ConditionOf(obj map[string]any, condType string) (Condition, bool) {
-	return FindCondition(Conditions(obj, "status", "conditions"), condType)
+	return FindConditionAt(obj, condType, "status", "conditions")
 }
 
 // StripCRDSchemaVersions drops spec.versions[*].schema — the

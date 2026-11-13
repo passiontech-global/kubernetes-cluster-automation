@@ -34,7 +34,7 @@ func textfileSample(t *testing.T, dir, file, metric string) (float64, bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if !strings.HasPrefix(line, metric+" ") {
 			continue
 		}

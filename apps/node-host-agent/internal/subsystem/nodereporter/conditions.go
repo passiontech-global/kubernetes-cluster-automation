@@ -180,7 +180,13 @@ func (r *Reporter) syncConditions(ctx context.Context) error {
 	// parity the plan calls out). A GET failure skips the seed AND
 	// the patch — the evals below still run so problem_gauge keeps
 	// updating (the gauges-are-local contract).
-	node, getErr := r.cfg.Client.CoreV1().Nodes().Get(ctx, r.cfg.NodeName, metav1.GetOptions{})
+	// ResourceVersion "0": the read-only GET serves from the
+	// apiserver's watch cache instead of a quorum read — the
+	// reporter re-reads the node every cycle and never acts on
+	// stale-vs-current ordering (the PATCH below is unconditional),
+	// so the Kine/etcd load cut is free.
+	node, getErr := r.cfg.Client.CoreV1().Nodes().Get(ctx, r.cfg.NodeName,
+		metav1.GetOptions{ResourceVersion: "0"})
 	if getErr == nil {
 		r.monitors.SeedConditions(node.Status.Conditions)
 	}

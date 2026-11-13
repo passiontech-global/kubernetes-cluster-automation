@@ -8,6 +8,7 @@ package hostconfig
 import (
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -107,13 +108,7 @@ func (c *cyc) hostnamePin() {
 		// The pin must carry THIS hostname as a whole field — a
 		// substring Contains matched "127.0.1.1 worker-10" when hn
 		// was "worker-1" and left the wrong pin live.
-		pinned := false
-		for _, f := range strings.Fields(string(m))[1:] {
-			if f == hn {
-				pinned = true
-				break
-			}
-		}
+		pinned := slices.Contains(strings.Fields(string(m))[1:], hn)
 		if !pinned {
 			nh := re.ReplaceAllFunc(hosts, func(l []byte) []byte {
 				sub := re.FindSubmatch(l)

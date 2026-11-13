@@ -86,7 +86,7 @@ func cdnsProbeService(name, ns string, age time.Duration, ready *bool) (*corev1.
 // newCDNSWatchdog returns a watchdog with every external probe stubbed
 // to the "all clean" result — each test overrides the layer it exercises.
 func newCDNSWatchdog(cs *fake.Clientset) *coreDNSWatchdog {
-	emulateEviction(cs) // recover() evicts via the PDB-respecting API
+	testutil.EmulateEviction(cs) // recover() evicts via the PDB-respecting API
 	return &coreDNSWatchdog{
 		cs: cs,
 		// NewDynamicClient (not StubDyn): recover()'s maintenance
@@ -106,12 +106,6 @@ func getCDNSDeployment(t *testing.T, cs *fake.Clientset) *appsv1.Deployment {
 		t.Fatalf("get deploy/coredns: %v", err)
 	}
 	return d
-}
-
-func cdnsPodExists(t *testing.T, cs *fake.Clientset, name string) bool {
-	t.Helper()
-	_, err := cs.CoreV1().Pods(corednsNS).Get(ctx, name, metav1.GetOptions{})
-	return err == nil
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +134,7 @@ func TestCoreDNSWatchdogLayer1LogHit(t *testing.T) {
 	if got := w.logStreak.Count("cdns-b"); got != 0 {
 		t.Fatal("clean pod got a streak")
 	}
-	if !cdnsPodExists(t, cs, "cdns-a") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("pod deleted on the FIRST log hit — one blip must not restart")
 	}
 	if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a != "" {
@@ -154,10 +148,10 @@ func TestCoreDNSWatchdogLayer1LogHit(t *testing.T) {
 		t.Fatalf("second run streak=%d, want %d", got, corednsStreakMax)
 	}
 	// 1 of 2 stale -> subset recovery deletes only that pod.
-	if cdnsPodExists(t, cs, "cdns-a") {
+	if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("stale pod not deleted")
 	}
-	if !cdnsPodExists(t, cs, "cdns-b") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-b") {
 		t.Fatal("healthy pod deleted — recovery must be surgical")
 	}
 	if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a == "" {
@@ -188,7 +182,7 @@ func TestCoreDNSWatchdogLayer1BlipResets(t *testing.T) {
 	if got := w.logStreak.Count("cdns-a"); got != 1 {
 		t.Fatalf("after first hit streak=%d, want 1", got)
 	}
-	if !cdnsPodExists(t, cs, "cdns-a") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("pod deleted on a single log hit")
 	}
 	// Run 2: no signature in the window -> the streak resets.
@@ -207,17 +201,17 @@ func TestCoreDNSWatchdogLayer1BlipResets(t *testing.T) {
 	if got := w.logStreak.Count("cdns-a"); got != 1 {
 		t.Fatalf("fresh hit after reset streak=%d, want 1", got)
 	}
-	if !cdnsPodExists(t, cs, "cdns-a") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("pod deleted on non-consecutive hits")
 	}
 	// Run 4: second consecutive hit -> stale -> deleted.
 	if err := w.run(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if cdnsPodExists(t, cs, "cdns-a") {
+	if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("pod not deleted after two consecutive log hits")
 	}
-	if !cdnsPodExists(t, cs, "cdns-b") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-b") {
 		t.Fatal("healthy pod deleted")
 	}
 }
@@ -323,7 +317,7 @@ func TestCoreDNSWatchdogLayer2StreakThenRecover(t *testing.T) {
 	if got := w.streak.Count("cdns-a"); got != 1 {
 		t.Fatalf("first run streak=%d, want 1", got)
 	}
-	if !cdnsPodExists(t, cs, "cdns-a") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("pod deleted on streak 1 — recovery fired too early")
 	}
 	if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a != "" {
@@ -337,10 +331,10 @@ func TestCoreDNSWatchdogLayer2StreakThenRecover(t *testing.T) {
 	if got := w.streak.Count("cdns-a"); got != corednsStreakMax {
 		t.Fatalf("second run streak=%d, want %d", got, corednsStreakMax)
 	}
-	if cdnsPodExists(t, cs, "cdns-a") {
+	if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("stale pod not deleted after streak max")
 	}
-	if !cdnsPodExists(t, cs, "cdns-b") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-b") {
 		t.Fatal("healthy pod deleted")
 	}
 	if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a == "" {
@@ -372,7 +366,7 @@ func TestCoreDNSWatchdogLayer2AbortAllFail(t *testing.T) {
 		t.Fatal("abort seeded a streak for cdns-b")
 	}
 	for _, p := range []string{"cdns-a", "cdns-b"} {
-		if !cdnsPodExists(t, cs, p) {
+		if !testutil.PodExists(t, cs, corednsNS, p) {
 			t.Fatalf("pod %s deleted during abort", p)
 		}
 	}
@@ -403,10 +397,10 @@ func TestCoreDNSWatchdogLayer3Panics(t *testing.T) {
 	if got := w.streak.Count("cdns-a"); got != corednsStreakMax {
 		t.Fatalf("streak=%d, want %d", got, corednsStreakMax)
 	}
-	if cdnsPodExists(t, cs, "cdns-a") {
+	if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("panicking pod not deleted")
 	}
-	if !cdnsPodExists(t, cs, "cdns-b") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-b") {
 		t.Fatal("healthy pod deleted")
 	}
 }
@@ -424,7 +418,7 @@ func TestCoreDNSWatchdogLayer3UnknownIsNotStale(t *testing.T) {
 	if got := w.streak.Count("cdns-a"); got != 0 {
 		t.Fatal("UNKNOWN metrics produced a streak")
 	}
-	if !cdnsPodExists(t, cs, "cdns-a") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("pod deleted on UNKNOWN metrics")
 	}
 }
@@ -446,7 +440,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, p := range []string{"cdns-a", "cdns-b"} {
-			if !cdnsPodExists(t, cs, p) {
+			if !testutil.PodExists(t, cs, corednsNS, p) {
 				t.Fatalf("pod %s deleted inside cooldown", p)
 			}
 		}
@@ -464,7 +458,7 @@ func TestCoreDNSRecover(t *testing.T) {
 		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
 			t.Fatal(err)
 		}
-		if !cdnsPodExists(t, cs, "cdns-a") {
+		if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 			t.Fatal("pod deleted during a node storm")
 		}
 		d := getCDNSDeployment(t, cs)
@@ -484,7 +478,7 @@ func TestCoreDNSRecover(t *testing.T) {
 		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
 			t.Fatal(err)
 		}
-		if !cdnsPodExists(t, cs, "cdns-a") {
+		if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 			t.Fatal("pod deleted during an in-flight rollout")
 		}
 	})
@@ -506,7 +500,7 @@ func TestCoreDNSRecover(t *testing.T) {
 		}
 		// The restart path does not delete pods directly.
 		for _, p := range []string{"cdns-a", "cdns-b"} {
-			if !cdnsPodExists(t, cs, p) {
+			if !testutil.PodExists(t, cs, corednsNS, p) {
 				t.Fatalf("pod %s deleted by the full-fleet path", p)
 			}
 		}
@@ -520,10 +514,10 @@ func TestCoreDNSRecover(t *testing.T) {
 		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
 			t.Fatal(err)
 		}
-		if cdnsPodExists(t, cs, "cdns-a") {
+		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 			t.Fatal("suspect pod not deleted")
 		}
-		if !cdnsPodExists(t, cs, "cdns-b") {
+		if !testutil.PodExists(t, cs, corednsNS, "cdns-b") {
 			t.Fatal("healthy pod deleted")
 		}
 		d := getCDNSDeployment(t, cs)
@@ -571,7 +565,7 @@ func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, p := range []string{"cdns-a", "cdns-b"} {
-			if !cdnsPodExists(t, cs, p) {
+			if !testutil.PodExists(t, cs, corednsNS, p) {
 				t.Fatalf("pod %s churned while apiserver watch-cache wedged", p)
 			}
 		}
@@ -593,7 +587,7 @@ func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
 		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
 			t.Fatal(err)
 		}
-		if !cdnsPodExists(t, cs, "cdns-a") {
+		if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 			t.Fatal("suspect pod deleted while apiserver watch-cache wedged")
 		}
 	})
@@ -607,10 +601,10 @@ func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
 		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
 			t.Fatal(err)
 		}
-		if cdnsPodExists(t, cs, "cdns-a") {
+		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 			t.Fatal("zombie wedge condition suppressed a needed recovery")
 		}
-		if !cdnsPodExists(t, cs, "cdns-b") {
+		if !testutil.PodExists(t, cs, corednsNS, "cdns-b") {
 			t.Fatal("healthy pod deleted")
 		}
 	})
@@ -631,7 +625,7 @@ func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
 		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
 			t.Fatal(err)
 		}
-		if cdnsPodExists(t, cs, "cdns-a") {
+		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 			t.Fatal("False wedge condition suppressed a needed recovery")
 		}
 	})
@@ -682,10 +676,10 @@ func TestCoreDNSWatchdogLayer2Skips(t *testing.T) {
 	if dnsCalled {
 		t.Fatal("dns probe ran for a stale or IP-less pod")
 	}
-	if cdnsPodExists(t, cs, "cdns-a") {
+	if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("layer-1-stale pod not deleted")
 	}
-	if !cdnsPodExists(t, cs, "cdns-b") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-b") {
 		t.Fatal("IP-less pod touched")
 	}
 }
@@ -747,7 +741,7 @@ func TestCoreDNSRecoverErrorPaths(t *testing.T) {
 func TestCoreDNSProbeFQDNTop8Cap(t *testing.T) {
 	ready := true
 	var objs []runtime.Object
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		svc, _ := cdnsProbeService(
 			fmt.Sprintf("svc-%d", i), "app-ns",
 			time.Duration(i+1)*time.Minute, &ready) // no EndpointSlice -> skip
@@ -875,7 +869,7 @@ func TestCoreDNSProbeFQDNCacheTTL(t *testing.T) {
 func TestCoreDNSProbeFQDNCacheSkipsInconclusive(t *testing.T) {
 	w := newCDNSWatchdog(fake.NewSimpleClientset()) // nothing qualifies
 	lists := svcListCounter(w.cs.(*fake.Clientset))
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if fqdn, _ := w.probeFQDN(ctx); fqdn != "" {
 			t.Fatalf("empty cluster returned %q", fqdn)
 		}
@@ -990,7 +984,7 @@ func TestCoreDNSWatchdogStaleCachedWantReprobes(t *testing.T) {
 		if got := w.streak.Count(p); got != 0 {
 			t.Fatalf("%s streak=%d — the stale cached want leaked a verdict", p, got)
 		}
-		if !cdnsPodExists(t, cs, p) {
+		if !testutil.PodExists(t, cs, corednsNS, p) {
 			t.Fatalf("healthy rolled pod %s deleted", p)
 		}
 	}
@@ -1028,7 +1022,7 @@ func TestCoreDNSWatchdogFreshPickFailsOnce(t *testing.T) {
 	if got := w.streak.Count("cdns-a"); got != 1 {
 		t.Fatalf("fresh-pick failure streak=%d, want 1", got)
 	}
-	if !cdnsPodExists(t, cs, "cdns-a") {
+	if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 		t.Fatal("pod deleted on streak 1 — recovery fired too early")
 	}
 }
@@ -1163,7 +1157,7 @@ func TestCoreDNSRecoverNotFoundDelete(t *testing.T) {
 		if err := w.recover(ctx, []string{"cdns-a", "ghost"}, nil, 3); err != nil {
 			t.Fatalf("NotFound delete must not error: %v", err)
 		}
-		if cdnsPodExists(t, cs, "cdns-a") {
+		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 			t.Fatal("live suspect not deleted")
 		}
 		if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a == "" {

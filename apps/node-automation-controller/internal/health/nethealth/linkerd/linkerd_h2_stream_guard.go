@@ -21,7 +21,6 @@ package linkerd
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -145,7 +144,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		if pod.DeletionTimestamp != nil ||
 			pod.Status.Phase != corev1.PodRunning ||
 			now.Sub(pod.CreationTimestamp.Time) < linkerdH2PodMinAge ||
-			!kube.PodSpecHasContainer(&pod.Spec, kube.LinkerdProxyContainer) {
+			!kube.PodIsMeshed(&pod.Spec) {
 			continue
 		}
 		key := pod.Namespace + "/" + pod.Name
@@ -165,40 +164,17 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		cands = append(cands, pod)
 	}
 
-	// Phase 2 — parallel log tails on a FIXED worker pool bounded at
-	// linkerdH2LogWorkers: each fetch is a kubelet round-trip (the
-	// sweep's slowest read), and a serial tail over every meshed pod
-	// could eat the whole per-check budget on a large cluster. The
-	// pool spawns only N goroutines regardless of len(cands) — the
-	// old spawn-all + semaphore shape allocated a goroutine stack
-	// per candidate just to park on the semaphore.
-	sigs := make([]logSignals, len(cands))
-	jobs := make(chan int)
-	var wg sync.WaitGroup
-	for w := 0; w < linkerdH2LogWorkers && w < len(cands); w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range jobs {
-				// A panic in one pod's log-tail fetch reads as that
-				// pod's inconclusive scan — never a process crash.
-				storm, identity, lerr := func() (s, id bool, err error) {
-					defer func() {
-						if r := recover(); r != nil {
-							err = fmt.Errorf("log signals panicked: %v", r)
-						}
-					}()
-					return p.linkerdH2LogSignals(ctx, cands[i])
-				}()
-				sigs[i] = logSignals{storm: storm, identity: identity, err: lerr}
-			}
-		}()
-	}
-	for i := range cands {
-		jobs <- i
-	}
-	close(jobs)
-	wg.Wait()
+	// Phase 2 — parallel log tails on the shared kube.ScanPodLogs
+	// pool bounded at linkerdH2LogWorkers: each fetch is a kubelet
+	// round-trip (the sweep's slowest read), and a serial tail over
+	// every meshed pod could eat the whole per-check budget on a
+	// large cluster. One pod's panicked scan reads as that pod's
+	// inconclusive result — never a process crash.
+	h2sigs := kube.ScanPodLogs(ctx, p.CS, cands, linkerdH2LogWorkers,
+		func(ctx context.Context, pod *corev1.Pod) (logSignals, error) {
+			storm, identity, err := p.linkerdH2LogSignals(ctx, pod)
+			return logSignals{storm: storm, identity: identity}, err
+		})
 
 	// Phase 3 — the serial verdict + heal pass over the fetched
 	// signatures (gauge ledgers, the heal mutex and the cooldown
@@ -207,14 +183,14 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		pod := cands[i]
 		key := pod.Namespace + "/" + pod.Name
 		lv := []string{pod.Namespace, pod.Name}
-		if err := sigs[i].err; err != nil {
+		if err := h2sigs[i].Err; err != nil {
 			// Inconclusive, not clean — a broken pod-log path must
 			// not silently read as "no signature".
 			log.Info("WARN: linkerd-proxy log fetch failed — log signatures inconclusive",
 				"pod", pod.Namespace+"/"+pod.Name, "error", err)
 			continue
 		}
-		storm, identity := sigs[i].storm, sigs[i].identity
+		storm, identity := h2sigs[i].Value.storm, h2sigs[i].Value.identity
 		if !storm && !identity {
 			continue
 		}

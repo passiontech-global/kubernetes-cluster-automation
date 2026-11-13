@@ -17,7 +17,7 @@ import (
 // line, "(none)" for a peer whose routes were wiped.
 func ParseWGAllowedIPs(out string) int {
 	n := 0
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		f := strings.Fields(line)
 		if len(f) < 2 || f[1] == "(none)" {
 			continue
@@ -35,7 +35,7 @@ func ParseWGAllowedIPs(out string) int {
 // malformed line is never peer evidence (ParseCtrLeases parity).
 func ParseWGDump(out string) []WGDumpPeer {
 	var peers []WGDumpPeer
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		f := strings.Split(line, "\t")
 		if len(f) != 8 || f[0] == "" {
 			continue

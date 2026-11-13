@@ -3,6 +3,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -15,13 +16,8 @@ const corednsRestartInterval = 5 * time.Minute
 // cooldown (shell restarted every run; a crashlooping stub otherwise
 // burns a restart every cycle).
 func (n *NetHealth) checkCoreDNSStub(ctx context.Context) {
-	loopback := false
-	for _, server := range nameservers(n.cfg.HostResolvConf, 16) {
-		if server == "127.0.0.1" {
-			loopback = true
-			break
-		}
-	}
+	loopback := slices.Contains(
+		nameservers(n.cfg.HostResolvConf, 16), "127.0.0.1")
 	if !loopback || n.cfg.Systemd == nil {
 		n.cycles.WithLabelValues(checkCoreDNS, "ok").Inc()
 		return

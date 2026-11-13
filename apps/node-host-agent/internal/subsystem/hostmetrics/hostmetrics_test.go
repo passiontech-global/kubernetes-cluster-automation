@@ -13,6 +13,8 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -82,8 +84,8 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		// assertions (same contract as cpuMeasure above).
 		adjtimexFn: func(*unix.Timex) (int, error) { return 0, unix.ENOSYS },
 		statfsFn:   func(string, *unix.Statfs_t) error { return unix.ENOENT },
-		TCPStatesFn: func(int) (map[uint8]int, error) {
-			return nil, errors.New("sock_diag disabled in tests")
+		TCPCensusFn: func(int) (netlinkx.TCPCensus, error) {
+			return netlinkx.TCPCensus{}, errors.New("sock_diag disabled in tests")
 		},
 		// The 10s Collect snapshot would serve stale reads across
 		// the fixture mutations every scrape test performs — the
@@ -176,11 +178,11 @@ func TestApplyDefaults(t *testing.T) {
 	if c.cfg.RouteFile != defaultRouteFile {
 		t.Fatalf("RouteFile=%q want %q", c.cfg.RouteFile, defaultRouteFile)
 	}
-	if c.cfg.K0sConfigFile != defaultK0sConfigFile {
-		t.Fatalf("K0sConfigFile=%q want %q", c.cfg.K0sConfigFile, defaultK0sConfigFile)
+	if c.cfg.K0sConfigFile != k0sconfig.DefaultConfigFile {
+		t.Fatalf("K0sConfigFile=%q want %q", c.cfg.K0sConfigFile, k0sconfig.DefaultConfigFile)
 	}
-	if c.cfg.K0sUnitFile != defaultK0sUnitFile {
-		t.Fatalf("K0sUnitFile=%q want %q", c.cfg.K0sUnitFile, defaultK0sUnitFile)
+	if c.cfg.K0sUnitFile != k0sconfig.DefaultUnitFile {
+		t.Fatalf("K0sUnitFile=%q want %q", c.cfg.K0sUnitFile, k0sconfig.DefaultUnitFile)
 	}
 	if len(c.cfg.RemovedFlags) != 1 || c.cfg.RemovedFlags[0] != "concurrent-service-syncs" {
 		t.Fatalf("RemovedFlags=%v want [concurrent-service-syncs]", c.cfg.RemovedFlags)
@@ -188,7 +190,7 @@ func TestApplyDefaults(t *testing.T) {
 	if c.cfg.NebulaCertFile != defaultNebulaCertFile {
 		t.Fatalf("NebulaCertFile=%q want %q", c.cfg.NebulaCertFile, defaultNebulaCertFile)
 	}
-	if len(c.cfg.ExpectedKCMArgs) != len(defaultExpectedKCMArgs) {
+	if len(c.cfg.ExpectedKCMArgs) != len(k0sconfig.DefaultExpectedKCMArgs) {
 		t.Fatalf("ExpectedKCMArgs=%v want defaults", c.cfg.ExpectedKCMArgs)
 	}
 	if c.cfg.ConntrackCountFile != defaultConntrackCountFile {

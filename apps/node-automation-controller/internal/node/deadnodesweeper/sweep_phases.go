@@ -7,7 +7,7 @@ package deadnodesweeper
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -55,7 +55,7 @@ func (s *deadNodeSweeper) reconcileRecoveredNodes(ctx context.Context,
 
 		// Recovery first: a node back to Ready=True must not keep
 		// the out-of-service taint or it stays unschedulable.
-		if !kube.HasTaint(n.Spec.Taints, outOfServiceTaintKey) || !kube.NodeReady(n) {
+		if !kube.HasTaint(n.Spec.Taints, kube.TaintNodeOutOfService) || !kube.NodeReady(n) {
 			continue
 		}
 		live, err := s.cs.CoreV1().Nodes().Get(ctx, n.Name, metav1.GetOptions{})
@@ -77,7 +77,7 @@ func (s *deadNodeSweeper) reconcileRecoveredNodes(ctx context.Context,
 			log.Info("node not Ready live — untaint skipped", "node", n.Name)
 			continue
 		}
-		if err := kube.UntaintNode(ctx, s.cs, n.Name, outOfServiceTaintKey); err != nil {
+		if err := kube.UntaintNode(ctx, s.cs, n.Name, kube.TaintNodeOutOfService); err != nil {
 			log.Error(err, "untaint failed", "node", n.Name)
 			metrics.IncError(s.queue)
 			continue
@@ -142,6 +142,6 @@ func (s *deadNodeSweeper) stuckTerminatingCensus(ctx context.Context,
 	for name := range stuck {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return stuck, names, nil
 }

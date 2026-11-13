@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -421,10 +422,10 @@ func TestMaxDeleteCountsPVObjectDelete(t *testing.T) {
 }
 
 func TestUnescapeMountField(t *testing.T) {
-	got := unescapeMountField(`/var/lib/dir\040with\011esc\012seq\134x`)
+	got := procfs.UnescapeMountPath(`/var/lib/dir\040with\011esc\012seq\134x`)
 	want := "/var/lib/dir with\tesc\nseq\\x"
 	if got != want {
-		t.Fatalf("unescapeMountField=%q want %q", got, want)
+		t.Fatalf("UnescapeMountPath=%q want %q", got, want)
 	}
 }
 

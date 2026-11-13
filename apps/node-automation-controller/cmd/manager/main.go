@@ -55,6 +55,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -63,9 +64,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/apiserverendpointguard"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/leaderelect"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
@@ -148,6 +149,15 @@ func main() {
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	// The manager cache carries CustomResourceDefinitions (the
+	// informer behind webhookguard's conversion census and the kine
+	// census's size side table) — the type must be in the scheme for
+	// the informer's protobuf-negotiated decodes to resolve it. The
+	// generated AddToScheme registers the kind, its conversions and
+	// its protobuf codecs in one call (client-go exposes no separate
+	// "protobuf scheme" entry point; codec registration rides the
+	// scheme builder).
+	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 
 	cfg := ctrl.GetConfigOrDie()
 	if err := tuneClientConfig(cfg); err != nil {
@@ -167,7 +177,7 @@ func main() {
 	// lets Setup reuse THIS dynamic client instead of cloning cfg into
 	// a second one — which would duplicate the http.Transport and its
 	// TLS connection pool just to silence one warning header.
-	cfg.WarningHandler = apiserverendpointguard.NewWarningHandler()
+	cfg.WarningHandler = kube.NewWarningHandler()
 
 	// leaseStolen is the LeaseLossWatchdog's flag, shared with the
 	// releaseGuardedLock: once the watchdog proves a foreign holder it
@@ -201,7 +211,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	mgr, err := ctrl.NewManager(cfg,
+	mgr, err := ctrl.NewManager(managerConfig(cfg),
 		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
 			leaseDuration, renewDeadline, retryPeriod, leaderNS, leaderLock))
 	if err != nil {
@@ -257,9 +267,15 @@ func main() {
 	// healthy (RecordTargetHealthy from each module's recovery path).
 	shared.WireTargetBreaker(cs)
 
+	// NodeReader on the shared verdict: the maintenance mutex's node
+	// census (active-cordon signal) rides the manager's informer
+	// cache — the same CachedNodeReader posture clusterhealthprobes
+	// wires — instead of a direct apiserver LIST per TTL evaluation.
 	deps := shared.Deps{Mgr: mgr, CS: cs, Dyn: dyn, Meta: meta,
 		ProbeCS: probeCS, ProbeDyn: probeDyn, ProbeMeta: probeMeta,
-		Maintenance: &maintenance.Verdict{}, Log: ctrl.Log}
+		Maintenance: &maintenance.Verdict{
+			NodeReader: kube.CachedNodeReader(mgr.GetClient()),
+		}, Log: ctrl.Log}
 	if err := registry.SetupModules(deps, mods); err != nil {
 		os.Exit(1)
 	}

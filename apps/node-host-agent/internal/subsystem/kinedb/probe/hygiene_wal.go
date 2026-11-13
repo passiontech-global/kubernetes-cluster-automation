@@ -43,7 +43,7 @@ func (p *Probe) hygieneWAL(ctx context.Context, pg, user, pass string,
 			note(fmt.Sprintf("wal-df-fail: %v", derr))
 		} else {
 			var lastLine string
-			for _, l := range strings.Split(strings.TrimSpace(df), "\n") {
+			for l := range strings.SplitSeq(strings.TrimSpace(df), "\n") {
 				lastLine = strings.TrimSpace(l)
 			}
 			if size, perr := strconv.ParseInt(lastLine, 10, 64); perr != nil {
@@ -115,7 +115,7 @@ func (p *Probe) hygieneWAL(ctx context.Context, pg, user, pass string,
 // query — unparseable lines are skipped, never fatal.
 func parseSlotRows(out string) []inactiveSlot {
 	var slots []inactiveSlot
-	for _, l := range strings.Split(out, "\n") {
+	for l := range strings.SplitSeq(out, "\n") {
 		l = strings.TrimSpace(l)
 		if l == "" {
 			continue

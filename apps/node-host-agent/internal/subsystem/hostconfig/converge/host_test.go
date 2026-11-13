@@ -41,14 +41,12 @@ func TestWriteManagedConcurrentNoTear(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, n)
 	for i := range n {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			content := []byte(strings.Repeat(string(rune('a'+i)), 4096))
 			if _, err := h.WriteManaged("/f.conf", content, 0o644); err != nil {
 				errCh <- err
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 	select {

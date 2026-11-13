@@ -5,7 +5,6 @@
 package probefw
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -59,7 +58,7 @@ other_metric 9
 }
 
 func TestFetchPodMetrics(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("nil client errors", func(t *testing.T) {
 		if _, err := FetchPodMetrics(ctx, nil, "10.0.0.1", 9180,

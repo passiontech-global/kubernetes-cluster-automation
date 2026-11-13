@@ -21,8 +21,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	eventsv1 "k8s.io/api/events/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -64,8 +62,6 @@ func NewLinkerdSidecarOOMGuardCheck(d *probefw.Deps) probefw.Check {
 const (
 	CheckNameLinkerdSidecarOOMGuard = "linkerd-sidecar-oom-guard"
 
-	// linkerdProxyContainer is the injected proxy's container name.
-	linkerdProxyContainer = "linkerd-proxy"
 	// linkerdOOMWindow bounds how fresh a termination must read —
 	// an OOM kill older than the window is history, not a live
 	// signature (the proxy has long since restarted).
@@ -296,7 +292,7 @@ func linkerdInitDeadlockShape(pod *corev1.Pod) (corev1.ContainerStatus, bool) {
 				completedInit = true
 			}
 			initIdx = i
-		case linkerdProxyContainer:
+		case kube.LinkerdProxyContainer:
 			proxyIdx = i
 		}
 	}
@@ -345,34 +341,29 @@ func linkerdInitDeadlockShape(pod *corev1.Pod) (corev1.ContainerStatus, bool) {
 
 // emitDeadlockEvent stamps the LinkerdInitSidecarOrderDeadlock
 // Warning Event on the pod — the events.k8s.io/v1 shape
-// emitOOMEvent uses. Best-effort: a Forbidden is logged, never
-// escalated — the gauge stays the signal.
+// emitOOMEvent uses, rendered through the shared kube.EmitWarningEvent
+// helper. Best-effort: a Forbidden is logged, never escalated — the
+// gauge stays the signal.
 func (p *linkerdSidecarOOMCheck) emitDeadlockEvent(
 	ctx context.Context, log logr.Logger, pod *corev1.Pod,
 	initName string, restarts int) {
 
 	now := p.Now()
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-			Namespace: pod.Namespace,
-		},
-		EventTime:           metav1.NewMicroTime(now),
-		Reason:              linkerdInitDeadlockEventReason,
-		Note:                fmt.Sprintf("init container %s crash-loops (%d restarts) while dialing 127.0.0.1:4140 before the linkerd-proxy nativeSidecar starts — linkerd-init already completed; reorder the app initContainers after linkerd-proxy or drop the proxy dial", initName, restarts),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-automation-controller",
-		ReportingInstance:   p.Name,
-		Action:              linkerdInitDeadlockEventReason,
+	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
+		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
+		Namespace: pod.Namespace,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Pod",
 			Namespace:  pod.Namespace,
 			Name:       pod.Name,
 		},
-	}
-	if _, err := p.CS.EventsV1().Events(pod.Namespace).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
+		Reason: linkerdInitDeadlockEventReason,
+		Note: fmt.Sprintf("init container %s crash-loops (%d restarts) while dialing 127.0.0.1:4140 before the linkerd-proxy nativeSidecar starts — linkerd-init already completed; reorder the app initContainers after linkerd-proxy or drop the proxy dial",
+			initName, restarts),
+		ReportingInstance: p.Name,
+		Now:               now,
+	}); err != nil {
 		log.Info("WARN: LinkerdInitSidecarOrderDeadlock event create failed (RBAC?)",
 			"pod", pod.Namespace+"/"+pod.Name, "error", err)
 		return
@@ -381,60 +372,37 @@ func (p *linkerdSidecarOOMCheck) emitDeadlockEvent(
 		"pod", pod.Namespace+"/"+pod.Name, "init", initName, "restarts", restarts)
 }
 
-// linkerdProxyOOMKills reports whether the pod's linkerd-proxy shows
-// an OOMKilled termination inside the window — current or last
-// terminated state — and returns the proxy's restart count for the
-// event dedup key (a fresh kill bumps it, re-arming the event).
+// linkerdProxyOOMKills is the sidecar-oom-guard's view of the shared
+// linkerdProxyOOMKill scan with ITS window (linkerdOOMWindow): the
+// proxy's restart count rides out for the event dedup key.
 func linkerdProxyOOMKills(pod *corev1.Pod, now time.Time) (int, bool) {
-	statuses := append([]corev1.ContainerStatus{},
-		pod.Status.InitContainerStatuses...)
-	statuses = append(statuses, pod.Status.ContainerStatuses...)
-	for _, cs := range statuses {
-		if cs.Name != linkerdProxyContainer {
-			continue
-		}
-		oomkilled := func(t *corev1.ContainerStateTerminated) bool {
-			return t != nil && t.Reason == "OOMKilled" &&
-				now.Sub(t.FinishedAt.Time) <= linkerdOOMWindow
-		}
-		if oomkilled(cs.State.Terminated) ||
-			oomkilled(cs.LastTerminationState.Terminated) {
-			return int(cs.RestartCount), true
-		}
-		return 0, false
-	}
-	return 0, false
+	return linkerdProxyOOMKill(pod, now, linkerdOOMWindow)
 }
 
 // emitOOMEvent stamps the LinkerdSidecarOOMKilled Warning Event on
 // the pod — the events.k8s.io/v1 shape the other check emitters use
-// (Regarding+Action, deprecated corev1 fields unset). Best-effort: a
+// (Regarding+Action, deprecated corev1 fields unset), rendered
+// through the shared kube.EmitWarningEvent helper. Best-effort: a
 // Forbidden is logged, never escalated — the gauge stays the signal.
 func (p *linkerdSidecarOOMCheck) emitOOMEvent(
 	ctx context.Context, log logr.Logger, pod *corev1.Pod, restarts int) {
 
 	now := p.Now()
-	ev := &eventsv1.Event{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-			Namespace: pod.Namespace,
-		},
-		EventTime:           metav1.NewMicroTime(now),
-		Reason:              linkerdOOMEventReason,
-		Note:                fmt.Sprintf("linkerd-proxy container OOMKilled inside the last %s — in-flight TCP/gRPC streams severed while the pod stayed Ready (restarts=%d)", linkerdOOMWindow, restarts),
-		Type:                corev1.EventTypeWarning,
-		ReportingController: "node-automation-controller",
-		ReportingInstance:   p.Name,
-		Action:              linkerdOOMEventReason,
+	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
+		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
+		Namespace: pod.Namespace,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
 			Kind:       "Pod",
 			Namespace:  pod.Namespace,
 			Name:       pod.Name,
 		},
-	}
-	if _, err := p.CS.EventsV1().Events(pod.Namespace).
-		Create(ctx, ev, metav1.CreateOptions{}); err != nil {
+		Reason: linkerdOOMEventReason,
+		Note: fmt.Sprintf("linkerd-proxy container OOMKilled inside the last %s — in-flight TCP/gRPC streams severed while the pod stayed Ready (restarts=%d)",
+			linkerdOOMWindow, restarts),
+		ReportingInstance: p.Name,
+		Now:               now,
+	}); err != nil {
 		log.Info("WARN: LinkerdSidecarOOMKilled event create failed (RBAC?)",
 			"pod", pod.Namespace+"/"+pod.Name, "error", err)
 		return

@@ -60,7 +60,7 @@ func procVMRSS(path string) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if !strings.HasPrefix(line, "VmRSS:") {
 			continue
 		}
@@ -87,7 +87,7 @@ func (c *Collector) collectK0sChildrenRSS(ch chan<- prometheus.Metric) {
 		return
 	}
 	rss := map[string]uint64{}
-	for _, pid := range strings.Fields(string(data)) {
+	for pid := range strings.FieldsSeq(string(data)) {
 		dir := filepath.Join(c.cfg.ProcRoot, pid)
 		label := k0sChildLabel(dir)
 		if label == "" {

@@ -148,7 +148,7 @@ func ParseMetricValue(line, name string) (float64, bool) {
 // compaction and per-endpoint schema-version series on one page).
 func ParseMetricValues(body, name string) []float64 {
 	var out []float64
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		if v, ok := ParseMetricValue(line, name); ok {
 			out = append(out, v)
 		}

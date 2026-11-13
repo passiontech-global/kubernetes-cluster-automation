@@ -5,7 +5,6 @@
 package kube
 
 import (
-	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -35,7 +34,7 @@ func controllerRef(kind, name string) *metav1.OwnerReference {
 }
 
 func TestTryReserveWorkloadDisruption(t *testing.T) {
-	ctx := WithSweepOverlay(context.Background())
+	ctx := WithSweepOverlay(t.Context())
 
 	// Two pods of the same ReplicaSet share ONE disruption slot —
 	// the second reservation is denied so a sibling check cannot
@@ -67,7 +66,7 @@ func TestTryReserveWorkloadDisruption(t *testing.T) {
 func TestTryReserveWorkloadDisruptionOutsideSweep(t *testing.T) {
 	// No overlay on ctx — every call is permissive (direct-Run
 	// checks and module periodics never share a sweep).
-	ctx := context.Background()
+	ctx := t.Context()
 	rs := controllerRef("ReplicaSet", "web-6d9f")
 	for i := 0; i < 3; i++ {
 		if !TryReserveWorkloadDisruption(ctx, overlayPod("web-"+string(rune('0'+i)), rs)) {
@@ -77,7 +76,7 @@ func TestTryReserveWorkloadDisruptionOutsideSweep(t *testing.T) {
 }
 
 func TestPodTombstones(t *testing.T) {
-	ctx := WithSweepOverlay(context.Background())
+	ctx := WithSweepOverlay(t.Context())
 	pods := []corev1.Pod{
 		*overlayPod("a", nil), *overlayPod("b", nil), *overlayPod("c", nil),
 	}
@@ -93,7 +92,7 @@ func TestPodTombstones(t *testing.T) {
 		t.Fatalf("FilterPodTombstones = %v, want [a c]", got)
 	}
 	// Empty tombstone set returns the input slice unchanged.
-	ctx2 := WithSweepOverlay(context.Background())
+	ctx2 := WithSweepOverlay(t.Context())
 	if got := FilterPodTombstones(ctx2, pods); len(got) != 3 {
 		t.Fatalf("no tombstones must return all pods, got %d", len(got))
 	}
@@ -105,7 +104,7 @@ func TestEffectiveAnnoAndRecordPatch(t *testing.T) {
 
 	// Outside a sweep: RecordAnnoPatch mirrors in place (the
 	// caller-private-object contract), EffectiveAnno reads through.
-	ctx := context.Background()
+	ctx := t.Context()
 	RecordAnnoPatch(ctx, obj, []byte(
 		`{"metadata":{"annotations":{"stale":"new","added":"yes","keep":null}}}`))
 	if got := EffectiveAnno(ctx, obj, "stale"); got != "new" {
@@ -120,7 +119,7 @@ func TestEffectiveAnnoAndRecordPatch(t *testing.T) {
 
 	// Inside a sweep the shared object is NEVER mutated — readers
 	// resolve through the overlay instead.
-	ctx = WithSweepOverlay(context.Background())
+	ctx = WithSweepOverlay(t.Context())
 	obj2 := overlayPod("p2", nil)
 	obj2.SetAnnotations(map[string]string{"k": "base"})
 	RecordAnnoPatch(ctx, obj2, []byte(

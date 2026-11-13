@@ -38,11 +38,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/kubernetes"
-	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/flowcontrol"
 )
 
 // leaderElectionID is the Lease object name — shared by the resource
@@ -61,6 +60,16 @@ const leaderElectionID = "node-automation-controller.passiontech.dev"
 // apiserver request could wedge the renew loop instead of losing
 // the lease and failing over. Split out so the normalization and
 // the max() floor are unit-testable without building clients.
+//
+// The copy also carries the election traffic's OWN posture, decoupled
+// from the shared manager client: a dedicated token bucket (the
+// election renews once per RetryPeriod and emits the rare
+// LeaderElection event — a fraction of one QPS — so the limiter is
+// pure isolation, not a capacity statement; drawing from the fleet's
+// 50/100 bucket would let a janitor delete burst queue-delay the
+// renew call, the exact call whose latency decides leader loss) and
+// protobuf negotiation (Leases/Events are core protobuf-registered
+// kinds; patches set their own merge-patch content type regardless).
 func leaderClientConfig(cfg *rest.Config,
 	renewDeadline time.Duration) *rest.Config {
 
@@ -69,8 +78,19 @@ func leaderClientConfig(cfg *rest.Config,
 		renewDeadline = 10 * time.Second
 	}
 	elCfg.Timeout = max(renewDeadline/2, time.Second)
+	elCfg.ContentType = "application/vnd.kubernetes.protobuf"
+	elCfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(
+		leaderElectionClientQPS, leaderElectionClientBurst)
 	return elCfg
 }
+
+// The election client's dedicated budget — sized far above the
+// ~0.5 QPS the elector actually issues (one renew per RetryPeriod
+// plus rare lease events) so the limiter can never throttle a renew.
+const (
+	leaderElectionClientQPS   = 5
+	leaderElectionClientBurst = 20
+)
 
 // buildLeaderLock constructs the Lease resource lock controller-
 // runtime would have built internally (same leases type, same
@@ -86,14 +106,14 @@ func buildLeaderLock(cfg *rest.Config, scheme *runtime.Scheme,
 	stolen *atomic.Bool, done <-chan struct{}) (resourcelock.Interface, error) {
 
 	elCfg := leaderClientConfig(cfg, renewDeadline)
-	coreClient, err := corev1client.NewForConfig(elCfg)
-	if err != nil {
-		return nil, fmt.Errorf("leader-election core client: %w", err)
-	}
-	coordClient, err := coordinationv1client.NewForConfig(elCfg)
-	if err != nil {
-		return nil, fmt.Errorf("leader-election coordination client: %w", err)
-	}
+	// ONE clientset for the whole election — the resource lock's
+	// core/coordination faces, the event sink and the guard's live
+	// Gets all share it. The per-surface constructors this replaced
+	// built three independent clients (three limiters once the
+	// election config stopped inheriting the shared bucket) off the
+	// identical config; deriving the typed faces from the single
+	// Clientset collapses them to one transport, one limiter, one
+	// construction failure mode.
 	cs, err := kubernetes.NewForConfig(elCfg)
 	if err != nil {
 		return nil, fmt.Errorf("leader-election clientset: %w", err)
@@ -120,7 +140,7 @@ func buildLeaderLock(cfg *rest.Config, scheme *runtime.Scheme,
 
 	lock, err := resourcelock.New(resourcelock.LeasesResourceLock,
 		namespace, leaderElectionID,
-		coreClient, coordClient,
+		cs.CoreV1(), cs.CoordinationV1(),
 		resourcelock.ResourceLockConfig{
 			Identity:      identity,
 			EventRecorder: broadcaster.NewRecorder(scheme, corev1.EventSource{Component: "leader-election"}),

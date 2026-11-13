@@ -49,6 +49,13 @@ const tokenMintTimeout = 15 * time.Second
 // tokenDefaultTTL applies when the token response omits expires_in.
 const tokenDefaultTTL = time.Hour
 
+// tokenMaxTTL caps a token lifetime at 24h: expires_in is attacker-
+// influenced server data, and time.Duration(expires_in) * time.Second
+// overflows int64 for values beyond ~292y — clamping keeps the
+// multiply inside the representable range and refuses to honor a
+// multi-day token claim from a misbehaving endpoint.
+const tokenMaxTTL = 24 * time.Hour
+
 // authMode selects how authorize() credentials a request.
 type authMode int
 
@@ -167,7 +174,7 @@ func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, err
 	// INCLUDING the caller that opened the flight, so leader and
 	// waiter share one code path below.
 	if a.flight == nil {
-		f := &tokenFlight{done: make(chan struct{})}
+		f := new(tokenFlight{done: make(chan struct{})})
 		a.flight = f
 		// The mint runs DETACHED from this caller's ctx: the flight
 		// is shared, so one worker's cancellation must not fail a
@@ -270,9 +277,17 @@ func (a *atcAuth) mint(ctx context.Context) (string, time.Time, bool, error) {
 			return "", time.Time{}, false,
 				fmt.Errorf("token endpoint %s: empty access_token", path)
 		}
-		ttl := time.Duration(tr.ExpiresIn) * time.Second
-		if ttl <= 0 {
+		var ttl time.Duration
+		switch {
+		case tr.ExpiresIn <= 0:
+			// Missing or nonsensical — fall back to the default.
 			ttl = tokenDefaultTTL
+		case tr.ExpiresIn > int64(tokenMaxTTL/time.Second):
+			// Clamp instead of multiplying: the raw multiply can
+			// overflow int64 and wrap the expiry into the past.
+			ttl = tokenMaxTTL
+		default:
+			ttl = time.Duration(tr.ExpiresIn) * time.Second
 		}
 		return tr.AccessToken, time.Now().Add(ttl), false, nil
 	}

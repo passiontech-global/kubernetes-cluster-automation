@@ -88,7 +88,7 @@ func (n *NetHealth) checkFail2ban(ctx context.Context) {
 	}
 	var pairs []string
 	if m := jailListRe.FindStringSubmatch(out); m != nil {
-		for _, j := range strings.Split(m[1], ",") {
+		for j := range strings.SplitSeq(m[1], ",") {
 			j = strings.TrimSpace(j)
 			if j == "" {
 				continue

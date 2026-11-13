@@ -142,6 +142,15 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 	r.armResets()
 	r.crCache = map[string]crListResult{}
 	r.orderCache = map[string]*orderIndex{}
+	// Release the per-cycle caches when the sweep ends — they are
+	// rebuilt fresh next run, and between cycles they held every
+	// listed CertificateRequest/Order object pinned for the full
+	// 15-minute idle window. Deferred so an early list error
+	// releases them too.
+	defer func() {
+		r.crCache = nil
+		r.orderCache = nil
+	}()
 	now := r.now.Now()
 
 	certs, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},

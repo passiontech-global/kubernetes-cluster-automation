@@ -3,13 +3,14 @@
 package hostmetrics
 
 import (
-	"fmt"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -219,40 +220,34 @@ func TestEphemeralPortSaturationNeedsBothLegs(t *testing.T) {
 
 func TestTCPCloseWaitSockets(t *testing.T) {
 	cfg, _ := fixture(t)
-	dir := t.TempDir()
-	cfg.ProcNetTCP = filepath.Join(dir, "tcp")
-	cfg.ProcNetTCP6 = filepath.Join(dir, "tcp6")
-	testutil.WriteFile(t, cfg.ProcNetTCP,
-		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when\n"+
-			"   0: 0100007F:0050 0100007F:1F90 01 00000000:00000000\n"+
-			"   1: 0100007F:0051 0100007F:1F91 08 00000000:00000000\n"+ // CLOSE_WAIT
-			"   2: 0100007F:0052 0100007F:1F92 06 00000000:00000000\n"+ // TIME_WAIT
-			"   3: 0100007F:0053 0100007F:1F93 08 00000000:00000000\n") // CLOSE_WAIT
-	testutil.WriteFile(t, cfg.ProcNetTCP6,
-		"  sl  local_address                         rem_address                        st\n"+
-			"   0: 0000000000000000000000000100007F:0050 0000000000000000000000000100007F:1F90 08\n")
+	// One AF_INET ESTABLISHED + two CLOSE_WAIT, one AF_INET6
+	// CLOSE_WAIT — the census fold counts both families into
+	// States (the old two-table /proc scan counted both files).
+	cfg.TCPCensusFn = func(int) (netlinkx.TCPCensus, error) {
+		return netlinkx.TCPCensus{
+			States: map[uint8]int{0x01: 1, 0x08: 3, 0x06: 1},
+		}, nil
+	}
 	c := New(cfg)
 	if v, ok := metricValue(t, c, "node_tcp_close_wait_sockets",
 		map[string]string{"node": "node-a"}); !ok || v != 3 {
-		t.Fatalf("close_wait=%v ok=%v want 3 (2 v4 + 1 v6)", v, ok)
+		t.Fatalf("close_wait=%v ok=%v want 3", v, ok)
 	}
 }
 
 func TestTCPCloseWaitAbsentWithoutTables(t *testing.T) {
-	cfg, _ := fixture(t)
-	dir := t.TempDir() // neither tcp nor tcp6 exists
-	cfg.ProcNetTCP = filepath.Join(dir, "tcp")
-	cfg.ProcNetTCP6 = filepath.Join(dir, "tcp6")
+	cfg, _ := fixture(t) // default census seam errors
 	c := New(cfg)
 	if _, ok := metricValue(t, c, "node_tcp_close_wait_sockets",
 		map[string]string{"node": "node-a"}); ok {
-		t.Fatal("close_wait emitted with no socket tables at all")
+		t.Fatal("close_wait emitted from a failed sock_diag dump")
 	}
-	// A single readable family still counts — an IPv6-less host
-	// legitimately lacks tcp6.
-	testutil.WriteFile(t, cfg.ProcNetTCP,
-		"  sl  local_address rem_address   st\n"+
-			"   0: 0100007F:0050 0100007F:1F90 01\n")
+	// A successful dump with zero CLOSE_WAIT still emits the
+	// explicit 0 — zero is data, not absence.
+	cfg.TCPCensusFn = func(int) (netlinkx.TCPCensus, error) {
+		return netlinkx.TCPCensus{States: map[uint8]int{0x01: 1}}, nil
+	}
+	c = New(cfg)
 	if v, ok := metricValue(t, c, "node_tcp_close_wait_sockets",
 		map[string]string{"node": "node-a"}); !ok || v != 0 {
 		t.Fatalf("close_wait=%v ok=%v want explicit 0", v, ok)
@@ -513,9 +508,11 @@ func TestEphemeralPortWidthDefaults(t *testing.T) {
 func TestSockstatTCPStates(t *testing.T) {
 	cfg, _ := fixture(t)
 	var gotPID int
-	cfg.TCPStatesFn = func(pid int) (map[uint8]int, error) {
+	cfg.TCPCensusFn = func(pid int) (netlinkx.TCPCensus, error) {
 		gotPID = pid
-		return map[uint8]int{1: 42, 6: 7, 8: 3, 10: 1}, nil
+		return netlinkx.TCPCensus{
+			States: map[uint8]int{1: 42, 6: 7, 8: 3, 10: 1},
+		}, nil
 	}
 	c := New(cfg)
 	for _, s := range tcpStateNames {
@@ -537,13 +534,13 @@ func TestSockstatTCPStates(t *testing.T) {
 		}
 	}
 	if gotPID != 1 {
-		t.Fatalf("TCPStatesFn pid=%d want 1", gotPID)
+		t.Fatalf("TCPCensusFn pid=%d want 1", gotPID)
 	}
 }
 
 // TestSockstatTCPStatesAbsentOnError: a failed sock_diag dump emits
 // no series at all — inconclusive, never a fabricated zero census.
-// (The fixture's default TCPStatesFn already errors.)
+// (The fixture's default TCPCensusFn already errors.)
 func TestSockstatTCPStatesAbsentOnError(t *testing.T) {
 	cfg, _ := fixture(t)
 	c := New(cfg)
@@ -581,29 +578,29 @@ func TestSockstatCloseWaitAliasAndMalformed(t *testing.T) {
 // --- A6: per-tuple ephemeral hot-spot + TCPTimeWaitOverflow ---
 
 // TestPerTupleHotSpotThreshold: the per-endpoint counts come out of
-// the same single table scan as the CLOSE_WAIT count; the max-tuple
-// gauge always emits when a table reads, the per-endpoint gauge only
-// past the 40k threshold, and the dst label carries the decoded
+// the same single census dump as the CLOSE_WAIT count; the max-tuple
+// gauge always emits when the dump answers, the per-endpoint gauge
+// only past the 40k threshold, and the dst label carries the decoded
 // host-order address.
 func TestPerTupleHotSpotThreshold(t *testing.T) {
 	cfg, _ := fixture(t)
-	dir := t.TempDir()
-	cfg.ProcNetTCP = filepath.Join(dir, "tcp")
-	cfg.ProcNetTCP6 = filepath.Join(dir, "tcp6")
-	// 0100007F:1F90 = 127.0.0.1:8080 (LE word 7F000001) — one socket
-	// below the threshold; AC1E90AF:8C3A = 175.144.30.172:35898 with
-	// 40001 sockets (one over the 40k threshold, written once here
-	// and counted by the repeated-row logic in the scan).
-	var b strings.Builder
-	b.WriteString("  sl  local_address rem_address   st\n")
-	b.WriteString("   0: 0100007F:0050 0100007F:1F90 01\n")
-	for i := 0; i < 40001; i++ {
-		fmt.Fprintf(&b, "%4d: 0100007F:0050 AC1E90AF:8C3A 01\n", i+1)
+	// Keys are raw daddr + big-endian dport: 127.0.0.1:8080 one
+	// socket below the threshold; 175.144.30.172:35898 with 40001
+	// sockets (one over the 40k threshold).
+	tupleKey := func(ip string, port uint16) string {
+		key := net.ParseIP(ip).To4()
+		return string(key) + string([]byte{byte(port >> 8), byte(port)})
 	}
-	testutil.WriteFile(t, cfg.ProcNetTCP, b.String())
-	testutil.WriteFile(t, cfg.ProcNetTCP6,
-		"  sl  local_address                         rem_address                        st\n"+
-			"   0: 0000000000000000000000000100007F:0050 0000000000000000000000000100007F:1F90 08\n")
+	per := map[string]int{
+		tupleKey("127.0.0.1", 8080):       1,
+		tupleKey("175.144.30.172", 35898): 40001,
+	}
+	cfg.TCPCensusFn = func(int) (netlinkx.TCPCensus, error) {
+		return netlinkx.TCPCensus{
+			States:   map[uint8]int{0x01: 40002, 0x08: 1},
+			PerTuple: per,
+		}, nil
+	}
 	c := New(cfg)
 	node := map[string]string{"node": "node-a"}
 	if v, ok := metricValue(t, c, "node_host_agent_tcp_per_tuple_max_sockets",
@@ -620,22 +617,19 @@ func TestPerTupleHotSpotThreshold(t *testing.T) {
 		map[string]string{"node": "node-a", "dst": "127.0.0.1:8080"}); ok {
 		t.Fatal("below-threshold endpoint emitted a labelled series")
 	}
-	// The close-wait count still rides the same scan (1 v6 row).
+	// The close-wait count still rides the same dump.
 	if v, ok := metricValue(t, c, "node_tcp_close_wait_sockets",
 		node); !ok || v != 1 {
-		t.Fatalf("close_wait=%v ok=%v want 1 (same-pass scan)", v, ok)
+		t.Fatalf("close_wait=%v ok=%v want 1 (same-pass census)", v, ok)
 	}
 }
 
 func TestPerTupleMaxAbsentWithoutTables(t *testing.T) {
-	cfg, _ := fixture(t)
-	dir := t.TempDir()
-	cfg.ProcNetTCP = filepath.Join(dir, "tcp")
-	cfg.ProcNetTCP6 = filepath.Join(dir, "tcp6")
+	cfg, _ := fixture(t) // default census seam errors
 	c := New(cfg)
 	if _, ok := metricValue(t, c, "node_host_agent_tcp_per_tuple_max_sockets",
 		map[string]string{"node": "node-a"}); ok {
-		t.Fatal("per-tuple max emitted with no socket tables")
+		t.Fatal("per-tuple max emitted from a failed sock_diag dump")
 	}
 }
 
@@ -659,20 +653,31 @@ func TestTCPTimeWaitOverflowCounter(t *testing.T) {
 	}
 }
 
-func TestHexSockAddrDecode(t *testing.T) {
-	for raw, want := range map[string]string{
-		"0100007F:1F90": "127.0.0.1:8080",
-		"AC1E90AF:8C3A": "175.144.30.172:35898",
-		// tcp6 fixtures use the REAL kernel layout — each u32 word
-		// little-endian (verified against /proc/net/tcp6: a [::1]
-		// listener prints ...01000000, not ...00000001).
-		"00000000000000000000000001000000:0016": "[::1]:22",
-		"B80D0120000000000000000001000000:1F90": "[2001:db8::1]:8080",
-		"junk":                                  "junk",
-		"0100007F":                              "0100007F",
+// TestDiagEndpointDecode: the census PerTuple keys (raw daddr bytes
+// + big-endian dport) render byte-for-byte like the old /proc
+// rem_address column decode did — including v4-mapped v6 endpoints
+// (net.IP unpads them inside the brackets) and malformed passthrough.
+func TestDiagEndpointDecode(t *testing.T) {
+	key := func(ip string, port uint16) string {
+		var raw net.IP
+		if strings.Contains(ip, ":") {
+			raw = net.ParseIP(ip).To16()
+		} else {
+			raw = net.ParseIP(ip).To4()
+		}
+		return string(raw) + string([]byte{byte(port >> 8), byte(port)})
+	}
+	for k, want := range map[string]string{
+		key("127.0.0.1", 8080):        "127.0.0.1:8080",
+		key("175.144.30.172", 35898):  "175.144.30.172:35898",
+		key("::1", 22):                "[::1]:22",
+		key("2001:db8::1", 8080):      "[2001:db8::1]:8080",
+		key("::ffff:127.0.0.1", 8080): "[127.0.0.1]:8080",
+		"junk":                        "junk",
+		"0100007F":                    "0100007F",
 	} {
-		if got := hexSockAddr(raw); got != want {
-			t.Fatalf("hexSockAddr(%q)=%q want %q", raw, got, want)
+		if got := netlinkx.DiagEndpoint(k); got != want {
+			t.Fatalf("DiagEndpoint(%q)=%q want %q", k, got, want)
 		}
 	}
 }

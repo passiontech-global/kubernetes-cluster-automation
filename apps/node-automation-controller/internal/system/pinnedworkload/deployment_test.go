@@ -64,7 +64,7 @@ func baseDeploySpec(cs kubernetes.Interface) DeploymentSpec {
 func getDeploy(t *testing.T, cs *fake.Clientset) *appsv1.Deployment {
 	t.Helper()
 	d, err := cs.AppsV1().Deployments("kube-system").
-		Get(context.Background(), "addon", metav1.GetOptions{})
+		Get(t.Context(), "addon", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get addon: %v", err)
 	}
@@ -75,7 +75,7 @@ func getDeploy(t *testing.T, cs *fake.Clientset) *appsv1.Deployment {
 // nil error on the 15m requeue, not a workqueue backoff.
 func TestDeploymentSpecNotFound(t *testing.T) {
 	res, err := baseDeploySpec(fake.NewSimpleClientset()).
-		Reconcile(context.Background())
+		Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestDeploymentSpecGetError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
 		})
-	_, err := baseDeploySpec(cs).Reconcile(context.Background())
+	_, err := baseDeploySpec(cs).Reconcile(t.Context())
 	if err == nil {
 		t.Fatal("expected error when the deployment get fails")
 	}
@@ -115,7 +115,7 @@ func TestDeploymentSpecNodeListError(t *testing.T) {
 		t.Fatal("Drifted ran after a failed node list")
 		return true
 	}
-	if _, err := s.Reconcile(context.Background()); err == nil {
+	if _, err := s.Reconcile(t.Context()); err == nil {
 		t.Fatal("expected error when the node list fails")
 	}
 }
@@ -128,7 +128,7 @@ func TestDeploymentSpecNoDrift(t *testing.T) {
 
 	s := baseDeploySpec(cs)
 	s.Drifted = func(*appsv1.Deployment, int32) bool { return false }
-	res, err := s.Reconcile(context.Background())
+	res, err := s.Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestDeploymentSpecMissingContainerSkips(t *testing.T) {
 	var patched bool
 	testutil.ForbidDeployPatch(cs, &patched)
 
-	res, err := baseDeploySpec(cs).Reconcile(context.Background())
+	res, err := baseDeploySpec(cs).Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestDeploymentSpecPatchBodyError(t *testing.T) {
 	s.PatchBody = func(int32) ([]byte, error) {
 		return nil, errors.New("render blew up")
 	}
-	if _, err := s.Reconcile(context.Background()); err == nil {
+	if _, err := s.Reconcile(t.Context()); err == nil {
 		t.Fatal("expected error when PatchBody fails")
 	}
 	if patched {
@@ -191,7 +191,7 @@ func TestDeploymentSpecPatchError(t *testing.T) {
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("patch rejected")
 		})
-	_, err := baseDeploySpec(cs).Reconcile(context.Background())
+	_, err := baseDeploySpec(cs).Reconcile(t.Context())
 	if err == nil {
 		t.Fatal("expected error when the drift patch fails")
 	}
@@ -223,7 +223,7 @@ func TestDeploymentSpecAppliesPatch(t *testing.T) {
 		bodyWant = want
 		return []byte(fmt.Sprintf(`{"spec":{"replicas":%d}}`, want)), nil
 	}
-	res, err := s.Reconcile(context.Background())
+	res, err := s.Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestDeploymentSpecCachedReadConfirmSkipsSettled(t *testing.T) {
 		return kube.PodSpecHasContainer(&d.Spec.Template.Spec, "app") &&
 			d.Spec.Template.Spec.Containers[0].Image == ""
 	}
-	res, err := s.Reconcile(context.Background())
+	res, err := s.Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -320,7 +320,7 @@ func TestDeploymentSpecCachedReadConfirmPatchesDrift(t *testing.T) {
 
 	s := baseDeploySpec(cs)
 	s.Reader = &fakeCacheReader{objs: []client.Object{stale}}
-	if _, err := s.Reconcile(context.Background()); err != nil {
+	if _, err := s.Reconcile(t.Context()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if patches != 1 {
@@ -336,7 +336,7 @@ func TestDeploymentSpecCachedReadNotFound(t *testing.T) {
 	testutil.ForbidDeployPatch(cs, &patched)
 	s := baseDeploySpec(cs)
 	s.Reader = &fakeCacheReader{}
-	res, err := s.Reconcile(context.Background())
+	res, err := s.Reconcile(t.Context())
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}

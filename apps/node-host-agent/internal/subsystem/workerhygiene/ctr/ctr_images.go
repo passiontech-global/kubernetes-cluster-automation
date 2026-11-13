@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
@@ -193,7 +192,7 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	for img := range seen {
 		images = append(images, img)
 	}
-	sort.Strings(images) // deterministic order — same convention as dnsStale
+	slices.Sort(images) // deterministic order — same convention as dnsStale
 	if !c.d.State.RateTrySpend("last-ctr-image-rm", wdeps.CtrImageRmInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: ctr-image-healer corrupted image(s) %s - in rm cooldown (<15m), skip",

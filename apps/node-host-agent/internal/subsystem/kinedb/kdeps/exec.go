@@ -68,7 +68,7 @@ func (d *Deps) DiscoverContainer(ctx context.Context, preferred string, match, e
 	if err != nil {
 		return preferred
 	}
-	for _, n := range strings.Split(out, "\n") {
+	for n := range strings.SplitSeq(out, "\n") {
 		n = strings.TrimSpace(n)
 		if n == "" || !match.MatchString(n) {
 			continue
@@ -283,7 +283,7 @@ func (d *Deps) ReapOrphanedMaintSessions(ctx context.Context, pg, user, pass str
 		return 0, err
 	}
 	n := 0
-	for _, l := range strings.Split(out, "\n") {
+	for l := range strings.SplitSeq(out, "\n") {
 		if strings.TrimSpace(l) == "t" {
 			n++
 		}

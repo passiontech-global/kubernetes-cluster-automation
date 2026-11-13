@@ -34,7 +34,7 @@ var (
 // scanBPFIDLines harvests prog_id:/map_id: lines from one fdinfo
 // blob into the dedup sets — a link fd can list several prog_ids.
 func scanBPFIDLines(data []byte, progs, maps map[uint64]bool) {
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) != 2 {
 			continue

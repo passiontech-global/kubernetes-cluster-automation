@@ -62,9 +62,13 @@ func runRuncWrapper(argv []string, env []string, runcReal string,
 
 	// Fast path — the script's `case " $* " in *" create "*)`: the
 	// gate is a substring match on the space-joined args, so the word
-	// `create` inside a single arg also enters the slow path (the
-	// stricter is_create flag below still gates the rewrite).
-	if strings.Contains(" "+strings.Join(args, " ")+" ", " create ") {
+	// `create` inside a single arg also enters the slow path. The
+	// in-process port scans args for the standalone word instead —
+	// the stricter is_create flag below still gates the rewrite, and
+	// a `--bundle=x-create-y`-style arg that the join would have
+	// caught is a config.json read for a path the createBundle loop
+	// would never pick, so the word-match is the faithful reading.
+	if slices.Contains(args, "create") {
 		if bundle, ok := createBundle(args); ok {
 			injectSharedCacheMount(
 				filepath.Join(bundle, "config.json"), sharedCacheSource)

@@ -26,11 +26,10 @@ func DNSConfigFromEnv() probefw.DNSConfig {
 	// alertmanager-operated NXDOMAINs whenever its single pod is
 	// recreating, which would flap the DNS check during every
 	// alertmanager rollout despite CoreDNS being fine.
-	hosts := strings.Split(envx.Getenv("HEALTH_DNS_HOSTNAMES",
+	var trimmed []string
+	for h := range strings.SplitSeq(envx.Getenv("HEALTH_DNS_HOSTNAMES",
 		"kubernetes.default.svc.cluster.local,"+
-			"kube-prometheus-stack-prometheus.prometheus-operator.svc.cluster.local"), ",")
-	trimmed := hosts[:0]
-	for _, h := range hosts {
+			"kube-prometheus-stack-prometheus.prometheus-operator.svc.cluster.local"), ",") {
 		if h = strings.TrimSpace(h); h != "" {
 			trimmed = append(trimmed, h)
 		}

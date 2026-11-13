@@ -51,7 +51,7 @@ func backingTargets(ns string, names ...string) []corev1.Pod {
 func TestDeleteBackingPodsUnverifiableStopsPass(t *testing.T) {
 	targets := backingTargets("kube-system", "ms-0", "ms-1")
 	cs := fake.NewSimpleClientset(&targets[0], &targets[1])
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	cs.PrependReactor("list", "nodes",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("api down")
@@ -66,7 +66,7 @@ func TestDeleteBackingPodsUnverifiableStopsPass(t *testing.T) {
 		t.Fatalf("deleted = %d, want 0 — unverifiable must stop the pass", deleted)
 	}
 	for _, name := range []string{"ms-0", "ms-1"} {
-		if !asgPodExists(t, cs, "kube-system", name) {
+		if !testutil.PodExists(t, cs, "kube-system", name) {
 			t.Fatalf("pod %s evicted while the maintenance check was unverifiable", name)
 		}
 	}
@@ -89,7 +89,7 @@ func TestDeleteBackingPodsMaintenanceDefers(t *testing.T) {
 		},
 	}
 	cs := fake.NewSimpleClientset(&targets[0], cordoned)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	g := asgGuard(cs, asgDynFake())
 	g.queue = "apiservice-guard"
 	u := &unblockHealer{}
@@ -99,7 +99,7 @@ func TestDeleteBackingPodsMaintenanceDefers(t *testing.T) {
 		targets, time.Now()); deleted != 0 {
 		t.Fatalf("deleted = %d, want 0 — a held mutex defers every target", deleted)
 	}
-	if !asgPodExists(t, cs, "kube-system", "ms-0") {
+	if !testutil.PodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("pod evicted while maintenance was in flight")
 	}
 	if got := testutil.QueueErrorCount(t, "apiservice-guard") - before; got != 0 {
@@ -132,7 +132,7 @@ func TestDeleteBackingPodsPDBRefusedSkips(t *testing.T) {
 		t.Fatalf("deleted = %d, want 0 — refused evictions deliver no heal", deleted)
 	}
 	for _, name := range []string{"ms-0", "ms-1"} {
-		if !asgPodExists(t, cs, "kube-system", name) {
+		if !testutil.PodExists(t, cs, "kube-system", name) {
 			t.Fatalf("PDB-refused pod %s was evicted anyway", name)
 		}
 	}
@@ -173,7 +173,7 @@ func TestDeleteBackingPodsEvictionErrorsCounted(t *testing.T) {
 		t.Fatalf("queue errors delta = %v, want 2 — ms-0/ms-2 failures, ms-1 NotFound quiet", got)
 	}
 	for _, name := range []string{"ms-0", "ms-1", "ms-2"} {
-		if !asgPodExists(t, cs, "kube-system", name) {
+		if !testutil.PodExists(t, cs, "kube-system", name) {
 			t.Fatalf("pod %s evicted although every eviction failed", name)
 		}
 	}
@@ -193,7 +193,7 @@ func TestDeleteBackingPodsCap(t *testing.T) {
 		objs = append(objs, &targets[i])
 	}
 	cs := fake.NewSimpleClientset(objs...)
-	emulateEviction(cs)
+	testutil.EmulateEviction(cs)
 	g := asgGuard(cs, asgDynFake())
 	g.queue = "apiservice-guard"
 	u := &unblockHealer{}
@@ -207,7 +207,7 @@ func TestDeleteBackingPodsCap(t *testing.T) {
 	// the sweep cap, not a failure.
 	alive := 0
 	for _, name := range names {
-		if asgPodExists(t, cs, "kube-system", name) {
+		if testutil.PodExists(t, cs, "kube-system", name) {
 			alive++
 		}
 	}

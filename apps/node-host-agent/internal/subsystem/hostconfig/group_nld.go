@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
@@ -128,7 +128,7 @@ func (c *cyc) guardAllowSources() []string {
 	allow := append(c.vs("nodelocaldns_guard_allow_private"),
 		c.vs("nodelocaldns_guard_allow_extra")...)
 	allow = append(allow, c.registryNodeIPs()...)
-	sort.Strings(allow)
+	slices.Sort(allow)
 	return allow
 }
 
@@ -167,7 +167,7 @@ func (c *cyc) registryNodeIPs() []string {
 func (c *cyc) portsGuardAllowSources() []string {
 	allow := append([]string{}, c.vs("host_internal_ports_guard_allow_extra")...)
 	allow = append(allow, c.registryNodeIPs()...)
-	sort.Strings(allow)
+	slices.Sort(allow)
 	return allow
 }
 

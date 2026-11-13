@@ -90,7 +90,7 @@ func (s *Ctr) RmLease(ctx context.Context, id string) error {
 // lease evidence.
 func ParseCtrLeases(out string) []CtrLease {
 	var leases []CtrLease
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "ID") {
 			continue

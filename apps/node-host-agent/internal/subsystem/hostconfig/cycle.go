@@ -161,6 +161,37 @@ func (c *cyc) dpkgInstalled(ctx context.Context, pkg string) bool {
 	return strings.Contains(out, "install ok installed")
 }
 
+// dpkgMissing reports which of pkgs are not fully installed — the
+// batched dpkg-query shape of dpkgInstalled: one fork probes the
+// whole set (dpkg-query prints one line per requested package;
+// unknown packages just miss from the output). Run it before any
+// install of the same group so the statuses read consistently.
+func (c *cyc) dpkgMissing(ctx context.Context, pkgs ...string) []string {
+	args := append([]string{"-W", "-f=${binary:Package}\t${Status}\n"}, pkgs...)
+	out, _ := c.r.run(ctx, "dpkg-query", args...)
+	seen := map[string]bool{}
+	for ln := range strings.SplitSeq(out, "\n") {
+		f := strings.Split(ln, "\t")
+		if len(f) != 2 {
+			continue
+		}
+		// binary:Package prints the arch qualifier when
+		// multi-arch-relevant ("libc6:amd64") — strip it.
+		name := f[0]
+		if i := strings.IndexByte(name, ':'); i >= 0 {
+			name = name[:i]
+		}
+		seen[name] = strings.Contains(f[1], "install ok installed")
+	}
+	var missing []string
+	for _, p := range pkgs {
+		if !seen[p] {
+			missing = append(missing, p)
+		}
+	}
+	return missing
+}
+
 func (c *cyc) vb(name string) bool { return c.t.Vars.Bool(name) }
 
 func (c *cyc) vl(name string) []any { return c.t.Vars.List(name) }
@@ -381,14 +412,17 @@ func lineInFile(s, re, line, insAfter string) string {
 
 // download fetches url to dst under the Config.HTTPTimeout client
 // deadline (nebula/coredns/etcdctl tarballs, haproxy + kine deb/bin).
-func (r *Reconciler) download(ctx context.Context, url, dst, wantSHA256 string) error {
-	return converge.DownloadFile(ctx, url, dst, wantSHA256, r.cfg.HTTPTimeout)
+// mode is the final file's permission bits (converge.DownloadFile).
+func (r *Reconciler) download(ctx context.Context, url, dst, wantSHA256 string,
+	mode os.FileMode) error {
+	return converge.DownloadFile(ctx, url, dst, wantSHA256, mode, r.cfg.HTTPTimeout)
 }
 
 // downloadFile streams url to dst atomically under an explicit client
 // deadline (nexpDownload floors the timeout above HTTPTimeout).
-func downloadFile(ctx context.Context, url, dst, wantSHA256 string, timeout time.Duration) error {
-	return converge.DownloadFile(ctx, url, dst, wantSHA256, timeout)
+func downloadFile(ctx context.Context, url, dst, wantSHA256 string,
+	mode os.FileMode, timeout time.Duration) error {
+	return converge.DownloadFile(ctx, url, dst, wantSHA256, mode, timeout)
 }
 
 // untarInstall extracts member name from a .tar.gz and atomically

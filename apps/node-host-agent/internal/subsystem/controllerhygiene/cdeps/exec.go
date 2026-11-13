@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -125,6 +126,35 @@ func (d *Deps) UnitProp(ctx context.Context, unit, prop string) (string, error) 
 	out, err := d.Cfg.HostExecFn(cctx, false, 0,
 		"systemctl", "show", unit, "-p", prop, "--value")
 	return strings.TrimSpace(out), err
+}
+
+// MainPID reads the unit's main process pid — systemctl show -p
+// MainPID parity, 0 = not running/absent. Zero-fork first: the
+// shared systemd client's D-Bus property read (its own systemctl
+// fallback fires only on connection-level failure). An unwired
+// client or a failed D-Bus probe falls back to the same
+// `systemctl show` argv UnitProp carries over the HostExecFn seam.
+// The feeder loop polls it per cycle; forking `systemctl show` per
+// poll bought nothing the D-Bus property read doesn't answer.
+func (d *Deps) MainPID(ctx context.Context, unit string) (uint32, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultSystemctlBudget)
+	defer cancel()
+	if d.Cfg.Systemd != nil {
+		if pid, err := d.Cfg.Systemd.MainPID(cctx, unit); err == nil {
+			return pid, nil
+		}
+	}
+	out, err := d.Cfg.HostExecFn(cctx, false, 0,
+		"systemctl", "show", unit, "-p", "MainPID", "--value")
+	out = strings.TrimSpace(out)
+	pid, perr := strconv.ParseUint(out, 10, 32)
+	if perr != nil {
+		if err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("%s: unparsable MainPID %q", unit, out)
+	}
+	return uint32(pid), nil
 }
 
 // UnitActiveState is `systemctl is-active <unit>` — the output is

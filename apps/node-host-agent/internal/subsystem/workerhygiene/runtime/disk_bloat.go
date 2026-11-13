@@ -16,10 +16,10 @@ import (
 
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kubeutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
@@ -189,7 +189,7 @@ func snapshotMountIDs(d *wdeps.Deps) map[string]string {
 	hostSandboxRoot := fsx.HostSidePath(d.Cfg.SandboxCtlRoot)
 	hostSnapRoot := fsx.HostSidePath(d.Cfg.Disk.WLayerSnapshotsDir) + "/"
 	out := map[string]string{}
-	for _, ln := range strings.Split(string(data), "\n") {
+	for ln := range strings.SplitSeq(string(data), "\n") {
 		sep := strings.LastIndex(ln, " - ")
 		if sep < 0 {
 			continue
@@ -198,7 +198,7 @@ func snapshotMountIDs(d *wdeps.Deps) map[string]string {
 		if len(f) < 5 {
 			continue
 		}
-		mount := unescapeOverlayPath(f[4])
+		mount := procfs.UnescapeMountPath(f[4])
 		var taskID string
 		for _, root := range []string{hostTaskRoot, hostSandboxRoot} {
 			if strings.HasPrefix(mount, root+"/") &&
@@ -210,11 +210,11 @@ func snapshotMountIDs(d *wdeps.Deps) map[string]string {
 		if taskID == "" {
 			continue
 		}
-		for _, opt := range strings.Split(ln[sep+3:], ",") {
+		for opt := range strings.SplitSeq(ln[sep+3:], ",") {
 			if !strings.HasPrefix(opt, "upperdir=") {
 				continue
 			}
-			up := unescapeOverlayPath(strings.TrimPrefix(opt, "upperdir="))
+			up := procfs.UnescapeMountPath(strings.TrimPrefix(opt, "upperdir="))
 			if rel, ok := strings.CutPrefix(up, hostSnapRoot); ok {
 				// rel = "<id>/fs" — the snapshot dir name.
 				if fsDir, ok := strings.CutSuffix(rel, "/fs"); ok &&
@@ -225,13 +225,6 @@ func snapshotMountIDs(d *wdeps.Deps) map[string]string {
 		}
 	}
 	return out
-}
-
-// unescapeOverlayPath decodes the kernel's octal escapes in
-// mountinfo fields — same set ctr/mountinfo_hygiene.go handles.
-func unescapeOverlayPath(s string) string {
-	return strings.NewReplacer(`\040`, " ", `\011`, "\t",
-		`\012`, "\n", `\134`, `\`).Replace(s)
 }
 
 // taskDirPodUID resolves a containerd task/sandbox dir id back to
@@ -368,13 +361,10 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// a raw pod delete: the apiserver enforces the victim's
 	// PodDisruptionBudget atomically, so a PDB-protected pod is
 	// refused instead of silently disrupted (psi-memory-thrash
-	// evict parity).
-	ev := &policyv1.Eviction{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      victim.Name,
-			Namespace: victim.Namespace,
-		},
-	}
+	// evict parity). The UID precondition closes the listing→evict
+	// race: a same-name pod is a different object and the apiserver
+	// refuses (kubeutil.EvictPodV1).
+	ev := kubeutil.EvictPodV1(victim)
 	c.d.State.AppendLog(fmt.Sprintf(
 		"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
 		victim.Namespace, victim.Name, victimBytes, used*100))

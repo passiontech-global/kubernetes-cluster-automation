@@ -33,7 +33,7 @@ func logFileLines(t *testing.T, path string) []string {
 		t.Fatalf("read log: %v", err)
 	}
 	var lines []string
-	for _, l := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
+	for l := range strings.SplitSeq(strings.TrimRight(string(b), "\n"), "\n") {
 		// Strip the "<rfc3339> " prefix — the message text is the
 		// contract under test.
 		if i := strings.IndexByte(l, ' '); i >= 0 {

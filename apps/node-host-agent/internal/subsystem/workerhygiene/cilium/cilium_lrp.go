@@ -281,9 +281,14 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 // legitimately reports 0; that's a real verdict, not a missing one.
 func (c *CiliumLRPCheck) serviceReadyEndpoints(ctx context.Context,
 	ns, name string) (ready int, ok bool) {
+	// ResourceVersion "0": serve the LIST from the apiserver's watch
+	// cache — a read-only best-effort scan re-run every cycle, so
+	// watch-cache lag cannot move a verdict on its own and the
+	// per-cycle quorum read is skipped.
 	slices, err := c.d.Cfg.Client.DiscoveryV1().EndpointSlices(ns).
 		List(ctx, metav1.ListOptions{
-			LabelSelector: endpointSliceServiceLabel + "=" + name,
+			LabelSelector:   endpointSliceServiceLabel + "=" + name,
+			ResourceVersion: "0",
 		})
 	if err == nil && len(slices.Items) > 0 {
 		for i := range slices.Items {

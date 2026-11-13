@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,7 +27,7 @@ func nameservers(path string, max int) []string {
 		return nil
 	}
 	var out []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 2 && f[0] == "nameserver" {
 			out = append(out, f[1])
@@ -47,7 +47,7 @@ func (n *NetHealth) pinFiles() []string {
 	if err != nil {
 		return nil
 	}
-	sort.Strings(files)
+	slices.Sort(files)
 	return files
 }
 
@@ -71,7 +71,7 @@ func (n *NetHealth) renderHostsBlock(block string) (changed bool, err error) {
 	var tail []string // lines inside an unterminated managed block
 	inBlock := false
 	hadBlock := false
-	for _, line := range strings.Split(cur, "\n") {
+	for line := range strings.SplitSeq(cur, "\n") {
 		switch strings.TrimSpace(line) {
 		case hostsBlockBegin:
 			inBlock, hadBlock = true, true

@@ -24,10 +24,11 @@ const (
 	// deadNodeCap: nodes tainted per cycle — wrong verdicts must
 	// never take more than one node at a time.
 	deadNodeCap = 1
-	// outOfServiceTaint*: the Kubernetes-native "node is fenced"
-	// signal — node lifecycle controller force-deletes the pods,
-	// attach-detach controller force-detaches the volumes.
-	outOfServiceTaintKey   = "node.kubernetes.io/out-of-service"
+	// outOfServiceTaintValue is the taint's effect — the Kubernetes
+	// native "node is fenced" signal lives in
+	// kube.TaintNodeOutOfService: node lifecycle controller
+	// force-deletes the pods, attach-detach controller
+	// force-detaches the volumes.
 	outOfServiceTaintValue = "nodeshutdown"
 )
 
@@ -116,7 +117,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 			log.Info("SKIP: node still Ready", "node", nodeName, "stuckPods", count)
 			continue
 		}
-		if kube.HasTaint(n.Spec.Taints, outOfServiceTaintKey) {
+		if kube.HasTaint(n.Spec.Taints, kube.TaintNodeOutOfService) {
 			// Already fenced — the node controller is working on
 			// the force-deletes; does not consume the cap.
 			log.Info("KEEP-TAINT: already out-of-service", "node", nodeName, "stuckPods", count)

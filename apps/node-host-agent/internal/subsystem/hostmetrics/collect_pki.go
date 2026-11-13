@@ -10,7 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -104,7 +104,7 @@ func pkiCertFiles(path string) []string {
 			files = append(files, filepath.Join(path, n))
 		}
 	}
-	sort.Strings(files)
+	slices.Sort(files)
 	return files
 }
 

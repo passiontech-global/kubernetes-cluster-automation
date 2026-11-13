@@ -13,10 +13,12 @@ import (
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
@@ -148,10 +150,19 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 		}
 	}
 	// Conversion-webhook CRDs — listed once here because the orphan
-	// sweep and the backend-health sweep both read them. A missing
-	// dynamic client or a list error is recorded, not fatal: the
-	// admission duties above already have their inputs.
-	if g.Dyn == nil {
+	// sweep and the backend-health sweep both read them. PREFERRED
+	// source is the manager's CRD informer cache (see
+	// crdCacheTransform in cmd/manager): the cached objects are
+	// schema-stripped with .spec.conversion kept — exactly the slice
+	// the compact projection below retains — so the run pays zero
+	// wire/serializations for the census instead of re-listing
+	// multi-MB CRD bodies every 5 minutes. A cache read error (no
+	// informer yet, RBAC lag right after rollout) falls back to the
+	// legacy dynamic full-object list, so the census can never regress
+	// below the pre-cache posture.
+	if crds, ok := g.cachedCRDs(ctx); ok {
+		s.CRDs = crds
+	} else if g.Dyn == nil {
 		s.CRDErr = errors.New("no dynamic client — CRD list skipped")
 	} else {
 		// ListEach at the CRD page bound: each page's full objects
@@ -179,6 +190,30 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 		metav1.ListOptions{Limit: ListPageSize},
 		kube.Services(g.CS, metav1.NamespaceAll))
 	return s
+}
+
+// cachedCRDs reads the CRD census from the manager's informer cache
+// and projects each object to the compact conversion shape
+// (compactCRDFromTyped). ok=false means "no cache reader wired or the
+// cached read failed" — the caller falls back to the dynamic list.
+func (g *Guard) cachedCRDs(ctx context.Context) (
+	[]unstructured.Unstructured, bool) {
+
+	if g.NodeReader == nil {
+		return nil, false
+	}
+	var list apiextensionsv1.CustomResourceDefinitionList
+	if err := g.NodeReader.List(ctx, &list); err != nil {
+		logf.FromContext(ctx).Info(
+			"CRD informer cache read failed — falling back to the dynamic list",
+			"error", err)
+		return nil, false
+	}
+	out := make([]unstructured.Unstructured, 0, len(list.Items))
+	for i := range list.Items {
+		out = append(out, compactCRDFromTyped(&list.Items[i]))
+	}
+	return out, true
 }
 
 // SetMWC writes a just-patched MutatingWebhookConfiguration back

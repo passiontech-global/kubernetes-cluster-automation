@@ -73,7 +73,7 @@ func (p *Probe) probeTopChurn(ctx context.Context, pg, user, pass string,
 		return
 	}
 	var top []kdeps.ChurnEntry
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		f := strings.Split(strings.TrimSpace(line), "|")
 		if len(f) < 2 || f[0] == "" {
 			continue
@@ -122,7 +122,7 @@ func (p *Probe) probeTopHotkeys(ctx context.Context, pg, user, pass string,
 		return
 	}
 	var keys []kdeps.ChurnKeyEntry
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		f := strings.Split(strings.TrimSpace(line), "|")
 		if len(f) < 2 || f[0] == "" {
 			continue

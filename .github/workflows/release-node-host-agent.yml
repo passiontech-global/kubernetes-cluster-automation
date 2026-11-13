@@ -12,7 +12,20 @@ on:
     branches: [main]
     paths:
       - "apps/node-host-agent/**"
-      - "libs/hostkit/**"
+      # Only the hostkit subpackages this app's ./cmd/... actually
+      # imports — see the controller workflow for why the blanket
+      # libs/hostkit/** glob is avoided. Enforced by
+      # internal/releaseglob (go list -deps ./cmd/... vs this list).
+      - "libs/hostkit/envx/**"
+      - "libs/hostkit/fsx/**"
+      - "libs/hostkit/httpx/**"
+      - "libs/hostkit/logx/**"
+      - "libs/hostkit/nodecond/**"
+      - "libs/hostkit/timex/**"
+      # Subpackage globs don't match module files — the module's dep
+      # graph changes fire releases too.
+      - "libs/hostkit/go.mod"
+      - "libs/hostkit/go.sum"
       - "libs/jinja/**"
       - ".moon/**"
       - "mise.toml"
@@ -52,5 +65,5 @@ jobs:
       # release (a follow-up job would download a non-executable 0644
       # asset and race a 404 window after `gh release create`).
       amd64_alias: true
-      lib_paths: "libs/hostkit/** libs/jinja/**"
+      lib_paths: "libs/hostkit/envx/** libs/hostkit/fsx/** libs/hostkit/httpx/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/** libs/jinja/**"
     secrets: inherit

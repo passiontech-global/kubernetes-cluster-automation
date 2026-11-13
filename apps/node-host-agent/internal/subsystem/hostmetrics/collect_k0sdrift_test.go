@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -24,7 +25,7 @@ func k0sCleanYAML(extraKeys ...string) string {
 	var b strings.Builder
 	b.WriteString("apiVersion: k0s.k0sproject.io/v1beta1\n" +
 		"kind: ClusterConfig\nspec:\n  controllerManager:\n    extraArgs:\n")
-	for _, k := range defaultExpectedKCMArgs {
+	for _, k := range k0sconfig.DefaultExpectedKCMArgs {
 		b.WriteString("      " + k + ": \"5\"\n")
 	}
 	for _, k := range extraKeys {

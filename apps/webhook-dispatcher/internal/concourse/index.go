@@ -41,6 +41,22 @@ type fetchFlight struct {
 // timing out never kills the shared fetch every other caller joined.
 const fetchFlightBudget = 30 * time.Second
 
+// clock returns the client's time source — time.Now unless a test
+// injected one via Client.now. Every cache-age decision below reads
+// the SAME source, so a fake clock advances the TTL, backoff,
+// negative-cache and refresh windows together instead of racing the
+// wall clock.
+func (c *Client) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// since is clock().Sub(t) — the age check every TTL/backoff branch
+// below is written against.
+func (c *Client) since(t time.Time) time.Duration { return c.clock().Sub(t) }
+
 // runFetch executes one index fetch on a caller-detached context and
 // publishes the outcome: success replaces the index/lookup wholesale,
 // failure records the cold-start negative cache and wakes joiners
@@ -66,7 +82,7 @@ func (c *Client) runFetch(callerCtx context.Context, flight *fetchFlight, prev [
 		// Negative-cache the failure (NegCacheTTL) — waiters waking
 		// on done re-loop into this check and share the error
 		// rather than serializing fetches.
-		c.lastErr, c.lastErrAt = err, time.Now()
+		c.lastErr, c.lastErrAt = err, c.clock()
 		indexFetchErrorsTotal.Inc()
 		if c.index != nil {
 			logger().Warn("resource index refresh failed — serving stale",
@@ -74,12 +90,11 @@ func (c *Client) runFetch(callerCtx context.Context, flight *fetchFlight, prev [
 				"error", err)
 		}
 	} else {
-		// The client keeps its OWN copy of the fetched index — the
-		// caller's slice must not alias the cache, or a caller
-		// mutating its return value would corrupt what every later
-		// delivery matches against. Serve paths below clone out too.
-		c.index = slices.Clone(index)
-		c.fetchedAt = time.Now()
+		// index is freshly built by fetchIndex per fetch and never
+		// mutated after this publish (serving paths clone out for
+		// callers), so the cache can own it directly.
+		c.index = index
+		c.fetchedAt = c.clock()
 		c.lookup = newLookup(c.index)
 		c.lastErr = nil
 		// Freshness signal: this gauge moves only here and in
@@ -132,9 +147,23 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// Fast path: a TTL-fresh index answers with a read lock only.
+	// This is the per-delivery hot path (EnsureIndex runs on every
+	// handled webhook), so it must not contend with itself behind a
+	// full Lock; the slow paths below keep the write lock for their
+	// attempt-stamping and flight bookkeeping. Under RLock the
+	// snapshot is race-free — publish replaces index wholesale and
+	// serving paths clone out, never mutating the cached slice.
+	c.mu.RLock()
+	if c.index != nil && c.since(c.fetchedAt) < c.ttl() {
+		index := c.index
+		c.mu.RUnlock()
+		return serveIndex(index, clone), nil
+	}
+	c.mu.RUnlock()
 	for {
 		c.mu.Lock()
-		if c.index != nil && time.Since(c.fetchedAt) < c.ttl() {
+		if c.index != nil && c.since(c.fetchedAt) < c.ttl() {
 			index := c.index
 			c.mu.Unlock()
 			return serveIndex(index, clone), nil
@@ -161,6 +190,15 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 				// are the answer this call exists to produce,
 				// and re-deciding would spin a fresh fetch per
 				// wake whenever the fetch outlasts the TTL.
+				// A failed flight reports ITS OWN error here:
+				// looping into the negative-cache branch would
+				// route this caller through shared state (and,
+				// if another fetch started meanwhile, into a
+				// NEW flight) instead of surfacing the failure
+				// the caller waited on.
+				if index == nil && f.err != nil {
+					return nil, f.err
+				}
 				c.mu.Lock()
 				index = c.index
 				c.mu.Unlock()
@@ -181,7 +219,7 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 		// every request re-takes the mutex and blocks on a doomed
 		// fetch. Reached only when NO fetch is in flight: a running
 		// one was joined above.
-		if c.index != nil && time.Since(c.lastAttemptAt) < c.ttl() {
+		if c.index != nil && c.since(c.lastAttemptAt) < c.ttl() {
 			index := c.index
 			c.mu.Unlock()
 			return serveIndex(index, clone), nil
@@ -193,7 +231,7 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 		// index to serve the backoff check above already owns the
 		// retry decision.
 		if c.index == nil && c.lastErr != nil &&
-			time.Since(c.lastErrAt) < c.negCacheTTL() {
+			c.since(c.lastErrAt) < c.negCacheTTL() {
 			err := c.lastErr
 			c.mu.Unlock()
 			return nil, err
@@ -203,10 +241,13 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 		// and be served the existing index / join this flight
 		// instead of starting their own) and install the flight.
 		// The fetch itself is detached — see runFetch.
-		c.lastAttemptAt = time.Now()
-		flight := &fetchFlight{done: make(chan struct{})}
+		c.lastAttemptAt = c.clock()
+		flight := new(fetchFlight{done: make(chan struct{})})
 		c.flight = flight
-		prev := slices.Clone(c.index)
+		// fetchIndex only reads prev (it builds its own carry-over
+		// map of value copies), so the current index can be handed
+		// over without a defensive clone.
+		prev := c.index
 		c.mu.Unlock()
 		go c.runFetch(ctx, flight, prev)
 		// The starter waits on ITS OWN flight rather than looping:
@@ -352,7 +393,7 @@ func (c *Client) refresh(ctx context.Context, clone bool) ([]Resource, error) {
 		// Resources consults, so a failed fetch can't be re-armed
 		// in a tight retry loop by alternating entry points.
 		if c.index == nil && c.lastErr != nil &&
-			time.Since(c.lastErrAt) < c.negCacheTTL() {
+			c.since(c.lastErrAt) < c.negCacheTTL() {
 			err := c.lastErr
 			c.mu.Unlock()
 			return nil, err
@@ -372,8 +413,8 @@ func (c *Client) refresh(ctx context.Context, clone bool) ([]Resource, error) {
 		// (nil, nil) — a silent empty success instead of the fetch
 		// error the caller asked a forced refresh to surface.
 		if c.index != nil &&
-			(time.Since(c.fetchedAt) < c.minRefreshInterval() ||
-				time.Since(c.lastForceRefreshAt) < c.minRefreshInterval()) {
+			(c.since(c.fetchedAt) < c.minRefreshInterval() ||
+				c.since(c.lastForceRefreshAt) < c.minRefreshInterval()) {
 			index := c.index
 			c.mu.Unlock()
 			return serveIndex(index, clone), nil
@@ -387,10 +428,12 @@ func (c *Client) refresh(ctx context.Context, clone bool) ([]Resource, error) {
 		// detached — see runFetch — so this stamp can never be
 		// "restored" by a caller unwind: a started fetch really did
 		// happen.
-		c.lastForceRefreshAt = time.Now()
-		flight := &fetchFlight{done: make(chan struct{})}
+		c.lastForceRefreshAt = c.clock()
+		flight := new(fetchFlight{done: make(chan struct{})})
 		c.flight = flight
-		prev := slices.Clone(c.index)
+		// Same as resources: fetchIndex never mutates prev — no
+		// defensive clone needed.
+		prev := c.index
 		c.mu.Unlock()
 		go c.runFetch(ctx, flight, prev)
 		// Wait on OUR OWN flight directly via the same helper the

@@ -32,12 +32,18 @@ type procScan struct {
 	fds     int    // len(/proc/<pid>/fd) — -1 when the dir didn't list
 }
 
-// procScanCache holds the last shared sweep.
+// procScanCache holds the last shared sweep. sweeping/done are the
+// singleflight: callers arriving while a sweep is in flight join its
+// result instead of re-walking /proc (Collect can run concurrently
+// across scrapes — one walk must serve all of them).
 type procScanCache struct {
 	mu      sync.Mutex
 	at      time.Time
 	scanned bool
 	procs   map[string]procScan
+
+	sweeping bool
+	done     chan struct{}
 }
 
 // procSnapshot returns the cached /proc scan, re-walking at most once
@@ -50,14 +56,35 @@ func (c *Collector) procSnapshot() (map[string]procScan, bool) {
 		c.proc.mu.Unlock()
 		return procs, ok
 	}
+	if c.proc.sweeping {
+		// Join the in-flight sweep — one /proc walk serves everyone.
+		done := c.proc.done
+		c.proc.mu.Unlock()
+		<-done
+		return c.cachedProcs()
+	}
+	c.proc.sweeping = true
+	done := make(chan struct{})
+	c.proc.done = done
 	c.proc.mu.Unlock()
 
 	procs := sweepProcs(c.cfg.ProcRoot)
 	c.proc.mu.Lock()
 	c.proc.at = c.cfg.Clock.Now()
 	c.proc.procs, c.proc.scanned = procs, procs != nil
+	c.proc.sweeping = false
+	c.proc.done = nil
 	c.proc.mu.Unlock()
+	close(done)
 	return procs, procs != nil
+}
+
+// cachedProcs returns the current cache contents — the joined
+// callers' tail read after the sweeper landed.
+func (c *Collector) cachedProcs() (map[string]procScan, bool) {
+	c.proc.mu.Lock()
+	defer c.proc.mu.Unlock()
+	return c.proc.procs, c.proc.scanned
 }
 
 // sweepProcs walks ProcRoot once collecting every pid's read set —
@@ -72,22 +99,31 @@ func (c *Collector) procSnapshot() (map[string]procScan, bool) {
 // is a watched daemon — every other pid's fds field stays -1, which
 // collectDaemonFD already treats as "not a candidate".
 func sweepProcs(procRoot string) map[string]procScan {
-	entries, err := os.ReadDir(procRoot)
+	// Readdirnames + the ASCII-digit gate replaces the ReadDir
+	// entry slice + pidDirRe match — no DirEntry allocs, no regex,
+	// on the ~1,500-name hot path. /proc numeric entries are all
+	// dirs, so the digit check alone is the pid gate.
+	d, err := os.Open(procRoot)
 	if err != nil {
 		return nil
 	}
-	procs := make(map[string]procScan, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() || !pidDirRe.MatchString(e.Name()) {
+	defer func() { _ = d.Close() }()
+	names, err := d.Readdirnames(-1)
+	if err != nil {
+		return nil
+	}
+	procs := make(map[string]procScan, len(names))
+	for _, name := range names {
+		if !isPidDir(name) {
 			continue
 		}
-		dir := filepath.Join(procRoot, e.Name())
+		dir := filepath.Join(procRoot, name)
 		ps := procScan{fds: -1}
 		if data, err := os.ReadFile(filepath.Join(dir, "stat")); err == nil {
 			ps.state, ps.comm = parseStatHead(data)
 		}
 		if !daemonFDComm(ps.comm) {
-			procs[e.Name()] = ps
+			procs[name] = ps
 			continue
 		}
 		var cmdline string
@@ -99,16 +135,31 @@ func sweepProcs(procRoot string) map[string]procScan {
 			}
 		}
 		if matchDaemon(ps.comm, cmdline) == "" {
-			procs[e.Name()] = ps
+			procs[name] = ps
 			continue
 		}
 		ps.cmdline = cmdline
 		if fds, err := os.ReadDir(filepath.Join(dir, "fd")); err == nil {
 			ps.fds = len(fds)
 		}
-		procs[e.Name()] = ps
+		procs[name] = ps
 	}
 	return procs
+}
+
+// isPidDir reports whether a /proc entry name is a numeric pid dir —
+// the ASCII-digit gate that replaced the pidDirRe match on the sweep
+// hot path.
+func isPidDir(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := range len(name) {
+		if name[i] < '0' || name[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // daemonFDComm reports whether comm is one of the daemonFDTargets

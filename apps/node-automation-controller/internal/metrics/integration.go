@@ -24,6 +24,15 @@ var CiliumIdentitiesCollectedTotal = prometheus.NewCounter(prometheus.CounterOpt
 	Help: "CiliumIdentity objects reaped by the two-pass safe GC.",
 })
 
+// CiliumActiveIdentities is the total CiliumIdentity count from the
+// last successful list — the eBPF identity-table occupancy. Single-
+// check series of the cilium-identity-auditor (Wave 5.1 consolidated
+// out of the module file into the integration domain file).
+var CiliumActiveIdentities = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "node_automation_cilium_active_identities",
+	Help: "Total CiliumIdentity objects in the cluster — eBPF identity table occupancy.",
+})
+
 // HelmHookJobsCleanedTotal counts failed helm-hook Jobs reaped when
 // the helmrelease-unlocker frees a stuck HelmRelease (C3).
 var HelmHookJobsCleanedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -234,12 +243,25 @@ var VeleroRepoUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while a velero.io BackupRepository is not Ready or its maintenance is >7d stale.",
 }, []string{"namespace", "name", "reason"})
 
+// VeleroDataMovementWedged marks (1) each DataUpload or
+// DataDownload stuck in an in-flight phase past the 6h window —
+// mark-only: unlike a PodVolumeBackup there is no provably-dead
+// node-agent thread to bounce a delete would safely restart, so the
+// wedged object pages and waits for operator/velero cleanup.
+// Single-check series of the cnpg-backup-audit data-movement sweep
+// (Wave 5.1 consolidated out of the module file into the integration
+// domain file).
+var VeleroDataMovementWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_data_movement_wedged",
+	Help: "1 while a velero.io/v2alpha1 DataUpload/DataDownload is stuck in an in-flight phase (InProgress/Accepted/Prepared/Canceling) past 6h — cnpg-backup-audit.",
+}, []string{"namespace", "name", "kind"})
+
 // integrationCollectors lists every vector declared in this file, in
 // declaration order; the single init() below registers the table, so
 // registration order stays byte-stable and adding a metric touches
 // only this file.
 var integrationCollectors = []prometheus.Collector{
-	CiliumIdentitiesCollectedTotal,
+	CiliumIdentitiesCollectedTotal, CiliumActiveIdentities,
 	HelmHookJobsCleanedTotal,
 	WebhookCABundleMismatch, TLSSecretDaysToExpiry,
 	WebhookCABundleDaysToExpiry, TrustBundleDaysToExpiry,
@@ -254,6 +276,7 @@ var integrationCollectors = []prometheus.Collector{
 	VeleroBackupStuck, VeleroPodVolumeBackupWedged,
 	VeleroPodVolumeRestoreWedged,
 	VeleroWedgedObjectsCleanedTotal, VeleroRepoUnhealthy,
+	VeleroDataMovementWedged,
 }
 
 func init() {

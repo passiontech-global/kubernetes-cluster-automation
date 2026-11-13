@@ -4,7 +4,6 @@
 package kube
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -29,7 +28,7 @@ func TestReadPodLogTail(t *testing.T) {
 		cs := fake.NewSimpleClientset(logTailPod())
 		cs.PrependReactor("get", "pods", testhelp.ProbeLogReactor(
 			"noise\nneedle in line\nmore noise", nil))
-		hit, err := ReadPodLogTail(context.Background(), cs, logTailPod(),
+		hit, err := ReadPodLogTail(t.Context(), cs, logTailPod(),
 			PodLogOpts{TailLines: 50, MaxBytes: 1 << 20, Timeout: time.Second}, match)
 		if err != nil || !hit {
 			t.Fatalf("ReadPodLogTail = (%v,%v), want (true,nil)", hit, err)
@@ -40,7 +39,7 @@ func TestReadPodLogTail(t *testing.T) {
 		cs := fake.NewSimpleClientset(logTailPod())
 		cs.PrependReactor("get", "pods", testhelp.ProbeLogReactor(
 			"all quiet\nnothing here", nil))
-		hit, err := ReadPodLogTail(context.Background(), cs, logTailPod(),
+		hit, err := ReadPodLogTail(t.Context(), cs, logTailPod(),
 			PodLogOpts{TailLines: 50, MaxBytes: 1 << 20, Timeout: time.Second}, match)
 		if err != nil || hit {
 			t.Fatalf("ReadPodLogTail = (%v,%v), want (false,nil)", hit, err)
@@ -52,7 +51,7 @@ func TestReadPodLogTail(t *testing.T) {
 		cs.PrependReactor("get", "pods", testhelp.ProbeLogReactor(
 			"ok\nneedle beyond the cap", nil))
 		// 3 bytes => only "ok\n" is read — the needle must not match.
-		hit, err := ReadPodLogTail(context.Background(), cs, logTailPod(),
+		hit, err := ReadPodLogTail(t.Context(), cs, logTailPod(),
 			PodLogOpts{TailLines: 50, MaxBytes: 3, Timeout: time.Second}, match)
 		if err != nil || hit {
 			t.Fatalf("ReadPodLogTail = (%v,%v), want (false,nil)", hit, err)
@@ -63,7 +62,7 @@ func TestReadPodLogTail(t *testing.T) {
 		cs := fake.NewSimpleClientset(logTailPod())
 		cs.PrependReactor("get", "pods", testhelp.ProbeLogReactor(
 			"", errors.New("log fetch boom")))
-		hit, err := ReadPodLogTail(context.Background(), cs, logTailPod(),
+		hit, err := ReadPodLogTail(t.Context(), cs, logTailPod(),
 			PodLogOpts{TailLines: 50, MaxBytes: 1 << 20, Timeout: time.Second}, match)
 		if err == nil || hit {
 			t.Fatalf("ReadPodLogTail = (%v,%v), want (false,err)", hit, err)

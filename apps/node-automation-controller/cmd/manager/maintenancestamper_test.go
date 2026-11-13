@@ -56,7 +56,7 @@ func TestMaintenanceStamperStampsImmediately(t *testing.T) {
 		})
 
 	r := &maintenanceStamperRunnable{cs: cs, dyn: nil, now: shared.SystemClock}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- r.Start(ctx) }()
 
@@ -98,7 +98,7 @@ func TestMaintenanceStamperUsesClock(t *testing.T) {
 		dyn: nil,
 		now: func() time.Time { return base },
 	}
-	r.stamp(context.Background())
+	r.stamp(t.Context())
 
 	if len(payloads) == 0 {
 		t.Fatal("stamp pass issued no node patch")

@@ -20,13 +20,11 @@ func boundedForEach(n []string, visit func(i int)) {
 	sem := make(chan struct{}, probePoolSize)
 	var wg sync.WaitGroup
 	for i := range n {
-		wg.Add(1)
 		sem <- struct{}{} // blocks while probePoolSize probes are in flight
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			defer func() { <-sem }()
 			visit(i)
-		}(i)
+		})
 	}
 	wg.Wait()
 }

@@ -133,7 +133,7 @@ func Setup(d shared.Deps) error {
 		// zero-value types — nothing to initialize here.
 		g := &webhookGuard{Guard: guardstate.Guard{
 			CS: d.CS, Dyn: d.Dyn, Queue: d.Name, Now: shared.SystemClock,
-			NodeReader: d.Mgr.GetClient(), Verdict: d.Maintenance}}
+			NodeReader: d.CachedClient(), Verdict: d.Maintenance}}
 		return shared.AddPeriodic(d.Mgr, g.Queue, 5*time.Minute, g.run)
 	})
 }

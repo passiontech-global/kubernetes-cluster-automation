@@ -23,6 +23,22 @@ type Mount struct {
 	Opts       string
 }
 
+// UnescapeMountPath decodes the octal escapes the kernel applies to
+// the path fields of /proc/*/mounts and /proc/*/mountinfo (space→
+// \040, tab→\011, newline→\012, backslash→\134) — pod/volume paths
+// may contain spaces. ParseMounts leaves the escapes verbatim (a
+// missed unescape only narrows the consumers' ro/fstype matching,
+// never widens it); call sites that need the real path decode
+// through here.
+func UnescapeMountPath(s string) string {
+	return strings.NewReplacer(
+		`\134`, `\`,
+		`\040`, " ",
+		`\011`, "\t",
+		`\012`, "\n",
+	).Replace(s)
+}
+
 // HasOpt reports whether the mount's comma-separated option list
 // contains exactly the token name (e.g. "ro") — whole-token match
 // only, never a prefix/suffix hit on a longer name. Zero-alloc:
@@ -49,7 +65,7 @@ func (m Mount) HasOpt(name string) bool {
 // reduce with LastByMountPoint.
 func ParseMounts(data []byte) []Mount {
 	var out []Mount
-	for _, ln := range strings.Split(string(data), "\n") {
+	for ln := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(ln)
 		if len(f) < 4 {
 			continue

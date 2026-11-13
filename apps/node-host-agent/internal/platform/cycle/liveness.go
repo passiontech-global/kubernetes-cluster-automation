@@ -140,6 +140,29 @@ func (l *Liveness) RegisterLoop(name string, interval, budget time.Duration) *Be
 	return b
 }
 
+// Unregister removes a beat RegisterLoop returned — cycle.Runner
+// defers it in Run so a loop's beat cannot outlive the loop. A beat
+// left registered keeps its last stamp forever: after a panic
+// restart the orphaned beat trips the /healthz staleness check ~one
+// budget later and the supervisor gets killed while healthy. A beat
+// not (or no longer) registered is a no-op, so a double-unregister
+// race is harmless. The fallback beat is NOT unregisterable — bare
+// Heartbeat callers stamp it for the registry's whole lifetime; the
+// supervisor renews whole registries per Run attempt instead.
+func (l *Liveness) Unregister(b *Beat) {
+	if b == nil {
+		return
+	}
+	l.mu.Lock()
+	for i, lb := range l.loops {
+		if lb == b {
+			l.loops = append(l.loops[:i], l.loops[i+1:]...)
+			break
+		}
+	}
+	l.mu.Unlock()
+}
+
 // LoopBeats snapshots every registered loop beat in the
 // non-exempt subtree — own loops first, then each live child's
 // (recursively). An exempt registry contributes nothing: cycle.Idle

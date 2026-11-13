@@ -20,6 +20,9 @@
 package apiserver
 
 import (
+	"bufio"
+	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -27,7 +30,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -171,11 +174,11 @@ func apfKeysSorted(m map[APFSeriesKey]float64) []APFSeriesKey {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].FlowSchema != keys[j].FlowSchema {
-			return keys[i].FlowSchema < keys[j].FlowSchema
+	slices.SortFunc(keys, func(a, b APFSeriesKey) int {
+		if c := cmp.Compare(a.FlowSchema, b.FlowSchema); c != 0 {
+			return c
 		}
-		return keys[i].PriorityLevel < keys[j].PriorityLevel
+		return cmp.Compare(a.PriorityLevel, b.PriorityLevel)
 	})
 	return keys
 }
@@ -210,13 +213,49 @@ func (c *FreezeCheck) apfMetrics(ctx context.Context) (string, error) {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return "", fmt.Errorf("apiserver /metrics status %d", resp.StatusCode)
 	}
-	// The apiserver /metrics body is a few MiB on a healthy cluster —
-	// 16MiB bounds it like the journal capture cap.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
+	return scanAPFMetrics(resp.Body)
+}
+
+// apfMetricPrefixes are the exposition families the APF/relist/RSS
+// parses match — every parse regex anchors `^` to the line start, so
+// a body of just the kept lines yields byte-identical matches to the
+// full scrape.
+var apfMetricPrefixes = [][]byte{
+	[]byte("apiserver_flowcontrol_rejected_requests_total"),
+	[]byte("apiserver_flowcontrol_current_inqueue_requests"),
+	[]byte("apiserver_terminated_watchers_total"),
+	[]byte("process_resident_memory_bytes"),
+}
+
+// scanAPFMetrics streams the /metrics body through a 64 KiB
+// bufio.Scanner, keeping only the four exposition families the
+// probes parse — the raw body is a few MiB on a healthy cluster and
+// the parse needs a few KiB, so the multi-MiB string never gets
+// materialized. The 16MiB kept-lines budget mirrors the old body cap.
+func scanAPFMetrics(r io.Reader) (string, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), 64<<10)
+	var kept []string
+	size := 0
+	for sc.Scan() {
+		ln := sc.Bytes()
+		for _, p := range apfMetricPrefixes {
+			if bytes.HasPrefix(ln, p) {
+				kept = append(kept, string(ln))
+				size += len(ln) + 1
+				if size >= 16<<20 {
+					// Same bound the old LimitReader applied —
+					// a pathological endpoint cannot pin memory.
+					return strings.Join(kept, "\n"), nil
+				}
+				break
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
 		return "", err
 	}
-	return string(body), nil
+	return strings.Join(kept, "\n"), nil
 }
 
 // ProbeAPF scrapes the local apiserver /metrics, mirrors the APF
@@ -269,8 +308,8 @@ func (c *FreezeCheck) ProbeAPF(ctx context.Context) {
 	if len(offenders) == 0 {
 		return
 	}
-	sort.Slice(offenders, func(i, j int) bool {
-		return offenders[i].delta > offenders[j].delta
+	slices.SortFunc(offenders, func(a, b apfOffender) int {
+		return cmp.Compare(b.delta, a.delta) // worst first
 	})
 	if len(offenders) > apfOffenderSample {
 		offenders = offenders[:apfOffenderSample]

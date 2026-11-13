@@ -28,7 +28,7 @@ func (c *Collector) collectFail2ban(ch chan<- prometheus.Metric) {
 	if err != nil {
 		return
 	}
-	for _, pair := range strings.Fields(string(data)) {
+	for pair := range strings.FieldsSeq(string(data)) {
 		jail, n, ok := strings.Cut(pair, "=")
 		if !ok || jail == "" {
 			continue

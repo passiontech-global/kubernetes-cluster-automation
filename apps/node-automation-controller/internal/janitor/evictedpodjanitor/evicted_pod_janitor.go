@@ -84,51 +84,55 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	// eviction reason, so without this the sweep deserializes every
 	// Running/Pending pod in the cluster to throw them away below.
 	// The in-code phase check stays — fake clientsets ignore field
-	// selectors and the belt costs nothing.
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		FieldSelector: "status.phase=" + string(corev1.PodFailed),
-		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(j.cs, metav1.NamespaceAll))
-	if err != nil {
-		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors j.queue
-	}
-
+	// selectors and the belt costs nothing. The filter pass runs
+	// INSIDE the page visit: it needs Status (metadata-only lists
+	// cannot serve it) but only the tiny target tuples survive, so
+	// each page's pod bodies die with the page instead of pinning
+	// the cluster's failed pods until the deletes run.
 	type target struct {
 		ns, name, node, reason string
 		uid                    types.UID
 		ageHours               int
 	}
 	var targets []target
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Status.Phase != corev1.PodFailed {
-			continue
-		}
-		if _, ok := evictedPodReasons[pod.Status.Reason]; !ok {
-			continue
-		}
-		if pod.DeletionTimestamp != nil {
-			continue // already terminating — the API owns it now
-		}
-		// The eviction happened when the containers died, not when
-		// the pod object was created — a pod can live for weeks
-		// before eviction, and CreationTimestamp-based aging would
-		// reap a minutes-old eviction the operator has not seen.
-		age := j.now.Now().Sub(evictionTime(pod))
-		if age <= evictedPodMaxAge {
-			continue // fresh eviction — keep it inspectable
-		}
-		targets = append(targets, target{
-			ns:       pod.Namespace,
-			name:     pod.Name,
-			node:     pod.Spec.NodeName,
-			reason:   pod.Status.Reason,
-			uid:      pod.UID,
-			ageHours: int(age.Hours()),
+	err := kube.ListEach(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase=" + string(corev1.PodFailed),
+		Limit:         kube.DefaultListPageSize,
+	}, kube.Pods(j.cs, metav1.NamespaceAll),
+		func(page []corev1.Pod) error {
+			for i := range page {
+				pod := &page[i]
+				if pod.Status.Phase != corev1.PodFailed {
+					continue
+				}
+				if _, ok := evictedPodReasons[pod.Status.Reason]; !ok {
+					continue
+				}
+				if pod.DeletionTimestamp != nil {
+					continue // already terminating — the API owns it now
+				}
+				// The eviction happened when the containers died, not when
+				// the pod object was created — a pod can live for weeks
+				// before eviction, and CreationTimestamp-based aging would
+				// reap a minutes-old eviction the operator has not seen.
+				age := j.now.Now().Sub(evictionTime(pod))
+				if age <= evictedPodMaxAge {
+					continue // fresh eviction — keep it inspectable
+				}
+				targets = append(targets, target{
+					ns:       pod.Namespace,
+					name:     pod.Name,
+					node:     pod.Spec.NodeName,
+					reason:   pod.Status.Reason,
+					uid:      pod.UID,
+					ageHours: int(age.Hours()),
+				})
+			}
+			return nil
 		})
+	if err != nil {
+		return fmt.Errorf("list failed pods: %w", err) // periodic wrapper IncErrors j.queue
 	}
-	// Release the pod slice before issuing Delete calls.
-	pods = nil
 
 	deleted, failed, capped := reap.Sweep(ctx, log, targets, reap.Options[target]{
 		// The cap bounds delete attempts (failed deletes churn the

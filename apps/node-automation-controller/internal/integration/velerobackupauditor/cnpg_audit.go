@@ -5,20 +5,18 @@
 // missing postures exported on DBBackupUnhealthy{
 // namespace,cluster,reason}. Clusters without the CNPG CRDs no-op
 // quietly, same contract as the Velero and Everest halves.
+// The sweep skeleton (list/404/index/skip/zero-backup/emit/prune)
+// lives in db_backup_audit.go — this file is the CNPG row of that
+// table plus the product-specific reason functions.
 package velerobackupauditor
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -35,6 +33,38 @@ const (
 	cnpgBackupStuckMaxAge = 6 * time.Hour
 	cnpgBackupStaleMaxAge = 36 * time.Hour
 )
+
+// cnpgDBBackupAudit is the cnpg-backup-audit CNPG row of the
+// db_backup_audit.go table: the ScheduledBackup/Backup GVR pair, the
+// list-only-when-schedules-exist gating, the spec.clusterName owner
+// field, the bound-and-not-suspended skip predicate and the
+// status.phase reasons functions.
+var cnpgDBBackupAudit = dbBackupAudit{
+	primaryGVR:     cnpgScheduledBackupGVR,
+	backupGVR:      cnpgBackupGVR,
+	primaryListErr: "list cnpg scheduledbackups",
+	backupListErr:  "list cnpg backups",
+	listBackups: func(primary *unstructured.UnstructuredList) bool {
+		// No schedules — skip the Backup read entirely.
+		return len(primary.Items) > 0
+	},
+	ownerPath: []string{"spec", "clusterName"},
+	identity: func(sb *unstructured.Unstructured) (string, string, bool) {
+		ns := sb.GetNamespace()
+		cluster, _ := kube.NestedString(sb.Object, "spec", "clusterName")
+		if cluster == "" {
+			return ns, "", true // schedule not bound to a cluster — nothing to judge
+		}
+		// A suspended schedule's stale backups are deliberate, not
+		// rot — same posture as a paused Velero Schedule / paused
+		// Everest DatabaseCluster.
+		suspend, _ := kube.NestedBool(sb.Object, "spec", "suspend")
+		return ns, cluster, suspend
+	},
+	reasons:      cnpgBackupReasons,
+	hasGood:      cnpgHasCompleted,
+	unhealthyMsg: "cnpg cluster backup unhealthy",
+}
 
 // auditCNPGBackups evaluates every non-suspended ScheduledBackup
 // against its cluster's Backup objects (matched on spec.clusterName
@@ -53,101 +83,7 @@ const (
 // the CNPG CRDs 404/NoMatch on the list — a quiet no-op, same
 // contract as the Velero and Everest halves of this module.
 func (a *veleroBackupAuditor) auditCNPGBackups(ctx context.Context) error {
-	a.seenCNPG.Begin() // drop any aborted sweep's leftover emissions
-	log := logf.FromContext(ctx)
-
-	sbs, err := a.veleroList(ctx, cnpgScheduledBackupGVR)
-	switch {
-	case err == nil:
-		// proceed below
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		// CNPG operator not installed — current stays empty so the
-		// prune below still clears any stale series.
-		sbs = &unstructured.UnstructuredList{}
-	default:
-		return fmt.Errorf("list cnpg scheduledbackups: %w", err)
-	}
-
-	var backups *unstructured.UnstructuredList
-	if len(sbs.Items) > 0 {
-		backups, err = a.veleroList(ctx, cnpgBackupGVR)
-		switch {
-		case err == nil:
-			// proceed
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-			backups = nil // backup CRD absent — schedules audit as "no backups"
-		default:
-			return fmt.Errorf("list cnpg backups: %w", err)
-		}
-	}
-
-	// Index backups by owning cluster ("ns/spec.clusterName") once —
-	// each schedule then judges only its own cluster's history.
-	byCluster := map[string][]*unstructured.Unstructured{}
-	if backups != nil {
-		for i := range backups.Items {
-			b := &backups.Items[i]
-			owner, _ := kube.NestedString(b.Object, "spec", "clusterName")
-			if owner == "" {
-				continue
-			}
-			key := b.GetNamespace() + "/" + owner
-			byCluster[key] = append(byCluster[key], b)
-		}
-	}
-
-	now := a.now.Now()
-	for i := range sbs.Items {
-		sb := &sbs.Items[i]
-		ns := sb.GetNamespace()
-		cluster, _ := kube.NestedString(sb.Object, "spec", "clusterName")
-		if cluster == "" {
-			continue // schedule not bound to a cluster — nothing to judge
-		}
-		// A suspended schedule's stale backups are deliberate, not
-		// rot — same posture as a paused Velero Schedule / paused
-		// Everest DatabaseCluster.
-		if suspend, _ := kube.NestedBool(sb.Object, "spec", "suspend"); suspend {
-			continue
-		}
-		clusterBackups := byCluster[ns+"/"+cluster]
-		reasons := cnpgBackupReasons(clusterBackups, now)
-		// Same zero-backup blind spot as the Velero Schedule and
-		// Everest cluster checks: a schedule older than 36h whose
-		// cluster produced ZERO backups is silently unprotected.
-		// Caller-side because the age clock belongs to the schedule,
-		// not the (empty) backup list.
-		if len(clusterBackups) == 0 {
-			sbCreated := sb.GetCreationTimestamp()
-			if !sbCreated.IsZero() &&
-				now.Sub(sbCreated.Time) > veleroMissingBackupMaxAge {
-				reasons = append(reasons, "missing")
-			}
-		} else if !cnpgHasCompleted(clusterBackups) {
-			// selfheal-alert-coverage Schrödinger's-backup: backup objects EXIST but
-			// none ever reached phase=completed — every attempt
-			// failed (or is wedged) and the newest may sit in
-			// "running" forever, so the in-list stale check (which
-			// keys on the newest COMPLETED) sees nothing. Past the
-			// 36h horizon the schedule is effectively unprotected.
-			// Caller-side because the age clock is the schedule's.
-			sbCreated := sb.GetCreationTimestamp()
-			if !sbCreated.IsZero() &&
-				now.Sub(sbCreated.Time) > veleroMissingBackupMaxAge {
-				reasons = append(reasons, "stale")
-			}
-		}
-		for _, reason := range reasons {
-			k := everestKey{ns, cluster, reason}
-			a.seenCNPG.Set(metrics.DBBackupUnhealthy, 1, k, ns, cluster, reason)
-			log.Info("cnpg cluster backup unhealthy",
-				"cluster", ns+"/"+cluster, "reason", reason,
-				"backups", len(clusterBackups))
-		}
-	}
-
-	a.seenCNPG.Prune(metrics.DBBackupUnhealthy.DeleteLabelValues)
-	return nil
+	return a.auditDBBackups(ctx, &a.seenCNPG, cnpgDBBackupAudit)
 }
 
 // cnpgBackupReasons evaluates one cluster's CNPG backup list and

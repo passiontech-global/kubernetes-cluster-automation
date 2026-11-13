@@ -135,12 +135,10 @@ func TestSuspectLogAtomicCheckSpend(t *testing.T) {
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for range racers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			s.SuspectLog("conntrack-parse", "deduped line", time.Hour)
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
