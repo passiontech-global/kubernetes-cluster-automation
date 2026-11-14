@@ -307,3 +307,16 @@ func TestStripCRDSchemaVersions(t *testing.T) {
 	StripCRDSchemaVersions(&unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{"versions": "not-a-list"}}})
 }
+
+func TestFindCondition(t *testing.T) {
+	conds := []Condition{
+		{Type: "Ready", Status: "True"},
+		{Type: "Synced", Status: "False", Reason: "Err"},
+	}
+	if c, ok := FindCondition(conds, "Synced"); !ok || c.Reason != "Err" {
+		t.Fatalf("FindCondition(Synced) = %+v, %v", c, ok)
+	}
+	if _, ok := FindCondition(conds, "Missing"); ok {
+		t.Fatal("expected Missing condition to return false")
+	}
+}

@@ -1,6 +1,14 @@
 package kube
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
 
 func i32(v int32) *int32 { return &v }
 
@@ -38,5 +46,80 @@ func TestIsIntentionallyDownscaled(t *testing.T) {
 		if got := IsIntentionallyDownscaled(c.annotations, c.replicas); got != c.want {
 			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestDownscaledClusterCRs(t *testing.T) {
+	items := []unstructured.Unstructured{
+		{Object: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"namespace":   "ns1",
+				"name":        "df-parked",
+				"annotations": map[string]interface{}{"downscaler/uptime": "Mon-Fri 08:00-18:00"},
+			},
+			"spec": map[string]interface{}{"replicas": int64(0)},
+		}},
+		{Object: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"namespace":   "ns1",
+				"name":        "df-live",
+				"annotations": map[string]interface{}{"downscaler/uptime": "Mon-Fri 08:00-18:00"},
+			},
+			"spec": map[string]interface{}{"replicas": int64(3)},
+		}},
+	}
+
+	got, err := DownscaledClusterCRs(items, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got["ns1/df-parked"] || got["ns1/df-live"] || len(got) != 1 {
+		t.Fatalf("unexpected downscaled map: %v", got)
+	}
+
+	// NotFound and NoMatchError are treated as "none parked".
+	for _, listErr := range []error{
+		apierrors.NewNotFound(schema.GroupResource{Group: "g", Resource: "r"}, "x"),
+		&meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{Resource: "r"}},
+	} {
+		got, err := DownscaledClusterCRs(nil, listErr)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("expected empty map and nil err for %v, got %v, %v", listErr, got, err)
+		}
+	}
+
+	// Other errors propagate.
+	if _, err := DownscaledClusterCRs(nil, errors.New("apiserver down")); err == nil {
+		t.Fatal("expected error to propagate")
+	}
+}
+
+func TestOwnsOrdinalPodAndDownscaledMemberPod(t *testing.T) {
+	cases := []struct {
+		cr, pod string
+		want    bool
+	}{
+		{"db", "db-0", true},
+		{"db", "db-12", true},
+		{"db", "db-server-0", true},
+		{"db", "db-cache-0", false},
+		{"db", "other-0", false},
+		{"db", "db-server-abc", false},
+	}
+	for _, tc := range cases {
+		if got := OwnsOrdinalPod(tc.cr, tc.pod); got != tc.want {
+			t.Errorf("OwnsOrdinalPod(%q, %q) = %v, want %v", tc.cr, tc.pod, got, tc.want)
+		}
+	}
+
+	downscaled := map[string]bool{
+		"ns1/db": true,
+		"badkey": true,
+	}
+	if !DownscaledMemberPod("ns1", "db-server-1", downscaled) {
+		t.Error("expected ns1/db-server-1 to match ns1/db")
+	}
+	if DownscaledMemberPod("ns2", "db-0", downscaled) {
+		t.Error("expected ns2/db-0 not to match ns1/db")
 	}
 }

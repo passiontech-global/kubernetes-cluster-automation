@@ -88,3 +88,19 @@ func TestMergePatchAnnos(t *testing.T) {
 		t.Fatalf("nil value must serialize as JSON null for merge-patch delete: %v", annos)
 	}
 }
+
+func TestAnnoTimeCtx(t *testing.T) {
+	if _, ok := AnnoTimeCtx(t.Context(), nil, "k"); ok {
+		t.Fatal("nil object must return false")
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		UID:         "u1",
+		Annotations: map[string]string{"ts": "2026-11-06T00:00:00Z"},
+	}}
+	ctx := WithSweepOverlay(t.Context())
+	RecordAnnoPatch(ctx, pod, []byte(`{"metadata":{"annotations":{"ts":"2026-11-07T00:00:00Z"}}}`))
+	got, ok := AnnoTimeCtx(ctx, pod, "ts")
+	if !ok || got.Day() != 7 {
+		t.Fatalf("expected overlaid timestamp day 7, got %v (ok=%v)", got, ok)
+	}
+}

@@ -137,3 +137,48 @@ func TestEffectiveAnnoAndRecordPatch(t *testing.T) {
 		t.Fatalf("EffectiveAnno absent = %q, want empty", got)
 	}
 }
+
+func TestTemplateAnnosAndPodTombstoneGen(t *testing.T) {
+	obj := overlayPod("sts-pod", nil)
+	base := map[string]string{"keep": "1", "over": "old"}
+
+	// Outside a sweep: RecordTemplateAnnos returns false, EffectiveTemplateAnnos returns base, PodTombstoneGen=0.
+	plainCtx := t.Context()
+	if RecordTemplateAnnos(plainCtx, obj, map[string]string{"a": "b"}) {
+		t.Fatal("expected RecordTemplateAnnos=false outside sweep")
+	}
+	if got := EffectiveTemplateAnnos(plainCtx, obj, base); got["over"] != "old" || len(got) != 2 {
+		t.Fatalf("unexpected EffectiveTemplateAnnos outside sweep: %v", got)
+	}
+	if got := PodTombstoneGen(plainCtx); got != 0 {
+		t.Fatalf("expected PodTombstoneGen=0 outside sweep, got %d", got)
+	}
+
+	// Inside a sweep.
+	ctx := WithSweepOverlay(t.Context())
+	if got := PodTombstoneGen(ctx); got != 0 {
+		t.Fatalf("expected initial PodTombstoneGen=0, got %d", got)
+	}
+	MarkPodDeleted(ctx, "uid-1")
+	if got := PodTombstoneGen(ctx); got != 1 {
+		t.Fatalf("expected PodTombstoneGen=1 after MarkPodDeleted, got %d", got)
+	}
+
+	// Unrecorded object returns base unchanged.
+	if got := EffectiveTemplateAnnos(ctx, obj, base); got["over"] != "old" || len(got) != 2 {
+		t.Fatalf("expected base unchanged before recording, got %v", got)
+	}
+	if RecordTemplateAnnos(ctx, obj, nil) {
+		t.Fatal("expected RecordTemplateAnnos=false for empty annos")
+	}
+	if !RecordTemplateAnnos(ctx, obj, map[string]string{"over": "new", "added": "yes"}) {
+		t.Fatal("expected RecordTemplateAnnos=true inside sweep")
+	}
+	merged := EffectiveTemplateAnnos(ctx, obj, base)
+	if merged["keep"] != "1" || merged["over"] != "new" || merged["added"] != "yes" {
+		t.Fatalf("unexpected merged template annos: %v", merged)
+	}
+	if base["over"] != "old" {
+		t.Fatal("base map must not be mutated")
+	}
+}
