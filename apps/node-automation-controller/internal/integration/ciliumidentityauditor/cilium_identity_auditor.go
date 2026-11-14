@@ -68,8 +68,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -303,7 +301,7 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		})
 	switch {
 	case err == nil:
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// CES CRD absent or API version not served — CEP-only
 		// cluster, nothing to merge.
 	default:

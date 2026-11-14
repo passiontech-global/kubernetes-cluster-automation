@@ -26,8 +26,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -149,7 +147,7 @@ func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
 		// flavor not installed" interpretation.
 		routes, err := p.AllUnstructured(ctx, rk.gvr)
 		switch {
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		case kube.IsCRDAbsent(err):
 			continue // gateway-api flavor not installed on this cluster
 		case err != nil:
 			return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.gvr.Resource, err)}

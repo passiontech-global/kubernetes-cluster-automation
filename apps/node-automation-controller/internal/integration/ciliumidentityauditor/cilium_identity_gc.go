@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -94,19 +93,8 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 				metrics.CiliumIdentitiesCollectedTotal.Inc()
 				return nil
 			},
-			OnError: func(log logr.Logger, name string, err error) {
-				switch {
-				case apierrors.IsNotFound(err):
-					log.Info("SKIP: identity already gone — raced with cilium's own GC",
-						"identity", name)
-				case apierrors.IsConflict(err):
-					log.Info("SKIP: identity recreated since the list — UID precondition fired",
-						"identity", name)
-				default:
-					metrics.IncError(a.queue)
-					log.Error(err, "identity delete failed", "identity", name)
-				}
-			},
+			OnError: reap.DeleteErrorHandler("identity", func(name string) string { return name },
+				func() { metrics.IncError(a.queue) }),
 		})
 	if capped {
 		log.Info("GC capped — remaining orphans drain next sweep",

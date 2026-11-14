@@ -18,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	admissionv1 "k8s.io/api/admissionregistration/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
@@ -246,53 +245,4 @@ func (b *Breaker) markHealthyStreak(key string) int {
 // confirmed) re-arms the gate from zero.
 func (b *Breaker) clearHealthyStreak(key string) {
 	b.recoverStreak.Reset(key)
-}
-
-// hookView is the breaker's uniform projection over MutatingWebhook /
-// ValidatingWebhook — identical relevant fields, distinct Go types.
-type hookView struct {
-	name string
-	fp   *admissionv1.FailurePolicyType
-	svc  *admissionv1.ServiceReference
-}
-
-func mutHookViews(ws []admissionv1.MutatingWebhook) []hookView {
-	out := make([]hookView, len(ws))
-	for i := range ws {
-		out[i] = hookView{
-			name: ws[i].Name, fp: ws[i].FailurePolicy,
-			svc: ws[i].ClientConfig.Service,
-		}
-	}
-	return out
-}
-
-func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
-	out := make([]hookView, len(ws))
-	for i := range ws {
-		out[i] = hookView{
-			name: ws[i].Name, fp: ws[i].FailurePolicy,
-			svc: ws[i].ClientConfig.Service,
-		}
-	}
-	return out
-}
-
-// allHookViews projects the snapshot's mutating then validating
-// configs — one pass over both kinds for consumers that read the same
-// fields off every webhook (the pod-bounce key collector). A nil
-// webhook-config list (its list failed) contributes nothing.
-func allHookViews(snap *guardstate.Snapshot) [][]hookView {
-	var out [][]hookView
-	if snap.MWC != nil {
-		for i := range snap.MWC.Items {
-			out = append(out, mutHookViews(snap.MWC.Items[i].Webhooks))
-		}
-	}
-	if snap.VWC != nil {
-		for i := range snap.VWC.Items {
-			out = append(out, valHookViews(snap.VWC.Items[i].Webhooks))
-		}
-	}
-	return out
 }

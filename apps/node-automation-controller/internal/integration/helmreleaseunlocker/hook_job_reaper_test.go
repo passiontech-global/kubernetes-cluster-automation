@@ -17,6 +17,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -249,8 +250,8 @@ func TestJobFailedCondition(t *testing.T) {
 		{"complete", cond(batchv1.JobComplete, corev1.ConditionTrue), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := jobFailed(tc.job); got != tc.want {
-				t.Fatalf("jobFailed = %v, want %v", got, tc.want)
+			if got := kube.JobHasCondition(tc.job, batchv1.JobFailed); got != tc.want {
+				t.Fatalf("JobHasCondition(JobFailed) = %v, want %v", got, tc.want)
 			}
 		})
 	}

@@ -11,8 +11,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -146,7 +144,7 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 	for _, gvr := range perconaClusterGVRs {
 		list, err := p.AllUnstructured(ctx, gvr)
 		if err != nil {
-			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			if kube.IsCRDAbsent(err) {
 				continue // operator/CRD not installed on this cluster
 			}
 			rep.InfraErr(fmt.Errorf("list %s: %w", gvr.Resource, err))

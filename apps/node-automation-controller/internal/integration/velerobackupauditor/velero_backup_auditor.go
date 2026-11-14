@@ -51,8 +51,6 @@ import (
 	"fmt"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -420,14 +418,14 @@ func (a *veleroBackupAuditor) veleroObjects(ctx context.Context) (
 	*unstructured.UnstructuredList, *unstructured.UnstructuredList, error) {
 	schedules, err := a.veleroList(ctx, veleroScheduleGVR)
 	if err != nil {
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		if kube.IsCRDAbsent(err) {
 			return nil, nil, nil
 		}
 		return nil, nil, fmt.Errorf("list velero schedules: %w", err)
 	}
 	backups, err := a.veleroList(ctx, veleroBackupGVR)
 	if err != nil {
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		if kube.IsCRDAbsent(err) {
 			backups = nil // schedules exist but backups CRD absent — check 1 still runs
 		} else {
 			return nil, nil, fmt.Errorf("list velero backups: %w", err)

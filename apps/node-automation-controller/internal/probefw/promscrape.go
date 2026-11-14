@@ -35,8 +35,15 @@ func StreamPodMetrics(ctx context.Context, client *http.Client,
 	if ip == "" {
 		return errors.New("pod has no IP — metrics unreachable")
 	}
-	lctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	if maxBytes <= 0 {
+		return errors.New("pod metrics maxBytes must be positive")
+	}
+	lctx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		lctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	// net.JoinHostPort, not fmt %s:%d — a bare IPv6 pod IP needs
 	// brackets or the URL parses as host "::1" port garbage.
 	req, err := http.NewRequestWithContext(lctx, http.MethodGet,
@@ -121,17 +128,19 @@ func ParseMetricValue(line, name string) (float64, bool) {
 	var raw string
 	switch {
 	case strings.HasPrefix(rest, "{"):
-		idx := strings.LastIndex(rest, "}")
-		if idx < 0 {
+		idx, ok := findLabelsEnd(rest)
+		if !ok {
 			return 0, false
 		}
 		raw = strings.TrimSpace(rest[idx+1:])
-	case strings.HasPrefix(rest, " "):
+	case strings.HasPrefix(rest, " "), strings.HasPrefix(rest, "\t"):
 		raw = strings.TrimSpace(rest)
 	default:
 		return 0, false
 	}
-	raw, _, _ = strings.Cut(raw, " ")
+	if i := strings.IndexAny(raw, " \t"); i >= 0 {
+		raw = raw[:i]
+	}
 	v, err := strconv.ParseFloat(raw, 64)
 	// NaN and ±Inf parse cleanly but are not samples — Prometheus
 	// emits them for stale/absent series and every consumer treats
@@ -140,6 +149,32 @@ func ParseMetricValue(line, name string) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// findLabelsEnd returns the byte index of the closing `}` for a `{...}`
+// Prometheus label set, ignoring `}` inside double-quoted label values
+// (with `\"` / `\\` escapes) and any trailing OpenMetrics exemplar `{...}`.
+func findLabelsEnd(s string) (int, bool) {
+	inQuote, escaped := false, false
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if c == '\\' && inQuote {
+			escaped = true
+			continue
+		}
+		if c == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote && c == '}' {
+			return i, true
+		}
+	}
+	return -1, false
 }
 
 // ParseMetricValues returns every sample value of name inside an

@@ -67,11 +67,11 @@ func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 		seen[key] = true
 		keys = append(keys, key)
 	}
-	for _, views := range allHookViews(snap) {
-		for _, h := range views {
-			add(h.svc)
+	snap.ForEachWebhookConfig(func(cfg guardstate.WebhookConfigView) {
+		for i := range cfg.Hooks {
+			add(cfg.Hooks[i].Service)
 		}
-	}
+	})
 	if len(keys) == 0 {
 		return
 	}

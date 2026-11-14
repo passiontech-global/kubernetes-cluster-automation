@@ -11,7 +11,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -100,7 +99,7 @@ func (p *gatewayRouteHealthCheck) loadGrants(ctx context.Context,
 		// version is not served" interpretation.
 		l, err := p.AllUnstructured(ctx, gvr)
 		switch {
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		case kube.IsCRDAbsent(err):
 			continue // this version is not served on the cluster
 		case err != nil:
 			c.grantsErr = true

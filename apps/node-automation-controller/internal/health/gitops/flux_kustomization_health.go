@@ -25,8 +25,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -140,7 +138,7 @@ func (p *fluxKustomizationHealthCheck) Run(ctx context.Context) probefw.Result {
 	// here.
 	kusts, err := p.AllUnstructured(ctx, fluxKustomizationGVR)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// CRD absent — Flux not installed. The sweep IS complete
 		// (nothing can exist), so the emitted ledger still closes
 		// out: tuples flagged while the CRD existed are dead series

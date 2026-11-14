@@ -13,7 +13,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -198,7 +197,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			rk.gvr, metav1.NamespaceAll,
 			metav1.ListOptions{Limit: probefw.HealthListPageSize})
 		switch {
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		case kube.IsCRDAbsent(err):
 			continue // report CRD absent on this cluster — no census, no GC
 		case err != nil:
 			// A failed read makes the sweep partial — bail before any
@@ -248,7 +247,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 				p.Dyn, rk.gvr, metav1.NamespaceAll,
 				metav1.ListOptions{Limit: probefw.HealthListPageSize})
 			switch {
-			case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+			case kube.IsCRDAbsent(err):
 				continue // CRD absent on this cluster — skip silently
 			case err != nil:
 				return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.resource, err)}
@@ -269,7 +268,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		// full-object census.
 		items, err := p.AllUnstructured(ctx, rk.gvr)
 		switch {
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		case kube.IsCRDAbsent(err):
 			continue // CRD absent on this cluster — skip silently
 		case err != nil:
 			return probefw.Result{Infra: fmt.Errorf("list %s: %w", rk.resource, err)}

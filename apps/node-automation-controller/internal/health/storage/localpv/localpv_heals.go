@@ -126,19 +126,15 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	// to the ledger-only gate, an unreadable census defers
 	// fail-closed.
 	var obj metav1.Object
-	deps, err := p.AllDeployments(ctx)
+	dep, err := p.Deployment(ctx, openebsProvisionerNS, openebsProvisionerName)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: read localpv provisioner deployment failed — heal deferred",
 			"error", err)
 		return
 	}
-	for i := range deps {
-		if deps[i].Namespace == openebsProvisionerNS &&
-			deps[i].Name == openebsProvisionerName {
-			obj = &deps[i]
-			break
-		}
+	if dep != nil {
+		obj = dep
 	}
 	// Confirm a provisioner pod exists BEFORE the persisted-cooldown
 	// + mutex + budget preamble — an empty/absent pod set must not

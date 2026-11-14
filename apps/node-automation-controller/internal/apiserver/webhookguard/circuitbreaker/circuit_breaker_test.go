@@ -52,13 +52,13 @@ func TestCircuitPatchUnmeasurableRefFreezesRecovery(t *testing.T) {
 	kind, cfg := guardstate.KindMutating, "mwc-url"
 	urlHook, noRefHook := "rewired.example.com", "noref.example.com"
 	ignore := new(admissionv1.Ignore) // the tripped state, externally re-asserted
-	views := []hookView{
+	views := []guardstate.WebhookView{
 		// URL clientConfig — no Service ref at all.
-		{name: urlHook, fp: ignore},
+		{Name: urlHook, FailurePolicy: ignore},
 		// Service ref with an empty namespace — unmeasurable the same
 		// way (svcEffective/svcRaw stay -1).
-		{name: noRefHook, fp: ignore,
-			svc: &admissionv1.ServiceReference{Name: "svc"}},
+		{Name: noRefHook, FailurePolicy: ignore,
+			Service: &admissionv1.ServiceReference{Name: "svc"}},
 	}
 	ready := guardstate.EndpointCensus{
 		Raw: map[string]int{}, Effective: map[string]int{}}

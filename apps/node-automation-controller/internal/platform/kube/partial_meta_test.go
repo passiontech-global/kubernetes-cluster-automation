@@ -91,6 +91,19 @@ func TestListPartialOrFallback_MetaSuccessAndErrors(t *testing.T) {
 	if _, err := ListPartialOrFallback(context.Background(), nil, nil, nil, gvr, "ns1", metav1.ListOptions{}); err == nil {
 		t.Fatal("expected error when all clients are nil")
 	}
+
+	// 6. 406 fallback error must surface the real fallback failure, not mask it with 406.
+	csForbidden := fake.NewClientset()
+	csForbidden.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, &apierrors.StatusError{ErrStatus: metav1.Status{
+			Status: metav1.StatusFailure,
+			Code:   http.StatusForbidden,
+			Reason: metav1.StatusReasonForbidden,
+		}}
+	})
+	if _, err := ListPartialOrFallback(context.Background(), meta406, csForbidden, nil, gvr, "ns1", metav1.ListOptions{}); !apierrors.IsForbidden(err) {
+		t.Fatalf("expected fallback Forbidden error, got %v", err)
+	}
 }
 
 func TestListPartialOrFallback_DynamicFallbackAndUnstructured(t *testing.T) {

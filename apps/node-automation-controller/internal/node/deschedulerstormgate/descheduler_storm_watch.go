@@ -10,8 +10,6 @@ import (
 	"slices"
 
 	corev1 "k8s.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -30,22 +28,11 @@ var nodeSweepRequests = shared.SweepRequests("descheduler-storm-gate-sweep")
 // equivalent: {conds: type=status, taints: keys}). Comparing raw
 // Status.Conditions would fire on every kubelet heartbeat —
 // lastHeartbeatTime/Reason/Message churn constantly.
-var stormSignalChanges = predicate.Funcs{
-	UpdateFunc: func(e event.UpdateEvent) bool {
-		oldN, ok1 := e.ObjectOld.(*corev1.Node)
-		newN, ok2 := e.ObjectNew.(*corev1.Node)
-		if !ok1 || !ok2 || oldN == nil || newN == nil {
-			return true
-		}
-		return oldN.Spec.Unschedulable != newN.Spec.Unschedulable ||
-			!maps.Equal(condStatusMap(oldN), condStatusMap(newN)) ||
-			!slices.Equal(taintKeys(oldN), taintKeys(newN))
-	},
-	// Node add/remove changes the storm verdict too.
-	CreateFunc:  func(event.CreateEvent) bool { return true },
-	DeleteFunc:  func(event.DeleteEvent) bool { return true },
-	GenericFunc: func(event.GenericEvent) bool { return true },
-}
+var stormSignalChanges = shared.NodeUpdatePredicate(true, func(oldN, newN *corev1.Node) bool {
+	return oldN.Spec.Unschedulable != newN.Spec.Unschedulable ||
+		!maps.Equal(condStatusMap(oldN), condStatusMap(newN)) ||
+		!slices.Equal(taintKeys(oldN), taintKeys(newN))
+})
 
 // condStatusMap is the jqFilter projection: condition type -> status,
 // dropping churny fields (lastHeartbeatTime, reason, message).

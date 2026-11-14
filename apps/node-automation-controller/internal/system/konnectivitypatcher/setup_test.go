@@ -33,15 +33,11 @@ func TestSetupRegistersController(t *testing.T) {
 // comment-enforced (the module has no GateEnv row today; the test
 // pins the gate the helper enforces for the day one lands).
 func TestSetupKonnectivityPatcherDisabled(t *testing.T) {
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Name: "konnectivity-patcher", Mgr: m,
-		CS: fake.NewSimpleClientset(), Dyn: testutil.StubDyn(),
-		Disabled: true}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	if len(m.Added) != 0 {
-		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
-	}
+	testutil.DisabledNoop(t, Setup, shared.Deps{
+		Name: "konnectivity-patcher",
+		CS:   fake.NewSimpleClientset(),
+		Dyn:  testutil.StubDyn(),
+	})
 }
 
 // The konnectivity-patcher predicate pins ns/name on top of the

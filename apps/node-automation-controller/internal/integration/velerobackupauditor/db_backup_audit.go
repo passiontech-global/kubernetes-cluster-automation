@@ -19,8 +19,6 @@ import (
 	"fmt"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -81,7 +79,7 @@ func (a *veleroBackupAuditor) auditDBBackups(ctx context.Context,
 	switch {
 	case err == nil:
 		// proceed below
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// Operator not installed — current stays empty so the
 		// prune below still clears any stale series.
 		primary = &unstructured.UnstructuredList{}
@@ -95,7 +93,7 @@ func (a *veleroBackupAuditor) auditDBBackups(ctx context.Context,
 		switch {
 		case err == nil:
 			// proceed
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		case kube.IsCRDAbsent(err):
 			backups = nil // backup CRD absent — subjects audit as "no backups"
 		default:
 			return fmt.Errorf("%s: %w", cfg.backupListErr, err)

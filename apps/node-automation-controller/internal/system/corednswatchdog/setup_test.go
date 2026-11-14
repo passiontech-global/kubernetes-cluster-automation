@@ -16,10 +16,9 @@ import (
 // crontab-equivalent interval — the pairing is what keeps
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Name: "coredns-stale-watchdog", Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	testutil.ExpectPeriodic(t, m, "coredns-stale-watchdog", time.Minute)
+	testutil.PeriodicContract(t, Setup, shared.Deps{
+		Name: "coredns-stale-watchdog",
+		CS:   fake.NewSimpleClientset(),
+		Dyn:  testutil.StubDyn(),
+	}, "coredns-stale-watchdog", time.Minute)
 }

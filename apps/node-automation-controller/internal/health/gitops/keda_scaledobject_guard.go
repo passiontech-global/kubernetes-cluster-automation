@@ -14,8 +14,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -95,7 +93,7 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 	now := p.Now()
 	sos, err := p.AllUnstructured(ctx, kube.GVRKedaScaledObject)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// KEDA absent — still reconcile the ledgers: a tuple/seen
 		// entry held from when KEDA existed is resolved, and
 		// returning Pass early leaks the series pinned at 1. (The
@@ -227,33 +225,27 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	var rv string
 	kind := ""
 	if want == "" || want == "Deployment" {
-		deps, err := p.AllDeployments(ctx)
+		dep, err := p.Deployment(ctx, ns, target)
 		if err != nil {
 			return // census unreadable — inconclusive, retry next sweep
 		}
-		for i := range deps {
-			if deps[i].Namespace == ns && deps[i].Name == target {
-				kind = "Deployment"
-				annotations = deps[i].Annotations
-				replicas = deps[i].Spec.Replicas
-				rv = deps[i].ResourceVersion
-				break
-			}
+		if dep != nil {
+			kind = "Deployment"
+			annotations = dep.Annotations
+			replicas = dep.Spec.Replicas
+			rv = dep.ResourceVersion
 		}
 	}
 	if kind == "" && (want == "" || want == "StatefulSet") {
-		stss, serr := p.AllStatefulSets(ctx)
+		sts, serr := p.StatefulSet(ctx, ns, target)
 		if serr != nil {
 			return // census unreadable — inconclusive
 		}
-		for i := range stss {
-			if stss[i].Namespace == ns && stss[i].Name == target {
-				kind = "StatefulSet"
-				annotations = stss[i].Annotations
-				replicas = stss[i].Spec.Replicas
-				rv = stss[i].ResourceVersion
-				break
-			}
+		if sts != nil {
+			kind = "StatefulSet"
+			annotations = sts.Annotations
+			replicas = sts.Spec.Replicas
+			rv = sts.ResourceVersion
 		}
 	}
 	if kind == "" && (want == "" || want == "Rollout") {

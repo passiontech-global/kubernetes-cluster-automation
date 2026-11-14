@@ -90,7 +90,7 @@ func (p *scyllaHealthCheck) memberStallFindings(ctx context.Context,
 			troubled = append(troubled, pod)
 		}
 	}
-	scans := kube.ScanPodLogs(ctx, p.CS, troubled, scyllaStallLogWorkers,
+	scans := kube.ScanPodLogs(ctx, troubled, scyllaStallLogWorkers,
 		func(ctx context.Context, pod *corev1.Pod) (string, error) {
 			return p.scyllaStallLogHit(ctx, pod)
 		})

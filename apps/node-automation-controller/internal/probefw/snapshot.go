@@ -412,26 +412,35 @@ type sweepSnapshot struct {
 	promMu      sync.Mutex
 	promQueries map[string]*memo[[]promq.Sample]
 
-	// resets is every memo's reset, bound at construction — see the
-	// type comment. InvalidateSweep runs it wholesale, then re-arms
-	// the nodes forceCS read via resetForced.
+	// memos and resets hold every registered census/index member bound ONCE
+	// at construction: InvalidateSweep resets both, and verifyUnmutated
+	// walks memos so new census fields can never drift between invalidation
+	// and fingerprint verification.
+	memos  []memoMember
 	resets []func()
 }
 
+type memoMember interface {
+	reset()
+	verify()
+}
+
 // newSweepSnapshot builds an empty snapshot and binds its blanket
-// reset list — every memo declared on the struct joins the list at
-// construction, so InvalidateSweep can never drift behind the field
-// set the way the hand-maintained drop list did.
+// reset and verify lists — every memo declared on the struct joins memos
+// at construction so InvalidateSweep and VerifySweepSnapshotUnmutated can
+// never drift behind the field set.
 func newSweepSnapshot(ctx context.Context) *sweepSnapshot {
 	s := &sweepSnapshot{ctx: ctx}
+	s.memos = []memoMember{
+		&s.pods, &s.nodes, &s.slices,
+		&s.services, &s.namespaces, &s.events,
+		&s.pvcs, &s.statefulSets, &s.deployments,
+		&s.daemonSets, &s.leases,
+		&s.replicaSets, &s.cronJobs, &s.jobs, &s.pdbs,
+		&s.nodeZones, &s.podNodes,
+		&s.leaseIndex, &s.serviceIndex,
+	}
 	s.resets = []func(){
-		s.pods.reset, s.nodes.reset, s.slices.reset,
-		s.services.reset, s.namespaces.reset, s.events.reset,
-		s.pvcs.reset, s.statefulSets.reset, s.deployments.reset,
-		s.daemonSets.reset, s.leases.reset,
-		s.replicaSets.reset, s.cronJobs.reset, s.jobs.reset, s.pdbs.reset,
-		s.nodeZones.reset, s.podNodes.reset,
-		s.leaseIndex.reset, s.serviceIndex.reset,
 		s.deploymentsIdx.reset, s.statefulSetsIdx.reset,
 		s.daemonSetsIdx.reset, s.replicaSetsIdx.reset,
 		s.cronJobsIdx.reset, s.jobsIdx.reset,

@@ -30,7 +30,6 @@ import (
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -99,7 +98,7 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 
 	csvs, err := p.AllUnstructured(ctx, olmCSVGVR)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		return // OLM not installed (or its CRDs absent — same quiet skip)
 	case err != nil:
 		metrics.IncError(p.Name)

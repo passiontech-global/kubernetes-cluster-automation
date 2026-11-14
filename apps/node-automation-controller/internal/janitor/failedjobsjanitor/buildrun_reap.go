@@ -19,8 +19,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -130,7 +128,7 @@ func (j *failedJobsJanitor) sweepCompletedRunKind(ctx context.Context,
 			return nil
 		})
 	if err != nil {
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		if kube.IsCRDAbsent(err) {
 			return nil // operator not installed — nothing to reap
 		}
 		return fmt.Errorf("list %ss: %w", kind, err)
@@ -182,10 +180,8 @@ func runTerminal(obj *unstructured.Unstructured) bool {
 // stamping completionTime (older Shipwright/Tekton builds), which the
 // BuildRun-only sweep used to keep forever.
 func runFinishedAt(obj *unstructured.Unstructured) (time.Time, bool) {
-	if ct, found := kube.NestedString(obj.Object, "status", "completionTime"); found {
-		if t, err := time.Parse(time.RFC3339, ct); err == nil {
-			return t, true
-		}
+	if t, found := kube.NestedTime(obj.Object, "status", "completionTime"); found {
+		return t, true
 	}
 	for _, condType := range []string{"Succeeded", "Failed", "Completed"} {
 		c, found := kube.ConditionOf(obj.Object, condType)

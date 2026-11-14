@@ -5,12 +5,15 @@
 package guardstate
 
 import (
+	"context"
 	"fmt"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -23,6 +26,104 @@ const (
 	KindMutating   = "mutating"
 	KindValidating = "validating"
 )
+
+// WebhookView is a read-only uniform projection over MutatingWebhook
+// and ValidatingWebhook so downstream duties (circuitbreaker,
+// criticalns, orphansweep, census) share one traversal instead of
+// duplicating MWC/VWC loops.
+type WebhookView struct {
+	Name              string
+	FailurePolicy     *admissionv1.FailurePolicyType
+	NamespaceSelector *metav1.LabelSelector
+	Rules             []admissionv1.RuleWithOperations
+	Service           *admissionv1.ServiceReference
+}
+
+// WebhookConfigView projects one MutatingWebhookConfiguration or
+// ValidatingWebhookConfiguration together with a snapshot-updating
+// Patch closure.
+type WebhookConfigView struct {
+	Kind     string
+	Resource string
+	Name     string
+	Anno     string
+	Object   metav1.Object
+	Hooks    []WebhookView
+	Patch    func(ctx context.Context, pt types.PatchType, payload []byte) error
+}
+
+// ForEachWebhookConfig walks all mutating then validating webhook
+// configurations in the snapshot, invoking visit with each projected
+// WebhookConfigView and a Patch closure that refreshes the snapshot
+// in place on success. Nil MWC/VWC lists are skipped.
+func (s *Snapshot) ForEachWebhookConfig(visit func(WebhookConfigView)) {
+	if s.MWC != nil {
+		for i := range s.MWC.Items {
+			cfg := &s.MWC.Items[i]
+			hooks := make([]WebhookView, len(cfg.Webhooks))
+			for j := range cfg.Webhooks {
+				w := &cfg.Webhooks[j]
+				hooks[j] = WebhookView{
+					Name:              w.Name,
+					FailurePolicy:     w.FailurePolicy,
+					NamespaceSelector: w.NamespaceSelector,
+					Rules:             w.Rules,
+					Service:           w.ClientConfig.Service,
+				}
+			}
+			visit(WebhookConfigView{
+				Kind:     KindMutating,
+				Resource: "mutatingwebhookconfigurations",
+				Name:     cfg.Name,
+				Anno:     cfg.Annotations[CircuitBrokenAnno],
+				Object:   cfg,
+				Hooks:    hooks,
+				Patch: func(ctx context.Context, pt types.PatchType, payload []byte) error {
+					patched, err := s.G.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
+						Patch(ctx, cfg.Name, pt, payload, metav1.PatchOptions{})
+					if err != nil {
+						return err
+					}
+					s.SetMWC(patched)
+					return nil
+				},
+			})
+		}
+	}
+	if s.VWC != nil {
+		for i := range s.VWC.Items {
+			cfg := &s.VWC.Items[i]
+			hooks := make([]WebhookView, len(cfg.Webhooks))
+			for j := range cfg.Webhooks {
+				w := &cfg.Webhooks[j]
+				hooks[j] = WebhookView{
+					Name:              w.Name,
+					FailurePolicy:     w.FailurePolicy,
+					NamespaceSelector: w.NamespaceSelector,
+					Rules:             w.Rules,
+					Service:           w.ClientConfig.Service,
+				}
+			}
+			visit(WebhookConfigView{
+				Kind:     KindValidating,
+				Resource: "validatingwebhookconfigurations",
+				Name:     cfg.Name,
+				Anno:     cfg.Annotations[CircuitBrokenAnno],
+				Object:   cfg,
+				Hooks:    hooks,
+				Patch: func(ctx context.Context, pt types.PatchType, payload []byte) error {
+					patched, err := s.G.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
+						Patch(ctx, cfg.Name, pt, payload, metav1.PatchOptions{})
+					if err != nil {
+						return err
+					}
+					s.SetVWC(patched)
+					return nil
+				},
+			})
+		}
+	}
+}
 
 // CircuitBrokenAnno records, on the webhook config object itself,
 // the comma-separated names of the sub-webhooks the C1 circuit

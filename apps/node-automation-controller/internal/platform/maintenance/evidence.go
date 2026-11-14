@@ -15,9 +15,9 @@ import (
 	"fmt"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
@@ -129,6 +129,54 @@ func kuredLockNodeID(raw string) string {
 	return raw
 }
 
+// activeAutopilotPlans returns every live autopilot Plan whose status.state
+// is neither Schedulable nor Completed. An absent CRD returns (nil, nil).
+func activeAutopilotPlans(ctx context.Context, dyn dynamic.Interface) ([]unstructured.Unstructured, error) {
+	plans, err := kube.ListAllUnstructured(ctx, dyn.Resource(kube.AutopilotPlanGVR),
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+	if err != nil {
+		if kube.IsCRDAbsent(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var active []unstructured.Unstructured
+	for i := range plans.Items {
+		state, _ := kube.NestedString(plans.Items[i].Object, "status", "state")
+		if state != "Schedulable" && state != "Completed" {
+			active = append(active, plans.Items[i])
+		}
+	}
+	return active, nil
+}
+
+// listLiveMedik8s lists one medik8s remediation GVR and returns only active
+// items (excluding finished NodeMaintenance with status.phase=="Succeeded").
+// An absent CRD returns (nil, nil).
+func listLiveMedik8s(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource) ([]unstructured.Unstructured, error) {
+	items, err := kube.ListAllUnstructured(ctx, dyn.Resource(gvr),
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+	if err != nil {
+		if kube.IsCRDAbsent(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	live := make([]unstructured.Unstructured, 0, len(items.Items))
+	for i := range items.Items {
+		obj := &items.Items[i]
+		// A NodeMaintenance reporting Succeeded is the completed record
+		// awaiting deletion — the cordon+drain already finished.
+		if gvr == kube.GVRNodeMaintenance {
+			if phase, _ := kube.NestedString(obj.Object, "status", "phase"); phase == "Succeeded" {
+				continue
+			}
+		}
+		live = append(live, *obj)
+	}
+	return live, nil
+}
+
 // AutopilotPlanEvidence returns the evidence strings for mutex
 // signal (c) — "autopilot plan <name> state=<state>" for every Plan
 // whose status.state is neither Schedulable nor Completed (a k0s
@@ -139,23 +187,15 @@ func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string
 	if dyn == nil {
 		return nil, errors.New("no dynamic client — autopilot plan check unverifiable (maintenance mutex)")
 	}
-	plans, err := kube.ListAllUnstructured(ctx, dyn.Resource(kube.AutopilotPlanGVR),
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
-	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-		// autopilot CRD not installed — no signal.
-		return nil, nil
-	case err != nil:
+	plans, err := activeAutopilotPlans(ctx, dyn)
+	if err != nil {
 		return nil, fmt.Errorf("list autopilot plans (maintenance mutex): %w", err)
 	}
 	var ev []string
-	for i := range plans.Items {
-		state, _ := kube.NestedString(
-			plans.Items[i].Object, "status", "state")
-		if state != "Schedulable" && state != "Completed" {
-			ev = append(ev, fmt.Sprintf("autopilot plan %s state=%s",
-				plans.Items[i].GetName(), state))
-		}
+	for i := range plans {
+		state, _ := kube.NestedString(plans[i].Object, "status", "state")
+		ev = append(ev, fmt.Sprintf("autopilot plan %s state=%s",
+			plans[i].GetName(), state))
 	}
 	return ev, nil
 }
@@ -179,25 +219,12 @@ func Medik8sRemediationEvidence(ctx context.Context, dyn dynamic.Interface) ([]s
 	}
 	var ev []string
 	for _, gvr := range kube.Medik8sRemediationGVRs {
-		items, err := kube.ListAllUnstructured(ctx, dyn.Resource(gvr),
-			metav1.ListOptions{Limit: kube.DefaultListPageSize})
-		switch {
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-			continue // CRD absent on this cluster — no signal
-		case err != nil:
+		items, err := listLiveMedik8s(ctx, dyn, gvr)
+		if err != nil {
 			return nil, fmt.Errorf("list %s (maintenance mutex): %w", gvr.Resource, err)
 		}
-		for i := range items.Items {
-			obj := &items.Items[i]
-			// A NodeMaintenance reporting Succeeded is the completed
-			// record awaiting deletion — the cordon+drain already
-			// finished, so it is not live evidence.
-			if gvr == kube.GVRNodeMaintenance {
-				if phase, _ := kube.NestedString(
-					obj.Object, "status", "phase"); phase == "Succeeded" {
-					continue
-				}
-			}
+		for i := range items {
+			obj := &items[i]
 			kind := obj.GetKind()
 			if kind == "" {
 				kind = gvr.Resource

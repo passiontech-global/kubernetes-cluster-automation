@@ -25,10 +25,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -64,24 +62,9 @@ var nodeSweepRequests = shared.SweepRequests("node-labeler-sweep")
 // nodeLabelChanges is the Node watch predicate — the bash
 // jqFilter='.metadata.labels': only label drift fires, everything
 // else is dropped.
-var nodeLabelChanges = predicate.Funcs{
-	CreateFunc:  func(event.CreateEvent) bool { return true },
-	DeleteFunc:  func(event.DeleteEvent) bool { return true },
-	GenericFunc: func(event.GenericEvent) bool { return true },
-	UpdateFunc: func(e event.UpdateEvent) bool {
-		// client.Object is an interface: == nil cannot
-		// catch a typed-nil pointer (GetLabels would
-		// panic on it). The ok-comma assert siblings use
-		// covers both — a nil interface fails the assert,
-		// a typed nil lands in oldN/newN.
-		oldN, ok1 := e.ObjectOld.(*corev1.Node)
-		newN, ok2 := e.ObjectNew.(*corev1.Node)
-		if !ok1 || !ok2 || oldN == nil || newN == nil {
-			return false // missing objects never fire
-		}
-		return !maps.Equal(oldN.GetLabels(), newN.GetLabels())
-	},
-}
+var nodeLabelChanges = shared.NodeUpdatePredicate(false, func(oldN, newN *corev1.Node) bool {
+	return !maps.Equal(oldN.GetLabels(), newN.GetLabels())
+})
 
 // Setup wires the node-labeler reconciler. configPath is the
 // labels.txt file (default /etc/node-labeler/labels.txt).

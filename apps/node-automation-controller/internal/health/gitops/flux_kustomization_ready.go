@@ -82,18 +82,11 @@ func parseFluxInventoryID(id string) (ns, name, kind string) {
 func (p *fluxKustomizationHealthCheck) fluxDeploymentReady(ctx context.Context,
 	ns, name string) bool {
 
-	deps, err := p.AllDeployments(ctx)
-	if err != nil {
+	d, err := p.Deployment(ctx, ns, name)
+	if err != nil || d == nil {
 		return false
 	}
-	for i := range deps {
-		d := &deps[i]
-		if d.Namespace != ns || d.Name != name {
-			continue
-		}
-		return d.Status.ReadyReplicas >= desiredReplicas(d.Spec.Replicas)
-	}
-	return false
+	return d.Status.ReadyReplicas >= desiredReplicas(d.Spec.Replicas)
 }
 
 // fluxRolloutReady is the argoproj.io Rollout twin (argo-rollout-gates): the

@@ -261,9 +261,9 @@ func (a *certDriftAuditor) certSecretNameUncached(ctx context.Context, ns, certN
 	cert, err := a.dyn.Resource(certificateGVR).Namespace(ns).
 		Get(ctx, certName, metav1.GetOptions{})
 	if err != nil {
-		// Only a genuine absence falls back to the name convention;
+		// Only a genuine CRD/object absence falls back to the name convention;
 		// every other failure is unresolvable, not a fallback.
-		if apierrors.IsNotFound(err) {
+		if kube.IsCRDAbsent(err) {
 			return certName, true
 		}
 		logf.FromContext(ctx).Error(err,

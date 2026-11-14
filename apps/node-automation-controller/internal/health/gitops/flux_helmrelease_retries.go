@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -111,7 +109,7 @@ func (p *fluxHRRetriesCheck) Run(ctx context.Context) probefw.Result {
 	// semantics via probefw.AllUnstructuredFirst).
 	hrs, gvr, err := p.AllUnstructuredFirst(ctx, helmReleaseRetryGVRs)
 	if err != nil {
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		if kube.IsCRDAbsent(err) {
 			return probefw.Result{Pass: true} // CRD not installed
 		}
 		return probefw.Result{Infra: fmt.Errorf("list helmreleases: %w", err)}

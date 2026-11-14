@@ -107,54 +107,6 @@ func (s *Sweeper) Sweep(snap *guardstate.Snapshot) {
 	s.auditHeartbeat(snap)
 }
 
-// hookView is the critical-ns duties' uniform projection over
-// MutatingWebhook / ValidatingWebhook — every field both audits read
-// (name, failure policy, namespace selector, rules) exists on both
-// kinds with identical types.
-type hookView struct {
-	name  string
-	fp    *admissionv1.FailurePolicyType
-	sel   *metav1.LabelSelector
-	rules []admissionv1.RuleWithOperations
-}
-
-func mutHookViews(ws []admissionv1.MutatingWebhook) []hookView {
-	out := make([]hookView, len(ws))
-	for i := range ws {
-		out[i] = hookView{name: ws[i].Name, fp: ws[i].FailurePolicy,
-			sel: ws[i].NamespaceSelector, rules: ws[i].Rules}
-	}
-	return out
-}
-
-func valHookViews(ws []admissionv1.ValidatingWebhook) []hookView {
-	out := make([]hookView, len(ws))
-	for i := range ws {
-		out[i] = hookView{name: ws[i].Name, fp: ws[i].FailurePolicy,
-			sel: ws[i].NamespaceSelector, rules: ws[i].Rules}
-	}
-	return out
-}
-
-// forEachConfig walks the snapshot's mutating then validating configs
-// in order, projecting each config's webhooks through hookView — one
-// shared pass so a kind-specific edit cannot land on only one twin.
-func forEachConfig(snap *guardstate.Snapshot,
-	visit func(kind, cfgName string, cfgObj metav1.Object, hooks []hookView)) {
-	if snap.MWC != nil {
-		for i := range snap.MWC.Items {
-			visit(guardstate.KindMutating, snap.MWC.Items[i].Name,
-				&snap.MWC.Items[i], mutHookViews(snap.MWC.Items[i].Webhooks))
-		}
-	}
-	if snap.VWC != nil {
-		for i := range snap.VWC.Items {
-			visit(guardstate.KindValidating, snap.VWC.Items[i].Name,
-				&snap.VWC.Items[i], valHookViews(snap.VWC.Items[i].Webhooks))
-		}
-	}
-}
-
 // matcher builds the namespaceSelector predicate both audits share
 // from the snapshot's namespace census: true when the selector still
 // matches (fails to exclude) any of the critical self-healing
@@ -281,13 +233,11 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 	g := snap.G
 	enforce := CriticalNSEnforceEnabled()
 
-	// patchExclusion lands the queued merge entries for one config —
-	// the orphansweep's mechanics (strategic-merge on the merge-key
-	// webhooks list, snapshot kept current for the later duties). The
-	// mutating flag only selects the typed clientset call — the only
-	// true MWC/VWC difference.
-	patchExclusion := func(kind string, mutating bool, cfgName string,
-		cfgObj metav1.Object, merges []map[string]any, onFail func()) {
+	// patchExclusion lands the queued merge entries for one config via
+	// cfg.Patch (strategic-merge on the merge-key webhooks list,
+	// keeping the snapshot current for later duties).
+	patchExclusion := func(cfg guardstate.WebhookConfigView,
+		merges []map[string]any, onFail func()) {
 		if len(merges) == 0 {
 			return
 		}
@@ -297,9 +247,9 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 		// Past the Heal-Revert-Loop threshold the patch SKIPS — the
 		// missing-exclusion series stays live (onFail) and the
 		// conflict counter fires, so the drift gets fixed in Git.
-		if !heal.FluxPatchGate(kind, cfgObj, kind+"/"+cfgName, g.Now.Now()) {
+		if !heal.FluxPatchGate(cfg.Kind, cfg.Object, cfg.Kind+"/"+cfg.Name, g.Now.Now()) {
 			log.Info("skip heal: Flux Heal-Revert Loop detected — exclusion patch deferred",
-				"kind", kind, "config", cfgName)
+				"kind", cfg.Kind, "config", cfg.Name)
 			onFail()
 			return
 		}
@@ -308,7 +258,7 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 			// Absorbed sub-failure: the audit logs and continues —
 			// metered so the dropped work is still counted.
 			metrics.IncError(g.Queue)
-			log.Error(err, "marshal critical-ns exclusion patch", "config", cfgName)
+			log.Error(err, "marshal critical-ns exclusion patch", "config", cfg.Name)
 			onFail()
 			return
 		}
@@ -319,60 +269,42 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 			}
 		}
 		log.Info("PATCH: injecting critical-ns NotIn exclusion into fail-closed webhook(s)",
-			"kind", kind, "config", cfgName, "webhooks", names,
+			"kind", cfg.Kind, "config", cfg.Name, "webhooks", names,
 			"namespaces", criticalSelfHealingNamespaces)
-		var patchErr error
-		if mutating {
-			var patched *admissionv1.MutatingWebhookConfiguration
-			patched, patchErr = g.CS.AdmissionregistrationV1().
-				MutatingWebhookConfigurations().Patch(snap.Ctx, cfgName,
-				types.StrategicMergePatchType, payload, metav1.PatchOptions{})
-			if patchErr == nil {
-				snap.SetMWC(patched)
-			}
-		} else {
-			var patched *admissionv1.ValidatingWebhookConfiguration
-			patched, patchErr = g.CS.AdmissionregistrationV1().
-				ValidatingWebhookConfigurations().Patch(snap.Ctx, cfgName,
-				types.StrategicMergePatchType, payload, metav1.PatchOptions{})
-			if patchErr == nil {
-				snap.SetVWC(patched)
-			}
-		}
-		if patchErr != nil {
+		if err := cfg.Patch(snap.Ctx, types.StrategicMergePatchType, payload); err != nil {
 			metrics.IncError(g.Queue)
-			log.Error(patchErr, "critical-ns exclusion patch failed — webhook left fail-closed against critical namespaces",
-				"kind", kind, "config", cfgName)
+			log.Error(err, "critical-ns exclusion patch failed — webhook left fail-closed against critical namespaces",
+				"kind", cfg.Kind, "config", cfg.Name)
 			onFail()
 		}
 	}
 
-	forEachConfig(snap, func(kind, cfgName string, cfgObj metav1.Object, hooks []hookView) {
+	snap.ForEachWebhookConfig(func(cfg guardstate.WebhookConfigView) {
 		var merges []map[string]any
-		var queued []hookView // webhooks whose exclusion the patch carries
-		for _, w := range hooks {
-			if !guardstate.FailClosed(w.fp) || !matchesCriticalNS(w.sel) {
+		var queued []guardstate.WebhookView // webhooks whose exclusion the patch carries
+		for _, w := range cfg.Hooks {
+			if !guardstate.FailClosed(w.FailurePolicy) || !matchesCriticalNS(w.NamespaceSelector) {
 				continue
 			}
-			if !enforce || criticalNSPatchAllowlist[cfgName+"/"+w.name] {
+			if !enforce || criticalNSPatchAllowlist[cfg.Name+"/"+w.Name] {
 				// No patch will cover this webhook (lever off, or the
 				// allowlist deliberately keeps it exposed) — the
 				// missing-exclusion series stays live.
 				s.exclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
-					kind+"/"+cfgName+"/"+w.name, kind, cfgName, w.name)
+					cfg.Kind+"/"+cfg.Name+"/"+w.Name, cfg.Kind, cfg.Name, w.Name)
 				continue
 			}
 			merges = append(merges, map[string]any{
-				"name": w.name, "namespaceSelector": mergeExclusion(w.sel)})
+				"name": w.Name, "namespaceSelector": mergeExclusion(w.NamespaceSelector)})
 			queued = append(queued, w)
 		}
 		// An auto-enforced webhook emits the series only when its
 		// patch FAILED — a landed patch means the exclusion exists
 		// and the ledger re-verifies (and re-emits) next sweep.
-		patchExclusion(kind, kind == guardstate.KindMutating, cfgName, cfgObj, merges, func() {
+		patchExclusion(cfg, merges, func() {
 			for _, w := range queued {
 				s.exclusionEmitted.Set(metrics.WebhookMissingCriticalNSExclusion, 1,
-					kind+"/"+cfgName+"/"+w.name, kind, cfgName, w.name)
+					cfg.Kind+"/"+cfg.Name+"/"+w.Name, cfg.Kind, cfg.Name, w.Name)
 			}
 		})
 	})
@@ -452,12 +384,12 @@ func (s *Sweeper) auditHeartbeat(snap *guardstate.Snapshot) {
 			}
 		}
 	}
-	forEachConfig(snap, func(kind, cfgName string, _ metav1.Object, hooks []hookView) {
-		for _, w := range hooks {
-			if !guardstate.FailClosed(w.fp) {
+	snap.ForEachWebhookConfig(func(cfg guardstate.WebhookConfigView) {
+		for _, w := range cfg.Hooks {
+			if !guardstate.FailClosed(w.FailurePolicy) {
 				continue
 			}
-			emitWebhook(kind, cfgName, w.name, w.rules, matchesCriticalNS(w.sel))
+			emitWebhook(cfg.Kind, cfg.Name, w.Name, w.Rules, matchesCriticalNS(w.NamespaceSelector))
 		}
 	})
 	s.heartbeatEmitted.Prune(metrics.WebhookHeartbeatResourceExposed.DeleteLabelValues)

@@ -9,8 +9,6 @@ import (
 
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -53,7 +51,7 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns, relea
 				"labeledRelease", j.Labels[helmReleaseNameLabel], "release", release)
 			continue
 		}
-		if !jobFailed(j) {
+		if !kube.JobHasCondition(j, batchv1.JobFailed) {
 			continue // still running or succeeded — leave it
 		}
 		targets = append(targets, j)
@@ -74,26 +72,7 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns, relea
 		// Delete failures are logged and skipped, never IncError'd —
 		// the sweep is best-effort residue cleanup riding a heal,
 		// and the periodic wrapper already counts the run error.
-		OnError: func(log logr.Logger, j *batchv1.Job, err error) {
-			if apierrors.IsNotFound(err) {
-				// Raced with the Job's own cleanup — nothing left to
-				// reap, nothing went wrong (cilium-identity janitor
-				// parity: a benign race is a skip, not an error).
-				log.Info("SKIP: helm-hook Job already gone — raced with its own cleanup",
-					"ns", ns, "job", j.Name)
-				return
-			}
-			log.Error(err, "helm-hook job delete failed", "ns", ns, "job", j.Name)
-		},
+		OnError: reap.DeleteErrorHandler("helm-hook job",
+			func(j *batchv1.Job) string { return ns + "/" + j.Name }, nil),
 	})
-}
-
-// jobFailed reports whether the Job carries a JobFailed=True condition.
-func jobFailed(j *batchv1.Job) bool {
-	for _, c := range j.Status.Conditions {
-		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
 }

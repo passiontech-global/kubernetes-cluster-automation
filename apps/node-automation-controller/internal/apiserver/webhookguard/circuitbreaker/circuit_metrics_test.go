@@ -55,7 +55,7 @@ func TestCarryBrokenForward(t *testing.T) {
 	// and the deleted webhook's tuple must be deleted, the carried
 	// one must survive.
 	b.brokenEmitted.Begin()
-	b.carryBrokenForward(kind, cfg, []hookView{{name: "hook.example.com"}})
+	b.carryBrokenForward(kind, cfg, []guardstate.WebhookView{{Name: "hook.example.com"}})
 	if n := b.brokenEmitted.Prune(metrics.WebhookCircuitBroken.DeleteLabelValues); n != 2 {
 		t.Fatalf("prune deleted %d series, want the foreign tuple and the deleted webhook's", n)
 	}

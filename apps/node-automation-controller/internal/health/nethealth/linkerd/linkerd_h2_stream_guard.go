@@ -170,7 +170,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 	// every meshed pod could eat the whole per-check budget on a
 	// large cluster. One pod's panicked scan reads as that pod's
 	// inconclusive result — never a process crash.
-	h2sigs := kube.ScanPodLogs(ctx, p.CS, cands, linkerdH2LogWorkers,
+	h2sigs := kube.ScanPodLogs(ctx, cands, linkerdH2LogWorkers,
 		func(ctx context.Context, pod *corev1.Pod) (logSignals, error) {
 			storm, identity, err := p.linkerdH2LogSignals(ctx, pod)
 			return logSignals{storm: storm, identity: identity}, err

@@ -185,21 +185,15 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 // error on any candidate is returned (errors are per-request, not
 // per-name — RBAC/network failures hit all names equally).
 func (p *operatorWorkqueueCheck) operatorLease(ctx context.Context, op operatorTarget) (*coordinationv1.Lease, error) {
-	// One memoized cluster LIST per sweep (AllLeases) replaces the
-	// per-name GET fan-out — ~35 GETs across all operator targets
-	// collapse into the shared census. Name order is preserved:
-	// the first candidate present in the census wins, same as the
-	// first successful GET did.
-	leases, err := p.AllLeases(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list leases for %s: %w", op.name, err)
-	}
+	// Name order is preserved: the first candidate present in the
+	// indexed lease census wins.
 	for _, name := range op.leaseNames {
-		for i := range leases {
-			if leases[i].Namespace == op.leaseNS &&
-				leases[i].Name == name {
-				return &leases[i], nil
-			}
+		l, err := p.Lease(ctx, op.leaseNS, name)
+		if err != nil {
+			return nil, fmt.Errorf("list leases for %s: %w", op.name, err)
+		}
+		if l != nil {
+			return l, nil
 		}
 	}
 	return nil, nil

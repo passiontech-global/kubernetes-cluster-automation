@@ -556,10 +556,23 @@ func TestTargetBreakerGlobalForgetHook(t *testing.T) {
 	if fired != 1 {
 		t.Fatalf("global forget hook fired %d times, want 1", fired)
 	}
-	// Unset before a breaker exists: the package-level setter is a
-	// no-op, not a panic.
+	// Unset before a breaker exists: safe to register hooks before
+	// ConfigureTargetBreaker runs, and hooks attach once configured.
 	ConfigureTargetBreaker(0, 0)
+	var openFired int
+	SetTargetCircuitOpenHook(func(module, target, reason string) { openFired++ })
 	SetTargetCircuitForgetHook(func(module, target string) { fired++ })
+	ConfigureTargetBreaker(TargetBreakerLimit, TargetBreakerWindow)
+	for range TargetBreakerLimit + 1 {
+		TryAcquireTarget("m", "n2", now)
+	}
+	if openFired != 1 {
+		t.Fatalf("pre-configured open hook fired %d times, want 1", openFired)
+	}
+	RecordTargetHealthy("m", "n2")
+	if fired != 2 {
+		t.Fatalf("pre-configured forget hook fired %d times, want 2", fired)
+	}
 }
 
 // RefundGrant returns the grant Gate consumed when a batch-gated

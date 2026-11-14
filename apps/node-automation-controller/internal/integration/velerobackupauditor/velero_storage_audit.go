@@ -13,7 +13,6 @@ import (
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -30,7 +29,7 @@ func (a *veleroBackupAuditor) auditBSLs(ctx context.Context,
 	log logr.Logger) error {
 	bsls, err := a.veleroList(ctx, veleroBSLGVR)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// CRD absent — nothing to audit.
 	case err != nil:
 		return fmt.Errorf("list velero backupstoragelocations: %w", err)
@@ -64,7 +63,7 @@ func (a *veleroBackupAuditor) auditBackupRepositories(ctx context.Context,
 	log logr.Logger) error {
 	repos, err := a.veleroList(ctx, veleroRepoGVR)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// CRD absent (older Velero without the repo API) — nothing
 		// to audit.
 	case err != nil:
@@ -94,18 +93,14 @@ func (a *veleroBackupAuditor) auditBackupRepositories(ctx context.Context,
 					}
 				}
 			}
-			lmt, ok := kube.NestedString(
-				repo.Object, "status", "lastMaintenanceTime")
-			if !ok {
-				continue // never stamped — can't tell, not stale
-			}
-			t, perr := time.Parse(time.RFC3339, lmt)
-			if perr != nil || a.now.Now().Sub(t) <= veleroRepoMaintenanceMaxAge {
+			t, ok := kube.NestedTime(repo.Object, "status", "lastMaintenanceTime")
+			if !ok || a.now.Now().Sub(t) <= veleroRepoMaintenanceMaxAge {
 				continue
 			}
 			a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
 				repoKey{ns, name, "maintenance_stale"},
 				ns, name, "maintenance_stale")
+			lmt, _ := kube.NestedString(repo.Object, "status", "lastMaintenanceTime")
 			log.Info("velero backup repository maintenance stale — prune/repack loop stopped",
 				"repo", ns+"/"+name, "lastMaintenanceTime", lmt,
 				"age", a.now.Now().Sub(t).Truncate(time.Hour))

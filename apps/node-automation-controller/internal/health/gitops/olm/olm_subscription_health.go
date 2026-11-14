@@ -218,19 +218,15 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	// there is nothing to annotate and the gate degrades to the
 	// ledger-only shape (AllowedVPersisted's nil-obj contract).
 	var obj metav1.Object
-	deps, err := p.AllDeployments(ctx)
+	dep, err := p.Deployment(ctx, olmOperatorNS, olmOperatorPodPrefix)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Info("WARN: read olm-operator deployment failed — heal deferred",
 			"error", err)
 		return
 	}
-	for i := range deps {
-		if deps[i].Namespace == olmOperatorNS &&
-			deps[i].Name == olmOperatorPodPrefix {
-			obj = &deps[i]
-			break
-		}
+	if dep != nil {
+		obj = dep
 	}
 
 	// Pick ONE candidate from the sweep's pod snapshot before the

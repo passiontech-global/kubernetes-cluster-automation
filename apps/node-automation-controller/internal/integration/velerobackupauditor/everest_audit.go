@@ -114,13 +114,7 @@ func everestBackupReasons(backups []*unstructured.Unstructured,
 		if state != "Succeeded" {
 			continue
 		}
-		done := b.GetCreationTimestamp().Time
-		if ct, ok := kube.NestedString(
-			b.Object, "status", "completionTime"); ok {
-			if t, err := time.Parse(time.RFC3339, ct); err == nil {
-				done = t
-			}
-		}
+		done := kube.NestedStatusTimeOrCreated(b, "completionTime")
 		if now.Sub(done) > everestBackupStaleMaxAge {
 			reasons = append(reasons, "stale")
 		}

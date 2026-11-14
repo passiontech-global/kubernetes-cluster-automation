@@ -160,14 +160,7 @@ func (d *Deps) Lease(ctx context.Context, ns, name string) (*coordinationv1.Leas
 		if err != nil {
 			return nil, err
 		}
-		m := make(map[types.NamespacedName]*coordinationv1.Lease, len(leases))
-		for i := range leases {
-			m[types.NamespacedName{
-				Namespace: leases[i].Namespace,
-				Name:      leases[i].Name,
-			}] = &leases[i]
-		}
-		return m, nil
+		return buildNamespacedIndex(leases), nil
 	})
 	if err != nil {
 		return nil, err
@@ -186,14 +179,7 @@ func (d *Deps) Service(ctx context.Context, ns, name string) (*corev1.Service, e
 		if err != nil {
 			return nil, err
 		}
-		m := make(map[types.NamespacedName]*corev1.Service, len(svcs))
-		for i := range svcs {
-			m[types.NamespacedName{
-				Namespace: svcs[i].Namespace,
-				Name:      svcs[i].Name,
-			}] = &svcs[i]
-		}
-		return m, nil
+		return buildNamespacedIndex(svcs), nil
 	})
 	if err != nil {
 		return nil, err

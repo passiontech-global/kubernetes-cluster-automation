@@ -85,8 +85,12 @@ type PodLogOpts struct {
 func ReadPodLogText(ctx context.Context, cs kubernetes.Interface,
 	pod *corev1.Pod, o PodLogOpts) (string, error) {
 
-	lctx, cancel := context.WithTimeout(ctx, o.Timeout)
-	defer cancel()
+	lctx := ctx
+	if o.Timeout > 0 {
+		var cancel context.CancelFunc
+		lctx, cancel = context.WithTimeout(ctx, o.Timeout)
+		defer cancel()
+	}
 	logOpts := &corev1.PodLogOptions{
 		Container: ResolveDefaultContainer(pod, o.Container),
 	}
@@ -101,7 +105,11 @@ func ReadPodLogText(ctx context.Context, cs kubernetes.Interface,
 		return "", err
 	}
 	defer func() { _ = stream.Close() }()
-	data, err := io.ReadAll(io.LimitReader(stream, o.MaxBytes))
+	var reader io.Reader = stream
+	if o.MaxBytes > 0 {
+		reader = io.LimitReader(stream, o.MaxBytes)
+	}
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return "", err
 	}
@@ -153,11 +161,14 @@ type PodLogScan[T any] struct {
 // one pod's scan reads as that pod's inconclusive scan — never a
 // process crash. The pool does NOT cancel sibling scans on an error:
 // every pod's verdict is collected (the caller decides per pod).
-func ScanPodLogs[T any](ctx context.Context, cs kubernetes.Interface,
+func ScanPodLogs[T any](ctx context.Context,
 	pods []*corev1.Pod, workers int,
 	scan func(ctx context.Context, pod *corev1.Pod) (T, error)) []PodLogScan[T] {
 
 	out := make([]PodLogScan[T], len(pods))
+	if workers <= 0 {
+		workers = 1
+	}
 	var g errgroup.Group
 	g.SetLimit(workers)
 	for i := range pods {

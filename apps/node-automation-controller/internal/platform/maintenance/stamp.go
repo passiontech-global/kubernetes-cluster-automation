@@ -12,8 +12,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -184,46 +182,21 @@ func maintenanceStampTargets(ctx context.Context, cs kubernetes.Interface,
 		complete = false
 	} else {
 		for _, gvr := range kube.Medik8sRemediationGVRs {
-			items, err := kube.ListAllUnstructured(ctx, dyn.Resource(gvr),
-				metav1.ListOptions{Limit: kube.DefaultListPageSize})
-			switch {
-			case err == nil:
-			case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-				continue // absent CRD — no targets, still complete
-			default:
+			items, err := listLiveMedik8s(ctx, dyn, gvr)
+			if err != nil {
 				complete = false
 				continue // list failure — no targets from it
 			}
-			for i := range items.Items {
-				obj := &items.Items[i]
-				if gvr == kube.GVRNodeMaintenance {
-					if phase, _ := kube.NestedString(
-						obj.Object, "status", "phase"); phase == "Succeeded" {
-						continue
-					}
-				}
-				if n := medik8sTargetNode(obj, nodeNames); n != "" {
+			for i := range items {
+				if n := medik8sTargetNode(&items[i], nodeNames); n != "" {
 					names[n] = true
 				}
 			}
 		}
-		plans, err := kube.ListAllUnstructured(ctx,
-			dyn.Resource(kube.AutopilotPlanGVR),
-			metav1.ListOptions{Limit: kube.DefaultListPageSize})
-		switch {
-		case err == nil:
-			for i := range plans.Items {
-				state, _ := kube.NestedString(
-					plans.Items[i].Object, "status", "state")
-				if state != "Schedulable" && state != "Completed" {
-					all = true // cluster upgrade — every node holds
-					break
-				}
-			}
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
-			// autopilot CRD absent — no targets, still complete
-		default:
+		if plans, err := activeAutopilotPlans(ctx, dyn); err != nil {
 			complete = false
+		} else if len(plans) > 0 {
+			all = true // cluster upgrade — every node holds
 		}
 	}
 	if holder, err := kuredLockHolder(ctx, cs); err == nil {

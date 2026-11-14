@@ -15,8 +15,6 @@ import (
 
 	"github.com/go-logr/logr"
 	coordinationv1 "k8s.io/api/coordination/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -145,7 +143,7 @@ func (p *operatorWorkqueueCheck) scanOperatorResources(ctx context.Context,
 		if !listed {
 			l, err := p.AllUnstructured(ctx, res.gvr)
 			switch {
-			case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+			case kube.IsCRDAbsent(err):
 				// CRD absent / not yet served — nothing to scan;
 				// the empty cache serves the sibling row too.
 			case err != nil:

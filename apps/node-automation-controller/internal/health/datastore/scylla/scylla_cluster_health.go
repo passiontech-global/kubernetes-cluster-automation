@@ -14,8 +14,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -254,7 +252,7 @@ func (p *scyllaHealthCheck) Run(ctx context.Context) probefw.Result {
 	// (a) degraded_condition — the CR's own condition clock.
 	crs, err := p.AllUnstructured(ctx, scyllaClusterGVR)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// ScyllaDB stack not installed on this cluster — (b)/(c)
 		// still run: member services/pods could outlive the CRD.
 	case err != nil:

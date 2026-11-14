@@ -254,20 +254,11 @@ func webhookBackendServices(snap *Snapshot) map[string][]int32 {
 		}
 		addPort(svc.Namespace+"/"+svc.Name, port)
 	}
-	if snap.MWC != nil {
-		for i := range snap.MWC.Items {
-			for j := range snap.MWC.Items[i].Webhooks {
-				add(snap.MWC.Items[i].Webhooks[j].ClientConfig.Service)
-			}
+	snap.ForEachWebhookConfig(func(cfg WebhookConfigView) {
+		for i := range cfg.Hooks {
+			add(cfg.Hooks[i].Service)
 		}
-	}
-	if snap.VWC != nil {
-		for i := range snap.VWC.Items {
-			for j := range snap.VWC.Items[i].Webhooks {
-				add(snap.VWC.Items[i].Webhooks[j].ClientConfig.Service)
-			}
-		}
-	}
+	})
 	// CRD conversion backends join the probe set — a hung conversion
 	// pod is the same brownout signature, and its probe verdict feeds
 	// the tls_probe_failed reason + the stage-1 bounce.

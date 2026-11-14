@@ -115,6 +115,10 @@ func ConfigureFluxConflictLoop(max int, window time.Duration) {
 // SetFluxConflictHook registers fn to run once per loop-denied patch.
 // Passing nil clears it. Boot-time wiring only.
 func SetFluxConflictHook(fn func(FluxConflictSignal)) {
+	if fn == nil {
+		fluxConflictHook.Store(nil)
+		return
+	}
 	fluxConflictHook.Store(&fn)
 }
 
@@ -169,11 +173,11 @@ func FluxPatchGate(kind string, obj metav1.Object, key string,
 		loop.forget(key) // not Git-owned — drop any stale loop history
 		return true
 	}
-	// This call would be sighting #(count+1) — deny when it reaches
-	// the threshold, exactly the boundary the record-then-count
-	// shape enforced (max=3 denies the third repeat).
-	if loop.count(key, now)+1 >= loop.max {
-		if fn := fluxConflictHook.Load(); fn != nil {
+	// Check-and-record under a single lock: this call would be sighting
+	// #(count+1) — deny when it reaches the threshold, leaving the window
+	// untouched (max=3 denies the third repeat).
+	if !loop.allow(key, now) {
+		if fn := fluxConflictHook.Load(); fn != nil && *fn != nil {
 			(*fn)(FluxConflictSignal{
 				Kind: kind, Namespace: obj.GetNamespace(),
 				Name: obj.GetName(), Manager: manager, Key: key,
@@ -181,44 +185,30 @@ func FluxPatchGate(kind string, obj metav1.Object, key string,
 		}
 		return false
 	}
-	loop.record(key, now)
 	return true
 }
 
-// count reports how many of key's stamps still sit inside the
-// window — the read half of the gate, run BEFORE record so a denied
-// call leaves the window untouched.
-func (l *fluxConflictLoop) count(key string, now time.Time) int {
+// allow atomically checks whether key has room in its sliding window and,
+// when allowed, appends now. A denied call leaves the window untouched.
+// Stamps expire oldest-first (append order); once the key set passes the cap,
+// expired keys are swept so pathological fleet-wide conflict storms stay bounded.
+func (l *fluxConflictLoop) allow(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	cut := now.Add(-l.window)
-	n := 0
-	for _, t := range l.hits[key] {
-		if t.After(cut) {
-			n++
-		}
-	}
-	return n
-}
-
-// record appends now to key's window — called only for an ALLOWED
-// patch (see FluxPatchGate). Stamps expire oldest-first (append
-// order); an all-expired key drops entirely. The whole map sweeps
-// for expired keys once the key set passes the cap — the ledger is
-// keyed by patched objects, so the cap only trips on a pathological
-// fleet-wide conflict storm, exactly when unbounded growth would
-// matter.
-func (l *fluxConflictLoop) record(key string, now time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	cut := now.Add(-l.window)
-	// Trim expired stamps in place (append order = time order) and
-	// append this sighting — the window stays sorted by construction.
 	keep := l.hits[key][:0]
 	for _, t := range l.hits[key] {
 		if t.After(cut) {
 			keep = append(keep, t)
 		}
+	}
+	if len(keep)+1 >= l.max {
+		if len(keep) == 0 {
+			delete(l.hits, key)
+		} else {
+			l.hits[key] = keep
+		}
+		return false
 	}
 	l.hits[key] = append(keep, now)
 	// Key-set hygiene: past the cap, drop every key whose newest
@@ -231,6 +221,7 @@ func (l *fluxConflictLoop) record(key string, now time.Time) {
 			}
 		}
 	}
+	return true
 }
 
 // forget drops key's loop history — a site whose object lost its

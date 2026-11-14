@@ -20,8 +20,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -118,7 +116,7 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 	// NotFound/NoMatch tolerance stays per family.
 	promotions, err := p.AllUnstructured(ctx, kube.GVRKargoPromotion)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// CRD absent — Kargo not installed; the family skips.
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list kargo promotions: %w", err)}
@@ -146,7 +144,7 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 	// cooldown.
 	warehouses, err := p.AllUnstructured(ctx, kube.GVRKargoWarehouse)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list kargo warehouses: %w", err)}
 	default:
@@ -176,7 +174,7 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 	// reasoning as Promotions.
 	analysisRuns, err := p.AllUnstructured(ctx, kube.GVRArgoAnalysisRun)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list argo analysisruns: %w", err)}
 	default:

@@ -82,7 +82,6 @@ package apiserverendpointguard
 import (
 	"context"
 	"net/http"
-	"runtime/debug"
 	"sync"
 	"time"
 
@@ -92,7 +91,6 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
@@ -271,39 +269,6 @@ func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
 }
 
 func (g *apiServerEndpointGuard) nextInterval(_ time.Duration) time.Duration {
-	if g.quarantineActive {
-		return g.quarantineCadence()
-	}
-	return g.sweepInterval()
-}
-
-// runCycle executes one guarded sweep and returns the cadence the
-// Start loop adopts next. It bypasses shared.Periodic (adaptive
-// interval), which also bypasses that helper's panic recovery — so
-// the recovery lives HERE: a panic in any clientset/dynamic call
-// path (or a malformed unstructured Endpoints object slipping past
-// the skip-garbage accessors) is contained to this cycle and logged,
-// instead of unwinding into controller-runtime and killing the whole
-// process. The cadence decision stays inside the guard so a panicking
-// sweep cannot lose the fast-quarantine switch.
-func (g *apiServerEndpointGuard) runCycle(ctx context.Context,
-	log logr.Logger, interval time.Duration) (next time.Duration) {
-	defer func() {
-		if r := recover(); r != nil {
-			metrics.IncError(g.queue)
-			log.Error(nil, "endpoint guard sweep panicked — recovered, process continues",
-				"panic", r, "stack", string(debug.Stack()))
-			next = interval
-		}
-	}()
-	// Per-cycle bound: sequential probes + clientset calls must
-	// never stall the loop past the interval.
-	runCtx, cancel := context.WithTimeout(ctx, endpointGuardRunTimeout)
-	defer cancel()
-	if err := g.run(runCtx); err != nil {
-		metrics.IncError(g.queue)
-		log.Error(err, "sweep failed")
-	}
 	if g.quarantineActive {
 		return g.quarantineCadence()
 	}

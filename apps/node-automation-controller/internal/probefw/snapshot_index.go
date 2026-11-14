@@ -46,6 +46,24 @@ func (ix *censusIndex[T]) reset() {
 	ix.mu.Unlock()
 }
 
+// buildNamespacedIndex builds a namespace/name → item pointer map
+// over a census slice.
+func buildNamespacedIndex[T any, PT interface {
+	*T
+	metav1.Object
+}](items []T) map[types.NamespacedName]*T {
+
+	m := make(map[types.NamespacedName]*T, len(items))
+	for i := range items {
+		p := PT(&items[i])
+		m[types.NamespacedName{
+			Namespace: p.GetNamespace(),
+			Name:      p.GetName(),
+		}] = &items[i]
+	}
+	return m
+}
+
 // lookup returns the named object, building the index from the
 // census on first call. The census error propagates (memoized like
 // every snapshot read — every later caller in the sweep reads the
@@ -64,15 +82,7 @@ func indexLookup[T any, PT interface {
 		if err != nil {
 			return nil, err
 		}
-		m := make(map[types.NamespacedName]*T, len(items))
-		for i := range items {
-			p := PT(&items[i])
-			m[types.NamespacedName{
-				Namespace: p.GetNamespace(),
-				Name:      p.GetName(),
-			}] = &items[i]
-		}
-		ix.byKey, ix.loaded = m, true
+		ix.byKey, ix.loaded = buildNamespacedIndex[T, PT](items), true
 	}
 	return ix.byKey[types.NamespacedName{Namespace: ns, Name: name}], nil
 }
@@ -187,7 +197,7 @@ func (ix *podPlacementIndex) lookup(ctx context.Context,
 	gen := kube.PodTombstoneGen(ctx)
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	if ix.built && ix.gen == gen && podSliceSame(ix.src, pods) {
+	if ix.built && ix.gen == gen && elemSliceSame(ix.src, pods) {
 		return ix.byNS, ix.byNode
 	}
 	byNS := make(map[string][]*corev1.Pod)

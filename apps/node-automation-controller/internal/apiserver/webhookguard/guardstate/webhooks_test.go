@@ -231,3 +231,43 @@ func TestInjectorHealthy(t *testing.T) {
 		})
 	}
 }
+
+func TestForEachWebhookConfig(t *testing.T) {
+	fail := admissionv1.Fail
+	ignore := admissionv1.Ignore
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mwc-a",
+			Annotations: map[string]string{CircuitBrokenAnno: "m.example.com"},
+		},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "m.example.com",
+			FailurePolicy: &ignore,
+			ClientConfig:  admissionv1.WebhookClientConfig{Service: &admissionv1.ServiceReference{Namespace: "ns", Name: "svc"}},
+		}},
+	}
+	vwc := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "vwc-a"},
+		Webhooks: []admissionv1.ValidatingWebhook{{
+			Name:          "v.example.com",
+			FailurePolicy: &fail,
+		}},
+	}
+	cs := fake.NewSimpleClientset(mwc, vwc)
+	snap := &Snapshot{
+		G:   &Guard{CS: cs},
+		MWC: &admissionv1.MutatingWebhookConfigurationList{Items: []admissionv1.MutatingWebhookConfiguration{*mwc}},
+		VWC: &admissionv1.ValidatingWebhookConfigurationList{Items: []admissionv1.ValidatingWebhookConfiguration{*vwc}},
+	}
+	var seen []string
+	snap.ForEachWebhookConfig(func(cfg WebhookConfigView) {
+		seen = append(seen, cfg.Kind+"/"+cfg.Resource+"/"+cfg.Name+"/"+cfg.Hooks[0].Name)
+	})
+	want := []string{
+		KindMutating + "/mutatingwebhookconfigurations/mwc-a/m.example.com",
+		KindValidating + "/validatingwebhookconfigurations/vwc-a/v.example.com",
+	}
+	if len(seen) != len(want) || seen[0] != want[0] || seen[1] != want[1] {
+		t.Fatalf("ForEachWebhookConfig saw %v, want %v", seen, want)
+	}
+}

@@ -328,11 +328,8 @@ func (u *helmReleaseUnlocker) helmUpgradeInProgress(ctx context.Context,
 // A hook Job that is terminal, or stale with no pods, is residue of
 // the wedged attempt — never progress.
 func hookJobInProgress(j *batchv1.Job, now time.Time) bool {
-	for _, c := range j.Status.Conditions {
-		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) &&
-			c.Status == corev1.ConditionTrue {
-			return false
-		}
+	if kube.JobTerminal(j) {
+		return false
 	}
 	return j.Status.Active > 0 ||
 		now.Sub(j.CreationTimestamp.Time) < helmHookFreshWindow

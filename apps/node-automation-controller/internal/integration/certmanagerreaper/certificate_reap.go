@@ -223,10 +223,9 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 				return r.dyn.Resource(orderGVR).Namespace(ns).
 					Delete(ctx, o.GetName(), kube.UIDDeleteOptions(o.GetUID(), ""))
 			},
-			OnError: func(log logr.Logger, o *unstructured.Unstructured, err error) {
-				metrics.IncError(r.queue)
-				log.Error(err, "order delete failed", "cert", key, "order", o.GetName())
-			},
+			OnError: reap.DeleteErrorHandler("order",
+				func(o *unstructured.Unstructured) string { return o.GetNamespace() + "/" + o.GetName() },
+				func() { metrics.IncError(r.queue) }),
 		})
 	if deleted == 0 {
 		return false

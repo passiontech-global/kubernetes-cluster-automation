@@ -122,10 +122,5 @@ func jobComplete(job *batchv1.Job) bool {
 	if job.Status.Succeeded >= want {
 		return true
 	}
-	for _, c := range job.Status.Conditions {
-		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
+	return kube.JobHasCondition(job, batchv1.JobComplete)
 }

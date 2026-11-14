@@ -38,8 +38,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/metadata"
@@ -229,7 +227,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 		// before the ESO rollout finished). Not an operational
 		// error — skip quietly instead of spamming "could not find
 		// the requested resource" every 10 minutes.
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		if kube.IsCRDAbsent(err) {
 			// CRD removal is a verified-empty census, not an
 			// unverifiable read: prune every emitted empty-key
 			// series so gauges flagged while ESO was installed do
@@ -253,7 +251,7 @@ func (n *externalSecretNudge) run(ctx context.Context) error {
 	}
 	namespacedStores, err := n.listFirst(ctx, secretStoreGVRs)
 	if err != nil {
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		if kube.IsCRDAbsent(err) {
 			namespacedStores = nil // SecretStore absent — cluster-only install
 		} else {
 			return fmt.Errorf("list secretstores: %w", err)

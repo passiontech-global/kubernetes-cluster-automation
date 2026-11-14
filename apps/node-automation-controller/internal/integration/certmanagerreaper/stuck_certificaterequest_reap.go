@@ -175,11 +175,9 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 				return r.dyn.Resource(certificateRequestGVR).Namespace(ns).
 					Delete(ctx, cr.GetName(), kube.UIDDeleteOptions(cr.GetUID(), ""))
 			},
-			OnError: func(log logr.Logger, cr *unstructured.Unstructured, err error) {
-				metrics.IncError(r.queue)
-				log.Error(err, "certificaterequest delete failed",
-					"cert", key, "certificaterequest", cr.GetName())
-			},
+			OnError: reap.DeleteErrorHandler("certificaterequest",
+				func(cr *unstructured.Unstructured) string { return cr.GetNamespace() + "/" + cr.GetName() },
+				func() { metrics.IncError(r.queue) }),
 		})
 	if deleted == 0 {
 		return false

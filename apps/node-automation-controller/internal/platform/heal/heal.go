@@ -95,6 +95,47 @@ func AllowedV(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
 	return true, false
 }
 
+// preparePodDisruption runs the shared preflight for DeletePod and EvictPod:
+// L1↔L3 local-remediation yield followed by the sweep overlay's workload
+// disruption slot reservation. deferHeal=true means another actor holds the
+// window (no mutation, no cooldown stamp).
+func preparePodDisruption(ctx context.Context, cs kubernetes.Interface,
+	pod *corev1.Pod, now time.Time) (deferHeal bool, err error) {
+
+	// L1↔L3 yield runs BEFORE the disruption reservation: a pod
+	// inside a node-host-agent self-heal window is deferred without
+	// burning the sweep's one-disruption slot. The caller's fleet
+	// grant (if AllowedV consumed one) goes back at the GATE — this
+	// helper cannot see it.
+	hold, err := localRemediationHold(ctx, cs, pod, now)
+	if err != nil {
+		return false, err
+	}
+	if hold {
+		return true, nil
+	}
+	// Quorum guard: inside a sweep the overlay grants each workload
+	// controller ONE disruption slot per sweep — a sibling check
+	// that already reserved this owner must not spend a second
+	// delete and take a 2-replica workload to zero. Denial is a
+	// deferral: no API call, no ledger stamp, retry next sweep.
+	if !kube.TryReserveWorkloadDisruption(ctx, pod) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// recordPodKilled tombstones pod.UID in the sweep overlay and stamps the
+// per-key cooldown ledger after a delivered delete or eviction.
+func recordPodKilled(ctx context.Context, heals *state.CooldownSet,
+	key string, pod *corev1.Pod, now time.Time) {
+
+	kube.MarkPodDeleted(ctx, pod.UID)
+	if heals != nil {
+		heals.Stamp(key, now)
+	}
+}
+
 // DeletePod issues the UID-preconditioned delete the heals share —
 // kube.UIDDeleteOptions with no propagation policy (the apiserver
 // default, matching every reference implementation: Preconditions{UID}
@@ -121,44 +162,15 @@ func DeletePod(ctx context.Context, cs kubernetes.Interface,
 	heals *state.CooldownSet, key string, pod *corev1.Pod,
 	now time.Time) (bool, error) {
 
-	// L1↔L3 yield runs BEFORE the disruption reservation: a pod
-	// inside a node-host-agent self-heal window is deferred without
-	// burning the sweep's one-disruption slot. The caller's fleet
-	// grant (if AllowedV consumed one) goes back at the GATE — this
-	// helper cannot see it.
-	hold, err := localRemediationHold(ctx, cs, pod, now)
-	if err != nil {
+	deferred, err := preparePodDisruption(ctx, cs, pod, now)
+	if err != nil || deferred {
 		return false, err
-	}
-	if hold {
-		return false, nil
-	}
-	// Quorum guard: inside a sweep the overlay grants each workload
-	// controller ONE disruption slot per sweep — a sibling check
-	// that already reserved this owner must not spend a second
-	// delete and take a 2-replica workload to zero (cooldowns are
-	// per-CHECK keys, so without the shared slot two checks each
-	// pass their own gate and each delete). Denial is a deferral:
-	// (false, nil) — no API call, no ledger stamp, and the next
-	// sweep retries once the sibling's cooldown has lapsed. Outside
-	// a sweep the reservation always succeeds (no overlay, no
-	// sharing). The deferral also hands back any grant the
-	// caller's AllowedV preamble consumed — at the gate, same
-	// contract EvictPodV applies to a refused eviction.
-	if !kube.TryReserveWorkloadDisruption(ctx, pod) {
-		return false, nil
 	}
 	if err := cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
 		kube.UIDDeleteOptions(pod.UID, "")); err != nil {
 		return false, err
 	}
-	// Tombstone the UID so later census reads this sweep hide the
-	// pod without a pod-list invalidation (the O(1) half of the
-	// sweep overlay — MarkPodDeleted is a no-op outside a sweep).
-	kube.MarkPodDeleted(ctx, pod.UID)
-	if heals != nil {
-		heals.Stamp(key, now)
-	}
+	recordPodKilled(ctx, heals, key, pod, now)
 	return true, nil
 }
 
@@ -198,25 +210,11 @@ func EvictPod(ctx context.Context, cs kubernetes.Interface,
 	heals *state.CooldownSet, key string, pod *corev1.Pod,
 	now time.Time) (evicted bool, refused bool, err error) {
 
-	// Same L1↔L3 yield as DeletePod — deferred BEFORE the
-	// disruption reservation so the slot stays free, reported as
-	// refused=true so every caller's existing "deferral, retry
-	// later" path applies (and EvictPodV refunds the grant, exactly
-	// like a real 429: no heal was delivered).
-	hold, err := localRemediationHold(ctx, cs, pod, now)
+	deferred, err := preparePodDisruption(ctx, cs, pod, now)
 	if err != nil {
 		return false, false, err
 	}
-	if hold {
-		return false, true, nil
-	}
-	// Same quorum guard as DeletePod: a sibling check that already
-	// reserved this workload's one-disruption slot this sweep makes
-	// this eviction a deferral — reported as refused=true so every
-	// caller's existing "PDB said no, retry later" path applies
-	// unchanged (EvictPodV refunds the grant it consumed, exactly
-	// like a real 429: no heal was delivered).
-	if !kube.TryReserveWorkloadDisruption(ctx, pod) {
+	if deferred {
 		return false, true, nil
 	}
 	deleteOpts := kube.UIDDeleteOptions(pod.UID, "")
@@ -234,12 +232,7 @@ func EvictPod(ctx context.Context, cs kubernetes.Interface,
 	if err != nil {
 		return false, false, err
 	}
-	// Tombstone the UID — an accepted eviction is a delivered kill
-	// for census purposes even while the pod finishes terminating.
-	kube.MarkPodDeleted(ctx, pod.UID)
-	if heals != nil {
-		heals.Stamp(key, now)
-	}
+	recordPodKilled(ctx, heals, key, pod, now)
 	return true, false, nil
 }
 

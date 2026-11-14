@@ -29,13 +29,8 @@ import (
 // patch is the equivalent that cannot shift indices mid-patch AND
 // cannot revert a concurrent writer's entries — see collect).
 type webhookPatch struct {
-	mutating bool
-	name     string
-	payload  []byte
-	// cfgObj is the config the patch targets — the SSA ping-pong
-	// gate reads its managedFields (the snapshot lists direct from
-	// the clientset, so the fields are intact).
-	cfgObj metav1.Object
+	cfg     guardstate.WebhookConfigView
+	payload []byte
 }
 
 // Sweep removes orphan admission-webhook entries — see doc.go. It is
@@ -80,7 +75,6 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	if snap.VWCErr != nil {
 		return fmt.Errorf("list validatingwebhookconfigurations (API flap) — abort: %w", snap.VWCErr)
 	}
-	mwc, vwc := snap.MWC, snap.VWC
 
 	var patches []webhookPatch
 	// collect queues ONE strategic-merge patch per config listing every
@@ -90,7 +84,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	// re-serializing the whole array from our List snapshot. A
 	// concurrent writer's entry — cainjector rotating caBundle, GitOps
 	// adding a webhook — is merged around, never silently reverted.
-	collect := func(mutating bool, cfgName string, cfgObj metav1.Object, removed []string) {
+	collect := func(cfg guardstate.WebhookConfigView, removed []string) {
 		if len(removed) == 0 {
 			return
 		}
@@ -104,30 +98,21 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 			// metered so the dropped work is still counted.
 			metrics.IncError(g.Queue)
 			log.Error(err, "marshal webhook patch",
-				"config", cfgName, "mutating", mutating)
+				"config", cfg.Name, "kind", cfg.Kind)
 			return
 		}
-		patches = append(patches, webhookPatch{mutating: mutating, name: cfgName, payload: payload, cfgObj: cfgObj})
+		patches = append(patches, webhookPatch{cfg: cfg, payload: payload})
 	}
 
-	for _, cfg := range mwc.Items {
+	snap.ForEachWebhookConfig(func(cfg guardstate.WebhookConfigView) {
 		var removed []string
-		for i, w := range cfg.Webhooks {
-			if orphanEntry(ctx, g, log, "mutatingwebhookconfigurations", cfg.Name, i, w.ClientConfig.Service, namespaces, services, haveSvc) {
+		for i, w := range cfg.Hooks {
+			if orphanEntry(ctx, g, log, cfg.Resource, cfg.Name, i, w.Service, namespaces, services, haveSvc) {
 				removed = append(removed, w.Name)
 			}
 		}
-		collect(true, cfg.Name, &cfg, removed)
-	}
-	for _, cfg := range vwc.Items {
-		var removed []string
-		for i, w := range cfg.Webhooks {
-			if orphanEntry(ctx, g, log, "validatingwebhookconfigurations", cfg.Name, i, w.ClientConfig.Service, namespaces, services, haveSvc) {
-				removed = append(removed, w.Name)
-			}
-		}
-		collect(false, cfg.Name, &cfg, removed)
-	}
+		collect(cfg, removed)
+	})
 
 	// CRD conversion webhooks get the same warn-only treatment: a
 	// backend Service deleted under a live namespace — or its whole
@@ -162,41 +147,20 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 
 	failed := false
 	for _, p := range patches {
-		kind := guardstate.KindValidating
-		if p.mutating {
-			kind = guardstate.KindMutating
-		}
 		// SSA ping-pong defense: a Git-owned config re-asserts its
 		// webhook list every reconcile — dropping entries past the
 		// Heal-Revert-Loop threshold fights Flux (the orphans are
 		// IN Git). Skip + report; fix the source in Git.
-		if !heal.FluxPatchGate(kind, p.cfgObj, kind+"/"+p.name, g.Now.Now()) {
+		if !heal.FluxPatchGate(p.cfg.Kind, p.cfg.Object, p.cfg.Kind+"/"+p.cfg.Name, g.Now.Now()) {
 			log.Info("skip heal: Flux Heal-Revert Loop detected — orphan-entry patch deferred",
-				"kind", kind, "config", p.name)
+				"kind", p.cfg.Kind, "config", p.cfg.Name)
 			continue
 		}
 		log.Info("PATCH: drop orphan entries by merge key",
-			"kind", kind, "config", p.name)
-		var err error
-		if p.mutating {
-			var patched *admissionv1.MutatingWebhookConfiguration
-			patched, err = g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().Patch(ctx, p.name, types.StrategicMergePatchType, p.payload, metav1.PatchOptions{})
-			if err == nil {
-				// Keep the shared snapshot current — the circuit
-				// breaker and the unmeshed audit run later on the
-				// same snap and must see the dropped entries gone.
-				snap.SetMWC(patched)
-			}
-		} else {
-			var patched *admissionv1.ValidatingWebhookConfiguration
-			patched, err = g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().Patch(ctx, p.name, types.StrategicMergePatchType, p.payload, metav1.PatchOptions{})
-			if err == nil {
-				snap.SetVWC(patched)
-			}
-		}
-		if err != nil {
+			"kind", p.cfg.Kind, "config", p.cfg.Name)
+		if err := p.cfg.Patch(ctx, types.StrategicMergePatchType, p.payload); err != nil {
 			log.Error(err, "webhook config patch failed",
-				"kind", kind, "config", p.name)
+				"kind", p.cfg.Kind, "config", p.cfg.Name)
 			failed = true
 		}
 	}

@@ -516,34 +516,38 @@ func TestEndpointGuardJWKSTieNeverFlags(t *testing.T) {
 	}
 }
 
-// runCycle contains a panicking sweep: a panic anywhere in the run
-// path (here: the version-probe seam) is recovered, metered and
-// logged, and the Start loop keeps its cadence — a wedged dependency
-// or a malformed unstructured object must not kill the whole
-// controller process. (This runnable bypasses shared.Periodic, which
-// is where every other module's panic recovery lives.)
+// Start delegates to shared.Periodic, containing panics in g.run
+// (here: the version-probe seam) so the loop keeps running, while
+// nextInterval preserves the adaptive quarantine cadence switch.
 func TestEndpointGuardCycleRecoversPanics(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	dyn := testutil.NewDynamicClient()
 	g := newEndpointGuard(cs, dyn, probeTable{})
-	g.serverMinorFn = func() (int, error) { panic("version probe exploded") }
-	if got := g.runCycle(ctx, logr.Discard(), endpointGuardInterval); got != endpointGuardInterval {
-		t.Fatalf("cadence after a panicking sweep = %v, want the passed-in interval", got)
+	g.interval = 5 * time.Millisecond
+	g.quarantineInterval = 2 * time.Millisecond
+
+	calls := 0
+	runCtx, cancel := context.WithCancel(ctx)
+	g.serverMinorFn = func() (int, error) {
+		calls++
+		if calls == 1 {
+			panic("version probe exploded")
+		}
+		cancel()
+		return 32, nil
 	}
-	// The recover must not wedge the loop: the passed-in cadence is
-	// retained through panicking cycles too.
-	if got := g.runCycle(ctx, logr.Discard(), endpointGuardQuarantineInterval); got != endpointGuardQuarantineInterval {
-		t.Fatalf("cadence after the recovered cycle = %v, want the passed-in quarantine interval", got)
+	if err := g.Start(runCtx); err != nil {
+		t.Fatalf("Start returned error after panic recovery: %v", err)
 	}
-	// And a healthy cycle still applies the quarantine fast-cadence
-	// switch.
-	g.serverMinorFn = nil
+	if calls < 2 {
+		t.Fatalf("calls = %d, want >= 2 (loop survived panic and kept cycling)", calls)
+	}
 	g.quarantineActive = true
-	if got := g.runCycle(ctx, logr.Discard(), endpointGuardInterval); got != endpointGuardQuarantineInterval {
-		t.Fatalf("healthy sweep after recovery = %v, want the quarantine fast cadence", got)
+	if got := g.nextInterval(endpointGuardInterval); got != 2*time.Millisecond {
+		t.Fatalf("nextInterval(quarantine) = %v, want 2ms", got)
 	}
 	g.quarantineActive = false
-	if got := g.runCycle(ctx, logr.Discard(), endpointGuardQuarantineInterval); got != endpointGuardInterval {
-		t.Fatalf("healthy sweep with quarantine disarmed = %v, want the steady interval", got)
+	if got := g.nextInterval(2 * time.Millisecond); got != 5*time.Millisecond {
+		t.Fatalf("nextInterval(steady) = %v, want 5ms", got)
 	}
 }

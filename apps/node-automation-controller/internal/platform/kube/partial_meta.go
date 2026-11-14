@@ -81,7 +81,7 @@ func ListPartialOrFallback(ctx context.Context,
 	namespace string,
 	opts metav1.ListOptions) ([]metav1.PartialObjectMetadata, error) {
 
-	var firstErr error
+	var metaErr, fallbackErr error
 	if meta != nil {
 		items, err := listPartialViaMeta(ctx, meta, gvr, namespace, opts)
 		if err == nil {
@@ -96,7 +96,7 @@ func ListPartialOrFallback(ctx context.Context,
 		if !metaUnsupported(err) {
 			return nil, err
 		}
-		firstErr = err
+		metaErr = err
 	}
 	// Built-in GVRs prefer the typed clientset: it is the path the
 	// fake clientsets in tests answer universally, and the typed
@@ -108,8 +108,8 @@ func ListPartialOrFallback(ctx context.Context,
 		if err == nil {
 			return items, nil
 		}
-		if firstErr == nil {
-			firstErr = err
+		if fallbackErr == nil {
+			fallbackErr = err
 		}
 	}
 	if fallbackDyn != nil {
@@ -118,12 +118,15 @@ func ListPartialOrFallback(ctx context.Context,
 		if err == nil {
 			return items, nil
 		}
-		if firstErr == nil {
-			firstErr = err
+		if fallbackErr == nil {
+			fallbackErr = err
 		}
 	}
-	if firstErr != nil {
-		return nil, firstErr
+	if fallbackErr != nil {
+		return nil, fallbackErr
+	}
+	if metaErr != nil {
+		return nil, metaErr
 	}
 	return nil, fmt.Errorf("no client available for metadata list of %s", gvr)
 }

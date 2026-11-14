@@ -85,7 +85,6 @@ import (
 	"slices"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -371,7 +370,7 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 	// scan; a real error is reported once for both consumers.
 	kustomizations, err := u.listAllPages(ctx, u.dyn.Resource(fluxKustomizationGVR))
 	var ksErr error
-	if err != nil && !apierrors.IsNotFound(err) {
+	if err != nil && !kube.IsCRDAbsent(err) {
 		ksErr = fmt.Errorf("list kustomizations: %w", err)
 	}
 	// C1 — stale-artifact source healing is independent of the

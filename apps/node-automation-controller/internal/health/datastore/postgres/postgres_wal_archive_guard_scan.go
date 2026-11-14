@@ -15,8 +15,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -73,7 +71,7 @@ func (s *walGuardSweep) scanCRConditions(ctx context.Context) (
 	for _, rk := range postgresCRKinds {
 		items, err := s.p.AllUnstructured(ctx, rk.gvr)
 		switch {
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		case kube.IsCRDAbsent(err):
 			continue
 		case err != nil:
 			return nil, fmt.Errorf("list %s: %w", rk.gvr.Resource, err)
@@ -129,7 +127,7 @@ func (s *walGuardSweep) scanPodLogs(ctx context.Context) error {
 	for j, i := range scanIdx {
 		scanPods[j] = &pods[i]
 	}
-	scans := kube.ScanPodLogs(ctx, s.p.CS, scanPods, postgresWALLogWorkers,
+	scans := kube.ScanPodLogs(ctx, scanPods, postgresWALLogWorkers,
 		func(ctx context.Context, pod *corev1.Pod) (string, error) {
 			return s.p.pgWALLogHit(ctx, pod)
 		})

@@ -13,20 +13,9 @@ import (
 )
 
 func TestSetupRegistersPeriodic(t *testing.T) {
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Name: "dead-node-sweeper", Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	testutil.ExpectPeriodic(t, m, "dead-node-sweeper", 5*time.Minute)
-}
-
-// Disabled registers nothing — the SetupNoConfig gate (structural,
-// not comment-enforced).
-func TestSetupDisabled(t *testing.T) {
-	testutil.DisabledNoop(t, Setup, shared.Deps{
+	testutil.PeriodicContract(t, Setup, shared.Deps{
 		Name: "dead-node-sweeper",
 		CS:   fake.NewSimpleClientset(),
 		Dyn:  testutil.StubDyn(),
-	})
+	}, "dead-node-sweeper", 5*time.Minute)
 }

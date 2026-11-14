@@ -10,10 +10,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -105,13 +103,7 @@ func (j *failedJobsJanitor) runRefDone(ctx context.Context, ns string,
 		if job.DeletionTimestamp != nil {
 			return true, nil // already on its way out
 		}
-		for _, c := range job.Status.Conditions {
-			if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) &&
-				c.Status == corev1.ConditionTrue {
-				return true, nil
-			}
-		}
-		return false, nil
+		return kube.JobTerminal(job), nil
 	}
 	gvr, ok := runRefGVR(ref.kind)
 	if !ok || j.dyn == nil {
@@ -122,7 +114,7 @@ func (j *failedJobsJanitor) runRefDone(ctx context.Context, ns string,
 	}
 	obj, err := j.dyn.Resource(gvr).Namespace(ns).Get(ctx, ref.name, metav1.GetOptions{})
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		return true, nil
 	case err != nil:
 		return false, err

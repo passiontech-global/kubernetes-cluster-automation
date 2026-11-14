@@ -52,7 +52,7 @@ type circuitEval struct {
 	log         logr.Logger
 	kind        string
 	cfgName     string
-	hooks       []hookView
+	hooks       []guardstate.WebhookView
 	ready       guardstate.EndpointCensus
 	now         time.Time
 	seen        map[string]bool
@@ -97,7 +97,7 @@ type circuitEval struct {
 // them earlier would let a failed patch pin or drop a series the
 // annotation no longer justifies.
 func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
-	hooks []hookView, ready guardstate.EndpointCensus, now time.Time,
+	hooks []guardstate.WebhookView, ready guardstate.EndpointCensus, now time.Time,
 	seen, recoverSeen map[string]bool, allowTrips bool) (payload []byte, trips, recovered, stillBroken, dropped []string) {
 
 	e := &circuitEval{
@@ -145,10 +145,10 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 // until the ref points at a measurable Service again, because
 // flipping the policy back to Fail on zero evidence a backend was
 // ever probed would un-fail-close a live outage.
-func (e *circuitEval) evalHook(h hookView) {
-	e.present[h.name] = true
-	key := e.kind + "/" + e.cfgName + "/" + h.name
-	isBroken := e.broken[h.name]
+func (e *circuitEval) evalHook(h guardstate.WebhookView) {
+	e.present[h.Name] = true
+	key := e.kind + "/" + e.cfgName + "/" + h.Name
+	isBroken := e.broken[h.Name]
 	// svcEffective < 0 marks "not Service-backed" — URL webhooks
 	// and malformed refs are unmeasurable, the breaker never
 	// trips them and never recovers them (the -1 freeze keeps the
@@ -165,8 +165,8 @@ func (e *circuitEval) evalHook(h hookView) {
 	// already covered by the endpoint-census path) and the service was
 	// actually probed this run.
 	unresponsive := false
-	if h.svc != nil && h.svc.Namespace != "" && h.svc.Name != "" {
-		svc = h.svc.Namespace + "/" + h.svc.Name
+	if h.Service != nil && h.Service.Namespace != "" && h.Service.Name != "" {
+		svc = h.Service.Namespace + "/" + h.Service.Name
 		svcEffective = e.ready.Effective[svc]
 		svcRaw = e.ready.Raw[svc]
 		unresponsive = svcEffective > 0 &&
@@ -183,7 +183,7 @@ func (e *circuitEval) evalHook(h hookView) {
 		e.evalRecover(h, key, svc)
 	case isBroken:
 		e.evalStillBroken(h, key)
-	case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.fp) && e.allowTrips:
+	case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.FailurePolicy) && e.allowTrips:
 		e.evalTrip(h, key, svc, svcRaw, unresponsive)
 	}
 }
@@ -194,20 +194,20 @@ func (e *circuitEval) evalHook(h hookView) {
 // alternating sweeps, patching the WebhookConfiguration twice a
 // cycle. The annotation stays the SSOT for "broken"; the counter
 // only gates WHEN the recover patch fires.
-func (e *circuitEval) evalRecover(h hookView, key, svc string) {
+func (e *circuitEval) evalRecover(h guardstate.WebhookView, key, svc string) {
 	streak := e.b.markHealthyStreak(key)
 	if streak < RecoverConfirmSweeps {
 		e.recoverSeen[key] = true
 		// Not confirmed yet — the entry stays broken:
 		// re-assert Ignore if the policy was flipped back
 		// externally, and re-assert the series.
-		if h.fp == nil || *h.fp != admissionv1.Ignore {
+		if h.FailurePolicy == nil || *h.FailurePolicy != admissionv1.Ignore {
 			e.flip(h, admissionv1.Ignore)
 		}
-		e.stillBroken = append(e.stillBroken, h.name)
+		e.stillBroken = append(e.stillBroken, h.Name)
 		e.log.Info("CIRCUIT-RECOVER-DEFER: healthy again — confirming next sweep",
-			"kind", e.kind, "config", e.cfgName, "webhook", h.name,
-			"service", svcRefString(h.svc),
+			"kind", e.kind, "config", e.cfgName, "webhook", h.Name,
+			"service", svcRefString(h.Service),
 			"healthySweeps", streak, "required", RecoverConfirmSweeps)
 		return
 	}
@@ -218,11 +218,11 @@ func (e *circuitEval) evalRecover(h hookView, key, svc string) {
 	// the EndpointSlice is not "serving".
 	e.b.clearHealthyStreak(key)
 	e.flip(h, admissionv1.Fail)
-	delete(e.broken, h.name)
-	e.recovered = append(e.recovered, h.name)
+	delete(e.broken, h.Name)
+	e.recovered = append(e.recovered, h.Name)
 	e.log.Info("CIRCUIT-RECOVER: restoring failurePolicy=Fail",
-		"kind", e.kind, "config", e.cfgName, "webhook", h.name,
-		"service", svcRefString(h.svc))
+		"kind", e.kind, "config", e.cfgName, "webhook", h.Name,
+		"service", svcRefString(h.Service))
 }
 
 // evalStillBroken re-asserts Ignore on an annotation-broken entry
@@ -234,12 +234,12 @@ func (e *circuitEval) evalRecover(h hookView, key, svc string) {
 // The series re-asserts post-patch via stillBroken: a failed patch
 // leaves the annotation unverifiable, so marking it emitted here
 // would let the prune keep (or drop) the wrong set.
-func (e *circuitEval) evalStillBroken(h hookView, key string) {
+func (e *circuitEval) evalStillBroken(h guardstate.WebhookView, key string) {
 	e.b.clearHealthyStreak(key) // the healthy streak must be CONSECUTIVE
-	if h.fp == nil || *h.fp != admissionv1.Ignore {
+	if h.FailurePolicy == nil || *h.FailurePolicy != admissionv1.Ignore {
 		e.flip(h, admissionv1.Ignore)
 	}
-	e.stillBroken = append(e.stillBroken, h.name)
+	e.stillBroken = append(e.stillBroken, h.Name)
 }
 
 // evalTrip runs the dead-backend streak for a fail-closed entry on
@@ -250,12 +250,12 @@ func (e *circuitEval) evalStillBroken(h hookView, key string) {
 // sweep retry immediately instead of re-opening a fresh window.
 // Once the entry is broken it no longer marks seen[key], so the
 // ledger prunes itself.
-func (e *circuitEval) evalTrip(h hookView, key, svc string, svcRaw int, unresponsive bool) {
+func (e *circuitEval) evalTrip(h guardstate.WebhookView, key, svc string, svcRaw int, unresponsive bool) {
 	e.seen[key] = true
 	first, tracked := e.b.deadSince.Observe(key, e.now)
 	if !tracked {
 		e.log.Info("circuit breaker: fail-closed webhook on a dead Service — tracking",
-			"kind", e.kind, "config", e.cfgName, "webhook", h.name,
+			"kind", e.kind, "config", e.cfgName, "webhook", h.Name,
 			"service", svc, "rawReady", svcRaw)
 		return
 	}
@@ -265,32 +265,32 @@ func (e *circuitEval) evalTrip(h hookView, key, svc string, svcRaw int, unrespon
 	}
 	// TRIP — dead backend past the threshold.
 	e.flip(h, admissionv1.Ignore)
-	e.broken[h.name] = true
-	e.trips = append(e.trips, h.name)
+	e.broken[h.Name] = true
+	e.trips = append(e.trips, h.Name)
 	switch {
 	case unresponsive:
 		// circuit-breaker-bounce — every probed Ready endpoint failed the
 		// TCP+TLS handshake: hung pods, not a partition.
 		// svcRaw > 0 keeps the 90s partition threshold.
 		e.log.Info("CIRCUIT-TRIP: unresponsive — all probed ready endpoints fail TCP+TLS handshake — patching failurePolicy=Ignore",
-			"kind", e.kind, "config", e.cfgName, "webhook", h.name,
+			"kind", e.kind, "config", e.cfgName, "webhook", h.Name,
 			"service", svc, "threshold", threshold)
 	case svcRaw > 0:
 		e.log.Info("CIRCUIT-TRIP: all ready endpoints on partitioned/unresponsive nodes — patching failurePolicy=Ignore",
-			"kind", e.kind, "config", e.cfgName, "webhook", h.name,
+			"kind", e.kind, "config", e.cfgName, "webhook", h.Name,
 			"service", svc, "rawReady", svcRaw, "threshold", threshold)
 	default:
 		e.log.Info("CIRCUIT-TRIP: 0 ready endpoints — patching failurePolicy=Ignore",
-			"kind", e.kind, "config", e.cfgName, "webhook", h.name,
+			"kind", e.kind, "config", e.cfgName, "webhook", h.Name,
 			"service", svc, "threshold", threshold)
 	}
 }
 
 // flip queues one failurePolicy merge entry — each hook is visited
 // once, so a plain append cannot duplicate a merge key.
-func (e *circuitEval) flip(h hookView, fp admissionv1.FailurePolicyType) {
+func (e *circuitEval) flip(h guardstate.WebhookView, fp admissionv1.FailurePolicyType) {
 	e.hookMerges = append(e.hookMerges, map[string]any{
-		"name": h.name, "failurePolicy": string(fp)})
+		"name": h.Name, "failurePolicy": string(fp)})
 	e.changed = true
 }
 

@@ -309,8 +309,6 @@ var (
 	// the liqo-controller-manager watchdog watches (W20).
 	GVRLiqoForeignCluster = schema.GroupVersionResource{
 		Group: "core.liqo.io", Version: "v1beta1", Resource: "foreignclusters"}
-	GVRCiliumNode = schema.GroupVersionResource{
-		Group: "cilium.io", Version: "v2", Resource: "ciliumnodes"}
 
 	// ---------------------------------------------------------------
 	// CloudNativePG (postgres-wal-archive-guard — complements the

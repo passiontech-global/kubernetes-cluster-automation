@@ -75,12 +75,16 @@ func (p *ciliumBPFMapPressureCheck) Run(ctx context.Context) probefw.Result {
 	query := `max by (node, map_name) (cilium_bpf_map_pressure) > ` +
 		strconv.FormatFloat(threshold, 'f', -1, 64)
 	series, err := p.PromQuery(ctx, query)
+	var rep probefw.SweepReport
 	if err != nil {
 		log.Info("WARN: cilium bpf map pressure query failed — check inconclusive",
 			"error", err)
+		for k, lv := range p.emitted.Last() {
+			rep.Carry(k, lv)
+		}
+		rep.Close(&p.emitted, ciliumBPFMapPressureGauge.DeleteLabelValues)
 		return probefw.Result{Pass: true}
 	}
-	var rep probefw.SweepReport
 	for _, s := range series {
 		node := s.Label("node", "kubernetes_node", "instance")
 		mapName := s.Metric["map_name"]

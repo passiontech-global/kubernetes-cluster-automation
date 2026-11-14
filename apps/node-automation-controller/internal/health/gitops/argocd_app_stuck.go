@@ -19,9 +19,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	appsv1 "k8s.io/api/apps/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -60,15 +57,6 @@ type argoCDAppStuckCheck struct {
 	// one lookup per distinct workload. Reset at the top of every
 	// Run (ownerSeen's shape in api-object-sprawl-report-gc).
 	downscaledSeen map[string]bool
-	// depIndex/stsIndex are the per-sweep ns/name indexes over the
-	// shared Deployment/StatefulSet censuses — without them each
-	// distinct workload linear-scanned the full census slice
-	// (O(workloads×census) per sweep). Built once on first lookup
-	// (the census LIST is already memoized per sweep), reset with
-	// downscaledSeen; a census read failure returns nil uncached so
-	// later lookups retry rather than poisoning the sweep.
-	depIndex map[string]*appsv1.Deployment
-	stsIndex map[string]*appsv1.StatefulSet
 }
 
 // newArgoCDAppStuckCheck builds the argocd-app-stuck check — its state is the
@@ -130,7 +118,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	}
 	now := p.Now()
 	apps, err := p.AllUnstructured(ctx, argocdAppGVR)
-	crdAbsent := apierrors.IsNotFound(err) || meta.IsNoMatchError(err)
+	crdAbsent := kube.IsCRDAbsent(err)
 	switch {
 	case crdAbsent:
 		// CRD absent — ArgoCD not installed. The sweep IS complete
@@ -146,7 +134,6 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	var rep probefw.SweepReport
 	comparisonErrors := 0
 	p.downscaledSeen = map[string]bool{} // per-sweep memo, reset each Run
-	p.depIndex, p.stsIndex = nil, nil    // census indexes rebuilt lazily
 	for i := range apps {
 		app := &apps[i]
 		ns, name := app.GetNamespace(), app.GetName()

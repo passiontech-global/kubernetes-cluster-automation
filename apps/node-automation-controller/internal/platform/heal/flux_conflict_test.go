@@ -5,6 +5,8 @@
 package heal
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -119,5 +121,31 @@ func TestFluxPatchGateForgetsWhenFluxLeaves(t *testing.T) {
 	}
 	if !FluxPatchGate("csv", flux, key, now.Add(3*time.Minute)) {
 		t.Fatal("stale loop history survived the manager change")
+	}
+}
+
+func TestFluxPatchGateNilHookAndConcurrentAllow(t *testing.T) {
+	ConfigureFluxConflictLoop(3, 30*time.Minute)
+	defer ConfigureFluxConflictLoop(0, 0)
+	SetFluxConflictHook(nil)
+
+	now := time.Now()
+	flux := objWithManager("helm-controller")
+	const key = "mwc/linkerd/nil-hook"
+	// Must not panic when hook is explicitly cleared with nil before tripping.
+	var allowed atomic.Int32
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if FluxPatchGate("mwc", flux, key, now) {
+				allowed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := allowed.Load(); got != 2 {
+		t.Fatalf("concurrent allowed = %d, want exactly 2 (max=3)", got)
 	}
 }

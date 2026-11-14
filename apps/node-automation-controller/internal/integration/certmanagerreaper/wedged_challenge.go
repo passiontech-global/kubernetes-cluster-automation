@@ -45,13 +45,7 @@ func challengeWedged(ch *unstructured.Unstructured, now time.Time) bool {
 	if !presented || !processing {
 		return false
 	}
-	since := ch.GetCreationTimestamp().Time
-	if ts, ok := kube.NestedString(
-		ch.Object, "status", "lastTransitionTime"); ok {
-		if t, err := time.Parse(time.RFC3339, ts); err == nil {
-			since = t
-		}
-	}
+	since := kube.NestedStatusTimeOrCreated(ch, "lastTransitionTime")
 	return now.Sub(since) > orderPendingMinAge
 }
 

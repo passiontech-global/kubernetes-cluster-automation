@@ -10,7 +10,6 @@ package gitops
 import (
 	"context"
 
-	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -114,77 +113,27 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 	return v
 }
 
-// deploymentIndex builds (once per sweep) the ns/name index over the
-// shared Deployment census — AllDeployments already memoizes the
-// cluster-wide LIST, so the map turns each distinct workload lookup
-// O(1) instead of a full-slice scan. A census read failure returns
-// nil UNCACHED: the next lookup retries the read rather than pinning
-// a poisoned empty index for the whole sweep.
-func (p *argoCDAppStuckCheck) deploymentIndex(
-	ctx context.Context) map[string]*appsv1.Deployment {
-	if p.depIndex != nil {
-		return p.depIndex
-	}
-	deps, err := p.AllDeployments(ctx)
-	if err != nil {
-		return nil
-	}
-	idx := make(map[string]*appsv1.Deployment, len(deps))
-	for i := range deps {
-		idx[deps[i].Namespace+"/"+deps[i].Name] = &deps[i]
-	}
-	p.depIndex = idx
-	return idx
-}
-
-// statefulSetIndex is deploymentIndex's StatefulSet twin.
-func (p *argoCDAppStuckCheck) statefulSetIndex(
-	ctx context.Context) map[string]*appsv1.StatefulSet {
-	if p.stsIndex != nil {
-		return p.stsIndex
-	}
-	stss, err := p.AllStatefulSets(ctx)
-	if err != nil {
-		return nil
-	}
-	idx := make(map[string]*appsv1.StatefulSet, len(stss))
-	for i := range stss {
-		idx[stss[i].Namespace+"/"+stss[i].Name] = &stss[i]
-	}
-	p.stsIndex = idx
-	return idx
-}
-
-// deploymentDownscaled resolves one workload against the sweep's
-// shared Deployment census — via the per-sweep ns/name index (one
-// LIST, O(1) per distinct workload). Absent (or unreadable) reads
-// false: not proven downscaled is stuck evidence, the fail-closed
-// posture.
+// deploymentDownscaled resolves one workload via the sweep's shared
+// per-ns/name index (single cluster-wide LIST on first lookup, O(1)
+// thereafter; failures remain uncached on *probefw.Deps). Absent or
+// unreadable reads false: not proven downscaled is stuck evidence,
+// the fail-closed posture.
 func (p *argoCDAppStuckCheck) deploymentDownscaled(ctx context.Context,
 	ns, name string) bool {
 
-	idx := p.deploymentIndex(ctx)
-	if idx == nil {
-		return false
-	}
-	dep, ok := idx[ns+"/"+name]
-	if !ok {
+	dep, err := p.Deployment(ctx, ns, name)
+	if err != nil || dep == nil {
 		return false
 	}
 	return kube.IsIntentionallyDownscaled(dep.Annotations, dep.Spec.Replicas)
 }
 
-// statefulSetDownscaled is the StatefulSet twin over the shared
-// per-sweep census index.
+// statefulSetDownscaled is the StatefulSet twin over *probefw.Deps.
 func (p *argoCDAppStuckCheck) statefulSetDownscaled(ctx context.Context,
 	ns, name string) bool {
 
-	idx := p.statefulSetIndex(ctx)
-	if idx == nil {
-		return false
-	}
-	sts, ok := idx[ns+"/"+name]
-	if !ok {
+	sts, err := p.StatefulSet(ctx, ns, name)
+	if err != nil || sts == nil {
 		return false
 	}
 	return kube.IsIntentionallyDownscaled(sts.Annotations, sts.Spec.Replicas)

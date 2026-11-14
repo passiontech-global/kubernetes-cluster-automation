@@ -16,28 +16,12 @@ import (
 
 	"github.com/go-logr/logr"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 )
-
-// circuitJob is one webhook configuration's per-sweep work: the
-// kind-independent fields the breaker evaluates plus the
-// kind-specific patch-and-refresh closure.
-type circuitJob struct {
-	kind  string
-	name  string
-	anno  string
-	views []hookView
-	// cfgObj is the config the patch targets — the SSA ping-pong
-	// gate reads its managedFields (typed configs are listed direct
-	// from the clientset, so the fields are intact).
-	cfgObj metav1.Object
-	patch  func(context.Context, []byte) error
-}
 
 // circuitSweep carries one Breaker.sweep's working state — the armed
 // keep-sets the deferred streak prunes read, the per-config jobs and
@@ -58,7 +42,7 @@ type circuitSweep struct {
 	recoverSeen map[string]bool
 	allowTrips  bool
 	failed      []string
-	jobs        []circuitJob
+	jobs        []guardstate.WebhookConfigView
 }
 
 // loadInputs runs the sweep's census half: the shared
@@ -84,49 +68,10 @@ func (s *circuitSweep) loadInputs() error {
 // list — the kind-specific patch closure refreshes the snapshot's
 // cached list so later duties in the same run see the patched state.
 func (s *circuitSweep) buildJobs() {
-	g := s.g
-	patchMutating := func(cfg *admissionv1.MutatingWebhookConfiguration) func(context.Context, []byte) error {
-		return func(ctx context.Context, payload []byte) error {
-			patched, err := g.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
-				Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
-			if err != nil {
-				return err
-			}
-			s.snap.SetMWC(patched)
-			return nil
-		}
-	}
-	patchValidating := func(cfg *admissionv1.ValidatingWebhookConfiguration) func(context.Context, []byte) error {
-		return func(ctx context.Context, payload []byte) error {
-			patched, err := g.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
-				Patch(ctx, cfg.Name, types.StrategicMergePatchType, payload, metav1.PatchOptions{})
-			if err != nil {
-				return err
-			}
-			s.snap.SetVWC(patched)
-			return nil
-		}
-	}
-	mwcs, vwcs := s.snap.MWC, s.snap.VWC
-	s.jobs = make([]circuitJob, 0, len(mwcs.Items)+len(vwcs.Items))
-	for i := range mwcs.Items {
-		cfg := &mwcs.Items[i]
-		s.jobs = append(s.jobs, circuitJob{
-			kind: guardstate.KindMutating, name: cfg.Name,
-			anno:  cfg.Annotations[guardstate.CircuitBrokenAnno],
-			views: mutHookViews(cfg.Webhooks), patch: patchMutating(cfg),
-			cfgObj: cfg,
-		})
-	}
-	for i := range vwcs.Items {
-		cfg := &vwcs.Items[i]
-		s.jobs = append(s.jobs, circuitJob{
-			kind: guardstate.KindValidating, name: cfg.Name,
-			anno:  cfg.Annotations[guardstate.CircuitBrokenAnno],
-			views: valHookViews(cfg.Webhooks), patch: patchValidating(cfg),
-			cfgObj: cfg,
-		})
-	}
+	s.jobs = nil
+	s.snap.ForEachWebhookConfig(func(cfg guardstate.WebhookConfigView) {
+		s.jobs = append(s.jobs, cfg)
+	})
 }
 
 // runJobs evaluates every config's circuitPatch verdict and lands
@@ -139,10 +84,10 @@ func (s *circuitSweep) buildJobs() {
 func (s *circuitSweep) runJobs(ctx context.Context) {
 	for _, job := range s.jobs {
 		payload, trips, recovered, stillBroken, dropped := s.b.circuitPatch(s.log, s.g.Queue,
-			job.kind, job.name, job.anno, job.views, s.ready, s.now, s.seen, s.recoverSeen,
+			job.Kind, job.Name, job.Anno, job.Hooks, s.ready, s.now, s.seen, s.recoverSeen,
 			s.allowTrips)
 		if payload == nil {
-			circuitMetrics(&s.b.brokenEmitted, job.kind, job.name, nil, nil, stillBroken)
+			circuitMetrics(&s.b.brokenEmitted, job.Kind, job.Name, nil, nil, stillBroken)
 			continue
 		}
 		// SSA ping-pong defense: a Git-owned config (a HelmRelease-
@@ -164,14 +109,14 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 		// payload rides the emergency write since its trips need it
 		// anyway.
 		if !emergencyPatch(payload) &&
-			!heal.FluxPatchGate(job.kind, job.cfgObj,
-				job.kind+"/"+job.name, s.now) {
-			s.b.carryBrokenForward(job.kind, job.name, job.views)
+			!heal.FluxPatchGate(job.Kind, job.Object,
+				job.Kind+"/"+job.Name, s.now) {
+			s.b.carryBrokenForward(job.Kind, job.Name, job.Hooks)
 			s.log.Info("skip heal: Flux Heal-Revert Loop detected — circuit patch deferred",
-				"kind", job.kind, "config", job.name)
+				"kind", job.Kind, "config", job.Name)
 			continue
 		}
-		if err := job.patch(ctx, payload); err != nil {
+		if err := job.Patch(ctx, types.StrategicMergePatchType, payload); err != nil {
 			// The post-patch annotation state is unverifiable —
 			// carry the config's last-emitted tuples forward so
 			// the sweep-end prune does not flap a still-broken
@@ -180,19 +125,19 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 			// longer in the config's snapshot views is not
 			// carried, so the sweep-end prune forgets its series
 			// instead of re-pinning it while patches keep failing.
-			s.b.carryBrokenForward(job.kind, job.name, job.views)
+			s.b.carryBrokenForward(job.Kind, job.Name, job.Hooks)
 			s.log.Error(err, "circuit breaker patch failed",
-				"kind", job.kind, "config", job.name)
-			s.failed = append(s.failed, job.name)
+				"kind", job.Kind, "config", job.Name)
+			s.failed = append(s.failed, job.Name)
 			continue
 		}
 		// The patch landed — the stale-annotation drops are durable,
 		// so their series are released only here (a failed patch
 		// keeps the annotation, the SSOT, listing those names).
 		for _, name := range dropped {
-			metrics.WebhookCircuitBroken.DeleteLabelValues(job.kind, job.name, name)
+			metrics.WebhookCircuitBroken.DeleteLabelValues(job.Kind, job.Name, name)
 		}
-		circuitMetrics(&s.b.brokenEmitted, job.kind, job.name, trips, recovered, stillBroken)
+		circuitMetrics(&s.b.brokenEmitted, job.Kind, job.Name, trips, recovered, stillBroken)
 	}
 }
 

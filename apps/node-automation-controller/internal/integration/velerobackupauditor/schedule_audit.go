@@ -201,14 +201,7 @@ func (a *veleroBackupAuditor) flagBadBackup(ctx context.Context,
 // RFC3339 strings on the unstructured Backup; an unparseable value
 // falls through to the next source rather than reading as zero-age.
 func veleroBackupDoneAt(b *unstructured.Unstructured) time.Time {
-	for _, field := range []string{"completionTimestamp", "startTimestamp"} {
-		if t, ok := kube.NestedString(b.Object, "status", field); ok {
-			if tt, err := time.Parse(time.RFC3339, t); err == nil {
-				return tt
-			}
-		}
-	}
-	return b.GetCreationTimestamp().Time
+	return kube.NestedStatusTimeOrCreated(b, "completionTimestamp", "startTimestamp")
 }
 
 // scheduleRunsWeeklyOrMonthly reports whether the Schedule's cron

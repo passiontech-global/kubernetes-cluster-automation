@@ -15,7 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -106,7 +105,7 @@ func (a *veleroBackupAuditor) auditWedgedTransferKind(ctx context.Context,
 
 	items, err := a.veleroList(ctx, gvr)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// CRD absent — clear any stale wedge series and stop.
 		seen.Prune(gauge.DeleteLabelValues)
 		return nil
@@ -191,7 +190,7 @@ func (a *veleroBackupAuditor) auditDataMovement(ctx context.Context) error {
 		kind := gvr.Resource
 		items, err := a.veleroList(ctx, gvr)
 		switch {
-		case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		case kube.IsCRDAbsent(err):
 			continue // CRD absent — nothing to scan, stale series still prune below
 		case err != nil:
 			// List failed — return WITHOUT pruning: the last-emitted
@@ -233,22 +232,10 @@ func pvbNode(pvb *unstructured.Unstructured) string {
 }
 
 // inFlightSince is the wedge-age clock for an in-flight velero
-// object: status.startTimestamp when parseable, else
-// creationTimestamp — the same convention flagBadBackup uses.
+// object: status.startTimestamp (or status.startedAt) when parseable,
+// else creationTimestamp — the same convention flagBadBackup uses.
 func inFlightSince(u *unstructured.Unstructured) time.Time {
-	since := u.GetCreationTimestamp().Time
-	// startTimestamp is the PVB convention; velero.io/v2alpha1
-	// DataUpload/DataDownload expose startedAt instead.
-	if st, ok := kube.NestedString(u.Object, "status", "startTimestamp"); ok {
-		if t, err := time.Parse(time.RFC3339, st); err == nil {
-			since = t
-		}
-	} else if st, ok := kube.NestedString(u.Object, "status", "startedAt"); ok {
-		if t, err := time.Parse(time.RFC3339, st); err == nil {
-			since = t
-		}
-	}
-	return since
+	return kube.NestedStatusTimeOrCreated(u, "startTimestamp", "startedAt")
 }
 
 // cleanWedgedTransfer decides whether the transfer object's

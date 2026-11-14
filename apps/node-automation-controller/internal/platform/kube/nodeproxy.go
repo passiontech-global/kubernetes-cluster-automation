@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 // kubeletHealthzTimeout bounds one fetch through the proxy — long
@@ -41,4 +42,20 @@ func KubeletHealthz(ctx context.Context, cs kubernetes.Interface, node string) (
 		AbsPath("/api/v1/nodes", node, "proxy", "healthz").
 		Timeout(kubeletHealthzTimeout).
 		DoRaw(ctx)
+}
+
+// CoreRESTClient returns cs.CoreV1().RESTClient() if usable, guarding against
+// nil clientsets and the typed-nil *rest.RESTClient returned by fake.Clientset.
+func CoreRESTClient(cs kubernetes.Interface) (rest.Interface, bool) {
+	if cs == nil {
+		return nil, false
+	}
+	rc := cs.CoreV1().RESTClient()
+	if rc == nil {
+		return nil, false
+	}
+	if restClient, ok := rc.(*rest.RESTClient); ok && restClient == nil {
+		return nil, false
+	}
+	return rc, true
 }

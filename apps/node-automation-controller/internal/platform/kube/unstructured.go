@@ -98,6 +98,30 @@ func NestedStringSlice(obj map[string]any, fields ...string) ([]string, bool) {
 	return v, found && err == nil
 }
 
+// NestedTime reads an RFC3339 timestamp string at path fields.
+func NestedTime(obj map[string]any, fields ...string) (time.Time, bool) {
+	raw, ok := NestedString(obj, fields...)
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// NestedStatusTimeOrCreated returns the first parseable RFC3339 timestamp
+// under status.<field> in statusFields, falling back to u's CreationTimestamp.
+func NestedStatusTimeOrCreated(u *unstructured.Unstructured, statusFields ...string) time.Time {
+	for _, field := range statusFields {
+		if t, ok := NestedTime(u.Object, "status", field); ok {
+			return t
+		}
+	}
+	return u.GetCreationTimestamp().Time
+}
+
 // Condition is one decoded entry of a conditions-style status list —
 // the near-universal {type,status,reason,message,lastTransitionTime}
 // shape cert-manager, Flux, OLM, Gateway-API and most operators

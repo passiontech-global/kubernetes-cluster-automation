@@ -274,7 +274,7 @@ func (s *natsSweep) logScan(ctx context.Context) {
 	for j, key := range scanKeys {
 		pods[j] = s.census.memberByName[key]
 	}
-	scans := kube.ScanPodLogs(ctx, s.p.CS, pods, natsLogScanWorkers,
+	scans := kube.ScanPodLogs(ctx, pods, natsLogScanWorkers,
 		func(ctx context.Context, pod *corev1.Pod) (string, error) {
 			reason := ""
 			hit, err := kube.ReadPodLogTail(ctx, s.p.CS, pod, kube.PodLogOpts{

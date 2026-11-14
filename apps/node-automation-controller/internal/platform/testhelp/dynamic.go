@@ -389,12 +389,8 @@ func DynListKinds() map[schema.GroupVersionResource]string {
 var CRDGVR = schema.GroupVersionResource{
 	Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
 
-// NewDynWithCRDs returns a dynamic fake with the full shared table
-// PLUS the CustomResourceDefinition list kind — the merge shim the
-// webhookguard snapshot and certdriftauditor conversion tests both
-// hand-rolled.
+// NewDynWithCRDs is an alias-style forwarder to NewDynamicClientWithCRDs
+// kept for existing callers.
 func NewDynWithCRDs(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
-	kinds := DynListKinds()
-	kinds[CRDGVR] = "CustomResourceDefinitionList"
-	return NewFakeDyn(kinds, objs...)
+	return NewDynamicClientWithCRDs(objs...)
 }

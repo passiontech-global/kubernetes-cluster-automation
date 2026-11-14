@@ -12,8 +12,6 @@ import (
 	"strings"
 	"time"
 
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -97,12 +95,7 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 		if gone {
 			continue // already gone — nothing to reap
 		}
-		done := job.Status.Succeeded >= 1 || jobFailed(job)
-		for _, c := range job.Status.Conditions {
-			if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
-				done = true
-			}
-		}
+		done := job.Status.Succeeded >= 1 || kube.JobTerminal(job)
 		if !done {
 			log.Info("skip: immutable Job still active — deleting it mid-run would orphan its pods",
 				"kustomization", key, "job", jobNS+"/"+job.Name)

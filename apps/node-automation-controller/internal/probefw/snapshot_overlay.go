@@ -8,22 +8,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// podSliceSame reports whether two pod slices share one backing
-// array — the census-identity half of the podView cache key. The
-// memoized census hands back the same slice header every read, so
-// first-element pointer equality is exact; an InvalidatePods
-// refetch allocates a fresh array (the old one stays referenced by
-// the cache, so its address cannot be recycled into a false hit).
-func podSliceSame(a, b []corev1.Pod) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	if len(a) == 0 {
-		return true
-	}
-	return &a[0] == &b[0]
-}
-
 // podCensusView returns src minus this sweep's pod tombstones,
 // memoized per (census identity, podTombstoneGen): an unchanged
 // generation means the filtered slice computed earlier is still
@@ -37,7 +21,7 @@ func (s *sweepSnapshot) podCensusView(ctx context.Context,
 	s.podViewMu.Lock()
 	defer s.podViewMu.Unlock()
 	if s.podFiltered != nil && s.podViewGen == gen &&
-		podSliceSame(s.podViewSrc, src) {
+		elemSliceSame(s.podViewSrc, src) {
 		return s.podFiltered
 	}
 	out := kube.FilterPodTombstones(ctx, src)
@@ -58,7 +42,7 @@ func (s *sweepSnapshot) podNodeView(ctx context.Context,
 	gen := kube.PodTombstoneGen(ctx)
 	s.podViewMu.Lock()
 	if s.podNodesView != nil && s.podNodesViewGen == gen &&
-		podSliceSame(s.podNodesViewSrc, idxSrc) {
+		elemSliceSame(s.podNodesViewSrc, idxSrc) {
 		out := s.podNodesView
 		s.podViewMu.Unlock()
 		return out
@@ -177,6 +161,9 @@ func (d *Deps) InvalidateLeases(ctx context.Context) {
 // call already sees fresh data).
 func (d *Deps) InvalidateSweep(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		for _, m := range s.memos {
+			m.reset()
+		}
 		for _, reset := range s.resets {
 			reset()
 		}
@@ -198,26 +185,9 @@ func (d *Deps) InvalidateSweep(ctx context.Context) {
 // the whole snapshot when verifySnapshots is off (verifyHash is
 // only populated under the test flag, so production pays nothing).
 func (s *sweepSnapshot) verifyUnmutated() {
-	// Typed censuses + derived joins — one verify per memo.
-	s.pods.verify()
-	s.nodes.verify()
-	s.slices.verify()
-	s.services.verify()
-	s.namespaces.verify()
-	s.events.verify()
-	s.pvcs.verify()
-	s.statefulSets.verify()
-	s.deployments.verify()
-	s.daemonSets.verify()
-	s.leases.verify()
-	s.replicaSets.verify()
-	s.cronJobs.verify()
-	s.jobs.verify()
-	s.pdbs.verify()
-	s.nodeZones.verify()
-	s.podNodes.verify()
-	s.leaseIndex.verify()
-	s.serviceIndex.verify()
+	for _, m := range s.memos {
+		m.verify()
+	}
 	// The unbounded-kind dynamic reads and the deduped Prometheus
 	// queries are memos too — same in-place-mutation bug class.
 	s.muUnstructs.Lock()

@@ -12,8 +12,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -121,7 +119,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 	// raw error kept for the NoMatch/NotFound interpretation below).
 	ceps, err := p.AllUnstructured(ctx, kube.GVRCiliumEndpoint)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// No Cilium on this cluster — still reconcile the ledgers:
 		// a tuple/streak held from when Cilium existed is resolved,
 		// and returning Pass early would leak the series pinned at

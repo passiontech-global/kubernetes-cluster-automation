@@ -9,7 +9,6 @@ import (
 
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -108,13 +107,7 @@ func jobStillActive(j *batchv1.Job) bool {
 	if j.DeletionTimestamp != nil {
 		return false
 	}
-	for _, c := range j.Status.Conditions {
-		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) &&
-			c.Status == corev1.ConditionTrue {
-			return false
-		}
-	}
-	return true
+	return !kube.JobTerminal(j)
 }
 
 // buildJobDedupeIndex lists Jobs cluster-wide once per sweep and

@@ -32,6 +32,10 @@ func TestParseMetricValue(t *testing.T) {
 		{"ha_connections abc", "ha_connections", 0, false},
 		{"ha_connections{l=\"v\"", "ha_connections", 0, false},
 		{"ha_connections{l=\"v\"}", "ha_connections", 0, false},
+		// Tab separators, '}' inside quoted label value, and OpenMetrics exemplars.
+		{"ha_connections\t4.5\t1700000000", "ha_connections", 4.5, true},
+		{`ha_connections{msg="bad\"}"} 7	1700000000`, "ha_connections", 7, true},
+		{`ha_connections{pod="a"} 2.5 # {trace_id="abc"} 1.0`, "ha_connections", 2.5, true},
 	}
 	for _, tc := range cases {
 		v, ok := ParseMetricValue(tc.line, tc.name)
@@ -128,6 +132,19 @@ func TestFetchPodMetrics(t *testing.T) {
 			time.Second, 5)
 		if err != nil || string(body) != "12345" {
 			t.Fatalf("FetchPodMetrics = (%q,%v), want exact-cap body", body, err)
+		}
+	})
+	t.Run("zero timeout uses parent ctx and non-positive maxBytes fails fast", func(t *testing.T) {
+		client := &http.Client{Transport: &testhelp.StubTransport{
+			Fn: func(r *http.Request) (*http.Response, error) {
+				return testhelp.ProbeResponse(200, "m 1\n"), nil
+			}}}
+		body, err := FetchPodMetrics(ctx, client, "10.1.2.3", 9180, 0, 128)
+		if err != nil || string(body) != "m 1\n" {
+			t.Fatalf("FetchPodMetrics(timeout=0) = (%q,%v), want (m 1\\n,nil)", body, err)
+		}
+		if _, err := FetchPodMetrics(ctx, client, "10.1.2.3", 9180, time.Second, 0); err == nil {
+			t.Fatal("want error for non-positive maxBytes")
 		}
 	})
 }

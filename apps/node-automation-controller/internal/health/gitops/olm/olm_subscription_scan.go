@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -61,7 +59,7 @@ func (p *olmHealthCheck) collectOLMSignatures(ctx context.Context,
 	}
 	csvs, err := p.AllUnstructured(ctx, olmCSVGVR)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		// OLM not installed on this cluster — nothing to audit.
 	case err != nil:
 		return nil, fmt.Errorf("list clusterserviceversions: %w", err)
@@ -74,18 +72,16 @@ func (p *olmHealthCheck) collectOLMSignatures(ctx context.Context,
 				addLive(olmKindCSV, csv.GetNamespace(), csv.GetName(),
 					olmReasonCSVStuck, csv)
 			}
-			if ts, found := kube.NestedString(
-				csv.Object, "status", "certsRotateAt"); found && ts != "" {
-				if t, err := time.Parse(time.RFC3339, ts); err == nil && now.After(t) {
-					addLive(olmKindCSV, csv.GetNamespace(), csv.GetName(),
-						olmReasonCertOverdue, csv)
-				}
+			if t, ok := kube.NestedTime(
+				csv.Object, "status", "certsRotateAt"); ok && now.After(t) {
+				addLive(olmKindCSV, csv.GetNamespace(), csv.GetName(),
+					olmReasonCertOverdue, csv)
 			}
 		}
 	}
 	subs, err := p.AllUnstructured(ctx, olmSubGVR)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 	case err != nil:
 		return nil, fmt.Errorf("list subscriptions: %w", err)
 	default:

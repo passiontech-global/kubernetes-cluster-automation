@@ -14,7 +14,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -259,7 +258,7 @@ func (s *deadNodeSweeper) remediationItems(ctx context.Context,
 				metav1.ListOptions{Limit: kube.DefaultListPageSize},
 				kube.DynamicPage(s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll)))
 			if err != nil {
-				if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+				if kube.IsCRDAbsent(err) {
 					continue // CRD not installed on this cluster
 				}
 				return nil, fmt.Errorf("list %s: %w", gvr.Resource, err)

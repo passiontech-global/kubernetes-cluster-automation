@@ -10,6 +10,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -147,4 +148,19 @@ func LeaseHolderPodCandidates(lease *coordinationv1.Lease) []string {
 		return []string{holder[:i], holder}
 	}
 	return []string{holder}
+}
+
+// JobHasCondition reports whether job j carries condType with status True.
+func JobHasCondition(j *batchv1.Job, condType batchv1.JobConditionType) bool {
+	for _, c := range j.Status.Conditions {
+		if c.Type == condType && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// JobTerminal reports whether job j has reached JobComplete=True or JobFailed=True.
+func JobTerminal(j *batchv1.Job) bool {
+	return JobHasCondition(j, batchv1.JobComplete) || JobHasCondition(j, batchv1.JobFailed)
 }

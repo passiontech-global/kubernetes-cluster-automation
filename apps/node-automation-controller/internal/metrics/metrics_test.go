@@ -110,6 +110,7 @@ func TestForgetAPIBackend(t *testing.T) {
 	const ip = "10.8.8.8"
 
 	ObserveAPIBackend(ip, 42, true)
+	ObserveAPIBackendJWKSSkew(ip, true)
 	ForgetAPIBackend(ip)
 
 	// DeleteLabelValues reports whether a series existed — a second
@@ -119,6 +120,9 @@ func TestForgetAPIBackend(t *testing.T) {
 	}
 	if apiBackendQuarantined.DeleteLabelValues(ip) {
 		t.Fatal("quarantined series still present after ForgetAPIBackend")
+	}
+	if apiBackendJWKSKIDSkew.DeleteLabelValues(ip) {
+		t.Fatal("jwksKidSkew series still present after ForgetAPIBackend")
 	}
 }
 

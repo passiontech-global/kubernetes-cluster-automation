@@ -20,7 +20,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/rest"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	hosthttpx "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
@@ -88,14 +87,8 @@ func (r *zombieSidecarReaper) proxyShutdown(ctx context.Context, p *corev1.Pod, 
 	if !ok {
 		target = zombieSidecarShutdownTargets[kube.LinkerdProxyContainer]
 	}
-	rc := r.cs.CoreV1().RESTClient()
-	// The fake clientset returns a typed-nil *rest.RESTClient —
-	// guard before dereferencing so unit tests degrade to "proxy
-	// unreachable" instead of panicking.
-	if rc == nil {
-		return errors.New("pods/proxy REST client unavailable")
-	}
-	if restClient, ok := rc.(*rest.RESTClient); ok && restClient == nil {
+	rc, ok := kube.CoreRESTClient(r.cs)
+	if !ok {
 		return errors.New("pods/proxy REST client unavailable")
 	}
 	return rc.Post().

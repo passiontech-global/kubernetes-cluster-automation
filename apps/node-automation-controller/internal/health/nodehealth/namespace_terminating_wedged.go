@@ -428,13 +428,8 @@ func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 	// finalizers are just as dead.
 	ns := obj.GetNamespace()
 	var rs metav1.Object
-	if list, lerr := p.AllReplicaSets(ctx); lerr == nil {
-		for i := range list {
-			if list[i].Namespace == ns && list[i].Name == ref.Name {
-				rs = &list[i]
-				break
-			}
-		}
+	if hit, lerr := p.ReplicaSet(ctx, ns, ref.Name); lerr == nil && hit != nil {
+		rs = hit
 	}
 	if rs == nil {
 		fetched, err := p.CS.AppsV1().ReplicaSets(ns).Get(ctx, ref.Name, metav1.GetOptions{})

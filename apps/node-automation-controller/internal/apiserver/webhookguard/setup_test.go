@@ -16,9 +16,8 @@ import (
 // crontab-equivalent interval — the pairing is what keeps
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Name: "admission-webhook-guard", Mgr: m, CS: fake.NewSimpleClientset()}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	testutil.ExpectPeriodic(t, m, "admission-webhook-guard", 5*time.Minute)
+	testutil.PeriodicContract(t, Setup, shared.Deps{
+		Name: "admission-webhook-guard",
+		CS:   fake.NewSimpleClientset(),
+	}, "admission-webhook-guard", 5*time.Minute)
 }

@@ -16,8 +16,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -268,7 +266,7 @@ func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		// absent on this cluster" interpretation.
 		items, lerr := p.AllUnstructured(ctx, g.gvr)
 		switch {
-		case apierrors.IsNotFound(lerr) || meta.IsNoMatchError(lerr):
+		case kube.IsCRDAbsent(lerr):
 			continue
 		case lerr != nil:
 			return probefw.Result{Infra: fmt.Errorf("list %s: %w", g.gvr.Resource, lerr)}

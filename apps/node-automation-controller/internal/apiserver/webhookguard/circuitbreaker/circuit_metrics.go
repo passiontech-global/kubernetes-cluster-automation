@@ -13,6 +13,7 @@ package circuitbreaker
 import (
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
@@ -54,10 +55,10 @@ func circuitMetrics(emitted *state.GaugeLedger[string], kind, cfgName string,
 // config. A dead tuple is simply not re-emitted, so the sweep-end
 // prune forgets its series via DeleteLabelValues and drops the
 // ledger entry.
-func (b *Breaker) carryBrokenForward(kind, cfgName string, views []hookView) {
+func (b *Breaker) carryBrokenForward(kind, cfgName string, views []guardstate.WebhookView) {
 	live := make(map[string]bool, len(views))
 	for _, v := range views {
-		live[v.name] = true
+		live[v.Name] = true
 	}
 	prefix := kind + "/" + cfgName + "/"
 	for k, lv := range b.brokenEmitted.Last() {

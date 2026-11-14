@@ -4,6 +4,7 @@
 package kube
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -108,5 +109,23 @@ func TestResolveDefaultContainer(t *testing.T) {
 	// No containers at all: "" keeps the apiserver's own verdict.
 	if got := ResolveDefaultContainer(&corev1.Pod{}, ""); got != "" {
 		t.Errorf("empty pod = %q, want \"\"", got)
+	}
+}
+
+func TestReadPodLogTextZeroBoundsAndScanWorkers(t *testing.T) {
+	cs := fake.NewSimpleClientset(logTailPod())
+	cs.PrependReactor("get", "pods", testhelp.ProbeLogReactor("line1\nline2", nil))
+	// Zero Timeout and MaxBytes must not cancel immediately or truncate to 0 bytes.
+	got, err := ReadPodLogText(t.Context(), cs, logTailPod(), PodLogOpts{})
+	if err != nil || got != "line1\nline2" {
+		t.Fatalf("ReadPodLogText zero opts = (%q,%v), want (line1\\nline2,nil)", got, err)
+	}
+	// Non-positive workers must clamp to 1 instead of failing errgroup.SetLimit.
+	res := ScanPodLogs(t.Context(), []*corev1.Pod{logTailPod()}, 0,
+		func(_ context.Context, p *corev1.Pod) (string, error) {
+			return p.Name, nil
+		})
+	if len(res) != 1 || res[0].Err != nil || res[0].Value != "p1" {
+		t.Fatalf("ScanPodLogs(workers=0) = %+v, want [{Value:p1 Err:<nil>}]", res)
 	}
 }

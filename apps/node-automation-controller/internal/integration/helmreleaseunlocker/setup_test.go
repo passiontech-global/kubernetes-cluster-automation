@@ -17,10 +17,9 @@ import (
 // metrics/alerts compatible with the old hook names.
 func TestSetupRegistersPeriodic(t *testing.T) {
 	t.Setenv("HELM_STALL_UNWEDGE_ENABLED", "true")
-	m := testutil.NewStubManager()
-	if err := Setup(shared.Deps{Name: "helmrelease-unlocker", Mgr: m, CS: fake.NewSimpleClientset(),
-		Dyn: testutil.StubDyn()}); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	testutil.ExpectPeriodic(t, m, "helmrelease-unlocker", 10*time.Minute)
+	testutil.PeriodicContract(t, Setup, shared.Deps{
+		Name: "helmrelease-unlocker",
+		CS:   fake.NewSimpleClientset(),
+		Dyn:  testutil.StubDyn(),
+	}, "helmrelease-unlocker", 10*time.Minute)
 }

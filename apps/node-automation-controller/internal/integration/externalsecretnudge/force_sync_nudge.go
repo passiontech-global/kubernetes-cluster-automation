@@ -20,8 +20,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -64,7 +62,7 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 	}()
 	list, esGVR, err := n.listES(ctx)
 	if err != nil {
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		if kube.IsCRDAbsent(err) {
 			// CRD removal is a verified-empty census — prune every
 			// emitted empty-key series so nothing flagged while ESO
 			// was installed lingers after the CRDs go away. Begin

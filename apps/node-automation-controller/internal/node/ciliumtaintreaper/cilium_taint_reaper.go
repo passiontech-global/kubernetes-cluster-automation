@@ -29,10 +29,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -83,19 +81,9 @@ var ciliumPodSweepRequests handler.MapFunc = func(_ context.Context, o client.Ob
 // ciliumTaintChanges is the Node watch predicate — the bash jqFilter:
 // fire only when THIS taint's entries change, otherwise every kubelet
 // heartbeat (~20s/node) would enqueue a full-cluster sweep.
-var ciliumTaintChanges = predicate.Funcs{
-	CreateFunc:  func(event.CreateEvent) bool { return true },
-	DeleteFunc:  func(event.DeleteEvent) bool { return true },
-	GenericFunc: func(event.GenericEvent) bool { return true },
-	UpdateFunc: func(e event.UpdateEvent) bool {
-		oldN, ok1 := e.ObjectOld.(*corev1.Node)
-		newN, ok2 := e.ObjectNew.(*corev1.Node)
-		if !ok1 || !ok2 || oldN == nil || newN == nil {
-			return true
-		}
-		return !equality.Semantic.DeepEqual(ciliumStaleTaints(oldN), ciliumStaleTaints(newN))
-	},
-}
+var ciliumTaintChanges = shared.NodeUpdatePredicate(true, func(oldN, newN *corev1.Node) bool {
+	return !equality.Semantic.DeepEqual(ciliumStaleTaints(oldN), ciliumStaleTaints(newN))
+})
 
 func Setup(d shared.Deps) error {
 	mgr, cs := d.Mgr, d.CS

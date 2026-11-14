@@ -12,11 +12,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -192,5 +195,25 @@ func FixedSweepRequest(key string) []reconcile.Request {
 func SweepRequests(key string) handler.MapFunc {
 	return func(context.Context, client.Object) []reconcile.Request {
 		return FixedSweepRequest(key)
+	}
+}
+
+// NodeUpdatePredicate returns a Node watch predicate that always fires on
+// Create, Delete, and Generic events, and on Update events only when changed
+// returns true for the old/new Node pair. When an Update event carries missing
+// or non-Node objects, it returns fallbackOnMissing.
+func NodeUpdatePredicate(fallbackOnMissing bool, changed func(oldNode, newNode *corev1.Node) bool) predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldN, ok1 := e.ObjectOld.(*corev1.Node)
+			newN, ok2 := e.ObjectNew.(*corev1.Node)
+			if !ok1 || !ok2 || oldN == nil || newN == nil {
+				return fallbackOnMissing
+			}
+			return changed(oldN, newN)
+		},
 	}
 }

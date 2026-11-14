@@ -6,8 +6,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -38,7 +36,7 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 
 	plans, err := p.AllUnstructured(ctx, olmInstallPlanGVR)
 	switch {
-	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+	case kube.IsCRDAbsent(err):
 		return
 	case err != nil:
 		metrics.IncError(p.Name)

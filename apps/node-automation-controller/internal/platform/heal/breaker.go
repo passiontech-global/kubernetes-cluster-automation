@@ -242,23 +242,47 @@ func (b *TargetBreaker) RecordTargetHealthy(module, targetKey string) {
 // call; atomic keeps the race detector honest.
 var defaultTargetBreaker atomic.Pointer[TargetBreaker]
 
+// defaultBreakerHooksMu serializes updates to defaultTargetOpenHook,
+// defaultTargetForgetHook, and defaultTargetBreaker so hook registration
+// and ConfigureTargetBreaker can run in any boot order without dropping hooks.
+var (
+	defaultBreakerHooksMu   sync.Mutex
+	defaultTargetOpenHook   func(module, target, reason string)
+	defaultTargetForgetHook func(module, target string)
+)
+
 // ConfigureTargetBreaker installs the process-global per-target
 // breaker: limit grants per (module,targetKey) per window. limit <= 0
-// or window <= 0 clears the breaker (the gate compiles away).
+// or window <= 0 clears the breaker and any registered global hooks
+// (the gate compiles away). Reconfiguring with positive limit/window
+// preserves any already-registered open/forget hooks.
 func ConfigureTargetBreaker(limit int, window time.Duration) {
+	defaultBreakerHooksMu.Lock()
+	defer defaultBreakerHooksMu.Unlock()
 	if limit <= 0 || window <= 0 {
+		defaultTargetOpenHook = nil
+		defaultTargetForgetHook = nil
 		defaultTargetBreaker.Store(nil)
 		return
 	}
-	defaultTargetBreaker.Store(NewTargetBreaker(limit, window))
+	b := NewTargetBreaker(limit, window)
+	if defaultTargetOpenHook != nil {
+		b.SetOpenHook(defaultTargetOpenHook)
+	}
+	if defaultTargetForgetHook != nil {
+		b.SetForgetHook(defaultTargetForgetHook)
+	}
+	defaultTargetBreaker.Store(b)
 }
 
 // SetTargetCircuitOpenHook registers fn to run once per breaker open
-// transition (see TargetBreaker.SetOpenHook). No-op while no breaker
-// is configured — boot order is ConfigureTargetBreaker first, and
-// reconfiguring drops any previously wired hook with the old
-// instance.
+// transition (see TargetBreaker.SetOpenHook). Safe in any boot order:
+// attaches to the active breaker if configured and is preserved across
+// positive ConfigureTargetBreaker reconfigurations.
 func SetTargetCircuitOpenHook(fn func(module, target, reason string)) {
+	defaultBreakerHooksMu.Lock()
+	defer defaultBreakerHooksMu.Unlock()
+	defaultTargetOpenHook = fn
 	if b := defaultTargetBreaker.Load(); b != nil {
 		b.SetOpenHook(fn)
 	}
@@ -267,10 +291,13 @@ func SetTargetCircuitOpenHook(fn func(module, target, reason string)) {
 // SetTargetCircuitForgetHook registers fn to run once per breaker
 // forget (see TargetBreaker.SetForgetHook) — the prune bridge
 // cmd/manager wires so HealTargetCircuitBrokenTotal series die with
-// the target's breaker state. No-op while no breaker is configured —
-// boot order is ConfigureTargetBreaker first, and reconfiguring drops
-// any previously wired hook with the old instance.
+// the target's breaker state. Safe in any boot order: attaches to
+// the active breaker if configured and is preserved across positive
+// ConfigureTargetBreaker reconfigurations.
 func SetTargetCircuitForgetHook(fn func(module, target string)) {
+	defaultBreakerHooksMu.Lock()
+	defer defaultBreakerHooksMu.Unlock()
+	defaultTargetForgetHook = fn
 	if b := defaultTargetBreaker.Load(); b != nil {
 		b.SetForgetHook(fn)
 	}
