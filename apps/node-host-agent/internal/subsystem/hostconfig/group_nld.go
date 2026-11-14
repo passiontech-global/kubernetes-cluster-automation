@@ -246,11 +246,21 @@ const hostPortsGuardNodePortRange = "30000-32767"
 // pins internalTrafficPolicy: Local — an in-cluster consumer can
 // therefore only ever reach its OWN node's endpoint, which arrives
 // on a pod-veth iif (never neb1) and would hit the drop below.
-// Pod→:4244 on every REMOTE node already traverses neb1 and is
-// accepted, so scoping this exemption to the pod-veth wildcards
-// opens nothing the overlay did not already expose — while every
-// other internal port stays closed to tenant pods.
-var hostPortsGuardPodExemptPorts = []int{4244}
+// :10250 is the kubelet API — authenticated (anonymous gets 401 and
+// kubelet authorization denies non-node subjects), but k0s clusters
+// reach kubelets THROUGH konnectivity-agent pods: when the
+// apiserver's dial is handled by a konnectivity-agent colocated
+// with the target kubelet, the SYN hairpins
+// pod→own-node-public-IP:10250 onto a pod-veth iif and hit the drop
+// (incident 2026-11-14 cicd: the guard rollout broke
+// apiserver→kubelet on vmi2940967 — kubectl logs/exec/stats/proxy
+// and the metrics-server all died while the node stayed Ready
+// because kubelet→apiserver outbound still worked). Pod→:10250 on
+// every REMOTE node already traverses neb1 and is accepted, so
+// scoping these exemptions to the pod-veth wildcards opens nothing
+// the overlay did not already expose — while every other internal
+// port stays closed to tenant pods.
+var hostPortsGuardPodExemptPorts = []int{4244, 10250}
 
 // hostPortsGuardPodIFaces are the pod-veth interface wildcards the
 // pre-roadmap-1.2 blanket accepts used, reused here ONLY in

@@ -6,6 +6,7 @@
 package hostconfig
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -85,28 +86,41 @@ func TestPortsGuardPortCoverage(t *testing.T) {
 	}
 }
 
-// TestPortsGuardHubblePeerExempt — the hubble-peer Service pins
-// internalTrafficPolicy: Local, so its consumers can only reach the
-// local node's :4244 over a pod-veth iif. The guard must exempt
-// exactly that port on the pod-veth wildcards (remote :4244 already
-// flows over neb1) while every other internal port stays closed.
-func TestPortsGuardHubblePeerExempt(t *testing.T) {
+// TestPortsGuardPodExemptPorts — two internal ports must still
+// answer pod-originated LOCAL-delivery traffic over the pod-veth
+// wildcards: :4244 (the hubble-peer Service pins
+// internalTrafficPolicy: Local) and :10250 (the kubelet API —
+// konnectivity-agent pods carry the apiserver→kubelet dial and
+// hairpin it to the SAME node's public IP, landing on a pod-veth
+// iif; incident 2026-11-14 cicd). Remote delivery already traverses
+// neb1, so the exemptions open nothing the overlay did not expose —
+// while every other internal port stays closed to tenant pods.
+func TestPortsGuardPodExemptPorts(t *testing.T) {
 	_, portsNFT := convergeNLDWithVars(t, "")
-	for _, iface := range []string{`iifname "cilium*"`, `iifname "lxc*"`, `iifname "cali*"`} {
-		if !strings.Contains(portsNFT, iface+" tcp dport 4244 accept") {
-			t.Fatalf("ports guard missing pod-exempt %s tcp dport 4244 accept:\n%s", iface, portsNFT)
+	for _, p := range []int{4244, 10250} {
+		for _, iface := range []string{`iifname "cilium*"`, `iifname "lxc*"`, `iifname "cali*"`} {
+			if want := fmt.Sprintf("%s tcp dport %d accept", iface, p); !strings.Contains(portsNFT, want) {
+				t.Fatalf("ports guard missing pod-exempt %q:\n%s", want, portsNFT)
+			}
 		}
 	}
-	// No other port may ride the pod-veth path — e.g. kubelet and the
-	// exporters must still drop for tenant pods.
-	for _, bad := range []string{"tcp dport 9100 accept", "tcp dport 10250 accept", "tcp dport 9962 accept"} {
+	// No other port may ride the pod-veth path — the exporters and
+	// the kubelet read-only/healthz listeners must still drop for
+	// tenant pods.
+	for _, bad := range []string{
+		"tcp dport 9100 accept", "tcp dport 9962 accept",
+		"tcp dport 10248 accept", "tcp dport 10256 accept",
+	} {
 		if strings.Contains(portsNFT, bad) {
 			t.Fatalf("ports guard exempts %q on a pod iface — guard hole:\n%s", bad, portsNFT)
 		}
 	}
-	// The exemption must sit BEFORE the drop rule to take effect.
-	if strings.Index(portsNFT, "tcp dport 4244 accept") > strings.Index(portsNFT, "tcp dport {") {
-		t.Fatalf("ports guard exemption renders after the drop rule:\n%s", portsNFT)
+	// The exemptions must sit BEFORE the drop rule to take effect.
+	for _, p := range []int{4244, 10250} {
+		if strings.Index(portsNFT, fmt.Sprintf("tcp dport %d accept", p)) >
+			strings.Index(portsNFT, "tcp dport {") {
+			t.Fatalf("ports guard exemption for :%d renders after the drop rule:\n%s", p, portsNFT)
+		}
 	}
 }
 
