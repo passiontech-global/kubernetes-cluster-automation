@@ -7,13 +7,12 @@ package apiprober
 import (
 	"context"
 	"os"
-	"time"
 )
 
 // Cycle runs one detection+guard round — the shell script body.
 func (p *Prober) Cycle(ctx context.Context) {
-	start := time.Now()
-	defer func() { p.duration.Set(time.Since(start).Seconds()) }()
+	start := p.cfg.Clock.Now()
+	defer func() { p.duration.Set(p.cfg.Clock.Now().Sub(start).Seconds()) }()
 
 	// Re-read the guard conf every cycle — a conf written or edited
 	// by hostconfig mid-run applies NOW, not after a restart.

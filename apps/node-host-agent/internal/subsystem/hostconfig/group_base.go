@@ -16,6 +16,22 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 )
 
+func (c *cyc) convergeLimitsDropIn(unit, varName, label string) {
+	_ = c.r.ensureDir(fmt.Sprintf("/etc/systemd/system/%s.service.d", unit), 0o755)
+	if nofile := c.v(varName); nofile != "" && c.cfgLimitNOFILE(varName, nofile) {
+		if ch, _ := c.r.writeManaged(
+			fmt.Sprintf("/etc/systemd/system/%s.service.d/10-limits.conf", unit),
+			[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for %s
+[Service]
+LimitNOFILE=%s
+LimitNPROC=infinity
+TasksMax=infinity
+`, label, nofile)), 0o644); ch {
+			c.r.daemonReload(c.ctx)
+		}
+	}
+}
+
 func (c *cyc) groupBase() {
 	r := c.r
 	ctx := c.ctx
@@ -124,44 +140,14 @@ ProcessSizeMax=0
 
 	// T2 k0sworker limits drop-in.
 	if c.worker() {
-		_ = c.r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)
-		// The value is a systemd assignment rendered verbatim — a
-		// newline/metachar var would inject a SECOND directive
-		// systemd applies; an unparsable one is dropped at
-		// daemon-reload and the unit silently keeps stock fd limits.
-		// Refuse both: skip the write, count the error. An empty
-		// var is absent, not refused — gating it here (like the
-		// sysctl pairs above) keeps it from erroring every cycle.
-		if nofile := c.v("k0sworker_limit_nofile"); nofile != "" && c.cfgLimitNOFILE("k0sworker_limit_nofile", nofile) {
-			if ch, _ := r.writeManaged("/etc/systemd/system/k0sworker.service.d/10-limits.conf",
-				[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s worker
-[Service]
-LimitNOFILE=%s
-LimitNPROC=infinity
-TasksMax=infinity
-`, nofile)), 0o644); ch {
-				r.daemonReload(ctx)
-			}
-		}
+		c.convergeLimitsDropIn("k0sworker", "k0sworker_limit_nofile", "k0s worker")
 	}
 
 	// k0scontroller-limits k0scontroller limits drop-in — same fd/task headroom as
 	// the worker unit so systemd never caps the controller's thread
 	// count below kernel pid_max during reconcile bursts.
 	if c.controller() {
-		_ = c.r.ensureDir("/etc/systemd/system/k0scontroller.service.d", 0o755)
-		// Same verbatim-assignment gate as the worker drop-in above.
-		if nofile := c.v("k0scontroller_limit_nofile"); nofile != "" && c.cfgLimitNOFILE("k0scontroller_limit_nofile", nofile) {
-			if ch, _ := r.writeManaged("/etc/systemd/system/k0scontroller.service.d/10-limits.conf",
-				[]byte(fmt.Sprintf(`# Managed by node-config-agent - explicit fd/task limits for k0s controller
-[Service]
-LimitNOFILE=%s
-LimitNPROC=infinity
-TasksMax=infinity
-`, nofile)), 0o644); ch {
-				r.daemonReload(ctx)
-			}
-		}
+		c.convergeLimitsDropIn("k0scontroller", "k0scontroller_limit_nofile", "k0s controller")
 		// gomemlimit-sum: clamp GOMEMLIMIT so the per-child soft cap can
 		// never leave the unit's sibling processes without room under
 		// MemoryMax (the multi-child cgroup OOMKill shape).

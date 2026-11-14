@@ -7,8 +7,6 @@ package runtime
 import (
 	"context"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -42,16 +40,9 @@ func (c *DevShmCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 
 // measureDevShm executes one dev-shm round.
 func (c *DevShmCheck) measureDevShm() {
-	var st unix.Statfs_t
-	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.Disk.HostShmDir, &st); err != nil ||
-		st.Blocks == 0 {
+	used, ok := c.d.DiskMaxUsageRatio(c.d.Cfg.Disk.HostShmDir)
+	if !ok {
 		return // unmeasurable — keep the last ratio, never fake a 0
-	}
-	used := 1.0 - float64(st.Bavail)/float64(st.Blocks)
-	if st.Files > 0 && st.Ffree <= st.Files {
-		if iu := 1.0 - float64(st.Ffree)/float64(st.Files); iu > used {
-			used = iu
-		}
 	}
 	c.d.DevShmUsedRatio = used
 }

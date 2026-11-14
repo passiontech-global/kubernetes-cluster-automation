@@ -276,13 +276,8 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckDiskBloat) {
 		return
 	}
-	var st unix.Statfs_t
-	used := -1.0
-	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.K0sDataDir, &st); err == nil &&
-		st.Blocks > 0 && st.Bavail <= st.Blocks {
-		used = float64(st.Blocks-st.Bavail) / float64(st.Blocks)
-	}
-	if used < 0 {
+	used, ok := c.d.DiskUsageRatio(c.d.Cfg.K0sDataDir)
+	if !ok {
 		// statfs failed or returned garbage — inconclusive; keep
 		// the latch like a failed probe.
 		c.d.CycleResult(wdeps.CheckDiskBloat, "abort")
@@ -341,18 +336,18 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
+	// L1↔L3 hold: check maintenance BEFORE spending the cooldown
+	// budget so a drain does not burn last-disk-bloat-evict.
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog("cleanup: disk-bloat evict held — " +
+			"cluster maintenance in progress")
+		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
+		return
+	}
 	if !c.d.State.RateTrySpend("last-disk-bloat-evict", diskBloatEvictInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: disk-bloat victim %s/%s bytes=%d - in evict cooldown (<15m), skip",
 			victim.Namespace, victim.Name, victimBytes))
-		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
-		return
-	}
-	// L1↔L3 hold: a policy eviction during cluster maintenance is
-	// exactly the churn a drain has to un-wedge — skip this cycle.
-	if c.d.HoldLocalAction(ctx) {
-		c.d.State.AppendLog("cleanup: disk-bloat evict held — " +
-			"cluster maintenance in progress")
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}

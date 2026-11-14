@@ -43,11 +43,11 @@ subsystem has no env gate.
 
 ### `cmd/agent`
 
-- `NODE_HOST_AGENT_HOST_ROOT` — `main.go:152`
+- `NODE_HOST_AGENT_HOST_ROOT` — `main.go:156`
 - `NODE_HOST_AGENT_HUBSYNC_LOCAL_BINARY` — `localbin.go:26`
-- `NODE_HOST_AGENT_PPROF_BIND_ADDRESS` — `main.go:277`
+- `NODE_HOST_AGENT_PPROF_BIND_ADDRESS` — `main.go:280`
 - `NODE_HOST_AGENT_REQUEST_TIMEOUT` — `main.go:87`
-- `NODE_HOST_AGENT_STANDALONE` — `main.go:143`
+- `NODE_HOST_AGENT_STANDALONE` — `main.go:147`
 - `NODE_HOST_AGENT_TEXTFILE_INTERVAL` — `wiring.go:262`
 
 ### `internal/ops/nebulasign`
@@ -72,7 +72,7 @@ subsystem has no env gate.
 
 ### `internal/platform/promfile`
 
-- `NODE_HOST_AGENT_TEXTFILE_DIR` — `promfile.go:55`
+- `NODE_HOST_AGENT_TEXTFILE_DIR` — `promfile.go:56`
 
 ### `internal/subsystem/apiprober`
 
@@ -90,7 +90,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_APIPROBER_RECOVER_CYCLES` — `config_env.go:116`
 - `NODE_HOST_AGENT_APIPROBER_SOCKET` — `config_env.go:57`
 - `NODE_HOST_AGENT_APIPROBER_TOKEN_FILE` — `config_env.go:71`
-- `NODE_HOST_AGENT_API_GUARD_CONF` — `apiprober_refresh.go:144`
+- `NODE_HOST_AGENT_API_GUARD_CONF` — `apiprober_refresh.go:176`
 
 ### `internal/subsystem/concoursecache`
 
@@ -137,30 +137,30 @@ subsystem has no env gate.
 
 ### `internal/subsystem/hostmetrics`
 
-- `NODE_HOST_AGENT_ARP_TABLE_FILE` — `config_env.go:70`
-- `NODE_HOST_AGENT_CGROUP_MEM_UNITS` — `config_env.go:81`
-- `NODE_HOST_AGENT_CLOCKSOURCE_AVAILABLE_FILE` — `config_env.go:78`
-- `NODE_HOST_AGENT_CLOCKSOURCE_CURRENT_FILE` — `config_env.go:75`
-- `NODE_HOST_AGENT_CONNTRACK_STAT_FILE` — `config_env.go:68`
-- `NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL` — `config_env.go:65`
-- `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:86`
-- `NODE_HOST_AGENT_HOST_ROUTE_FILE` — `config_env.go:55`
-- `NODE_HOST_AGENT_K0S_CONFIG` — `config_env.go:56`
-- `NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS` — `config_env.go:63`
-- `NODE_HOST_AGENT_K0S_UNIT` — `config_env.go:58`
-- `NODE_HOST_AGENT_KEY_USERS_FILE` — `config_env.go:49`
-- `NODE_HOST_AGENT_LATCH_INTERVAL` — `config_env.go:51`
-- `NODE_HOST_AGENT_NEBULA_CERT` — `config_env.go:60`
-- `NODE_HOST_AGENT_NEBULA_IFACE` — `config_env.go:54`
-- `NODE_HOST_AGENT_PSI_FILE` — `config_env.go:64`
-- `NODE_HOST_AGENT_SYS_CLASS_NET` — `config_env.go:53`
-- `NODE_HOST_AGENT_WATCHDOG_LOG_FILE` — `config_env.go:47`
+- `NODE_HOST_AGENT_ARP_TABLE_FILE` — `config_env.go:71`
+- `NODE_HOST_AGENT_CGROUP_MEM_UNITS` — `config_env.go:82`
+- `NODE_HOST_AGENT_CLOCKSOURCE_AVAILABLE_FILE` — `config_env.go:79`
+- `NODE_HOST_AGENT_CLOCKSOURCE_CURRENT_FILE` — `config_env.go:76`
+- `NODE_HOST_AGENT_CONNTRACK_STAT_FILE` — `config_env.go:69`
+- `NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL` — `config_env.go:66`
+- `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:87`
+- `NODE_HOST_AGENT_HOST_ROUTE_FILE` — `config_env.go:56`
+- `NODE_HOST_AGENT_K0S_CONFIG` — `config_env.go:57`
+- `NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS` — `config_env.go:64`
+- `NODE_HOST_AGENT_K0S_UNIT` — `config_env.go:59`
+- `NODE_HOST_AGENT_KEY_USERS_FILE` — `config_env.go:50`
+- `NODE_HOST_AGENT_LATCH_INTERVAL` — `config_env.go:52`
+- `NODE_HOST_AGENT_NEBULA_CERT` — `config_env.go:61`
+- `NODE_HOST_AGENT_NEBULA_IFACE` — `config_env.go:55`
+- `NODE_HOST_AGENT_PSI_FILE` — `config_env.go:65`
+- `NODE_HOST_AGENT_SYS_CLASS_NET` — `config_env.go:54`
+- `NODE_HOST_AGENT_WATCHDOG_LOG_FILE` — `config_env.go:48`
 
 ### `internal/subsystem/hubsync`
 
 - `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `config_env.go:46`
-- `NODE_HOST_AGENT_HUBSYNC_SSH_ALLOW_INSECURE_HOST_KEY` — `config_env.go:48, hostkeys.go:179, ssh.go:112`
-- `NODE_HOST_AGENT_HUBSYNC_SSH_HOST_KEY_FINGERPRINT` — `config_env.go:47, hostkeys.go:178, ssh.go:111`
+- `NODE_HOST_AGENT_HUBSYNC_SSH_ALLOW_INSECURE_HOST_KEY` — `config_env.go:48, hostkeys.go:182, ssh.go:112`
+- `NODE_HOST_AGENT_HUBSYNC_SSH_HOST_KEY_FINGERPRINT` — `config_env.go:47, hostkeys.go:181, ssh.go:111`
 - `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `config_env.go:45`
 
 ### `internal/subsystem/janitor`
@@ -174,7 +174,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_KINEDB_BACKUP_DIR` — `env.go:44`
 - `NODE_HOST_AGENT_KINEDB_BACKUP_INTERVAL` — `env.go:46`
 - `NODE_HOST_AGENT_KINEDB_ENV_FILE` — `env.go:36`
-- `NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS` — `config.go:348, env.go:51`
+- `NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS` — `config.go:332, env.go:51`
 - `NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR` — `env.go:38`
 - `NODE_HOST_AGENT_KINEDB_PG_DATA_DIR` — `env.go:42`
 

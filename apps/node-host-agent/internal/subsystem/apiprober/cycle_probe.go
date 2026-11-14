@@ -251,7 +251,7 @@ func (p *Prober) probeOne(ctx context.Context, b backend,
 							v.fresh = true
 						}
 						log.Info("ACTION: enabled backend — fresh again",
-							"backend", b.Name, "backend", p.eff.backend,
+							"backend", b.Name, "haproxyBackend", p.eff.backend,
 							"ok", p.eff.recoverC, "gap", gap)
 					}
 				} else {

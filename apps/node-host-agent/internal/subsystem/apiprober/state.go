@@ -5,7 +5,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -170,7 +169,7 @@ func (p *Prober) latchStale(dir string, b backend) {
 	f := dir + "/" + latchdefs.LatchFilePrefix +
 		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
 	if fi, err := os.Stat(f); err == nil {
-		now := time.Now()
+		now := p.cfg.Clock.Now()
 		// Touch only once the mtime ages past LatchTouchMinInterval —
 		// the janitor reaps at 24h; per-cycle utimensat was needless.
 		if cerr := fsx.TouchIfDue(f, fi, now,
@@ -181,7 +180,7 @@ func (p *Prober) latchStale(dir string, b backend) {
 		return
 	}
 	if err := fsx.WriteFileAtomicBytes(f,
-		[]byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n")); err != nil {
+		[]byte(strconv.FormatInt(p.cfg.Clock.Now().Unix(), 10)+"\n")); err != nil {
 		logger().Warn("watchdog stale latch write failed",
 			"file", f, "backend", b.Name, "error", err,
 		)
@@ -342,7 +341,7 @@ func (p *Prober) saveState(dir, name string, st *backendState) {
 	if st.drained {
 		if _, err := os.Stat(drained); err != nil {
 			p.writeStateFile(drained,
-				strconv.FormatInt(time.Now().Unix(), 10))
+				strconv.FormatInt(p.cfg.Clock.Now().Unix(), 10))
 		}
 	} else {
 		p.removeStateFile(drained)

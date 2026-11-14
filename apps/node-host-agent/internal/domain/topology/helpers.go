@@ -62,12 +62,3 @@ func difference(in, excl []string) []string {
 	}
 	return out
 }
-
-func contains(l []string, s string) bool {
-	for _, x := range l {
-		if x == s {
-			return true
-		}
-	}
-	return false
-}

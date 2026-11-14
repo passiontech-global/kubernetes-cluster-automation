@@ -14,8 +14,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -121,13 +119,12 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if !c.d.StreakPending(&c.VethFails, fmt.Sprintf(
 			"suspect: calico-hygiene veth leak candidate cali=%d pods=%d",
 			cali, len(e.Pods))) {
-			if !c.d.State.Exists(latchdefs.LatchCalicoVethLeak) {
+			if c.d.State.EnterFresh(latchdefs.LatchCalicoVethLeak,
+				fmt.Sprintf("cali=%d pods=%d", cali, len(e.Pods))) {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: calico-hygiene orphan veth leak cali=%d pods=%d threshold=%d — CNI DEL cleanup is leaking veth pairs",
 					cali, len(e.Pods), c.d.Cfg.Calico.OrphanVethThreshold))
 			}
-			c.d.State.Enter(latchdefs.LatchCalicoVethLeak,
-				fmt.Sprintf("cali=%d pods=%d", cali, len(e.Pods)))
 		}
 	} else {
 		c.VethFails = 0
@@ -201,11 +198,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"ACTION: calico-hygiene deleted pod %s/%s - felix readiness down %dx",
 					felix.Namespace, felix.Name, c.felixFails))
-				c.d.StampPodHealed(ctx, felix.Namespace, felix.Name)
-				if derr := c.d.Cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
-					ctx, felix.Name, metav1.DeleteOptions{
-						GracePeriodSeconds: ptr.To[int64](5),
-						Preconditions:      &metav1.Preconditions{UID: &felix.UID}}); derr != nil {
+				if derr := c.d.DeletePodGraceful(ctx, felix); derr != nil {
 					c.d.State.AppendLog(fmt.Sprintf(
 						"suspect: calico-hygiene delete %s/%s failed: %v",
 						felix.Namespace, felix.Name, derr))
@@ -282,15 +275,7 @@ func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod)
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: calico-hygiene deleted pod %s/%s - wireguard.cali down/no-carrier",
 			felix.Namespace, felix.Name))
-		// Same UID precondition as the felix remedy above — the
-		// name-reuse race applies identically here. The heal stamp
-		// rides BEFORE the delete so attribution survives a
-		// mid-call crash.
-		c.d.StampPodHealed(ctx, felix.Namespace, felix.Name)
-		if derr := c.d.Cfg.Client.CoreV1().Pods(felix.Namespace).Delete(
-			ctx, felix.Name, metav1.DeleteOptions{
-				GracePeriodSeconds: ptr.To[int64](5),
-				Preconditions:      &metav1.Preconditions{UID: &felix.UID}}); derr != nil {
+		if derr := c.d.DeletePodGraceful(ctx, felix); derr != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: calico-hygiene delete %s/%s failed: %v",
 				felix.Namespace, felix.Name, derr))
@@ -330,14 +315,14 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 			d.State.ClearBudget("veth-seen-" + name)
 			continue
 		}
-		if !d.StateFileExists("veth-seen-" + name) {
-			d.State.RateSpend("veth-seen-" + name)
+		firstSeen, confirmed := d.State.ConfirmMarker("veth-seen-"+name, calicoVethGCMinAge)
+		if firstSeen {
 			d.State.AppendLog(fmt.Sprintf(
 				"calico-hygiene: orphan veth candidate %s - carrier down, confirm in %dm",
 				name, int(calicoVethGCMinAge.Minutes())))
 			continue
 		}
-		if !d.State.RateOK("veth-seen-"+name, calicoVethGCMinAge) {
+		if !confirmed {
 			continue
 		}
 		if d.Cfg.Seams.Host.LinkDelFn == nil {
@@ -361,13 +346,8 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 		d.Actions.WithLabelValues(wdeps.CheckCalico, "veth_delete").Inc()
 	}
 	// Prune markers for ifaces that no longer exist.
-	if ms, err := filepath.Glob(
-		filepath.Join(d.Cfg.WatchdogStateDir, "veth-seen-*")); err == nil {
-		for _, m := range ms {
-			name := strings.TrimPrefix(filepath.Base(m), "veth-seen-")
-			if _, err := os.Stat(filepath.Join(d.Cfg.SysClassNet, name)); err != nil {
-				d.State.ClearBudget(filepath.Base(m))
-			}
-		}
-	}
+	d.State.PruneMarkers("veth-seen-", func(name string) bool {
+		_, err := os.Stat(filepath.Join(d.Cfg.SysClassNet, name))
+		return err == nil
+	})
 }

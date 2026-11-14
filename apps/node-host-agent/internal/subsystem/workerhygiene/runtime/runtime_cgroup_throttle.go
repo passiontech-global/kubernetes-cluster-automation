@@ -38,6 +38,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -73,26 +74,8 @@ func (c *CgroupThrottleCheck) Name() string { return wdeps.CheckCgroupThrottle }
 // some/full format as /proc/pressure/memory (guards'
 // psiMemoryFullAvg60 parity, parameterized by path).
 func psiFullAvg60File(path string) (float64, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	for line := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 3 || f[0] != "full" {
-			continue
-		}
-		for _, kv := range f[1:] {
-			k, v, ok := strings.Cut(kv, "=")
-			if !ok || k != "avg60" {
-				continue
-			}
-			if x, err := strconv.ParseFloat(v, 64); err == nil {
-				return x, true
-			}
-		}
-	}
-	return 0, false
+	avg60, _, ok := procfs.ParsePSIFull(path)
+	return avg60, ok
 }
 
 // cgroupEventsValue parses "key <n>" out of a cgroup events file
@@ -205,10 +188,7 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.evented == nil {
 		c.evented = map[string]bool{}
 	}
-	podByUID := map[string]*corev1.Pod{}
-	for i := range e.Pods {
-		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
-	}
+	podByUID := e.PodByUID()
 	dirs := podSliceDirs(kubepods)
 	seen := map[string]bool{}
 	var maxRatio float64
@@ -300,24 +280,10 @@ func (c *CgroupThrottleCheck) throttledEvent(ctx context.Context,
 			uid))
 		return true
 	}
-	now := c.d.Cfg.Seams.Host.Clock.Now()
-	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
-		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-		Namespace: pod.Namespace,
-		Reason:    "PodMemoryHighThrottled",
-		Note: fmt.Sprintf(
+	if err := c.d.EmitPodEvent(ctx, pod, "", "PodMemoryHighThrottled",
+		fmt.Sprintf(
 			"pod cgroup under kubepods.slice throttled on memory.high: memory.pressure full avg60=%.1f%%, memory.events high +%d this cycle — pod stalls in direct reclaim while node PSI stays flat (memory.request mis-sized)",
-			avg60, highDelta),
-		When: now,
-		Regarding: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Namespace:  pod.Namespace,
-			Name:       pod.Name,
-			UID:        pod.UID,
-		},
-		Owner: pod.Namespace + "/" + pod.Name,
-	}); err != nil {
+			avg60, highDelta)); err != nil {
 		return false
 	}
 	c.d.Actions.WithLabelValues(wdeps.CheckCgroupThrottle, "event").Inc()

@@ -20,8 +20,6 @@
 package apiserver
 
 import (
-	"bufio"
-	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -233,29 +231,7 @@ var apfMetricPrefixes = [][]byte{
 // the parse needs a few KiB, so the multi-MiB string never gets
 // materialized. The 16MiB kept-lines budget mirrors the old body cap.
 func scanAPFMetrics(r io.Reader) (string, error) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64<<10), 64<<10)
-	var kept []string
-	size := 0
-	for sc.Scan() {
-		ln := sc.Bytes()
-		for _, p := range apfMetricPrefixes {
-			if bytes.HasPrefix(ln, p) {
-				kept = append(kept, string(ln))
-				size += len(ln) + 1
-				if size >= 16<<20 {
-					// Same bound the old LimitReader applied —
-					// a pathological endpoint cannot pin memory.
-					return strings.Join(kept, "\n"), nil
-				}
-				break
-			}
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return "", err
-	}
-	return strings.Join(kept, "\n"), nil
+	return promfile.ScanLinesWithPrefixes(r, apfMetricPrefixes, 16<<20)
 }
 
 // ProbeAPF scrapes the local apiserver /metrics, mirrors the APF

@@ -70,6 +70,18 @@ func (d *Deps) ForceDeletePod(ctx context.Context, p *corev1.Pod) error {
 		})
 }
 
+// DeletePodGraceful stamps the pod-healed attribution and deletes
+// the pod with a 5s grace period and UID precondition so a same-name
+// recycle cannot be killed by mistake.
+func (d *Deps) DeletePodGraceful(ctx context.Context, p *corev1.Pod) error {
+	d.StampPodHealed(ctx, p.Namespace, p.Name)
+	return d.Cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
+		metav1.DeleteOptions{
+			GracePeriodSeconds: ptr.To[int64](5),
+			Preconditions:      &metav1.Preconditions{UID: &p.UID},
+		})
+}
+
 // HoldLocalAction is the L1↔L3 maintenance gate every destructive
 // path consults before a pod delete or policy eviction: true while
 // the cluster verifiably holds the maintenance mutex (upgrade /

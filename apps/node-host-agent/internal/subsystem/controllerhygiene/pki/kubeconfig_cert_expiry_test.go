@@ -94,9 +94,7 @@ func TestKubeconfigCertExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.H.Cfg.K0sDir = k0s
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	// admin.conf cert expiring in 5 days → inside the 14d window.
 	testutil.WriteFile(t, filepath.Join(pkiDir, "admin.conf"),
@@ -114,7 +112,7 @@ func TestKubeconfigCertExpiry(t *testing.T) {
 		t.Fatal("kubeconfig-cert-expiring latch missing")
 	}
 	// x509 truncates NotAfter to seconds — allow sub-day slop.
-	v, ok := textfileSample(t, cdeps.TextfileDirOverride,
+	v, ok := textfileSample(t, e.H.Cfg.TextfileDir,
 		"node-agent-kubeconfig-cert.prom", pki.CertDaysMetric)
 	if !ok || v <= 4.9 || v > 5.0 {
 		t.Fatalf("min-days=%v ok=%v want ~5", v, ok)
@@ -128,7 +126,7 @@ func TestKubeconfigCertExpiry(t *testing.T) {
 	if e.HasState(cdeps.StateKubeCertExpiring) {
 		t.Fatal("latch still held on healthy certs")
 	}
-	v, ok = textfileSample(t, cdeps.TextfileDirOverride,
+	v, ok = textfileSample(t, e.H.Cfg.TextfileDir,
 		"node-agent-kubeconfig-cert.prom", pki.CertDaysMetric)
 	if !ok || v <= 59.9 || v > 60.0 {
 		t.Fatalf("min-days=%v ok=%v want ~60", v, ok)
@@ -139,16 +137,14 @@ func TestKubeconfigCertExpiryNoCerts(t *testing.T) {
 	e := fixture(t)
 	root := t.TempDir()
 	e.H.Cfg.K0sDir = filepath.Join(root, "k0s") // no kubeconfigs at all
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	cdepstest.Check[*pki.KubeCertCheck](e.H, cdeps.CheckKubeCert).Run(context.Background()) // no panic
 	if e.HasState(cdeps.StateKubeCertExpiring) {
 		t.Fatal("latch on a host with no kubeconfigs")
 	}
 	prom, err := os.ReadFile(filepath.Join(
-		cdeps.TextfileDirOverride, "node-agent-kubeconfig-cert.prom"))
+		e.H.Cfg.TextfileDir, "node-agent-kubeconfig-cert.prom"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,9 +189,7 @@ func TestKubeconfigCertFileReference(t *testing.T) {
 	k0s := filepath.Join(root, "k0s")
 	pkiDir := filepath.Join(k0s, "pki")
 	e.H.Cfg.K0sDir = k0s
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	// Phase 1: client.pem next to admin.conf — the referenced file's
 	// NotAfter drives the metric (40d, outside the warn window).
@@ -207,7 +201,7 @@ func TestKubeconfigCertFileReference(t *testing.T) {
 	if e.HasState(cdeps.StateKubeCertExpiring) {
 		t.Fatal("file-referenced cert inside the window was missed")
 	}
-	v, ok := textfileSample(t, cdeps.TextfileDirOverride,
+	v, ok := textfileSample(t, e.H.Cfg.TextfileDir,
 		"node-agent-kubeconfig-cert.prom", pki.CertDaysMetric)
 	if !ok || v <= 39.9 || v > 40.0 {
 		t.Fatalf("min-days=%v ok=%v want ~40 (referenced file unread)", v, ok)
@@ -229,7 +223,7 @@ func TestKubeconfigCertFileReference(t *testing.T) {
 			base64.StdEncoding.EncodeToString(
 				testClientCertPEM(t, e.Now.Add(50*24*time.Hour)))+"\n")
 	cdepstest.Check[*pki.KubeCertCheck](e.H, cdeps.CheckKubeCert).Run(context.Background())
-	v, ok = textfileSample(t, cdeps.TextfileDirOverride,
+	v, ok = textfileSample(t, e.H.Cfg.TextfileDir,
 		"node-agent-kubeconfig-cert.prom", pki.CertDaysMetric)
 	if !ok || v <= 49.9 || v > 50.0 {
 		t.Fatalf("min-days=%v ok=%v want ~50 (missing ref not skipped)", v, ok)
@@ -249,7 +243,7 @@ func TestKubeconfigCertFileReference(t *testing.T) {
 	if !e.HasState(cdeps.StateKubeCertExpiring) {
 		t.Fatal("valid cert after junk blocks missed the warn window")
 	}
-	v, ok = textfileSample(t, cdeps.TextfileDirOverride,
+	v, ok = textfileSample(t, e.H.Cfg.TextfileDir,
 		"node-agent-kubeconfig-cert.prom", pki.CertDaysMetric)
 	if !ok || v <= 8.9 || v > 9.0 {
 		t.Fatalf("min-days=%v ok=%v want ~9 (junk blocks misparsed)", v, ok)
@@ -264,9 +258,7 @@ func TestKubeconfigCertUserWithoutCert(t *testing.T) {
 	k0s := filepath.Join(root, "k0s")
 	pkiDir := filepath.Join(k0s, "pki")
 	e.H.Cfg.K0sDir = k0s
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	testutil.WriteFile(t, filepath.Join(pkiDir, "scheduler.conf"),
 		"apiVersion: v1\nkind: Config\n"+
@@ -281,7 +273,7 @@ func TestKubeconfigCertUserWithoutCert(t *testing.T) {
 		t.Fatal("cert-less kubeconfig latched the expiry state")
 	}
 	prom, err := os.ReadFile(filepath.Join(
-		cdeps.TextfileDirOverride, "node-agent-kubeconfig-cert.prom"))
+		e.H.Cfg.TextfileDir, "node-agent-kubeconfig-cert.prom"))
 	if err != nil {
 		t.Fatal(err)
 	}

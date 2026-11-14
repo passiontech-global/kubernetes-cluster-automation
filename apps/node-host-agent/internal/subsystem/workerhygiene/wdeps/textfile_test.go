@@ -112,8 +112,7 @@ func TestPromTextfileDir(t *testing.T) {
 	}
 
 	override := filepath.Join(t.TempDir(), "override")
-	wdeps.PromTextfileDirOverride = override
-	t.Cleanup(func() { wdeps.PromTextfileDirOverride = "" })
+	e.D.Cfg.TextfileDir = override
 	if got := e.D.PromTextfileDir(); got != override {
 		t.Fatalf("override ignored: dir=%q want %q", got, override)
 	}
@@ -126,8 +125,7 @@ func TestPromTextfileDir(t *testing.T) {
 func TestWriteNodeAgentPromTextfile(t *testing.T) {
 	e := fixture(t)
 	dir := t.TempDir()
-	wdeps.PromTextfileDirOverride = dir
-	t.Cleanup(func() { wdeps.PromTextfileDirOverride = "" })
+	e.D.Cfg.TextfileDir = dir
 
 	wdepstest.WriteFile(t, e.D.Cfg.Host.OOMCountFile, "7\n")
 	wdepstest.WriteFile(t, e.D.Cfg.Host.ConntrackDropsFile, "3\n")
@@ -184,8 +182,7 @@ func TestWriteNodeAgentPromTextfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	e2 := fixture(t)
-	wdeps.PromTextfileDirOverride = filepath.Join(blocker, "sub")
-	t.Cleanup(func() { wdeps.PromTextfileDirOverride = "" })
+	e2.D.Cfg.TextfileDir = filepath.Join(blocker, "sub")
 	e2.D.WriteNodeAgentPromTextfile()
 	if !strings.Contains(e2.LogLines(t), "node-agent prom textfile unwritable") {
 		t.Fatalf("missing suspect line:\n%s", e2.LogLines(t))

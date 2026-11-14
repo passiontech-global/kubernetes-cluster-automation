@@ -14,7 +14,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -169,15 +168,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.State.AppendLog(fmt.Sprintf(
 		"ACTION: cilium-lrp-dns deleted pod %s/%s - :53 probe failed %dx while Ready=True (LRP datapath wedge)",
 		nld.Namespace, nld.Name, c.Fails))
-	c.d.StampPodHealed(ctx, nld.Namespace, nld.Name)
-	if err := c.d.Cfg.Client.CoreV1().Pods(nld.Namespace).Delete(ctx, nld.Name,
-		metav1.DeleteOptions{
-			GracePeriodSeconds: ptr.To[int64](5),
-			// Same precondition the calico/spegel remedies carry: the
-			// listing→delete window can outlive this pod, and a
-			// same-named DS recycle is not ours to kill.
-			Preconditions: &metav1.Preconditions{UID: &nld.UID},
-		}); err != nil {
+	if err := c.d.DeletePodGraceful(ctx, nld); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns delete %s/%s failed: %v",
 			nld.Namespace, nld.Name, err))

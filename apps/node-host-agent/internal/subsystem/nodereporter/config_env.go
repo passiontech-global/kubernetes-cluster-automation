@@ -32,9 +32,6 @@ func ConfigFromEnv(d EnvDeps) Config {
 		Base:     subframe.FromDeps(d.Deps),
 		NodeName: d.NodeName,
 		Client:   d.Client,
-		// The shared host-systemd client rides the embedded
-		// hostctx.Deps — the reporter never builds its own.
-		Systemd: d.Systemd,
 	}
 	// The env surface, one row per knob in declaration order.
 	envx.Apply([]envx.Knob{

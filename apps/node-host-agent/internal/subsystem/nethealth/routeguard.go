@@ -74,6 +74,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth/routewatch"
 )
@@ -157,24 +158,19 @@ func (n *NetHealth) spawnRouteGuard(ctx context.Context) {
 		return
 	}
 	if last := n.routeGuardLastExit.Load(); last != 0 &&
-		time.Since(time.Unix(0, last)) < routeGuardRespawnBackoff {
+		n.cfg.Clock.Now().Sub(time.Unix(0, last)) < routeGuardRespawnBackoff {
 		return
 	}
 	if !n.routeGuardRunning.CompareAndSwap(false, true) {
 		return
 	}
-	go func() {
+	cycle.Spawn(ctx, "nethealth-route-guard", func(cctx context.Context) {
 		defer func() {
-			if r := recover(); r != nil {
-				logger().Error("route-guard: guard panicked — exiting, "+
-					"respawn allowed after backoff",
-					"panic", r)
-			}
-			n.routeGuardLastExit.Store(time.Now().UnixNano())
+			n.routeGuardLastExit.Store(n.cfg.Clock.Now().UnixNano())
 			n.routeGuardRunning.Store(false)
 		}()
-		n.routeGuard(ctx)
-	}()
+		n.routeGuard(cctx)
+	})
 }
 
 // routeGuard is the outer lifecycle: poll for nebula-up.sh, bind the
@@ -239,8 +235,8 @@ func (n *NetHealth) routeGuard(ctx context.Context) {
 			// lost while the guard is down (the script + is-active
 			// gates apply inside; capped to one exec per
 			// minRestore so a hard-down socket can't exec-storm).
-			if time.Since(lastFailRestore) >= minRestore {
-				lastFailRestore = time.Now()
+			if n.cfg.Clock.Now().Sub(lastFailRestore) >= minRestore {
+				lastFailRestore = n.cfg.Clock.Now()
 				n.restoreRouteGuard(ctx)
 			}
 			if !sleepCtx(ctx, routeGuardRetry) {

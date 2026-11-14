@@ -179,14 +179,14 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			continue
 		}
 		marker := "cni-netns-seen-" + name
-		if !c.d.StateFileExists(marker) {
-			c.d.State.RateSpend(marker)
+		firstSeen, confirmed := c.d.State.ConfirmMarker(marker, cniNetnsMinAge)
+		if firstSeen {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"cni-netns-gc: orphan netns candidate %s - no live process, confirm in %dm",
 				name, int(cniNetnsMinAge.Minutes())))
 			continue
 		}
-		if !c.d.State.RateOK(marker, cniNetnsMinAge) {
+		if !confirmed {
 			continue
 		}
 		// Re-stat before acting: the inode must STILL be
@@ -268,18 +268,11 @@ func reapCNINetns(d *wdeps.Deps, ctx context.Context, name string) {
 // file vanished — a file that reappeared referenced or was cleaned
 // up by other means must not keep a stale confirmation armed.
 func pruneCNINetnsMarkers(d *wdeps.Deps, seen map[string]bool) {
-	ms, err := filepath.Glob(filepath.Join(
-		d.Cfg.WatchdogStateDir, "cni-netns-seen-*"))
-	if err != nil {
-		return
-	}
-	for _, m := range ms {
-		name := strings.TrimPrefix(filepath.Base(m), "cni-netns-seen-")
+	d.State.PruneMarkers("cni-netns-seen-", func(name string) bool {
 		if seen != nil && seen[name] {
-			continue
+			return true
 		}
-		if _, err := os.Stat(filepath.Join(d.Cfg.Net.NetnsDir, name)); err != nil {
-			d.State.ClearBudget(filepath.Base(m))
-		}
-	}
+		_, err := os.Stat(filepath.Join(d.Cfg.Net.NetnsDir, name))
+		return err == nil
+	})
 }

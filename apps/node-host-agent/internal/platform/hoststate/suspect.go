@@ -54,28 +54,22 @@ func (s *Store) ExitClearAllSuspects(name string) {
 // at Debug so operators tracing a latch have the evidence without
 // spamming steady-state logs.
 func (s *Store) ClearSuspect(name string) {
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
 	if err := os.Remove(filepath.Join(s.Dir,
 		SuspectBudgetPrefix+name)); err != nil && !os.IsNotExist(err) {
 		s.log().Debug("hoststate: failed to clear suspect budget",
 			"key", name, "error", err)
 	}
-	s.forgetSpent(SuspectBudgetPrefix + name)
-}
-
-// forgetSpent drops the RAM lastSpent mirror for one budget under
-// s.Dir — required wherever a budget FILE is removed outside
-// RateSpend: the mirror would otherwise keep the cooldown alive
-// after the file is gone (RateOKIn verdicts on max(disk, ram)).
-func (s *Store) forgetSpent(name string) {
-	s.shared.mu.Lock()
-	defer s.shared.mu.Unlock()
-	delete(s.shared.lastSpent, rateSpendKey(s.Dir, name))
+	delete(s.shared.lastSpent, rateSpendKey(filepath.Clean(s.Dir), SuspectBudgetPrefix+name))
 }
 
 // ClearAllSuspects drops every last-suspect-* dedupe budget in the
 // Store's dir — best-effort like ClearSuspect, with the same Debug
 // surfacing of failed removes.
 func (s *Store) ClearAllSuspects() {
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
 	files, err := filepath.Glob(filepath.Join(s.Dir, SuspectBudgetPrefix+"*"))
 	if err != nil {
 		s.log().Debug("hoststate: failed to list suspect budgets",
@@ -89,14 +83,12 @@ func (s *Store) ClearAllSuspects() {
 		}
 	}
 	// Drop the matching RAM mirrors — see ClearSuspect.
-	s.shared.mu.Lock()
-	prefix := rateSpendKey(s.Dir, SuspectBudgetPrefix)
+	prefix := rateSpendKey(filepath.Clean(s.Dir), SuspectBudgetPrefix)
 	for k := range s.shared.lastSpent {
 		if strings.HasPrefix(k, prefix) {
 			delete(s.shared.lastSpent, k)
 		}
 	}
-	s.shared.mu.Unlock()
 }
 
 // SuspectLog emits msg at most once per cadence per key — a

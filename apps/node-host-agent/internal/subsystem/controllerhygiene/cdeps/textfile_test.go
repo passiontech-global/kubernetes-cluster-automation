@@ -32,17 +32,15 @@ func newTextfileDeps(t *testing.T) *Deps {
 
 func TestTextfilePromDir(t *testing.T) {
 	d := newTextfileDeps(t)
-	old := TextfileDirOverride
-	t.Cleanup(func() { TextfileDirOverride = old })
 
-	// The override wins — the test seam.
-	TextfileDirOverride = "/tmp/textfile-override"
+	// Config.TextfileDir wins when set.
+	d.Cfg.TextfileDir = "/tmp/textfile-override"
 	if got := d.textfilePromDir(); got != "/tmp/textfile-override" {
 		t.Fatalf("override ignored: dir=%q", got)
 	}
 
 	// K0sDir is <root>/var/lib/k0s → the sibling node-exporter dir.
-	TextfileDirOverride = ""
+	d.Cfg.TextfileDir = ""
 	want := filepath.Join(filepath.Dir(d.Cfg.K0sDir),
 		"node-exporter", "textfile")
 	if got := d.textfilePromDir(); got != want {
@@ -52,10 +50,8 @@ func TestTextfilePromDir(t *testing.T) {
 
 func TestWriteTextfileProm(t *testing.T) {
 	d := newTextfileDeps(t)
-	old := TextfileDirOverride
-	t.Cleanup(func() { TextfileDirOverride = old })
 	outDir := filepath.Join(t.TempDir(), "textfile")
-	TextfileDirOverride = outDir
+	d.Cfg.TextfileDir = outDir
 
 	d.WriteTextfileProm("node-agent-test.prom",
 		"# HELP node_agent_test_probe Help text.\n")
@@ -71,16 +67,14 @@ func TestWriteTextfileProm(t *testing.T) {
 
 func TestWriteTextfilePromFailureSuspects(t *testing.T) {
 	d := newTextfileDeps(t)
-	old := TextfileDirOverride
-	t.Cleanup(func() { TextfileDirOverride = old })
-	// The override names a path UNDER an existing file — MkdirAll
+	// Config.TextfileDir names a path UNDER an existing file — MkdirAll
 	// cannot succeed there, so the install fails and the failure
 	// must land in the watchdog tail via suspectLog.
 	blocked := filepath.Join(t.TempDir(), "file.txt")
 	if err := os.WriteFile(blocked, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	TextfileDirOverride = filepath.Join(blocked, "textfile")
+	d.Cfg.TextfileDir = filepath.Join(blocked, "textfile")
 
 	d.WriteTextfileProm("node-agent-test.prom", "x\n") // must not panic
 

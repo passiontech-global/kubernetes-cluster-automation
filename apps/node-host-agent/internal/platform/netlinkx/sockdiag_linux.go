@@ -65,6 +65,28 @@ func TCPTables(pid int) (TCPCensus, error) {
 // saves one full socket+bind+rcvtimeo setup per cycle. A failed dump
 // leaves out zeroed — the caller treats an error as "inconclusive,
 // emit nothing".
+func diagRecvLoop(fd int, buf []byte, op string, onBatch func([]byte) (bool, error)) error {
+	for {
+		n, _, rerr := unix.Recvfrom(fd, buf, 0)
+		if errors.Is(rerr, unix.EINTR) {
+			continue // signal interruption is not a dump failure
+		}
+		if rerr != nil {
+			return fmt.Errorf("%s: %w", op, rerr)
+		}
+		done, err := onBatch(buf[:n])
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+// tcpCensusDump opens one NETLINK_SOCK_DIAG socket and dumps AF_INET
+// + AF_INET6 TCP tables into out. Pre-sized out + pooled 64 KiB recv
+// buffer keep per-cycle allocations to the map growth alone.
 func tcpCensusDump(out *TCPCensus) error {
 	out.States = map[uint8]int{}
 	out.PerTuple = map[string]int{}
@@ -87,22 +109,11 @@ func tcpCensusDump(out *TCPCensus) error {
 			0, sa); err != nil {
 			return fmt.Errorf("sock_diag send %d: %w", family, err)
 		}
-		done := false
-		for !done {
-			n, _, rerr := unix.Recvfrom(fd, buf, 0)
-			if errors.Is(rerr, unix.EINTR) {
-				continue // signal interruption is not a dump failure
-			}
-			if rerr != nil {
-				return fmt.Errorf("sock_diag recv %d: %w", family, rerr)
-			}
-			endSeq, ferr := parseDiagCensus(buf[:n], out)
-			if ferr != nil {
-				return ferr
-			}
-			if endSeq != 0 {
-				done = true
-			}
+		if err := diagRecvLoop(fd, buf, fmt.Sprintf("sock_diag recv %d", family), func(b []byte) (bool, error) {
+			endSeq, ferr := parseDiagCensus(b, out)
+			return endSeq != 0, ferr
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -288,6 +299,10 @@ func destroyListeners(port uint16) (int, error) {
 	defer func() { _ = unix.Close(fd) }()
 	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
 
+	bufp := diagBufPool.Get().(*[]byte)
+	defer diagBufPool.Put(bufp)
+	buf := *bufp
+
 	// Phase 1 — dump both families, collecting LISTEN sockets on
 	// the target port. The dump REQUIRES NLM_F_REQUEST|NLM_F_DUMP
 	// and idiag_states=1<<TCP_LISTEN: kernel-side filtering keeps
@@ -301,22 +316,10 @@ func destroyListeners(port uint16) (int, error) {
 			0, sa); err != nil {
 			return 0, fmt.Errorf("sock_diag send %d: %w", family, err)
 		}
-		buf := make([]byte, 1<<16)
-		for {
-			n, _, rerr := unix.Recvfrom(fd, buf, 0)
-			if errors.Is(rerr, unix.EINTR) {
-				continue
-			}
-			if rerr != nil {
-				return 0, fmt.Errorf("sock_diag recv %d: %w", family, rerr)
-			}
-			done, merr := collectPortListeners(buf[:n], family, port, &matches)
-			if merr != nil {
-				return 0, merr
-			}
-			if done {
-				break
-			}
+		if err := diagRecvLoop(fd, buf, fmt.Sprintf("sock_diag recv %d", family), func(b []byte) (bool, error) {
+			return collectPortListeners(b, family, port, &matches)
+		}); err != nil {
+			return 0, err
 		}
 	}
 
@@ -334,19 +337,10 @@ func destroyListeners(port uint16) (int, error) {
 		}
 		// Drain the ACK/error reply so the socket buffer cannot
 		// fill across a large listener table.
-		buf := make([]byte, 4096)
-		for {
-			n, _, rerr := unix.Recvfrom(fd, buf, 0)
-			if errors.Is(rerr, unix.EINTR) {
-				continue
-			}
-			if rerr != nil {
-				return killed, fmt.Errorf("sock_diag destroy recv: %w", rerr)
-			}
-			if ackErr := parseDiagAck(buf[:n]); ackErr != nil {
-				return killed, ackErr
-			}
-			break
+		if err := diagRecvLoop(fd, buf, "sock_diag destroy recv", func(b []byte) (bool, error) {
+			return true, parseDiagAck(b)
+		}); err != nil {
+			return killed, err
 		}
 		killed++
 	}

@@ -91,37 +91,10 @@ func (c *cyc) renderZoneFile() ([]byte, error) {
 // | hash('sha256') | int(0,16) % 4294967295. Changes only when the
 // inputs change (no DNS blip on every converge).
 func (c *cyc) zoneSerial() int64 {
-	nj, _ := json.Marshal(jsonPlain(c.t.Nodes))
-	zj, _ := json.Marshal(jsonPlain(c.t.Zone))
+	nj, _ := json.Marshal(topologyPlain(c.t.Nodes))
+	zj, _ := json.Marshal(topologyPlain(c.t.Zone))
 	h := sha256.Sum256(append(nj, zj...))
 	i := new(big.Int).SetBytes(h[:])
 	i.Mod(i, big.NewInt(4294967295))
 	return i.Int64()
-}
-
-// jsonPlain renders OMap/List as sorted-key JSON-compatible values.
-func jsonPlain(v any) any {
-	switch t := v.(type) {
-	case *jinja.OMap:
-		m := map[string]any{}
-		for _, k := range t.Keys() {
-			vv, _ := t.Get(k)
-			m[k] = jsonPlain(vv)
-		}
-		return m
-	case *jinja.List:
-		out := make([]any, len(t.V))
-		for i, x := range t.V {
-			out[i] = jsonPlain(x)
-		}
-		return out
-	case []any:
-		out := make([]any, len(t))
-		for i, x := range t {
-			out[i] = jsonPlain(x)
-		}
-		return out
-	default:
-		return v
-	}
 }

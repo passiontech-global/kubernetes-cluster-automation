@@ -82,23 +82,33 @@ func ActionEntryPrefix(name string) string {
 // the filelog contract: the filesystem-readonly vs fs-readonly split
 // is exactly the drift this prevents (both registered tokens feed
 // the one FilesystemReadOnly event reason).
-func StateEnterRe(latches ...string) *regexp.Regexp {
+func statePrefixRe(prefix string, latches ...string) *regexp.Regexp {
+	if len(latches) == 0 {
+		panic("latchdefs: statePrefixRe requires at least one latch name")
+	}
 	alts := make([]string, 0, len(latches))
 	for _, l := range latches {
 		alts = append(alts, regexp.QuoteMeta(l))
 	}
-	return regexp.MustCompile(StateEnterPrefix + `(?:` + strings.Join(alts, "|") + `)`)
+	return regexp.MustCompile(prefix + `(?:` + strings.Join(alts, "|") + `)(?:$|\s)`)
+}
+
+// StateEnterRe builds the "STATE-ENTER: <latch>" match pattern for one
+// or more latch names — the regex the filelog monitor compiles
+// (moved verbatim from nodereporter/events.go, where it lived as a
+// package-private helper). A renamed latch can never silently drift
+// the filelog contract: the filesystem-readonly vs fs-readonly split
+// is exactly the drift this prevents (both registered tokens feed
+// the one FilesystemReadOnly event reason).
+func StateEnterRe(latches ...string) *regexp.Regexp {
+	return statePrefixRe(StateEnterPrefix, latches...)
 }
 
 // StateExitRe builds the "STATE-EXIT: <latch>" match pattern for one
 // or more latch names — the matcher the informational exit-event
 // rules use (the mirror of StateEnterRe for episode-end lines).
 func StateExitRe(latches ...string) *regexp.Regexp {
-	alts := make([]string, 0, len(latches))
-	for _, l := range latches {
-		alts = append(alts, regexp.QuoteMeta(l))
-	}
-	return regexp.MustCompile(StateExitPrefix + `(?:` + strings.Join(alts, "|") + `)`)
+	return statePrefixRe(StateExitPrefix, latches...)
 }
 
 // ActionEntryRe builds the unanchored ACTION-entry match pattern for

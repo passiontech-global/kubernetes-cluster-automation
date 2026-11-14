@@ -102,11 +102,6 @@ const (
 	LatchConntrackPressure   = "conntrack-pressure"    // H2
 	LatchNebulaPMTUBlackhole = "nebula-pmtu-blackhole" // overlay-mtu-guard
 	LatchNebulaMTUBlackhole  = "nebula-mtu-blackhole"  // routeguard NM4
-	// LatchClocksourceUnstable is the clocksource evidence latch — the
-	// kernel marked its clocksource unstable (kmsg signature) or
-	// hostmetrics found the current clocksource drifted off tsc/
-	// kvm-clock (the collector's non-TSC gauge).
-	LatchClocksourceUnstable = "clocksource-unstable" // hostmetrics clocksource guard
 
 	// controllerhygiene — the control-plane guards.
 	LatchAPIServerCacheStale    = "apiserver-cache-stale"    // sig13
@@ -157,6 +152,11 @@ const (
 	// STATE-ENTER line + the node_agent_*_prefail textfile gauges
 	// are the consumption surface.
 	LatchDiskPreFail = "disk-pre-fail" // updateDiskPreFailEvidence
+	// LatchClocksourceUnstable is the clocksource evidence latch — the
+	// kernel marked its clocksource unstable (kmsg signature) or
+	// hostmetrics found the current clocksource drifted off tsc/
+	// kvm-clock (the collector's non-TSC gauge).
+	LatchClocksourceUnstable = "clocksource-unstable" // hostmetrics clocksource guard
 
 	// apiprober — the per-backend stale family; the suffix is the
 	// backend IP with dots dashed (shell ${beh//./-}), minted per

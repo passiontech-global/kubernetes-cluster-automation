@@ -30,14 +30,14 @@ import (
 // 2 usage error — same contract as the other ops subcommands).
 func Cmd(ctx context.Context, args []string) int {
 	fs := opsx.FlagSet("check-k0s-drift")
-	config := fs.String("config", "/etc/k0s/k0s.yaml", "k0s config to scan")
+	config := fs.String("config", k0sconfig.DefaultConfigFile, "k0s config to scan")
 	expected := fs.String("expected-keys", "",
 		"comma-separated expected controllerManager.extraArgs keys "+
 			"(default: the repo-pinned set)")
 	removed := fs.String("removed-flags", "",
 		"comma-separated config keys removed upstream "+
 			"(default: concurrent-service-syncs)")
-	unit := fs.String("unit-file", "/etc/systemd/system/k0scontroller.service",
+	unit := fs.String("unit-file", k0sconfig.DefaultUnitFile,
 		"k0s controller gate — the check only runs when this unit file "+
 			"exists (point at /dev/null to force on a non-controller)")
 	if code, ok := opsx.Parse(fs, args); !ok {

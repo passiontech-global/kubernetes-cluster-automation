@@ -425,7 +425,9 @@ func (w *wiring) descriptors() []Descriptor {
 // that actually appended a subsystem.
 func (w *wiring) resolveAndBuild(d Descriptor) {
 	resolved := true
-	if d.EnvFlag != "" {
+	if d.Needs.PodModeOnly && w.standalone {
+		resolved = false
+	} else if d.EnvFlag != "" {
 		switch mode := envx.ModeEnv(d.EnvFlag, d.Default); mode {
 		case envx.ModeOff:
 			resolved = false
@@ -435,9 +437,6 @@ func (w *wiring) resolveAndBuild(d Descriptor) {
 	}
 	w.resolved[d.Name] = resolved
 	if !resolved {
-		return
-	}
-	if d.Needs.PodModeOnly && w.standalone {
 		return
 	}
 	if d.Needs.NodeName && w.NodeName == "" {

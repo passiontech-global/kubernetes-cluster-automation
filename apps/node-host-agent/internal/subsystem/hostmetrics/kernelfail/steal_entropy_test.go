@@ -100,13 +100,14 @@ func TestCPUStealLatchHysteresis(t *testing.T) {
 
 func TestStealEntropyPromGauges(t *testing.T) {
 	f := kfixture(t)
-	textfileDirOverride = t.TempDir()
+	td := t.TempDir()
+	f.r.deps.TextfileDir = td
 	testutil.WriteFile(t, filepath.Join(f.deps.ProcRoot,
 		"sys/kernel/random/entropy_avail"), "3789\n")
 
 	writeProcStat(t, f.deps.ProcRoot, 0, 1000)
 	f.r.updateStealEntropy() // baseline — entropy already emits
-	prom := testutil.ReadFile(t, filepath.Join(textfileDirOverride,
+	prom := testutil.ReadFile(t, filepath.Join(td,
 		stealEntropyPromName))
 	if !strings.Contains(prom,
 		"node_agent_kernel_entropy_avail_bits 3789") {
@@ -118,7 +119,7 @@ func TestStealEntropyPromGauges(t *testing.T) {
 
 	writeProcStat(t, f.deps.ProcRoot, 40, 1100) // delta 40/140 ≈ 0.2857
 	f.r.updateStealEntropy()
-	prom = testutil.ReadFile(t, filepath.Join(textfileDirOverride,
+	prom = testutil.ReadFile(t, filepath.Join(td,
 		stealEntropyPromName))
 	got := ""
 	for ln := range strings.SplitSeq(prom, "\n") {

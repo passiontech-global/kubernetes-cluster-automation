@@ -236,24 +236,10 @@ func (c *LocalPVQuotaCheck) throttlePVTasks(ctx context.Context,
 // on the throttled pod.
 func (c *LocalPVQuotaCheck) emitPVQuotaEvent(ctx context.Context,
 	pod *corev1.Pod, dir string, size, cap int64, throttled int) {
-	now := c.d.Cfg.Seams.Host.Clock.Now()
-	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
-		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-		Namespace: pod.Namespace,
-		Reason:    "LocalPVQuotaExceeded",
-		Note: fmt.Sprintf(
+	if err := c.d.EmitPodEvent(ctx, pod, "", "LocalPVQuotaExceeded",
+		fmt.Sprintf(
 			"localpv dir %s holds %d bytes > %.0fx PV capacity %d bytes under disk pressure — %d tasks deprioritized (ionice idle + renice +19 + io.weight)",
-			dir, size, c.d.Cfg.Disk.LocalPVQuotaRatio, cap, throttled),
-		When: now,
-		Regarding: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Namespace:  pod.Namespace,
-			Name:       pod.Name,
-			UID:        pod.UID,
-		},
-		Owner: pod.Namespace + "/" + pod.Name,
-	}); err != nil {
+			dir, size, c.d.Cfg.Disk.LocalPVQuotaRatio, cap, throttled)); err != nil {
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(

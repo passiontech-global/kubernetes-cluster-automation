@@ -8,17 +8,16 @@
 package wdeps
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"strings"
 	"syscall"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
 // deletedFDStat is the DeletedFDStatFn default: stat() the
@@ -92,25 +91,5 @@ var kubeletMetricPrefixes = [][]byte{
 // name before '{', and HELP/TYPE comment lines never match the
 // prefixes.
 func scanKubeletMetrics(r io.Reader) (string, error) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64<<10), 64<<10)
-	var kept []string
-	size := 0
-	for sc.Scan() {
-		ln := sc.Bytes()
-		for _, p := range kubeletMetricPrefixes {
-			if bytes.HasPrefix(ln, p) {
-				kept = append(kept, string(ln))
-				size += len(ln) + 1
-				if size >= 4<<20 {
-					return strings.Join(kept, "\n"), nil
-				}
-				break
-			}
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return "", err
-	}
-	return strings.Join(kept, "\n"), nil
+	return promfile.ScanLinesWithPrefixes(r, kubeletMetricPrefixes, 4<<20)
 }

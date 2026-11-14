@@ -22,6 +22,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -128,33 +129,7 @@ func parseDiskstats(data []byte) map[string]diskIOStat {
 // ok=false when PSI io is unavailable (old kernel / psi disabled)
 // — the check then runs on the diskstats half alone.
 func psiIOFullAvgs(d *wdeps.Deps) (avg60, avg300 float64, ok bool) {
-	data, err := os.ReadFile(filepath.Join(d.Cfg.ProcRoot, "pressure", "io"))
-	if err != nil {
-		return 0, 0, false
-	}
-	for line := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 3 || f[0] != "full" {
-			continue
-		}
-		for _, kv := range f[1:] {
-			k, v, cut := strings.Cut(kv, "=")
-			if !cut {
-				continue
-			}
-			x, err := strconv.ParseFloat(v, 64)
-			if err != nil {
-				continue
-			}
-			switch k {
-			case "avg60":
-				avg60, ok = x, true
-			case "avg300":
-				avg300 = x
-			}
-		}
-	}
-	return avg60, avg300, ok
+	return procfs.ParsePSIFull(filepath.Join(d.Cfg.ProcRoot, "pressure", "io"))
 }
 
 // IOPressureCheck is the disk-IO starvation guard as a Check. It

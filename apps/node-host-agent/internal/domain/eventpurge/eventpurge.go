@@ -32,6 +32,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // Defaults mirror purge-events.py.
@@ -137,16 +139,11 @@ func (c Config) httpClient() (*http.Client, error) {
 	// shared connections to HTTP/1.1 (a fresh &http.Transport with
 	// TLSClientConfig set would — that contradicted the HTTP/2
 	// multiplexing this comment block always promised).
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	// The worker pool runs cfg.Workers parallel DELETEs —
-	// the default MaxIdleConnsPerHost=2 would churn
-	// connections every cycle.
-	tr.MaxIdleConnsPerHost = c.Workers
-	tr.TLSClientConfig = &tls.Config{
+	tr := httpx.PooledTransport(c.Workers, &tls.Config{
 		RootCAs:      pool,
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
-	}
+	})
 	return &http.Client{
 		Timeout:   c.Timeout,
 		Transport: tr,

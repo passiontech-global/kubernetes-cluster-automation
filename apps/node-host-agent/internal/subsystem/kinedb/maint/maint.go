@@ -72,30 +72,17 @@ const (
 // everything (probe deadTupleVacuum parity).
 func (m *Maint) buildHeavyScript(freeze bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b,
-		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS km_locked;\n",
-		m.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\gset\n\\if :km_locked\n")
 	fmt.Fprintf(&b, "REINDEX TABLE CONCURRENTLY %s;\n", kdeps.SQLIdent(m.d.Cfg.Table))
 	if freeze {
 		fmt.Fprintf(&b, "VACUUM (FREEZE, ANALYZE) %s;\n", kdeps.SQLIdent(m.d.Cfg.Table))
 	}
-	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", m.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
-	return b.String()
+	return kdeps.WrapAdvisoryLockScript(m.d.Cfg.AdvisoryLockID, "km_locked", b.String())
 }
 
 // buildLockProbe renders a try-lock/unlock probe for work that runs
 // outside psql (pg_repack) — a busy lock skips the caller this cycle.
 func (m *Maint) buildLockProbe() string {
-	var b strings.Builder
-	fmt.Fprintf(&b,
-		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS km_probe;\n",
-		m.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\gset\n\\if :km_probe\n")
-	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", m.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
-	return b.String()
+	return kdeps.WrapAdvisoryLockScript(m.d.Cfg.AdvisoryLockID, "km_probe", "")
 }
 
 // deadTuplePct returns n_dead_tup as a percentage of estimated rows —

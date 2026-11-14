@@ -12,7 +12,6 @@ import (
 	"slices"
 	"time"
 
-	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -49,12 +48,10 @@ func (c *CoredumpGCCheck) coredumpGC() {
 	if dir == "" {
 		return
 	}
-	var st unix.Statfs_t
-	if err := c.d.Cfg.Seams.Host.StatfsFn(dir, &st); err != nil ||
-		st.Blocks <= 0 || st.Bavail > st.Blocks {
+	used, ok := c.d.DiskUsageRatio(dir)
+	if !ok {
 		return // inconclusive — never sweep on garbage statfs
 	}
-	used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
 	if used <= c.d.Cfg.Disk.BloatWatermark {
 		return
 	}

@@ -229,14 +229,15 @@ func port(c *cyc) string {
 	return c.t.Vars.StrDef("interdc_nebula_port", "45670")
 }
 
+var k0sNodeIPRe = regexp.MustCompile(`--node-ip=([0-9.]+)`)
+
 // nodeIP: --node-ip from k0sworker unit, else marker for hubs.
 func nodeIP(c *cyc) string {
 	if c.t.AmLighthouse {
 		return c.t.Markers[c.t.MeshName]
 	}
 	b, _ := os.ReadFile(c.r.hp("/etc/systemd/system/k0sworker.service"))
-	re := regexp.MustCompile(`--node-ip=([0-9.]+)`)
-	if m := re.FindSubmatch(b); m != nil {
+	if m := k0sNodeIPRe.FindSubmatch(b); m != nil {
 		return string(m[1])
 	}
 	return c.t.Markers[c.t.MeshName]

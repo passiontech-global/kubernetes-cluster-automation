@@ -156,6 +156,12 @@ func (c *ClockJumpCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckClockJump, "ok")
 		return
 	}
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog("cleanup: clock-jump-session-healer held — " +
+			"cluster maintenance in progress")
+		c.d.CycleResult(wdeps.CheckClockJump, "ok")
+		return
+	}
 	if !c.d.State.RateTrySpend("last-clock-jump-konn", c.d.Cfg.MinRestartInterval) {
 		c.d.State.AppendLog(
 			"suspect: clock-jump-session-healer konn auth-fail evidence but recreate cooldown (<30m), skip")

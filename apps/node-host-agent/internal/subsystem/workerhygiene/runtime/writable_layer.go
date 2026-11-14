@@ -41,10 +41,7 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 		return
 	}
 	threshold := c.d.Cfg.Disk.WLayerBloatThresholdBytes
-	podByUID := map[string]*corev1.Pod{}
-	for i := range e.Pods {
-		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
-	}
+	podByUID := e.PodByUID()
 	// (a) overlayfs snapshot upperdirs — snapshot dir names are
 	// numeric on containerd; snapshotMountIDs binds each to its
 	// task id through the live rootfs mount's upperdir=, and
@@ -98,38 +95,32 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 // to a pod on this node, else node-scoped in the event namespace.
 func (c *WritableLayerCheck) emitWLayerBloatEvent(ctx context.Context,
 	pod *corev1.Pod, dir string, size int64) {
-	now := c.d.Cfg.Seams.Host.Clock.Now()
-	ns := c.d.Cfg.Host.EventNamespace
-	regarding := corev1.ObjectReference{
-		APIVersion: "v1",
-		Kind:       "Node",
-		Name:       c.d.Cfg.NodeName,
-	}
-	name := fmt.Sprintf("%s.wlayer.%x", c.d.Cfg.NodeName, now.UnixNano())
-	owner := "node " + c.d.Cfg.NodeName
+	note := fmt.Sprintf(
+		"writable layer %s holds %d bytes > threshold %d and the container declares no limits.ephemeral-storage — DiskPressure risk",
+		dir, size, c.d.Cfg.Disk.WLayerBloatThresholdBytes)
+	var owner string
+	var err error
 	if pod != nil {
-		ns = pod.Namespace
-		regarding = corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Namespace:  pod.Namespace,
-			Name:       pod.Name,
-			UID:        pod.UID,
-		}
-		name = fmt.Sprintf("%s.wlayer.%x", pod.Name, now.UnixNano())
 		owner = "pod " + pod.Namespace + "/" + pod.Name
+		err = c.d.EmitPodEvent(ctx, pod, "wlayer", "ContainerWritableLayerBloat", note)
+	} else {
+		now := c.d.Cfg.Seams.Host.Clock.Now()
+		owner = "node " + c.d.Cfg.NodeName
+		err = c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
+			Name:      fmt.Sprintf("%s.wlayer.%x", c.d.Cfg.NodeName, now.UnixNano()),
+			Namespace: c.d.Cfg.Host.EventNamespace,
+			Reason:    "ContainerWritableLayerBloat",
+			Note:      note,
+			When:      now,
+			Regarding: corev1.ObjectReference{
+				APIVersion: "v1",
+				Kind:       "Node",
+				Name:       c.d.Cfg.NodeName,
+			},
+			Owner: owner,
+		})
 	}
-	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
-		Name:      name,
-		Namespace: ns,
-		Reason:    "ContainerWritableLayerBloat",
-		Note: fmt.Sprintf(
-			"writable layer %s holds %d bytes > threshold %d and the container declares no limits.ephemeral-storage — DiskPressure risk",
-			dir, size, c.d.Cfg.Disk.WLayerBloatThresholdBytes),
-		When:      now,
-		Regarding: regarding,
-		Owner:     owner,
-	}); err != nil {
+	if err != nil {
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(

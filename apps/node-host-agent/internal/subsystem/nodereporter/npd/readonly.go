@@ -67,16 +67,19 @@ func (m *Monitor) SyncReadonlyMounts(ctx context.Context, s Sink) error {
 	}
 	ro := readonlyTargets(procfs.LastByMountPoint(procfs.ParseMounts(data)),
 		cfg.ReadonlyTargets, cfg.ReadonlyFSTypes)
-	was := m.readonlyFS
 	m.readonlyFS = len(ro) > 0
-	if m.readonlyFS {
-		m.readonlyFSMsg = "read-only filesystems: " + strings.Join(ro, ", ")
-		if !was {
-			if err := s.EmitEvent(ctx, readonlyProblemReason, m.readonlyFSMsg); err != nil {
-				logger().Error("nodereporter: event emit failed",
-					"reason", readonlyProblemReason, "error", err)
-			}
+	if !m.readonlyFS {
+		m.readonlyEventSent = false
+		return nil
+	}
+	m.readonlyFSMsg = "read-only filesystems: " + strings.Join(ro, ", ")
+	if !m.readonlyEventSent {
+		if err := s.EmitEvent(ctx, readonlyProblemReason, m.readonlyFSMsg); err != nil {
+			logger().Error("nodereporter: event emit failed",
+				"reason", readonlyProblemReason, "error", err)
+			return nil
 		}
+		m.readonlyEventSent = true
 	}
 	return nil
 }

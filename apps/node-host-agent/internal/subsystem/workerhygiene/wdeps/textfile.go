@@ -59,20 +59,40 @@ func (d *Deps) WalkBytes(root string) (total int64, truncated bool) {
 	return total, truncated
 }
 
+// DiskUsageRatio returns the unprivileged block-usage ratio (0..1) for dir
+// via StatfsFn, saturating when Bavail > Blocks (btrfs/XFS). Returns (0, false)
+// when statfs fails or reports zero blocks.
+func (d *Deps) DiskUsageRatio(dir string) (float64, bool) {
+	var st unix.Statfs_t
+	if err := d.Cfg.Seams.Host.StatfsFn(dir, &st); err != nil ||
+		st.Blocks == 0 || st.Bavail > st.Blocks {
+		return 0, false
+	}
+	return float64(st.Blocks-st.Bavail) / float64(st.Blocks), true
+}
+
+// DiskMaxUsageRatio returns the worst of block usage and inode usage (0..1)
+// for dir via StatfsFn.
+func (d *Deps) DiskMaxUsageRatio(dir string) (float64, bool) {
+	var st unix.Statfs_t
+	if err := d.Cfg.Seams.Host.StatfsFn(dir, &st); err != nil || st.Blocks == 0 {
+		return 0, false
+	}
+	used := 1.0 - float64(st.Bavail)/float64(st.Blocks)
+	if st.Files > 0 && st.Ffree <= st.Files {
+		if iu := 1.0 - float64(st.Ffree)/float64(st.Files); iu > used {
+			used = iu
+		}
+	}
+	return used, true
+}
+
 // DiskUsageAboveWatermark reports whether the filesystem holding dir is above
 // the ST2 removal watermark — statfs through the injectable seam.
 func (d *Deps) DiskUsageAboveWatermark(dir string) bool {
-	var st unix.Statfs_t
-	if err := d.Cfg.Seams.Host.StatfsFn(dir, &st); err != nil || st.Blocks == 0 {
-		return false // can't measure → don't remove (fail closed)
-	}
-	used := 1.0 - float64(st.Bavail)/float64(st.Blocks)
-	return used > orphanHostPathDiskHigh
+	used, ok := d.DiskUsageRatio(dir)
+	return ok && used > orphanHostPathDiskHigh
 }
-
-// PromTextfileDirOverride wins over the K0sDataDir-derived textfile
-// dir in tests (controllerhygiene's kineTextfileDirOverride parity).
-var PromTextfileDirOverride string
 
 // PromTextfileDir resolves the node-exporter textfile drop dir —
 // NODE_HOST_AGENT_TEXTFILE_DIR (wired into Config.TextfileDir from
@@ -80,9 +100,6 @@ var PromTextfileDirOverride string
 // textfile, i.e. <hostRoot>/var/lib/node-exporter/textfile in both
 // pod and standalone layouts.
 func (d *Deps) PromTextfileDir() string {
-	if PromTextfileDirOverride != "" {
-		return PromTextfileDirOverride
-	}
 	if d.Cfg.TextfileDir != "" {
 		return d.Cfg.TextfileDir
 	}

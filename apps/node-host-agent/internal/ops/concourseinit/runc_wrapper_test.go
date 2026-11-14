@@ -365,14 +365,6 @@ func TestCreateBundleParsing(t *testing.T) {
 	}
 }
 
-// syncFile's open failure is the only error it can produce in the
-// normal world (fsync on a just-written file is near-infallible).
-func TestSyncFileMissing(t *testing.T) {
-	if err := syncFile(filepath.Join(t.TempDir(), "gone")); err == nil {
-		t.Fatal("expected open error")
-	}
-}
-
 // A "mounts" field that is not an array fails its own unmarshal —
 // passthrough, config untouched, exec still runs.
 func TestWrapperCreateBadMountsShape(t *testing.T) {
@@ -427,16 +419,19 @@ func TestWrapperCreateSkipsBadMountEntry(t *testing.T) {
 	}
 }
 
-// The atomic swap's first step: when <config>.tmp cannot be created
-// (a directory squats at the staging path) the rewrite bails with the
-// config untouched — fail-open, no litter.
+// The atomic swap's first step: when the bundle directory is unwritable
+// the rewrite bails with the config untouched — fail-open, no litter.
 func TestWrapperCreateTmpWriteFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory write permissions")
+	}
 	bundle := writeSpec(t, qualifyingSpec)
 	configPath := filepath.Join(bundle, "config.json")
 	before, _ := os.ReadFile(configPath)
-	if err := os.Mkdir(configPath+".tmp", 0o755); err != nil {
+	if err := os.Chmod(bundle, 0o555); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.Chmod(bundle, 0o755) })
 
 	injectSharedCacheMount(configPath, sharedCacheSource)
 

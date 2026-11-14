@@ -85,3 +85,30 @@ func (d *Deps) EmitCheckEvent(ctx context.Context, ev CheckEvent) error {
 	}
 	return nil
 }
+
+// EmitPodEvent builds and emits a pod-scoped Warning event using the
+// standard `<pod>.<suffix>.<hex-nanos>` name and `pod <ns>/<name>`
+// owner convention.
+func (d *Deps) EmitPodEvent(ctx context.Context, p *corev1.Pod,
+	suffix, reason, note string) error {
+	now := d.Cfg.Seams.Host.Clock.Now()
+	name := fmt.Sprintf("%s.%x", p.Name, now.UnixNano())
+	if suffix != "" {
+		name = fmt.Sprintf("%s.%s.%x", p.Name, suffix, now.UnixNano())
+	}
+	return d.EmitCheckEvent(ctx, CheckEvent{
+		Name:      name,
+		Namespace: p.Namespace,
+		Reason:    reason,
+		Note:      note,
+		When:      now,
+		Regarding: corev1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "Pod",
+			Namespace:  p.Namespace,
+			Name:       p.Name,
+			UID:        p.UID,
+		},
+		Owner: "pod " + p.Namespace + "/" + p.Name,
+	})
+}

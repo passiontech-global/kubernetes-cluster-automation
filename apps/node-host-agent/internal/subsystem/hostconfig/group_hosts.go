@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+var hosts127011Re = regexp.MustCompile(`(?m)^([ \t]*127\.0\.1\.1[ \t]+)\S+(.*)$`)
+
 // hostsBlockRe matches a managed block in BOTH marker styles: the
 // ansible blockinfile `{mark} <name> managed block` and the first
 // port's `ANSIBLE MANAGED BLOCK - <name>` — stale blocks of either
@@ -109,16 +111,15 @@ func (c *cyc) hostnamePin() {
 	// aliases so a re-pin swaps ONLY the hostname field — ansible
 	// lineinfile parity keeps `127.0.1.1 <hn> alias1 alias2`'s
 	// aliases alive across converges.
-	re := regexp.MustCompile(`(?m)^([ \t]*127\.0\.1\.1[ \t]+)\S+(.*)$`)
 	line := "127.0.1.1 " + hn
-	if m := re.Find(hosts); m != nil {
+	if m := hosts127011Re.Find(hosts); m != nil {
 		// The pin must carry THIS hostname as a whole field — a
 		// substring Contains matched "127.0.1.1 worker-10" when hn
 		// was "worker-1" and left the wrong pin live.
 		pinned := slices.Contains(strings.Fields(string(m))[1:], hn)
 		if !pinned {
-			nh := re.ReplaceAllFunc(hosts, func(l []byte) []byte {
-				sub := re.FindSubmatch(l)
+			nh := hosts127011Re.ReplaceAllFunc(hosts, func(l []byte) []byte {
+				sub := hosts127011Re.FindSubmatch(l)
 				// Copy — sub slices share hosts' backing array, and
 				// appending into it would corrupt later matches.
 				out := append([]byte{}, sub[1]...)

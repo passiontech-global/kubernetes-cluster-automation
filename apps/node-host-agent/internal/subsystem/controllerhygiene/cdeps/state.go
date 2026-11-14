@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // --- watchdog file helpers (lib.sh parity) ---
@@ -61,7 +63,7 @@ func (d *Deps) ReadState(name string) string {
 // the Store's WriteEpochFile directly).
 func (d *Deps) WriteState(name, content string) {
 	p := filepath.Join(d.State.Dir, name)
-	if err := os.WriteFile(p, []byte(content+"\n"), 0o644); err != nil {
+	if err := fsx.WriteFile(p, []byte(content+"\n"), fsx.Opts{Mode: 0o644}); err != nil {
 		logger().Warn("controllerhygiene: state file write failed",
 			"path", p, "error", err)
 	}

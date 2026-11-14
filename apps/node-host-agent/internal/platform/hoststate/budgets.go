@@ -160,12 +160,14 @@ func (s *Store) rateSpendInLocked(dir, name string) {
 // after the file is gone (RateOKIn verdicts on max(disk, ram)).
 // Best-effort like ClearSuspect: an absent file is already clear.
 func (s *Store) ClearBudget(name string) {
+	s.shared.mu.Lock()
 	if err := os.Remove(filepath.Join(s.Dir, name)); err != nil &&
 		!os.IsNotExist(err) {
 		s.log().Debug("hoststate: failed to clear budget file",
 			"name", name, "error", err)
 	}
-	s.forgetSpent(name)
+	delete(s.shared.lastSpent, rateSpendKey(filepath.Clean(s.Dir), name))
+	s.shared.mu.Unlock()
 }
 
 // RateTrySpend is the atomic check+spend used for the budgets two
@@ -182,4 +184,34 @@ func (s *Store) RateTrySpend(name string, interval time.Duration) bool {
 	}
 	s.rateSpendInLocked(s.Dir, name)
 	return true
+}
+
+// ConfirmMarker implements the two-pass confirmation marker pattern
+// (`<prefix>-seen-<id>`): on first sight it creates the marker file
+// via RateSpend and returns (true, false); on subsequent cycles it
+// returns (false, true) once minAge has elapsed, or (false, false)
+// while still cooling down.
+func (s *Store) ConfirmMarker(marker string, minAge time.Duration) (firstSeen, confirmed bool) {
+	if _, err := os.Stat(filepath.Join(s.Dir, marker)); err != nil {
+		s.RateSpend(marker)
+		return true, false
+	}
+	return false, s.RateOK(marker, minAge)
+}
+
+// PruneMarkers clears any `<prefix>*` marker files whose extracted id
+// fails keep(id).
+func (s *Store) PruneMarkers(prefix string, keep func(id string) bool) {
+	ms, err := filepath.Glob(filepath.Join(s.Dir, prefix+"*"))
+	if err != nil {
+		return
+	}
+	for _, m := range ms {
+		base := filepath.Base(m)
+		id := strings.TrimPrefix(base, prefix)
+		if keep != nil && keep(id) {
+			continue
+		}
+		s.ClearBudget(base)
+	}
 }

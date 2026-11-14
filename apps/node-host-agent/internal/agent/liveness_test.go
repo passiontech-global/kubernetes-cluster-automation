@@ -79,6 +79,7 @@ func TestSuperviseRenewsLivenessPerRestart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sub := &earlyReturnSubsystem{ran: make(chan struct{})}
 	a := New(Config{Subsystems: []Subsystem{sub}})
+	a.backoffInitial = 50 * time.Millisecond
 	var wg sync.WaitGroup
 	a.supervise(ctx, &wg)
 	defer func() {

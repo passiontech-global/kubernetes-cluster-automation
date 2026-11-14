@@ -161,6 +161,24 @@ func (c *cyc) dpkgInstalled(ctx context.Context, pkg string) bool {
 	return strings.Contains(out, "install ok installed")
 }
 
+// dpkgVersionSatisfied reports whether pkg is installed and its version
+// is >= minVer (when minVer != "") via `dpkg --compare-versions`.
+func (c *cyc) dpkgVersionSatisfied(ctx context.Context, pkg, minVer string) bool {
+	out, _ := c.r.run(ctx, "dpkg-query", "-W", "-f=${Status} ${Version}", pkg)
+	if !strings.Contains(out, "install ok installed") {
+		return false
+	}
+	if minVer == "" {
+		return true
+	}
+	f := strings.Fields(out)
+	if len(f) < 4 {
+		return false
+	}
+	_, err := c.r.run(ctx, "dpkg", "--compare-versions", f[len(f)-1], "ge", minVer)
+	return err == nil
+}
+
 // dpkgMissing reports which of pkgs are not fully installed — the
 // batched dpkg-query shape of dpkgInstalled: one fork probes the
 // whole set (dpkg-query prints one line per requested package;
@@ -373,6 +391,12 @@ func topologyPlain(v any) any {
 	case *jinja.List:
 		out := make([]any, len(t.V))
 		for i, x := range t.V {
+			out[i] = topologyPlain(x)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, x := range t {
 			out[i] = topologyPlain(x)
 		}
 		return out

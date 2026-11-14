@@ -16,6 +16,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const lastHostOOMEventFile = "last-host-oom-event"
@@ -88,7 +89,7 @@ func (c *HostOOMCheck) Run(ctx context.Context, _ *wdeps.CycleEnv) {
 		p := filepath.Join(c.d.Cfg.WatchdogStateDir, lastHostOOMEventFile)
 		content := strconv.FormatInt(count, 10) + " " +
 			strconv.FormatInt(epoch, 10) + "\n"
-		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		if err := fsx.WriteFile(p, []byte(content), fsx.Opts{Mode: 0o644}); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: host-oom dedup marker write failed: %v", err))
 		}

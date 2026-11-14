@@ -173,15 +173,19 @@ func TestEnvDocOneRowPerVar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read %s: %v", docPath, err)
 	}
-	var want = "- `NODE_HOST_AGENT_NODE_NAME` — `deps_env.go:119, hostctx.go:30`\n"
-	if n := strings.Count(string(doc), "- `NODE_HOST_AGENT_NODE_NAME`"); n != 1 {
+	const prefix = "- `NODE_HOST_AGENT_NODE_NAME` — `"
+	if n := strings.Count(string(doc), prefix); n != 1 {
 		t.Fatalf("ENV.md has %d knob rows for NODE_HOST_AGENT_NODE_NAME, "+
 			"want exactly 1 (run scripts/gen-envdoc.sh — the per-package "+
 			"rows must dedupe with sources joined)", n)
 	}
-	if !strings.Contains(string(doc), want) {
-		t.Fatalf("ENV.md knob row for NODE_HOST_AGENT_NODE_NAME does not "+
-			"list both sources (want %q); run scripts/gen-envdoc.sh", want)
+	idx := strings.Index(string(doc), prefix)
+	line := string(doc)[idx:]
+	if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+		line = line[:nl]
+	}
+	if !strings.Contains(line, "deps_env.go:") || !strings.Contains(line, "hostctx.go:") {
+		t.Fatalf("ENV.md knob row %q does not list both deps_env.go and hostctx.go; run scripts/gen-envdoc.sh", line)
 	}
 }
 

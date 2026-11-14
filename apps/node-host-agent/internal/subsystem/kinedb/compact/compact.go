@@ -134,72 +134,28 @@ func (g *Guard) clampStepTarget(crev, target int64) int64 {
 // out of stdout, so the `deleted=N` lines sumDeleted parses must be
 // real query output.
 func (g *Guard) buildCompactScript(cur, target int64) string {
+	return g.buildChunkDeleteScript(cur, target, true)
+}
+
+func (g *Guard) buildSweepScript(minID, crev int64) string {
+	return g.buildChunkDeleteScript(minID, crev, false)
+}
+
+func (g *Guard) buildChunkDeleteScript(cur, target int64, advanceMarker bool) string {
 	t := kdeps.SQLIdent(g.d.Cfg.Table)
 	var b strings.Builder
-	fmt.Fprintf(&b,
-		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kcg_locked;\n",
-		g.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\gset\n\\if :kcg_locked\n")
 	b.WriteString("CREATE TEMP TABLE kcg_deleted(n int);\n")
 	for chunks := 0; cur < target && chunks < g.d.Cfg.MaxChunks; chunks++ {
 		next := cur + g.d.Cfg.ChunkRevisions
 		if next > target {
 			next = target
 		}
-		fmt.Fprintf(&b, `DO $$
-DECLARE n int;
-BEGIN
-  UPDATE %s SET prev_revision = %d WHERE name = '%s';
-  DELETE FROM %s AS kv USING (
-      SELECT kp.prev_revision AS id FROM %s AS kp
-      WHERE kp.name != '%s' AND kp.prev_revision != 0
-        AND kp.id > %d AND kp.id <= %d
-      UNION ALL
-      SELECT kd.id AS id FROM %s AS kd
-      WHERE kd.deleted != 0 AND kd.id > %d AND kd.id <= %d
-  ) AS ks WHERE kv.id = ks.id;
-  GET DIAGNOSTICS n = ROW_COUNT;
-  INSERT INTO kcg_deleted VALUES (n);
-  RAISE NOTICE 'deleted=%%', n;
-END $$;
-`, t, next, kdeps.CompactRevKey, t, t, kdeps.CompactRevKey, cur, next, t, cur, next)
-		cur = next
-	}
-	b.WriteString("SELECT 'deleted=' || n AS deleted FROM kcg_deleted;\n")
-	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", t)
-	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", g.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
-	return b.String()
-}
-
-// buildSweepScript renders the below-horizon backlog sweep: when
-// the compaction marker already sits at/ahead of head-Tail there is
-// no forward window to advance through, but dead rows BELOW
-// compact_rev can still pile up (a marker moved without its
-// deletes, or chunk ranges a previous run never reached). Rows
-// under the marker are already-compacted history — watchers resume
-// from compact_rev and eat a 410 Gone below it — so the same
-// shadowed/deleted-row DELETE semantics run over [minID, crev] in
-// bounded chunks WITHOUT the compact_rev_key UPDATE: the marker
-// must not move (there is no forward progress to record), it only
-// gates what may be deleted.
-func (g *Guard) buildSweepScript(minID, crev int64) string {
-	t := kdeps.SQLIdent(g.d.Cfg.Table)
-	var b strings.Builder
-	fmt.Fprintf(&b,
-		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kcg_locked;\n",
-		g.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\gset\n\\if :kcg_locked\n")
-	b.WriteString("CREATE TEMP TABLE kcg_deleted(n int);\n")
-	for cur, chunks := minID, 0; cur < crev && chunks < g.d.Cfg.MaxChunks; chunks++ {
-		next := cur + g.d.Cfg.ChunkRevisions
-		if next > crev {
-			next = crev
+		b.WriteString("DO $$\nDECLARE n int;\nBEGIN\n")
+		if advanceMarker {
+			fmt.Fprintf(&b, "  UPDATE %s SET prev_revision = %d WHERE name = '%s';\n",
+				t, next, kdeps.CompactRevKey)
 		}
-		fmt.Fprintf(&b, `DO $$
-DECLARE n int;
-BEGIN
-  DELETE FROM %s AS kv USING (
+		fmt.Fprintf(&b, `  DELETE FROM %s AS kv USING (
       SELECT kp.prev_revision AS id FROM %s AS kp
       WHERE kp.name != '%s' AND kp.prev_revision != 0
         AND kp.id > %d AND kp.id <= %d
@@ -216,9 +172,7 @@ END $$;
 	}
 	b.WriteString("SELECT 'deleted=' || n AS deleted FROM kcg_deleted;\n")
 	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", t)
-	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", g.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
-	return b.String()
+	return kdeps.WrapAdvisoryLockScript(g.d.Cfg.AdvisoryLockID, "kcg_locked", b.String())
 }
 
 // sumDeleted totals the deleted=N notices from the chunk run.

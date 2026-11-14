@@ -179,7 +179,11 @@ func Write(dir, name string, content []byte) error {
 					// promTouchInterval) for staleness watchers,
 					// then skip the whole write. No MkdirAll:
 					// the file exists, so the dir does too.
-					_ = fsx.TouchIfDue(path, fi, time.Now(), promTouchInterval)
+					if err := fsx.TouchIfDue(path, fi, time.Now(), promTouchInterval); err == nil {
+						if newKey, kerr := fsx.FileStatKey(path); kerr == nil && newKey != st.key {
+							promFileStates.Store(clean, promFileState{sum: sum, key: newKey})
+						}
+					}
 					return nil
 				}
 			}

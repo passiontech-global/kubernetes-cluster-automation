@@ -6,7 +6,6 @@ package probe
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
@@ -55,10 +54,7 @@ func (p *Probe) hygieneSeqScan(ctx context.Context, pg, user, pass string,
 	}
 	note(fmt.Sprintf("seq-tup-read +%d>%d between probes — planner fell back to seq scan; ANALYZE %s",
 		delta, seqTupReadDeltaMax, p.d.Cfg.Table))
-	// MkdirAll before the spend — Store.WriteEpochFile does not
-	// create the state dir itself (same note as deadTupleVacuum).
-	_ = os.MkdirAll(p.d.Cfg.GuardStateDir, 0o755)
-	if !p.d.State.RateTrySpend(kineAnalyzeFile, kineAnalyzeBudget) {
+	if !p.d.GuardRateTrySpend(kineAnalyzeFile, kineAnalyzeBudget) {
 		note("kine-analyze cooldown (<30m)")
 		return
 	}

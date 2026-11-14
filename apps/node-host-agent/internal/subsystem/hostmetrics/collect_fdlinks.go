@@ -16,16 +16,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-)
 
-// pidDirRe matches the numeric pid directories directly under
-// ProcRoot — shared by the fd-link sweep and the proc census walk.
-var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+)
 
 // fdLinkResult is the merged sweep payload — the inotify half
 // (instances/watches/top-holders) and the ebpf half (unique
@@ -109,7 +106,7 @@ func (c *Collector) sweepFDLinks() *fdLinkResult {
 	if err == nil {
 		res.procOK = true
 		for _, p := range pids {
-			if !p.IsDir() || !pidDirRe.MatchString(p.Name()) {
+			if !p.IsDir() || !procfs.IsDigits(p.Name()) {
 				continue
 			}
 			pid, _ := strconv.Atoi(p.Name())

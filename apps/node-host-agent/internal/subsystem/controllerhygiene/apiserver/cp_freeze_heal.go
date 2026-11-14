@@ -422,55 +422,26 @@ func (c *FreezeCheck) healFreeze(ctx context.Context, reason string) {
 		c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "gated").Inc()
 		return
 	}
-	// Peer-quorum gate: the peer answers probes, but the restart
-	// still needs default/kubernetes to report >=2 ready apiserver
-	// endpoints — below quorum the bounce takes the last serving
-	// apiserver down with it.
-	if !c.d.ControllerQuorumReady(ctx) {
-		c.d.State.SuspectLog(cdeps.StateCPComponentFrozen, fmt.Sprintf(
-			"suspect: cp-component-frozen %s but default/kubernetes reports <2 ready endpoints — holding restart",
-			reason), c.d.Cfg.SuspectLogCadence)
-		c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "quorum_hold").Inc()
-		return
-	}
-	if c.d.HoldEmergencyHeal(ctx) {
-		c.d.State.SuspectLog(cdeps.StateCPComponentFrozen, fmt.Sprintf(
-			"suspect: cp-component-frozen %s but cluster maintenance in progress — holding restart",
-			reason), c.d.Cfg.SuspectLogCadence)
-		c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "maint_hold").Inc()
-		return
-	}
 	// FileRateRestart — the shared k0scontroller budget — not a
 	// check-private file: a sig13 wedge restart seconds earlier
 	// must cool this heal down too (and vice versa).
-	if !c.d.State.RateOK(cdeps.FileRateRestart,
-		c.d.Cfg.CPFreeze.MinRestart) {
-		c.d.State.SuspectLog(cdeps.StateCPComponentFrozen, fmt.Sprintf(
-			"suspect: cp-component-frozen %s but in restart cooldown (<%dm), skip",
-			reason, int(c.d.Cfg.CPFreeze.MinRestart.Minutes())),
-			c.d.Cfg.SuspectLogCadence)
-		c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "cooldown").Inc()
-		return
-	}
-	switch c.d.Cfg.Sig13.Mode {
-	case cdeps.ModeEnforce:
-		c.d.State.AppendLog(
-			"ACTION: restarting k0scontroller - cp-component-frozen " +
-				reason)
-		c.d.State.RateSpend(cdeps.FileRateRestart)
-		c.d.State.ResetCounter(cdeps.FileCtrCPFreeze)
-		c.d.State.ResetCounter(cdeps.FileCtrKCMQuiet)
-		c.kcmQuietSince = time.Time{}
-		if err := c.d.Restart(ctx, c.d.Cfg.RestartUnit); err != nil {
-			c.d.State.AppendLogWarn(fmt.Sprintf(
-				"suspect: restart %s failed: %v", c.d.Cfg.RestartUnit, err))
-		}
-		c.d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "restart_controller").Inc()
-	case cdeps.ModeDryRun:
-		c.d.State.AppendLog(
-			"DRY-RUN: would restart k0scontroller - cp-component-frozen " +
-				reason)
-		c.d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "dryrun_restart").Inc()
-	}
-	c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, "ok").Inc()
+	outcome, _ := c.d.RestartWithGates(ctx, cdeps.RestartGateSpec{
+		Check:       cdeps.CheckCPFreeze,
+		State:       cdeps.StateCPComponentFrozen,
+		Budget:      cdeps.FileRateRestart,
+		Cooldown:    c.d.Cfg.CPFreeze.MinRestart,
+		NeedQuorum:  true,
+		HoldPrefix:  "cp-component-frozen " + reason,
+		Unit:        c.d.Cfg.RestartUnit,
+		ActionLine:  "ACTION: restarting k0scontroller - cp-component-frozen " + reason,
+		DryRunLine:  "DRY-RUN: would restart k0scontroller - cp-component-frozen " + reason,
+		ActionLabel: "restart_controller",
+		DryRunLabel: "dryrun_restart",
+		BeforeRestart: func() {
+			c.d.State.ResetCounter(cdeps.FileCtrCPFreeze)
+			c.d.State.ResetCounter(cdeps.FileCtrKCMQuiet)
+			c.kcmQuietSince = time.Time{}
+		},
+	})
+	c.d.Cycles.WithLabelValues(cdeps.CheckCPFreeze, outcome).Inc()
 }

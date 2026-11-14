@@ -126,13 +126,11 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.xdsFails >= c.d.Cfg.ConsecNeeded {
 		// NPD contract: the ACTION entry line feeds
 		// CiliumEnvoyXDSReject (events.go) — ActionEntryRe parses
-		// it. Once per episode: Enter is idempotent while the
-		// latch holds, so gate the line on the latch being absent.
-		fresh := !c.d.State.Exists(latchdefs.LatchCiliumEnvoyXDSReject)
-		c.d.State.Enter(latchdefs.LatchCiliumEnvoyXDSReject,
+		// it. Once per episode: EnterFresh returns true only on
+		// transition into the latch.
+		if c.d.State.EnterFresh(latchdefs.LatchCiliumEnvoyXDSReject,
 			fmt.Sprintf("update_rejected=%d fails=%d",
-				c.xdsLast, c.xdsFails))
-		if fresh {
+				c.xdsLast, c.xdsFails)) {
 			c.d.State.AppendLog(latchdefs.ActionEntryPrefix(
 				latchdefs.LatchCiliumEnvoyXDSReject) +
 				fmt.Sprintf("update_rejected=%d fails=%d",

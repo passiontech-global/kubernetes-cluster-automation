@@ -211,6 +211,7 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		a.ready.Store(false)
 		// The parked gracefulShutdown goroutines are draining the
 		// servers under shutdownGrace — wait for that drain to
 		// actually finish, then for every supervise + sd_notify
@@ -220,6 +221,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		waitSubsystems(&wg)
 		return nil
 	case err := <-errCh:
+		a.ready.Store(false)
 		// A listener died while ctx is live — drop the sibling
 		// servers too (Close is immediate; Shutdown could park on a
 		// wedged handler) so nothing outlives Run returning the

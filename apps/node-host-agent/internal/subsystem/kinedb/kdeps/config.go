@@ -8,8 +8,10 @@ package kdeps
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,7 +19,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -282,11 +283,6 @@ func (c *Config) ApplyDefaults() error {
 	if c.AdvisoryLockID == 0 {
 		c.AdvisoryLockID = defaultAdvisoryLockID
 	}
-	// compact-step-cap: NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS
-	// overrides the step cap when set to a positive integer —
-	// 0/unset/garbage keeps MaxStepRevisions disabled (the
-	// unbounded head-Tail step).
-	applyStepRevisionEnv(c)
 	if c.RepackDeadPct <= 0 {
 		c.RepackDeadPct = defaultRepackDeadPct
 	}
@@ -332,21 +328,17 @@ func (c *Config) ApplyDefaults() error {
 			return hostexec.RunCombinedEnv(ctx, env, argv...)
 		}
 	}
+	if c.MaxStepRevisions <= 0 {
+		if raw := strings.TrimSpace(os.Getenv(envnames.EnvKinedbGuardMaxStepRevisions)); raw != "" {
+			if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+				c.MaxStepRevisions = n
+			}
+		}
+	}
 	if c.StatFSFn == nil {
 		c.StatFSFn = statfsFree
 	}
 	return nil
-}
-
-// applyStepRevisionEnv is the compact-step-cap step-cap env rule shared by
-// ConfigFromEnv's knob and ApplyDefaults (a directly-constructed
-// Config never sees the knob): a positive NODE_HOST_AGENT_KINEDB_
-// GUARD_MAX_STEP_REVISIONS becomes the cap; unset/0/garbage stays
-// disabled.
-func applyStepRevisionEnv(c *Config) {
-	if n := envx.Int64(envnames.EnvKinedbGuardMaxStepRevisions, 0); n > 0 {
-		c.MaxStepRevisions = n
-	}
 }
 
 // statfsFree returns the free-byte ratio of the fs holding path —

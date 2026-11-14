@@ -197,16 +197,9 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	// Prune wedged-seen markers for dirs that disappeared between
 	// runs (teardown finished or a previous cleanup won the race).
-	if ms, err := filepath.Glob(
-		filepath.Join(c.d.Cfg.WatchdogStateDir, "wedged-seen-*")); err == nil {
-		for _, m := range ms {
-			if !liveDirs[strings.TrimPrefix(filepath.Base(m), "wedged-seen-")] {
-				// ClearBudget drops the lastSpent RAM mirror too —
-				// a bare os.Remove leaves a phantom cooldown.
-				c.d.State.ClearBudget(filepath.Base(m))
-			}
-		}
-	}
+	c.d.State.PruneMarkers("wedged-seen-", func(id string) bool {
+		return liveDirs[id]
+	})
 	// Scan task dirs → wedge candidates confirmed by a >=5m marker.
 	var wedged []string
 	for _, e := range entries {
@@ -247,12 +240,12 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.State.ClearBudget(marker)
 			continue
 		}
-		if !c.d.StateFileExists(marker) {
-			c.d.State.RateSpend(marker)
+		firstSeen, confirmed := c.d.State.ConfirmMarker(marker, 5*time.Minute)
+		if firstSeen {
 			c.d.State.AppendLog(fmt.Sprintf("ctr-task-dead candidate %.12s - confirm next run", id))
 			continue
 		}
-		if !c.d.State.RateOK(marker, 5*time.Minute) {
+		if !confirmed {
 			continue
 		}
 		wedged = append(wedged, d)
@@ -338,13 +331,13 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				continue
 			}
 			marker := "sandbox-orphan-seen-" + id
-			if !c.d.StateFileExists(marker) {
-				c.d.State.RateSpend(marker)
+			firstSeen, confirmed := c.d.State.ConfirmMarker(marker, orphanSandboxAge)
+			if firstSeen {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"orphan sandbox candidate %.12s - no task dir, no shim - confirm next run", id))
 				continue
 			}
-			if !c.d.State.RateOK(marker, orphanSandboxAge) {
+			if !confirmed {
 				continue
 			}
 			if nClean >= c.d.Cfg.Ctr.MaxTaskClean {
@@ -366,14 +359,9 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	// Prune orphan-sandbox markers whose sandbox dir disappeared
 	// between runs (containerd GC'd it or a previous cleanup won).
-	if ms, err := filepath.Glob(filepath.Join(c.d.Cfg.WatchdogStateDir,
-		"sandbox-orphan-seen-*")); err == nil {
-		for _, m := range ms {
-			if !sbDirs[strings.TrimPrefix(filepath.Base(m), "sandbox-orphan-seen-")] {
-				c.d.State.ClearBudget(filepath.Base(m))
-			}
-		}
-	}
+	c.d.State.PruneMarkers("sandbox-orphan-seen-", func(id string) bool {
+		return sbDirs[id]
+	})
 	// Full scan with no D/Z orphan shim left → release our hold on
 	// the shared latch (pod-teardown's own hold, if any, is
 	// untouched). A capped or escalated scan keeps it.

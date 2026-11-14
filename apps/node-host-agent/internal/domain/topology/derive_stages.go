@@ -9,6 +9,7 @@ package topology
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -85,7 +86,8 @@ func parseRelays(om *jinja.OMap) []RelayEntry {
 // stageMarkerDup — marker uniqueness assert.
 func stageMarkerDup(t *Topology, _ *deriveCtx) {
 	seen := map[string]string{}
-	for n, m := range t.Markers {
+	for _, n := range slices.Sorted(maps.Keys(t.Markers)) {
+		m := t.Markers[n]
 		if other, dup := seen[m]; dup {
 			t.Errors = append(t.Errors, fmt.Sprintf(
 				"marker IP %s duplicated between %s and %s — set marker_octet", m, other, n))
@@ -150,7 +152,7 @@ func stageTargetsEgress(t *Topology, c *deriveCtx) {
 			}
 		}
 		for _, r := range t.RelayMap[nm] {
-			siteOK := r.Sites == nil || contains(r.Sites, c.site)
+			siteOK := r.Sites == nil || slices.Contains(r.Sites, c.site)
 			if nsite != c.site && siteOK && r.Mode != "fallback" {
 				targets = append(targets, r.IP)
 			}
@@ -181,11 +183,11 @@ func stageProbeMarkers(t *Topology, c *deriveCtx) {
 		}
 		if nsite != c.site {
 			probeM = append(probeM, mk)
-			if !contains(c.farSites, c.site) && !contains(c.farSites, nsite) {
+			if !slices.Contains(c.farSites, c.site) && !slices.Contains(c.farSites, nsite) {
 				slowM = append(slowM, mk)
 			}
 		}
-		if contains(t.SitePeers, nm) {
+		if slices.Contains(t.SitePeers, nm) {
 			siteM = append(siteM, mk)
 		}
 	})
@@ -321,7 +323,7 @@ func stageUnsafeRoutes(t *Topology, c *deriveCtx) {
 			t.UnsafeRoutes = append(t.UnsafeRoutes, UnsafeRoute{ip + "/32", mk, 100})
 		}
 		for _, r := range t.RelayMap[nm] {
-			siteOK := r.Sites == nil || contains(r.Sites, c.site)
+			siteOK := r.Sites == nil || slices.Contains(r.Sites, c.site)
 			if siteOK && !c.selfwin[r.IP] {
 				if r.IP == "" {
 					// Same guard as the registry ip above — an
@@ -378,16 +380,10 @@ func stageBwAudit(t *Topology, c *deriveCtx) {
 			mk = c.markerOf(om)
 		}
 		t.BwAuditTargets = append(t.BwAuditTargets, AuditTarget{nm + "-marker", mk})
-		for _, r := range om.Slice("relay") {
-			var rip string
-			if rm, ok := r.(*jinja.OMap); ok {
-				rip = rm.Str("ip")
-			} else {
-				rip = jinja.Stringify(r)
-			}
-			if !seenAddr[rip] {
-				seenAddr[rip] = true
-				t.BwAuditTargets = append(t.BwAuditTargets, AuditTarget{"relay-" + rip, rip})
+		for _, r := range t.RelayMap[nm] {
+			if r.IP != "" && !seenAddr[r.IP] {
+				seenAddr[r.IP] = true
+				t.BwAuditTargets = append(t.BwAuditTargets, AuditTarget{"relay-" + r.IP, r.IP})
 			}
 		}
 	})

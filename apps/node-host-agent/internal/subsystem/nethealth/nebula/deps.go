@@ -85,7 +85,6 @@ type Deps struct {
 	HostRoot             func() string
 	Interval             func() time.Duration // effective cadence, default applied
 	TextfileDir          func() string
-	TextfileDirOverride  func() string // parent test override var
 	Clock                func() *timex.Cell
 
 	// Transport seams (the parent Config's unexported func fields).

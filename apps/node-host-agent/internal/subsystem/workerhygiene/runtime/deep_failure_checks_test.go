@@ -165,8 +165,7 @@ func TestNodeAgentPromTextfileWrite(t *testing.T) {
 	e := fixture(t)
 	h := e.H
 	dir := t.TempDir()
-	wdeps.PromTextfileDirOverride = dir
-	defer func() { wdeps.PromTextfileDirOverride = "" }()
+	h.Cfg.TextfileDir = dir
 	h.OrphanHostPathBytes = 4096
 	h.OrphanHostPathDirs = 2
 	h.WriteNodeAgentPromTextfile()

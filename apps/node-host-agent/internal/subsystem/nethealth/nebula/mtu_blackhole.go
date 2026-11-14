@@ -433,9 +433,6 @@ func (n *Deps) WriteMTUBHMetric(st *MTUProbeState) {
 		dir = filepath.Join(n.HostRoot(),
 			"var", "lib", "node-exporter", "textfile")
 	}
-	if o := n.TextfileDirOverride(); o != "" {
-		dir = o
-	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		logger().Debug("mtu metric: textfile mkdir failed",
 			"dir", dir, "error", err)

@@ -190,6 +190,9 @@ func startTempEtcdExec(ctx context.Context, bin string,
 	// cleanly), and only escalate to SIGKILL if the killGracePeriod
 	// WaitDelay elapses.
 	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
 		return cmd.Process.Signal(syscall.SIGTERM)
 	}
 	cmd.WaitDelay = killGracePeriod

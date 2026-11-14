@@ -201,7 +201,15 @@ func (j *Janitor) resetFailedUnit(ctx context.Context, unit, load, active string
 // (reparented orphan) or the parent is itself a retired-script
 // process; anything else is logged `suspect:` and skipped.
 func (j *Janitor) sweepIPMonitors() {
-	for _, pid := range j.procPIDs() {
+	pids, err := j.proc.PIDs()
+	if err != nil {
+		j.state.AppendLog(fmt.Sprintf(
+			"janitor: proc root %s unreadable: %v — ip monitor sweep skipped",
+			j.cfg.ProcRoot, err))
+		j.cycles.WithLabelValues(checkIPMonitor, "abort").Inc()
+		return
+	}
+	for _, pid := range pids {
 		argv := j.proc.Cmdline(pid)
 		if !isIPMonitorArgv(argv) {
 			continue
@@ -236,13 +244,14 @@ func (j *Janitor) sweepIPMonitors() {
 			// Retired script still looping (e.g. the unit was torn
 			// down but the shell survived): kill the loop first so
 			// the monitor can't be respawned, then the monitor.
-			j.state.AppendLog(fmt.Sprintf(
-				"ACTION: kill legacy script pid=%d (%s)", ppid, parent))
 			if err := j.cfg.killFn(ppid, syscall.SIGKILL); err != nil {
 				j.state.AppendLog(fmt.Sprintf(
 					"suspect: kill legacy script pid=%d failed: %v", ppid, err))
+			} else {
+				j.state.AppendLog(fmt.Sprintf(
+					"ACTION: kill legacy script pid=%d (%s)", ppid, parent))
+				j.actions.WithLabelValues(checkIPMonitor, "kill").Inc()
 			}
-			j.actions.WithLabelValues(checkIPMonitor, "kill").Inc()
 			j.killIPMonitor(pid, cmdline,
 				fmt.Sprintf("legacy parent pid=%d", ppid))
 		default:
@@ -255,13 +264,14 @@ func (j *Janitor) sweepIPMonitors() {
 }
 
 func (j *Janitor) killIPMonitor(pid int, cmdline, why string) {
-	j.state.AppendLog(fmt.Sprintf(
-		"ACTION: killed orphan ip monitor pid=%d (%s) cmdline=%q",
-		pid, why, cmdline))
 	if err := j.cfg.killFn(pid, syscall.SIGKILL); err != nil {
 		j.state.AppendLog(fmt.Sprintf(
 			"suspect: kill orphan ip monitor pid=%d failed: %v", pid, err))
+		return
 	}
+	j.state.AppendLog(fmt.Sprintf(
+		"ACTION: killed orphan ip monitor pid=%d (%s) cmdline=%q",
+		pid, why, cmdline))
 	j.actions.WithLabelValues(checkIPMonitor, "kill").Inc()
 }
 
@@ -292,22 +302,4 @@ func isLegacyProcCmdline(cmdline string) bool {
 		}
 	}
 	return false
-}
-
-// --- /proc helpers (hostPID: pod /proc == host /proc) ---
-// The reads themselves live in platform/procfs (j.proc); only the
-// logging wrapper below remains.
-
-// procPIDs lists the numeric pid dirs under ProcRoot via procfs.
-// An unreadable root is logged — a silent nil would make the
-// monitor sweep no-op invisibly.
-func (j *Janitor) procPIDs() []int {
-	pids, err := j.proc.PIDs()
-	if err != nil {
-		j.state.AppendLog(fmt.Sprintf(
-			"janitor: proc root %s unreadable: %v — ip monitor sweep skipped",
-			j.cfg.ProcRoot, err))
-		return nil
-	}
-	return pids
 }

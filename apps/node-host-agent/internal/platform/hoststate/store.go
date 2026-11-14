@@ -198,17 +198,25 @@ func (s *Store) Exists(name string) bool {
 // (appendFile re-enters the shared mu for the rotation decision; sync.Mutex
 // is not reentrant).
 func (s *Store) Enter(name, extra string) {
+	_ = s.EnterFresh(name, extra)
+}
+
+// EnterFresh behaves like Enter and returns true only when the latch
+// file was newly created this call (so callers can emit a one-shot
+// per-episode ACTION entry without a separate Exists race).
+func (s *Store) EnterFresh(name, extra string) bool {
 	s.shared.mu.Lock()
 	written := s.enterLocked(name)
 	s.shared.mu.Unlock()
 	if !written {
-		return
+		return false
 	}
 	if extra != "" {
 		s.AppendLog(fmt.Sprintf(latchdefs.StateEnterPrefix+"%s %s", name, extra))
 	} else {
 		s.AppendLog(latchdefs.StateEnterPrefix + name)
 	}
+	return true
 }
 
 // enterLocked performs the stat→(touch|create) half of Enter — the

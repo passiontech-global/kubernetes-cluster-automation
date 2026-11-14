@@ -85,11 +85,6 @@ type Config struct {
 	subframe.Base
 	NodeName string // this node (spec.nodeName) — conditions + events attach here
 	Client   kubernetes.Interface
-	// Systemd is the SHARED host-systemd client (wiring's sdClient via
-	// hostctx.Deps) — the journald monitors read through it instead of
-	// the reporter building its own connection. nil → applyDefaults
-	// builds an owned client (tests, hand-built configs).
-	Systemd *systemd.Client
 
 	// CycleTimeout is the per-Cycle deadline Run applies around each
 	// Cycle: Run calls Cycle synchronously inside the ticker loop,

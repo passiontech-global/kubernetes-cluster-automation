@@ -125,11 +125,11 @@ func TestKernelNetShimHygieneCheck(t *testing.T) {
 	}
 
 	// The node-agent textfile carries all five new series.
-	wdeps.PromTextfileDirOverride = t.TempDir()
-	t.Cleanup(func() { wdeps.PromTextfileDirOverride = "" })
+	td := t.TempDir()
+	e.H.Cfg.TextfileDir = td
 	e.H.WriteNodeAgentPromTextfile()
 	prom, err := os.ReadFile(filepath.Join(
-		wdeps.PromTextfileDirOverride, "node-agent-hygiene.prom"))
+		td, "node-agent-hygiene.prom"))
 	if err != nil {
 		t.Fatal(err)
 	}

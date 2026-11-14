@@ -12,11 +12,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -29,16 +29,6 @@ const (
 
 // Marker/state file name inside the watchdog state dir.
 const pidFDCountFile = "pid-fd-pressure-count"
-
-// textfileDirOverride wins over the HostRoot-derived textfile
-// dir in tests (controllerhygiene's kineTextfileDirOverride parity).
-var textfileDirOverride string
-
-// pidDirRe matches numeric /proc entries — the pid sweep's
-// directory gate. Same regex the scrape-side collectors carry in
-// the parent package (collect_inotify.go) — duplicated rather than
-// shared because the engine cannot import its parent.
-var pidDirRe = regexp.MustCompile(`^[0-9]+$`)
 
 // --- pid-fd-pressure: pid/thread/fd exhaustion ---
 
@@ -62,7 +52,7 @@ func (r *Runner) kernelProcRatios() (pids, threads, filefd, pty float64,
 	if entries, err := os.ReadDir(r.deps.ProcRoot); err == nil {
 		tasks := 0
 		for _, e := range entries {
-			if e.IsDir() && pidDirRe.MatchString(e.Name()) {
+			if e.IsDir() && procfs.IsDigits(e.Name()) {
 				tasks++
 			}
 		}
@@ -175,8 +165,8 @@ func (r *Runner) updatePidFDPressure() {
 // textfile. textfileDirOverride wins over both in tests
 // (controllerhygiene's kineTextfileDirOverride parity).
 func (r *Runner) textfileDir() string {
-	if textfileDirOverride != "" {
-		return textfileDirOverride
+	if r.deps.TextfileDir != "" {
+		return r.deps.TextfileDir
 	}
 	return promfile.TextfileDir(r.deps.HostRoot)
 }

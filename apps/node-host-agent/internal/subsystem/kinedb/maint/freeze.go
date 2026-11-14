@@ -90,15 +90,9 @@ func repackBinPath(ctx context.Context, d *kdeps.Deps, pg string) (string, error
 // (the locked session then carries the VACUUM (FREEZE, ANALYZE)).
 func (m *Maint) readXidAge(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string)) bool {
-	out, err := m.d.PsqlQuery(ctx, pg, user, pass,
-		"SELECT COALESCE(MAX(age(datfrozenxid)),0) FROM pg_database")
+	age, err := m.d.QueryXidAge(ctx, pg, user, pass)
 	if err != nil {
-		note(fmt.Sprintf("xid-age-fail: %v", err))
-		return false
-	}
-	age, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
-	if perr != nil {
-		note(fmt.Sprintf("xid-age-unparsed: %v", perr))
+		note(err.Error())
 		return false
 	}
 	res.xidAge, res.xidSeen = age, true

@@ -184,8 +184,7 @@ func TestNebulaMTUMetric(t *testing.T) {
 	n := e.n
 	st := n.mtuState()
 	dir := t.TempDir()
-	textfileDirOverride = dir
-	defer func() { textfileDirOverride = "" }()
+	n.cfg.TextfileDir = dir
 	n.writeMTUBHMetric(st)
 	b, err := os.ReadFile(filepath.Join(dir, "node-agent-nebula-mtu.prom"))
 	if err != nil {
@@ -275,10 +274,9 @@ func TestCiliumWGMTUInvariantCompliantNoClamp(t *testing.T) {
 // ticker.
 func TestMTUProbeLoopTicksAndDefaults(t *testing.T) {
 	dir := t.TempDir()
-	textfileDirOverride = dir
-	defer func() { textfileDirOverride = "" }()
 	e := mtuEnv(t)
 	n := e.n
+	n.cfg.TextfileDir = dir
 	st := n.mtuState()
 	n.cfg.Interval = 5 * time.Millisecond // fast ticks
 	ctx, cancel := context.WithCancel(context.Background())
@@ -511,8 +509,7 @@ func TestMTUMetricWriteFailuresDegrade(t *testing.T) {
 	// A FILE squatting the textfile dir path → MkdirAll fails.
 	blocker := filepath.Join(t.TempDir(), "textfile")
 	testutil.WriteFile(t, blocker, "not a dir\n")
-	textfileDirOverride = blocker
-	defer func() { textfileDirOverride = "" }()
+	n.cfg.TextfileDir = blocker
 	n.writeMTUBHMetric(st) // mkdir fails → debug log, return
 
 	// A read-only dir → promfile.Write fails after mkdir succeeds.
@@ -524,7 +521,7 @@ func TestMTUMetricWriteFailuresDegrade(t *testing.T) {
 	st.Mu.Lock()
 	st.LastGauge = "" // force the write attempt
 	st.Mu.Unlock()
-	textfileDirOverride = dir
+	n.cfg.TextfileDir = dir
 	n.writeMTUBHMetric(st)
 	if _, err := os.Stat(filepath.Join(dir, "node-agent-nebula-mtu.prom")); !os.IsNotExist(err) {
 		t.Fatal("metric file appeared despite a failed write")

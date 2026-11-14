@@ -31,8 +31,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -78,13 +76,8 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckUnlinkedOpenFiles) {
 		return
 	}
-	var st unix.Statfs_t
-	used := -1.0
-	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.K0sDataDir, &st); err == nil &&
-		st.Blocks > 0 && st.Bavail <= st.Blocks {
-		used = float64(st.Blocks-st.Bavail) / float64(st.Blocks)
-	}
-	if used < 0 {
+	used, ok := c.d.DiskUsageRatio(c.d.Cfg.K0sDataDir)
+	if !ok {
 		// statfs failed or returned garbage — inconclusive; keep
 		// the series like a failed probe.
 		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "abort")

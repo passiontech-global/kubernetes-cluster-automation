@@ -20,17 +20,8 @@ func SameNetNS(int) (bool, error) { return false, errNotLinux }
 // InNetNS refuses off Linux.
 func InNetNS(int, func() error) error { return errNotLinux }
 
-// Routes refuses off Linux.
-func Routes(int) ([]netlink.Route, error) { return nil, errNotLinux }
-
 // Rules refuses off Linux.
 func Rules(int) ([]netlink.Rule, error) { return nil, errNotLinux }
-
-// Links refuses off Linux.
-func Links(int) ([]netlink.Link, error) { return nil, errNotLinux }
-
-// LinkByName refuses off Linux.
-func LinkByName(int, string) (netlink.Link, error) { return nil, errNotLinux }
 
 // LinkAddrs refuses off Linux.
 func LinkAddrs(int, string) ([]netlink.Addr, error) { return nil, errNotLinux }

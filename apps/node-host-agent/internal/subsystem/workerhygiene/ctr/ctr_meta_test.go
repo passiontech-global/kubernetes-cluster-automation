@@ -180,7 +180,7 @@ func TestCtrMetaOrphanShims(t *testing.T) {
 	if !strings.Contains(log, "1 orphan shim(s) ppid=1") {
 		t.Fatalf("exactly one qualifying orphan expected:\n%s", log)
 	}
-	if !strings.Contains(log, "run 1/2") {
+	if !strings.Contains(log, "1/2") {
 		t.Fatalf("evidence streak not visible:\n%s", log)
 	}
 	c.Run(context.Background(), cycle)

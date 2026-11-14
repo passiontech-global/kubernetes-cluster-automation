@@ -789,7 +789,7 @@ func TestProcRootUnreadableSkipsMonitorSweep(t *testing.T) {
 		t.Fatal("missing unreadable-proc-root skip log")
 	}
 	if got := promtest.ToFloat64(
-		e.j.cycles.WithLabelValues(checkIPMonitor, "ok")); got != 1 {
-		t.Fatalf("ip-monitor cycles=%v want 1", got)
+		e.j.cycles.WithLabelValues(checkIPMonitor, "abort")); got != 1 {
+		t.Fatalf("ip-monitor abort cycles=%v want 1", got)
 	}
 }

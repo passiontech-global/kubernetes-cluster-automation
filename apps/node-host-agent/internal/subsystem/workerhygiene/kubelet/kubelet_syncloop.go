@@ -153,30 +153,10 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"kubelet-syncloop-down suppressed-overloaded - pleg-frozen last_err=%v", lastErr))
 	}
-	switch {
-	case overloaded:
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-syncloop-down - node overloaded, skip restart k0sworker (err=%v)", lastErr))
-	case !k0sWorkerSettled(c.d, ctx):
-		c.d.State.AppendLog("suspect: kubelet-syncloop-down - k0sworker not settled (<180s), skip restart")
-	case c.d.HoldLocalAction(ctx):
-		// L1↔L3 maintenance hold — BEFORE the budget spend so a held
-		// restart never burns the shared last-restart cooldown.
-		c.d.State.AppendLog("suspect: kubelet-syncloop-down - cluster maintenance in progress, skip restart k0sworker")
-	case !c.d.State.RateTrySpend("last-restart", c.d.Cfg.MinRestartInterval):
-		c.d.State.AppendLog("suspect: kubelet-syncloop-down - in restart cooldown (<30m), skip")
-	default:
-		// Budget already spent atomically by the rateTrySpend
-		// case — the feeder goroutine competes for the same file.
-		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
-			" - kubelet-syncloop-down pleg-frozen (persisted %dx)",
-			c.fails))
+	if restartK0sWorkerGated(c.d, ctx, wdeps.CheckSyncloop,
+		"kubelet-syncloop-down", "kubelet-syncloop-down", false, true, overloaded,
+		fmt.Sprintf("kubelet-syncloop-down pleg-frozen (persisted %dx)", c.fails)) {
 		c.fails = 0
-		if err := restartK0sWorker(c.d, ctx); err != nil {
-			c.d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
-		} else {
-			c.d.Actions.WithLabelValues(wdeps.CheckSyncloop, "restart").Inc()
-		}
 	}
 	c.d.CycleResult(wdeps.CheckSyncloop, "ok")
 }
@@ -440,30 +420,10 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"containerd-sock-down suppressed-overloaded - probe_err=%v", err))
 	}
-	switch {
-	case overloaded:
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: containerd-sock-down - node overloaded, skip restart k0sworker (err=%v)", err))
-	case !k0sWorkerSettled(c.d, ctx):
-		c.d.State.AppendLog("suspect: containerd-sock-down - k0sworker not settled (<180s), skip restart")
-	case c.d.HoldLocalAction(ctx):
-		// L1↔L3 maintenance hold — BEFORE the budget spend so a held
-		// restart never burns the shared last-restart cooldown.
-		c.d.State.AppendLog("suspect: containerd-sock-down - cluster maintenance in progress, skip restart k0sworker")
-	case !c.d.State.RateTrySpend("last-restart", c.d.Cfg.MinRestartInterval):
-		c.d.State.AppendLog("suspect: containerd-sock-down - in restart cooldown (<30m), skip")
-	default:
-		// Budget already spent atomically by the rateTrySpend
-		// case — the feeder goroutine competes for the same file.
-		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
-			" - containerd-sock-down %s (persisted %dx)",
-			c.d.Cfg.CtrSocket, c.fails))
+	if restartK0sWorkerGated(c.d, ctx, wdeps.CheckCtrSock,
+		"containerd-sock-down", "containerd-sock-down", false, true, overloaded,
+		fmt.Sprintf("containerd-sock-down %s (persisted %dx)", c.d.Cfg.CtrSocket, c.fails)) {
 		c.fails = 0
-		if err := restartK0sWorker(c.d, ctx); err != nil {
-			c.d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
-		} else {
-			c.d.Actions.WithLabelValues(wdeps.CheckCtrSock, "restart").Inc()
-		}
 	}
 	c.d.CycleResult(wdeps.CheckCtrSock, "ok")
 }

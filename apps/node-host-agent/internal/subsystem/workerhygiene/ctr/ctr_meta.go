@@ -112,11 +112,8 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	c.measureMetaDBSize(ctx)
 	if evidence != "" {
-		c.fails++
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: containerd meta.db corruption evidence (%s) — run %d/%d",
-			evidence, c.fails, c.d.Cfg.ConsecNeeded))
-		if c.fails >= c.d.Cfg.ConsecNeeded {
+		if !c.d.StreakPending(&c.fails,
+			fmt.Sprintf("suspect: containerd meta.db corruption evidence (%s)", evidence)) {
 			c.d.State.Enter(latchdefs.LatchContainerdCorrupt, evidence)
 		}
 	} else {

@@ -145,10 +145,7 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.scopes = map[string]*oomScope{}
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
-	podByUID := map[string]*corev1.Pod{}
-	for i := range e.Pods {
-		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
-	}
+	podByUID := e.PodByUID()
 	seen := map[string]bool{}
 	for _, podDir := range podSliceDirs(kubepods) {
 		uid := podUIDFromSlice(podDir)
@@ -252,24 +249,10 @@ func (c *SubprocOOMCheck) report(ctx context.Context, uid string,
 			base, uid, kill, pid1, memStat))
 		return
 	}
-	now := c.d.Cfg.Seams.Host.Clock.Now()
-	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
-		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-		Namespace: pod.Namespace,
-		Reason:    "ContainerSubprocessOOMKilled",
-		Note: fmt.Sprintf(
+	if err := c.d.EmitPodEvent(ctx, pod, "", "ContainerSubprocessOOMKilled",
+		fmt.Sprintf(
 			"container %s hit memcg oom_kill (total %d) but PID 1 (%d) survived %s — subprocess kill, container left running (living dead)%s",
-			base, kill, pid1, subprocOOMConfirm, memStat),
-		When: now,
-		Regarding: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Namespace:  pod.Namespace,
-			Name:       pod.Name,
-			UID:        pod.UID,
-		},
-		Owner: pod.Namespace + "/" + pod.Name,
-	}); err != nil {
+			base, kill, pid1, subprocOOMConfirm, memStat)); err != nil {
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(
@@ -299,24 +282,10 @@ func (c *SubprocOOMCheck) reportGroupKill(ctx context.Context, uid string,
 			base, uid, groupKill, delta, memStat))
 		return
 	}
-	now := c.d.Cfg.Seams.Host.Clock.Now()
-	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
-		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-		Namespace: pod.Namespace,
-		Reason:    "ContainerCgroupOOMGroupKilled",
-		Note: fmt.Sprintf(
+	if err := c.d.EmitPodEvent(ctx, pod, "", "ContainerCgroupOOMGroupKilled",
+		fmt.Sprintf(
 			"container %s hit memcg oom_group_kill (+%d, %d total) — kernel killed the entire container cgroup; pod will restart%s",
-			base, delta, groupKill, memStat),
-		When: now,
-		Regarding: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Namespace:  pod.Namespace,
-			Name:       pod.Name,
-			UID:        pod.UID,
-		},
-		Owner: pod.Namespace + "/" + pod.Name,
-	}); err != nil {
+			base, delta, groupKill, memStat)); err != nil {
 		return
 	}
 	c.d.State.AppendLog(fmt.Sprintf(

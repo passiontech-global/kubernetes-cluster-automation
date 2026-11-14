@@ -133,7 +133,7 @@ func dispatch(argv []string) (int, bool) {
 	// /concourse-runc/runc is a copy of this binary exec'd by
 	// containerd-shim — argv[0] selects the wrapper.
 	if filepath.Base(argv[0]) == "runc" {
-		return concourseinit.RuncWrapper(), true
+		return concourseinit.RunRuncWrapper(argv, os.Environ()), true
 	}
 	if len(argv) < 2 || strings.HasPrefix(argv[1], "-") {
 		return 0, false

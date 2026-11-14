@@ -44,9 +44,8 @@ func newNebulaDeps(n *NetHealth) *nebula.Deps {
 			}
 			return n.cfg.Interval
 		},
-		TextfileDir:         func() string { return n.cfg.TextfileDir },
-		TextfileDirOverride: func() string { return textfileDirOverride },
-		Clock:               func() *timex.Cell { return n.cfg.Clock },
+		TextfileDir: func() string { return n.cfg.TextfileDir },
+		Clock:       func() *timex.Cell { return n.cfg.Clock },
 		RunHostCmd: func(ctx context.Context, argv []string) (string, error) {
 			return n.cfg.runHostCmd(ctx, argv)
 		},
@@ -181,10 +180,6 @@ func (n *NetHealth) maybeClampNebulaMSS(ctx context.Context,
 func (n *NetHealth) writeMTUBHMetric(st *nebula.MTUProbeState) {
 	n.neb.WriteMTUBHMetric(st)
 }
-
-// textfileDirOverride wins over the HostRoot-derived dir in
-// tests (controllerhygiene's kineTextfileDirOverride parity).
-var textfileDirOverride string
 
 // minRTT parses the smallest "time=<ms>" from ping output — the
 // shell's wd_probe_rtt (first sample is inflated by ARP/tunnel setup).

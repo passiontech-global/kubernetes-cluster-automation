@@ -131,9 +131,7 @@ func TestParseAPFMetrics(t *testing.T) {
 func TestAPFProbeEmitsAndLogsRejectGrowth(t *testing.T) {
 	e := fixture(t)
 	root := t.TempDir()
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	body1 := apfBody(
 		map[string]float64{"system:serviceaccounts/wl-high": 40},
@@ -146,7 +144,7 @@ func TestAPFProbeEmitsAndLogsRejectGrowth(t *testing.T) {
 	}
 	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).ProbeAPF(context.Background()) // scrape 1 — baseline only
 	prom, err := os.ReadFile(filepath.Join(
-		cdeps.TextfileDirOverride, apiserver.APFPromFile))
+		e.H.Cfg.TextfileDir, apiserver.APFPromFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +176,7 @@ func TestAPFProbeEmitsAndLogsRejectGrowth(t *testing.T) {
 	if !strings.Contains(log, "+17 rejects") {
 		t.Fatalf("reject delta not logged:\n%s", log)
 	}
-	prom, _ = os.ReadFile(filepath.Join(cdeps.TextfileDirOverride, apiserver.APFPromFile))
+	prom, _ = os.ReadFile(filepath.Join(e.H.Cfg.TextfileDir, apiserver.APFPromFile))
 	if !strings.Contains(string(prom), "} 57") {
 		t.Fatalf("textfile not refreshed:\n%s", prom)
 	}
@@ -189,16 +187,14 @@ func TestAPFProbeEmitsAndLogsRejectGrowth(t *testing.T) {
 func TestAPFProbeScrapeFailureDropsSeries(t *testing.T) {
 	e := fixture(t)
 	root := t.TempDir()
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).APFMetricsFn = func(context.Context) (string, error) {
 		return "", errors.New("connection refused")
 	}
 	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).ProbeAPF(context.Background()) // must not panic
 	prom, err := os.ReadFile(filepath.Join(
-		cdeps.TextfileDirOverride, apiserver.APFPromFile))
+		e.H.Cfg.TextfileDir, apiserver.APFPromFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,9 +213,7 @@ func TestAPFProbeScrapeFailureDropsSeries(t *testing.T) {
 func TestAPFProbeCounterResetInconclusive(t *testing.T) {
 	e := fixture(t)
 	root := t.TempDir()
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).APFMetricsFn = func(context.Context) (string, error) {
 		return apfBody(map[string]float64{"a/b": 100}, nil), nil
@@ -255,8 +249,7 @@ func TestEmitAPFMetricsTerminatedWatchers(t *testing.T) {
 	e := fixture(t)
 	c := apiserver.NewFreeze(e.H.Deps, nil, nil)
 	dir := t.TempDir()
-	cdeps.TextfileDirOverride = dir
-	defer func() { cdeps.TextfileDirOverride = "" }()
+	e.H.Cfg.TextfileDir = dir
 	c.EmitAPFMetrics(nil, nil, 42, true)
 	b, err := os.ReadFile(filepath.Join(dir, apiserver.APFPromFile))
 	if err != nil {
@@ -317,8 +310,7 @@ func TestEmitAPFMetricsSortedKeys(t *testing.T) {
 	e := fixture(t)
 	c := apiserver.NewFreeze(e.H.Deps, nil, nil)
 	dir := t.TempDir()
-	cdeps.TextfileDirOverride = dir
-	defer func() { cdeps.TextfileDirOverride = "" }()
+	e.H.Cfg.TextfileDir = dir
 	c.EmitAPFMetrics(map[apiserver.APFSeriesKey]float64{
 		{"b", "p2"}: 1,
 		{"b", "p1"}: 2,
@@ -364,13 +356,12 @@ func TestAPFMetricsDefaultSeamErrors(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := fixture(t)
-			cdeps.TextfileDirOverride = t.TempDir()
-			defer func() { cdeps.TextfileDirOverride = "" }()
+			e.H.Cfg.TextfileDir = t.TempDir()
 			tc.mut(e)
 			cdepstest.Check[*apiserver.FreezeCheck](
 				e.H, cdeps.CheckCPFreeze).ProbeAPF(context.Background())
 			prom, err := os.ReadFile(filepath.Join(
-				cdeps.TextfileDirOverride, apiserver.APFPromFile))
+				e.H.Cfg.TextfileDir, apiserver.APFPromFile))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -423,8 +414,7 @@ func (errReader) Read([]byte) (int, error) {
 // textfile (apiserver-rss-gauge) and the new-key + sampling offender branches.
 func TestAPFProbeDefaultSeamEmitAndSampling(t *testing.T) {
 	e := fixture(t)
-	cdeps.TextfileDirOverride = t.TempDir()
-	defer func() { cdeps.TextfileDirOverride = "" }()
+	e.H.Cfg.TextfileDir = t.TempDir()
 
 	// Scrape 1: baseline with an RSS sample — the gauge must appear.
 	base := "process_resident_memory_bytes{instance=\"a:6443\"} 1.5e8\n"
@@ -442,7 +432,7 @@ func TestAPFProbeDefaultSeamEmitAndSampling(t *testing.T) {
 		}
 	cdepstest.Check[*apiserver.FreezeCheck](e.H, cdeps.CheckCPFreeze).ProbeAPF(context.Background())
 	prom, err := os.ReadFile(filepath.Join(
-		cdeps.TextfileDirOverride, apiserver.APFPromFile))
+		e.H.Cfg.TextfileDir, apiserver.APFPromFile))
 	if err != nil {
 		t.Fatal(err)
 	}

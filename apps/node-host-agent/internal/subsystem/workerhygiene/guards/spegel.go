@@ -11,8 +11,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -112,11 +110,7 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: spegel-mirror deleted pod %s/%s - stale containerd.sock inode (k0sworker/containerd restarted under it)",
 			sp.Namespace, sp.Name))
-		c.d.StampPodHealed(ctx, sp.Namespace, sp.Name)
-		if err := c.d.Cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
-			metav1.DeleteOptions{
-				GracePeriodSeconds: ptr.To[int64](5),
-				Preconditions:      &metav1.Preconditions{UID: &sp.UID}}); err != nil {
+		if err := c.d.DeletePodGraceful(ctx, sp); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: spegel-mirror delete %s/%s failed: %v",
 				sp.Namespace, sp.Name, err))
@@ -165,11 +159,7 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.State.AppendLog(fmt.Sprintf(
 		"ACTION: spegel-mirror deleted pod %s/%s - Ready=False %dx (containerd mirror points at a wedged peer)",
 		sp.Namespace, sp.Name, c.Fails))
-	c.d.StampPodHealed(ctx, sp.Namespace, sp.Name)
-	if err := c.d.Cfg.Client.CoreV1().Pods(sp.Namespace).Delete(ctx, sp.Name,
-		metav1.DeleteOptions{
-			GracePeriodSeconds: ptr.To[int64](5),
-			Preconditions:      &metav1.Preconditions{UID: &sp.UID}}); err != nil {
+	if err := c.d.DeletePodGraceful(ctx, sp); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: spegel-mirror delete %s/%s failed: %v",
 			sp.Namespace, sp.Name, err))

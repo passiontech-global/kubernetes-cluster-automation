@@ -16,6 +16,8 @@ import (
 
 // ---------- T12 api-local-lb ----------
 
+var kubeletServerHostRe = regexp.MustCompile(`server:\s*https://([^:/\s]+)`)
+
 func (c *cyc) groupAPILB() {
 	r, ctx := c.r, c.ctx
 	if !c.worker() {
@@ -32,8 +34,7 @@ func (c *cyc) groupAPILB() {
 	// else the hosts pin does not affect this node's kubelet (warn
 	// only — node may legitimately use a static IP).
 	if kb, err := os.ReadFile(r.hp("/var/lib/k0s/kubelet.conf")); err == nil {
-		re := regexp.MustCompile(`server:\s*https://([^:/\s]+)`)
-		if m := re.FindSubmatch(kb); m != nil && string(m[1]) != c.v("cp_endpoint") {
+		if m := kubeletServerHostRe.FindSubmatch(kb); m != nil && string(m[1]) != c.v("cp_endpoint") {
 			logger().Warn("T12: kubelet.conf server host != cp_endpoint — pin has no effect on kubelet",
 				"host", string(m[1]), "cp_endpoint", c.v("cp_endpoint"))
 		}
@@ -58,19 +59,8 @@ func (c *cyc) groupAPILB() {
 	// dpkg --compare-versions does the Debian-version compare on
 	// the host; a missing/malformed compare falls back to
 	// installing (same as the old mismatch path).
-	out, _ := r.run(ctx, "dpkg-query", "-W", "-f=${Status} ${Version}", "haproxy")
 	ver := c.v("api_lb_haproxy_version")
-	needDeb := !strings.Contains(out, "install ok installed")
-	if !needDeb && ver != "" {
-		f := strings.Fields(out)
-		if len(f) < 4 {
-			needDeb = true
-		} else if _, err := r.run(ctx, "dpkg", "--compare-versions",
-			f[len(f)-1], "ge", ver); err != nil {
-			needDeb = true
-		}
-	}
-	if needDeb {
+	if !c.dpkgVersionSatisfied(ctx, "haproxy", ver) {
 		// The deb must live on a host-visible path: download() writes
 		// in the container mount ns while apt-get runs via nsenter in
 		// the host's — /tmp/hostconfig doesn't exist there. The

@@ -70,10 +70,7 @@ func (c *PipeWriteCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckPipeWrite) {
 		return
 	}
-	podByUID := map[string]*corev1.Pod{}
-	for i := range e.Pods {
-		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
-	}
+	podByUID := e.PodByUID()
 	blocked := map[pipeWriteKey]bool{}
 	for _, pid := range e.PidsOnce() {
 		uid := podUIDForPID(c.d, pid)
@@ -143,24 +140,10 @@ func (c *PipeWriteCheck) pipeBlockedEvent(ctx context.Context,
 			key.uid))
 		return true
 	}
-	now := c.d.Cfg.Seams.Host.Clock.Now()
-	if err := c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
-		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-		Namespace: pod.Namespace,
-		Reason:    "ContainerPipeWriteBlocked",
-		Note: fmt.Sprintf(
+	if err := c.d.EmitPodEvent(ctx, pod, "", "ContainerPipeWriteBlocked",
+		fmt.Sprintf(
 			"container process pid=%d has been blocked in pipe_write (TASK_INTERRUPTIBLE) for %d consecutive cycles — the stdout/stderr 64KB pipe is full and write(1, ...) can never drain (shim/log consumer stalled, typically during log rotation). The pod answers tcpSocket probes at the kernel TCP layer while the app is frozen (Ghost Pod); inspect the shim/log tail, then restart the pod",
-			key.pid, c.streak[key]),
-		When: now,
-		Regarding: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Namespace:  pod.Namespace,
-			Name:       pod.Name,
-			UID:        pod.UID,
-		},
-		Owner: pod.Namespace + "/" + pod.Name,
-	}); err != nil {
+			key.pid, c.streak[key])); err != nil {
 		return false
 	}
 	c.d.Actions.WithLabelValues(wdeps.CheckPipeWrite, "event").Inc()

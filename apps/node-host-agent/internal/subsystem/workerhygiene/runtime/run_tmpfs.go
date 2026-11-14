@@ -14,8 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -57,16 +55,9 @@ const (
 
 // runTmpfsGuard executes one run-tmpfs round.
 func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
-	var st unix.Statfs_t
-	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.Disk.HostRunDir, &st); err != nil ||
-		st.Blocks == 0 {
+	used, ok := c.d.DiskMaxUsageRatio(c.d.Cfg.Disk.HostRunDir)
+	if !ok {
 		return // unmeasurable — keep the last ratio, never act blind
-	}
-	used := 1.0 - float64(st.Bavail)/float64(st.Blocks)
-	if st.Files > 0 && st.Ffree <= st.Files {
-		if iu := 1.0 - float64(st.Ffree)/float64(st.Files); iu > used {
-			used = iu
-		}
 	}
 	c.d.RunTmpfsUsedRatio = used
 	if used <= runTmpfsHighRatio {

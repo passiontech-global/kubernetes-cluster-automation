@@ -26,7 +26,6 @@ package probe
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -298,10 +297,7 @@ func (p *Probe) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	note(fmt.Sprintf("pgbouncer wedge: %s — remediating %s", reason, pgb))
 	logger().Warn("kinedb: pgbouncer wedge — remediating pooler",
 		"reason", reason, "container", pgb)
-	// WriteIntFile's lazy MkdirAll — Store.WriteEpochFile does
-	// not create the state dir itself.
-	_ = os.MkdirAll(dir, 0o755)
-	p.d.State.RateSpend(pgbRestartFile)
+	p.d.GuardRateSpend(pgbRestartFile)
 
 	// A starvation-only wedge gets RECONNECT first: it closes and
 	// reopens every backend conn — the half-open conns are the

@@ -167,6 +167,7 @@ func TestRunStartsSubsystems(t *testing.T) {
 		ProbeAddr:   "127.0.0.1:0",
 		Subsystems:  []Subsystem{sub},
 	})
+	a.backoffInitial = 50 * time.Millisecond
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 
@@ -264,6 +265,7 @@ func TestRunRecoversSubsystemPanic(t *testing.T) {
 		ProbeAddr:   "127.0.0.1:0",
 		Subsystems:  []Subsystem{sub},
 	})
+	a.backoffInitial = 50 * time.Millisecond
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 
@@ -517,6 +519,7 @@ func TestSubsystemUpGaugeFlips(t *testing.T) {
 		ProbeAddr:   "127.0.0.1:0",
 		Subsystems:  []Subsystem{sub},
 	})
+	a.backoffInitial = 50 * time.Millisecond
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 	defer func() { cancel(); t.Logf("Run: %v", <-done) }()
@@ -545,6 +548,7 @@ func TestSubsystemPanicCountedAsRestart(t *testing.T) {
 		ProbeAddr:   "127.0.0.1:0",
 		Subsystems:  []Subsystem{sub},
 	})
+	a.backoffInitial = 50 * time.Millisecond
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 	defer func() { cancel(); t.Logf("Run: %v", <-done) }()
@@ -583,6 +587,7 @@ func TestSubsystemEarlyReturnCancelDuringBackoff(t *testing.T) {
 		ProbeAddr:   "127.0.0.1:0",
 		Subsystems:  []Subsystem{sub},
 	})
+	a.backoffInitial = 50 * time.Millisecond
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
 

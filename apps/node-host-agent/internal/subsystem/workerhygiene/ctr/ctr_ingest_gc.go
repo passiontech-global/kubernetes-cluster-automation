@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -35,18 +33,8 @@ func (c *IngestGCCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckIngestGC) {
 		return
 	}
-	var st unix.Statfs_t
 	diskHigh := false
-	// Free > total wraps uint64 to ~2^64 → used ~= 1.0 → diskHigh
-	// permanently true → the GC sweeps EVERY cycle (btrfs/XFS can
-	// report Bavail > Blocks). Saturate instead of subtracting
-	// blind — same guard as concourse_cache's fsPressure. The
-	// free-side field is Bavail, not Bfree: kubelet/containerd run
-	// unprivileged against the root-reserved block margin, so
-	// unprivileged-free is the signal that trips ENOSPC first.
-	if err := c.d.Cfg.Seams.Host.StatfsFn(c.d.Cfg.K0sDataDir, &st); err == nil &&
-		st.Blocks > 0 && st.Bavail <= st.Blocks {
-		used := float64(st.Blocks-st.Bavail) / float64(st.Blocks)
+	if used, ok := c.d.DiskUsageRatio(c.d.Cfg.K0sDataDir); ok {
 		diskHigh = used > c.d.Cfg.Disk.HighWatermark
 	}
 	due := c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) >= c.d.Cfg.Ctr.IngestScanInterval

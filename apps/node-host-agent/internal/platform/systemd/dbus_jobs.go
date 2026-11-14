@@ -15,6 +15,7 @@ import (
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 )
 
 // dbusJob runs a start-job verb (RestartUnit /
@@ -122,72 +123,12 @@ func (b *dbusBackend) dbusSignal(ctx context.Context, unit, sig string) error {
 // the SIG prefix) to D-Bus signal numbers — the common set
 // systemctl kill accepts by name.
 func signalNumber(sig string) (int32, bool) {
-	name := strings.ToUpper(strings.TrimPrefix(sig, "SIG"))
-	switch name {
-	case "HUP":
-		return 1, true
-	case "INT":
-		return 2, true
-	case "QUIT":
-		return 3, true
-	case "ILL":
-		return 4, true
-	case "TRAP":
-		return 5, true
-	case "ABRT":
-		return 6, true
-	case "BUS":
-		return 7, true
-	case "FPE":
-		return 8, true
-	case "KILL":
-		return 9, true
-	case "USR1":
-		return 10, true
-	case "SEGV":
-		return 11, true
-	case "USR2":
-		return 12, true
-	case "PIPE":
-		return 13, true
-	case "ALRM":
-		return 14, true
-	case "TERM":
-		return 15, true
-	case "STKFLT":
-		return 16, true
-	case "CHLD":
-		return 17, true
-	case "CONT":
-		return 18, true
-	case "STOP":
-		return 19, true
-	case "TSTP":
-		return 20, true
-	case "TTIN":
-		return 21, true
-	case "TTOU":
-		return 22, true
-	case "URG":
-		return 23, true
-	case "XCPU":
-		return 24, true
-	case "XFSZ":
-		return 25, true
-	case "VTALRM":
-		return 26, true
-	case "PROF":
-		return 27, true
-	case "WINCH":
-		return 28, true
-	case "IO":
-		return 29, true
-	case "PWR":
-		return 30, true
-	case "SYS":
-		return 31, true
+	name := "SIG" + strings.ToUpper(strings.TrimPrefix(sig, "SIG"))
+	n := unix.SignalNum(name)
+	if n == 0 {
+		return 0, false
 	}
-	return 0, false
+	return int32(n), true
 }
 
 // dbusDaemonReload mirrors `systemctl daemon-reload` —

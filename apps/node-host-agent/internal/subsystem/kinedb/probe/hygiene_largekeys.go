@@ -6,7 +6,6 @@ package probe
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
@@ -32,10 +31,7 @@ func (p *Probe) hygieneLargeKeys(ctx context.Context, pg, user, pass string,
 	if p.d.Cfg.ReadOnly {
 		return
 	}
-	// MkdirAll before the spend — Store.WriteEpochFile does not
-	// create the state dir itself (same note as hygieneSeqScan).
-	_ = os.MkdirAll(p.d.Cfg.GuardStateDir, 0o755)
-	if !p.d.State.RateTrySpend(largeKeysFile, largeKeysBudget) {
+	if !p.d.GuardRateTrySpend(largeKeysFile, largeKeysBudget) {
 		return // inside the 15m window — cached rows still emit
 	}
 	// `bytes|name` field order: name lands LAST so a key containing

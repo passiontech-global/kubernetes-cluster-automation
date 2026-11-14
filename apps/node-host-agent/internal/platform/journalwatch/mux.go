@@ -78,7 +78,6 @@ type Multiplexer struct {
 	cursor     string
 	lastFetch  time.Time
 	subs       map[string]*muxSub
-	fetchErr   error // last fetch error, surfaced to Poll callers
 	fetchCount int
 	// fetchMu serializes the journalctl exec OUTSIDE m.mu — the
 	// subprocess can run for seconds and must not stall Subscribe,
@@ -205,7 +204,6 @@ func (m *Multiplexer) maybeFetch(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err != nil {
-		m.fetchErr = err
 		return err
 	}
 	// cursor advanced inside Fetch through the last COMPLETE line;
@@ -216,7 +214,6 @@ func (m *Multiplexer) maybeFetch(ctx context.Context) error {
 	m.cursor = cursor
 	m.lastFetch = m.now()
 	m.fetchCount++
-	m.fetchErr = nil
 	for _, e := range entries {
 		for _, sub := range m.subs {
 			if sub.match != nil && !sub.match(e) {

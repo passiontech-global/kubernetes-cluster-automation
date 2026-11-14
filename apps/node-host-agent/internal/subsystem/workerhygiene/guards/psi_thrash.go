@@ -11,6 +11,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kubeutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -43,26 +44,8 @@ const (
 // ok=false when the file is unreadable or carries no full avg60
 // (PSI disabled on this kernel — the whole check is then dormant).
 func psiMemoryFullAvg60(d *wdeps.Deps) (float64, bool) {
-	data, err := os.ReadFile(filepath.Join(d.Cfg.ProcRoot, "pressure", "memory"))
-	if err != nil {
-		return 0, false
-	}
-	for line := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 3 || f[0] != "full" {
-			continue
-		}
-		for _, kv := range f[1:] {
-			k, v, ok := strings.Cut(kv, "=")
-			if !ok || k != "avg60" {
-				continue
-			}
-			if x, err := strconv.ParseFloat(v, 64); err == nil {
-				return x, true
-			}
-		}
-	}
-	return 0, false
+	avg60, _, ok := procfs.ParsePSIFull(filepath.Join(d.Cfg.ProcRoot, "pressure", "memory"))
+	return avg60, ok
 }
 
 // memInfo holds the <ProcRoot>/meminfo fields the memory checks
@@ -140,14 +123,6 @@ func guardKernelSlabLeak(d *wdeps.Deps, m memInfo) bool {
 	latched := d.State.Exists(latchdefs.LatchKernelSlabLeak)
 	switch {
 	case ratio > slabLeakEnterRatio:
-		if !latched {
-			// NPD contract parity: the ACTION line announces the
-			// latch entry (nodereporter maps STATE-ENTER too).
-			d.State.AppendLog(fmt.Sprintf(
-				latchdefs.ActionEntryPrefix(latchdefs.LatchKernelSlabLeak)+
-					"sunreclaim_ratio=%.3f sunreclaim_kb=%d memtotal_kb=%d",
-				ratio, m.slabUnrecKB, m.totalKB))
-		}
 		latched = true
 	case ratio <= slabLeakClearRatio:
 		if latched {
@@ -158,10 +133,17 @@ func guardKernelSlabLeak(d *wdeps.Deps, m memInfo) bool {
 	if !latched {
 		return false
 	}
-	// stateEnter refreshes the latch mtime every cycle it is held —
+	// EnterFresh refreshes the latch mtime every cycle it is held —
 	// the janitor's 24h reap must not retire a live condition.
-	d.State.Enter(latchdefs.LatchKernelSlabLeak,
-		fmt.Sprintf("sunreclaim_ratio=%.3f", ratio))
+	if d.State.EnterFresh(latchdefs.LatchKernelSlabLeak,
+		fmt.Sprintf("sunreclaim_ratio=%.3f", ratio)) {
+		// NPD contract parity: the ACTION line announces the
+		// latch entry (nodereporter maps STATE-ENTER too).
+		d.State.AppendLog(fmt.Sprintf(
+			latchdefs.ActionEntryPrefix(latchdefs.LatchKernelSlabLeak)+
+				"sunreclaim_ratio=%.3f sunreclaim_kb=%d memtotal_kb=%d",
+			ratio, m.slabUnrecKB, m.totalKB))
+	}
 	if d.State.RateTrySpend("last-slab-drop-caches", slabDropCachesInterval) {
 		dropKernelCaches(d)
 	}
@@ -354,7 +336,8 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
 		return
 	}
-	if !c.d.State.Exists(latchdefs.LatchPSIMemoryThrash) {
+	if c.d.State.EnterFresh(latchdefs.LatchPSIMemoryThrash,
+		fmt.Sprintf("psi_full_avg60=%.1f mem_free=%.3f", avg60, free)) {
 		// NPD contract: nodereporter maps this line to the
 		// NodeMemoryPSIThrashing Event + problem_counter — logged
 		// once per latch entry (wdeps.CheckCiliumMTU parity).
@@ -363,8 +346,6 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				"psi_full_avg60=%.1f mem_free=%.3f fails=%d",
 			avg60, free, c.fails))
 	}
-	c.d.State.Enter(latchdefs.LatchPSIMemoryThrash,
-		fmt.Sprintf("psi_full_avg60=%.1f mem_free=%.3f", avg60, free))
 	if !e.APIOK {
 		c.d.State.AppendLog("suspect: psi-memory-thrash but API unreachable — skip pod evict")
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
@@ -387,18 +368,18 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
 		return
 	}
+	// L1↔L3 hold: check maintenance BEFORE spending the cooldown
+	// budget so a drain does not burn last-psi-evict.
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog("cleanup: psi-memory-thrash evict held — " +
+			"cluster maintenance in progress")
+		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
+		return
+	}
 	if !c.d.State.RateTrySpend("last-psi-evict", psiEvictInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: psi-memory-thrash victim %s/%s mem=%d - in evict cooldown (<15m), skip",
 			victim.Namespace, victim.Name, mem))
-		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
-		return
-	}
-	// L1↔L3 hold: a policy eviction during cluster maintenance is
-	// exactly the churn a drain has to un-wedge — skip this cycle.
-	if c.d.HoldLocalAction(ctx) {
-		c.d.State.AppendLog("cleanup: psi-memory-thrash evict held — " +
-			"cluster maintenance in progress")
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
 		return
 	}

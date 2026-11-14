@@ -99,6 +99,20 @@ type CycleEnv struct {
 	// dirs in one cycle; the cache makes the IO-bounded walk run at
 	// most once per path per cycle. Nil in tests → direct walks.
 	WalkOnce func(root string) (total int64, truncated bool)
+
+	podByUID map[string]*corev1.Pod
+}
+
+// PodByUID returns a lazy-cached map from pod UID string to *corev1.Pod
+// over e.Pods.
+func (e *CycleEnv) PodByUID() map[string]*corev1.Pod {
+	if e.podByUID == nil {
+		e.podByUID = make(map[string]*corev1.Pod, len(e.Pods))
+		for i := range e.Pods {
+			e.podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
+		}
+	}
+	return e.podByUID
 }
 
 // Check is one hygiene probe+remedy pair. Name() is the prometheus

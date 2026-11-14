@@ -60,13 +60,11 @@ func TestSAPubFingerprintTextfile(t *testing.T) {
 	root := t.TempDir()
 	k0s := filepath.Join(root, "k0s")
 	e.H.Cfg.K0sDir = k0s
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 	testutil.WriteFile(t, filepath.Join(k0s, "pki", "sa.pub"), "PUBKEY-BYTES")
 
 	cdepstest.Check[*pki.DriftCheck](e.H, cdeps.CheckPKIDrift).Run(context.Background())
-	data, err := os.ReadFile(filepath.Join(cdeps.TextfileDirOverride, pki.SAPubPromFile))
+	data, err := os.ReadFile(filepath.Join(e.H.Cfg.TextfileDir, pki.SAPubPromFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +77,7 @@ func TestSAPubFingerprintTextfile(t *testing.T) {
 	// A drifted sa.pub rewrites the series with the new hash.
 	testutil.WriteFile(t, filepath.Join(k0s, "pki", "sa.pub"), "PUBKEY-BYTES-2")
 	cdepstest.Check[*pki.DriftCheck](e.H, cdeps.CheckPKIDrift).Run(context.Background())
-	data, err = os.ReadFile(filepath.Join(cdeps.TextfileDirOverride, pki.SAPubPromFile))
+	data, err = os.ReadFile(filepath.Join(e.H.Cfg.TextfileDir, pki.SAPubPromFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,12 +94,10 @@ func TestSAPubFingerprintMissingFile(t *testing.T) {
 	e := fixture(t)
 	root := t.TempDir()
 	e.H.Cfg.K0sDir = filepath.Join(root, "k0s") // no sa.pub
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	cdepstest.Check[*pki.DriftCheck](e.H, cdeps.CheckPKIDrift).Run(context.Background())
-	data, err := os.ReadFile(filepath.Join(cdeps.TextfileDirOverride, pki.SAPubPromFile))
+	data, err := os.ReadFile(filepath.Join(e.H.Cfg.TextfileDir, pki.SAPubPromFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,9 +162,7 @@ func driftEnv(t *testing.T, sock *x509.Certificate, sockErr error,
 		return sock, sockErr
 	}
 	root := t.TempDir()
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	t.Cleanup(func() { cdeps.TextfileDirOverride = oldTD })
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 	return e
 }
 

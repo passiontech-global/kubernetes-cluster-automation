@@ -60,12 +60,89 @@ type HubCheck struct {
 // Name returns the check label / log context.
 func (c *HubCheck) Name() string { return cdeps.CheckHub }
 
+type rvProbe struct {
+	rvC, rvN   int64
+	gapKnown   bool
+	gap        int64
+	frn        int
+	frozen     bool
+	prv        string
+	prvOK      bool
+	prvRV      int64
+	pfn        int
+	peerFrozen bool
+}
+
 // Run executes the journal early-warning plus the rv probe wedge
 // logic — one merged 60s pass over module 22's sig13 body.
 func (c *HubCheck) Run(ctx context.Context) {
 	now := c.d.Cfg.Clock.Now()
+	cacheErrs := c.checkCacheStale(ctx, now)
 
-	// --- early warning: apiserver-cache-stale ---
+	// --- functional wedge confirm ---
+	// The shell gates the whole rv probe on the admin cert existing;
+	// ensureClient()==nil is the equivalent "not a controller / k0s
+	// not initialised" no-op.
+	if c.d.EnsureClient() == nil {
+		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "no_creds").Inc()
+		return
+	}
+
+	p := c.probeSelfAndPeerRV(ctx)
+
+	wedged := false
+	wreason := ""
+	if p.gapKnown && p.gap > c.d.Cfg.Sig13.GapMin {
+		wedged = true
+		wreason = fmt.Sprintf("gap=%d", p.gap)
+	} else if p.frozen {
+		wedged = true
+		wreason = fmt.Sprintf("frozen=%dx gap=%d", p.frn, p.gap)
+	}
+	// A measurable gap means the API answered → kine backend is
+	// alive → clear the DB-dead latch (the alert must not outlive
+	// the outage it describes).
+	if p.gapKnown {
+		c.d.StateExit(cdeps.StateKineUnreachable)
+	}
+
+	if !wedged {
+		c.d.State.ResetCounter(cdeps.FileCtrGap)
+		c.d.StateExit(cdeps.StateCacheWedged)
+		// rv measurable again → reset the dead counter (it only
+		// covers the both-APIs-mute window; left alone it would
+		// carry into the next incident).
+		if p.gapKnown {
+			c.d.State.ResetCounter(cdeps.FileCtrDead)
+		}
+		if !p.gapKnown && cacheErrs > 0 {
+			c.deadFallback(ctx)
+		}
+		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "ok").Inc()
+		return
+	}
+
+	// --- wedge evidence present ---
+	gn := c.d.State.Incr(cdeps.FileCtrGap)
+	c.d.State.Enter(cdeps.StateCacheWedged,
+		fmt.Sprintf("%s rv_cache=%d rv_now=%d", wreason, p.rvC, p.rvN))
+	// Frozen is already sustained evidence — bypass the second
+	// GAP_CYCLES gate (a big one-off gap can be transient lag; a
+	// bit-identical rv_cache cannot).
+	if !p.frozen && gn < c.d.StreakCycles(c.d.Cfg.Sig13.GapCycles) {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: apiserver cache %s — wedge evidence%s",
+			wreason,
+			checkkit.Progress(gn, c.d.StreakCycles(c.d.Cfg.Sig13.GapCycles))))
+		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "ok").Inc()
+		return
+	}
+
+	c.fenceAndRestart(ctx, wreason, gn, p)
+	c.d.Cycles.WithLabelValues(cdeps.CheckHub, "ok").Inc()
+}
+
+func (c *HubCheck) checkCacheStale(ctx context.Context, now time.Time) int {
 	cacheErrs := cdeps.CountMatches(cacheErrRe,
 		c.d.JournalText(ctx, now.Add(-6*time.Minute)))
 	if cacheErrs >= c.d.Cfg.Sig13.StaleMinErrs {
@@ -77,44 +154,37 @@ func (c *HubCheck) Run(ctx context.Context) {
 	} else {
 		c.d.StateExit(cdeps.StateCacheStale)
 	}
+	return cacheErrs
+}
 
-	// --- functional wedge confirm ---
-	// The shell gates the whole rv probe on the admin cert existing;
-	// ensureClient()==nil is the equivalent "not a controller / k0s
-	// not initialised" no-op.
-	if c.d.EnsureClient() == nil {
-		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "no_creds").Inc()
-		return
-	}
-
-	rvC, okC := c.d.ListRV(ctx, c.d.Cfg.Hub.SelfEndpoint, true)
-	rvN, okN := c.d.ListRV(ctx, c.d.Cfg.Hub.SelfEndpoint, false)
+func (c *HubCheck) probeSelfAndPeerRV(ctx context.Context) rvProbe {
+	var p rvProbe
+	var okC, okN bool
+	p.rvC, okC = c.d.ListRV(ctx, c.d.Cfg.Hub.SelfEndpoint, true)
+	p.rvN, okN = c.d.ListRV(ctx, c.d.Cfg.Hub.SelfEndpoint, false)
 	// Consistent read via self failed (apiserver too wedged) → fall
 	// back to the peer: every consistent read goes to the storage
 	// backend so the rv is equivalent.
 	if !okN && c.d.Cfg.Hub.PeerAPI != "" {
-		rvN, okN = c.d.ListRV(ctx, c.d.Cfg.Hub.PeerAPI, false)
+		p.rvN, okN = c.d.ListRV(ctx, c.d.Cfg.Hub.PeerAPI, false)
 	}
-	gapKnown := okC && okN
-	var gap int64
-	if gapKnown {
-		gap = rvN - rvC
-		c.d.RVGap.Set(float64(gap))
+	p.gapKnown = okC && okN
+	if p.gapKnown {
+		p.gap = p.rvN - p.rvC
+		c.d.RVGap.Set(float64(p.gap))
 	}
 
 	// Frozen signal: rv_cache bit-identical to the previous cycle
 	// while rv_now keeps advancing. Counter resets when rv_cache
 	// moves (healthy), rv_now <= rv_cache (idle cluster — standing
 	// still is not wedge evidence) or rv_now is unmeasurable.
-	frn := 0
-	frozen := false
 	if okC {
 		prev := c.d.ReadState(cdeps.FileLastRVC)
-		c.d.State.WriteEpochFile(filepath.Join(c.d.State.Dir, cdeps.FileLastRVC), rvC)
-		if gapKnown && prev == strconv.FormatInt(rvC, 10) && rvN > rvC {
-			frn = c.d.State.Incr(cdeps.FileCtrFrozen)
-			if frn >= c.d.StreakCycles(c.d.Cfg.Sig13.FrozenCycles) {
-				frozen = true
+		c.d.State.WriteEpochFile(filepath.Join(c.d.State.Dir, cdeps.FileLastRVC), p.rvC)
+		if p.gapKnown && prev == strconv.FormatInt(p.rvC, 10) && p.rvN > p.rvC {
+			p.frn = c.d.State.Incr(cdeps.FileCtrFrozen)
+			if p.frn >= c.d.StreakCycles(c.d.Cfg.Sig13.FrozenCycles) {
+				p.frozen = true
 			}
 		} else {
 			c.d.State.ResetCounter(cdeps.FileCtrFrozen)
@@ -125,90 +195,39 @@ func (c *HubCheck) Run(ctx context.Context) {
 	// fence distinguishes "peer genuinely fresh" (cache advancing)
 	// from "peer also wedged" — a gap-only check misses a fresh peer
 	// wedge (gap stays < GapMin for the first hours).
-	prv := ""
-	prvOK := false
-	var prvRV int64
-	pfn := 0
-	peerFrozen := false
 	if c.d.Cfg.Hub.PeerAPI != "" {
-		prvRV, prvOK = c.d.ListRV(ctx, c.d.Cfg.Hub.PeerAPI, true)
-		if prvOK {
-			prv = strconv.FormatInt(prvRV, 10)
+		p.prvRV, p.prvOK = c.d.ListRV(ctx, c.d.Cfg.Hub.PeerAPI, true)
+		if p.prvOK {
+			p.prv = strconv.FormatInt(p.prvRV, 10)
 			prevP := c.d.ReadState(cdeps.FileLastPRVC)
-			c.d.State.WriteEpochFile(filepath.Join(c.d.State.Dir, cdeps.FileLastPRVC), prvRV)
-			if prevP != "" && prevP == prv && gapKnown && rvN > prvRV {
-				pfn = c.d.State.Incr(cdeps.FileCtrPeerFrozen)
-				if pfn >= c.d.StreakCycles(c.d.Cfg.Sig13.FrozenCycles) {
-					peerFrozen = true
+			c.d.State.WriteEpochFile(filepath.Join(c.d.State.Dir, cdeps.FileLastPRVC), p.prvRV)
+			if prevP != "" && prevP == p.prv && p.gapKnown && p.rvN > p.prvRV {
+				p.pfn = c.d.State.Incr(cdeps.FileCtrPeerFrozen)
+				if p.pfn >= c.d.StreakCycles(c.d.Cfg.Sig13.FrozenCycles) {
+					p.peerFrozen = true
 				}
 			} else {
 				c.d.State.ResetCounter(cdeps.FileCtrPeerFrozen)
 			}
 		}
 	}
+	return p
+}
 
-	wedged := false
-	wreason := ""
-	if gapKnown && gap > c.d.Cfg.Sig13.GapMin {
-		wedged = true
-		wreason = fmt.Sprintf("gap=%d", gap)
-	} else if frozen {
-		wedged = true
-		wreason = fmt.Sprintf("frozen=%dx gap=%d", frn, gap)
-	}
-	// A measurable gap means the API answered → kine backend is
-	// alive → clear the DB-dead latch (the alert must not outlive
-	// the outage it describes).
-	if gapKnown {
-		c.d.StateExit(cdeps.StateKineUnreachable)
-	}
-
-	if !wedged {
-		c.d.State.ResetCounter(cdeps.FileCtrGap)
-		c.d.StateExit(cdeps.StateCacheWedged)
-		// rv measurable again → reset the dead counter (it only
-		// covers the both-APIs-mute window; left alone it would
-		// carry into the next incident).
-		if gapKnown {
-			c.d.State.ResetCounter(cdeps.FileCtrDead)
-		}
-		if !gapKnown && cacheErrs > 0 {
-			c.deadFallback(ctx)
-		}
-		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "ok").Inc()
-		return
-	}
-
-	// --- wedge evidence present ---
-	gn := c.d.State.Incr(cdeps.FileCtrGap)
-	c.d.State.Enter(cdeps.StateCacheWedged,
-		fmt.Sprintf("%s rv_cache=%d rv_now=%d", wreason, rvC, rvN))
-	// Frozen is already sustained evidence — bypass the second
-	// GAP_CYCLES gate (a big one-off gap can be transient lag; a
-	// bit-identical rv_cache cannot).
-	if !frozen && gn < c.d.StreakCycles(c.d.Cfg.Sig13.GapCycles) {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: apiserver cache %s — wedge evidence%s",
-			wreason,
-			checkkit.Progress(gn, c.d.StreakCycles(c.d.Cfg.Sig13.GapCycles))))
-		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "ok").Inc()
-		return
-	}
-
-	// --- peer fence ---
+func (c *HubCheck) fenceAndRestart(ctx context.Context, wreason string, gn int, p rvProbe) {
 	peerFresh := false
 	peerNote := "no-api-peer-conf"
 	if c.d.Cfg.Hub.PeerAPI != "" {
 		switch {
-		case !prvOK:
+		case !p.prvOK:
 			peerNote = "peer-unreachable-or-unreadable"
-		case peerFrozen:
-			peerNote = fmt.Sprintf("peer-frozen prv=%s (%dx)", prv, pfn)
-		case rvN-prvRV < c.d.Cfg.Sig13.GapMin:
+		case p.peerFrozen:
+			peerNote = fmt.Sprintf("peer-frozen prv=%s (%dx)", p.prv, p.pfn)
+		case p.rvN-p.prvRV < c.d.Cfg.Sig13.GapMin:
 			peerFresh = true
-			peerNote = fmt.Sprintf("peer-fresh gap=%d", rvN-prvRV)
+			peerNote = fmt.Sprintf("peer-fresh gap=%d", p.rvN-p.prvRV)
 		default:
-			peerNote = fmt.Sprintf("peer-stale gap=%d", rvN-prvRV)
+			peerNote = fmt.Sprintf("peer-stale gap=%d", p.rvN-p.prvRV)
 		}
 	}
 	soloOK := false
@@ -238,7 +257,7 @@ func (c *HubCheck) Run(ctx context.Context) {
 				"suspect: apiserver-cache-wedged %s (%dx) but cluster maintenance in progress — holding restart",
 				wreason, gn), c.d.Cfg.SuspectLogCadence)
 			c.d.Actions.WithLabelValues(cdeps.CheckHub, "maint_hold").Inc()
-			break
+			return
 		}
 		// Peer-quorum gate on the peer-fresh path: the kubernetes
 		// service must still report >=2 ready apiserver endpoints —
@@ -251,14 +270,21 @@ func (c *HubCheck) Run(ctx context.Context) {
 				"suspect: apiserver-cache-wedged %s (%dx) but default/kubernetes reports <2 ready endpoints — holding restart",
 				wreason, gn), c.d.Cfg.SuspectLogCadence)
 			c.d.Actions.WithLabelValues(cdeps.CheckHub, "quorum_hold").Inc()
-			break
+			return
 		}
 		switch c.d.Cfg.Sig13.Mode {
 		case cdeps.ModeEnforce:
+			if !c.d.State.RateTrySpend(cdeps.FileRateRestart, c.d.Cfg.Sig13.MinRestart) {
+				c.d.State.SuspectLog(cdeps.StateCacheWedged, fmt.Sprintf(
+					"suspect: apiserver-cache-wedged %s (%dx) - in restart cooldown (<%dm), skip",
+					wreason, gn, int(c.d.Cfg.Sig13.MinRestart.Minutes())),
+					c.d.Cfg.SuspectLogCadence)
+				c.d.Actions.WithLabelValues(cdeps.CheckHub, "fence_cooldown").Inc()
+				return
+			}
 			c.d.State.AppendLog(fmt.Sprintf(
 				"ACTION: restarting k0scontroller - apiserver-cache-wedged %s (%dx) %s solo=%v",
 				wreason, gn, peerNote, soloOK))
-			c.d.State.RateSpend(cdeps.FileRateRestart)
 			c.d.State.ResetCounter(cdeps.FileCtrGap)
 			// cp-component-restart: hung HTTP/2 watch streams can survive past the
 			// wedge decision and pin the apiserver's watch cache —
@@ -285,7 +311,6 @@ func (c *HubCheck) Run(ctx context.Context) {
 			wreason, gn, peerNote, c.d.StreakCycles(c.d.Cfg.Sig13.SoloCycles)), c.d.Cfg.SuspectLogCadence)
 		c.d.Actions.WithLabelValues(cdeps.CheckHub, "fence_skip").Inc()
 	}
-	c.d.Cycles.WithLabelValues(cdeps.CheckHub, "ok").Inc()
 }
 
 // deadFallback is the rv-unmeasurable path (incident 2026-09-25: both

@@ -145,3 +145,36 @@ func IsDigits(s string) bool {
 	}
 	return true
 }
+
+// ParsePSIFull reads a /proc/pressure/* or cgroup *.pressure file and
+// extracts the `full` line's avg60 and avg300 values. ok is true iff
+// `full` and `avg60=` were parsed.
+func ParsePSIFull(path string) (avg60, avg300 float64, ok bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 || f[0] != "full" {
+			continue
+		}
+		for _, kv := range f[1:] {
+			k, v, cut := strings.Cut(kv, "=")
+			if !cut {
+				continue
+			}
+			x, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				continue
+			}
+			switch k {
+			case "avg60":
+				avg60, ok = x, true
+			case "avg300":
+				avg300 = x
+			}
+		}
+	}
+	return avg60, avg300, ok
+}

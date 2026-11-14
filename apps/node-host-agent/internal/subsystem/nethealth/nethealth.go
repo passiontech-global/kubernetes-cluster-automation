@@ -49,6 +49,7 @@ package nethealth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 
@@ -177,8 +178,19 @@ func (n *NetHealth) Run(ctx context.Context) {
 		// leave route deletes unmonitored until the next
 		// full Run restart.
 		n.spawnRouteGuard(ctx)
-		n.Cycle(ctx)
+		n.runCycle(ctx)
 	}).Run(ctx)
+}
+
+func (n *NetHealth) runCycle(ctx context.Context) {
+	cctx, cancel := context.WithTimeout(ctx, n.cfg.CycleTimeout)
+	defer cancel()
+	n.Cycle(cctx)
+	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+		n.state.AppendLogWarn(fmt.Sprintf(
+			"nethealth: cycle deadline %s exceeded — stalled check(s) aborted",
+			n.cfg.CycleTimeout))
+	}
 }
 
 // initChecks builds the ordered dispatch table Cycle drives — the

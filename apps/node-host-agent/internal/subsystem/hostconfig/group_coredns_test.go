@@ -532,7 +532,7 @@ func TestJSONPlainFlattens(t *testing.T) {
 	om.Set("b", inner)
 	om.Set("a", &jinja.List{V: []any{3, "x"}})
 
-	got := jsonPlain(om).(map[string]any)
+	got := topologyPlain(om).(map[string]any)
 	if got["b"].(map[string]any)["z"] != 1 {
 		t.Fatalf("nested OMap not flattened: %v", got)
 	}
@@ -542,7 +542,7 @@ func TestJSONPlainFlattens(t *testing.T) {
 
 	// Plain []any — the untested branch: elements are still
 	// recursively flattened.
-	out := jsonPlain([]any{inner, "s"}).([]any)
+	out := topologyPlain([]any{inner, "s"}).([]any)
 	if out[0].(map[string]any)["z"] != 1 || out[1] != "s" {
 		t.Fatalf("[]any input not flattened: %v", out)
 	}

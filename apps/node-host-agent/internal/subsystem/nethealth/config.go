@@ -24,6 +24,7 @@ import (
 // Defaults mirror the shell modules + DaemonSet host mounts.
 const (
 	defaultInterval     = 2 * time.Minute
+	defaultCycleTimeout = 15 * time.Minute
 	defaultConsecNeeded = 2
 	defaultMinRestart   = 30 * time.Minute
 	defaultHostRoot     = "/"
@@ -68,6 +69,7 @@ type Config struct {
 	// state dir/log, host root, systemd client, watchdog conf +
 	// reloader and clock splice (subframe.FromDeps).
 	subframe.Base
+	CycleTimeout       time.Duration
 	HostResolvConf     string // host resolv.conf (DNS probe source)
 	HostsFile          string // host /etc/hosts (managed block)
 	ProcNetUDP         string // host /proc/1/net/udp (socket check)
@@ -152,6 +154,9 @@ type Config struct {
 func (c *Config) applyDefaults() {
 	if c.Interval <= 0 {
 		c.Interval = defaultInterval
+	}
+	if c.CycleTimeout <= 0 {
+		c.CycleTimeout = defaultCycleTimeout
 	}
 	if c.WatchdogStateDir == "" {
 		c.WatchdogStateDir = defaultWatchdogStateDir

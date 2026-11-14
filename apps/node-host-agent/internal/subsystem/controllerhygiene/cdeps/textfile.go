@@ -17,20 +17,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
-// TextfileDirOverride wins over the K0sDir-derived textfile dir —
-// test seam.
-var TextfileDirOverride = ""
-
 // textfilePromDir resolves the node-exporter textfile drop dir:
 // NODE_HOST_AGENT_TEXTFILE_DIR (wired into Config.TextfileDir from
 // hostctx) when set; else K0sDir is <hostRoot>/var/lib/k0s, so the
 // dir is its sibling <hostRoot>/var/lib/node-exporter/textfile
-// (DaemonSet: /host/var/lib/..., standalone: /var/lib/...). The
-// override wins for tests.
+// (DaemonSet: /host/var/lib/..., standalone: /var/lib/...).
 func (d *Deps) textfilePromDir() string {
-	if TextfileDirOverride != "" {
-		return TextfileDirOverride
-	}
 	if d.Cfg.TextfileDir != "" {
 		return d.Cfg.TextfileDir
 	}

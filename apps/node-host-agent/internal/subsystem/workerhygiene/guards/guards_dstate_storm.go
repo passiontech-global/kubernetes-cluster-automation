@@ -77,16 +77,15 @@ func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckDState, "ok")
 		return
 	}
-	if !c.d.State.Exists(latchdefs.LatchDStateStorm) {
+	if c.d.State.EnterFresh(latchdefs.LatchDStateStorm,
+		fmt.Sprintf("count=%d runtime=%d", total, runtime)) {
 		// NPD contract: nodereporter maps this line to the
 		// KernelHungTasks Event + problem_counter — logged once per
-		// latch entry (the !stateExists gate, wdeps.CheckCiliumMTU parity).
+		// latch entry.
 		c.d.State.AppendLog(fmt.Sprintf(
 			latchdefs.ActionEntryPrefix(latchdefs.LatchDStateStorm)+
 				"count=%d runtime=%d wchan=%s",
 			total, runtime, strings.Join(wchans, ",")))
 	}
-	c.d.State.Enter(latchdefs.LatchDStateStorm,
-		fmt.Sprintf("count=%d runtime=%d", total, runtime))
 	c.d.CycleResult(wdeps.CheckDState, "ok")
 }

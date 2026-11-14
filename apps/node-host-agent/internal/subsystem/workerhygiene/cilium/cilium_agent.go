@@ -66,7 +66,9 @@ func (c *CiliumCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// conntrack/SNAT/LB BPF maps can sit at capacity while the
 		// agent still answers 200. Evaluate the map fill ratios on
 		// the same agent socket.
-		c.CheckBPFMaps(ctx)
+		if !c.d.Gated(e, wdeps.CheckCiliumBPF) {
+			c.CheckBPFMaps(ctx)
+		}
 		c.d.CycleResult(wdeps.CheckCilium, "ok")
 		return
 	}

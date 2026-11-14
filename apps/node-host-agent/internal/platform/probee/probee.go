@@ -55,25 +55,19 @@ package probee
 import (
 	"crypto/tls"
 	"net/http"
-	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // insecureClient backs the kubelet/apiserver/KCM probes — every
 // original carried `curl -ks` parity because kubelet and the KCM /
 // scheduler endpoints serve certs whose SANs never cover the
 // loopback/IP addresses the agent dials.
-var insecureClient = func() *http.Client {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // mirrors curl -ks
-	tr.IdleConnTimeout = 90 * time.Second
-	return &http.Client{Transport: tr}
-}()
+var insecureClient = &http.Client{
+	Transport: httpx.PooledTransport(0, &tls.Config{InsecureSkipVerify: true}), // mirrors curl -ks
+}
 
 // plainClient backs the unauthenticated-plaintext probes (kubelet
 // :10248 healthz, envoy admin :9901) — a verifying TLS transport,
 // matching the originals which set no TLSClientConfig at all.
-var plainClient = func() *http.Client {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.IdleConnTimeout = 90 * time.Second
-	return &http.Client{Transport: tr}
-}()
+var plainClient = &http.Client{Transport: httpx.PooledTransport(0, nil)}

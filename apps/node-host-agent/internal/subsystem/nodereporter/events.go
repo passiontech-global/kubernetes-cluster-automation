@@ -107,28 +107,22 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 	if replay && (ts.IsZero() || r.cfg.Clock.Now().Sub(ts) > r.cfg.LogLookback) {
 		return true
 	}
-	ok := true
-	for _, rule := range logRules {
-		if !rule.re.MatchString(msg) {
-			continue
-		}
-		r.problemCounter.WithLabelValues(rule.reason).Inc()
-		if err := r.emitEvent(ctx, rule.reason, msg, corev1.EventTypeWarning); err != nil {
-			// Logged, not fatal — the counter already reflects the
-			// match and the next identical line retries the Event.
-			logger().Error("nodereporter: event emit failed",
-				"reason", rule.reason, "error", err)
-			ok = false
-		}
+	ok := r.applyRules(ctx, logRules, msg, corev1.EventTypeWarning, "nodereporter: event emit failed")
+	if !r.applyRules(ctx, exitLogRules, msg, corev1.EventTypeNormal, "nodereporter: exit event emit failed") {
+		ok = false
 	}
-	for _, rule := range exitLogRules {
+	return ok
+}
+
+func (r *Reporter) applyRules(ctx context.Context, rules []logRule, msg, eventType, errMsg string) bool {
+	ok := true
+	for _, rule := range rules {
 		if !rule.re.MatchString(msg) {
 			continue
 		}
 		r.problemCounter.WithLabelValues(rule.reason).Inc()
-		if err := r.emitEvent(ctx, rule.reason, msg, corev1.EventTypeNormal); err != nil {
-			logger().Error("nodereporter: exit event emit failed",
-				"reason", rule.reason, "error", err)
+		if err := r.emitEvent(ctx, rule.reason, msg, eventType); err != nil {
+			logger().Error(errMsg, "reason", rule.reason, "error", err)
 			ok = false
 		}
 	}

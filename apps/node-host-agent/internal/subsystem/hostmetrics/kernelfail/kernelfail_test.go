@@ -167,9 +167,10 @@ func TestPidFDPressureLatch(t *testing.T) {
 		t.Fatal("latch not cleared below threshold")
 	}
 	// Textfile gauge emitted.
-	textfileDirOverride = t.TempDir()
+	td := t.TempDir()
+	f.r.deps.TextfileDir = td
 	f.r.updatePidFDPressure()
-	b, err := os.ReadFile(filepath.Join(textfileDirOverride,
+	b, err := os.ReadFile(filepath.Join(td,
 		"node-agent-kernel.prom"))
 	if err != nil {
 		t.Fatalf("kernel prom missing: %v", err)
@@ -289,8 +290,8 @@ func TestROPVCMounts(t *testing.T) {
 // fallback behavior is pinned separately below.
 func TestClockWarpDetection(t *testing.T) {
 	f := kfixture(t)
-	textfileDirOverride = t.TempDir()
-	t.Cleanup(func() { textfileDirOverride = "" })
+	td := t.TempDir()
+	f.r.deps.TextfileDir = td
 	now := time.Now()
 	f.deps.Clock.Set(func() time.Time { return now })
 
@@ -336,7 +337,7 @@ func TestClockWarpDetection(t *testing.T) {
 		t.Fatalf("watchdog log missing clock-warp ACTION:\n%s", data)
 	}
 	prom, err := os.ReadFile(filepath.Join(
-		textfileDirOverride, "node-agent-clockwarp.prom"))
+		td, "node-agent-clockwarp.prom"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,8 +670,7 @@ func TestEnsureStateLatchWriteFailure(t *testing.T) {
 func TestKernelUtilPromPartialSources(t *testing.T) {
 	f := kfixture(t)
 	dir := t.TempDir()
-	textfileDirOverride = dir
-	t.Cleanup(func() { textfileDirOverride = "" })
+	f.r.deps.TextfileDir = dir
 
 	// pid dirs 7 and 9 + pid_max → only the pids ratio parses.
 	for _, pid := range []string{"7", "9"} {
@@ -747,8 +747,7 @@ func TestClockWarpPromInstallFailure(t *testing.T) {
 	f := kfixture(t)
 	blocker := filepath.Join(t.TempDir(), "file")
 	testutil.WriteFile(t, blocker, "x\n")
-	textfileDirOverride = filepath.Join(blocker, "textfile")
-	t.Cleanup(func() { textfileDirOverride = "" })
+	f.r.deps.TextfileDir = filepath.Join(blocker, "textfile")
 
 	now := time.Now()
 	f.deps.Clock.Set(func() time.Time { return now })
@@ -830,8 +829,7 @@ func TestKernelPromWritersSurviveBrokenTextfileDir(t *testing.T) {
 	f := kfixture(t)
 	blocker := filepath.Join(t.TempDir(), "file")
 	testutil.WriteFile(t, blocker, "x\n")
-	textfileDirOverride = filepath.Join(blocker, "textfile")
-	t.Cleanup(func() { textfileDirOverride = "" })
+	f.r.deps.TextfileDir = filepath.Join(blocker, "textfile")
 
 	// pid/fd domain: one parsed source walks the writer; entropy
 	// parses for the steal domain — both textfile installs fail.

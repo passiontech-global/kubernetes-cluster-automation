@@ -230,32 +230,51 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	} else {
 		c.d.State.Exit(latchdefs.LatchKubeletRuntimeStall, nil)
 	}
-	switch {
-	case overloaded:
-		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - node overloaded, skip restart k0sworker", reason))
-	case !e.APIOK:
-		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - API unreachable (isolated?), skip restart k0sworker", reason))
-	case !k0sWorkerSettled(c.d, ctx):
-		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - k0sworker not settled (<180s), skip restart", reason))
-	case c.d.HoldLocalAction(ctx):
-		// L1↔L3 maintenance hold — BEFORE the budget spend so a held
-		// restart never burns the shared last-restart cooldown.
-		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - cluster maintenance in progress, skip restart k0sworker", reason))
-	case !c.d.State.RateTrySpend("last-restart", c.d.Cfg.MinRestartInterval):
-		c.d.State.AppendLog(fmt.Sprintf("suspect: %s - in restart cooldown (<30m), skip", reason))
-	default:
-		// Budget already spent atomically by the rateTrySpend case —
-		// the feeder goroutine competes for the same file.
-		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
-			" - %s (persisted %dx)", reason, c.Fails))
+	if restartK0sWorkerGated(c.d, ctx, wdeps.CheckStall,
+		reason, reason, e.APIOK, true, overloaded,
+		fmt.Sprintf("%s (persisted %dx)", reason, c.Fails)) {
 		c.Fails = 0
-		if err := restartK0sWorker(c.d, ctx); err != nil {
-			c.d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
-		} else {
-			c.d.Actions.WithLabelValues(wdeps.CheckStall, "restart").Inc()
-		}
 	}
 	c.d.CycleResult(wdeps.CheckStall, "ok")
+}
+
+// restartK0sWorkerGated enforces the shared overload / API / settle /
+// maintenance-hold / last-restart-budget gate ladder before restarting
+// k0sworker. Returns true when the restart attempt was triggered (so
+// callers reset their streak counter).
+func restartK0sWorkerGated(d *wdeps.Deps, ctx context.Context,
+	check, suspectTag, overloadTag string,
+	checkAPI, apiOK, overloaded bool, actionDetail string) bool {
+	switch {
+	case overloaded:
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: %s - node overloaded, skip restart k0sworker", overloadTag))
+		return false
+	case checkAPI && !apiOK:
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: %s - API unreachable (isolated?), skip restart k0sworker", suspectTag))
+		return false
+	case !k0sWorkerSettled(d, ctx):
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: %s - k0sworker not settled (<180s), skip restart", suspectTag))
+		return false
+	case d.HoldLocalAction(ctx):
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: %s - cluster maintenance in progress, skip restart k0sworker", suspectTag))
+		return false
+	case !d.State.RateTrySpend("last-restart", d.Cfg.MinRestartInterval):
+		d.State.AppendLog(fmt.Sprintf(
+			"suspect: %s - in restart cooldown (<30m), skip", suspectTag))
+		return false
+	default:
+		d.State.AppendLog(latchdefs.ActionK0sworkerRestart + " - " + actionDetail)
+		if err := restartK0sWorker(d, ctx); err != nil {
+			d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
+		} else {
+			d.Actions.WithLabelValues(check, "restart").Inc()
+		}
+		return true
+	}
 }
 
 // --- Check: kubelet-watch-wedge (06-kubelet-watch-wedge.sh) ---
@@ -360,33 +379,11 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			return
 		}
 	}
-	switch {
-	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-watch-wedge unseen=%d - node overloaded, skip restart k0sworker", missing))
-	case !k0sWorkerSettled(c.d, ctx):
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-watch-wedge unseen=%d - k0sworker not settled (<180s), skip restart", missing))
-	case c.d.HoldLocalAction(ctx):
-		// L1↔L3 maintenance hold — BEFORE the budget spend so a held
-		// restart never burns the shared last-restart cooldown.
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-watch-wedge unseen=%d - cluster maintenance in progress, skip restart k0sworker", missing))
-	case !c.d.State.RateTrySpend("last-restart", c.d.Cfg.MinRestartInterval):
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: kubelet-watch-wedge unseen=%d - in restart cooldown (<30m), skip", missing))
-	default:
-		// Budget already spent atomically by the rateTrySpend case —
-		// the feeder goroutine competes for the same file.
-		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionK0sworkerRestart+
-			" - kubelet-watch-wedge unseen-pods=%d (persisted %dx)",
-			missing, c.Fails))
+	tag := fmt.Sprintf("kubelet-watch-wedge unseen=%d", missing)
+	if restartK0sWorkerGated(c.d, ctx, wdeps.CheckWatch,
+		tag, tag, false, true, c.d.State.Exists(latchdefs.LatchNodeOverloaded),
+		fmt.Sprintf("kubelet-watch-wedge unseen-pods=%d (persisted %dx)", missing, c.Fails)) {
 		c.Fails = 0
-		if err := restartK0sWorker(c.d, ctx); err != nil {
-			c.d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
-		} else {
-			c.d.Actions.WithLabelValues(wdeps.CheckWatch, "restart").Inc()
-		}
 	}
 	c.d.CycleResult(wdeps.CheckWatch, "ok")
 }

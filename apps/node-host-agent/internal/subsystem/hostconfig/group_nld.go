@@ -15,11 +15,13 @@ import (
 
 // ---------- T4 nodelocaldns guard ----------
 
+var resolvedStubRe = regexp.MustCompile(`127\.0\.0\.5[34]:53`)
+
 func (c *cyc) groupNLD() {
 	r, ctx := c.r, c.ctx
 	stubListening := false
 	if out, err := r.run(ctx, "ss", "-lntu"); err == nil {
-		stubListening = regexp.MustCompile(`127\.0\.0\.5[34]:53`).MatchString(out)
+		stubListening = resolvedStubRe.MatchString(out)
 	} else {
 		// Best-effort detection — a failed probe leaves
 		// stubListening=false and the rest of T4 still converges.
@@ -126,10 +128,17 @@ table inet nodelocaldns_guard {
 // them (roadmap 1.2: blanket 10.0.0.0/8 on the admin ports is the
 // hole, not the DNS path).
 func (c *cyc) guardAllowSources() []string {
-	allow := append(c.vs("nodelocaldns_guard_allow_private"),
-		c.vs("nodelocaldns_guard_allow_extra")...)
+	return c.allowSources("nodelocaldns_guard_allow",
+		"nodelocaldns_guard_allow_private", "nodelocaldns_guard_allow_extra")
+}
+
+func (c *cyc) allowSources(what string, keys ...string) []string {
+	var allow []string
+	for _, k := range keys {
+		allow = append(allow, c.vs(k)...)
+	}
 	allow = append(allow, c.registryNodeIPs()...)
-	allow = c.nftAllowFilter("nodelocaldns_guard_allow", allow)
+	allow = c.nftAllowFilter(what, allow)
 	slices.Sort(allow)
 	return allow
 }
@@ -186,11 +195,7 @@ func (c *cyc) registryNodeIPs() []string {
 // these rules), and NOT the interface wildcard accepts (removed —
 // see convergeHostPortsGuard).
 func (c *cyc) portsGuardAllowSources() []string {
-	allow := append([]string{}, c.vs("host_internal_ports_guard_allow_extra")...)
-	allow = append(allow, c.registryNodeIPs()...)
-	allow = c.nftAllowFilter("host_internal_ports_guard_allow", allow)
-	slices.Sort(allow)
-	return allow
+	return c.allowSources("host_internal_ports_guard_allow", "host_internal_ports_guard_allow_extra")
 }
 
 // splitAddrFamilies partitions an allow list into nft-usable

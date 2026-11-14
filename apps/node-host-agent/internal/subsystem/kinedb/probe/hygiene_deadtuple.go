@@ -6,7 +6,6 @@ package probe
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
@@ -80,22 +79,13 @@ func (p *Probe) hygieneDeadTuple(ctx context.Context, pg, user, pass string,
 // probe round.
 func (p *Probe) deadTupleVacuum(ctx context.Context, pg, user, pass string,
 	note func(string)) bool {
-	// MkdirAll before the spend — Store.WriteEpochFile does not
-	// create the state dir itself (same note as checkPGBWedge).
-	_ = os.MkdirAll(p.d.Cfg.GuardStateDir, 0o755)
-	if !p.d.State.RateTrySpend(deadTupleVacuumFile, deadTupleVacuumBudget) {
+	if !p.d.GuardRateTrySpend(deadTupleVacuumFile, deadTupleVacuumBudget) {
 		note("dead-tuple-vacuum-cooldown (<30m)")
 		return false
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b,
-		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS kh_locked;\n",
-		p.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\gset\n\\if :kh_locked\n")
-	fmt.Fprintf(&b, "VACUUM (ANALYZE) %s;\n", kdeps.SQLIdent(p.d.Cfg.Table))
-	fmt.Fprintf(&b, "SELECT pg_advisory_unlock(%d);\n", p.d.Cfg.AdvisoryLockID)
-	b.WriteString("\\else\n\\echo '" + kdeps.LockBusyMarker + "'\n\\endif\n")
-	sout, err := p.d.PsqlScript(ctx, pg, user, pass, b.String())
+	script := kdeps.WrapAdvisoryLockScript(p.d.Cfg.AdvisoryLockID, "kh_locked",
+		fmt.Sprintf("VACUUM (ANALYZE) %s;\n", kdeps.SQLIdent(p.d.Cfg.Table)))
+	sout, err := p.d.PsqlScript(ctx, pg, user, pass, script)
 	switch {
 	case err != nil:
 		note(fmt.Sprintf("dead-tuple-vacuum-fail: %v", err))

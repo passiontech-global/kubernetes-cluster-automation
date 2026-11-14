@@ -92,10 +92,7 @@ func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckSATokenTTL, "abort")
 		return
 	}
-	podByUID := map[string]*corev1.Pod{}
-	for i := range e.Pods {
-		podByUID[string(e.Pods[i].UID)] = &e.Pods[i]
-	}
+	podByUID := e.PodByUID()
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	minTTL := -1.0
 	for _, ent := range podDirs {
@@ -183,22 +180,8 @@ func (c *SATokenTTLCheck) stall(ctx context.Context, pod *corev1.Pod,
 // pod — events.v1 shape like the SystemOOMVictim emitter.
 func (c *SATokenTTLCheck) emitEvent(ctx context.Context, pod *corev1.Pod,
 	ttl int64) {
-	now := c.d.Cfg.Seams.Host.Clock.Now()
-	_ = c.d.EmitCheckEvent(ctx, wdeps.CheckEvent{
-		Name:      fmt.Sprintf("%s.%x", pod.Name, now.UnixNano()),
-		Namespace: pod.Namespace,
-		Reason:    "SATokenRotationStalled",
-		Note: fmt.Sprintf(
+	_ = c.d.EmitPodEvent(ctx, pod, "", "SATokenRotationStalled",
+		fmt.Sprintf(
 			"projected service-account token ttl=%ds < %ds floor — kubelet volume rotation appears stalled, resync nudged",
-			ttl, c.d.Cfg.Runtime.SATokenMinTTLSec),
-		When: now,
-		Regarding: corev1.ObjectReference{
-			APIVersion: "v1",
-			Kind:       "Pod",
-			Namespace:  pod.Namespace,
-			Name:       pod.Name,
-			UID:        pod.UID,
-		},
-		Owner: pod.Namespace + "/" + pod.Name,
-	})
+			ttl, c.d.Cfg.Runtime.SATokenMinTTLSec))
 }

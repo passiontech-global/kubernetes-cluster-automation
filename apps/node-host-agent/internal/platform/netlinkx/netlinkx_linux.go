@@ -168,51 +168,25 @@ func routeHandle(pid int) (*netlink.Handle, error) {
 	return h, nil
 }
 
-// Routes returns every route of pid's netns across ALL routing
-// tables — `ip route show table all` parity. The RT_FILTER_TABLE
-// mask with RT_TABLE_UNSPEC keeps the kernel's unfiltered dump:
-// policy-routing tables (100..103, cilium/kube-ipvs shapes) are
-// real routes the old table-blind RouteList could miss.
-func Routes(pid int) ([]netlink.Route, error) {
+func withRouteHandle(pid int, fn func(*netlink.Handle) error) error {
 	h, err := routeHandle(pid)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer h.Close()
-	return h.RouteListFiltered(netlink.FAMILY_ALL,
-		&netlink.Route{Table: unix.RT_TABLE_UNSPEC}, netlink.RT_FILTER_TABLE)
+	return fn(h)
 }
 
 // Rules returns the policy routing rules of pid's netns —
 // `ip rule show` parity.
 func Rules(pid int) ([]netlink.Rule, error) {
-	h, err := routeHandle(pid)
-	if err != nil {
-		return nil, err
-	}
-	defer h.Close()
-	return h.RuleList(netlink.FAMILY_ALL)
-}
-
-// Links returns every link in pid's netns with its admin/oper
-// state — `ip link show` parity.
-func Links(pid int) ([]netlink.Link, error) {
-	h, err := routeHandle(pid)
-	if err != nil {
-		return nil, err
-	}
-	defer h.Close()
-	return h.LinkList()
-}
-
-// LinkByName resolves one interface by name in pid's netns.
-func LinkByName(pid int, name string) (netlink.Link, error) {
-	h, err := routeHandle(pid)
-	if err != nil {
-		return nil, err
-	}
-	defer h.Close()
-	return h.LinkByName(name)
+	var out []netlink.Rule
+	err := withRouteHandle(pid, func(h *netlink.Handle) error {
+		var rerr error
+		out, rerr = h.RuleList(netlink.FAMILY_ALL)
+		return rerr
+	})
+	return out, err
 }
 
 // LinkAddrs lists every address bound to the named link in pid's
@@ -220,30 +194,28 @@ func LinkByName(pid int, name string) (netlink.Link, error) {
 // A missing link surfaces the LinkByName error, the same
 // non-zero-exit shape the ip CLI gave callers.
 func LinkAddrs(pid int, name string) ([]netlink.Addr, error) {
-	h, err := routeHandle(pid)
-	if err != nil {
-		return nil, err
-	}
-	defer h.Close()
-	link, err := h.LinkByName(name)
-	if err != nil {
-		return nil, err
-	}
-	return h.AddrList(link, netlink.FAMILY_ALL)
+	var out []netlink.Addr
+	err := withRouteHandle(pid, func(h *netlink.Handle) error {
+		link, lerr := h.LinkByName(name)
+		if lerr != nil {
+			return lerr
+		}
+		var aerr error
+		out, aerr = h.AddrList(link, netlink.FAMILY_ALL)
+		return aerr
+	})
+	return out, err
 }
 
 // LinkDel deletes one interface by name in pid's netns —
 // `ip link delete <name>` parity for the calico orphan-veth GC,
 // minus the fork+exec the shell-out cost every confirmed delete.
 func LinkDel(pid int, name string) error {
-	h, err := routeHandle(pid)
-	if err != nil {
-		return err
-	}
-	defer h.Close()
-	l, err := h.LinkByName(name)
-	if err != nil {
-		return err
-	}
-	return h.LinkDel(l)
+	return withRouteHandle(pid, func(h *netlink.Handle) error {
+		l, err := h.LinkByName(name)
+		if err != nil {
+			return err
+		}
+		return h.LinkDel(l)
+	})
 }

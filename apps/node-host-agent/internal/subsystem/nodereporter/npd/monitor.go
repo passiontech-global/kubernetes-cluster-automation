@@ -118,6 +118,7 @@ type Monitor struct {
 	kernelDeadlockEventSent bool
 	readonlyFS              bool
 	readonlyFSMsg           string
+	readonlyEventSent       bool
 	// seeded marks the ONE startup seed pass SeedConditions runs —
 	// the parent's syncConditions calls it every cycle, but only the
 	// first may fold the live conditions in. Re-seeding each pass

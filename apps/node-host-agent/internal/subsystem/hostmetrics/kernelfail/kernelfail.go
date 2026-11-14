@@ -72,6 +72,8 @@ type Deps struct {
 	// HostRoot prefixes the kmsg device fallback and the
 	// node-exporter textfile dir.
 	HostRoot string
+	// TextfileDir overrides promfile.TextfileDir(HostRoot) when non-empty.
+	TextfileDir string
 	// ConntrackMaxFile is the nf_conntrack_max sysctl the
 	// table-full bump doubles.
 	ConntrackMaxFile string

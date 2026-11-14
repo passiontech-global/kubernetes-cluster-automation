@@ -42,9 +42,7 @@ func setupKineStore(t *testing.T, e *env, dbSize, walSize int64) *int {
 	oldMin := storelocal.WALCheckpointMinBytes
 	storelocal.WALCheckpointMinBytes = 100
 	t.Cleanup(func() { storelocal.WALCheckpointMinBytes = oldMin })
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	t.Cleanup(func() { cdeps.TextfileDirOverride = oldTD })
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	calls := new(int)
 	oldFn := storelocal.CheckpointFn
@@ -77,7 +75,7 @@ func TestKineStorageHealthCheckpointGating(t *testing.T) {
 	}
 	// Metrics landed in the textfile.
 	prom, err := os.ReadFile(filepath.Join(
-		cdeps.TextfileDirOverride, "node-agent-kine-storage.prom"))
+		e.H.Cfg.TextfileDir, "node-agent-kine-storage.prom"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,13 +133,11 @@ func TestKineStorageHealthAbsentStore(t *testing.T) {
 	e := fixture(t)
 	root := t.TempDir()
 	e.H.Cfg.K0sDir = filepath.Join(root, "k0s") // nothing inside
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	defer func() { cdeps.TextfileDirOverride = oldTD }()
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	cdepstest.Check[*storelocal.StorageCheck](e.H, cdeps.CheckKineStorage).Run(context.Background()) // must not panic
 	prom, err := os.ReadFile(filepath.Join(
-		cdeps.TextfileDirOverride, "node-agent-kine-storage.prom"))
+		e.H.Cfg.TextfileDir, "node-agent-kine-storage.prom"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,10 +155,10 @@ func runStorage(t *testing.T, e *env) {
 }
 
 // readProm reads the node-agent-kine-storage.prom textfile.
-func readProm(t *testing.T) string {
+func readProm(t *testing.T, e *env) string {
 	t.Helper()
 	prom, err := os.ReadFile(filepath.Join(
-		cdeps.TextfileDirOverride, "node-agent-kine-storage.prom"))
+		e.H.Cfg.TextfileDir, "node-agent-kine-storage.prom"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +198,7 @@ func TestKineStorageLargeObjectScan(t *testing.T) {
 		t.Fatalf("large-object scan calls=%d want 1", *calls)
 	}
 	// Gauge = top-1 length in the textfile.
-	if prom := readProm(t); !strings.Contains(prom,
+	if prom := readProm(t, e); !strings.Contains(prom,
 		"node_agent_kine_max_object_bytes 600000") {
 		t.Fatalf("textfile missing max-object gauge:\n%s", prom)
 	}
@@ -220,7 +216,7 @@ func TestKineStorageLargeObjectScan(t *testing.T) {
 	if *calls != 1 {
 		t.Fatalf("scan ran inside cooldown: calls=%d want 1", *calls)
 	}
-	if prom := readProm(t); !strings.Contains(prom,
+	if prom := readProm(t, e); !strings.Contains(prom,
 		"node_agent_kine_max_object_bytes 600000") {
 		t.Fatalf("cached gauge lost across cooldown:\n%s", prom)
 	}
@@ -288,7 +284,7 @@ func TestKineStorageLargeObjectGaugeAbsentUntilScanned(t *testing.T) {
 	t.Cleanup(func() { storelocal.LargeObjectsFn = oldFn })
 
 	runStorage(t, e)
-	prom := readProm(t)
+	prom := readProm(t, e)
 	if strings.Contains(prom, "\nnode_agent_kine_max_object_bytes ") {
 		t.Fatalf("gauge sample emitted before any successful scan:\n%s", prom)
 	}
@@ -337,9 +333,7 @@ func TestKineStorageNonSQLiteStoreDir(t *testing.T) {
 	writeTreeFile(t, filepath.Join(k0s, "nats", "store", "jetstream"), 999)
 	e.H.Cfg.K0sDir = k0s
 
-	oldTD := cdeps.TextfileDirOverride
-	cdeps.TextfileDirOverride = filepath.Join(root, "textfile")
-	t.Cleanup(func() { cdeps.TextfileDirOverride = oldTD })
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
 
 	cpCalls := new(int)
 	oldCP := storelocal.CheckpointFn
@@ -357,7 +351,7 @@ func TestKineStorageNonSQLiteStoreDir(t *testing.T) {
 	t.Cleanup(func() { storelocal.LargeObjectsFn = oldLO })
 
 	runStorage(t, e)
-	prom := readProm(t)
+	prom := readProm(t, e)
 	for _, want := range []string{
 		"node_agent_kine_db_bytes 325",
 		"node_agent_kine_wal_bytes 0",

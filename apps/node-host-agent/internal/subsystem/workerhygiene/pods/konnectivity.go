@@ -14,8 +14,6 @@ import (
 	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
@@ -93,17 +91,7 @@ func DeleteKonnectivityPod(d *wdeps.Deps, ctx context.Context, pods []corev1.Pod
 			p.DeletionTimestamp != nil {
 			continue
 		}
-		// The heal stamp rides BEFORE the delete so the cluster side
-		// sees the attribution even if this process dies mid-call.
-		d.StampPodHealed(ctx, p.Namespace, p.Name)
-		if err := d.Cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
-			metav1.DeleteOptions{
-				GracePeriodSeconds: ptr.To[int64](5),
-				// UID precondition: the listing→delete window can
-				// outlive this pod — a same-named recycle (DS churn)
-				// is not ours to kill.
-				Preconditions: &metav1.Preconditions{UID: &p.UID},
-			}); err != nil {
+		if err := d.DeletePodGraceful(ctx, p); err != nil {
 			d.State.AppendLog(fmt.Sprintf(
 				"suspect: konnectivity pod delete %s/%s failed: %v",
 				p.Namespace, p.Name, err))
