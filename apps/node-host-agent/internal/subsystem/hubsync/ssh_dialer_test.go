@@ -289,7 +289,9 @@ func (s *testServer) serveSession(srv ssh.Channel,
 		// drain to EOF before answering.
 		var stdin []byte
 		if strings.HasPrefix(cmd, "cat >") ||
-			strings.HasPrefix(cmd, "sudo -n tee") {
+			strings.HasPrefix(cmd, "sudo -n tee") ||
+			strings.HasPrefix(cmd, "sh -c") ||
+			strings.HasPrefix(cmd, "sudo -n sh -c") {
 			stdin, _ = io.ReadAll(srv)
 		}
 		_, _ = srv.Write([]byte(execFn(cmd, stdin)))
@@ -399,5 +401,92 @@ func TestSSHConnLiveServer(t *testing.T) {
 	}
 	if _, err := down.Dial(ctx, Target{IP: "127.0.0.1"}); err == nil {
 		t.Fatal("dial to unused port want error")
+	}
+}
+
+func TestSSHConnPutAtomicAndStageSuffix(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "id_ed25519")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var cmds []string
+	var payloads []string
+	srv := newTestSSHServer(t, keyPath,
+		func(cmd string, stdin []byte) string {
+			cmds = append(cmds, cmd)
+			payloads = append(payloads, string(stdin))
+			return ""
+		})
+
+	d, err := newSSHDialer(keyPath, srv.port(), 5*time.Second, "", true, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Root user: StageSuffix is non-empty, PutAtomic streams without sudo.
+	conn, err := d.Dial(ctx, Target{Name: "t", IP: "127.0.0.1"})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	sc := conn.(*sshConn)
+	if sc.StageSuffix() == "" {
+		_ = conn.Close()
+		t.Fatal("StageSuffix() = empty, want per-dial nonce")
+	}
+	if err := sc.PutAtomic(ctx, "/etc/nebula/host.key", strings.NewReader("secret"), "0600"); err != nil {
+		_ = conn.Close()
+		t.Fatalf("PutAtomic root: %v", err)
+	}
+	_ = conn.Close()
+	if len(cmds) != 1 || strings.HasPrefix(cmds[0], "sudo -n ") ||
+		!strings.Contains(cmds[0], "install -m 600") ||
+		!strings.Contains(cmds[0], sc.StageSuffix()) {
+		t.Fatalf("root PutAtomic cmd=%v", cmds)
+	}
+	if payloads[0] != "secret" {
+		t.Fatalf("root PutAtomic payload=%q want secret", payloads[0])
+	}
+
+	// Non-root user: PutAtomic wraps in sudo -n sh -c.
+	sudoConn, err := d.Dial(ctx, Target{Name: "t", IP: "127.0.0.1", SSHUser: "ubuntu"})
+	if err != nil {
+		t.Fatalf("sudo dial: %v", err)
+	}
+	if err := sudoConn.(*sshConn).PutAtomic(ctx, "/etc/foo.conf", strings.NewReader("cfg"), "0644"); err != nil {
+		_ = sudoConn.Close()
+		t.Fatalf("PutAtomic sudo: %v", err)
+	}
+	_ = sudoConn.Close()
+	if len(cmds) != 2 || !strings.HasPrefix(cmds[1], "sudo -n sh -c ") ||
+		strings.Contains(cmds[1], "install -m 600") {
+		t.Fatalf("sudo PutAtomic cmd=%q", cmds[1])
+	}
+
+	// Failed PutAtomic surfaces wrapped error.
+	failSrv := newTestSSHServerOpts(t, keyPath,
+		func(string, []byte) string { return "" },
+		sshServerOpts{failOn: map[string]string{"sh -c": "perm denied"}})
+	failDialer, err := newSSHDialer(keyPath, failSrv.port(), 5*time.Second, "", true, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failConn, err := failDialer.Dial(ctx, Target{Name: "t", IP: "127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = failConn.Close() }()
+	if err := failConn.(*sshConn).PutAtomic(ctx, "/etc/fail", strings.NewReader("x"), "0644"); err == nil ||
+		!strings.Contains(err.Error(), "putAtomic /etc/fail") {
+		t.Fatalf("failed PutAtomic err=%v, want putAtomic /etc/fail", err)
 	}
 }

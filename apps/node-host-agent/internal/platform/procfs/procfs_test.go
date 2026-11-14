@@ -345,3 +345,24 @@ func TestLastByMountPoint(t *testing.T) {
 		t.Fatalf("/other = %+v", m)
 	}
 }
+
+func TestIsDigits(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{"0", true},
+		{"1234567890", true},
+		{"123a", false},
+		{"-1", false},
+		{" 12", false},
+		{"12 ", false},
+		{"١٢", false},
+	}
+	for _, tc := range cases {
+		if got := IsDigits(tc.in); got != tc.want {
+			t.Errorf("IsDigits(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

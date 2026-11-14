@@ -182,3 +182,21 @@ func TestStatfsFreeBytes(t *testing.T) {
 		t.Fatal("statfsFreeBytes on missing path returned nil error")
 	}
 }
+
+func TestKeepKCMetricsLine(t *testing.T) {
+	cases := []struct {
+		line string
+		want bool
+	}{
+		{"leader_election_master_status{name=\"kube-controller-manager\"} 1", true},
+		{"  \tkonnectivity_network_proxy_server_ready_backend_connections 3", true},
+		{"# HELP apiserver_storage_objects ...", false},
+		{"go_goroutines 100", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := keepKCMetricsLine([]byte(tc.line)); got != tc.want {
+			t.Errorf("keepKCMetricsLine(%q) = %v, want %v", tc.line, got, tc.want)
+		}
+	}
+}

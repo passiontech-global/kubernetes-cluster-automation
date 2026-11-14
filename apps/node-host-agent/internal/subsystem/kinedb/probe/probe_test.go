@@ -436,3 +436,23 @@ func TestParseShowPoolsSkipsMalformedRows(t *testing.T) {
 		t.Fatalf("serverConns=%d want 5", st.serverConns)
 	}
 }
+
+func TestUserlistPassword(t *testing.T) {
+	ul := "\"postgres_extra\" \"wrong\"\r\n" +
+		"\"postgres\" \"md5abc123\"\r\n" +
+		"\"noquote\" bare\n" +
+		"\"unterminated\" \"tailval\n"
+
+	if got := userlistPassword(ul, "postgres"); got != "md5abc123" {
+		t.Fatalf("postgres=%q want md5abc123", got)
+	}
+	if got := userlistPassword(ul, "noquote"); got != "" {
+		t.Fatalf("noquote=%q want empty", got)
+	}
+	if got := userlistPassword(ul, "unterminated"); got != "tailval" {
+		t.Fatalf("unterminated=%q want tailval", got)
+	}
+	if got := userlistPassword(ul, "absent"); got != "" {
+		t.Fatalf("absent=%q want empty", got)
+	}
+}

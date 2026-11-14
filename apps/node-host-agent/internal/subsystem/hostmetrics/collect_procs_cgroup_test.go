@@ -272,3 +272,21 @@ func TestMTUDriftLxcOnlySource(t *testing.T) {
 		t.Fatalf("lxc-only source: drift=%v ok=%v want 1", got, ok)
 	}
 }
+
+func TestCachedProcs(t *testing.T) {
+	cfg, dirs := fixture(t)
+	testutil.WriteFile(t, filepath.Join(dirs["proc"], "1", "stat"), "1 (init) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 10\n")
+	c := New(cfg)
+
+	if procs, ok := c.cachedProcs(); ok || procs != nil {
+		t.Fatalf("initial cachedProcs = (%v, %v), want (nil, false)", procs, ok)
+	}
+	procs, ok := c.procSnapshot()
+	if !ok || len(procs) != 1 {
+		t.Fatalf("procSnapshot = (%d, %v), want (1, true)", len(procs), ok)
+	}
+	cached, ok := c.cachedProcs()
+	if !ok || len(cached) != 1 {
+		t.Fatalf("cachedProcs after getProcs = (%d, %v), want (1, true)", len(cached), ok)
+	}
+}

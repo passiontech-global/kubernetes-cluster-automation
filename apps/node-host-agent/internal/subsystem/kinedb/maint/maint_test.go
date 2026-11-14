@@ -752,3 +752,37 @@ func containsNote(notes []string, substr string) bool {
 	}
 	return false
 }
+
+func TestReapOrphanedMaint(t *testing.T) {
+	ctx := context.Background()
+
+	// n > 0 notes terminated count.
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_terminate_backend", Out: "t\nt\n"},
+	})
+	var notes []string
+	k.reapOrphanedMaint(ctx, "pg", "postgres", "secret", func(s string) { notes = append(notes, s) })
+	if !containsNote(notes, "terminated 2 orphaned maintenance backend(s)") {
+		t.Fatalf("notes=%v want terminated count", notes)
+	}
+
+	// n == 0 produces no notes.
+	k, _, _ = fixture(t, []testutil.ExecRule{
+		{Substr: "pg_terminate_backend", Out: ""},
+	})
+	notes = nil
+	k.reapOrphanedMaint(ctx, "pg", "postgres", "secret", func(s string) { notes = append(notes, s) })
+	if len(notes) != 0 {
+		t.Fatalf("n=0 notes=%v want empty", notes)
+	}
+
+	// Query error notes orphan-reap-fail.
+	k, _, _ = fixture(t, []testutil.ExecRule{
+		{Substr: "pg_terminate_backend", Err: errors.New("db down")},
+	})
+	notes = nil
+	k.reapOrphanedMaint(ctx, "pg", "postgres", "secret", func(s string) { notes = append(notes, s) })
+	if !containsNote(notes, "orphan-reap-fail") {
+		t.Fatalf("err notes=%v want orphan-reap-fail", notes)
+	}
+}

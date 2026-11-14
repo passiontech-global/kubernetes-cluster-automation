@@ -612,3 +612,22 @@ func TestNewMetricsCollectors(t *testing.T) {
 		t.Fatalf("counterfunc values: %v", vals)
 	}
 }
+
+func TestReapOrphanedMaintSessions(t *testing.T) {
+	ctx := context.Background()
+
+	d, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_terminate_backend", Out: "t\nf\n t \n\n"},
+	})
+	n, err := d.ReapOrphanedMaintSessions(ctx, "pg", "postgres", "secret")
+	if err != nil || n != 2 {
+		t.Fatalf("ReapOrphanedMaintSessions = %d, %v; want 2, nil", n, err)
+	}
+
+	d, _, _ = fixture(t, []testutil.ExecRule{
+		{Substr: "pg_terminate_backend", Err: errors.New("exec timeout")},
+	})
+	if n, err := d.ReapOrphanedMaintSessions(ctx, "pg", "postgres", "secret"); err == nil || n != 0 {
+		t.Fatalf("ReapOrphanedMaintSessions on err = %d, %v; want 0, err", n, err)
+	}
+}

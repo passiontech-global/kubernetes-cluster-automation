@@ -207,3 +207,10 @@ func TestActiveGate(t *testing.T) {
 		t.Fatal("insecure must activate")
 	}
 }
+
+func TestHostPortAddrNetwork(t *testing.T) {
+	a := hostPortAddr("node-a:22")
+	if a.Network() != "tcp" || a.String() != "node-a:22" {
+		t.Fatalf("hostPortAddr = (%q, %q), want (tcp, node-a:22)", a.Network(), a.String())
+	}
+}

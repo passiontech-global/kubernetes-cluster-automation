@@ -196,3 +196,47 @@ func TestCollectPortListenersDoneAndError(t *testing.T) {
 		t.Fatalf("ACK batch: done=%v err=%v want true/nil", got, err)
 	}
 }
+
+func TestParseDiagAck(t *testing.T) {
+	// Empty / trailing short bytes return nil.
+	if err := parseDiagAck(nil); err != nil {
+		t.Fatalf("parseDiagAck(nil) = %v, want nil", err)
+	}
+
+	// ACK (NLMSG_ERROR with errno=0) succeeds.
+	ack := make([]byte, 20)
+	binary.LittleEndian.PutUint32(ack[0:], 20)
+	binary.LittleEndian.PutUint16(ack[4:], nlmsgError)
+	if err := parseDiagAck(ack); err != nil {
+		t.Fatalf("parseDiagAck(ACK) = %v, want nil", err)
+	}
+
+	// NLMSG_DONE followed by ACK succeeds.
+	done := make([]byte, 16)
+	binary.LittleEndian.PutUint32(done[0:], 16)
+	binary.LittleEndian.PutUint16(done[4:], unix.NLMSG_DONE)
+	if err := parseDiagAck(append(done, ack...)); err != nil {
+		t.Fatalf("parseDiagAck(DONE+ACK) = %v, want nil", err)
+	}
+
+	// Negative errno surfaces as an error.
+	nack := make([]byte, 20)
+	binary.LittleEndian.PutUint32(nack[0:], 20)
+	binary.LittleEndian.PutUint16(nack[4:], nlmsgError)
+	errno := -int32(unix.EPERM)
+	binary.LittleEndian.PutUint32(nack[16:], uint32(errno))
+	if err := parseDiagAck(nack); err == nil {
+		t.Fatal("parseDiagAck(negative errno) = nil, want error")
+	}
+
+	// Bad nlmsg length (<16 or >len(buf)) returns error.
+	bad := make([]byte, 16)
+	binary.LittleEndian.PutUint32(bad[0:], 8)
+	if err := parseDiagAck(bad); err == nil {
+		t.Fatal("parseDiagAck(len=8) = nil, want error")
+	}
+	binary.LittleEndian.PutUint32(bad[0:], 32)
+	if err := parseDiagAck(bad); err == nil {
+		t.Fatal("parseDiagAck(len>buf) = nil, want error")
+	}
+}
