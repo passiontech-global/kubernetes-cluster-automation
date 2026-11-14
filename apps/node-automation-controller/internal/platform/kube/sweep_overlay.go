@@ -82,6 +82,8 @@ type SweepOverlay struct {
 	annos map[types.UID]map[string]*string
 	// tombstones is the set of pod UIDs deleted this sweep.
 	tombstones map[types.UID]struct{}
+	// pvcTombstones is the set of PVC UIDs deleted this sweep.
+	pvcTombstones map[types.UID]struct{}
 	// podTombstoneGen counts MarkPodDeleted calls — the generation
 	// the sweep snapshot keys its filtered pod views on: a bump
 	// means "the tombstone set changed, rebuild the filtered
@@ -110,10 +112,11 @@ type SweepOverlay struct {
 // outside a sweep never need it (helpers degrade gracefully).
 func WithSweepOverlay(ctx context.Context) context.Context {
 	return context.WithValue(ctx, sweepOverlayCtxKey{}, &SweepOverlay{
-		annos:        map[types.UID]map[string]*string{},
-		tombstones:   map[types.UID]struct{}{},
-		ownerDisrupt: map[string]struct{}{},
-		tmplAnnos:    map[types.UID]map[string]*string{},
+		annos:         map[types.UID]map[string]*string{},
+		tombstones:    map[types.UID]struct{}{},
+		pvcTombstones: map[types.UID]struct{}{},
+		ownerDisrupt:  map[string]struct{}{},
+		tmplAnnos:     map[types.UID]map[string]*string{},
 	})
 }
 
@@ -402,6 +405,40 @@ func FilterPodTombstones(ctx context.Context, pods []corev1.Pod) []corev1.Pod {
 	for i := range pods {
 		if _, dead := ov.tombstones[pods[i].UID]; !dead {
 			out = append(out, pods[i])
+		}
+	}
+	return out
+}
+
+// MarkPVCDeleted records PVC uid as deleted this sweep so concurrent
+// or subsequent AllPVCs readers hide the deleted claim without a
+// cluster-wide re-LIST. No-op outside a sweep.
+func MarkPVCDeleted(ctx context.Context, uid types.UID) {
+	ov := sweepOverlay(ctx)
+	if ov == nil || uid == "" {
+		return
+	}
+	ov.mu.Lock()
+	ov.pvcTombstones[uid] = struct{}{}
+	ov.mu.Unlock()
+}
+
+// FilterPVCTombstones returns pvcs minus this sweep's deleted-UID
+// tombstones. Returns pvcs unchanged when no PVC tombstones exist.
+func FilterPVCTombstones(ctx context.Context, pvcs []corev1.PersistentVolumeClaim) []corev1.PersistentVolumeClaim {
+	ov := sweepOverlay(ctx)
+	if ov == nil {
+		return pvcs
+	}
+	ov.mu.RLock()
+	defer ov.mu.RUnlock()
+	if len(ov.pvcTombstones) == 0 {
+		return pvcs
+	}
+	out := make([]corev1.PersistentVolumeClaim, 0, len(pvcs))
+	for i := range pvcs {
+		if _, dead := ov.pvcTombstones[pvcs[i].UID]; !dead {
+			out = append(out, pvcs[i])
 		}
 	}
 	return out

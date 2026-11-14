@@ -290,18 +290,24 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 		return false
 	}
 	uid := obj.GetUID()
-	if err := a.dyn.Resource(gvr).Namespace(ns).Delete(ctx, name,
-		kube.UIDDeleteOptions(uid, "")); err != nil && !apierrors.IsNotFound(err) {
+	err = a.dyn.Resource(gvr).Namespace(ns).Delete(ctx, name,
+		kube.UIDDeleteOptions(uid, ""))
+	switch {
+	case apierrors.IsNotFound(err):
+		// Already deleted between list and heal — no mutation delivered here.
+	case err != nil:
 		log.Error(err, "wedged transfer delete failed",
 			"kind", kind, "object", ns+"/"+name)
 		metrics.IncError(a.queue)
 		return false
+	default:
+		metrics.VeleroWedgedObjectsCleanedTotal.
+			WithLabelValues(ns, kind+"_deleted").Inc()
+		log.Info("ACTION: deleted wedged velero transfer object",
+			"kind", kind, "object", ns+"/"+name,
+			"agentPod", agentPodName(agent))
 	}
-	metrics.VeleroWedgedObjectsCleanedTotal.
-		WithLabelValues(ns, kind+"_deleted").Inc()
-	log.Info("ACTION: deleted wedged velero transfer object",
-		"kind", kind, "object", ns+"/"+name,
-		"agentPod", agentPodName(agent))
+	objDeleted := err == nil
 
 	// Bounce the node-agent pod ONLY when it is not already a fresh
 	// incarnation. pvbAgentWedged proves the wedge through evidence
@@ -331,6 +337,7 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 	// exemption.
 	predatesTransfer := agent != nil &&
 		agent.CreationTimestamp.Time.Before(objStart)
+	podBounced := false
 	if agent != nil && (agent.Status.Phase != corev1.PodRunning ||
 		(!kube.PodReadyCond(agent) && predatesTransfer)) {
 		agentUID := agent.UID
@@ -340,12 +347,17 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 				"pod", agent.Namespace+"/"+agent.Name)
 			metrics.IncError(a.queue)
 			return false
-		} else {
+		} else if err == nil {
+			podBounced = true
 			metrics.VeleroWedgedObjectsCleanedTotal.
 				WithLabelValues(ns, "pod_restarted").Inc()
 			log.Info("ACTION: bounced node-agent pod",
 				"pod", agent.Namespace+"/"+agent.Name)
 		}
+	}
+	if !objDeleted && !podBounced {
+		heal.RefundGrant(now)
+		return false
 	}
 	return true
 }

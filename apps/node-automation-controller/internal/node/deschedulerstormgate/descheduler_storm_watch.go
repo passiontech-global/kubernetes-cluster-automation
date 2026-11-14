@@ -34,7 +34,7 @@ var stormSignalChanges = predicate.Funcs{
 	UpdateFunc: func(e event.UpdateEvent) bool {
 		oldN, ok1 := e.ObjectOld.(*corev1.Node)
 		newN, ok2 := e.ObjectNew.(*corev1.Node)
-		if !ok1 || !ok2 {
+		if !ok1 || !ok2 || oldN == nil || newN == nil {
 			return true
 		}
 		return oldN.Spec.Unschedulable != newN.Spec.Unschedulable ||

@@ -21,12 +21,17 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
+
+const ciliumNodeIPAMMinFreeDefault = 0.15
 
 // ciliumNodeIPAMExhaustionCheck is the cilium node IPAM exhaustion
 // watchdog with terminal-pod reaping.
 type ciliumNodeIPAMExhaustionCheck struct {
 	*probefw.Deps
+
+	minFreeRatio float64
 
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
@@ -35,11 +40,12 @@ type ciliumNodeIPAMExhaustionCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newCiliumNodeIPAMExhaustionCheck builds the cilium-node-ipam-exhaustion check — its
-// only state is the emitted-gauge ledger; reap cooldowns ride the
-// shared Deps.Heals set.
+// NewCiliumNodeIPAMExhaustionCheck builds the cilium-node-ipam-exhaustion check.
 func NewCiliumNodeIPAMExhaustionCheck(d *probefw.Deps) probefw.Check {
-	return &ciliumNodeIPAMExhaustionCheck{Deps: d}
+	return &ciliumNodeIPAMExhaustionCheck{
+		Deps:         d,
+		minFreeRatio: envx.GetenvFloat("CILIUM_NODE_IPAM_MIN_FREE_RATIO", ciliumNodeIPAMMinFreeDefault),
+	}
 }
 
 const (
@@ -100,10 +106,10 @@ func podCIDRCapacity(podCIDR string) (int, bool) {
 func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	// The CILIUM_NODE_IPAM_MIN_FREE_RATIO knob resolves once at
-	// sweep Setup (CiliumConfigFromEnv — >1 keeps working as
-	// the documented "disable this check" escape).
-	minFree := p.Cfg.Cilium.NodeIPAMMinFreeRatio
+	minFree := p.minFreeRatio
+	if minFree <= 0 {
+		minFree = ciliumNodeIPAMMinFreeDefault
+	}
 
 	// Prometheus operator IPAM census — cilium_operator_ipam_{used,
 	// available}_ips{target_node} (cilium >=1.15; the old

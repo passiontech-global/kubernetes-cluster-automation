@@ -124,6 +124,9 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 			_, err := p.Dyn.Resource(kube.GVRKedaScaledObject).
 				Namespace(so.GetNamespace()).Patch(ctx, so.GetName(),
 				types.MergePatchType, data, metav1.PatchOptions{})
+			if err == nil {
+				kube.RecordAnnoPatch(ctx, so, data)
+			}
 			return err
 		}
 		var reasons []string

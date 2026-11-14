@@ -33,25 +33,44 @@ const (
 // The five ported kuberhealthy checks — stateless probes that read
 // only Deps; each gets its own struct so the registry shape stays
 // uniform with the stateful watchdog checks.
-type dnsStatusCheck struct{ *probefw.Deps }
+type dnsStatusCheck struct {
+	*probefw.Deps
+	cfg DNSConfig
+}
 
 type httpContentCheck struct{ *probefw.Deps }
 
-type podRestartsCheck struct{ *probefw.Deps }
+type podRestartsCheck struct {
+	*probefw.Deps
+	cfg PodsConfig
+}
 
-type podStatusCheck struct{ *probefw.Deps }
+type podStatusCheck struct {
+	*probefw.Deps
+	cfg PodsConfig
+}
 
-type resourceQuotaCheck struct{ *probefw.Deps }
+type resourceQuotaCheck struct {
+	*probefw.Deps
+	cfg QuotaConfig
+}
 
 // The ported-check constructors — every check exposes a
 // NewXxxCheck(d *probefw.Deps) probefw.Check factory so the
-// registry's CheckReg rows can stay data-driven; these five carry
-// no per-check state.
-func NewDNSStatusCheck(d *probefw.Deps) probefw.Check     { return &dnsStatusCheck{Deps: d} }
-func NewHTTPContentCheck(d *probefw.Deps) probefw.Check   { return &httpContentCheck{Deps: d} }
-func NewPodRestartsCheck(d *probefw.Deps) probefw.Check   { return &podRestartsCheck{Deps: d} }
-func NewPodStatusCheck(d *probefw.Deps) probefw.Check     { return &podStatusCheck{Deps: d} }
-func NewResourceQuotaCheck(d *probefw.Deps) probefw.Check { return &resourceQuotaCheck{Deps: d} }
+// registry's CheckReg rows can stay data-driven.
+func NewDNSStatusCheck(d *probefw.Deps) probefw.Check {
+	return &dnsStatusCheck{Deps: d, cfg: DNSConfigFromEnv()}
+}
+func NewHTTPContentCheck(d *probefw.Deps) probefw.Check { return &httpContentCheck{Deps: d} }
+func NewPodRestartsCheck(d *probefw.Deps) probefw.Check {
+	return &podRestartsCheck{Deps: d, cfg: PodsConfigFromEnv()}
+}
+func NewPodStatusCheck(d *probefw.Deps) probefw.Check {
+	return &podStatusCheck{Deps: d, cfg: PodsConfigFromEnv()}
+}
+func NewResourceQuotaCheck(d *probefw.Deps) probefw.Check {
+	return &resourceQuotaCheck{Deps: d, cfg: QuotaConfigFromEnv()}
+}
 
 // probeDNS ports dns-resolution-check: every configured hostname must
 // resolve. Per-check timeout comes from HEALTH_CHECK_TIMEOUT (the
@@ -59,7 +78,7 @@ func NewResourceQuotaCheck(d *probefw.Deps) probefw.Check { return &resourceQuot
 func (p *dnsStatusCheck) Run(ctx context.Context) probefw.Result {
 	ctx, cancel := context.WithTimeout(ctx, p.Cfg.Timeouts.Check)
 	defer cancel()
-	for _, host := range p.Cfg.DNS.Hostnames {
+	for _, host := range p.cfg.Hostnames {
 		if _, err := p.LookupHost(ctx, host); err != nil {
 			return probefw.Result{Why: fmt.Sprintf("lookup %s: %v", host, err)}
 		}
@@ -128,10 +147,10 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 // check red forever — RestartCount is monotonic, so the raw count
 // alone can never recover.
 func (p *podRestartsCheck) Run(ctx context.Context) probefw.Result {
-	pods, err := p.PodsIn(ctx, p.Cfg.Pods.Namespace)
+	pods, err := p.PodsIn(ctx, p.cfg.Namespace)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods in %s: %w",
-			p.Cfg.Pods.Namespace, err)}
+			p.cfg.Namespace, err)}
 	}
 	now := p.Now()
 	var offenders []string
@@ -143,7 +162,7 @@ func (p *podRestartsCheck) Run(ctx context.Context) probefw.Result {
 			pod.Status.EphemeralContainerStatuses,
 		} {
 			for _, s := range statuses {
-				if s.RestartCount > p.Cfg.Pods.MaxRestarts &&
+				if s.RestartCount > p.cfg.MaxRestarts &&
 					restartRecentlyActive(s, now) {
 					offenders = append(offenders,
 						fmt.Sprintf("%s/%s=%d", pod.Name, s.Name, s.RestartCount))
@@ -152,7 +171,7 @@ func (p *podRestartsCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 	return probefw.WhyFold(probefw.Section("restarts>%d: %s",
-		offenders, p.Cfg.Pods.MaxRestarts))
+		offenders, p.cfg.MaxRestarts))
 }
 
 // podRestartRecentWindow bounds how far back the last termination may
@@ -181,15 +200,15 @@ func restartRecentlyActive(s corev1.ContainerStatus, now time.Time) bool {
 // images pull); any older pod whose Phase is not Running or Succeeded
 // is a FAIL (Failed/Unknown/stuck Pending).
 func (p *podStatusCheck) Run(ctx context.Context) probefw.Result {
-	pods, err := p.PodsIn(ctx, p.Cfg.Pods.Namespace)
+	pods, err := p.PodsIn(ctx, p.cfg.Namespace)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods in %s: %w",
-			p.Cfg.Pods.Namespace, err)}
+			p.cfg.Namespace, err)}
 	}
 	var bad []string
 	for i := range pods {
 		pod := pods[i]
-		if p.Now().Sub(pod.CreationTimestamp.Time) < p.Cfg.Pods.SkipDuration {
+		if p.Now().Sub(pod.CreationTimestamp.Time) < p.cfg.SkipDuration {
 			continue // too young — still allowed to be Pending
 		}
 		if pod.Status.Phase != corev1.PodRunning &&
@@ -198,7 +217,7 @@ func (p *podStatusCheck) Run(ctx context.Context) probefw.Result {
 		}
 	}
 	return probefw.WhyFold(probefw.Section("non-Running pods in %s: %s",
-		bad, p.Cfg.Pods.Namespace))
+		bad, p.cfg.Namespace))
 }
 
 // probeResourceQuota ports resource-quota-check: FAIL when any quota
@@ -224,12 +243,12 @@ func (p *resourceQuotaCheck) Run(ctx context.Context) probefw.Result {
 			// which compares false -> pass. Only `>` fails: exactly
 			// at threshold is still a pass.
 			ratio := used.AsApproximateFloat64() / hard.AsApproximateFloat64()
-			if ratio > p.Cfg.Quota.Threshold {
+			if ratio > p.cfg.Threshold {
 				over = append(over, fmt.Sprintf("%s/%s %s=%s/%s",
 					q.Namespace, q.Name, name, used.String(), hard.String()))
 			}
 		}
 	}
 	return probefw.WhyFold(probefw.Section("quota used/hard>%.2g: %s",
-		over, p.Cfg.Quota.Threshold))
+		over, p.cfg.Threshold))
 }

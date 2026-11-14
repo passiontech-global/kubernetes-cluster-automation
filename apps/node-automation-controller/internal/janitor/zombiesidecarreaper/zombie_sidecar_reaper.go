@@ -57,7 +57,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -268,24 +267,8 @@ func (r *zombieSidecarReaper) run(ctx context.Context) error {
 			metrics.ZombieSidecarPodsReapedTotal.WithLabelValues(t.pod.Namespace).Inc()
 			return nil
 		},
-		OnError: func(log logr.Logger, t zombieTarget, err error) {
-			switch {
-			case apierrors.IsNotFound(err):
-				// The pod was deleted under us — raced with an
-				// external cleanup; nothing failed.
-				log.Info("SKIP: zombie pod already gone — raced with an external delete",
-					"pod", t.pod.Namespace+"/"+t.pod.Name)
-			case apierrors.IsConflict(err):
-				// The UID precondition fired — a same-named pod was
-				// recreated since the list; not ours to reap.
-				log.Info("SKIP: zombie pod recreated since the list — UID precondition fired",
-					"pod", t.pod.Namespace+"/"+t.pod.Name)
-			default:
-				metrics.IncError(r.queue)
-				log.Error(err, "zombie pod delete failed",
-					"pod", t.pod.Namespace+"/"+t.pod.Name)
-			}
-		},
+		OnError: reap.DeleteErrorHandler("pod", func(t zombieTarget) string { return t.pod.Namespace + "/" + t.pod.Name },
+			func() { metrics.IncError(r.queue) }),
 	})
 
 	// Prune ledger entries for pods that vanished or stopped

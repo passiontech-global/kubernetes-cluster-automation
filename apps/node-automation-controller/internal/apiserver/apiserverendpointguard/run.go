@@ -1,3 +1,6 @@
+// run.go — the sweep entrypoint for apiserver-endpoint-guard: chooses
+// between EndpointSlice and Endpoints mode, checks backend health, and
+// drives endpoint quarantine or un-quarantine.
 package apiserverendpointguard
 
 import (

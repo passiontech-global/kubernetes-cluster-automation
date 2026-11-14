@@ -81,7 +81,6 @@ package apiserverendpointguard
 
 import (
 	"context"
-	"math/rand/v2"
 	"net/http"
 	"runtime/debug"
 	"sync"
@@ -92,7 +91,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -262,39 +260,21 @@ func Setup(d shared.Deps) error {
 // non-empty (see the coverage-caveats note above: the endpoint
 // reconciler re-adds quarantined IPs every ~10s).
 func (g *apiServerEndpointGuard) Start(ctx context.Context) error {
-	// Inject the named logger into the ctx run() sees: this runnable
-	// bypasses shared.Periodic (it needs the adaptive interval), so
-	// without this run()'s logf.FromContext would resolve the UNNAMED
-	// root logger and every sweep line would lack
-	// "logger":"apiserver-endpoint-guard". A guard built by hand may
-	// leave g.log zero-value — fall back to naming the ctx logger
-	// rather than silently discarding.
-	log := g.log
-	if log.GetSink() == nil {
-		log = logf.FromContext(ctx).WithName(g.queue)
+	return (&shared.Periodic{
+		Name:         g.queue,
+		Interval:     g.sweepInterval(),
+		RunTimeout:   endpointGuardRunTimeout,
+		NextInterval: g.nextInterval,
+		Fn:           g.run,
+		Log:          g.log,
+	}).Start(ctx)
+}
+
+func (g *apiServerEndpointGuard) nextInterval(_ time.Duration) time.Duration {
+	if g.quarantineActive {
+		return g.quarantineCadence()
 	}
-	ctx = logf.IntoContext(ctx, log)
-	interval := g.sweepInterval()
-	// Startup jitter, same contract as shared.Periodic's first-tick
-	// offset: the first sweep lands in [0, interval) instead of a
-	// fixed interval, so a freshly-elected leader (or a pod restart
-	// during an incident) doesn't probe every backend in lockstep.
-	first := true
-	for {
-		wait := interval
-		if first {
-			wait = rand.N(g.sweepInterval())
-			first = false
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil
-		case <-timer.C:
-		}
-		interval = g.runCycle(ctx, log, interval)
-	}
+	return g.sweepInterval()
 }
 
 // runCycle executes one guarded sweep and returns the cadence the

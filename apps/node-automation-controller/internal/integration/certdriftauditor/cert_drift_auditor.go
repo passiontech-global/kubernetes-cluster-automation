@@ -271,11 +271,11 @@ func (a *certDriftAuditor) run(ctx context.Context) error {
 // splitNSName parses the "namespace/name" annotation value format —
 // exactly two non-empty segments or the reference is malformed.
 func splitNSName(ref string) (ns, name string, ok bool) {
-	parts := strings.Split(ref, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	ns, name, ok = strings.Cut(ref, "/")
+	if !ok || ns == "" || name == "" || strings.Contains(name, "/") {
 		return "", "", false
 	}
-	return parts[0], parts[1], true
+	return ns, name, true
 }
 
 // earliestCertExpiryDays returns days until the earliest NotAfter

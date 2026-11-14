@@ -1,10 +1,10 @@
 // cluster_health_probes.go — the sweep module root: Setup and the
-// prober. The 48 checks it drives live in per-domain subpackages
+// prober. The 56 checks it drives live in per-domain subpackages
 // under internal/health on top of the shared probefw framework; the
 // roster itself is a registry concern — every check is a CheckReg
-// row in internal/registry (the 45 always-on rows plus the three
-// gated gitops rows), collected into Deps.CheckRegs in
-// registry order, which IS the sweep order:
+// row in internal/registry (52 always-on rows plus 4 gated rows),
+// collected into Deps.CheckRegs in registry order, which IS the
+// sweep order:
 //
 //   - ported — the five kuberhealthy "passive" HealthChecks that used
 //     to run as periodic checker Pods in the kuberhealthy namespace
@@ -68,10 +68,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/datastore"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/watchdogs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -79,40 +75,18 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// healthProbeConfigFromEnv resolves the check knobs once at Setup.
-// It fills the sweep-level Timeouts itself and pulls each domain's
-// knobs from the package that consumes them — the ported
-// kuberhealthy checks' fields from the ported.*ConfigFromEnv
-// resolvers, the kcm-workqueue-watchdog knobs from
-// watchdogs.KCMConfigFromEnv, the cilium and linkerd nethealth knobs
-// from the nethealth resolvers (without them the checks read
-// zero-value thresholds).
+// healthProbeConfigFromEnv resolves the framework-level sweep knobs
+// once at Setup. Check-specific knobs live in the check packages.
 func healthProbeConfigFromEnv() probefw.Config {
 	return probefw.Config{
 		Timeouts: probefw.TimeoutsConfig{
-			// envx.GetenvDuration floors every duration knob at
-			// 1s (the retired helpers accepted any d > 0) —
-			// sub-second probe timeouts and persistence windows
-			// were already pathological, so the tightened bound
-			// changes no sane configuration.
-			Check: envx.GetenvDuration("HEALTH_CHECK_TIMEOUT", 30*time.Second),
-			// Bounds one check's share of the serial sweep — a hung
-			// apiserver call used to stretch the whole cycle; past
-			// the deadline the check's context is cancelled (the
-			// in-flight call unwinds) and the sweep moves on. The
-			// check's own error still surfaces as FAIL/infra, so
-			// reporting semantics are unchanged — only the wait is
-			// bounded.
+			Check:    envx.GetenvDuration("HEALTH_CHECK_TIMEOUT", 30*time.Second),
 			PerCheck: envx.GetenvDuration("HEALTH_PER_CHECK_TIMEOUT", 2*time.Minute),
 		},
-		DNS:         ported.DNSConfigFromEnv(),
-		HTTPContent: ported.HTTPContentConfigFromEnv(),
-		Pods:        ported.PodsConfigFromEnv(),
-		Quota:       ported.QuotaConfigFromEnv(),
-		KCM:         watchdogs.KCMConfigFromEnv(),
-		Cilium:      nethealth.CiliumConfigFromEnv(),
-		Datastore:   datastore.ConfigFromEnv(),
-		Linkerd:     nethealth.LinkerdConfigFromEnv(),
+		HTTPContent: probefw.HTTPContentConfig{
+			URL:      envx.Getenv("HEALTH_HTTP_CONTENT_URL", "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"),
+			Expected: envx.Getenv("HEALTH_HTTP_EXPECTED_CONTENT", "Healthy"),
+		},
 	}
 }
 
@@ -180,6 +154,7 @@ func newClusterHealthProber(d shared.Deps, cfg probefw.Config) (*clusterHealthPr
 	nodeReader := kube.CachedNodeReader(d.CachedClient())
 	deps := probefw.NewDeps(d.Name, d.CS, d.Dyn, nodeReader, cfg)
 	deps.Maintenance = d.Maintenance
+	deps.CRDSize = d.CRDSize
 	// The metadata client feeds ListPartialOrFallback's preferred
 	// path (AllReplicaSets and the metadata-only censuses) — nil
 	// keeps the CS/Dyn fallback the test Deps shape relies on.
@@ -189,9 +164,7 @@ func newClusterHealthProber(d shared.Deps, cfg probefw.Config) (*clusterHealthPr
 		boot:     time.Now(),
 		lastPass: map[string]time.Time{},
 	}
-	if err := p.appendCheckRegs(d.CheckRegs); err != nil {
-		return nil, err
-	}
+	p.appendCheckRegs(d.CheckRegs)
 	return p, nil
 }
 
@@ -212,25 +185,11 @@ func Setup(d shared.Deps) error {
 		if err != nil {
 			return err
 		}
-		// Surface the resolved HEALTH_* knobs once at registration so an
-		// operator can tell from the logs which targets/thresholds the
-		// checks run with (an unparseable env value silently falls back
-		// to the default — the effective value is what matters here).
 		logf.Log.WithName(d.Name).Info("registered",
-			// checks surfaces the roster size — a -modules selection
-			// that picks cluster-health-probes without any check row
-			// sweeps an empty roster, which only this line reveals.
 			"checks", len(p.checks),
 			"interval", cfg.interval, "perCheckTimeout", p.Cfg.Timeouts.PerCheck,
-			"dnsHostnames", p.Cfg.DNS.Hostnames,
 			"checkTimeout", p.Cfg.Timeouts.Check, "httpURL", p.Cfg.HTTPContent.URL,
-			"httpExpectedContent", p.Cfg.HTTPContent.Expected,
-			"podCheckNamespace", p.Cfg.Pods.Namespace,
-			"maxPodRestarts", p.Cfg.Pods.MaxRestarts,
-			"podSkipDuration", p.Cfg.Pods.SkipDuration,
-			"quotaThreshold", p.Cfg.Quota.Threshold,
-			"kcmLeaseMaxAge", p.Cfg.KCM.LeaseMaxAge,
-			"kcmFreezeMinAge", p.Cfg.KCM.FreezeMinAge)
+			"httpExpectedContent", p.Cfg.HTTPContent.Expected)
 		return shared.AddPeriodic(d.Mgr, d.Name, cfg.interval, p.run)
 	})
 }

@@ -19,6 +19,7 @@ package pvc
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
@@ -27,11 +28,16 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
+
+const pvcResizeStallDefaultMinAge = 30 * time.Minute
 
 // pvcResizeStallGuardCheck is the pvc-resize PVC expansion watchdog.
 type pvcResizeStallGuardCheck struct {
 	*probefw.Deps
+
+	minAge time.Duration
 
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
@@ -45,11 +51,13 @@ type pvcResizeStallGuardCheck struct {
 	seen state.FirstSeenLedger
 }
 
-// NewPVCResizeStallGuardCheck builds the pvc-resize check — its only
-// state is the two ledgers; the check is detection-only and carries
-// no heal state.
+// NewPVCResizeStallGuardCheck builds the pvc-resize check — resolves
+// HEALTH_PVC_RESIZE_STALL_MIN_AGE and initializes the check ledgers.
 func NewPVCResizeStallGuardCheck(d *probefw.Deps) probefw.Check {
-	return &pvcResizeStallGuardCheck{Deps: d}
+	return &pvcResizeStallGuardCheck{
+		Deps:   d,
+		minAge: envx.GetenvDuration("HEALTH_PVC_RESIZE_STALL_MIN_AGE", pvcResizeStallDefaultMinAge),
+	}
 }
 
 const (
@@ -89,7 +97,10 @@ var pvcResizeStallConditions = map[corev1.PersistentVolumeClaimConditionType]boo
 func (p *pvcResizeStallGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	minAge := p.Cfg.Datastore.PVCResizeStallMinAge
+	minAge := p.minAge
+	if minAge <= 0 {
+		minAge = pvcResizeStallDefaultMinAge
+	}
 
 	pvcs, err := p.AllPVCs(ctx)
 	if err != nil {

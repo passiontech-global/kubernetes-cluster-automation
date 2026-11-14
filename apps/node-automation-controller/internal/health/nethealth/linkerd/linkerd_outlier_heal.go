@@ -30,7 +30,7 @@ func (p *linkerdOutlierGuardCheck) maybeEvictOutlier(ctx context.Context,
 	podKey := pod.Namespace + "/" + pod.Name
 	// Gate 6 first — detection ran either way; the kill switch only
 	// gates the actuation half.
-	if !p.Cfg.Linkerd.OutlierEvictEnabled {
+	if !p.evictEnabled {
 		return
 	}
 	// Gate 1 — persistence + pod age: the signature must hold the

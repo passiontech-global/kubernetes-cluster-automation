@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 )
 
@@ -77,9 +78,12 @@ type Deps struct {
 	// StubManager wiring) leaves each consumer's own fallback verdict
 	// in place.
 	Maintenance *maintenance.Verdict
-	Log         logr.Logger
-	Disabled    bool
-	CheckRegs   []CheckReg
+	// CRDSize is the informer-fed CRD serialized-size side table
+	// (nil in tests falls back to kube.CRDSizeIndex).
+	CRDSize   *kube.CRDSizeTable
+	Log       logr.Logger
+	Disabled  bool
+	CheckRegs []CheckReg
 }
 
 // CachedClient returns the manager's informer-backed read client —

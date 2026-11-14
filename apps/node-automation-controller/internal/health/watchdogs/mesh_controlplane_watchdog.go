@@ -261,14 +261,11 @@ func (p *meshControlPlaneCheck) ciliumOperatorLeaderPod(ctx context.Context,
 	if lease == nil {
 		return fallback
 	}
-	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+	candidates := kube.LeaseHolderPodCandidates(lease)
+	if len(candidates) == 0 {
 		return fallback
 	}
 	holder := *lease.Spec.HolderIdentity
-	candidates := []string{holder}
-	if i := strings.LastIndex(holder, "_"); i > 0 {
-		candidates = append([]string{holder[:i]}, candidates...)
-	}
 	for _, name := range candidates {
 		for i := range pods {
 			pod := pods[i]

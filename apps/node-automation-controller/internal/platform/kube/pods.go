@@ -6,9 +6,11 @@ package kube
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -112,4 +114,37 @@ func PodMergePatcher(cs kubernetes.Interface, pod *corev1.Pod) func(context.Cont
 			pod.Name, types.MergePatchType, data, metav1.PatchOptions{})
 		return err
 	}
+}
+
+// PodClaimedPVCs returns the PVC claim names referenced by pod's
+// PersistentVolumeClaim and generic Ephemeral volumes.
+func PodClaimedPVCs(pod *corev1.Pod) []string {
+	var claims []string
+	for _, v := range pod.Spec.Volumes {
+		switch {
+		case v.PersistentVolumeClaim != nil:
+			if v.PersistentVolumeClaim.ClaimName != "" {
+				claims = append(claims, v.PersistentVolumeClaim.ClaimName)
+			}
+		case v.Ephemeral != nil:
+			// Generic ephemeral volumes materialize a PVC named
+			// <pod>-<volume> owned by the pod.
+			claims = append(claims, pod.Name+"-"+v.Name)
+		}
+	}
+	return claims
+}
+
+// LeaseHolderPodCandidates returns candidate pod names derived from a
+// coordinationv1.Lease's HolderIdentity ("<pod>_<uuid>" tries the pod
+// prefix first, then the verbatim identity).
+func LeaseHolderPodCandidates(lease *coordinationv1.Lease) []string {
+	if lease == nil || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+		return nil
+	}
+	holder := *lease.Spec.HolderIdentity
+	if i := strings.LastIndex(holder, "_"); i > 0 {
+		return []string{holder[:i], holder}
+	}
+	return []string{holder}
 }

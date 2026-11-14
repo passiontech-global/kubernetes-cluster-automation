@@ -57,6 +57,7 @@ func (p *localPVStrandedCheck) healStrandedEphemeral(ctx context.Context,
 			})
 		switch {
 		case pvcErr == nil || apierrors.IsNotFound(pvcErr):
+			kube.MarkPVCDeleted(ctx, pvcUID)
 			// NotFound: the claim vanished between list and heal —
 			// the release half is already done, still free the pod.
 		case apierrors.IsForbidden(pvcErr):

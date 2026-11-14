@@ -19,100 +19,88 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// volumeAttachmentCache memoizes the once-per-sweep VolumeAttachment
-// listing — nodeHasStatefulHolders and logVolumeAttachments consume
-// the same census (previously two full cluster lists per fence). The
-// list error is cached too, and each consumer applies its own policy
-// to it: the holder check fails closed, the forensics log is
-// signal-only — both stay consistent across the sweep instead of
-// re-hammering a flapping API per node (same shape as
-// verdict.go's remediationCache).
-type volumeAttachmentCache struct {
+// memo caches one once-per-sweep read (value + error) so N suspect
+// nodes in a cycle pay one list call instead of N.
+type memo[T any] struct {
 	fetched bool
-	items   []storagev1.VolumeAttachment
+	val     T
 	err     error
 }
+
+func (m *memo[T]) get(fn func() (T, error)) (T, error) {
+	if m.fetched {
+		return m.val, m.err
+	}
+	m.fetched = true
+	m.val, m.err = fn()
+	return m.val, m.err
+}
+
+// volumeAttachmentCache memoizes the once-per-sweep VolumeAttachment
+// listing.
+type volumeAttachmentCache = memo[[]storagev1.VolumeAttachment]
 
 // volumeAttachments returns the cluster's VolumeAttachments, listing
 // at most once per cache instance.
 func (s *deadNodeSweeper) volumeAttachments(ctx context.Context,
 	vac *volumeAttachmentCache) ([]storagev1.VolumeAttachment, error) {
-	if vac.fetched {
-		return vac.items, vac.err
-	}
-	vac.fetched = true
-	vac.err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.VolumeAttachments(s.cs),
-		func(items []storagev1.VolumeAttachment) error {
-			vac.items = append(vac.items, items...)
-			return nil
-		})
-	return vac.items, vac.err
+	return vac.get(func() ([]storagev1.VolumeAttachment, error) {
+		var items []storagev1.VolumeAttachment
+		err := kube.ListEach(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			kube.VolumeAttachments(s.cs),
+			func(page []storagev1.VolumeAttachment) error {
+				items = append(items, page...)
+				return nil
+			})
+		return items, err
+	})
 }
 
-// pvCache memoizes the once-per-sweep PersistentVolume census —
-// PV-referenced VolumeAttachments carry only the volume NAME, so
-// nodeHasStatefulHolders resolves access modes off the PV object
-// itself. PVs are cluster-scoped and number in the dozens; without
-// the cache every suspect node re-paged the whole list.
-type pvCache struct {
-	fetched bool
-	modes   map[string][]corev1.PersistentVolumeAccessMode // pv name -> accessModes
-	err     error
-}
+// pvCache memoizes the once-per-sweep PersistentVolume census.
+type pvCache = memo[map[string][]corev1.PersistentVolumeAccessMode]
 
 // pvAccessModes returns PV name → access modes, listing at most
 // once per cache.
 func (s *deadNodeSweeper) pvAccessModes(ctx context.Context,
 	pc *pvCache) (map[string][]corev1.PersistentVolumeAccessMode, error) {
-	if pc.fetched {
-		return pc.modes, pc.err
-	}
-	pc.fetched = true
-	pc.modes = map[string][]corev1.PersistentVolumeAccessMode{}
-	pc.err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.PersistentVolumes(s.cs),
-		func(items []corev1.PersistentVolume) error {
-			for i := range items {
-				pc.modes[items[i].Name] = items[i].Spec.AccessModes
-			}
-			return nil
-		})
-	return pc.modes, pc.err
+	return pc.get(func() (map[string][]corev1.PersistentVolumeAccessMode, error) {
+		modes := map[string][]corev1.PersistentVolumeAccessMode{}
+		err := kube.ListEach(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			kube.PersistentVolumes(s.cs),
+			func(items []corev1.PersistentVolume) error {
+				for i := range items {
+					modes[items[i].Name] = items[i].Spec.AccessModes
+				}
+				return nil
+			})
+		return modes, err
+	})
 }
 
-// pvcCache memoizes the once-per-sweep PVC census — the same
-// listing serves every suspect node (previously each node would
-// re-list all claims). Keyed "namespace/name" → bound PV name.
-type pvcCache struct {
-	fetched bool
-	pvOf    map[string]string // claim "ns/name" -> spec.volumeName
-	err     error
-}
+// pvcCache memoizes the once-per-sweep PVC census.
+type pvcCache = memo[map[string]string]
 
 // pvClaims returns claim→PV bindings, listing at most once per cache.
 func (s *deadNodeSweeper) pvClaims(ctx context.Context,
 	pc *pvcCache) (map[string]string, error) {
-	if pc.fetched {
-		return pc.pvOf, pc.err
-	}
-	pc.fetched = true
-	pc.pvOf = map[string]string{}
-	pc.err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.PersistentVolumeClaims(s.cs, metav1.NamespaceAll),
-		func(items []corev1.PersistentVolumeClaim) error {
-			for i := range items {
-				c := &items[i]
-				if c.Spec.VolumeName != "" {
-					pc.pvOf[c.Namespace+"/"+c.Name] = c.Spec.VolumeName
+	return pc.get(func() (map[string]string, error) {
+		pvOf := map[string]string{}
+		err := kube.ListEach(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			kube.PersistentVolumeClaims(s.cs, metav1.NamespaceAll),
+			func(items []corev1.PersistentVolumeClaim) error {
+				for i := range items {
+					c := &items[i]
+					if c.Spec.VolumeName != "" {
+						pvOf[c.Namespace+"/"+c.Name] = c.Spec.VolumeName
+					}
 				}
-			}
-			return nil
-		})
-	return pc.pvOf, pc.err
+				return nil
+			})
+		return pvOf, err
+	})
 }
 
 // nodeHasStatefulHolders reports whether the node holds

@@ -277,5 +277,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdPodAnno(ctx context.Con
 		}
 		log.Info("WARN: linkerd heal — pod annotation patch failed (RBAC?)",
 			"pod", pod.Namespace+"/"+pod.Name, "error", err)
+		return
 	}
+	kube.RecordAnnoPatch(ctx, pod, payload)
 }

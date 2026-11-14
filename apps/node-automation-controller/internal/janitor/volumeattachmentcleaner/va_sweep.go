@@ -17,7 +17,6 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
@@ -206,23 +205,8 @@ func (c *volumeAttachmentCleaner) sweep(ctx context.Context, log logr.Logger,
 			if t.strip {
 				return // stripFinalizers already metered + logged the failure
 			}
-			switch {
-			case apierrors.IsNotFound(err):
-				// The VA was deleted under us — raced with an
-				// external cleanup; nothing failed.
-				log.Info("SKIP: volumeattachment already gone — raced with an external delete",
-					"va", t.va.Name)
-			case apierrors.IsConflict(err):
-				// The UID precondition fired — the VA was recreated
-				// (same csi-hash name, new volume) since the list.
-				log.Info("SKIP: volumeattachment recreated since the list — UID precondition fired",
-					"va", t.va.Name, "node", t.va.Spec.NodeName)
-			default:
-				metrics.IncError(c.queue)
-				log.Error(err, "volumeattachment delete failed",
-					"va", t.va.Name, "node", t.va.Spec.NodeName,
-					"pv", ptr.Deref(t.va.Spec.Source.PersistentVolumeName, "?"))
-			}
+			reap.DeleteErrorHandler("va", func(t *vaTarget) string { return t.va.Name },
+				func() { metrics.IncError(c.queue) })(log, t, err)
 		},
 	})
 }

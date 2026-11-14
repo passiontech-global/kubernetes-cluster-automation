@@ -81,9 +81,9 @@ func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 // as empty (same "unparseable = absent" posture as
 // kube.ParseAnnoTime); the in-RAM half needs no enumeration —
 // p.seen.Prune drops non-live keys at sweep end.
-func argoPersistedFirstSeen(app *unstructured.Unstructured) map[string]bool {
+func argoPersistedFirstSeen(ctx context.Context, app *unstructured.Unstructured) map[string]bool {
 	sigs := map[string]bool{}
-	raw := app.GetAnnotations()[kube.AnnoFirstSeenArgoCDAppStuck]
+	raw := kube.EffectiveAnno(ctx, app, kube.AnnoFirstSeenArgoCDAppStuck)
 	if raw == "" {
 		return sigs
 	}

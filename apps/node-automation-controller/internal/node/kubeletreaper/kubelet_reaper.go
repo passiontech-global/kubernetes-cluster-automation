@@ -106,6 +106,9 @@ type kubeletReaper struct {
 	// which the fake clientset cannot serve — a field so tests can
 	// stub the healthz outcome per node.
 	probeFn func(ctx context.Context, node string) bool
+	// probeGap overrides kubeletReaperProbeGap in unit tests so retry
+	// cadence tests don't sleep 30+ real seconds. 0 = production default.
+	probeGap time.Duration
 	// freshFail tracks how long each node's probe-fail has persisted
 	// while its kubelet Lease stayed fresh — the cross-sweep
 	// persistence window that separates a wedged :10250 (fake-ready,

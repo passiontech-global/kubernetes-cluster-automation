@@ -108,8 +108,8 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	// on time.Equal — a second w.now.Now() call would miss the stamp
 	// by nanoseconds and silently keep the grant.
 	gateNow := w.now.Now()
-	proceed, unverifiable := heal.AllowedV(ctx, log, w.verdict,
-		w.cs, w.dyn, nil, "coredns", 0, gateNow)
+	proceed, unverifiable := heal.Gate(ctx, log, w.verdict,
+		w.cs, w.dyn, "coredns", gateNow)
 	if unverifiable {
 		metrics.IncError(w.queue)
 		return nil
@@ -175,6 +175,7 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 		// sweep.
 		evictCap := max(1, int(deploy.Status.ReadyReplicas)/4)
 		deleted := 0
+		var evictErr error
 		for _, name := range suspects {
 			if deleted >= evictCap {
 				log.Info("DEFER: per-pass CoreDNS eviction cap reached — rest next sweep",
@@ -202,19 +203,25 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 				log.Info("stale pod already gone", "pod", corednsNS+"/"+name)
 				continue
 			case err != nil:
-				return fmt.Errorf("evict stale pod %s/%s: %w", corednsNS, name, err)
+				evictErr = fmt.Errorf("evict stale pod %s/%s: %w", corednsNS, name, err)
 			case !evicted:
 				continue
+			}
+			if evictErr != nil {
+				break
 			}
 			deleted++
 		}
 		// The cooldown annotation is stamped only for recovery we
 		// DELIVERED — zero deletes means nothing happened this cycle,
 		// and stamping anyway would suppress a needed recovery for a
-		// full cooldown window. The batch's single AllowedV grant
-		// bought no heal either, so it goes back — same contract
-		// heal.EvictPodV applies per PDB refusal.
+		// full cooldown window. If at least one eviction landed before
+		// a later pod errored, still stamp the cooldown before
+		// returning the error so the partial recovery is cooled down.
 		if deleted == 0 {
+			if evictErr != nil {
+				return evictErr
+			}
 			heal.RefundGrant(gateNow)
 			log.Info("sweep done: no stale pod deleted (all already gone)", "pods", suspects)
 			return nil
@@ -226,6 +233,9 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 		if _, err := w.cs.AppsV1().Deployments(corednsNS).Patch(ctx, "coredns",
 			types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 			return fmt.Errorf("stamp cooldown annotation on deployment %s/coredns: %w", corednsNS, err)
+		}
+		if evictErr != nil {
+			return evictErr
 		}
 	}
 	log.Info("sweep done: stale coredns recovery issued", "pods", suspects)

@@ -300,7 +300,7 @@ func TestParseModulesFlag(t *testing.T) {
 }
 
 // Every runnable module registers exactly one runnable on the
-// manager — 32 runnable rows in the 84-row registry (the 52 health
+// manager — 32 runnable rows in the 88-row registry (the 56 health
 // CheckReg rows contribute checks to the sweep roster, not
 // runnables) — except the gate-skippers, which SetupModules hands
 // Deps.Disabled and which then skip mgr.Add entirely. Modules whose

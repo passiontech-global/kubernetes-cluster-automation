@@ -120,6 +120,9 @@ func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 			_, err := p.CS.CoreV1().Pods(pod.Namespace).Patch(ctx,
 				pod.Name, types.MergePatchType, data,
 				metav1.PatchOptions{})
+			if err == nil {
+				kube.RecordAnnoPatch(ctx, pod, data)
+			}
 			return err
 		}
 		reason, err := p.ksmWedgeReason(ctx, pod)

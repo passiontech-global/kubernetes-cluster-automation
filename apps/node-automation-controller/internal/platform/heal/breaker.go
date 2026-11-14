@@ -148,17 +148,9 @@ func (b *TargetBreaker) TryAcquireTarget(module, targetKey string, now time.Time
 	// forget hook can fire ONCE per dropped entry outside the mutex.
 	var forgotten []breakerTarget
 	if h != nil {
-		// Same ascending-prefix trim as Budget.Allow: grants append
-		// in time order, so the expired prefix drops with one slice
-		// trim — a full scan only on clock skew. A fully expired
+		// Same ascending-prefix trim as Budget.Allow: a fully expired
 		// history closes and GCs the entry: the circuit resets.
-		if i := slices.IndexFunc(h.stamps, func(t time.Time) bool {
-			return t.After(cut)
-		}); i > 0 {
-			h.stamps = append([]time.Time{}, h.stamps[i:]...)
-		} else if i < 0 {
-			h.stamps = h.stamps[:0]
-		}
+		h.stamps = trimWindow(h.stamps, cut)
 		if len(h.stamps) == 0 {
 			delete(b.targets, k)
 			h = nil

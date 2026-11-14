@@ -30,14 +30,5 @@ func testProber(cs *fake.Clientset) *probetest.Prober {
 }
 
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober {
-	p := probetest.NewCheckProber(cs, dyn, harnessChecks...)
-	// The production sweep resolves the CILIUM_* knobs into
-	// Cfg.Cilium once at Setup (CiliumConfigFromEnv —
-	// clusterhealthprobes wiring); NewDeps leaves it zero, so the
-	// harness stamps the documented defaults the env parse yields.
-	p.Cfg.Cilium = probefw.CiliumConfig{
-		BPFMapPressureThreshold: probefw.CiliumBPFMapPressureDefault,
-		NodeIPAMMinFreeRatio:    probefw.CiliumNodeIPAMMinFreeDefault,
-	}
-	return p
+	return probetest.NewCheckProber(cs, dyn, harnessChecks...)
 }

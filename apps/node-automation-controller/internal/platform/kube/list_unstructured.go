@@ -77,7 +77,7 @@ func ListFirstGVR[T any](ctx context.Context,
 		if err == nil {
 			return items, gvr, nil
 		}
-		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		if IsCRDAbsent(err) {
 			if benignErr == nil {
 				benignErr = err
 			}
@@ -91,6 +91,12 @@ func ListFirstGVR[T any](ctx context.Context,
 		return zero, schema.GroupVersionResource{}, realErr
 	}
 	return zero, schema.GroupVersionResource{}, benignErr
+}
+
+// IsCRDAbsent reports whether err indicates the target CRD/API resource
+// does not exist on the cluster (404 NotFound or RESTMapper NoMatch).
+func IsCRDAbsent(err error) bool {
+	return apierrors.IsNotFound(err) || meta.IsNoMatchError(err)
 }
 
 // ListFirstUnstructured is ListFirstGVR bound to the direct dynamic

@@ -81,7 +81,10 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGClusterHealth(
 	ctx context.Context, log logr.Logger, rep *probefw.SweepReport,
 	clusters []*unstructured.Unstructured, now time.Time) {
 
-	minAge := p.Cfg.Datastore.CNPGUnhealthyMinAge
+	minAge := p.cnpgUnhealthyMinAge
+	if minAge <= 0 {
+		minAge = cnpgUnhealthyDefaultMinAge
+	}
 	var cnpgRep probefw.SweepReport
 	live := map[string]bool{} // first-seen keys still holding this sweep
 	emit := func(cr *unstructured.Unstructured, reason, detail string) {
@@ -457,6 +460,7 @@ func (p *postgresWALArchiveGuardCheck) unfenceCNPGInstance(
 	if err != nil {
 		return err
 	}
+	kube.RecordAnnoPatch(ctx, cr, data)
 	// Hand the fresh RV back OUT — never onto cr itself (the census
 	// object is shared read-only state for the rest of the sweep).
 	if patched != nil {

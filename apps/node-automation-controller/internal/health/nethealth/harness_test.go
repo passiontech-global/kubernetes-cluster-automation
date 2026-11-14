@@ -41,20 +41,7 @@ func testProber(cs *fake.Clientset) *probetest.Prober {
 }
 
 func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *probetest.Prober {
-	p := probetest.NewCheckProber(cs, dyn, harnessChecks...)
-	// The production sweep resolves the CILIUM_* knobs into
-	// Cfg.Cilium once at Setup (CiliumConfigFromEnv —
-	// clusterhealthprobes wiring); NewDeps leaves it zero, so the
-	// harness stamps the documented defaults the env parse yields.
-	p.Cfg.Cilium = probefw.CiliumConfig{
-		BPFMapPressureThreshold: probefw.CiliumBPFMapPressureDefault,
-		NodeIPAMMinFreeRatio:    probefw.CiliumNodeIPAMMinFreeDefault,
-	}
-	// Same stamp for the linkerd-outlier evict kill-switch —
-	// nethealth.LinkerdConfigFromEnv resolves it at Setup; tests
-	// that want the gate off set the field to false directly.
-	p.Cfg.Linkerd.OutlierEvictEnabled = LinkerdOutlierEvictEnabledDefault
-	return p
+	return probetest.NewCheckProber(cs, dyn, harnessChecks...)
 }
 
 // clusterIPService builds a routable (non-headless) ClusterIP Service

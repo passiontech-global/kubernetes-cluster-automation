@@ -17,11 +17,16 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
+
+const ciliumBPFMapPressureDefault = 0.85
 
 // ciliumBPFMapPressureCheck is the cilium BPF map pressure watchdog.
 type ciliumBPFMapPressureCheck struct {
 	*probefw.Deps
+
+	threshold float64
 
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
@@ -30,10 +35,12 @@ type ciliumBPFMapPressureCheck struct {
 	emitted state.GaugeLedger[string]
 }
 
-// newCiliumBPFMapPressureCheck builds the cilium-bpf-map-pressure check — its only
-// state is the emitted-gauge ledger.
+// NewCiliumBPFMapPressureCheck builds the cilium-bpf-map-pressure check.
 func NewCiliumBPFMapPressureCheck(d *probefw.Deps) probefw.Check {
-	return &ciliumBPFMapPressureCheck{Deps: d}
+	return &ciliumBPFMapPressureCheck{
+		Deps:      d,
+		threshold: envx.GetenvFloat("CILIUM_BPF_MAP_PRESSURE_THRESHOLD", ciliumBPFMapPressureDefault),
+	}
 }
 
 const (
@@ -61,10 +68,10 @@ func init() {
 // false FAIL.
 func (p *ciliumBPFMapPressureCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
-	// The CILIUM_BPF_MAP_PRESSURE_THRESHOLD knob resolves once at
-	// sweep Setup (CiliumConfigFromEnv — >1 keeps working as
-	// the documented "disable this check" escape).
-	threshold := p.Cfg.Cilium.BPFMapPressureThreshold
+	threshold := p.threshold
+	if threshold <= 0 {
+		threshold = ciliumBPFMapPressureDefault
+	}
 	query := `max by (node, map_name) (cilium_bpf_map_pressure) > ` +
 		strconv.FormatFloat(threshold, 'f', -1, 64)
 	series, err := p.PromQuery(ctx, query)

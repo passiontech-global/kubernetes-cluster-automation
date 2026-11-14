@@ -20,13 +20,17 @@ import (
 // storage checks (resize stalls, stranded localpv pods) read.
 func (d *Deps) AllPVCs(ctx context.Context) ([]corev1.PersistentVolumeClaim, error) {
 	s := sweepSnap(ctx)
-	return s.pvcs.get(func(bool) ([]corev1.PersistentVolumeClaim, error) {
+	pvcs, err := s.pvcs.get(func(bool) ([]corev1.PersistentVolumeClaim, error) {
 		lctx, cancel := s.listCtx(ctx)
 		defer cancel()
 		return kube.ListAll(lctx,
 			snapshotListOpts(),
 			kube.PersistentVolumeClaims(d.CS, metav1.NamespaceAll))
 	})
+	if err != nil {
+		return nil, err
+	}
+	return kube.FilterPVCTombstones(ctx, pvcs), nil
 }
 
 // AllStatefulSets is the statefulset twin.

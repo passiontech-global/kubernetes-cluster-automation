@@ -38,6 +38,7 @@ func chPod(ns, name string, phase corev1.PodPhase, age time.Duration) *corev1.Po
 // ---------------------------------------------------------------------------
 
 func TestProbeDNS(t *testing.T) {
+	t.Setenv("HEALTH_DNS_HOSTNAMES", "svc-a.ns.svc,svc-b.ns.svc")
 	p := testProber(fake.NewSimpleClientset())
 	if res := probetest.MustCheck[*dnsStatusCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("expected pass, got %+v", res)

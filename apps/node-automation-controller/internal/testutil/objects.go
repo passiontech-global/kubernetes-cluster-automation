@@ -140,12 +140,22 @@ func EmulatePodNodeNameSelector(cs *fake.Clientset) {
 		})
 }
 
-// ForbidDeployPatch records any patch attempt on deployments — the
-// probe for "reconcile must not patch".
-func ForbidDeployPatch(cs *fake.Clientset, patched *bool) {
-	cs.PrependReactor("patch", "deployments",
+// ForbidResourcePatch records any patch attempt on resource.
+func ForbidResourcePatch(cs *fake.Clientset, resource string, patched *bool) {
+	cs.PrependReactor("patch", resource,
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			*patched = true
 			return true, nil, nil
 		})
+}
+
+// ForbidDeployPatch records any patch attempt on deployments — the
+// probe for "reconcile must not patch".
+func ForbidDeployPatch(cs *fake.Clientset, patched *bool) {
+	ForbidResourcePatch(cs, "deployments", patched)
+}
+
+// ForbidDaemonSetPatch records any patch attempt on daemonsets.
+func ForbidDaemonSetPatch(cs *fake.Clientset, patched *bool) {
+	ForbidResourcePatch(cs, "daemonsets", patched)
 }

@@ -39,7 +39,7 @@ import (
 // preserving the old registerCheck idempotence. r.New carries the
 // typed check constructor — a mistyped registration fails the
 // build, never reaches boot.
-func (p *clusterHealthProber) appendCheckRegs(regs []shared.CheckReg) error {
+func (p *clusterHealthProber) appendCheckRegs(regs []shared.CheckReg) {
 	seen := make(map[string]bool, len(p.checks)+len(regs))
 	for _, c := range p.checks {
 		seen[c.name] = true
@@ -51,5 +51,4 @@ func (p *clusterHealthProber) appendCheckRegs(regs []shared.CheckReg) error {
 		p.checks = append(p.checks, checkEntry{name: r.Name, check: r.New(p.Deps)})
 		seen[r.Name] = true
 	}
-	return nil
 }

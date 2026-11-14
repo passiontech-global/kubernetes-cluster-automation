@@ -3,7 +3,7 @@
 controller-runtime operator replacing the shell-operator Deployment +
 bash hooks for node lifecycle automation. All logic is compiled in —
 no shell, no `kubectl`/`jq`/`curl` forks. One binary runs 32 wired
-modules plus a 52-check cluster-health sweep, grouped in six domain
+modules plus a 56-check cluster-health sweep, grouped in six domain
 trees; the interface contract is Prometheus metrics on
 `:9115/metrics` plus `/healthz`+`/readyz` on `:8081` (kept
 byte-stable with the shell-operator alerts).
@@ -132,8 +132,8 @@ byte-stable with the shell-operator alerts).
 - `internal/platform`, `internal/metrics`, `internal/promq`,
   `internal/probefw` are leaves: they must NEVER import
   shared/registry/testutil or a domain module (push shared logic
-  down into platform; probefw → shared was the import cycle that
-  forced `CheckReg.New` to be `any`).
+  down into platform; `shared.CheckReg.New` is typed as
+  `func(*probefw.Deps) probefw.Check`).
 - `internal/shared` may use metrics/platform but never a domain
   module or the registry.
 - Domain trees are self-contained: `health/*` may not import
@@ -177,13 +177,14 @@ byte-stable with the shell-operator alerts).
   `shared.SetupWithConfig`, modules without use
   `shared.SetupNoConfig`, so parse warnings fire even when gated
   off and no module hand-rolls `if d.Disabled`. Reading env inside
-  a run/sweep is a bug — the FOUR sanctioned
+  a run/sweep is a bug — the FIVE sanctioned
   exceptions, all deliberately hot-reloaded per sweep as ops levers,
-  are, per module: webhookguard's `WEBHOOK_CIRCUIT_BREAKER_ENABLED` /
-  `UNMESHED_POD_REMEDIATION_ENABLED` and
-  `WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED`
-  (apiserver/webhookguard/unmeshed/unmeshed_audit.go), and
-  deadnodesweeper's `DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL`
+  are, per module: webhookguard's `WEBHOOK_CIRCUIT_BREAKER_ENABLED`
+  (`circuitbreaker/circuit_breaker.go`),
+  `UNMESHED_POD_REMEDIATION_ENABLED` (`unmeshed/unmeshed_audit.go`),
+  `WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED` (`criticalns/criticalns.go`),
+  and `MEDIK8S_BOOT_FAIL_OPEN_ENABLED` (`bootwebhooks/bootwebhooks.go`),
+  plus deadnodesweeper's `DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL`
   (internal/node/deadnodesweeper — read every cycle by
   fenceUnfencedStateful).
  `os.Getenv`/`os.LookupEnv` is depguard-denied
@@ -196,7 +197,7 @@ byte-stable with the shell-operator alerts).
   fixtures work.
 - Reads go through the direct clientset `d.CS` (RBAC has no watch on
   most types); the informer cache only covers the few types with
-  explicit watches — see `buildCacheOptions` in main.go.
+  explicit watches — see `buildCacheOptions` in `cmd/manager/options.go`.
 
 ## Verify
 

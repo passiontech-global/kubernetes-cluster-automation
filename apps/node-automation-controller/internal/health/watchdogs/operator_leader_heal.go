@@ -208,22 +208,16 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 // own namespace is the fallback when neither resolves.
 func (p *operatorWorkqueueCheck) leaderPods(ctx context.Context, op operatorTarget,
 	lease *coordinationv1.Lease) ([]corev1.Pod, error) {
-	holder := ""
 	// The pod namespace is the operator's own — podNS when the Lease
 	// lives elsewhere (cert-manager elects in kube-system, runs in
 	// cert-manager), else the Lease's namespace; for a nil lease
 	// (leaseOptional operators) the selector scans targetPodNS(op).
 	podNS := targetPodNS(op)
-	if lease != nil {
-		if lease.Spec.HolderIdentity != nil {
-			holder = *lease.Spec.HolderIdentity
-		}
+	holder := ""
+	if lease != nil && lease.Spec.HolderIdentity != nil {
+		holder = *lease.Spec.HolderIdentity
 	}
-	if holder != "" {
-		candidates := []string{holder}
-		if i := strings.LastIndex(holder, "_"); i > 0 {
-			candidates = append([]string{holder[:i]}, candidates...)
-		}
+	if candidates := kube.LeaseHolderPodCandidates(lease); len(candidates) > 0 {
 		for _, name := range candidates {
 			pod, err := p.CS.CoreV1().Pods(podNS).
 				Get(ctx, name, metav1.GetOptions{})

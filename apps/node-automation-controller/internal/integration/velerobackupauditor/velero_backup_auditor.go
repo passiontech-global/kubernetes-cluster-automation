@@ -298,12 +298,14 @@ func (a *veleroBackupAuditor) veleroInstallNS() string {
 // cert-drift-auditor.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	return shared.SetupNoConfig(d, func() error {
+	return shared.SetupWithConfig(d, func() string {
+		return envx.Getenv("VELERO_NAMESPACE", veleroInstallNSDefault)
+	}, func(veleroNS string) error {
 		a := &veleroBackupAuditor{
 			verdict:  d.Maintenance,
 			cs:       cs,
 			dyn:      dyn,
-			veleroNS: envx.Getenv("VELERO_NAMESPACE", veleroInstallNSDefault),
+			veleroNS: veleroNS,
 			now:      shared.SystemClock,
 			queue:    d.Name,
 		}

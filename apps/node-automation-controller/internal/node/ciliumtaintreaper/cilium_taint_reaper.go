@@ -90,7 +90,7 @@ var ciliumTaintChanges = predicate.Funcs{
 	UpdateFunc: func(e event.UpdateEvent) bool {
 		oldN, ok1 := e.ObjectOld.(*corev1.Node)
 		newN, ok2 := e.ObjectNew.(*corev1.Node)
-		if !ok1 || !ok2 {
+		if !ok1 || !ok2 || oldN == nil || newN == nil {
 			return true
 		}
 		return !equality.Semantic.DeepEqual(ciliumStaleTaints(oldN), ciliumStaleTaints(newN))
@@ -105,7 +105,8 @@ func Setup(d shared.Deps) error {
 	// controller, no informer, no RequeueAfter loop. The manager
 	// cache's cilium-pod ByObject entry exists only for this module.
 	return shared.SetupNoConfig(d, func() error {
-		r := &ciliumTaintReaper{cs: cs, nodeReader: mgr.GetClient(), podReader: mgr.GetClient()}
+		cached := d.CachedClient()
+		r := &ciliumTaintReaper{cs: cs, nodeReader: cached, podReader: cached}
 		return ctrl.NewControllerManagedBy(mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the

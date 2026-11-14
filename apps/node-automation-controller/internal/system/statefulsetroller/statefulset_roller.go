@@ -126,8 +126,7 @@ type statefulSetOnDeleteRoller struct {
 // resolved by setupModules into Deps.Disabled) skip registration
 // entirely — same contract as cert-drift-auditor.
 func Setup(d shared.Deps) error {
-	return shared.SetupNoConfig(d, func() error {
-		prom := newDragonflyPromSeam()
+	return shared.SetupWithConfig(d, newDragonflyPromSeam, func(prom dragonflyPromSeam) error {
 		r := &statefulSetOnDeleteRoller{
 			verdict: d.Maintenance, cs: d.CS, dyn: d.Dyn, queue: d.Name,
 			nodeReader: d.CachedClient(), now: shared.SystemClock, prom: prom}
@@ -438,20 +437,14 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// state), and a 409 (the UID precondition fired — the pod was
 	// recreated since ownedPods listed it). All three retry cleanly
 	// next sweep; only a genuine API failure is an error.
-	ev := &policyv1.Eviction{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: candidate.Name, Namespace: sts.Namespace},
-		DeleteOptions: ptr.To(kube.UIDDeleteOptions(candidate.UID, "")),
-	}
-	if err := r.cs.PolicyV1().Evictions(sts.Namespace).
-		Evict(ctx, ev); err != nil {
+	if _, refused, err := heal.EvictPod(ctx, r.cs, nil, "", candidate, now); refused {
+		heal.RefundGrant(now)
+		log.Info("DEFER: PDB refused eviction — roll retries next sweep",
+			"statefulset", sts.Namespace+"/"+sts.Name,
+			"pod", candidate.Name)
+		return false, nil
+	} else if err != nil {
 		switch {
-		case apierrors.IsTooManyRequests(err):
-			heal.RefundGrant(now)
-			log.Info("DEFER: PDB refused eviction — roll retries next sweep",
-				"statefulset", sts.Namespace+"/"+sts.Name,
-				"pod", candidate.Name)
-			return false, nil
 		case apierrors.IsNotFound(err):
 			// The pod is already gone — another actor finished the
 			// roll, the goal state — but OUR eviction never

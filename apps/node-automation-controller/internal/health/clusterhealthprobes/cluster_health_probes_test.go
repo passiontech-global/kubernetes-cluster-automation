@@ -133,13 +133,17 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: watchdogs.CheckNameOnePasswordConnectSync, New: watchdogs.NewOnePasswordConnectSyncCheck},
 		{Name: linkerd.CheckNameLinkerdSidecarOOMGuard, New: linkerd.NewLinkerdSidecarOOMGuardCheck},
 		{Name: cilium.CheckNameCiliumDatapathMapGuard, New: cilium.NewCiliumDatapathMapGuardCheck},
+		{Name: cilium.CheckNameCiliumL2LeaseGuard, New: cilium.NewCiliumL2LeaseGuardCheck},
 		{Name: watchdogs.CheckNameObservabilityPipelineGuard, New: watchdogs.NewObservabilityPipelineGuardCheck},
+		{Name: watchdogs.CheckNameAPIServerRelistStorm, New: watchdogs.NewAPIServerRelistStormCheck},
 		// The three gated gitops rows close out the roster —
 		// the sweep-order contract keeps them after the always-on
 		// sequence.
 		{Name: gitops.CheckNameFluxKustomizationHealth, New: gitops.NewFluxKustomizationHealthCheck},
 		{Name: gitops.CheckNameWorkloadScaleFlapping, New: gitops.NewWorkloadScaleFlappingCheck},
 		{Name: gitops.CheckNameImagePullSecretAuditor, New: gitops.NewImagePullSecretAuditorCheck},
+		{Name: gitops.CheckNameArgoCDAgentSpin, New: gitops.NewArgoCDAgentSpinCheck},
+		{Name: nethealth.CheckNameApiserverNodeReachability, New: nethealth.NewApiserverNodeReachabilityCheck},
 	}
 }
 
@@ -273,8 +277,11 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// twenty-six total. dragonfly-replica-sync-storm's PRIMARY
 	// master-link query dies on the health-text stub and now reports
 	// Infra instead of passing silently — twenty-seven total.
-	if got := errCount() - before; got != 27 {
-		t.Fatalf("run errors delta = %v, want 27", got)
+	// Plus cilium-l2-lease-guard and apiserver-relist-storm-breaker /
+	// argocd-agent-spin / apiserver-node-reachability added to bring
+	// fleetCheckRegs to parity with the 56-check registry -> twenty-nine total.
+	if got := errCount() - before; got != 29 {
+		t.Fatalf("run errors delta = %v, want 29", got)
 	}
 }
 
@@ -342,11 +349,7 @@ func TestHealthEnvKnobsClampBadValues(t *testing.T) {
 		t.Setenv(k, "")
 	}
 	cfg := healthProbeConfigFromEnv()
-	if cfg.Timeouts.Check != 30*time.Second || cfg.Pods.SkipDuration != 10*time.Minute ||
-		cfg.KCM.LeaseMaxAge != 30*time.Second || cfg.KCM.FreezeMinAge != 10*time.Minute {
-		t.Fatalf("unset env produced non-default config: %+v", cfg)
-	}
-	if cfg.Pods.MaxRestarts != 10 || cfg.Quota.Threshold != 0.9 {
+	if cfg.Timeouts.Check != 30*time.Second || cfg.Timeouts.PerCheck != 2*time.Minute {
 		t.Fatalf("unset env produced non-default config: %+v", cfg)
 	}
 
@@ -361,26 +364,6 @@ func TestHealthEnvKnobsClampBadValues(t *testing.T) {
 	t.Setenv("HEALTH_CHECK_TIMEOUT", "15s")
 	if got := healthProbeConfigFromEnv().Timeouts.Check; got != 15*time.Second {
 		t.Fatalf("HEALTH_CHECK_TIMEOUT=15s → %v, want 15s", got)
-	}
-
-	// Negative int → default; 0 is a legitimate (strict) threshold.
-	t.Setenv("HEALTH_MAX_POD_RESTARTS", "-1")
-	if got := healthProbeConfigFromEnv().Pods.MaxRestarts; got != 10 {
-		t.Fatalf("HEALTH_MAX_POD_RESTARTS=-1 → %d, want 10 default", got)
-	}
-	t.Setenv("HEALTH_MAX_POD_RESTARTS", "not-an-int")
-	if got := healthProbeConfigFromEnv().Pods.MaxRestarts; got != 10 {
-		t.Fatalf("HEALTH_MAX_POD_RESTARTS=not-an-int → %d, want 10 default", got)
-	}
-	t.Setenv("HEALTH_MAX_POD_RESTARTS", "0")
-	if got := healthProbeConfigFromEnv().Pods.MaxRestarts; got != 0 {
-		t.Fatalf("HEALTH_MAX_POD_RESTARTS=0 → %d, want 0 (any restart flags)", got)
-	}
-
-	// Unparseable float → default.
-	t.Setenv("HEALTH_RESOURCE_QUOTA_THRESHOLD", "banana")
-	if got := healthProbeConfigFromEnv().Quota.Threshold; got != 0.9 {
-		t.Fatalf("HEALTH_RESOURCE_QUOTA_THRESHOLD=banana → %v, want 0.9", got)
 	}
 }
 

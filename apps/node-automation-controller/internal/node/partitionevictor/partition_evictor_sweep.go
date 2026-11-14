@@ -438,7 +438,11 @@ loop:
 				s.log.Info("DEFER: PDB refused eviction — pod stays until disruptions free up",
 					"pod", p.Namespace+"/"+p.Name, "node", name)
 				continue
-			case err != nil && !apierrors.IsNotFound(err):
+			case apierrors.IsNotFound(err) || apierrors.IsConflict(err):
+				// Already gone or UID precondition fired (replaced) — no
+				// mutation by us, and don't burn the per-sweep cap.
+				continue
+			case err != nil:
 				errN++
 				metrics.IncError(s.e.queue)
 				s.log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
@@ -447,7 +451,7 @@ loop:
 			if delivered {
 				deliveredN++
 			}
-			evicted++ // every attempt but a 429 refusal counts against the cap
+			evicted++ // every real attempt (or non-404/409 error) counts against the cap
 		}
 	}
 	// The sweep grant bought no heal when NOTHING was delivered and

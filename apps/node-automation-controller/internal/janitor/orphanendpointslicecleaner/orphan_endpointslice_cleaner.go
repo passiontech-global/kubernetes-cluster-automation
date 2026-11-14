@@ -41,7 +41,6 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -249,29 +248,9 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 			metrics.OrphanEndpointSlicesCleanedTotal.WithLabelValues(t.ns).Inc()
 			return nil
 		},
-		OnError: func(log logr.Logger, t target, err error) {
-			// Benign delete races are not run errors: NotFound — the
-			// vetted slice was already gone (a sibling janitor, the
-			// previous sweep's delete, or kube-controller-manager
-			// catching up removed it first); Conflict — the UID
-			// precondition caught a same-named slice RECREATED
-			// between the census and the delete, exactly the TOCTOU
-			// window the precondition exists to close. Both mean the
-			// object we vetted is no longer the one on the cluster:
-			// log and move on WITHOUT IncError (a recreated slice
-			// re-arms its own streak under its new UID key, so the
-			// ledger needs no reset here).
-			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-				log.Info("SKIP: orphan endpointslice gone/recreated before delete (benign race)",
-					"endpointslice", t.ns+"/"+t.name,
-					"notFound", apierrors.IsNotFound(err),
-					"conflict", apierrors.IsConflict(err))
-				return
-			}
-			log.Error(err, "orphan endpointslice delete failed",
-				"endpointslice", t.ns+"/"+t.name)
-			metrics.IncError(c.queue)
-		},
+		OnError: reap.DeleteErrorHandler("endpointslice",
+			func(t target) string { return t.ns + "/" + t.name },
+			func() { metrics.IncError(c.queue) }),
 	})
 
 	// Prune streaks for slices that vanished or whose Service came

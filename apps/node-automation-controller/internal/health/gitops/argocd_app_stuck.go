@@ -233,7 +233,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		// recurrence re-arms the full window — a stale stamp would
 		// fast-trip it (premature remediation). Tolerated
 		// sub-failure: Warn + continue, retry next sweep.
-		for sig := range argoPersistedFirstSeen(app) {
+		for sig := range argoPersistedFirstSeen(ctx, app) {
 			if seenKeep[sig] {
 				continue
 			}

@@ -63,6 +63,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // linkerdOutlierGuardCheck is the linkerd-outlier single-pod 5xx gray-
@@ -70,6 +71,8 @@ import (
 // the six gates documented in the file header.
 type linkerdOutlierGuardCheck struct {
 	*probefw.Deps
+
+	evictEnabled bool
 
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
@@ -83,11 +86,13 @@ type linkerdOutlierGuardCheck struct {
 	seen state.FirstSeenLedger
 }
 
-// NewLinkerdOutlierGuardCheck builds the linkerd-outlier check — its state
-// is the emitted-gauge and first-seen ledgers; evict cooldowns ride
-// the shared Deps.Heals set.
+// NewLinkerdOutlierGuardCheck builds the linkerd-outlier check — resolves
+// LINKERD_OUTLIER_EVICT_ENABLED and initializes the check ledgers.
 func NewLinkerdOutlierGuardCheck(d *probefw.Deps) probefw.Check {
-	return &linkerdOutlierGuardCheck{Deps: d}
+	return &linkerdOutlierGuardCheck{
+		Deps:         d,
+		evictEnabled: envx.Gate("LINKERD_OUTLIER_EVICT_ENABLED", true),
+	}
 }
 
 const (

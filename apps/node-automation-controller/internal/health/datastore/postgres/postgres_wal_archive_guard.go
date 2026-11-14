@@ -7,8 +7,9 @@
 // guard in on top of the same CR scan: a failover phase wedged past
 // CNPGUnhealthyMinAge, a ready<instances shortfall, or disabled
 // continuous archiving flags node_automation_cnpg_cluster_unhealthy.
-// Detection-only: nothing here execs, deletes or patches — the
-// gauges are the alert contract.
+// Note: WAL archive / replication-slot / volume checks are detection-only;
+// checkCNPGClusterHealth additionally auto-unfences stale cnpg.io/fencedInstances
+// via the gated heal preamble.
 package postgres
 
 import (
@@ -27,11 +28,16 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
+
+const cnpgUnhealthyDefaultMinAge = 15 * time.Minute
 
 // postgresWALArchiveGuardCheck is the WAL-archive stall watchdog.
 type postgresWALArchiveGuardCheck struct {
 	*probefw.Deps
+
+	cnpgUnhealthyMinAge time.Duration
 
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
@@ -59,11 +65,13 @@ type postgresWALArchiveGuardCheck struct {
 	cnpgFenceSeen state.FirstSeenLedger
 }
 
-// NewPostgresWALArchiveGuardCheck builds the WAL guard — its only
-// state is the emitted-gauge ledger; the check is detection-only and
-// carries no heal state.
+// NewPostgresWALArchiveGuardCheck builds the WAL guard and resolves
+// HEALTH_CNPG_UNHEALTHY_MIN_AGE.
 func NewPostgresWALArchiveGuardCheck(d *probefw.Deps) probefw.Check {
-	return &postgresWALArchiveGuardCheck{Deps: d}
+	return &postgresWALArchiveGuardCheck{
+		Deps:                d,
+		cnpgUnhealthyMinAge: envx.GetenvDuration("HEALTH_CNPG_UNHEALTHY_MIN_AGE", cnpgUnhealthyDefaultMinAge),
+	}
 }
 
 const (

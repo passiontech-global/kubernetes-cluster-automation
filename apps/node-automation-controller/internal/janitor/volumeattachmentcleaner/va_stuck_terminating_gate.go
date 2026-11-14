@@ -309,19 +309,7 @@ func (c *volumeAttachmentCleaner) podsUsingVolume(ctx context.Context,
 			p.Status.Phase == corev1.PodFailed {
 			continue // terminal — nobody is writing through it
 		}
-		for _, v := range p.Spec.Volumes {
-			claim := ""
-			switch {
-			case v.PersistentVolumeClaim != nil:
-				claim = v.PersistentVolumeClaim.ClaimName
-			case v.Ephemeral != nil:
-				// Generic ephemeral volumes materialize a PVC named
-				// <pod>-<volume> owned by the pod.
-				claim = p.Name + "-" + v.Name
-			}
-			if claim == "" {
-				continue
-			}
+		for _, claim := range kube.PodClaimedPVCs(p) {
 			vol, err := c.pvcBoundVolume(ctx, pvcPVs,
 				p.Namespace, claim, log)
 			if err != nil {

@@ -57,7 +57,6 @@ func NewDeps(cs kubernetes.Interface, dyn dynamic.Interface) *probefw.Deps {
 		CS:   cs,
 		Dyn:  dyn,
 		Cfg: probefw.Config{
-			DNS: probefw.DNSConfig{Hostnames: []string{"svc-a.ns.svc", "svc-b.ns.svc"}},
 			Timeouts: probefw.TimeoutsConfig{
 				Check:    5 * time.Second,
 				PerCheck: time.Minute,
@@ -65,35 +64,6 @@ func NewDeps(cs kubernetes.Interface, dyn dynamic.Interface) *probefw.Deps {
 			HTTPContent: probefw.HTTPContentConfig{
 				URL:      "http://127.0.0.1:1/",
 				Expected: "Healthy",
-			},
-			Pods: probefw.PodsConfig{
-				Namespace:    "kube-system",
-				MaxRestarts:  10,
-				SkipDuration: 10 * time.Minute,
-			},
-			Quota: probefw.QuotaConfig{Threshold: 0.9},
-			KCM: probefw.KCMConfig{
-				LeaseMaxAge:  30 * time.Second,
-				FreezeMinAge: 10 * time.Minute,
-			},
-			// Env-equivalent datastore defaults (the values
-			// datastore.ConfigFromEnv resolves) — the shared
-			// scaffold deliberately stays free of domain-package
-			// imports, so the cnpg-health window numbers repeat here.
-			Datastore: probefw.DatastoreConfig{
-				CNPGUnhealthyMinAge:  15 * time.Minute,
-				PVCResizeStallMinAge: 30 * time.Minute,
-			},
-			// Env-equivalent cilium/linkerd defaults — same
-			// domain-free posture as Datastore above (the
-			// nethealth defaults live in a sibling package this
-			// scaffold must not import, so the literals repeat).
-			Cilium: probefw.CiliumConfig{
-				BPFMapPressureThreshold: probefw.CiliumBPFMapPressureDefault,
-				NodeIPAMMinFreeRatio:    probefw.CiliumNodeIPAMMinFreeDefault,
-			},
-			Linkerd: probefw.LinkerdConfig{
-				OutlierEvictEnabled: true, // = nethealth.LinkerdOutlierEvictEnabledDefault
 			},
 		},
 		LookupHost: func(context.Context, string) ([]string, error) {

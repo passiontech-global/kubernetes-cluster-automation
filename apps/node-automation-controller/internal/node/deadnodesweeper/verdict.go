@@ -236,15 +236,8 @@ func healthyCanaryName(nodes []corev1.Node) string {
 const remediationNodeNameAnno = "remediation.medik8s.io/node-name"
 
 // remediationCache memoizes the once-per-sweep remediation CR
-// listing — the same API read serves every suspect node in the
-// cycle, so N suspects cost two List calls total, not 2N. A list
-// failure is cached too: the verdict stays consistent across the
-// sweep instead of re-hammering a flapping API per node.
-type remediationCache struct {
-	fetched bool
-	items   []unstructured.Unstructured
-	err     error
-}
+// listing.
+type remediationCache = memo[[]unstructured.Unstructured]
 
 // remediationItems returns both CRDs' objects, listing at most once
 // per cache instance. A missing CRD is "no evidence" for that GVR —
@@ -257,26 +250,24 @@ func (s *deadNodeSweeper) remediationItems(ctx context.Context,
 	if s.dyn == nil {
 		return nil, errors.New("no dynamic client — remediation CR check unverifiable")
 	}
-	if rem.fetched {
-		return rem.items, rem.err
-	}
-	rem.fetched = true
-	for _, gvr := range []schema.GroupVersionResource{
-		selfNodeRemediationGVR, fenceAgentsRemediationGVR,
-	} {
-		items, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.DynamicPage(s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll)))
-		if err != nil {
-			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
-				continue // CRD not installed on this cluster
+	return rem.get(func() ([]unstructured.Unstructured, error) {
+		var items []unstructured.Unstructured
+		for _, gvr := range []schema.GroupVersionResource{
+			selfNodeRemediationGVR, fenceAgentsRemediationGVR,
+		} {
+			page, err := kube.ListAll(ctx,
+				metav1.ListOptions{Limit: kube.DefaultListPageSize},
+				kube.DynamicPage(s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll)))
+			if err != nil {
+				if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+					continue // CRD not installed on this cluster
+				}
+				return nil, fmt.Errorf("list %s: %w", gvr.Resource, err)
 			}
-			rem.err = fmt.Errorf("list %s: %w", gvr.Resource, err)
-			return nil, rem.err
+			items = append(items, page...)
 		}
-		rem.items = append(rem.items, items...)
-	}
-	return rem.items, nil
+		return items, nil
+	})
 }
 
 // hasRemediationCR reports whether any medik8s remediation object

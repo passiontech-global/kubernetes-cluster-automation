@@ -7,6 +7,7 @@
 package probetest
 
 import (
+	"context"
 	"testing"
 
 	"k8s.io/client-go/dynamic"
@@ -57,6 +58,15 @@ func MustCheck[T probefw.Check](t *testing.T, p *Prober) T {
 	t.Fatalf("no registered check of the wanted type")
 	var zero T
 	return zero
+}
+
+// RunCheck runs chk inside a fresh SweepCtx and verifies no census
+// memo was mutated in place afterwards.
+func RunCheck(ctx context.Context, chk probefw.Check) probefw.Result {
+	sctx := SweepCtx(ctx)
+	res := chk.Run(sctx)
+	VerifySweep(sctx)
+	return res
 }
 
 // LedgerKeys reports the keys a FirstSeenLedger currently holds —

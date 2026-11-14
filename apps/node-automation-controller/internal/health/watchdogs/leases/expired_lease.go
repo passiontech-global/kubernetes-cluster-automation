@@ -17,6 +17,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // Expired lease + running pods — the wedged-elector signature + heal
@@ -47,11 +49,8 @@ func leaseStaleWindow(lease *coordinationv1.Lease, now time.Time) bool {
 func controllerRunningPods(lease *coordinationv1.Lease, pods []corev1.Pod) (
 	targets []corev1.Pod, fallbackAmbiguous bool) {
 	holderNames := map[string]bool{}
-	if h := lease.Spec.HolderIdentity; h != nil && *h != "" {
-		holderNames[*h] = true
-		if i := strings.LastIndex(*h, "_"); i > 0 {
-			holderNames[(*h)[:i]] = true
-		}
+	for _, name := range kube.LeaseHolderPodCandidates(lease) {
+		holderNames[name] = true
 	}
 	ownerUIDs := map[types.UID]bool{}
 	for i := range pods {

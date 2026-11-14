@@ -282,7 +282,6 @@ func TestLinkerdOutlierEvicted(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
 	testutil.EmulateEviction(cs)
 	p := testProber(cs)
-	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
@@ -319,7 +318,6 @@ func TestLinkerdOutlierInconclusiveSweepResetsPersistence(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
 	testutil.EmulateEviction(cs)
 	p := testProber(cs)
-	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
@@ -351,9 +349,9 @@ func TestLinkerdOutlierEvictDisabled(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
 	testutil.EmulateEviction(cs)
 	p := testProber(cs)
-	p.Cfg.Linkerd.OutlierEvictEnabled = false // kill switch
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
+	chk.evictEnabled = false // kill switch
 	probetest.FreezeNow(p.Deps, base)
 	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("outlier signature must still fail when evict is off")
@@ -382,7 +380,6 @@ func TestLinkerdOutlierNoReadySiblingSurvives(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
 	testutil.EmulateEviction(cs)
 	p := testProber(cs)
-	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
@@ -415,7 +412,6 @@ func TestLinkerdOutlierPDBBlocksEvict(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2, pdb)
 	testutil.EmulateEviction(cs)
 	p := testProber(cs)
-	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
@@ -441,7 +437,6 @@ func TestLinkerdOutlierControllerCooldown(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
 	testutil.EmulateEviction(cs)
 	p := testProber(cs)
-	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
@@ -489,7 +484,6 @@ func TestLinkerdOutlierYoungPodSurvives(t *testing.T) {
 	cs := fake.NewSimpleClientset(bad, sib1, sib2)
 	testutil.EmulateEviction(cs)
 	p := testProber(cs)
-	p.Cfg.Linkerd.OutlierEvictEnabled = true
 	wireProm(t, p, outlierRPS(), outlierFails())
 	chk := probetest.MustCheck[*linkerdOutlierGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)

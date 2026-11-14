@@ -61,7 +61,7 @@ func (r *deschedulerStormGate) applyVerdict(ctx context.Context,
 	// arrive early, never hold the descheduler.
 	if err := heal.ClearPersistedFirstSeen(ctx, log, &r.holdSeen, deploy,
 		kube.AnnoFirstSeenStormGateHold, stormHoldLedgerKey,
-		r.deployAnnoPatch()); err != nil {
+		r.deployAnnoPatch(deploy)); err != nil {
 		log.Info("WARN: storm-gate hold first-seen clear failed — "+
 			"a stale stamp could warn early on the next hold",
 			"error", err)

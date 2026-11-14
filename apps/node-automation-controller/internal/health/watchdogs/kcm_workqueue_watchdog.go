@@ -23,6 +23,8 @@ import (
 type kcmWorkqueueCheck struct {
 	*probefw.Deps
 
+	cfg KCMConfig
+
 	// C6 watchdog state (serial sweep — unguarded):
 	//   - kcmFirstSeen: signature key "<reason>/<kind>/<name>" → the
 	//     first sweep that observed it; a signature must persist
@@ -38,7 +40,7 @@ type kcmWorkqueueCheck struct {
 // newKcmWorkqueueCheck builds the C6 watchdog — both ledgers arm
 // lazily on first use (the GaugeLedger zero value is ready).
 func NewKcmWorkqueueCheck(d *probefw.Deps) probefw.Check {
-	return &kcmWorkqueueCheck{Deps: d}
+	return &kcmWorkqueueCheck{Deps: d, cfg: KCMConfigFromEnv()}
 }
 
 // C6 watchdog knobs — the KCM leader Lease name and the
@@ -133,7 +135,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	}
 	if lease == nil ||
 		lease.Spec.RenewTime == nil ||
-		now.Sub(lease.Spec.RenewTime.Time) > p.Cfg.KCM.LeaseMaxAge {
+		now.Sub(lease.Spec.RenewTime.Time) > p.cfg.LeaseMaxAge {
 		// No leader Lease at all, or a stale renewTime = the holder
 		// is gone — a dead KCM, not a frozen one. Stay quiet.
 		p.resetKCMWorkqueue()
@@ -187,7 +189,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	frozen := map[string]bool{}
 	for sig, reason := range sigs {
 		if probefw.Persisted(&p.kcmFirstSeen, sig, now,
-			p.Cfg.KCM.FreezeMinAge, log) {
+			p.cfg.FreezeMinAge, log) {
 			frozen[reason] = true
 		}
 	}
@@ -205,7 +207,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	return rep.Result(&p.kcmFrozenReasons, kcmFrozenFlipZero,
 		fmt.Sprintf(
 			"KCM lease renews but kube-system objects unreconciled >=%s: ",
-			p.Cfg.KCM.FreezeMinAge), ", ")
+			p.cfg.FreezeMinAge), ", ")
 }
 
 // kcmFrozenFlipZero is the ledger's prune action: a reason series

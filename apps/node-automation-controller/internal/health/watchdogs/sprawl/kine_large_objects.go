@@ -201,9 +201,13 @@ func (p *apiObjectSprawlReportGCCheck) auditKineCRDSize(ctx context.Context,
 		return fmt.Errorf("list %s: %w",
 			kube.GVRCustomResourceDefinition.Resource, err)
 	}
+	crdSize := p.CRDSize
+	if crdSize == nil {
+		crdSize = kube.CRDSizeIndex
+	}
 	for i := range poms {
 		pom := &poms[i]
-		size, ok := kube.CRDSizeIndex.Lookup(pom.Name, pom.ResourceVersion)
+		size, ok := crdSize.Lookup(pom.Name, pom.ResourceVersion)
 		if !ok {
 			// The informer has not stamped this (name, RV) yet —
 			// measure live rather than under-report a fresh CRD.

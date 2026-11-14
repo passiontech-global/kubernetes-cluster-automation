@@ -119,18 +119,17 @@ func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	// this reconcile). A confirmed-fresh object skips; a confirmed
 	// drift patches against the live spec.
 	if s.Reader != nil {
-		d, err = s.CS.AppsV1().Deployments(s.Namespace).
-			Get(ctx, s.Name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			log.Info("SKIP: deployment gone between cache read and confirm", "deployment", ref)
-			return res, nil
-		}
+		var proceed bool
+		d, proceed, err = confirmDirect(ctx, log, "deployment", ref, s.NoDriftLog,
+			func(ctx context.Context) (*appsv1.Deployment, error) {
+				return s.CS.AppsV1().Deployments(s.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
+			},
+			func(d *appsv1.Deployment) bool { return s.Drifted(d, wantReplicas) },
+			"wantReplicas", wantReplicas)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("confirm deployment %s on direct client: %w", ref, err)
+			return ctrl.Result{}, err
 		}
-		if !s.Drifted(d, wantReplicas) {
-			log.Info(s.NoDriftLog+" (confirmed on direct client)",
-				"deployment", ref, "wantReplicas", wantReplicas)
+		if !proceed {
 			return res, nil
 		}
 	}

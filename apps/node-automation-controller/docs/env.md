@@ -60,7 +60,7 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 
 | Env var | Module | Default | Notes |
 |---|---|---|---|
-| `CILIUM_TAINT_REAPER_ENABLED` | cilium-taint-reaper | opt-in (`"true"`) | Registration gate — removes cilium agent-not-ready taints; also gates the kube-system/cilium pods informer (no watch when off). |
+| `CILIUM_TAINT_REAPER_ENABLED` | cilium-taint-reaper | opt-in (`"true"`) | Registration gate — removes cilium agent-not-ready taints (`kube-system` pods informer for `k8s-app in (cilium,kube-dns)` stays configured in the manager cache for `coredns-stale-watchdog` regardless). |
 | `PDB_WATCHDOG_ENABLED` | pdb-deadlock-watchdog | on unless `"false"` | Registration gate — detects PDBs deadlocking drains/evictions. |
 | `CSR_APPROVER_ENABLED` | csr-watcher | off unless `"true"` | Sub-feature gate — approve mode. Off = detect/report pending CSRs only (module always registers). |
 | `NODE_LABELER_CONFIG_PATH` | node-labeler | `/etc/node-labeler/labels.txt` | Path to the labels.txt file the reconciler applies to nodes. |
@@ -108,7 +108,7 @@ knobs (always-on, no gates).
 
 | Env var | Module | Default | Notes |
 |---|---|---|---|
-| `CLUSTER_HEALTH_PROBES_ENABLED` | cluster-health-probes | on unless `"false"` | Registration gate — the ported kuberhealthy check sweep (27 checks). |
+| `CLUSTER_HEALTH_PROBES_ENABLED` | cluster-health-probes | on unless `"false"` | Registration gate — the 56-check cluster-health sweep. |
 | `CLUSTER_HEALTH_PROBES_INTERVAL` | cluster-health-probes | `5m` | Sweep interval for the whole check roster. |
 | `HEALTH_CHECK_TIMEOUT` | cluster-health-probes | `30s` | Timeout wrapping each remote call (probe, PromQL query). |
 | `HEALTH_PER_CHECK_TIMEOUT` | cluster-health-probes | `2m` | Bounds one check's share of the serial sweep — past it the check's ctx is cancelled and the sweep moves on. |
@@ -145,3 +145,4 @@ knobs (always-on, no gates).
 | `-leader-elect-renew-deadline` | `0` | Time the leader retries renewing before giving up; `0` = default (10s). |
 | `-leader-elect-retry-period` | `0` | Interval between Lease renew/acquire attempts; `0` = default (2s). |
 | `-modules` | `""` (all) | Comma-separated allowlist of registry ops names or `@group` selectors (see `internal/registry`) — only those modules wire runnables. Groups: `@system`, `@node`, `@apiserver`, `@janitors`, `@integration`, `@health`. Unknown names/groups abort boot; metric series are predeclared for the full registry regardless. |
+| `-zap-*` | `zap.Options` defaults | Standard controller-runtime zap logging flags (`-zap-devel`, `-zap-encoder`, `-zap-log-level`, `-zap-stacktrace-level`, `-zap-time-encoding`). |

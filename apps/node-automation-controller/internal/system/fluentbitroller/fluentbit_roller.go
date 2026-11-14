@@ -233,8 +233,8 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// sharing r.verdict. Unverifiable fails closed: IncError the
 	// queue and skip; the drift clears on the next reconcile once
 	// maintenance is verifiable again.
-	proceed, unverifiable := heal.AllowedV(ctx, log, r.verdict,
-		r.cs, r.dyn, nil, "fluent-system/fluent-bit", 0, r.now.Now())
+	proceed, unverifiable := heal.Gate(ctx, log, r.verdict,
+		r.cs, r.dyn, "fluent-system/fluent-bit", r.now.Now())
 	if unverifiable {
 		metrics.IncError(r.queue)
 		log.Info("SKIP roll: maintenance mutex unverifiable",

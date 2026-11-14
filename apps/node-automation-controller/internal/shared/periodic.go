@@ -33,10 +33,15 @@ import (
 // only tolerated sub-operation failures that the run absorbs (log +
 // continue, nil return) may IncError from inside fn.
 type Periodic struct {
-	Name     string
-	Interval time.Duration
-	Fn       func(ctx context.Context) error
-	Log      logr.Logger
+	Name       string
+	Interval   time.Duration
+	RunTimeout time.Duration
+	// NextInterval, when non-nil, switches Start from a fixed NewTicker
+	// to an adaptive timer that re-computes the next wait after each
+	// runOnce call (receiving the previous interval).
+	NextInterval func(prev time.Duration) time.Duration
+	Fn           func(ctx context.Context) error
+	Log          logr.Logger
 }
 
 func (p *Periodic) Start(ctx context.Context) error {
@@ -84,6 +89,26 @@ func (p *Periodic) Start(ctx context.Context) error {
 		metrics.IncError(p.Name)
 		log.Error(err, "periodic run failed")
 	}
+	if p.NextInterval != nil {
+		cur := p.Interval
+		for {
+			cur = p.NextInterval(cur)
+			if cur <= 0 {
+				cur = p.Interval
+			}
+			waitTimer := time.NewTimer(cur)
+			select {
+			case <-ctx.Done():
+				waitTimer.Stop()
+				return nil
+			case <-waitTimer.C:
+			}
+			if err := p.runOnce(runCtx); err != nil {
+				metrics.IncError(p.Name)
+				log.Error(err, "periodic run failed")
+			}
+		}
+	}
 	t := time.NewTicker(p.Interval)
 	defer t.Stop()
 	for {
@@ -113,6 +138,11 @@ func (p *Periodic) Start(ctx context.Context) error {
 // queue counter already attribute the failure to the module, which
 // is all the run-level contract needs.
 func (p *Periodic) runOnce(ctx context.Context) (err error) {
+	if p.RunTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.RunTimeout)
+		defer cancel()
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("panic in periodic run: %v", recovered)

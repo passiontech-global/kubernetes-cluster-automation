@@ -115,6 +115,10 @@ type Deps struct {
 	// (the former deps.meshHealed map).
 	Heals state.CooldownSet
 
+	// CRDSize is the informer-fed CRD serialized-size side table
+	// (nil in tests falls back to kube.CRDSizeIndex).
+	CRDSize *kube.CRDSizeTable
+
 	// Maintenance is the shared maintenance-mutex verdict every heal
 	// gate in the sweep memoizes on — wired from
 	// shared.Deps.Maintenance by the sweep module so ALL checks pay
@@ -177,86 +181,26 @@ func NewDeps(name string, cs kubernetes.Interface, dyn dynamic.Interface,
 }
 
 // Config carries the HEALTH_* env knobs the checker Pods read
-// (HOSTNAME/TARGET_URL/MAX_FAILURES_ALLOWED/...), re-homed under a
-// HEALTH_ prefix and grouped by the check (or check family) that
-// consumes them. Defaults match the live check manifests.
+// Config holds the framework-wide sweep configuration: remote-call
+// timeouts and the HTTP/Prometheus target URL used by http-content-check
+// and Probefw.PromEndpoint. Check-specific knobs live in the check
+// packages themselves.
 type Config struct {
 	Timeouts    TimeoutsConfig
-	DNS         DNSConfig
 	HTTPContent HTTPContentConfig
-	Pods        PodsConfig
-	Quota       QuotaConfig
-	KCM         KCMConfig
-	Cilium      CiliumConfig
-	Datastore   DatastoreConfig
-	Linkerd     LinkerdConfig
 }
 
 // TimeoutsConfig bounds remote calls at two levels: Check is the
 // per-request deadline the ported checks (and the shared Prometheus
 // client) wrap each remote call in; PerCheck bounds one check's whole
-// share of the serial sweep.
+// share of the sweep.
 type TimeoutsConfig struct {
 	Check    time.Duration // HEALTH_CHECK_TIMEOUT
 	PerCheck time.Duration // HEALTH_PER_CHECK_TIMEOUT
 }
 
-// DNSConfig — dns-status-internal (the ported dns-resolution-check):
-// every hostname must resolve.
-type DNSConfig struct {
-	Hostnames []string // HEALTH_DNS_HOSTNAMES
-}
-
-// HTTPContentConfig — http-content-check: GET must return 200 with a
-// body containing the expected string.
+// HTTPContentConfig — http-content-check & shared Prometheus base URL.
 type HTTPContentConfig struct {
 	URL      string // HEALTH_HTTP_CONTENT_URL
 	Expected string // HEALTH_HTTP_EXPECTED_CONTENT
-}
-
-// PodsConfig — the pod-restarts and pod-status checks: which
-// namespace to census, the restart ceiling and the young-pod grace.
-type PodsConfig struct {
-	Namespace    string        // HEALTH_POD_CHECK_NAMESPACE
-	MaxRestarts  int32         // HEALTH_MAX_POD_RESTARTS
-	SkipDuration time.Duration // HEALTH_POD_SKIP_DURATION
-}
-
-// QuotaConfig — resource-quota-check: the used/hard ceiling.
-type QuotaConfig struct {
-	Threshold float64 // HEALTH_RESOURCE_QUOTA_THRESHOLD
-}
-
-// KCMConfig — kcm-workqueue-watchdog (C6): how fresh the leader
-// Lease's renewTime must read, and how long a freeze signature must
-// persist before the gauge fires.
-type KCMConfig struct {
-	LeaseMaxAge  time.Duration // HEALTH_KCM_LEASE_MAX_AGE
-	FreezeMinAge time.Duration // HEALTH_KCM_FREEZE_MIN_AGE
-}
-
-// CiliumConfig — the cilium nethealth knobs: the BPF map fill-ratio
-// ceiling for cilium-bpf-map-pressure and the node pod-IP free-ratio
-// floor for cilium-node-ipam-exhaustion. The env names carry no
-// HEALTH_ prefix — they predate the port and the ops contract keeps
-// them byte-stable.
-type CiliumConfig struct {
-	BPFMapPressureThreshold float64 // CILIUM_BPF_MAP_PRESSURE_THRESHOLD
-	NodeIPAMMinFreeRatio    float64 // CILIUM_NODE_IPAM_MIN_FREE_RATIO
-}
-
-// DatastoreConfig — the datastore checks' persistence windows:
-// postgres-wal-archive-guard's cnpg-health CloudNativePG signatures and
-// the pvc-resize-stall-guard's stall window.
-type DatastoreConfig struct {
-	CNPGUnhealthyMinAge  time.Duration // HEALTH_CNPG_UNHEALTHY_MIN_AGE
-	PVCResizeStallMinAge time.Duration // HEALTH_PVC_RESIZE_STALL_MIN_AGE
-}
-
-// LinkerdConfig — the linkerd nethealth knobs:
-// linkerd-outlier-guard's evict kill-switch (linkerd-outlier). The env name
-// carries no HEALTH_ prefix — it is an ops lever on the flags
-// ConfigMap like the other sub-feature gates.
-type LinkerdConfig struct {
-	OutlierEvictEnabled bool // LINKERD_OUTLIER_EVICT_ENABLED
 }

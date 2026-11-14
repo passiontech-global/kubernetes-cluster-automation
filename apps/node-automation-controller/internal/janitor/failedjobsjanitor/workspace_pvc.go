@@ -156,16 +156,8 @@ func (j *failedJobsJanitor) claimedPVCNames(ctx context.Context,
 					p.Status.Phase == corev1.PodFailed {
 					continue
 				}
-				for _, v := range p.Spec.Volumes {
-					switch {
-					case v.PersistentVolumeClaim != nil:
-						claims[v.PersistentVolumeClaim.ClaimName] = true
-					case v.Ephemeral != nil:
-						// The ephemeral controller names the claim
-						// <pod>-<volume>; treating it as unclaimed could strip
-						// its protection finalizer while the pod still mounts it.
-						claims[p.Name+"-"+v.Name] = true
-					}
+				for _, claim := range kube.PodClaimedPVCs(p) {
+					claims[claim] = true
 				}
 			}
 			return nil
@@ -296,24 +288,9 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 			return j.cs.CoreV1().PersistentVolumeClaims(t.ns).Delete(ctx, t.name,
 				kube.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground))
 		},
-		OnError: func(log logr.Logger, t orphanWorkspaceTarget, err error) {
-			switch {
-			case apierrors.IsNotFound(err):
-				// The PVC was deleted under us — raced with its
-				// owner's workspace cleanup; nothing failed.
-				log.Info("SKIP: pvc already gone — raced with an external delete",
-					"pvc", t.ns+"/"+t.name)
-			case apierrors.IsConflict(err):
-				// The UID precondition fired — a same-named claim was
-				// recreated since the list; not ours to reap.
-				log.Info("SKIP: pvc recreated since the list — UID precondition fired",
-					"pvc", t.ns+"/"+t.name)
-			default:
-				metrics.IncError(j.queue)
-				log.Error(err, "orphan workspace pvc sweep failed",
-					"pvc", t.ns+"/"+t.name)
-			}
-		},
+		OnError: reap.DeleteErrorHandler("pvc",
+			func(t orphanWorkspaceTarget) string { return t.ns + "/" + t.name },
+			func() { metrics.IncError(j.queue) }),
 	})
 	if capped {
 		log.Info("SKIP rest: cap reached", "cap", workspacePVCCap)

@@ -9,11 +9,13 @@ package concoursejanitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -159,7 +161,18 @@ type kubeletStatsReader struct {
 }
 
 func (r *kubeletStatsReader) Summary(ctx context.Context, node string) (nodefsUsed, nodefsCap, imageFsUsed int64, err error) {
-	raw, err := r.cs.CoreV1().RESTClient().Get().
+	if r.cs == nil {
+		return 0, 0, 0, errors.New("kubelet stats REST client unavailable")
+	}
+	rc := r.cs.CoreV1().RESTClient()
+	// Fake clientset returns a typed-nil *rest.RESTClient; guard before dereferencing.
+	if rc == nil {
+		return 0, 0, 0, errors.New("kubelet stats REST client unavailable")
+	}
+	if restClient, ok := rc.(*rest.RESTClient); ok && restClient == nil {
+		return 0, 0, 0, errors.New("kubelet stats REST client unavailable")
+	}
+	raw, err := rc.Get().
 		Resource("nodes").Name(node).
 		SubResource("proxy").Suffix("stats", "summary").
 		DoRaw(ctx)

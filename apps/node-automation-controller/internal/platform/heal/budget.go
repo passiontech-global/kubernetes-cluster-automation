@@ -55,6 +55,18 @@ func NewBudget(max int, window time.Duration) *Budget {
 	return &Budget{max: max, window: window}
 }
 
+// trimWindow drops timestamps at or before cut from an ascending slice.
+func trimWindow(stamps []time.Time, cut time.Time) []time.Time {
+	if i := slices.IndexFunc(stamps, func(t time.Time) bool {
+		return t.After(cut)
+	}); i > 0 {
+		return append([]time.Time{}, stamps[i:]...)
+	} else if i < 0 {
+		return stamps[:0]
+	}
+	return stamps
+}
+
 // Allow consumes a grant at now and reports whether the budget had
 // room. Stamps older than window expire out of the count first.
 func (b *Budget) Allow(now time.Time) bool {
@@ -63,13 +75,7 @@ func (b *Budget) Allow(now time.Time) bool {
 	cut := now.Add(-b.window)
 	// Grants append in time order, so the expired prefix drops with
 	// one slice trim — a full scan only on clock skew.
-	if i := slices.IndexFunc(b.grants, func(t time.Time) bool {
-		return t.After(cut)
-	}); i > 0 {
-		b.grants = append([]time.Time{}, b.grants[i:]...)
-	} else if i < 0 {
-		b.grants = b.grants[:0]
-	}
+	b.grants = trimWindow(b.grants, cut)
 	if len(b.grants) >= b.max {
 		return false
 	}

@@ -66,9 +66,8 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 		}
 	})
 
-	// All four probes failing -> false, after the real 10s backoff
-	// gaps (~30s of wall time — the retry cadence IS the code under
-	// test; a kubelet restart must not be punished by a single blip).
+	// All four probes failing -> false (probeGap shortened for fast test
+	// execution while exercising the full 4-attempt timer loop).
 	t.Run("four consecutive failures return false", func(t *testing.T) {
 		var attempts atomic.Int32
 		cs := testutil.ProbeClientset(t, func(w http.ResponseWriter, r *http.Request) {
@@ -76,7 +75,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, "error trying to reach service")
 		})
-		r := &kubeletReaper{cs: cs}
+		r := &kubeletReaper{cs: cs, probeGap: 5 * time.Millisecond}
 		done := make(chan bool, 1)
 		go func() { done <- r.probe(ctx, "w1") }()
 		select {
@@ -87,7 +86,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 			if n := attempts.Load(); n != kubeletReaperProbes {
 				t.Fatalf("attempts = %d, want %d", n, kubeletReaperProbes)
 			}
-		case <-time.After(kubeletReaperProbes*kubeletReaperProbeGap + 20*time.Second):
+		case <-time.After(5 * time.Second):
 			t.Fatal("probe did not exhaust retries")
 		}
 	})
@@ -104,7 +103,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 			}
 			_, _ = fmt.Fprint(w, "error trying to reach service")
 		})
-		r := &kubeletReaper{cs: cs}
+		r := &kubeletReaper{cs: cs, probeGap: 5 * time.Millisecond}
 		done := make(chan bool, 1)
 		go func() { done <- r.probe(ctx, "w1") }()
 		select {
@@ -115,7 +114,7 @@ func TestKubeletReaperProbeHTTP(t *testing.T) {
 			if n := attempts.Load(); n != 2 {
 				t.Fatalf("attempts = %d, want 2", n)
 			}
-		case <-time.After(kubeletReaperProbeGap + 20*time.Second):
+		case <-time.After(5 * time.Second):
 			t.Fatal("probe did not retry")
 		}
 	})

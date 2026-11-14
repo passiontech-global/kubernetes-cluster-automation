@@ -15,7 +15,6 @@ import (
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -99,24 +98,9 @@ func (j *failedJobsJanitor) sweepFailedJobs(ctx context.Context) error {
 			return j.cs.BatchV1().Jobs(t.ns).Delete(ctx, t.name,
 				kube.UIDDeleteOptions(t.uid, metav1.DeletePropagationBackground))
 		},
-		OnError: func(log logr.Logger, t failedJobTarget, err error) {
-			switch {
-			case apierrors.IsNotFound(err):
-				// The Job was deleted under us — raced with an
-				// external cleanup; nothing failed.
-				log.Info("SKIP: job already gone — raced with an external delete",
-					"job", t.ns+"/"+t.name)
-			case apierrors.IsConflict(err):
-				// The UID precondition fired — a same-named Job was
-				// recreated since the list; not ours to reap.
-				log.Info("SKIP: job recreated since the list — UID precondition fired",
-					"job", t.ns+"/"+t.name)
-			default:
-				metrics.IncError(j.queue)
-				log.Error(err, "job delete failed",
-					"job", t.ns+"/"+t.name, "failedForHours", t.ageHours)
-			}
-		},
+		OnError: reap.DeleteErrorHandler("job",
+			func(t failedJobTarget) string { return t.ns + "/" + t.name },
+			func() { metrics.IncError(j.queue) }),
 	})
 	if capped {
 		log.Info("SKIP rest: cap reached", "cap", failedJobCap)

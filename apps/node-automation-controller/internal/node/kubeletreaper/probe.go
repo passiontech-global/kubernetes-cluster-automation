@@ -64,14 +64,18 @@ func (r *kubeletReaper) probe(ctx context.Context, node string) bool {
 	// Armed stopped+drained so Reset never races an earlier fire; each
 	// wait below consumes the pending fire, leaving the channel empty
 	// for the next Reset.
-	gap := time.NewTimer(kubeletReaperProbeGap)
+	gapDur := kubeletReaperProbeGap
+	if r.probeGap > 0 {
+		gapDur = r.probeGap
+	}
+	gap := time.NewTimer(gapDur)
 	if !gap.Stop() {
 		<-gap.C
 	}
 	defer gap.Stop()
 	for i := range kubeletReaperProbes {
 		if i > 0 {
-			gap.Reset(kubeletReaperProbeGap)
+			gap.Reset(gapDur)
 			select {
 			case <-ctx.Done():
 				return false

@@ -14,14 +14,11 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // remediate runs the bounded eviction pass over the census's
@@ -107,26 +104,15 @@ func (a *Auditor) evictCandidates(ctx context.Context, g *guardstate.Guard,
 		// window between the audit snapshot and the evict — a
 		// same-named pod recreated in between was admitted after
 		// the injector recovered and is not ours to reap.
-		uid := p.UID
-		deleteOpts := kube.UIDDeleteOptions(uid, "")
-		eviction := &policyv1.Eviction{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      p.Name,
-				Namespace: p.Namespace,
-			},
-			DeleteOptions: &deleteOpts,
+		_, refused, err := heal.EvictPod(ctx, g.CS, nil, "", p, now)
+		if refused {
+			// HTTP 429 / workload disruption / local remediation hold:
+			// deferral, not a failure.
+			log.Info("DEFER: PDB refused eviction of unmeshed pod — keeping pod alive",
+				"pod", p.Namespace+"/"+p.Name)
+			continue
 		}
-		if err := g.CS.CoreV1().Pods(p.Namespace).EvictV1(ctx, eviction); err != nil {
-			if apierrors.IsTooManyRequests(err) {
-				// HTTP 429 — a PDB with disruptionsAllowed==0
-				// refused the eviction. That is a deferral, not a
-				// failure: the workload is already at its replica
-				// floor and killing this pod would finish the
-				// outage. Keep it, count no error, move on.
-				log.Info("DEFER: PDB refused eviction of unmeshed pod — keeping pod alive",
-					"pod", p.Namespace+"/"+p.Name)
-				continue
-			}
+		if err != nil {
 			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 				// The pod was deleted under us or recreated since
 				// the audit — either way there is nothing of ours

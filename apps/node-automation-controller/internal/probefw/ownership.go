@@ -194,34 +194,28 @@ func (d *Deps) OwnerGone(ctx context.Context, ns string,
 					func(p *corev1.Pod) metav1.Object { return p })
 			}
 		case "ReplicaSet":
-			if rss, err := d.AllReplicaSets(ctx); err == nil {
-				found, liveUID = censusHit(rss, ns, ref.Name,
-					func(o *metav1.PartialObjectMetadata) metav1.Object { return o })
+			if o, err := d.ReplicaSet(ctx, ns, ref.Name); err == nil && o != nil {
+				found, liveUID = true, o.UID
 			}
 		case "Deployment":
-			if ds, err := d.AllDeployments(ctx); err == nil {
-				found, liveUID = censusHit(ds, ns, ref.Name,
-					func(o *appsv1.Deployment) metav1.Object { return o })
+			if o, err := d.Deployment(ctx, ns, ref.Name); err == nil && o != nil {
+				found, liveUID = true, o.UID
 			}
 		case "StatefulSet":
-			if ss, err := d.AllStatefulSets(ctx); err == nil {
-				found, liveUID = censusHit(ss, ns, ref.Name,
-					func(o *appsv1.StatefulSet) metav1.Object { return o })
+			if o, err := d.StatefulSet(ctx, ns, ref.Name); err == nil && o != nil {
+				found, liveUID = true, o.UID
 			}
 		case "DaemonSet":
-			if ds, err := d.AllDaemonSets(ctx); err == nil {
-				found, liveUID = censusHit(ds, ns, ref.Name,
-					func(o *appsv1.DaemonSet) metav1.Object { return o })
+			if o, err := d.DaemonSet(ctx, ns, ref.Name); err == nil && o != nil {
+				found, liveUID = true, o.UID
 			}
 		case "CronJob":
-			if cjs, err := d.AllCronJobs(ctx); err == nil {
-				found, liveUID = censusHit(cjs, ns, ref.Name,
-					func(o *batchv1.CronJob) metav1.Object { return o })
+			if o, err := d.CronJob(ctx, ns, ref.Name); err == nil && o != nil {
+				found, liveUID = true, o.UID
 			}
 		case "Job":
-			if jobs, err := d.AllJobs(ctx); err == nil {
-				found, liveUID = censusHit(jobs, ns, ref.Name,
-					func(o *batchv1.Job) metav1.Object { return o })
+			if o, err := d.Job(ctx, ns, ref.Name); err == nil && o != nil {
+				found, liveUID = true, o.UID
 			}
 		}
 		if found {

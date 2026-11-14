@@ -48,6 +48,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -77,15 +78,24 @@ import (
 var version = "dev"
 
 func main() {
+	if err := run(ctrl.SetupSignalHandler(), os.Args[1:]); err != nil {
+		if !errors.Is(err, flag.ErrHelp) {
+			os.Exit(1)
+		}
+	}
+}
+
+func run(sigCtx context.Context, args []string) error {
 	var metricsAddr, probeAddr, modulesFilter string
 	var showVersion, leaderElect bool
 	var leaseDuration, renewDeadline, retryPeriod time.Duration
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9115",
+	fs := flag.NewFlagSet("node-automation-controller", flag.ContinueOnError)
+	fs.StringVar(&metricsAddr, "metrics-bind-address", ":9115",
 		"address the Prometheus metrics endpoint binds to")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
+	fs.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
 		"address the health/readiness probe endpoints bind to")
-	flag.BoolVar(&showVersion, "version", false, "print version and exit")
-	flag.BoolVar(&leaderElect, "leader-elect", false,
+	fs.BoolVar(&showVersion, "version", false, "print version and exit")
+	fs.BoolVar(&leaderElect, "leader-elect", false,
 		"enable leader election via a coordination.k8s.io Lease — "+
 			"required when running more than one replica")
 	// Lease timing knobs. 0 = unset: the matching *time.Duration field
@@ -101,13 +111,13 @@ func main() {
 	// RetryPeriod*JitterFactor(1.2) is already enforced by client-go's
 	// NewLeaderElector — an invalid combo fails mgr.Start → exit 1 →
 	// visible CrashLoopBackOff, so no extra validation here.
-	flag.DurationVar(&leaseDuration, "leader-elect-lease-duration", 0,
+	fs.DurationVar(&leaseDuration, "leader-elect-lease-duration", 0,
 		"duration non-leader candidates wait before force-acquiring the "+
 			"Lease; 0 keeps the controller-runtime default (15s)")
-	flag.DurationVar(&renewDeadline, "leader-elect-renew-deadline", 0,
+	fs.DurationVar(&renewDeadline, "leader-elect-renew-deadline", 0,
 		"duration the leader retries renewing the Lease before giving "+
 			"up; 0 keeps the controller-runtime default (10s)")
-	flag.DurationVar(&retryPeriod, "leader-elect-retry-period", 0,
+	fs.DurationVar(&retryPeriod, "leader-elect-retry-period", 0,
 		"interval between Lease renew/acquire attempts; 0 keeps the "+
 			"controller-runtime default (2s)")
 	// Blast-radius allowlist: an empty value (the default) runs the
@@ -115,19 +125,21 @@ func main() {
 	// module in a named @group — wire their runnables. Metrics
 	// predeclaration is NOT affected — every queue's series still
 	// exists so /metrics shows the full fleet.
-	flag.StringVar(&modulesFilter, "modules", "",
+	fs.StringVar(&modulesFilter, "modules", "",
 		"comma-separated module names or @groups to run (default: all); "+
 			"names are the registry ops names from internal/registry "+
 			"(health-sweep check names count as module names — a check "+
 			"row still needs cluster-health-probes to run) and "+
 			"@<group> expands to a whole section (e.g. @janitors)")
 	opts := zap.Options{Development: false}
-	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
+	opts.BindFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	if showVersion {
 		fmt.Printf("node-automation-controller %s\n", version)
-		os.Exit(0)
+		return nil
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
@@ -140,7 +152,7 @@ func main() {
 	mods, err := registry.FilterModules(moduleNames)
 	if err != nil {
 		log.Error(err, "invalid -modules allowlist")
-		os.Exit(1)
+		return err
 	}
 	if len(moduleNames) > 0 {
 		log.Info("modules allowlist active", "count", len(mods),
@@ -159,10 +171,14 @@ func main() {
 	// scheme builder).
 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 
-	cfg := ctrl.GetConfigOrDie()
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		log.Error(err, "unable to get kubeconfig")
+		return err
+	}
 	if err := tuneClientConfig(cfg); err != nil {
 		log.Error(err, "unable to tune kube client config")
-		os.Exit(1)
+		return err
 	}
 
 	// The endpoint-guard warning filter is installed BEFORE anything
@@ -195,7 +211,7 @@ func main() {
 	// armed against clobbering the new holder's record. Created
 	// before buildLeaderLock so the election broadcaster's
 	// Shutdown rides the same cancellation.
-	workCtx, workCancel := context.WithCancel(ctrl.SetupSignalHandler())
+	workCtx, workCancel := context.WithCancel(sigCtx)
 	defer workCancel()
 	// The guarded resource lock is built only when election is on —
 	// ctrl.Options ignores the interface otherwise, and building it
@@ -208,21 +224,22 @@ func main() {
 			renewDeadline, &leaseStolen, workCtx.Done())
 		if err != nil {
 			log.Error(err, "unable to build leader election lock")
-			os.Exit(1)
+			return err
 		}
 	}
+	crdSize := kube.NewCRDSizeTable(1024)
 	mgr, err := ctrl.NewManager(managerConfig(cfg),
 		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
-			leaseDuration, renewDeadline, retryPeriod, leaderNS, leaderLock))
+			leaseDuration, renewDeadline, retryPeriod, leaderNS, leaderLock, crdSize))
 	if err != nil {
 		log.Error(err, "unable to create manager")
-		os.Exit(1)
+		return err
 	}
 
 	clients, err := buildKubeClients(cfg)
 	if err != nil {
 		log.Error(err, "unable to create kube clients")
-		os.Exit(1)
+		return err
 	}
 	cs, dyn, meta := clients.cs, clients.dyn, clients.meta
 	probeCS, probeDyn := clients.probeCS, clients.probeDyn
@@ -275,9 +292,11 @@ func main() {
 		ProbeCS: probeCS, ProbeDyn: probeDyn, ProbeMeta: probeMeta,
 		Maintenance: &maintenance.Verdict{
 			NodeReader: kube.CachedNodeReader(mgr.GetClient()),
-		}, Log: ctrl.Log}
+		},
+		CRDSize: crdSize,
+		Log:     ctrl.Log}
 	if err := registry.SetupModules(deps, mods); err != nil {
-		os.Exit(1)
+		return err
 	}
 
 	// selfheal-alert-coverage fast dead-leader lease preemption: without it a leader
@@ -296,7 +315,7 @@ func main() {
 			log:       ctrl.Log.WithName("leader-lease-preemptor"),
 		}); err != nil {
 			log.Error(err, "unable to add leader lease preemptor")
-			os.Exit(1)
+			return err
 		}
 		// LeaseLossWatchdog: the leader-side half of the same
 		// contract — poll the Lease every 5s and, on a foreign
@@ -312,7 +331,7 @@ func main() {
 			log:       ctrl.Log.WithName("lease-loss-watchdog"),
 		}); err != nil {
 			log.Error(err, "unable to add lease loss watchdog")
-			os.Exit(1)
+			return err
 		}
 	}
 
@@ -329,16 +348,16 @@ func main() {
 		log: ctrl.Log.WithName("cluster-maintenance-stamper"),
 	}); err != nil {
 		log.Error(err, "unable to add cluster maintenance stamper")
-		os.Exit(1)
+		return err
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to add healthz check")
-		os.Exit(1)
+		return err
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		log.Error(err, "unable to add readyz check")
-		os.Exit(1)
+		return err
 	}
 
 	log.Info("starting manager", "version", version,
@@ -350,6 +369,7 @@ func main() {
 		"retryPeriod", retryPeriod)
 	if err := mgr.Start(workCtx); err != nil {
 		log.Error(err, "manager exited")
-		os.Exit(1)
+		return err
 	}
+	return nil
 }

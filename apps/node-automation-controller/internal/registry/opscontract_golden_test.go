@@ -10,6 +10,9 @@
 package registry
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -333,6 +336,14 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"AnnoFluxResetAt", "reconcile.fluxcd.io/resetAt"},
 	{"AnnoFluxForceAt", "reconcile.fluxcd.io/forceAt"},
 	{"AnnoKargoRefresh", "kargo.akuity.io/refresh"},
+	{"AnnoLastLinkerdIssuerRollout", "passiontech.dev/last-linkerd-issuer-rollout"},
+	{"AnnoLastLinkerdEndpointSyncHeal", "passiontech.dev/last-linkerd-endpoint-sync-heal"},
+	{"AnnoLastOLMOperatorHeal", "passiontech.dev/last-olm-operator-heal"},
+	{"AnnoLastLocalPVProvisionerHeal", "passiontech.dev/last-localpv-provisioner-heal"},
+	{"TaintNodeHangPreCordon", "passiontech.dev/node-hang-precordon"},
+	{"AnnoVolumeSelectedNode", "volume.kubernetes.io/selected-node"},
+	{"AnnoRelistStormSuspend", "passiontech.dev/relist-storm-suspend"},
+	{"AnnoRelistStormSuspendedBy", "passiontech.dev/relist-storm-suspended-by"},
 }
 
 func TestGoldenRegistryRows(t *testing.T) {
@@ -449,9 +460,35 @@ func goldenMetricNamesFromSource(t *testing.T) map[string]string {
 }
 
 func TestGoldenAnnoKeys(t *testing.T) {
+	seen := make(map[string]bool, len(goldenAnnoKeys))
 	for _, want := range goldenAnnoKeys {
+		seen[want.Key] = true
 		if got := annoKeyFor(t, want.Key); got != want.Value {
 			t.Errorf("anno key %s drifted: live=%q golden=%q — external-contract values must never change", want.Key, got, want.Value)
+		}
+	}
+	// Verify every exported string const in internal/platform/kube/annos.go
+	// is pinned in goldenAnnoKeys so new keys cannot silently bypass coverage.
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filepath.Join("..", "platform", "kube", "annos.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse annos.go: %v", err)
+	}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for _, ident := range vs.Names {
+				if ident.IsExported() && !seen[ident.Name] {
+					t.Errorf("exported const %s in internal/platform/kube/annos.go is missing from goldenAnnoKeys", ident.Name)
+				}
+			}
 		}
 	}
 }
@@ -562,6 +599,22 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.AnnoFluxForceAt
 	case "AnnoKargoRefresh":
 		return kube.AnnoKargoRefresh
+	case "AnnoLastLinkerdIssuerRollout":
+		return kube.AnnoLastLinkerdIssuerRollout
+	case "AnnoLastLinkerdEndpointSyncHeal":
+		return kube.AnnoLastLinkerdEndpointSyncHeal
+	case "AnnoLastOLMOperatorHeal":
+		return kube.AnnoLastOLMOperatorHeal
+	case "AnnoLastLocalPVProvisionerHeal":
+		return kube.AnnoLastLocalPVProvisionerHeal
+	case "TaintNodeHangPreCordon":
+		return kube.TaintNodeHangPreCordon
+	case "AnnoVolumeSelectedNode":
+		return kube.AnnoVolumeSelectedNode
+	case "AnnoRelistStormSuspend":
+		return kube.AnnoRelistStormSuspend
+	case "AnnoRelistStormSuspendedBy":
+		return kube.AnnoRelistStormSuspendedBy
 	default:
 		t.Fatalf("golden key %s no longer exists as an exported const in internal/platform/kube/annos.go — update the golden consciously", name)
 		return ""

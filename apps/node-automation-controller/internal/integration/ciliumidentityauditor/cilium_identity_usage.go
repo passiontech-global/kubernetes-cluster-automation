@@ -16,13 +16,9 @@ import (
 // endpointIdentityID extracts .status.identity.id — numeric in real
 // objects (int64) but float64 in hand-built fixtures.
 func endpointIdentityID(ep *unstructured.Unstructured) string {
-	if id, ok := kube.NestedInt64(
+	if id, ok := kube.NestedNumber(
 		ep.Object, "status", "identity", "id"); ok {
 		return strconv.FormatInt(id, 10)
-	}
-	if f, ok := kube.NestedFloat64(
-		ep.Object, "status", "identity", "id"); ok {
-		return strconv.FormatInt(int64(f), 10)
 	}
 	return ""
 }
@@ -40,14 +36,9 @@ func sliceIdentityIDs(ces *unstructured.Unstructured) []string {
 		if !ok {
 			continue
 		}
-		if id, ok := kube.NestedInt64(
+		if id, ok := kube.NestedNumber(
 			m, "identity", "id"); ok {
 			out = append(out, strconv.FormatInt(id, 10))
-			continue
-		}
-		if f, ok := kube.NestedFloat64(
-			m, "identity", "id"); ok {
-			out = append(out, strconv.FormatInt(int64(f), 10))
 		}
 	}
 	return out

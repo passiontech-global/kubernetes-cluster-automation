@@ -148,24 +148,9 @@ func (j *failedJobsJanitor) sweepCompletedRunKind(ctx context.Context,
 				Namespace(t.ns).Delete(ctx, t.name,
 				kube.UIDDeleteOptions(t.uid, ""))
 		},
-		OnError: func(log logr.Logger, t runTarget, err error) {
-			switch {
-			case apierrors.IsNotFound(err):
-				// The run was deleted under us — raced with its
-				// operator's own TTL cleaner; nothing failed.
-				log.Info("SKIP: "+kind+" already gone — raced with an external delete",
-					kind, t.ns+"/"+t.name)
-			case apierrors.IsConflict(err):
-				// The UID precondition fired — a same-named run was
-				// recreated since the list; not ours to reap.
-				log.Info("SKIP: "+kind+" recreated since the list — UID precondition fired",
-					kind, t.ns+"/"+t.name)
-			default:
-				metrics.IncError(j.queue)
-				log.Error(err, kind+" delete failed",
-					kind, t.ns+"/"+t.name)
-			}
-		},
+		OnError: reap.DeleteErrorHandler(kind,
+			func(t runTarget) string { return t.ns + "/" + t.name },
+			func() { metrics.IncError(j.queue) }),
 	})
 	if capped {
 		log.Info("SKIP rest: cap reached", "cap", failedJobsDeleteCap)

@@ -57,7 +57,7 @@ func (r *deschedulerStormGate) checkHoldStale(ctx context.Context,
 	deploy *appsv1.Deployment, now time.Time, log logr.Logger) {
 	if !heal.FirstSeenPersisted(ctx, log, &r.holdSeen, deploy,
 		kube.AnnoFirstSeenStormGateHold, stormHoldLedgerKey,
-		maintenanceHoldStaleAfter, now, r.deployAnnoPatch()) {
+		maintenanceHoldStaleAfter, now, r.deployAnnoPatch(deploy)) {
 		return // window not yet held out — nothing to warn about
 	}
 	if !r.holdWarned.Add(stormHoldLedgerKey) {
@@ -79,13 +79,19 @@ func (r *deschedulerStormGate) checkHoldStale(ctx context.Context,
 // deployAnnoPatch delivers the hold's first-seen stamp merge patch
 // onto the descheduler Deployment — the same merge-patch-only
 // contract the scale path runs (no full-object Update that would
-// race a concurrent spec edit).
-func (r *deschedulerStormGate) deployAnnoPatch() func(context.Context, []byte) error {
+// race a concurrent spec edit) — and refreshes deploy.ResourceVersion
+// so a subsequent RV-pinned scale patch in the same reconcile sees the
+// post-patch RV instead of self-conflicting with 409.
+func (r *deschedulerStormGate) deployAnnoPatch(deploy *appsv1.Deployment) func(context.Context, []byte) error {
 	return func(ctx context.Context, data []byte) error {
-		if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
-			"descheduler", types.MergePatchType, data, metav1.PatchOptions{}); err != nil {
+		updated, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
+			"descheduler", types.MergePatchType, data, metav1.PatchOptions{})
+		if err != nil {
 			return fmt.Errorf(
 				"patch first-seen annotation on deployment kube-system/descheduler: %w", err)
+		}
+		if updated != nil && updated.ResourceVersion != "" && deploy != nil {
+			deploy.ResourceVersion = updated.ResourceVersion
 		}
 		return nil
 	}

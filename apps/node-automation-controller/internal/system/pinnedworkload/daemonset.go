@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -93,17 +94,15 @@ func (s DaemonSetSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	// Confirm the cache-served drift verdict on the direct clientset
 	// before the patch — same contract as DeploymentSpec.Reader.
 	if s.Reader != nil {
-		ds, err = s.CS.AppsV1().DaemonSets(s.Namespace).
-			Get(ctx, s.Name, metav1.GetOptions{})
-		if apierrors.IsNotFound(err) {
-			log.Info("SKIP: daemonset gone between cache read and confirm", "daemonset", ref)
-			return res, nil
-		}
+		var proceed bool
+		ds, proceed, err = confirmDirect(ctx, log, "daemonset", ref, s.NoDriftLog,
+			func(ctx context.Context) (*appsv1.DaemonSet, error) {
+				return s.CS.AppsV1().DaemonSets(s.Namespace).Get(ctx, s.Name, metav1.GetOptions{})
+			}, s.Drifted)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("confirm daemonset %s on direct client: %w", ref, err)
+			return ctrl.Result{}, err
 		}
-		if !s.Drifted(ds) {
-			log.Info(s.NoDriftLog+" (confirmed on direct client)", "daemonset", ref)
+		if !proceed {
 			return res, nil
 		}
 	}
@@ -137,4 +136,27 @@ func (s DaemonSetSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 		return ctrl.Result{}, fmt.Errorf("patch daemonset %s: %w", ref, err)
 	}
 	return res, nil
+}
+
+// confirmDirect re-fetches an object from the direct clientset when
+// the initial read came from an informer cache, skipping if the object
+// vanished or no longer shows drift.
+func confirmDirect[T any](ctx context.Context, log logr.Logger, kind, ref, noDriftLog string,
+	get func(context.Context) (T, error), drifted func(T) bool, extraKV ...any) (T, bool, error) {
+	obj, err := get(ctx)
+	if apierrors.IsNotFound(err) {
+		log.Info("SKIP: "+kind+" gone between cache read and confirm", kind, ref)
+		var zero T
+		return zero, false, nil
+	}
+	if err != nil {
+		var zero T
+		return zero, false, fmt.Errorf("confirm %s %s on direct client: %w", kind, ref, err)
+	}
+	if !drifted(obj) {
+		kv := append([]any{kind, ref}, extraKV...)
+		log.Info(noDriftLog+" (confirmed on direct client)", kv...)
+		return obj, false, nil
+	}
+	return obj, true, nil
 }

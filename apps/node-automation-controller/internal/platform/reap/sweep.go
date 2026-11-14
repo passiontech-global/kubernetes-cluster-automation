@@ -10,6 +10,7 @@ import (
 	"slices"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // Options is the per-module wiring for one Sweep. Every field but
@@ -123,4 +124,27 @@ func Sweep[T any](ctx context.Context, log logr.Logger, items []T,
 		deleted++
 	}
 	return deleted, failed, false
+}
+
+// DeleteErrorHandler builds the standard OnError callback for Sweep:
+// NotFound and Conflict (UID precondition) log as benign races without
+// calling incError; all other errors log and invoke incError.
+func DeleteErrorHandler[T any](kind string, ref func(T) string,
+	incError func()) func(log logr.Logger, item T, err error) {
+	return func(log logr.Logger, item T, err error) {
+		target := ref(item)
+		switch {
+		case apierrors.IsNotFound(err):
+			log.Info("SKIP: "+kind+" already gone — raced with an external delete",
+				kind, target)
+		case apierrors.IsConflict(err):
+			log.Info("SKIP: "+kind+" recreated since the list — UID precondition fired",
+				kind, target)
+		default:
+			if incError != nil {
+				incError()
+			}
+			log.Error(err, kind+" delete failed", kind, target)
+		}
+	}
 }

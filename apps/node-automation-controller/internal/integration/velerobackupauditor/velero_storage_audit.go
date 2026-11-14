@@ -142,11 +142,13 @@ func (a *veleroBackupAuditor) reinitStaleRepo(ctx context.Context,
 	}
 	if err := a.dyn.Resource(veleroRepoGVR).Namespace(ns).Delete(ctx,
 		name, kube.UIDDeleteOptions(repo.GetUID(), "")); err != nil {
-		if !apierrors.IsNotFound(err) {
-			log.Error(err, "stale backup repository delete failed",
-				"repo", ns+"/"+name)
-			metrics.IncError(a.queue)
+		if apierrors.IsNotFound(err) {
+			heal.RefundGrant(now)
+			return
 		}
+		log.Error(err, "stale backup repository delete failed",
+			"repo", ns+"/"+name)
+		metrics.IncError(a.queue)
 		return
 	}
 	a.repoHealed.Stamp(key, now)
