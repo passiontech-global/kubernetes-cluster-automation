@@ -348,9 +348,7 @@ func TestCollectAIO(t *testing.T) {
 	root := t.TempDir()
 	nrFile := filepath.Join(root, "aio-nr")
 	maxFile := filepath.Join(root, "aio-max-nr")
-	oldNr, oldMax := aioNrFile, aioMaxFile
-	aioNrFile, aioMaxFile = nrFile, maxFile
-	t.Cleanup(func() { aioNrFile, aioMaxFile = oldNr, oldMax })
+	cfg.aioNrFile, cfg.aioMaxFile = nrFile, maxFile
 
 	testutil.WriteFile(t, nrFile, "314572\n")
 	testutil.WriteFile(t, maxFile, "1048576\n")
@@ -399,9 +397,7 @@ func TestCollectAIOBump(t *testing.T) {
 	root := t.TempDir()
 	nrFile := filepath.Join(root, "aio-nr")
 	maxFile := filepath.Join(root, "aio-max-nr")
-	oldNr, oldMax := aioNrFile, aioMaxFile
-	aioNrFile, aioMaxFile = nrFile, maxFile
-	t.Cleanup(func() { aioNrFile, aioMaxFile = oldNr, oldMax })
+	cfg.aioNrFile, cfg.aioMaxFile = nrFile, maxFile
 	labels := map[string]string{"node": "node-a"}
 
 	// 100/100 → ratio 1.0 > 0.75 → reconcile doubles to 200.
@@ -439,14 +435,17 @@ func TestCollectAIOBump(t *testing.T) {
 	if err := os.MkdirAll(roDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	testutil.WriteFile(t, filepath.Join(roDir, "aio-nr"), "3000000\n")
-	testutil.WriteFile(t, filepath.Join(roDir, "aio-max-nr"), "3000000\n")
-	aioNrFile, aioMaxFile = filepath.Join(roDir, "aio-nr"), filepath.Join(roDir, "aio-max-nr")
-	if err := os.Chmod(aioMaxFile, 0o444); err != nil {
+	roNr := filepath.Join(roDir, "aio-nr")
+	roMax := filepath.Join(roDir, "aio-max-nr")
+	testutil.WriteFile(t, roNr, "3000000\n")
+	testutil.WriteFile(t, roMax, "3000000\n")
+	cfg3 := cfg
+	cfg3.aioNrFile, cfg3.aioMaxFile = roNr, roMax
+	if err := os.Chmod(roMax, 0o444); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(aioMaxFile, 0o644) })
-	c3 := New(cfg)
+	t.Cleanup(func() { _ = os.Chmod(roMax, 0o644) })
+	c3 := New(cfg3)
 	c3.reconcileHostWrites()
 	if got, ok := metricValue(t, c3, "node_host_agent_aio_maximum", labels); !ok || got != 3000000 {
 		t.Fatalf("aio_maximum through a failed bump=%v ok=%v want the read truth 3000000", got, ok)
@@ -458,9 +457,7 @@ func TestCollectAIOBump(t *testing.T) {
 func TestCollectUserNSGauge(t *testing.T) {
 	cfg, _ := fixture(t)
 	f := filepath.Join(t.TempDir(), "max_user_namespaces")
-	old := maxUserNSFile
-	maxUserNSFile = f
-	t.Cleanup(func() { maxUserNSFile = old })
+	cfg.maxUserNSFile = f
 
 	c := New(cfg)
 	if _, ok := metricValue(t, c, "node_host_agent_max_user_namespaces",

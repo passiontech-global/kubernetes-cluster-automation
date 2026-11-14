@@ -204,54 +204,35 @@ func (p *hostKeyPolicy) checkKnownHosts(hostname string,
 	if !p.knownHostsPresent() {
 		return false, nil
 	}
-	cb, kerr := knownhosts.New(p.knownHostsPath)
-	if kerr != nil {
-		// Fail closed: the operator pinned trust in a file we cannot
-		// read — skipping it would fall through to TOFU and treat
-		// every pinned host as first contact.
-		return false, fmt.Errorf("hubsync: known_hosts parse failed — refusing "+
-			"(fail closed): %w", kerr)
-	}
-	// knownhosts requires BOTH args in host:port form and matches
-	// entries port-exactly — build the addr from the normalized
-	// host + the dialed port.
-	addrPort := net.JoinHostPort(normalizeSSHHost(hostname),
-		strconv.Itoa(port))
-	err := cb(addrPort, hostPortAddr(addrPort), key)
-	if err == nil {
+	matched, unlisted, err := sshclient.CheckKnownHosts(p.knownHostsPath, hostname, port, key)
+	if err == nil && matched {
 		return true, nil
 	}
-	var ke *knownhosts.KeyError
-	if errors.As(err, &ke) && len(ke.Want) == 0 {
+	if errors.Is(err, sshclient.ErrKnownHostsParse) {
+		// Fail closed: an unreadable trust store must not silently fall through to TOFU.
+		return false, fmt.Errorf("hubsync: known_hosts parse failed — refusing "+
+			"(fail closed): %w", err)
+	}
+	if unlisted {
 		return false, nil // host unlisted — TOFU may record it
 	}
 	return false, fmt.Errorf("ssh host key rejected by %s: %w",
 		p.knownHostsPath, err)
 }
 
-// checkTOFU validates against <StateDir>/hubsync_known_hosts and
-// records first-seen keys. The file is itself a known_hosts database
-// (knownhosts.Line output), so later verifies — and operators with
-// ssh-keygen — read it natively. port is the port the DIAL carried:
-// entries are port-exact like the operator file.
 func (p *hostKeyPolicy) checkTOFU(host string, key ssh.PublicKey, port int) error {
 	p.tofuMu.Lock()
 	defer p.tofuMu.Unlock()
 
 	if _, err := os.Stat(p.tofuPath); err == nil {
-		cb, err := knownhosts.New(p.tofuPath)
-		if err != nil {
-			return fmt.Errorf("hubsync: tofu known_hosts parse: %w", err)
-		}
-		// Feed host:port — entries were written under the same
-		// port-exact matching the operator file uses.
-		addrPort := net.JoinHostPort(host, strconv.Itoa(port))
-		err = cb(addrPort, hostPortAddr(addrPort), key)
-		if err == nil {
+		matched, unlisted, cerr := sshclient.CheckKnownHosts(p.tofuPath, host, port, key)
+		if cerr == nil && matched {
 			return nil
 		}
-		var ke *knownhosts.KeyError
-		if !(errors.As(err, &ke) && len(ke.Want) == 0) {
+		if errors.Is(cerr, sshclient.ErrKnownHostsParse) {
+			return fmt.Errorf("hubsync: tofu known_hosts parse: %w", cerr)
+		}
+		if !unlisted {
 			return fmt.Errorf("ssh host key for %s changed since "+
 				"first trust — refusing (possible MITM); remove %s "+
 				"to re-pin", host, p.tofuPath)
@@ -309,15 +290,8 @@ type hostPortAddr string
 func (a hostPortAddr) Network() string { return "tcp" }
 func (a hostPortAddr) String() string  { return string(a) }
 
-// normalizeSSHHost lowercases the dial hostname and strips a
-// :port suffix — pin-map keys and TOFU entries are port-independent
-// (the converge port is a Config knob, not part of host identity).
 func normalizeSSHHost(hostname string) string {
-	h := strings.ToLower(strings.TrimSpace(hostname))
-	if host, _, err := net.SplitHostPort(h); err == nil {
-		return strings.Trim(host, "[]")
-	}
-	return strings.Trim(h, "[]")
+	return sshclient.NormalizeHost(hostname)
 }
 
 // appendFileAtomic appends data to path via write-temp+rename so a

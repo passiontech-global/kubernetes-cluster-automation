@@ -77,9 +77,9 @@ var kernelTempRules = []rule{
 // soft-lockup/RCU-stall signatures: all three are the same deadlock
 // class (a CPU wedged in kernel or a stalled RCU grace period blocks
 // every task queued behind it).
-var kernelDeadlockRe = regexp.MustCompile(`INFO: task .* blocked for more than` +
-	`|watchdog: BUG: soft lockup - CPU#\d+ stuck for \d+s!` +
-	`|INFO: rcu_(?:sched|preempt|bh) (?:self-)?detected stall on CPU`)
+var kernelDeadlockRe = regexp.MustCompile(`INFO: task .* blocked for more than|` +
+	kernelSoftLockupRe.String() + `|` +
+	kernelRCUStallRe.String())
 
 // kernelSoftLockupLatch / kernelRCUStallLatch are the KernelHungTasks
 // evidence latches the kernel monitor Enters on a soft-lockup /

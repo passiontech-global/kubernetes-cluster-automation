@@ -21,8 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
-
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/concourse"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
@@ -87,9 +86,7 @@ func (c *Config) applyDefaults() {
 		c.deleteSubvol = btrfsDeleteSubvol
 	}
 	if c.chown == nil {
-		c.chown = func(_ string, fd, uid, gid int) error {
-			return unix.Fchown(fd, uid, gid)
-		}
+		c.chown = concourse.DefaultChownFD
 	}
 }
 
@@ -219,44 +216,12 @@ func WorkerInit(ctx context.Context, cfg Config) error {
 		}
 		targets = append(targets, p)
 	}
-	// fd-based enforcement closes the documented swap window: open
-	// O_NOFOLLOW (a swapped-in symlink fails the open instead of
-	// being dereferenced), fstat to confirm the fd is a plain dir or
-	// regular file, then chown/chmod on the held fd — the path is
-	// never re-resolved after the check. Top-level cache entries may
-	// legitimately be regular files (loose tool state), so both
-	// S_IFDIR and S_IFREG pass; anything else (device, fifo, link)
-	// is refused.
+	// fd-based enforcement closes the documented swap window (O_NOFOLLOW + fstat
+	// plain dir/file check + Fchown/Fchmod on the held fd).
 	for _, t := range targets {
-		fd, err := unix.Open(t,
-			unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-		if err != nil {
-			return fmt.Errorf("open %s (nofollow): %w", t, err)
-		}
-		var st unix.Stat_t
-		if err := unix.Fstat(fd, &st); err != nil {
-			_ = unix.Close(fd)
-			return fmt.Errorf("fstat %s: %w", t, err)
-		}
-		switch st.Mode & unix.S_IFMT {
-		case unix.S_IFDIR, unix.S_IFREG:
-		default:
-			_ = unix.Close(fd)
-			return fmt.Errorf("%s: not a dir or regular file (mode %o)",
-				t, st.Mode&unix.S_IFMT)
-		}
-		if cfg.OwnerUID >= 0 || cfg.OwnerGID >= 0 {
-			if err := cfg.chown(t, fd, cfg.OwnerUID, cfg.OwnerGID); err != nil {
-				_ = unix.Close(fd)
-				return fmt.Errorf("chown %s: %w", t, err)
-			}
-		}
-		if err := unix.Fchmod(fd, uint32(cfg.Mode)); err != nil {
-			_ = unix.Close(fd)
-			return fmt.Errorf("chmod %s: %w", t, err)
-		}
-		if err := unix.Close(fd); err != nil {
-			return fmt.Errorf("close %s: %w", t, err)
+		if err := concourse.EnforcePermsFD(t, true, cfg.OwnerUID, cfg.OwnerGID,
+			cfg.Mode, cfg.chown); err != nil {
+			return err
 		}
 	}
 

@@ -8,16 +8,13 @@ package kdeps
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -326,13 +323,6 @@ func (c *Config) ApplyDefaults() error {
 	if c.RunCombined == nil {
 		c.RunCombined = func(ctx context.Context, env, argv []string, _ string) (string, error) {
 			return hostexec.RunCombinedEnv(ctx, env, argv...)
-		}
-	}
-	if c.MaxStepRevisions <= 0 {
-		if raw := strings.TrimSpace(os.Getenv(envnames.EnvKinedbGuardMaxStepRevisions)); raw != "" {
-			if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
-				c.MaxStepRevisions = n
-			}
 		}
 	}
 	if c.StatFSFn == nil {

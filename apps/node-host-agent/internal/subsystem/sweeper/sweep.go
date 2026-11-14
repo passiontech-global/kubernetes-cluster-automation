@@ -6,7 +6,9 @@ package sweeper
 
 import (
 	"context"
+	"log/slog"
 	"os"
+	"path/filepath"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -100,10 +102,7 @@ func (s *Sweeper) Sweep(ctx context.Context) {
 	log.Info("sweep done", "dirs", ndir, "deleted", ndel)
 }
 
-func (s *Sweeper) loadCycleInputs(ctx context.Context, log interface {
-	Info(string, ...any)
-	Error(string, ...any)
-}) ([]os.DirEntry, map[string]*corev1.PersistentVolume, bool) {
+func (s *Sweeper) loadCycleInputs(ctx context.Context, log *slog.Logger) ([]os.DirEntry, map[string]*corev1.PersistentVolume, bool) {
 	// PV list once per cycle. An empty list while pvc-* dirs exist on
 	// disk is abnormal → ABORT the whole cycle (fail closed).
 	dirs, err := s.listPVDirs()
@@ -145,11 +144,7 @@ func (s *Sweeper) loadCycleInputs(ctx context.Context, log interface {
 
 func (s *Sweeper) sweepCandidate(
 	ctx context.Context,
-	log interface {
-		Debug(string, ...any)
-		Info(string, ...any)
-		Error(string, ...any)
-	},
+	log *slog.Logger,
 	d os.DirEntry,
 	pvByName map[string]*corev1.PersistentVolume,
 	mounts []string,
@@ -200,7 +195,7 @@ func (s *Sweeper) sweepCandidate(
 		*ndel++
 	}
 
-	dirPath := s.cfg.BaseDir + "/" + name
+	dirPath := filepath.Join(s.cfg.BaseDir, name)
 	if !s.pvGoneAndUnmounted(ctx, log, name, dirPath, mounts, mountsErr) {
 		return false
 	}
@@ -232,10 +227,7 @@ func (s *Sweeper) sweepCandidate(
 
 func (s *Sweeper) releaseStalePV(
 	ctx context.Context,
-	log interface {
-		Debug(string, ...any)
-		Info(string, ...any)
-	},
+	log *slog.Logger,
 	name string,
 	pv *corev1.PersistentVolume,
 ) bool {
@@ -316,7 +308,7 @@ func (s *Sweeper) releaseStalePV(
 
 func (s *Sweeper) pvGoneAndUnmounted(
 	ctx context.Context,
-	log interface{ Info(string, ...any) },
+	log *slog.Logger,
 	name, dirPath string,
 	mounts []string,
 	mountsErr error,

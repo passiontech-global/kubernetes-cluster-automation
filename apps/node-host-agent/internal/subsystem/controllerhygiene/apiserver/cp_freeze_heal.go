@@ -433,6 +433,7 @@ func (c *FreezeCheck) healFreeze(ctx context.Context, reason string) {
 		NeedQuorum:  true,
 		HoldPrefix:  "cp-component-frozen " + reason,
 		Unit:        c.d.Cfg.RestartUnit,
+		Mode:        c.d.Cfg.Sig13.Mode,
 		ActionLine:  "ACTION: restarting k0scontroller - cp-component-frozen " + reason,
 		DryRunLine:  "DRY-RUN: would restart k0scontroller - cp-component-frozen " + reason,
 		ActionLabel: "restart_controller",

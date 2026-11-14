@@ -20,7 +20,6 @@ package cdeps
 
 import (
 	"net/http"
-	"sync"
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -48,15 +47,6 @@ type Deps struct {
 	// consecutive-*/last-suspect-* file and the watchdog log append
 	// goes through it (the single lib.sh-parity implementation).
 	State *hoststate.Store
-
-	// RateMu serialises the remediate G5 check + G6 budget spend:
-	// the last-restart epoch file stays the cross-process contract,
-	// but the in-process read-compare-write still needs a mutex or
-	// two overlapping remediate passes can both see "allowed" in
-	// the same window (TOCTOU double-restart). Held only around
-	// the file check+mkdir+write, never across systemctl —
-	// workerhygiene rateTrySpend parity.
-	RateMu sync.Mutex
 
 	// JournalReads is the journal-unreadable accounting — every
 	// JournalText result is classified into it; the tracker fires

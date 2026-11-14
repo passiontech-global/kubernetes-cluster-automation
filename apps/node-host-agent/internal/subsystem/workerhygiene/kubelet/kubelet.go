@@ -80,21 +80,9 @@ func dashedHost(addr string) string {
 // missing token just falls back to anonymous, whose 401 still counts
 // as alive.
 func kubelet10250Alive(d *wdeps.Deps, ctx context.Context) bool {
-	bearer := kubeletBearer(d)
-	for i := 0; i < wdeps.ProbeAttempts; i++ {
-		if _, err := d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx,
-			d.Cfg.Kubelet.HealthzURL, bearer, wdeps.ProbeTimeout); err == nil {
-			return true
-		}
-		if i+1 < wdeps.ProbeAttempts {
-			select {
-			case <-ctx.Done():
-				return false
-			case <-time.After(d.Cfg.ProbeGap):
-			}
-		}
-	}
-	return false
+	return d.ProbeHTTPStatusSeries(ctx, d.Cfg.Kubelet.HealthzURL,
+		kubeletBearer(d), wdeps.ProbeAttempts, wdeps.ProbeTimeout,
+		d.Cfg.ProbeGap, func(int) (bool, error) { return true, nil }) == nil
 }
 
 // podDirCount counts kubelet pod dirs — the shell's

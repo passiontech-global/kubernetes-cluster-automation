@@ -31,17 +31,10 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics/kernelfail"
 )
 
-// runHostCmd builds the host-command executor for hostRoot — a
-// package var so tests stub the whole factory. Production gets a
-// hostexec.Runner entering every host PID-1 namespace: the probes
-// it serves (chronyc, dmesg, nvme smart-log) read HOST state —
-// sockets, /dev nodes, the kernel ring — that a container-side
-// exec cannot see. HostRoot "/" (standalone) runs unwrapped.
-// The 30s cap matches the nethealth runHostCmd convention; the
-// exec itself is Runner.ExecCombined — capped output + WaitDelay,
-// no second timeout stacked underneath. Reached by the engine
-// through Deps.RunHostCmd's late-bound closure.
-var runHostCmd = func(hostRoot string) func(ctx context.Context, argv ...string) (string, error) {
+// defaultRunHostCmd builds the default host-command executor for
+// hostRoot. Production gets a hostexec.Runner entering every host
+// PID-1 namespace; HostRoot "/" (standalone) runs unwrapped.
+func defaultRunHostCmd(hostRoot string) func(ctx context.Context, argv ...string) (string, error) {
 	runner := hostexec.New(hostexec.Config{HostRoot: hostRoot})
 	return func(ctx context.Context, argv ...string) (string, error) {
 		if len(argv) == 0 {
@@ -53,12 +46,7 @@ var runHostCmd = func(hostRoot string) func(ctx context.Context, argv ...string)
 	}
 }
 
-// kmsgDevicePaths returns the /dev/kmsg candidates — a package var
-// so tests point it at a fixture instead of the real device (the
-// DaemonSet bind-mounts host /dev/kmsg; <HostRoot>/dev/kmsg covers
-// standalone layouts where only the host tree is mounted). Reached
-// by the engine through Deps.KmsgDevicePaths's late-bound closure.
-var kmsgDevicePaths = func(hostRoot string) []string {
+func defaultKmsgDevicePaths(hostRoot string) []string {
 	return kmsg.DevicePaths("/dev/kmsg", hostRoot)
 }
 
@@ -82,9 +70,11 @@ func (c *Collector) kernelFailDeps() kernelfail.Deps {
 		Adjtimex: func(tx *unix.Timex) (int, error) {
 			return c.cfg.adjtimexFn(tx)
 		},
-		RunHostCmd: runHostCmd(c.cfg.HostRoot),
+		RunHostCmd: func(ctx context.Context, argv ...string) (string, error) {
+			return c.cfg.runHostCmd(ctx, argv...)
+		},
 		KmsgDevicePaths: func(hostRoot string) []string {
-			return kmsgDevicePaths(hostRoot)
+			return c.cfg.kmsgDevicePaths(hostRoot)
 		},
 	}
 }

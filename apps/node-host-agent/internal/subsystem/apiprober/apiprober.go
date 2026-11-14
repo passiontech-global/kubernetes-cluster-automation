@@ -72,6 +72,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // Mode values — the shell script's dry-run default is preserved.
@@ -161,8 +162,13 @@ type Config struct {
 	// GuardReloader on NODE_HOST_AGENT_API_GUARD_CONF (default
 	// /etc/api-backend-guard.conf) when GuardSrc is nil; set an
 	// explicit GuardSrc to point elsewhere or at a path that never
-	// exists to disable the overlay.
-	GuardSrc *GuardReloader
+	// exists to disable the overlay. New() auto-wires a GuardReloader
+	// on GuardConfPath (resolved from NODE_HOST_AGENT_API_GUARD_CONF in
+	// ConfigFromEnv, default /etc/api-backend-guard.conf) when GuardSrc
+	// is nil; set an explicit GuardSrc to point elsewhere or at a path
+	// that never exists to disable the overlay.
+	GuardConfPath string
+	GuardSrc      *GuardReloader
 	// envSet records which conf-overlappable knobs env explicitly
 	// carried at ConfigFromEnv time — the documented precedence is
 	// env > guard.conf > default, so refreshGuard's live conf
@@ -244,6 +250,12 @@ func (c *Config) applyDefaults() {
 	if c.WatchdogStateDir == "" {
 		c.WatchdogStateDir = defaultWatchdogStateDir
 	}
+	if c.GuardConfPath == "" {
+		c.GuardConfPath = defaultGuardConfPath
+	}
+	if c.Clock == nil {
+		c.Clock = timex.NewCell(nil)
+	}
 }
 
 // Prober runs the wedge-detection loop.
@@ -305,10 +317,11 @@ func New(cfg Config, reg prometheus.Registerer) (*Prober, error) {
 			cfg.Mode, ModeDryRun, ModeEnforce)
 	}
 	if cfg.GuardSrc == nil {
-		// Auto-wire the conf cmd/agent parses once at startup: a
-		// reloader keeps that layer live per cycle (hostconfig's
-		// first render lands AFTER the agent starts on api-lb VMs).
-		cfg.GuardSrc = NewGuardReloader(guardConfPath(), GuardDefaults{})
+		// Auto-wire the conf resolved by ConfigFromEnv (or
+		// defaultGuardConfPath for hand-built Configs): a reloader
+		// keeps that layer live per cycle (hostconfig's first
+		// render lands AFTER the agent starts on api-lb VMs).
+		cfg.GuardSrc = NewGuardReloader(cfg.GuardConfPath, GuardDefaults{})
 	}
 	p := &Prober{cfg: cfg, states: map[string]*backendState{}}
 

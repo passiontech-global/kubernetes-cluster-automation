@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -49,11 +48,12 @@ var nebulaNetRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // that EXISTS is enforced — an unlisted host or a key mismatch
 // fails the fetch closed.
 func knownHostsVerify(keyPath string) (func(hostname string, key ssh.PublicKey) error, error) {
-	// ExpandHome BEFORE deriving the known_hosts dir: the default
-	// --ssh-key is "~/.ssh/id_ed25519", and filepath.Dir on the raw
-	// string yields "~/.ssh" — os.Stat then always ENOENTs and the
-	// fetch silently falls back to InsecureIgnoreHostKey.
-	p := filepath.Join(filepath.Dir(sshclient.ExpandHome(keyPath)), "known_hosts")
+	// Derive known_hosts after ExpandHome so "~/.ssh/id_ed25519" stats the
+	// expanded directory rather than literal "~/.ssh".
+	p := sshclient.KnownHostsPath(keyPath)
+	if p == "" {
+		return nil, nil
+	}
 	if _, err := os.Stat(p); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil // no trust material — tolerant parity
@@ -64,9 +64,7 @@ func knownHostsVerify(keyPath string) (func(hostname string, key ssh.PublicKey) 
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", p, err)
 	}
-	// knownhosts matches entries port-exactly in host:port form —
-	// the nebulasign fetch is hard-coded to port 22 (knownhosts
-	// keys off the host:port string; the addr is only formatting).
+	// knownhosts matches entries port-exactly in host:port form (port 22).
 	return func(hostname string, key ssh.PublicKey) error {
 		return cb(net.JoinHostPort(hostname, "22"),
 			&net.TCPAddr{Port: 22}, key)
@@ -97,41 +95,14 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 	}
 	defer func() { _ = link.Close() }()
 
-	// Bound the channel-open on the conn (NewSession takes no ctx —
-	// a wedged target would block it forever), then re-arm at the
-	// ctx budget for the session BODY: CombinedOutput needs a real
-	// transport deadline — Session.Close only sends an SSH
-	// channel-close, which a blackholed conn never drains.
-	clear := sshclient.BoundOp(ctx, cfg.Log, link.DeadlineConn(), cfg.Timeout)
-	sess, err := link.Client.NewSession()
-	clear()
+	out, err := link.CombinedOutputCapped(ctx, cfg.Log, cfg.Timeout,
+		"cat /etc/nebula/"+nebulaNet+"/host.pub", sshclient.DefaultMaxOutputBytes)
 	if err != nil {
-		return "", err
-	}
-	defer func() { _ = sess.Close() }()
-	defer sshclient.BoundOpCtx(ctx, cfg.Log, link.DeadlineConn(), cfg.Timeout)()
-	type result struct {
-		out []byte
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		out, err := sess.CombinedOutput(
-			"cat /etc/nebula/" + nebulaNet + "/host.pub")
-		done <- result{out, err}
-	}()
-	select {
-	case <-ctx.Done():
-		// sess.Close can't unblock a dead transport — only killing
-		// the conn makes the CombinedOutput goroutine return (the
-		// deferred link.Close above is idempotent).
-		_ = link.Close()
-		return "", ctx.Err()
-	case r := <-done:
-		if r.err != nil {
-			return "", fmt.Errorf("read host.pub: %w (%s)", r.err,
-				strings.TrimSpace(string(r.out)))
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return "", err
 		}
-		return string(r.out), nil
+		return "", fmt.Errorf("read host.pub: %w (%s)", err,
+			strings.TrimSpace(string(out)))
 	}
+	return string(out), nil
 }

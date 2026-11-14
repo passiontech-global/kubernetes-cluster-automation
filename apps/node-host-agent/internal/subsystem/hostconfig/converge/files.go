@@ -22,12 +22,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
-// maxArtifactBytes bounds the bytes ONE DownloadFile download (and
-// one UntarInstall member) may produce — a compromised mirror or a
-// misrouted URL must not be able to fill the node's disk through the
-// converge path. Var, not const: the tests shrink it instead of
-// serving 256MiB fixtures.
-var maxArtifactBytes = int64(256) << 20
+// defaultMaxArtifactBytes bounds the bytes ONE DownloadFile download
+// (and one UntarInstall member) may produce — a compromised mirror or
+// a misrouted URL must not be able to fill the node's disk through the
+// converge path.
+const defaultMaxArtifactBytes = int64(256) << 20
 
 // maxErrorBodyDrain bounds the non-200 body read — draining a
 // bounded slice of the error body lets the keep-alive connection be
@@ -98,6 +97,11 @@ func Sha256FileOK(path, wantHex string) bool {
 // at the hardwired 0644 and stay non-executable until a later chmod.
 func DownloadFile(ctx context.Context, url, dst, wantSHA256 string,
 	mode os.FileMode, timeout time.Duration) error {
+	return downloadFileBounded(ctx, url, dst, wantSHA256, mode, timeout, defaultMaxArtifactBytes)
+}
+
+func downloadFileBounded(ctx context.Context, url, dst, wantSHA256 string,
+	mode os.FileMode, timeout time.Duration, maxBytes int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -127,10 +131,10 @@ func DownloadFile(ctx context.Context, url, dst, wantSHA256 string,
 	// One byte past the cap: n > max means the artifact is over the
 	// budget (the extra byte is discarded with the swept tmp, never
 	// renamed into place).
-	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxArtifactBytes+1))
-	if err == nil && n > maxArtifactBytes {
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(resp.Body, maxBytes+1))
+	if err == nil && n > maxBytes {
 		err = fmt.Errorf("download %s: artifact exceeds the %d MiB cap",
-			url, maxArtifactBytes>>20)
+			url, maxBytes>>20)
 	}
 	if err == nil && wantSHA256 != "" &&
 		!strings.EqualFold(wantSHA256, hex.EncodeToString(h.Sum(nil))) {
@@ -165,6 +169,10 @@ func DownloadFile(ctx context.Context, url, dst, wantSHA256 string,
 // a hostile archive can't balloon one member past the artifact
 // budget.
 func UntarInstall(tgz, member, dst string, mode os.FileMode) error {
+	return untarInstallBounded(tgz, member, dst, mode, defaultMaxArtifactBytes)
+}
+
+func untarInstallBounded(tgz, member, dst string, mode os.FileMode, maxBytes int64) error {
 	f, err := os.Open(tgz)
 	if err != nil {
 		return err
@@ -184,7 +192,7 @@ func UntarInstall(tgz, member, dst string, mode os.FileMode) error {
 			return fmt.Errorf("%s not found in %s", member, tgz)
 		}
 		if filepath.Base(hd.Name) == member {
-			return installMember(tr, dst, mode)
+			return installMember(tr, dst, mode, maxBytes)
 		}
 	}
 }
@@ -194,8 +202,8 @@ func UntarInstall(tgz, member, dst string, mode os.FileMode) error {
 // unique "base.tmp-*" name, so a crashed install's stage can never
 // collide with the next attempt's), payload fsync + rename + dir
 // fsync, the stage swept on EVERY failure path. The member stream is
-// capped at maxArtifactBytes.
-func installMember(r io.Reader, dst string, mode os.FileMode) error {
+// capped at maxBytes.
+func installMember(r io.Reader, dst string, mode os.FileMode, maxBytes int64) error {
 	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return err
@@ -203,15 +211,15 @@ func installMember(r io.Reader, dst string, mode os.FileMode) error {
 	// One byte past the cap: n > max means the member is over the
 	// budget. Copy failure (and the cap) sweep the stage before
 	// fsx.Promote takes over its failure paths.
-	if n, cerr := io.Copy(tmp, io.LimitReader(r, maxArtifactBytes+1)); cerr != nil {
+	if n, cerr := io.Copy(tmp, io.LimitReader(r, maxBytes+1)); cerr != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return cerr
-	} else if n > maxArtifactBytes {
+	} else if n > maxBytes {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("%s: member exceeds the %d MiB extract cap",
-			dst, maxArtifactBytes>>20)
+			dst, maxBytes>>20)
 	}
 	// fsx.Promote carries the durability contract the bespoke tail
 	// used to hand-roll: fsync before rename (WriteManaged parity) —

@@ -19,8 +19,6 @@ import (
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 // unitSuffixes is the systemd unit-type vocabulary — a name ending
@@ -140,15 +138,14 @@ func (b *dbusBackend) dbusActive(ctx context.Context, unit string) (bool, error)
 		}
 		return false, fmt.Errorf("dbus Get ActiveState %s: %w", unit, err)
 	}
-	switch state := propString(v); state {
-	case "active":
-		return true, nil
-	case "reloading", "activating", "deactivating", "inactive",
-		"failed", "maintenance", "unknown", "":
+	state := propString(v)
+	if state == "" {
 		return false, nil
-	default:
-		return false, fmt.Errorf("%s: unexpected ActiveState %q", unit, state)
 	}
+	if active, ok := parseActiveStateWord(state); ok {
+		return active, nil
+	}
+	return false, fmt.Errorf("%s: unexpected ActiveState %q", unit, state)
 }
 
 // dbusExists mirrors `systemctl show -p LoadState` — the unit_load_
@@ -161,17 +158,7 @@ func (b *dbusBackend) dbusExists(ctx context.Context, unit string) (bool, error)
 		}
 		return false, fmt.Errorf("dbus Get LoadState %s: %w", unit, err)
 	}
-	switch state := propString(v); state {
-	case "loaded", "merged":
-		return true, nil
-	case "stub", "not-found", "bad-setting", "error", "masked", "":
-		return false, nil
-	default:
-		logger().Warn("systemd: unexpected LoadState word — "+
-			"treating unit as absent this probe",
-			"unit", unit, "loadstate", state)
-		return false, nil
-	}
+	return parseLoadStateWord(unit, propString(v)), nil
 }
 
 // dbusActiveAge mirrors ActiveAge: ActiveEnterTimestampMonotonic
@@ -188,14 +175,7 @@ func (b *dbusBackend) dbusActiveAge(ctx context.Context, unit string,
 		return 0, fmt.Errorf("%s: unusable ActiveEnterTimestampMonotonic (not active)",
 			unit)
 	}
-	up, err := procfs.UptimeSeconds(procUptimeFile)
-	if err != nil {
-		return 0, fmt.Errorf("%s: read %s: %w", unit, procUptimeFile, err)
-	}
-	if age := up*1e6 - float64(monoUS); age > 0 {
-		return time.Duration(age) * time.Microsecond, nil
-	}
-	return 0, nil
+	return activeAgeFromMonoUS(unit, monoUS, procUptimeFile)
 }
 
 // dbusMainPID mirrors `systemctl show -p MainPID --value` — the
@@ -280,16 +260,11 @@ func (b *dbusBackend) dbusEnabled(ctx context.Context, unit string) (bool, error
 		}
 		return false, fmt.Errorf("%w: dbus GetUnitFileState %s: %v", errDBusUnavailable, unit, err)
 	}
-	switch state {
-	case "enabled", "enabled-runtime", "static", "indirect",
-		"alias", "generated", "transient", "linked", "linked-runtime":
-		return true, nil
-	case "disabled", "masked", "masked-runtime", "bad":
-		return false, nil
-	default:
-		logger().Warn("systemd: unexpected unit-file state word — "+
-			"treating unit as not enabled this probe",
-			"unit", unit, "state", state)
-		return false, nil
+	if enabled, ok := parseEnabledStateWord(state); ok {
+		return enabled, nil
 	}
+	logger().Warn("systemd: unexpected unit-file state word — "+
+		"treating unit as not enabled this probe",
+		"unit", unit, "state", state)
+	return false, nil
 }

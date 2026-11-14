@@ -5,6 +5,7 @@
 package hostmetrics
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"time"
@@ -186,6 +187,14 @@ type Config struct {
 	// fsProbeTimeout bounds one statfs probe before the mount is
 	// reported stalled — seam so tests don't wait the full 2s.
 	fsProbeTimeout time.Duration
+	// aioNrFile / aioMaxFile / maxUserNSFile and runHostCmd /
+	// kmsgDevicePaths default in applyDefaults; tests override them per
+	// Config instance rather than mutating package globals.
+	aioNrFile       string
+	aioMaxFile      string
+	maxUserNSFile   string
+	runHostCmd      func(ctx context.Context, argv ...string) (string, error)
+	kmsgDevicePaths func(hostRoot string) []string
 }
 
 func (c *Config) applyDefaults() {
@@ -380,5 +389,20 @@ func (c *Config) applyDefaults() {
 	}
 	if c.EBPFScanInterval <= 0 {
 		c.EBPFScanInterval = defaultEBPFScanInterval
+	}
+	if c.aioNrFile == "" {
+		c.aioNrFile = defaultAIONrFile
+	}
+	if c.aioMaxFile == "" {
+		c.aioMaxFile = defaultAIOMaxFile
+	}
+	if c.maxUserNSFile == "" {
+		c.maxUserNSFile = defaultMaxUserNSFile
+	}
+	if c.runHostCmd == nil {
+		c.runHostCmd = defaultRunHostCmd(c.HostRoot)
+	}
+	if c.kmsgDevicePaths == nil {
+		c.kmsgDevicePaths = defaultKmsgDevicePaths
 	}
 }

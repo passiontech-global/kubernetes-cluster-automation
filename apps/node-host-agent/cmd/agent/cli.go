@@ -34,15 +34,18 @@ var usageIndent = strings.Repeat(" ", usageDescCol)
 
 // subcommand is one row of the dispatch table: the argv[1] word, the
 // usage text (flags + description column), and the runner. run gets
-// the signal context and the invocation argv MINUS the subcommand
-// word — argv[0] is kept because concourse-runc-wrapper forwards the
-// rebuilt argv to runc.real.
+// the signal context and the post-subcommand flags/args by default;
+// keepArgv0 preserves argv[0] ahead of them (concourse-runc-wrapper
+// forwards argv[0] to runc.real).
 type subcommand struct {
-	name  string
-	flags string // what follows the name in usage ("" = none)
-	desc  string // description column ("\n" continues on the next line)
-	run   func(ctx context.Context, argv []string) int
+	name      string
+	flags     string // what follows the name in usage ("" = none)
+	desc      string // description column ("\n" continues on the next line)
+	keepArgv0 bool
+	run       func(ctx context.Context, args []string) int
 }
+
+var runConvergeOnce = hostconverge.Cmd
 
 var subcommands = []subcommand{
 	{
@@ -59,15 +62,12 @@ var subcommands = []subcommand{
 		name:  "concourse-worker-init",
 		flags: "[--work-dir=DIR] [--runc-dir=DIR] [--runc-source=PATH] [--wrapper-source=PATH]",
 		desc:  "concourse worker init-rm (init container)",
-		run: func(ctx context.Context, argv []string) int {
-			return concourseinit.Cmd(ctx, argv[1:])
-		},
+		run:   concourseinit.Cmd,
 	},
 	{
-		name: "concourse-runc-wrapper",
-		desc: `runc shim (argv[0] "runc" works too)`,
-		// The subcommand word is already stripped from argv — the
-		// wrapper forwards it to runc.real.
+		name:      "concourse-runc-wrapper",
+		desc:      `runc shim (argv[0] "runc" works too)`,
+		keepArgv0: true,
 		run: func(_ context.Context, argv []string) int {
 			return concourseinit.RunRuncWrapper(argv, os.Environ())
 		},
@@ -76,50 +76,41 @@ var subcommands = []subcommand{
 		name:  "converge-once",
 		flags: "--vars-dir=DIR [--node-name=N] [--nebula-certs-dir=DIR]",
 		desc:  "one hostconfig converge on the host, then exit",
-		run: func(ctx context.Context, argv []string) int {
-			return hostconverge.Cmd(ctx, argv[1:])
+		// Closure indirection lets cli_test.go swap runConvergeOnce.
+		run: func(ctx context.Context, args []string) int {
+			return runConvergeOnce(ctx, args)
 		},
 	},
 	{
 		name:  "nebula-sign",
 		flags: "--vars-dir=DIR --ca-dir=DIR [--node=N] [--duration=8760h] [--ssh-key=PATH]",
 		desc:  "sign interdc nebula host certs with the local CA",
-		run: func(ctx context.Context, argv []string) int {
-			return nebulasign.Cmd(ctx, argv[1:])
-		},
+		run:   nebulasign.Cmd,
 	},
 	{
 		name:  "purge-events",
 		flags: "[--api=URL] [--ca=FILE] [--cert=FILE] [--key=FILE] [--workers=N] [--before=TS | RFC3339]",
 		desc:  "delete apiserver events older than the cutoff (etcd backlog GC)",
-		run: func(ctx context.Context, argv []string) int {
-			return evpurge.Cmd(ctx, argv[1:])
-		},
+		run:   evpurge.Cmd,
 	},
 	{
 		name:  "check-kine-db",
 		flags: "[--env-file=FILE] [--wire-addr=HOST:PORT] [--runtime=podman|docker]",
 		desc:  "verify the kine postgres+pgbouncer stack (exit 1 on any FAIL)",
-		run: func(ctx context.Context, argv []string) int {
-			return kinecheckdb.Cmd(ctx, argv[1:])
-		},
+		run:   kinecheckdb.Cmd,
 	},
 	{
 		name:  "check-k0s-drift",
 		flags: "[--config=FILE] [--expected-keys=a,b] [--removed-flags=x,y] [--unit-file=FILE]",
 		desc:  "report k0s.yaml extraArgs drift (removed-flag/extra-key/missing-key)",
-		run: func(ctx context.Context, argv []string) int {
-			return k0sdrift.Cmd(ctx, argv[1:])
-		},
+		run:   k0sdrift.Cmd,
 	},
 	{
 		name:  "rescue-etcd",
 		flags: "[--k0s-dir=DIR] [--endpoint=URL] [--force-offline]",
 		desc: "rescue a k0s etcd at backend quota\n" + usageIndent +
 			"(compact -> online defrag -> offline defrag -> alarm disarm -> canary)",
-		run: func(ctx context.Context, argv []string) int {
-			return etcdrescue.Cmd(ctx, argv[1:])
-		},
+		run: etcdrescue.Cmd,
 	},
 }
 
@@ -144,9 +135,11 @@ func dispatch(argv []string) (int, bool) {
 		}
 		ctx, stop := signalContext()
 		defer stop()
-		// The subcommand word is not part of the runner's argv —
-		// rebuild argv without it so argv[0] still leads.
-		return sc.run(ctx, append([]string{argv[0]}, argv[2:]...)), true
+		args := argv[2:]
+		if sc.keepArgv0 {
+			args = append([]string{argv[0]}, args...)
+		}
+		return sc.run(ctx, args), true
 	}
 	subcommandUsage(argv[1])
 	return 2, true

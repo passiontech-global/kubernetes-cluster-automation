@@ -340,10 +340,8 @@ func TestUntarInstall(t *testing.T) {
 	})
 
 	t.Run("member exactly at the cap installs", func(t *testing.T) {
-		defer func(orig int64) { maxArtifactBytes = orig }(maxArtifactBytes)
-		maxArtifactBytes = int64(len("tool-bytes"))
 		dst := filepath.Join(t.TempDir(), "installed")
-		if err := UntarInstall(tgz, "tool", dst, 0o755); err != nil {
+		if err := untarInstallBounded(tgz, "tool", dst, 0o755, int64(len("tool-bytes"))); err != nil {
 			t.Fatal(err)
 		}
 		if got := testutil.ReadFile(t, dst); got != "tool-bytes" {
@@ -353,15 +351,12 @@ func TestUntarInstall(t *testing.T) {
 }
 
 func TestUntarInstallExtractCap(t *testing.T) {
-	defer func(orig int64) { maxArtifactBytes = orig }(maxArtifactBytes)
-	maxArtifactBytes = 1024
-
 	dir := t.TempDir()
 	tgz := filepath.Join(dir, "bundle.tar.gz")
 	writeTarGz(t, tgz, map[string]string{"bin/tool": strings.Repeat("A", 2000)})
 
 	dst := filepath.Join(t.TempDir(), "installed")
-	err := UntarInstall(tgz, "tool", dst, 0o755)
+	err := untarInstallBounded(tgz, "tool", dst, 0o755, 1024)
 	if err == nil || !strings.Contains(err.Error(), "extract cap") {
 		t.Fatalf("err = %v, want the extract-cap failure", err)
 	}
@@ -379,9 +374,6 @@ func TestUntarInstallExtractCap(t *testing.T) {
 }
 
 func TestDownloadFileArtifactCap(t *testing.T) {
-	defer func(orig int64) { maxArtifactBytes = orig }(maxArtifactBytes)
-	maxArtifactBytes = 1024
-
 	overCap := strings.Repeat("B", 2000)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(overCap))
@@ -390,7 +382,7 @@ func TestDownloadFileArtifactCap(t *testing.T) {
 
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "f.bin")
-	err := DownloadFile(context.Background(), srv.URL, dst, "", 0o644, 10*time.Second)
+	err := downloadFileBounded(context.Background(), srv.URL, dst, "", 0o644, 10*time.Second, 1024)
 	if err == nil || !strings.Contains(err.Error(), "exceeds the") {
 		t.Fatalf("err = %v, want the artifact-cap failure", err)
 	}

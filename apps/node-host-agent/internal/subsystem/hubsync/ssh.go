@@ -9,7 +9,6 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -75,10 +74,7 @@ func newSSHDialer(keyPath string, port int, timeout time.Duration,
 	if log == nil {
 		log = logger()
 	}
-	knownHosts := ""
-	if dir := filepath.Dir(sshclient.ExpandHome(keyPath)); dir != "" && dir != "." {
-		knownHosts = filepath.Join(dir, "known_hosts")
-	}
+	knownHosts := sshclient.KnownHostsPath(keyPath)
 	tofu := ""
 	if stateDir != "" {
 		tofu = filepath.Join(stateDir, "hubsync_known_hosts")
@@ -227,100 +223,18 @@ func (c *sshConn) Close() error { return c.link.Close() }
 // it to the tmp path so concurrent runs never share a staging inode.
 func (c *sshConn) StageSuffix() string { return c.nonce }
 
-// newSession opens a session channel and returns it together with
-// the body-deadline release func the caller MUST defer for the
-// session's whole span. Two bounds apply: BoundOp covers just the
-// channel-open (NewSession takes no ctx and a wedged target blocks
-// it indefinitely), then BoundOpCtx re-arms the conn at the ctx
-// budget for the SESSION BODY — Session.Close only sends an SSH
-// channel-close, which a blackholed transport never drains, so
-// CombinedOutput/io.Copy/Wait need a real transport deadline or
-// they hang past ctx cancel. link.DeadlineConn picks the conn
-// SetDeadline actually works on (the jump's TCP conn behind a
-// bastion — see sshclient.Link).
 func (c *sshConn) newSession(ctx context.Context) (*ssh.Session, func(), error) {
-	clear := sshclient.BoundOp(ctx, c.log, c.link.DeadlineConn(), c.timeout)
-	sess, err := c.link.Client.NewSession()
-	clear()
-	if err != nil {
-		return nil, nil, err
-	}
-	return sess, sshclient.BoundOpCtx(ctx, c.log,
-		c.link.DeadlineConn(), c.timeout), nil
-}
-
-// maxRemoteOutputBytes caps one Run's retained combined output —
-// CombinedOutput buffers unbounded, so a remote command flooding
-// stdout/stderr (a broken script looping errors, a huge sha256sum
-// stderr storm) would grow agent memory without limit. The head is
-// kept — error banners and the first hash lines come first — and
-// the excess is drained so the remote never blocks on a full pipe.
-const maxRemoteOutputBytes = 1 << 20
-
-// cappedOut is the stdout+stderr sink for one Run — same keep-head
-// contract as hostexec's cappedBuffer.
-type cappedOut struct {
-	mu  sync.Mutex
-	buf strings.Builder
-}
-
-func (w *cappedOut) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if rem := maxRemoteOutputBytes - w.buf.Len(); rem > 0 {
-		if rem > len(p) {
-			rem = len(p)
-		}
-		_, _ = w.buf.Write(p[:rem])
-	}
-	return len(p), nil
-}
-
-// combinedOutputCapped is sess.CombinedOutput with the output sink
-// capped: Stdout and Stderr point at the SAME writer so the remote
-// streams merge in wire order exactly like CombinedOutput, while
-// retention stops at maxRemoteOutputBytes.
-func combinedOutputCapped(sess *ssh.Session, cmd string) ([]byte, error) {
-	var out cappedOut
-	sess.Stdout = &out
-	sess.Stderr = &out
-	// Keep the partial head on failure — the sudo-error path reads
-	// remote stderr out of it ("sudo: a password is required").
-	err := sess.Run(cmd)
-	return []byte(out.buf.String()), err
+	return c.link.NewSession(ctx, c.log, c.timeout)
 }
 
 func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	if c.sudo {
 		cmd = "sudo -n " + cmd
 	}
-	sess, unbind, err := c.newSession(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer unbind()
-	defer func() { _ = sess.Close() }()
-	done := make(chan struct{})
-	var out []byte
-	var runErr error
-	go func() {
-		defer close(done)
-		out, runErr = combinedOutputCapped(sess, cmd)
-	}()
-	select {
-	case <-ctx.Done():
-		// sess.Close alone CANNOT unblock a dead transport — it only
-		// sends an SSH channel-close, which a blackholed conn never
-		// drains, so CombinedOutput (and the <-done wait) would hang
-		// forever and take the whole converge loop down. Closing the
-		// LINK kills the transport conn: every session read/write
-		// fails and done closes. The conn dies with this op anyway —
-		// syncTarget dials per target and its deferred conn.Close is
-		// idempotent.
-		_ = c.link.Close()
-		<-done
-		return "", ctx.Err()
-	case <-done:
+	out, runErr := c.link.CombinedOutputCapped(ctx, c.log, c.timeout, cmd,
+		sshclient.DefaultMaxOutputBytes)
+	if runErr != nil && ctx.Err() != nil {
+		return "", runErr
 	}
 	if c.sudo && runErr != nil {
 		// A `sudo -n` failure is otherwise a bare "exit status 1" —

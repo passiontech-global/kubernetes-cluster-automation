@@ -94,30 +94,14 @@ func fixture(t *testing.T) (Config, map[string]string) {
 		// Never wait the real 2s in tests — the stall tests inject
 		// their own hanging statfsFn against this shortened deadline.
 		fsProbeTimeout: 50 * time.Millisecond,
-	}
-	fixtureSeams(root)
-	return cfg, dirs
-}
-
-// fixtureSeams pins the deep-failure seams to a nonexistent path for the
-// whole test binary — fixture() re-points them at its own temp root
-// per test. Without this every refreshLatches would open the REAL
-// /dev/kmsg and exec REAL dmesg/chronyc on the test host — the
-// vars feed the kernelfail engine through Deps closures, so the
-// stubs still land across the package boundary. (The
-// textfileDirOverride seam moved into kernelfail with the textfile
-// writers; nothing under fixture() reaches a textfile write —
-// updatePidFDPressure/updateStealEntropy early-return on the empty
-// fixture proc.)
-func fixtureSeams(root string) {
-	kmsgDevicePaths = func(string) []string {
-		return []string{filepath.Join(root, "dev", "kmsg")}
-	}
-	runHostCmd = func(string) func(context.Context, ...string) (string, error) {
-		return func(context.Context, ...string) (string, error) {
+		kmsgDevicePaths: func(string) []string {
+			return []string{filepath.Join(root, "dev", "kmsg")}
+		},
+		runHostCmd: func(context.Context, ...string) (string, error) {
 			return "", errors.New("exec disabled in tests")
-		}
+		},
 	}
+	return cfg, dirs
 }
 
 // metricValue gathers the collector once and returns the value of the

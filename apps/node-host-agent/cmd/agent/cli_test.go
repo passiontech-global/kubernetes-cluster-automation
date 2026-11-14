@@ -124,15 +124,18 @@ func (quietRunner) Run(ctx context.Context, name string, args ...string) (string
 }
 
 func TestDispatchConvergeOnceCleanExit0(t *testing.T) {
-	// Stub the host seams: a tempdir host root + a runner that never
-	// fails, so a fully self-gating converge reports errs==0 and the
+	// Stub runConvergeOnce with a tempdir host root + never-failing
+	// runner, so a fully self-gating converge reports errs==0 and the
 	// command exits 0 (the timer/CI "converged" contract).
-	oldRoot, oldRunner := hostconverge.HostRoot, hostconverge.RunnerFactory
-	defer func() {
-		hostconverge.HostRoot, hostconverge.RunnerFactory = oldRoot, oldRunner
-	}()
-	hostconverge.HostRoot = t.TempDir()
-	hostconverge.RunnerFactory = func() hostconfig.Runner { return quietRunner{} }
+	oldRun := runConvergeOnce
+	t.Cleanup(func() { runConvergeOnce = oldRun })
+	root := t.TempDir()
+	runConvergeOnce = func(ctx context.Context, args []string) int {
+		return hostconverge.CmdWith(ctx, args, hostconverge.Options{
+			HostRoot: root,
+			Runner:   func() hostconfig.Runner { return quietRunner{} },
+		})
+	}
 
 	dir := t.TempDir()
 	for name, content := range map[string]string{

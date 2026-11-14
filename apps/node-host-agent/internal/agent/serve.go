@@ -76,10 +76,6 @@ func (a *Agent) probeMux() *http.ServeMux {
 }
 
 const (
-	// shutdownGrace bounds each http.Server.Shutdown drain on ctx
-	// cancel — the handlers already run under the per-server
-	// timeouts, so a longer drain only delays pod termination.
-	shutdownGrace = 5 * time.Second
 	// subsystemShutdownTimeout bounds the supervise-goroutine wait
 	// before Run returns — a subsystem wedged mid-check must not
 	// pin the agent's own shutdown forever.
@@ -101,8 +97,7 @@ const (
 // at metricsHandlerTimeout=25s — 30s leaves the timed-out body room
 // to flush) and 0 ONLY on the loopback profile listener, where
 // pprof.Profile/Trace legitimately outlive their sampling windows.
-// The shutdown drain budget stays httpx's 5s default — the same
-// shutdownGrace the hand-rolled gracefulShutdown applied.
+// The shutdown drain budget stays httpx.DefaultShutdownBudget (5s).
 var serverTimeouts = httpx.Opts{
 	ReadHeaderTimeout: 5 * time.Second,
 	ReadTimeout:       15 * time.Second,
@@ -213,10 +208,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		a.ready.Store(false)
 		// The parked gracefulShutdown goroutines are draining the
-		// servers under shutdownGrace — wait for that drain to
-		// actually finish, then for every supervise + sd_notify
-		// goroutine to unwind (bounded — a wedged subsystem can't
-		// pin Run, and STOPPING=1 is a single datagram send).
+		// servers under httpx.DefaultShutdownBudget — wait for that
+		// drain to actually finish, then for every supervise +
+		// sd_notify goroutine to unwind (bounded — a wedged subsystem
+		// can't pin Run, and STOPPING=1 is a single datagram send).
 		srvWG.Wait()
 		waitSubsystems(&wg)
 		return nil
@@ -282,7 +277,7 @@ func gracefulShutdown(ctx context.Context, done <-chan struct{},
 	// Bounded drain: the parent's ctx is already dead, so the
 	// shutdown gets its own deadline — a handler ignoring conn
 	// close would otherwise hold Run's srvWG wait open.
-	sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	sctx, cancel := context.WithTimeout(context.Background(), httpx.DefaultShutdownBudget)
 	defer cancel()
 	if err := shutdown(sctx); err != nil &&
 		!errors.Is(err, http.ErrServerClosed) {

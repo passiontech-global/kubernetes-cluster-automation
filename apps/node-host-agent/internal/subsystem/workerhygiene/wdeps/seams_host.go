@@ -76,7 +76,14 @@ func (s *Host) applyDefaults(c *Config) {
 		}
 	}
 	if s.Clock == nil {
-		s.Clock = timex.NewCell(nil)
+		if c.Base.Clock != nil {
+			s.Clock = c.Base.Clock
+		} else {
+			s.Clock = timex.NewCell(nil)
+		}
+	}
+	if c.Base.Clock == nil {
+		c.Base.Clock = s.Clock
 	}
 	if s.JournalFn == nil {
 		sd := c.Systemd

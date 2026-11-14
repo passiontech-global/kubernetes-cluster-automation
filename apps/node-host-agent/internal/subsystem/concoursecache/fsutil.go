@@ -5,7 +5,6 @@ package concoursecache
 
 import (
 	"cmp"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,46 +13,12 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/concourse"
 )
 
-// enforceDirPermsFD applies uid/gid + mode to a directory WITHOUT
-// re-resolving the path: the dir is opened O_NOFOLLOW (a swapped-in
-// symlink fails the open instead of being dereferenced), fstat'd to
-// confirm the fd still is a plain directory, then Fchown/Fchmod run
-// on the held fd. The Lstat-then-Chown pattern had a swap window —
-// on a CI-controlled 0777 tree an actor can replace a verified
-// entry with `<entry> -> /etc` between the check and the chmod,
-// turning the root perm pass into a host-file privilege gadget.
-// withDirFD opens path with O_NOFOLLOW, verifies via fstat that the held
-// fd is a directory, and invokes fn on that fd so callers never suffer
-// an Lstat-then-chown/chmod symlink swap race.
-func withDirFD(path string, fn func(fd int, st *unix.Stat_t) error) error {
-	fd, err := unix.Open(path,
-		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	f := os.NewFile(uintptr(fd), path)
-	defer func() { _ = f.Close() }()
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return err
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return fmt.Errorf("%s: not a directory (mode %o)", path, st.Mode&unix.S_IFMT)
-	}
-	return fn(fd, &st)
-}
-
 func enforceDirPermsFD(path string, uid, gid int, mode os.FileMode) error {
-	return withDirFD(path, func(fd int, _ *unix.Stat_t) error {
-		if uid >= 0 || gid >= 0 {
-			if err := unix.Fchown(fd, uid, gid); err != nil {
-				return err
-			}
-		}
-		return unix.Fchmod(fd, uint32(mode))
-	})
+	return concourse.EnforcePermsFD(path, false, uid, gid, mode, nil)
 }
 
 // isDir is the script's `[ -d "$d" ]` guard — but Lstat, not Stat:
@@ -238,7 +203,7 @@ func makeWritableDirs(root string) {
 // fstat'd to confirm the fd still is a plain directory, then
 // Fchmod'd — only the held inode's mode ever changes.
 func chmodDirWritableFD(path string) {
-	_ = withDirFD(path, func(fd int, st *unix.Stat_t) error {
+	_ = concourse.WithNoFollowFD(path, false, func(fd int, st *unix.Stat_t) error {
 		return unix.Fchmod(fd, (st.Mode&0o7777)|0o200)
 	})
 }

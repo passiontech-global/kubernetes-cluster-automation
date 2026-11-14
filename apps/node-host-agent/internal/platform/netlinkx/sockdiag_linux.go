@@ -126,50 +126,34 @@ func tcpCensusDump(out *TCPCensus) error {
 // NLMSG_ERROR payloads carry a negative errno — a positive/zero
 // error is an ACK and ends the dump silently (kernel sent nothing
 // more).
-func parseDiagCensus(buf []byte, out *TCPCensus) (uint32, error) {
+// walkNLMsgs iterates 4-byte-aligned netlink messages in buf, handling
+// NLMSG_DONE and NLMSG_ERROR (returning non-nil error on negative errno,
+// or seq + done=true on ACK/DONE) and passing data payloads to onPayload.
+func walkNLMsgs(buf []byte, destroyCtx bool, onPayload func(payload []byte)) (seq uint32, done bool, err error) {
 	for len(buf) >= 16 {
 		length := int(binary.LittleEndian.Uint32(buf[0:4]))
 		mtype := binary.LittleEndian.Uint16(buf[4:6])
-		seq := binary.LittleEndian.Uint32(buf[8:12])
+		msgSeq := binary.LittleEndian.Uint32(buf[8:12])
 		if length < 16 || length > len(buf) {
-			return 0, fmt.Errorf("sock_diag: bad nlmsg len %d", length)
+			return 0, false, fmt.Errorf("sock_diag: bad nlmsg len %d", length)
 		}
 		switch mtype {
 		case nlmsgDone:
-			return seq, nil
+			return msgSeq, true, nil
 		case nlmsgError:
 			if length >= 20 {
 				errno := int32(binary.LittleEndian.Uint32(buf[16:20]))
 				if errno < 0 {
-					return 0, fmt.Errorf("sock_diag: %w", unix.Errno(-errno))
+					if destroyCtx {
+						return 0, false, fmt.Errorf("sock_diag destroy: %w", unix.Errno(-errno))
+					}
+					return 0, false, fmt.Errorf("sock_diag: %w", unix.Errno(-errno))
 				}
 			}
-			return seq, nil
+			return msgSeq, true, nil
 		default:
-			// inet_diag_msg: family@0, state@1, sockid@4 —
-			// dport (BE) at sockid+2, daddr at sockid+20 (4 bytes
-			// for AF_INET, the full 16 for AF_INET6; the kernel
-			// stores __be32s verbatim, so the bytes are already
-			// network order).
-			if length >= 16+diagMsg {
-				payload := buf[16:length]
-				if payload[0] == unix.AF_INET || payload[0] == unix.AF_INET6 {
-					out.States[payload[1]]++
-					var kb [18]byte
-					k := kb[:6]
-					if payload[0] == unix.AF_INET6 {
-						k = kb[:18]
-						copy(kb[:16], payload[24:40])
-					} else {
-						copy(kb[:4], payload[24:28])
-					}
-					copy(k[len(k)-2:], payload[6:8])
-					if n, ok := out.PerTuple[string(k)]; ok {
-						out.PerTuple[string(k)] = n + 1
-					} else {
-						out.PerTuple[string(k)] = 1 // copies once per NEW endpoint
-					}
-				}
+			if onPayload != nil {
+				onPayload(buf[16:length])
 			}
 		}
 		// NLMSG_ALIGN(4): headers and payloads are 4-byte aligned.
@@ -181,7 +165,34 @@ func parseDiagCensus(buf []byte, out *TCPCensus) (uint32, error) {
 		}
 		buf = buf[advance:]
 	}
-	return 0, nil
+	return 0, false, nil
+}
+
+func parseDiagCensus(buf []byte, out *TCPCensus) (uint32, error) {
+	seq, _, err := walkNLMsgs(buf, false, func(payload []byte) {
+		// inet_diag_msg: family@0, state@1, sockid@4 —
+		// dport (BE) at sockid+2, daddr at sockid+20 (4 bytes
+		// for AF_INET, the full 16 for AF_INET6; the kernel
+		// stores __be32s verbatim, so the bytes are already
+		// network order).
+		if len(payload) < diagMsg {
+			return
+		}
+		if payload[0] == unix.AF_INET || payload[0] == unix.AF_INET6 {
+			out.States[payload[1]]++
+			var kb [18]byte
+			k := kb[:6]
+			if payload[0] == unix.AF_INET6 {
+				k = kb[:18]
+				copy(kb[:16], payload[24:40])
+			} else {
+				copy(kb[:4], payload[24:28])
+			}
+			copy(k[len(k)-2:], payload[6:8])
+			out.PerTuple[string(k)]++
+		}
+	})
+	return seq, err
 }
 
 // DiagEndpoint renders a census PerTuple key (raw daddr bytes +
@@ -351,45 +362,22 @@ func destroyListeners(port uint16) (int, error) {
 // matches — LISTEN-state TCP sockets whose idiag_sport equals port.
 // Returns done=true on NLMSG_DONE (same contract as parseDiagMsgs).
 func collectPortListeners(buf []byte, family uint8, port uint16, matches *[]sockMatch) (bool, error) {
-	for len(buf) >= 16 {
-		length := int(binary.LittleEndian.Uint32(buf[0:4]))
-		mtype := binary.LittleEndian.Uint16(buf[4:6])
-		if length < 16 || length > len(buf) {
-			return false, fmt.Errorf("sock_diag: bad nlmsg len %d", length)
+	_, done, err := walkNLMsgs(buf, false, func(payload []byte) {
+		// inet_diag_msg: family@0 state@1, sockid@4 (48B) —
+		// idiag_sport is sockid+0, big-endian (payload[4:6]);
+		// idiag_dport (sockid+2) is always 0 for listeners.
+		if len(payload) < 4+sockidLen {
+			return
 		}
-		switch mtype {
-		case nlmsgDone:
-			return true, nil
-		case nlmsgError:
-			if length >= 20 {
-				errno := int32(binary.LittleEndian.Uint32(buf[16:20]))
-				if errno < 0 {
-					return false, fmt.Errorf("sock_diag: %w", unix.Errno(-errno))
-				}
-			}
-			return true, nil
-		default:
-			// inet_diag_msg: family@0 state@1, sockid@4 (48B) —
-			// idiag_sport is sockid+0, big-endian (payload[4:6]);
-			// idiag_dport (sockid+2) is always 0 for listeners.
-			if length >= 16+4+sockidLen {
-				payload := buf[16:]
-				if payload[0] == family && payload[1] == tcpStateListen &&
-					binary.BigEndian.Uint16(payload[4:6]) == port {
-					var m sockMatch
-					m.family = payload[0]
-					copy(m.id[:], payload[4:4+sockidLen])
-					*matches = append(*matches, m)
-				}
-			}
+		if payload[0] == family && payload[1] == tcpStateListen &&
+			binary.BigEndian.Uint16(payload[4:6]) == port {
+			var m sockMatch
+			m.family = payload[0]
+			copy(m.id[:], payload[4:4+sockidLen])
+			*matches = append(*matches, m)
 		}
-		advance := (length + 3) &^ 3
-		if advance > len(buf) {
-			advance = len(buf)
-		}
-		buf = buf[advance:]
-	}
-	return false, nil
+	})
+	return done, err
 }
 
 // parseDiagAck reads one destroy-phase reply: NLMSG_ERROR with a
@@ -397,23 +385,6 @@ func collectPortListeners(buf []byte, family uint8, port uint16, matches *[]sock
 // success — the kernel may also answer DONE for an id that no
 // longer exists, which is the desired idempotent outcome.
 func parseDiagAck(buf []byte) error {
-	for len(buf) >= 16 {
-		length := int(binary.LittleEndian.Uint32(buf[0:4]))
-		mtype := binary.LittleEndian.Uint16(buf[4:6])
-		if length < 16 || length > len(buf) {
-			return fmt.Errorf("sock_diag: bad nlmsg len %d", length)
-		}
-		if mtype == nlmsgError && length >= 20 {
-			errno := int32(binary.LittleEndian.Uint32(buf[16:20]))
-			if errno < 0 {
-				return fmt.Errorf("sock_diag destroy: %w", unix.Errno(-errno))
-			}
-		}
-		advance := (length + 3) &^ 3
-		if advance > len(buf) {
-			advance = len(buf)
-		}
-		buf = buf[advance:]
-	}
-	return nil
+	_, _, err := walkNLMsgs(buf, true, nil)
+	return err
 }

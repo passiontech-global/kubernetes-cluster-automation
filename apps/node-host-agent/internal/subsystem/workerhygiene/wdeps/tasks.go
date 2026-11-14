@@ -47,11 +47,36 @@ const (
 // and cilium healthz probes.
 func (d *Deps) ProbeHTTPSeries(ctx context.Context, url string,
 	attempts int, timeout, gap time.Duration) error {
+	return probeRetry(ctx, attempts, gap, func() (bool, error) {
+		err := d.Cfg.Seams.Probe.ProbeHTTP(ctx, url, timeout)
+		return err == nil, err
+	})
+}
+
+// ProbeHTTPStatusSeries runs up to `attempts` authenticated GET status
+// probes `gap` apart, delegating status interpretation to accept (which
+// returns stop=true once a conclusive verdict or short-circuit condition is
+// reached).
+func (d *Deps) ProbeHTTPStatusSeries(ctx context.Context, url, bearer string,
+	attempts int, timeout, gap time.Duration,
+	accept func(code int) (stop bool, err error)) error {
+	return probeRetry(ctx, attempts, gap, func() (bool, error) {
+		code, err := d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx, url, bearer, timeout)
+		if err != nil {
+			return false, err
+		}
+		return accept(code)
+	})
+}
+
+func probeRetry(ctx context.Context, attempts int, gap time.Duration,
+	attempt func() (stop bool, err error)) error {
 	var last error
 	for i := 0; i < attempts; i++ {
-		last = d.Cfg.Seams.Probe.ProbeHTTP(ctx, url, timeout)
-		if last == nil {
-			return nil
+		var stop bool
+		stop, last = attempt()
+		if stop {
+			return last
 		}
 		if i+1 < attempts {
 			select {

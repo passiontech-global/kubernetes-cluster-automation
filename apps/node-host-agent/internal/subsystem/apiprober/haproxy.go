@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"strings"
-	"time"
 )
 
 // dial connects to the HAProxy admin socket.
@@ -34,7 +33,7 @@ func (p *Prober) socketCmd(ctx context.Context, cmd string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = conn.Close() }()
-	deadline := time.Now().Add(p.cfg.TCPTimeout)
+	deadline := p.cfg.Clock.Now().Add(p.cfg.TCPTimeout)
 	_ = conn.SetDeadline(deadline)
 	if _, err := io.WriteString(conn, cmd+"\n"); err != nil {
 		return "", err

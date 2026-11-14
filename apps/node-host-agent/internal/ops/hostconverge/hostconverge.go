@@ -16,20 +16,25 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig"
 )
 
-// HostRoot/RunnerFactory wire the production standalone contract
-// ("/" + DirectRunner) — tests stub both to run a scripted converge
-// against a tempdir host root instead of exec'ing real host
-// commands.
-var (
-	HostRoot      = "/"
-	RunnerFactory = func() hostconfig.Runner { return hostconfig.DirectRunner{} }
-)
+// Options configures the target host root and command runner for
+// CmdWith; zero fields default to the standalone production contract
+// ("/" + DirectRunner).
+type Options struct {
+	HostRoot string
+	Runner   func() hostconfig.Runner
+}
 
 // Cmd is the `converge-once` subcommand entrypoint: flag parsing +
 // dispatch, returning the process exit code (0 clean, 1 runtime
 // failure, 2 usage error — same contract as the other ops
 // subcommands).
 func Cmd(ctx context.Context, args []string) int {
+	return CmdWith(ctx, args, Options{})
+}
+
+// CmdWith runs `converge-once` with explicit Options (tests inject a
+// tempdir HostRoot and scripted Runner without package globals).
+func CmdWith(ctx context.Context, args []string, opts Options) int {
 	fs := opsx.FlagSet("converge-once")
 	varsDir := opsx.VarsDirFlag(fs)
 	nodeName := fs.String("node-name", "",
@@ -41,11 +46,19 @@ func Cmd(ctx context.Context, args []string) int {
 	// hostctx.NodeName owns the NODE_HOST_AGENT_NODE_NAME > NODE_NAME
 	// > flag precedence (main.go parity); converge keeps the OS
 	// hostname as the final fallback.
-	return converge(ctx, *varsDir, hostctx.NodeName(*nodeName), *certsDir)
+	return converge(ctx, *varsDir, hostctx.NodeName(*nodeName), *certsDir, opts)
 }
 
 // converge runs exactly one hostconfig cycle on the host.
-func converge(ctx context.Context, varsDir, nodeName, certsDir string) int {
+func converge(ctx context.Context, varsDir, nodeName, certsDir string, opts Options) int {
+	hostRoot := opts.HostRoot
+	if hostRoot == "" {
+		hostRoot = "/"
+	}
+	var runner hostconfig.Runner = hostconfig.DirectRunner{}
+	if opts.Runner != nil {
+		runner = opts.Runner()
+	}
 	hostname, _ := os.Hostname()
 	nn := nodeName
 	if nn == "" {
@@ -54,10 +67,10 @@ func converge(ctx context.Context, varsDir, nodeName, certsDir string) int {
 	hc, err := hostconfig.New(hostconfig.Config{
 		NodeName:       nn,
 		Hostname:       hostname,
-		HostRoot:       HostRoot,
+		HostRoot:       hostRoot,
 		VarsDir:        varsDir,
 		NebulaCertsDir: certsDir,
-		Runner:         RunnerFactory(),
+		Runner:         runner,
 	}, nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "converge-once:", err)

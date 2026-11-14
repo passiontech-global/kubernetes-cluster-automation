@@ -12,6 +12,25 @@ import (
 	"time"
 )
 
+// buildDNSAQuery builds a minimal RFC 1035 A-record query for name.
+func buildDNSAQuery(name string, id uint16) []byte {
+	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
+	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
+	for label := range strings.SplitSeq(strings.TrimSuffix(name, "."), ".") {
+		if label == "" {
+			continue
+		}
+		q = append(q, byte(len(label)))
+		q = append(q, label...)
+	}
+	return append(q, 0, 0, 1, 0, 1) // root label + QTYPE A + QCLASS IN
+}
+
+// validDNSReply reports whether buf echoes q's id with the QR bit set.
+func validDNSReply(buf, q []byte) bool {
+	return len(buf) >= 4 && buf[0] == q[0] && buf[1] == q[1] && buf[2]&0x80 != 0
+}
+
 // DNSQuery sends one minimal A-record query for name to addr over
 // UDP and reports whether a well-formed reply returns before the
 // deadline — the node-local-dns :53 datapath probe. Any reply
@@ -22,17 +41,7 @@ import (
 //
 // Mirrors workerhygiene.probeDNSUDP (cilium.go).
 func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) bool {
-	id := uint16(time.Now().UnixNano())
-	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
-	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
-	for label := range strings.SplitSeq(strings.TrimSuffix(name, "."), ".") {
-		if label == "" {
-			continue
-		}
-		q = append(q, byte(len(label)))
-		q = append(q, label...)
-	}
-	q = append(q, 0, 0, 1, 0, 1) // root label + QTYPE A + QCLASS IN
+	q := buildDNSAQuery(name, uint16(time.Now().UnixNano()))
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "udp", addr)
 	if err != nil {
@@ -47,8 +56,7 @@ func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) boo
 	n, err := conn.Read(buf)
 	// ID echo + QR bit set (a response, not another query or a stray
 	// datagram sharing the id).
-	return err == nil && n >= 4 && buf[0] == q[0] && buf[1] == q[1] &&
-		buf[2]&0x80 != 0
+	return err == nil && validDNSReply(buf[:n], q)
 }
 
 // DNSQueryTCP is the server-speaks-first-ports TCP :53 twin of DNSQuery: the same
@@ -61,20 +69,11 @@ func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) boo
 // same id/QR-bit contract. ctx bounds the dial; timeout still
 // bounds the whole exchange via the conn deadline.
 func DNSQueryTCP(ctx context.Context, addr, name string, timeout time.Duration) bool {
-	id := uint16(time.Now().UnixNano())
-	// Header: ID, flags 0x0100 (RD), QDCOUNT=1, AN/NS/AR=0.
-	q := []byte{byte(id >> 8), byte(id), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0}
-	for label := range strings.SplitSeq(strings.TrimSuffix(name, "."), ".") {
-		if label == "" {
-			continue
-		}
-		q = append(q, byte(len(label)))
-		q = append(q, label...)
-	}
-	q = append(q, 0, 0, 1, 0, 1) // root label + QTYPE A + QCLASS IN
+	q := buildDNSAQuery(name, uint16(time.Now().UnixNano()))
 	// TCP framing: 2-byte big-endian length prefix on both directions.
-	frame := []byte{byte(len(q) >> 8), byte(len(q))}
-	frame = append(frame, q...)
+	frame := make([]byte, 2+len(q))
+	frame[0], frame[1] = byte(len(q)>>8), byte(len(q))
+	copy(frame[2:], q)
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -99,5 +98,5 @@ func DNSQueryTCP(ctx context.Context, addr, name string, timeout time.Duration) 
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return false
 	}
-	return buf[0] == q[0] && buf[1] == q[1] && buf[2]&0x80 != 0
+	return validDNSReply(buf, q)
 }

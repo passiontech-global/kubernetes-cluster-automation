@@ -20,6 +20,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
@@ -300,20 +301,19 @@ func (n *Deps) MaybeClampNebulaMSS(ctx context.Context,
 // (LastClamp) must only be spent once the rule actually landed —
 // a failed iptables run would otherwise mute retries for a full
 // mtuClampEvery while the blackhole persists.
-func (n *Deps) clampMSSOn(ctx context.Context, dev string) error {
-	args := []string{"-t", "mangle", "-C", "POSTROUTING",
+func iptablesMSSArgs(op, dev string) []string {
+	return []string{"iptables", "-w", "5", "-t", "mangle", op, "POSTROUTING",
 		"-o", dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
 		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}
-	if _, err := n.RunMountCmd(ctx,
-		append([]string{"iptables", "-w", "5"}, args...)); err == nil {
+}
+
+// clampMSSOn installs the TCPMSS --clamp-mss-to-pmtu rule on dev (idempotent via -C).
+func (n *Deps) clampMSSOn(ctx context.Context, dev string) error {
+	if _, err := n.RunMountCmd(ctx, iptablesMSSArgs("-C", dev)); err == nil {
 		// Rule already present — nothing to do.
 		return nil
 	}
-	out, err := n.RunMountCmd(ctx,
-		[]string{"iptables", "-w", "5", "-t", "mangle", "-A",
-			"POSTROUTING", "-o", dev, "-p", "tcp",
-			"--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS", "--clamp-mss-to-pmtu"})
+	out, err := n.RunMountCmd(ctx, iptablesMSSArgs("-A", dev))
 	if err != nil {
 		n.State.AppendLog(fmt.Sprintf(
 			"suspect: nebula-mtu-blackhole MSS clamp failed on %s: %v (%s)",
@@ -325,24 +325,12 @@ func (n *Deps) clampMSSOn(ctx context.Context, dev string) error {
 	return nil
 }
 
-// UnclampMSSOn removes the TCPMSS --clamp-mss-to-pmtu rule one
-// interface carries — the blackhole-recovery half of clampMSSOn.
-// The -C probe keeps it idempotent (a rule never installed, or
-// already removed, is a silent no-op — cilium_wg0 legitimately
-// carries no rule when the invariant is satisfied).
+// UnclampMSSOn removes the TCPMSS --clamp-mss-to-pmtu rule from dev (idempotent via -C).
 func (n *Deps) UnclampMSSOn(ctx context.Context, dev string) {
-	args := []string{"-t", "mangle", "-C", "POSTROUTING",
-		"-o", dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
-		"-j", "TCPMSS", "--clamp-mss-to-pmtu"}
-	if _, err := n.RunMountCmd(ctx,
-		append([]string{"iptables", "-w", "5"}, args...)); err != nil {
+	if _, err := n.RunMountCmd(ctx, iptablesMSSArgs("-C", dev)); err != nil {
 		return // rule absent (or uncheckable) — nothing to remove
 	}
-	if out, err := n.RunMountCmd(ctx,
-		[]string{"iptables", "-w", "5", "-t", "mangle", "-D",
-			"POSTROUTING", "-o", dev, "-p", "tcp",
-			"--tcp-flags", "SYN,RST", "SYN",
-			"-j", "TCPMSS", "--clamp-mss-to-pmtu"}); err != nil {
+	if out, err := n.RunMountCmd(ctx, iptablesMSSArgs("-D", dev)); err != nil {
 		n.State.AppendLog(fmt.Sprintf(
 			"suspect: nebula-mtu-blackhole MSS unclamp failed on %s: %v (%s)",
 			dev, err, n.TrimRunErr(out)))
@@ -352,19 +340,13 @@ func (n *Deps) UnclampMSSOn(ctx context.Context, dev string) {
 	n.State.AppendLog("ACTION: nebula-mtu-blackhole removed the TCP MSS clamp on " + dev)
 }
 
-// SysfsMTU reads the MTU of one interface through the host sysfs
-// (HostRoot-parity with the other proc/sys reads in this package).
+// SysfsMTU reads the MTU of one interface through the host sysfs.
 func (n *Deps) SysfsMTU(dev string) (int, error) {
-	b, err := os.ReadFile(filepath.Join(n.HostRoot(),
-		"sys", "class", "net", dev, "mtu"))
-	if err != nil {
-		return 0, err
+	mtu, ok := procfs.MTUOfIface(filepath.Join(n.HostRoot(), "sys", "class", "net"), dev)
+	if !ok {
+		return 0, fmt.Errorf("sysfs mtu %s: unreadable or invalid", dev)
 	}
-	var mtu int
-	if _, err := fmt.Sscanf(string(b), "%d", &mtu); err != nil {
-		return 0, err
-	}
-	return mtu, nil
+	return int(mtu), nil
 }
 
 // CheckCiliumWGMTUInvariant enforces MTU(cilium_wg0) <= MTU(neb1)-80:

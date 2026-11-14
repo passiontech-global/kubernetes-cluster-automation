@@ -41,18 +41,9 @@ const (
 	// io_uring/aio engines exhaust (EAGAIN masquerading as slow
 	// storage). Path seam vars (not Config fields) so tests can
 	// point them at fixture files without touching config.go.
-	defaultAIONrFile  = "/proc/sys/fs/aio-nr"
-	defaultAIOMaxFile = "/proc/sys/fs/aio-max-nr"
-)
-
-// aio-pressure AIO path seams — package vars overridden per-test
-// (fixtureSeams precedent), never per-node config.
-var (
-	aioNrFile  = defaultAIONrFile
-	aioMaxFile = defaultAIOMaxFile
-	// maxUserNSFile is the user.max_user_namespaces read seam —
-	// same fixture-override contract as the aio pair.
-	maxUserNSFile = "/proc/sys/user/max_user_namespaces"
+	defaultAIONrFile     = "/proc/sys/fs/aio-nr"
+	defaultAIOMaxFile    = "/proc/sys/fs/aio-max-nr"
+	defaultMaxUserNSFile = "/proc/sys/user/max_user_namespaces"
 )
 
 const (
@@ -254,8 +245,8 @@ func (c *Collector) collectFileFD(ch chan<- prometheus.Metric) {
 // (aio-pressure). Each gauge emits only when its own file parses; the
 // used ratio emits 0 when the max is 0 rather than divide by zero.
 func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
-	nr, nrOK := fsx.ReadUintFile(aioNrFile)
-	mx, mxOK := fsx.ReadUintFile(aioMaxFile)
+	nr, nrOK := fsx.ReadUintFile(c.cfg.aioNrFile)
+	mx, mxOK := fsx.ReadUintFile(c.cfg.aioMaxFile)
 	// kernel-resource-table-tuning — the runtime aio-max-nr bump
 	// WRITE lives in reconcileHostWrites (host_writes.go) on the
 	// 30s latch tick; Collect stays read-only.
@@ -281,7 +272,7 @@ func (c *Collector) collectAIO(ch chan<- prometheus.Metric) {
 // userns creation ceiling hostconfig converges to 65536 (kernel-resource-table-tuning).
 // Absent file (kernel without USER_NS) emits nothing.
 func (c *Collector) collectUserNS(ch chan<- prometheus.Metric) {
-	v, ok := fsx.ReadUintFile(maxUserNSFile)
+	v, ok := fsx.ReadUintFile(c.cfg.maxUserNSFile)
 	if !ok {
 		return
 	}

@@ -22,7 +22,6 @@ func (p *Prober) reapplyDrains(ctx context.Context, stale map[string]bool,
 	statusByName map[string]backend, svnameByAddr map[string]string,
 	fresh int) {
 
-	log := logger()
 	for _, name := range slices.Sorted(maps.Keys(p.states)) {
 		st := p.states[name]
 		if !st.drained {
@@ -44,17 +43,21 @@ func (p *Prober) reapplyDrains(ctx context.Context, stale map[string]bool,
 			continue
 		}
 		if p.eff.mode == ModeEnforce {
-			if err := p.haproxyServer(ctx, "disable",
-				svname, !inPrimary); err != nil {
-				log.Error("re-apply disable failed",
-					"backend", name, "server", svname, "error", err)
-			} else {
-				log.Info("ACTION: re-applied disable — HAProxy forgot drained server",
-					"backend", name)
-				p.actions.WithLabelValues(name, "disable").Inc()
-			}
+			p.reapplyDisable(ctx, name, svname, inPrimary)
 		}
 	}
+}
+
+func (p *Prober) reapplyDisable(ctx context.Context, name, svname string, inPrimary bool) {
+	log := logger()
+	if err := p.haproxyServer(ctx, "disable", svname, !inPrimary); err != nil {
+		log.Error("re-apply disable failed",
+			"backend", name, "server", svname, "error", err)
+		return
+	}
+	log.Info("ACTION: re-applied disable — HAProxy forgot drained server",
+		"backend", name)
+	p.actions.WithLabelValues(name, "disable").Inc()
 }
 
 // drainStale runs the drain phase over the stale set in name
@@ -91,15 +94,7 @@ func (p *Prober) drainStale(ctx context.Context, stale map[string]bool,
 			// protection as the drain phase below.
 			if p.eff.mode == ModeEnforce && b.discovered && b.up() &&
 				*fresh >= 1 {
-				if err := p.haproxyServer(ctx, "disable",
-					svname, !inPrimary); err != nil {
-					log.Error("re-apply disable failed",
-						"backend", name, "server", svname, "error", err)
-				} else {
-					log.Info("ACTION: re-applied disable — HAProxy forgot drained server",
-						"backend", name)
-					p.actions.WithLabelValues(name, "disable").Inc()
-				}
+				p.reapplyDisable(ctx, name, svname, inPrimary)
 			}
 			continue
 		}

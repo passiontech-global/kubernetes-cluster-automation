@@ -81,35 +81,25 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	unauth := false
 	// The bearer token is re-read every cycle — the file is small
 	// and bound SA tokens rotate.
-	bearer := kubeletBearer(c.d)
-	for i := 0; i < wdeps.ProbeAttempts; i++ {
-		code, err := c.d.Cfg.Seams.Probe.ProbeHTTPStatus(ctx,
-			c.d.Cfg.Kubelet.SyncloopURL, bearer, wdeps.ProbeTimeout)
-		if err == nil {
+	lastErr = c.d.ProbeHTTPStatusSeries(ctx, c.d.Cfg.Kubelet.SyncloopURL,
+		kubeletBearer(c.d), wdeps.ProbeAttempts, wdeps.ProbeTimeout,
+		c.d.Cfg.ProbeGap, func(code int) (bool, error) {
 			switch {
 			case code == http.StatusOK:
 				alive = true
+				return true, nil
 			case code == http.StatusUnauthorized || code == http.StatusForbidden:
 				// Kubelet answered but won't divulge the verdict —
 				// retrying the same credentials won't help.
 				unauth = true
+				return true, nil
 			default:
-				lastErr = fmt.Errorf("syncloop status %d", code)
+				return false, fmt.Errorf("syncloop status %d", code)
 			}
-		} else {
-			lastErr = err
-		}
-		if alive || unauth {
-			break
-		}
-		if i+1 < wdeps.ProbeAttempts {
-			select {
-			case <-ctx.Done():
-				c.d.CycleResult(wdeps.CheckSyncloop, "abort")
-				return
-			case <-time.After(c.d.Cfg.ProbeGap):
-			}
-		}
+		})
+	if !alive && !unauth && ctx.Err() != nil {
+		c.d.CycleResult(wdeps.CheckSyncloop, "abort")
+		return
 	}
 	if unauth {
 		// The verdict is unknowable without working credentials —

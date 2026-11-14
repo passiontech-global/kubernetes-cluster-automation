@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/concourse"
 )
 
 // Sweep runs one prune pass over every pvc-*/shared-cache under
@@ -38,7 +40,7 @@ func (p *Pruner) Sweep(ctx context.Context, openebsRoot string) error {
 			continue
 		}
 		p.pruneSharedCache(ctx,
-			filepath.Join(openebsRoot, e.Name(), "shared-cache"))
+			filepath.Join(openebsRoot, e.Name(), concourse.SharedCacheName))
 	}
 	p.cycles.WithLabelValues("ok").Inc()
 	return nil

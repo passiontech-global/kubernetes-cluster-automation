@@ -39,21 +39,6 @@ func New(root string) FS {
 // (the subsystems' killFn seams plug in directly).
 type KillFn func(pid int, sig syscall.Signal) error
 
-// isPIDName reports whether a /proc entry name is a numeric pid —
-// the plain digit scan replaces the old ^[0-9]+$ regex on the hot
-// per-entry path (every dir entry of every /proc sweep).
-func isPIDName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := range name {
-		if name[i] < '0' || name[i] > '9' {
-			return false
-		}
-	}
-	return true
-}
-
 // File joins <root>/<pid>/<elems...> — /proc/<pid>/stat and friends.
 func (f FS) File(pid int, elems ...string) string {
 	parts := append([]string{f.root, strconv.Itoa(pid)}, elems...)
@@ -72,7 +57,7 @@ func (f FS) PIDs() ([]int, error) {
 	}
 	var pids []int
 	for _, e := range entries {
-		if !e.IsDir() || !isPIDName(e.Name()) {
+		if !e.IsDir() || !IsDigits(e.Name()) {
 			continue
 		}
 		if pid, err := strconv.Atoi(e.Name()); err == nil {
@@ -213,16 +198,11 @@ func (f FS) PIDAgeSeconds(pid int, clkTck float64) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	s := string(data)
-	i := strings.LastIndexByte(s, ')')
-	if i < 0 {
-		return 0, errors.New("bad stat")
-	}
-	fields := strings.Fields(s[i+1:])
-	if len(fields) < 20 {
+	st, ok := parseStat(string(data))
+	if !ok || len(st.Fields) < 20 {
 		return 0, errors.New("short stat")
 	}
-	start, err := strconv.ParseFloat(fields[19], 64) // field 22 overall
+	start, err := strconv.ParseFloat(st.Fields[19], 64) // field 22 overall
 	if err != nil {
 		return 0, err
 	}

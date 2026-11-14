@@ -480,24 +480,21 @@ func TestMaxStepRevisionsEnv(t *testing.T) {
 	}
 
 	t.Setenv(envnames.EnvKinedbGuardMaxStepRevisions, "250000")
-	var set Config
-	if err := set.ApplyDefaults(); err != nil {
+	// ApplyDefaults must stay pure (ConfigFromEnv owns the env contract).
+	var direct Config
+	if err := direct.ApplyDefaults(); err != nil {
 		t.Fatal(err)
 	}
-	if set.MaxStepRevisions != 250000 {
-		t.Fatalf("set env: MaxStepRevisions=%d want 250000", set.MaxStepRevisions)
+	if direct.MaxStepRevisions != 0 {
+		t.Fatalf("ApplyDefaults read env unexpectedly: MaxStepRevisions=%d want 0", direct.MaxStepRevisions)
 	}
 	if viaEnv := ConfigFromEnv(EnvDeps{}).MaxStepRevisions; viaEnv != 250000 {
 		t.Fatalf("ConfigFromEnv: MaxStepRevisions=%d want 250000", viaEnv)
 	}
 
 	t.Setenv(envnames.EnvKinedbGuardMaxStepRevisions, "garbage")
-	var junk Config
-	if err := junk.ApplyDefaults(); err != nil {
-		t.Fatal(err)
-	}
-	if junk.MaxStepRevisions != 0 {
-		t.Fatalf("garbage env: MaxStepRevisions=%d want 0 (disabled)", junk.MaxStepRevisions)
+	if viaEnv := ConfigFromEnv(EnvDeps{}).MaxStepRevisions; viaEnv != 0 {
+		t.Fatalf("garbage env: MaxStepRevisions=%d want 0 (disabled)", viaEnv)
 	}
 }
 

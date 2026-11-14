@@ -17,6 +17,7 @@ type RestartGateSpec struct {
 	NeedQuorum    bool
 	HoldPrefix    string
 	Unit          string
+	Mode          string
 	ActionLine    string
 	DryRunLine    string
 	ActionLabel   string
@@ -30,6 +31,10 @@ type RestartGateSpec struct {
 // ("quorum_hold", "maint_hold", "cooldown", or "ok") and whether a restart
 // or dry-run action ran.
 func (d *Deps) RestartWithGates(ctx context.Context, s RestartGateSpec) (string, bool) {
+	mode := s.Mode
+	if mode == "" {
+		mode = d.Cfg.Sig13.Mode
+	}
 	if s.NeedQuorum && !d.ControllerQuorumReady(ctx) {
 		d.State.SuspectLog(s.State, fmt.Sprintf(
 			"suspect: %s but default/kubernetes reports <2 ready endpoints — holding restart",
@@ -48,7 +53,7 @@ func (d *Deps) RestartWithGates(ctx context.Context, s RestartGateSpec) (string,
 			s.HoldPrefix, int(s.Cooldown.Minutes())), d.Cfg.SuspectLogCadence)
 		return "cooldown", false
 	}
-	switch d.Cfg.Sig13.Mode {
+	switch mode {
 	case ModeEnforce:
 		if !d.State.RateTrySpend(s.Budget, s.Cooldown) {
 			d.State.SuspectLog(s.State, fmt.Sprintf(

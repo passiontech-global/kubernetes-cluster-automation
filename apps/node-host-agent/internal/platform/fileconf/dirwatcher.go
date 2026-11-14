@@ -48,8 +48,9 @@ type DirWatcher struct {
 	// stats caches the last scan's per-file (size, mtime, hash);
 	// fingerprint reads+writes it under fpMu — Changed runs a
 	// fingerprint OUTSIDE w.mu by design, so scans may overlap.
-	fpMu  sync.Mutex
-	stats map[string]dirWatchFile
+	fpMu     sync.Mutex
+	stats    map[string]dirWatchFile
+	readFile func(string) ([]byte, error) // optional test seam; nil -> os.ReadFile
 }
 
 // dirWatchFile is one file's cached fingerprint inputs.
@@ -59,9 +60,12 @@ type dirWatchFile struct {
 	sum     []byte
 }
 
-// readFile is the content-read seam — tests count reads to prove the
-// stat-unchanged fast path skips hashing.
-var readFile = os.ReadFile
+func (w *DirWatcher) readContent(path string) ([]byte, error) {
+	if w.readFile != nil {
+		return w.readFile(path)
+	}
+	return os.ReadFile(path)
+}
 
 // log resolves the per-consumer logger: the injected one when set,
 // else the fileconf default.
@@ -130,7 +134,7 @@ func (w *DirWatcher) fingerprint() string {
 			// file's bytes are not re-read this scan.
 			sum = c.sum
 		} else {
-			b, err := readFile(f)
+			b, err := w.readContent(f)
 			if err != nil {
 				w.log().Debug("hostconfig: watcher cannot read file — excluded from fingerprint",
 					"file", f, "error", err)

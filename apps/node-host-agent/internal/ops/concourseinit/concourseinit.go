@@ -26,6 +26,8 @@
 // wrapper is a copy of this same binary) → RuncWrapper.
 package concourseinit
 
+import "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/concourse"
+
 const (
 	// DefaultWorkDir is the concourse worker work dir the init wipes —
 	// the chart mounts the PVC here.
@@ -40,22 +42,10 @@ const (
 	// DefaultRuncReal is where the wrapper execs the real binary.
 	DefaultRuncReal = DefaultRuncDir + "/runc.real"
 
-	// sharedCacheName is the one top-level work-dir entry the wipe
-	// never removes (the script's `[ "${d##*/}" = "shared-cache" ]`).
-	sharedCacheName = "shared-cache"
-	// sharedCacheSource is the bind-mount source injected into task
-	// containers — the path INSIDE the worker pod, matching the
-	// script's injected JSON verbatim.
+	sharedCacheName   = concourse.SharedCacheName
 	sharedCacheSource = DefaultWorkDir + "/" + sharedCacheName
-
-	// cacheOwner is the host uid+gid that container root (0) of
-	// unprivileged task containers maps to through the userns
-	// (uidMappings hostID:4294967294). The scaffold is chowned to it
-	// so task containers can write the shared cache.
-	cacheOwner = 4294967294
-	// cachePerm is forced on shared-cache + its first level — many
-	// jobs write through the /shared-cache bind mount.
-	cachePerm = 0o777
+	cacheOwner        = concourse.CacheOwner
+	cachePerm         = concourse.CachePerm
 )
 
 // PersistentCacheDirs is the keep-list under shared-cache — the 14

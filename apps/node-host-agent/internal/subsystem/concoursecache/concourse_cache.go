@@ -40,6 +40,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/concourse"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -58,8 +59,8 @@ const DefaultInterval = 15 * time.Minute
 
 // prune.sh constants. Size thresholds were KiB (du -sk); here bytes.
 const (
-	ccOwner       = 4294967294 // uid+gid unprivileged task containers run as
-	ccPerm        = 0o777
+	ccOwner       = concourse.CacheOwner
+	ccPerm        = concourse.CachePerm
 	ccGoBuildHigh = 15 << 30 // 15728640 KiB
 	ccGoBuildLow  = 8 << 30  //  8388608 KiB
 	ccBuildHigh   = 4 << 30  //  4194304 KiB

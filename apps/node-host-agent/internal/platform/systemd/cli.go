@@ -17,45 +17,88 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
+func parseActiveStateWord(state string) (active, known bool) {
+	switch state {
+	case "active":
+		return true, true
+	case "reloading", "activating", "deactivating", "inactive",
+		"failed", "maintenance", "unknown":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func parseEnabledStateWord(state string) (enabled, known bool) {
+	switch state {
+	case "enabled", "enabled-runtime", "static", "indirect", "alias",
+		"generated", "transient", "linked", "linked-runtime":
+		return true, true
+	case "disabled", "masked", "masked-runtime", "bad":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func parseLoadStateWord(unit, state string) bool {
+	switch state {
+	case "loaded", "merged":
+		return true
+	case "stub", "not-found", "bad-setting", "error", "masked", "":
+		return false
+	default:
+		logger().Warn("systemd: unexpected LoadState word — "+
+			"treating unit as absent this probe",
+			"unit", unit, "loadstate", state)
+		return false
+	}
+}
+
+func activeAgeFromMonoUS(unit string, monoUS uint64, procUptimeFile string) (time.Duration, error) {
+	up, err := procfs.UptimeSeconds(procUptimeFile)
+	if err != nil {
+		return 0, fmt.Errorf("%s: read %s: %w", unit, procUptimeFile, err)
+	}
+	// Same clock family (CLOCK_MONOTONIC vs boot time) — the µs
+	// rounding can push the delta a hair below zero on a unit that
+	// just started.
+	if age := up*1e6 - float64(monoUS); age > 0 {
+		return time.Duration(age) * time.Microsecond, nil
+	}
+	return 0, nil
+}
+
 // cliActive is the systemctl is-active fallback for Active — same
 // word vocabulary, same "output word vs probe failure" distinction.
 func (c *Client) cliActive(ctx context.Context, unit string) (bool, error) {
 	out, err := c.systemctl(ctx, "is-active", unit)
-	switch strings.TrimSpace(out) {
-	case "active":
-		return true, nil
-	case "reloading", "activating", "deactivating", "inactive",
-		"failed", "maintenance", "unknown":
-		// A real ActiveState — the probe answered "not active".
-		return false, nil
+	state := strings.TrimSpace(out)
+	if active, ok := parseActiveStateWord(state); ok {
+		return active, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("systemctl is-active %s: %w (%s)",
-			unit, err, strings.TrimSpace(out))
+			unit, err, state)
 	}
 	return false, fmt.Errorf("systemctl is-active %s: unexpected output %q",
-		unit, strings.TrimSpace(out))
+		unit, state)
 }
 
 // cliEnabled is the systemctl is-enabled fallback for Enabled —
 // the rc==0 "installed" vocabulary mapped onto the stdout word.
 func (c *Client) cliEnabled(ctx context.Context, unit string) (bool, error) {
 	out, err := c.systemctl(ctx, "is-enabled", unit)
-	switch strings.TrimSpace(out) {
-	case "enabled", "enabled-runtime", "static", "indirect", "alias",
-		"generated", "transient", "linked", "linked-runtime":
-		// The whole "installed" vocabulary the rc==0 test accepted.
-		return true, nil
-	case "disabled", "masked", "masked-runtime", "bad":
-		// is-enabled answered — the unit file exists but is off.
-		return false, nil
+	state := strings.TrimSpace(out)
+	if enabled, ok := parseEnabledStateWord(state); ok {
+		return enabled, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("systemctl is-enabled %s: %w (%s)",
-			unit, err, strings.TrimSpace(out))
+			unit, err, state)
 	}
 	return false, fmt.Errorf("systemctl is-enabled %s: unexpected output %q",
-		unit, strings.TrimSpace(out))
+		unit, state)
 }
 
 // cliExists is the systemctl show -p LoadState fallback for Exists —
@@ -66,17 +109,7 @@ func (c *Client) cliExists(ctx context.Context, unit string) (bool, error) {
 		return false, fmt.Errorf("systemctl show -p LoadState --value %s: %w (%s)",
 			unit, err, strings.TrimSpace(out))
 	}
-	switch state := strings.TrimSpace(out); state {
-	case "loaded", "merged":
-		return true, nil
-	case "stub", "not-found", "bad-setting", "error", "masked", "":
-		return false, nil
-	default:
-		logger().Warn("systemd: unexpected LoadState word — "+
-			"treating unit as absent this probe",
-			"unit", unit, "loadstate", state)
-		return false, nil
-	}
+	return parseLoadStateWord(unit, strings.TrimSpace(out)), nil
 }
 
 // cliActiveAge is the systemctl show -p
@@ -99,17 +132,7 @@ func (c *Client) cliActiveAge(ctx context.Context, unit string) (time.Duration, 
 		return 0, fmt.Errorf("%s: unusable ActiveEnterTimestampMonotonic %q (not active)",
 			unit, ts)
 	}
-	up, err := procfs.UptimeSeconds(c.procUptimeFile)
-	if err != nil {
-		return 0, fmt.Errorf("%s: read %s: %w", unit, c.procUptimeFile, err)
-	}
-	// Same clock family (CLOCK_MONOTONIC vs boot time) — the µs
-	// rounding can push the delta a hair below zero on a unit that
-	// just started.
-	if age := up*1e6 - float64(monoUS); age > 0 {
-		return time.Duration(age) * time.Microsecond, nil
-	}
-	return 0, nil
+	return activeAgeFromMonoUS(unit, uint64(monoUS), c.procUptimeFile)
 }
 
 // cliListUnits is the systemctl list-units --all --no-legend --plain

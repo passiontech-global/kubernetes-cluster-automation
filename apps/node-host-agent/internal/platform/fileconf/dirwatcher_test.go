@@ -150,12 +150,10 @@ func TestDirWatcherFingerprintFastPath(t *testing.T) {
 	fp1 := w.fingerprint() // seeds the stat cache
 
 	reads := 0
-	prev := readFile
-	readFile = func(name string) ([]byte, error) {
+	w.readFile = func(name string) ([]byte, error) {
 		reads++
-		return prev(name)
+		return os.ReadFile(name)
 	}
-	defer func() { readFile = prev }()
 
 	if fp2 := w.fingerprint(); fp2 != fp1 {
 		t.Fatal("fingerprint moved without any file change")

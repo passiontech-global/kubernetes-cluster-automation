@@ -86,7 +86,10 @@ func resolveProberInputs(wd *watchdogconf.Config,
 // GuardReloader on the same conf path — a conf rendered by
 // hostconfig after agent start still lands next cycle.
 func ConfigFromEnv(d EnvDeps) Config {
-	guardPath := guardConfPath()
+	var guardPath string
+	envx.Apply([]envx.Knob{
+		envx.StringKnob(envnames.EnvAPIGuardConf, &guardPath, defaultGuardConfPath),
+	})
 	guardConf, gerr := LoadGuardConf(guardPath)
 	if gerr != nil {
 		logger().Error("api-backend-guard.conf parse failed — running on defaults",
@@ -95,6 +98,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 	}
 	pi := resolveProberInputs(d.Watchdog, guardConf)
 	cfg := Config{
+		GuardConfPath:     guardPath,
 		SocketPath:        pi.socket,
 		BackendName:       pi.backend,
 		CompanionBackends: pi.companions,

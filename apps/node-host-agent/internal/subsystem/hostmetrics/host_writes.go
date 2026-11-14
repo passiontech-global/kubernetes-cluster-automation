@@ -104,8 +104,8 @@ func (c *Collector) maybeRestoreClocksource() {
 // writes, so it goes through a plain truncating write — the same
 // semantics sysctl expects.
 func (c *Collector) maybeBumpAIOMax() {
-	nr, nrOK := fsx.ReadUintFile(aioNrFile)
-	mx, mxOK := fsx.ReadUintFile(aioMaxFile)
+	nr, nrOK := fsx.ReadUintFile(c.cfg.aioNrFile)
+	mx, mxOK := fsx.ReadUintFile(c.cfg.aioMaxFile)
 	if !nrOK || !mxOK || mx == 0 || mx >= aioMaxTarget ||
 		float64(nr)/float64(mx) <= aioUsedRatioBump {
 		return
@@ -114,7 +114,7 @@ func (c *Collector) maybeBumpAIOMax() {
 	if bumped > aioMaxTarget {
 		bumped = aioMaxTarget
 	}
-	if c.attemptHostWrite(aioMaxFile, strconv.FormatUint(bumped, 10)) {
+	if c.attemptHostWrite(c.cfg.aioMaxFile, strconv.FormatUint(bumped, 10)) {
 		logger().Warn("hostmetrics: aio-max-nr bumped",
 			"from", mx, "to", bumped)
 	}

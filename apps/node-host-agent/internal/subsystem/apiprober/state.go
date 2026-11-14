@@ -3,6 +3,7 @@ package apiprober
 import (
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -134,7 +135,7 @@ func dashedIP(addr string) string {
 // "0\n"-ish value every 30s (the collect_nebula.go cert-days
 // pattern).
 func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
-	f := dir + "/apibe-gap-" + dashedIP(b.Addr)
+	f := filepath.Join(dir, "apibe-gap-"+dashedIP(b.Addr))
 	content := strconv.FormatInt(gap, 10) + "\n"
 	if cur, err := os.ReadFile(f); err == nil && string(cur) == content {
 		return
@@ -154,8 +155,8 @@ func (p *Prober) writeGapFile(dir string, b backend, gap int64) {
 // streak still has a latch to recover from (vs the tmp+rename+fsync
 // a counter-file rewrite costs every cycle it keeps counting).
 func (p *Prober) staleLatched(dir string, b backend) bool {
-	_, err := os.Stat(dir + "/" + latchdefs.LatchFilePrefix +
-		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr))
+	_, err := os.Stat(filepath.Join(dir, latchdefs.LatchFilePrefix+
+		latchdefs.LatchAPIServerBackendStalePrefix+dashedIP(b.Addr)))
 	return err == nil
 }
 
@@ -166,8 +167,8 @@ func (p *Prober) staleLatched(dir string, b backend) bool {
 // must not lose its latch mid-episode (the prober has no clock seam;
 // the same time.Now the epoch content carries keys the touch).
 func (p *Prober) latchStale(dir string, b backend) {
-	f := dir + "/" + latchdefs.LatchFilePrefix +
-		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
+	f := filepath.Join(dir, latchdefs.LatchFilePrefix+
+		latchdefs.LatchAPIServerBackendStalePrefix+dashedIP(b.Addr))
 	if fi, err := os.Stat(f); err == nil {
 		now := p.cfg.Clock.Now()
 		// Touch only once the mtime ages past LatchTouchMinInterval —
@@ -191,8 +192,8 @@ func (p *Prober) latchStale(dir string, b backend) {
 // only on a fully-fresh cycle (hysteresis: inconclusive cycles keep
 // whatever exists). not-exist is ignored.
 func (p *Prober) clearStale(dir string, b backend) {
-	f := dir + "/" + latchdefs.LatchFilePrefix +
-		latchdefs.LatchAPIServerBackendStalePrefix + dashedIP(b.Addr)
+	f := filepath.Join(dir, latchdefs.LatchFilePrefix+
+		latchdefs.LatchAPIServerBackendStalePrefix+dashedIP(b.Addr))
 	if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
 		logger().Warn("watchdog stale latch remove failed",
 			"file", f, "backend", b.Name, "error", err,
@@ -233,7 +234,7 @@ func (p *Prober) pruneWatchdogFiles(dir string, backends []backend) {
 			continue
 		}
 		if !keep[suffix] {
-			if err := os.Remove(dir + "/" + name); err != nil {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil {
 				logger().Warn("watchdog stale file prune failed",
 					"file", name, "dir", dir, "error", err,
 				)
@@ -294,11 +295,11 @@ func (p *Prober) loadState(dir, name string, st *backendState) {
 		return
 	}
 	key := stateFileKey(name)
-	st.qfail = stateCounter(dir + "/apibe-qfail-" + key)
-	st.frozen = stateCounter(dir + "/apibe-frozen-" + key)
-	st.fail = stateCounter(dir + "/apibe-fail-" + key)
-	st.ok = stateCounter(dir + "/apibe-ok-" + key)
-	if v, ok := readStateInt(dir + "/apibe-prevcache-" + key); ok {
+	st.qfail = stateCounter(filepath.Join(dir, "apibe-qfail-"+key))
+	st.frozen = stateCounter(filepath.Join(dir, "apibe-frozen-"+key))
+	st.fail = stateCounter(filepath.Join(dir, "apibe-fail-"+key))
+	st.ok = stateCounter(filepath.Join(dir, "apibe-ok-"+key))
+	if v, ok := readStateInt(filepath.Join(dir, "apibe-prevcache-"+key)); ok {
 		// Without the persisted baseline the first post-restart
 		// cycle runs hasPrev=false — the frozen else-branch would
 		// zero a streak that was mid-accumulation on disk.
@@ -306,7 +307,7 @@ func (p *Prober) loadState(dir, name string, st *backendState) {
 	}
 	// The drained marker is presence-only — content (the epoch the
 	// drain latched) is informational.
-	if _, err := os.Stat(dir + "/apibe-drained-" + key); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, "apibe-drained-"+key)); err == nil {
 		st.drained = true
 	}
 	st.loaded = true
@@ -321,11 +322,11 @@ func (p *Prober) loadState(dir, name string, st *backendState) {
 // a failure is Warn'd, never fatal.
 func (p *Prober) saveState(dir, name string, st *backendState) {
 	key := stateFileKey(name)
-	p.writeStateCounter(dir+"/apibe-qfail-"+key, int64(st.qfail))
-	p.writeStateCounter(dir+"/apibe-frozen-"+key, int64(st.frozen))
-	p.writeStateCounter(dir+"/apibe-fail-"+key, int64(st.fail))
-	p.writeStateCounter(dir+"/apibe-ok-"+key, int64(st.ok))
-	prev := dir + "/apibe-prevcache-" + key
+	p.writeStateCounter(filepath.Join(dir, "apibe-qfail-"+key), int64(st.qfail))
+	p.writeStateCounter(filepath.Join(dir, "apibe-frozen-"+key), int64(st.frozen))
+	p.writeStateCounter(filepath.Join(dir, "apibe-fail-"+key), int64(st.fail))
+	p.writeStateCounter(filepath.Join(dir, "apibe-ok-"+key), int64(st.ok))
+	prev := filepath.Join(dir, "apibe-prevcache-"+key)
 	// The baseline only earns a restart witness while a verdict is
 	// in flight — it exists to resume a frozen/gap/fail streak or a
 	// drain recovery. A fully-healthy backend's rv_cache advances
@@ -337,7 +338,7 @@ func (p *Prober) saveState(dir, name string, st *backendState) {
 	} else {
 		p.removeStateFile(prev)
 	}
-	drained := dir + "/apibe-drained-" + key
+	drained := filepath.Join(dir, "apibe-drained-"+key)
 	if st.drained {
 		if _, err := os.Stat(drained); err != nil {
 			p.writeStateFile(drained,
@@ -363,7 +364,7 @@ func (p *Prober) flushStates(dir string) {
 func (p *Prober) removeStateFiles(dir, name string) {
 	key := stateFileKey(name)
 	for _, prefix := range apibeStatePrefixes {
-		p.removeStateFile(dir + "/" + prefix + key)
+		p.removeStateFile(filepath.Join(dir, prefix+key))
 	}
 }
 

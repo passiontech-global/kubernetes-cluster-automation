@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 )
 
@@ -126,69 +128,15 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		}
 	}()
 	for {
-		began := time.Now()
-		// Fresh registry per attempt — the old one dies with the
-		// run that exited, stale stamps and all.
-		sb.live.Store(cycle.NewLiveness())
-		up.Set(1)
-		sb.active.Store(true)
-		// Run-entry stamp doubles as the startup grace: the first
-		// cycle gets the full stale window to complete before
-		// /healthz can call the subsystem wedged. It lands on the
-		// shared fallback beat — Runner loops stamp their own
-		// beats from inside Run.
-		// Each run gets its OWN cancelable context: sub.Run spawns
-		// child goroutines (probers, guards, feeders) that must die
-		// with the run — a panic-recovered restart that reused the
-		// parent ctx would orphan every child of the dead run AND
-		// keep heartbeating into the liveness registry entry the
-		// next attempt already replaced.
-		runCtx, runCancel := context.WithCancel(ctx)
-		lctx := cycle.WithLiveness(runCtx, sb.live.Load())
-		cycle.Heartbeat(lctx)
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			defer func() {
-				if r := recover(); r != nil {
-					logger().Error("subsystem panicked — restarting",
-						"subsystem", name, "panic", r)
+		began, stopped := runSubsystemAttempt(ctx, name, sub, sb, up,
+			superviseHealthyAfter(backoff), func() {
+				if atMax {
+					a.maxBackoffSubs.Add(-1)
+					atMax = false
 				}
-			}()
-			// Registered last so it runs FIRST on exit — the run's
-			// children are cancelled before done closes and the
-			// supervisor starts the next attempt.
-			defer runCancel()
-			sub.Run(lctx)
-		}()
-		// Mid-run healthy watch: a run that stays up past
-		// superviseHealthyAfter(backoff) proves the crash-loop is
-		// over — clear the /readyz degraded flag and reset the
-		// ladder NOW. Without this a subsystem that stabilised
-		// after reaching the 5m cap kept maxBackoffSubs elevated
-		// until its next exit — for a permanently healthy run
-		// that exit never comes, so /readyz sat at 503 forever.
-		healthy := time.NewTimer(superviseHealthyAfter(backoff))
-		select {
-		case <-done:
-			healthy.Stop()
-		case <-ctx.Done():
-			healthy.Stop()
-			<-done
-			up.Set(0)
-			sb.active.Store(false)
-			return
-		case <-healthy.C:
-			if atMax {
-				a.maxBackoffSubs.Add(-1)
-				atMax = false
-			}
-			backoff = a.backoffInitial
-			<-done
-		}
-		up.Set(0)
-		sb.active.Store(false)
-		if ctx.Err() != nil {
+				backoff = a.backoffInitial
+			})
+		if stopped {
 			return
 		}
 		restarts.Inc()
@@ -213,16 +161,7 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 		// Run returned while ctx is live (panic recovered, or
 		// a silent early return) — restart after backoff
 		// instead of letting the subsystem die invisibly.
-		// Jitter (±15%) desynchronizes subsystems sharing a
-		// restart cadence — without it every crash-looping
-		// subsystem restarts in lockstep at 5s and again at
-		// the same multiple up the exponential ladder, piling
-		// all the restart log lines and work into one burst. The
-		// jitter is computed in float BEFORE the Duration
-		// conversion — time.Duration(rand.Float64()*2-1)
-		// truncates [-1,1) to 0, which would null the jitter
-		// term entirely.
-		wait := backoff + time.Duration((rand.Float64()*2-1)*float64(backoff*3/20))
+		wait := jitteredBackoff(backoff)
 		logger().Error("subsystem exited unexpectedly — restarting",
 			"subsystem", name, "backoff", backoff, "wait", wait)
 		timer = time.NewTimer(wait)
@@ -235,4 +174,69 @@ func (a *Agent) superviseSubsystem(ctx context.Context, sub Subsystem) {
 			backoff = superviseBackoffMax
 		}
 	}
+}
+
+// runSubsystemAttempt launches one panic-recovered sub.Run attempt with a fresh
+// per-run cancel context and liveness registry, returning true when ctx stopped
+// it (so the supervisor should exit rather than restart).
+func runSubsystemAttempt(
+	ctx context.Context,
+	name string,
+	sub Subsystem,
+	sb *subBeat,
+	up prometheus.Gauge,
+	healthyAfter time.Duration,
+	onHealthy func(),
+) (began time.Time, stopped bool) {
+	began = time.Now()
+	// Fresh registry per attempt — the old one dies with the run that exited,
+	// stale stamps and all.
+	sb.live.Store(cycle.NewLiveness())
+	up.Set(1)
+	sb.active.Store(true)
+	// Each run gets its own cancelable context: sub.Run spawns child goroutines
+	// (probers, guards, feeders) that must die with the run — a panic-recovered
+	// restart reusing parent ctx would orphan children and keep heartbeating.
+	runCtx, runCancel := context.WithCancel(ctx)
+	lctx := cycle.WithLiveness(runCtx, sb.live.Load())
+	cycle.Heartbeat(lctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				logger().Error("subsystem panicked — restarting",
+					"subsystem", name, "panic", r)
+			}
+		}()
+		// Registered last so it runs FIRST on exit — children cancel before
+		// done closes and the supervisor starts the next attempt.
+		defer runCancel()
+		sub.Run(lctx)
+	}()
+	// Mid-run healthy watch: outliving healthyAfter proves the crash-loop ended
+	// — clear /readyz degraded state now rather than waiting for the next exit.
+	healthy := time.NewTimer(healthyAfter)
+	select {
+	case <-done:
+		healthy.Stop()
+	case <-ctx.Done():
+		healthy.Stop()
+		<-done
+		up.Set(0)
+		sb.active.Store(false)
+		return began, true
+	case <-healthy.C:
+		onHealthy()
+		<-done
+	}
+	up.Set(0)
+	sb.active.Store(false)
+	return began, ctx.Err() != nil
+}
+
+// jitteredBackoff adds ±15% jitter in float before converting to Duration so
+// crash-looping subsystems sharing a cadence desynchronize.
+func jitteredBackoff(backoff time.Duration) time.Duration {
+	return backoff + time.Duration((rand.Float64()*2-1)*float64(backoff*3/20))
 }

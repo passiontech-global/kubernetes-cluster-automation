@@ -23,15 +23,15 @@ func (quietRunner) Run(ctx context.Context, name string, args ...string) (string
 	return "", nil
 }
 
-// stubHost points the production seams at a tempdir host root and a
-// never-failing runner so Cmd runs a scripted converge instead of
+// testOpts returns Options pointing at a tempdir host root and a
+// never-failing runner so CmdWith runs a scripted converge instead of
 // exec'ing real host commands.
-func stubHost(t *testing.T) {
+func testOpts(t *testing.T) Options {
 	t.Helper()
-	oldRoot, oldRunner := HostRoot, RunnerFactory
-	t.Cleanup(func() { HostRoot, RunnerFactory = oldRoot, oldRunner })
-	HostRoot = t.TempDir()
-	RunnerFactory = func() hostconfig.Runner { return quietRunner{} }
+	return Options{
+		HostRoot: t.TempDir(),
+		Runner:   func() hostconfig.Runner { return quietRunner{} },
+	}
 }
 
 func TestCmdArgParsing(t *testing.T) {
@@ -39,33 +39,31 @@ func TestCmdArgParsing(t *testing.T) {
 		{"--bogus"},
 		{"--vars-dir"}, // value flag missing its argument
 	} {
-		if code := Cmd(context.Background(), args); code != 2 {
-			t.Fatalf("Cmd(%v)=%d want 2", args, code)
+		if code := CmdWith(context.Background(), args, testOpts(t)); code != 2 {
+			t.Fatalf("CmdWith(%v)=%d want 2", args, code)
 		}
 	}
 	// -h/--help exit 0 — flag.ErrHelp is a clean exit, not a usage
 	// error.
 	for _, h := range []string{"-h", "--help"} {
-		if code := Cmd(context.Background(), []string{h}); code != 0 {
-			t.Fatalf("Cmd(%s)=%d want 0", h, code)
+		if code := CmdWith(context.Background(), []string{h}, testOpts(t)); code != 0 {
+			t.Fatalf("CmdWith(%s)=%d want 0", h, code)
 		}
 	}
 }
 
 func TestCmdMissingTopology(t *testing.T) {
-	stubHost(t)
 	// A vars dir without the topology files → the cycle counts the
 	// load error and the command exits 1 (converge-once reports
 	// errs > 0 — the timer/CI "did not converge" contract).
-	code := Cmd(context.Background(), []string{
-		"--vars-dir=" + t.TempDir(), "--node-name=testnode"})
+	code := CmdWith(context.Background(), []string{
+		"--vars-dir=" + t.TempDir(), "--node-name=testnode"}, testOpts(t))
 	if code != 1 {
-		t.Fatalf("Cmd(missing topology)=%d want 1", code)
+		t.Fatalf("CmdWith(missing topology)=%d want 1", code)
 	}
 }
 
 func TestCmdCleanConverge(t *testing.T) {
-	stubHost(t)
 	dir := t.TempDir()
 	for name, content := range map[string]string{
 		"interdc_nodes.yaml": "{}\n",
@@ -78,21 +76,20 @@ func TestCmdCleanConverge(t *testing.T) {
 	}
 	// A node absent from the registry self-gates every group →
 	// errs == 0 → exit 0 (the timer/CI "converged" contract).
-	code := Cmd(context.Background(), []string{
-		"--vars-dir=" + dir, "--node-name=testnode"})
+	code := CmdWith(context.Background(), []string{
+		"--vars-dir=" + dir, "--node-name=testnode"}, testOpts(t))
 	if code != 0 {
-		t.Fatalf("Cmd(clean converge)=%d want 0", code)
+		t.Fatalf("CmdWith(clean converge)=%d want 0", code)
 	}
 }
 
 // No --node-name and no env override → the OS hostname is the final
 // fallback (converge keeps it unlike the daemon's fail-loud path).
 func TestCmdHostnameFallback(t *testing.T) {
-	stubHost(t)
 	t.Setenv("NODE_HOST_AGENT_NODE_NAME", "")
 	t.Setenv("NODE_NAME", "")
-	code := Cmd(context.Background(), []string{"--vars-dir=" + t.TempDir()})
+	code := CmdWith(context.Background(), []string{"--vars-dir=" + t.TempDir()}, testOpts(t))
 	if code != 1 {
-		t.Fatalf("Cmd(no node name, missing topology)=%d want 1", code)
+		t.Fatalf("CmdWith(no node name, missing topology)=%d want 1", code)
 	}
 }

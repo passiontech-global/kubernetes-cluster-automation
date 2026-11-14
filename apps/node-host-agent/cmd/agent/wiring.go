@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -363,7 +364,7 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: envnames.EnvEnableHostconfig,
 			Default: envx.ModeAuto,
 			Auto: func(w *wiring) bool {
-				_, err := os.Stat(w.VarsDir + "/defaults.yaml")
+				_, err := os.Stat(filepath.Join(w.VarsDir, "defaults.yaml"))
 				return err == nil
 			},
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {

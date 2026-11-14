@@ -143,6 +143,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RunCmd == nil {
 		c.RunCmd = func(ctx context.Context, argv []string) (string, error) {
+			if len(argv) == 0 {
+				return "", errEmptyArgv
+			}
 			// newCmd carries the group-kill Cancel and WaitDelay.
 			// WaitDelay only works on goroutine-copied pipes (an
 			// io.Writer sink) — a StdoutPipe fd is only closed

@@ -132,6 +132,7 @@ func (c *DriftCheck) Run(ctx context.Context) {
 			NeedQuorum:    pair.Unit == c.d.Cfg.RestartUnit,
 			HoldPrefix:    "cp-cert-reload-stale " + pair.CertFile,
 			Unit:          pair.Unit,
+			Mode:          c.d.Cfg.Sig13.Mode,
 			ActionLine:    fmt.Sprintf("ACTION: restarting %s - cp-cert-reload-stale %s newer than %s", pair.Unit, pair.CertFile, pair.Addr),
 			DryRunLine:    fmt.Sprintf("DRY-RUN: would restart %s - cp-cert-reload-stale %s", pair.Unit, pair.CertFile),
 			ActionLabel:   "restart_unit",

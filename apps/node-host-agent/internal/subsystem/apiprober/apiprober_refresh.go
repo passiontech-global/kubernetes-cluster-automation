@@ -1,7 +1,7 @@
 // apiprober_refresh.go — the apiprober client refresh path:
 // refreshGuard re-derives the guard conf, refreshClient rebuilds
 // the http.Client when CA/statics change, plus the small helpers
-// (firstNonEmpty/dedupStatic/guardConfPath). Split out of
+// (firstNonEmpty/dedupStatic). Split out of
 // apiprober.go — the prober loop and backend dispatch stay there.
 
 package apiprober
@@ -9,8 +9,6 @@ package apiprober
 import (
 	"net/http"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
@@ -168,10 +166,4 @@ func dedupStatic(in []StaticBackend) []StaticBackend {
 		out = append(out, sb)
 	}
 	return out
-}
-
-// guardConfPath resolves the conf path the same way cmd/agent does —
-// NODE_HOST_AGENT_API_GUARD_CONF, default /etc/api-backend-guard.conf.
-func guardConfPath() string {
-	return envx.String(envnames.EnvAPIGuardConf, defaultGuardConfPath)
 }
