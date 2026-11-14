@@ -42,9 +42,29 @@ const (
 	// budget — dead-unit bookkeeping also feeds the unit-table
 	// bloat the session janitor fights.
 	systemdResetFailedInterval = 30 * time.Minute
+	// systemdInitProbeBudget bounds the is-system-running probe for
+	// the PID1-frozen detector — far under hostexec's 30s default so
+	// a wedged init stalls one check cycle ~10s instead of 30s, and
+	// far above systemdDbusSlowSeconds so "slow but answering" stays
+	// inside the session-bloat domain.
+	systemdInitProbeBudget = 10 * time.Second
+	// systemdInitContInterval rate-limits the SIGCONT retry while
+	// the unresponsive latch is held — a job-control-stopped PID1
+	// resumes on the first signal; the do_wait wedge a SIGQUIT
+	// freeze leaves behind ignores it and the NHC reboot path owns
+	// recovery, so one signal per window is enough (no signal
+	// storm against init).
+	systemdInitContInterval = 15 * time.Minute
 )
 
-type SystemdSessionCheck struct{ d *wdeps.Deps }
+type SystemdSessionCheck struct {
+	d *wdeps.Deps
+	// unrespFails is the consecutive is-system-running probe-timeout
+	// streak behind LatchSystemdUnresponsive — RAM-only like every
+	// other check streak (a restart rebuilds it in ConsecNeeded
+	// cycles while the frozen init stays frozen).
+	unrespFails int
+}
 
 // Name returns the check label / WD_SIG key.
 func (c *SystemdSessionCheck) Name() string { return wdeps.CheckSystemdSessions }
@@ -103,22 +123,61 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.SystemdSessionsStale = int64(len(stale))
 	sd := c.d.Cfg.Systemd
 	latency := -1.0
+	probeTimedOut := false
 	if sd != nil {
 		// The is-system-running call is itself the D-Bus probe —
 		// ANY answer (running/degraded/offline) means D-Bus replied
 		// and only the round-trip TIME is the signal. The
 		// measurement uses the seam clock, not time.Now: the test
-		// seam keeps latency deterministic.
+		// seam keeps latency deterministic. ExecBounded at
+		// systemdInitProbeBudget: a manager that cannot answer
+		// inside the budget is the PID1-frozen signature (a
+		// SIGQUIT'd init stops servicing the manager socket while
+		// kubelet keeps the node Ready — vmi3507437, 2026-11-07),
+		// NOT merely slow — answered errors still count as alive.
 		t0 := c.d.Cfg.Seams.Host.Clock.Now()
-		if _, err := sd.Exec(ctx, "systemctl", "is-system-running"); err != nil {
+		_, probeErr := sd.ExecBounded(ctx, systemdInitProbeBudget,
+			"systemctl", "is-system-running")
+		elapsed := c.d.Cfg.Seams.Host.Clock.Now().Sub(t0)
+		latency = elapsed.Seconds()
+		c.d.SystemdDbusLatencySec = latency
+		if probeErr != nil {
 			// A non-zero exit is still a D-Bus round trip (degraded
 			// reports exit 1); only log at debug level via suspect
 			// — the latency number already carries the verdict.
 			logger().Debug("workerhygiene: is-system-running probe non-ok",
-				"error", err)
+				"error", probeErr)
+			probeTimedOut = elapsed >= systemdInitProbeBudget
 		}
-		latency = c.d.Cfg.Seams.Host.Clock.Now().Sub(t0).Seconds()
-		c.d.SystemdDbusLatencySec = latency
+	}
+	// PID1-frozen detector: consecutive probe timeouts Enter
+	// LatchSystemdUnresponsive (nodereporter surfaces
+	// SystemdUnresponsive; the NHC worker pool owns the reboot).
+	// SIGCONT is the cheap first remedy — it revives a
+	// job-control-stopped init, while the do_wait wedge the
+	// SIGQUIT freeze leaves ignores it; either way the signal is
+	// rate-limited and harmless.
+	if !probeTimedOut {
+		c.unrespFails = 0
+		c.d.State.Exit(latchdefs.LatchSystemdUnresponsive, nil)
+	} else if !c.d.StreakPending(&c.unrespFails, fmt.Sprintf(
+		"suspect: systemd-init-unresponsive is-system-running probe timeout %.0fs",
+		latency)) {
+		c.d.State.Enter(latchdefs.LatchSystemdUnresponsive,
+			fmt.Sprintf("is-system-running timeout %.0fs", latency))
+		if c.d.State.RateTrySpend("last-systemd-init-cont",
+			systemdInitContInterval) {
+			if _, err := sd.Exec(ctx, "kill", "-CONT", "1"); err != nil {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: systemd-init-unresponsive SIGCONT pid1 failed: %v",
+					err))
+			} else {
+				c.d.State.AppendLog(latchdefs.ActionPrefix +
+					"systemd-init-unresponsive SIGCONT pid1")
+				c.d.Actions.WithLabelValues(
+					wdeps.CheckSystemdSessions, "sigcont_pid1").Inc()
+			}
+		}
 	}
 	triggered := len(stale) >= systemdSessionAbandonedMin ||
 		latency > systemdDbusSlowSeconds
@@ -129,8 +188,11 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	c.d.State.Enter(latchdefs.LatchSystemdSessionBloat, fmt.Sprintf(
 		"abandoned=%d dbus_latency=%.2fs", len(stale), latency))
-	if sd == nil {
-		// No host exec wired — evidence + latch only.
+	if sd == nil || probeTimedOut {
+		// No host exec wired — evidence + latch only. A timed-out
+		// probe means PID1 is frozen: every loginctl/systemctl call
+		// below would burn its own timeout, so the reap tail waits
+		// for the manager to answer again.
 		c.d.CycleResult(wdeps.CheckSystemdSessions, "ok")
 		return
 	}

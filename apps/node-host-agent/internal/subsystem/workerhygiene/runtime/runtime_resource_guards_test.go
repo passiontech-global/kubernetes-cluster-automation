@@ -162,6 +162,75 @@ func TestSystemdSessionDbusLatencyLatch(t *testing.T) {
 	}
 }
 
+// The PID1-frozen detector: an is-system-running probe that burns
+// its whole budget with no answer is the SIGQUIT-freeze signature —
+// distinct from the slow-but-answering D-Bus arm above. Two
+// consecutive timeouts confirm the latch, SIGCONT pid1 is attempted
+// once (rate-limited), and a prompt answer clears both streak and
+// latch.
+func TestSystemdInitUnresponsive(t *testing.T) {
+	e := fixture(t)
+	h := e.H
+	ctx := context.Background()
+	h.Cfg.Runtime.SessionsDir = t.TempDir()
+	// No SDReply for is-system-running -> ENOENT; SDHook advances
+	// the fake clock past the probe budget, simulating a call that
+	// never answers inside systemdInitProbeBudget.
+	e.SDHook = func(joined string) {
+		if strings.Contains(joined, "is-system-running") {
+			e.Now = e.Now.Add(11 * time.Second)
+		}
+	}
+	e.SDReply["kill -CONT 1"] = ""
+
+	chk := wdepstest.Check[*runtime.SystemdSessionCheck](h, wdeps.CheckSystemdSessions)
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if _, err := os.Stat(filepath.Join(e.StateDir, "state-systemd-unresponsive")); !os.IsNotExist(err) {
+		t.Fatal("unresponsive latch set after a single probe timeout")
+	}
+	if e.SDRan("kill -CONT 1") {
+		t.Fatal("SIGCONT sent before the streak confirmed")
+	}
+
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if _, err := os.Stat(filepath.Join(e.StateDir, "state-systemd-unresponsive")); err != nil {
+		t.Fatal("unresponsive latch missing after confirmed timeouts")
+	}
+	if !e.SDRan("kill -CONT 1") {
+		t.Fatal("SIGCONT pid1 not attempted on latch confirmation")
+	}
+
+	// A prompt answer is a live manager — streak and latch clear.
+	e.SDHook = nil
+	e.SDReply["systemctl is-system-running"] = "running\n"
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if _, err := os.Stat(filepath.Join(e.StateDir, "state-systemd-unresponsive")); !os.IsNotExist(err) {
+		t.Fatal("unresponsive latch stuck after systemd recovered")
+	}
+}
+
+// An answered error — even a fast one — is a live manager, not a
+// frozen PID1: the unresponsive streak must not advance.
+func TestSystemdInitResponsiveErrorNoLatch(t *testing.T) {
+	e := fixture(t)
+	h := e.H
+	ctx := context.Background()
+	h.Cfg.Runtime.SessionsDir = t.TempDir()
+	// is-system-running exits non-zero fast (degraded answer) —
+	// SDReply can't express exit codes, so leave it unconfigured:
+	// ENOENT returns immediately, well under the probe budget.
+	chk := wdepstest.Check[*runtime.SystemdSessionCheck](h, wdeps.CheckSystemdSessions)
+	for i := 0; i < 3; i++ {
+		chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "state-systemd-unresponsive")); !os.IsNotExist(err) {
+		t.Fatal("unresponsive latch set on fast answered errors")
+	}
+	if e.SDRan("kill -CONT 1") {
+		t.Fatal("SIGCONT sent for a responsive manager")
+	}
+}
+
 // --- overlayfs-stale-mount ---
 
 func staleOverlayPod(e *env, name, uid string) *corev1.Pod {

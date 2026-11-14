@@ -58,6 +58,7 @@ const (
 	KernelSlabLeak         = "KernelSlabLeak"         // unreclaimable slab above threshold
 	CgroupDyingLeak        = "CgroupDyingLeak"        // cgroup v2 dying descendants leak
 	SystemdSessionBloat    = "SystemdSessionBloat"    // abandoned logind session scopes
+	SystemdUnresponsive    = "SystemdUnresponsive"    // PID1 frozen — manager socket unanswered (systemd-unresponsive latch)
 	KubeletPLEGUnhealthy   = "KubeletPLEGUnhealthy"   // PLEG relist latency/lag degrading
 	DiskSlowIO             = "DiskSlowIO"             // disk write await + io PSI gray failure
 	KernelNetShimDegraded  = "KernelNetShimDegraded"  // socket/softnet drops, shim RSS breach
@@ -175,7 +176,7 @@ var HeartbeatSweptNames = []string{
 	ClockUnsynchronized, KernelSlabLeak, NebulaPMTUBlackhole,
 	KernelResourceExhaustion, ClockSkewDetected,
 	KubeconfigCertExpiring, CPUStealPressure,
-	CgroupDyingLeak, SystemdSessionBloat,
+	CgroupDyingLeak, SystemdSessionBloat, SystemdUnresponsive,
 	KubeletPLEGUnhealthy, DiskSlowIO, KernelNetShimDegraded,
 	ClocksourceUnstable,
 	InodePressure,
@@ -207,7 +208,9 @@ var HangPreCordonNames = []string{
 	// class: a kernel that cannot allocate pages and a disk in
 	// runaway growth are both "cordon before it dies" signals on
 	// the same fuse as the PSI/slab exhaustion latches.
-	KernelPageAllocFailure, DiskBloatRunaway,
+	// SystemdUnresponsive joins too: a frozen PID1 cannot manage
+	// the node's services — cordon ahead of the NHC reboot.
+	KernelPageAllocFailure, DiskBloatRunaway, SystemdUnresponsive,
 }
 
 // ClockSkewPreCordonNames are the clock-health conditions on the
@@ -244,7 +247,8 @@ var StormGateNames = []string{
 	CiliumBPFMapPressure,
 	InodePressure, MemoryPSIThrashing, CgroupDyingLeak,
 	KernelResourceExhaustion, KubeletPLEGUnhealthy,
-	SystemdSessionBloat, CiliumAgentDown, CiliumInitStuck,
+	SystemdSessionBloat, SystemdUnresponsive, CiliumAgentDown,
+	CiliumInitStuck,
 	CiliumEnvoyDown, CiliumWGStale, "CiliumLRPDegraded",
 	CiliumMTUDrift, ConntrackPressure, JournaldUnreadable,
 	ControlPlaneCertReloadStale, DiskSlowIO,

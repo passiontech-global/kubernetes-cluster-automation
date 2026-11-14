@@ -91,8 +91,9 @@ func TestKernelLatchConditions(t *testing.T) {
 // TestHygieneLatchConditions covers the remaining registered
 // latches — each maps 1:1 to its permanent NodeCondition:
 // kubeconfig-cert-expiring (controllerhygiene cert-expiry),
-// cpu-steal-pressure (hostmetrics steal guard), cgroup-dying-leak
-// and systemd-session-bloat (workerhygiene hygiene checks).
+// cpu-steal-pressure (hostmetrics steal guard), cgroup-dying-leak,
+// systemd-session-bloat, and systemd-unresponsive (workerhygiene
+// hygiene checks).
 func TestHygieneLatchConditions(t *testing.T) {
 	e := fixture(t)
 	r := e.r
@@ -107,6 +108,7 @@ func TestHygieneLatchConditions(t *testing.T) {
 		"cpu-steal-pressure":       {"CPUStealPressure", "CPUStealPressureDetected"},
 		"cgroup-dying-leak":        {"CgroupDyingLeak", "CgroupDyingLeakDetected"},
 		"systemd-session-bloat":    {"SystemdSessionBloat", "SystemdSessionBloatDetected"},
+		"systemd-unresponsive":     {"SystemdUnresponsive", "SystemdUnresponsiveDetected"},
 	}
 	// Baseline: every condition False with its default reason.
 	for _, want := range latches {
@@ -170,8 +172,8 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 // latch keys, a present latch flips the condition True with the
 // problem reason, and a removed latch flips it back to False.
 func TestCiliumLatchConditions(t *testing.T) {
-	if len(conditionDefs) != 49 {
-		t.Fatalf("conditionDefs has %d defs, want 49 (41 prior + 7 W21 latch→condition surface + ApiserverWatchCacheWedged)",
+	if len(conditionDefs) != 50 {
+		t.Fatalf("conditionDefs has %d defs, want 50 (41 prior + 7 W21 latch→condition surface + ApiserverWatchCacheWedged + SystemdUnresponsive)",
 			len(conditionDefs))
 	}
 	// The cilium pair sits before the inode-pressure + W21 tail —

@@ -103,6 +103,7 @@ var conditionOrder = []string{
 	latchdefs.LatchNebulaSiteedge,
 	latchdefs.LatchPageAllocFailure,
 	latchdefs.LatchAPIServerCacheWedged,
+	latchdefs.LatchSystemdUnresponsive,
 }
 
 // staleConditionDef is WatchdogStale's def — the one condition whose

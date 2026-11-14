@@ -71,11 +71,17 @@ const (
 	LatchCalicoFelixDown        = "calico-felix-down"      // calico-hygiene
 	LatchPSIMemoryThrash        = "psi-memory-thrash"
 	LatchKernelSlabLeak         = "kernel-slab-leak"
-	LatchContainerdCorrupt      = "containerd-corrupt"     // meta-db-corruption
-	LatchCgroupDyingLeak        = "cgroup-dying-leak"      // cgroup-dying-reclaim
-	LatchSystemdSessionBloat    = "systemd-session-bloat"  // systemd-session-hygiene
-	LatchKubeletPLEGUnhealthy   = "kubelet-pleg-unhealthy" // kubelet-syncloop PLEG metrics
-	LatchDiskSlowIO             = "disk-slow-io"           // disk-slow-io io-pressure gray failure
+	LatchContainerdCorrupt      = "containerd-corrupt"    // meta-db-corruption
+	LatchCgroupDyingLeak        = "cgroup-dying-leak"     // cgroup-dying-reclaim
+	LatchSystemdSessionBloat    = "systemd-session-bloat" // systemd-session-hygiene
+	// LatchSystemdUnresponsive is the PID1-frozen latch — the same
+	// check's is-system-running probe burned its whole budget with
+	// no answer (a SIGQUIT-frozen init stops servicing the manager
+	// socket while kubelet keeps the node Ready). Harder evidence
+	// than session-bloat's slow-D-Bus arm.
+	LatchSystemdUnresponsive  = "systemd-unresponsive"   // systemd-session-hygiene
+	LatchKubeletPLEGUnhealthy = "kubelet-pleg-unhealthy" // kubelet-syncloop PLEG metrics
+	LatchDiskSlowIO           = "disk-slow-io"           // disk-slow-io io-pressure gray failure
 	// LatchKernelNetShim is the kernel-net-shim-hygiene degradation
 	// latch — sustained kernel socket/softnet drop growth or a
 	// containerd-shim RSS breach (individual 200MiB / total 1.5GiB).
@@ -244,6 +250,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchContainerdCorrupt, Owner: "workerhygiene"},
 	{Name: LatchCgroupDyingLeak, Owner: "workerhygiene"},
 	{Name: LatchSystemdSessionBloat, Owner: "workerhygiene"},
+	{Name: LatchSystemdUnresponsive, Owner: "workerhygiene"},
 	{Name: LatchKubeletPLEGUnhealthy, Owner: "workerhygiene"},
 	{Name: LatchDiskSlowIO, Owner: "workerhygiene"},
 	{Name: LatchKernelNetShim, Owner: "workerhygiene"},

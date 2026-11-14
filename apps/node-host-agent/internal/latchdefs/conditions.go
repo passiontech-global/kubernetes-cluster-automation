@@ -265,6 +265,12 @@ var CondDefs = map[string]CondDef{
 		DefaultMessage: "logind session count and D-Bus latency healthy",
 		ProblemReason:  "SystemdSessionBloatDetected",
 	},
+	LatchSystemdUnresponsive: {
+		Type:           "SystemdUnresponsive",
+		DefaultReason:  "SystemdResponsive",
+		DefaultMessage: "systemd PID1 answering manager probes",
+		ProblemReason:  "SystemdUnresponsiveDetected",
+	},
 	LatchKubeletPLEGUnhealthy: {
 		Type:           "KubeletPLEGUnhealthy",
 		DefaultReason:  "KubeletPLEGHealthy",

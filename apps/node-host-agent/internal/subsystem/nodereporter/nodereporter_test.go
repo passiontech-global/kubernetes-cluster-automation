@@ -224,6 +224,8 @@ func TestAllConditionDefaults(t *testing.T) {
 		"KernelPageAllocFailure": {"KernelPageAllocOk", "no kernel page-allocation failure records"},
 		// controllerhygiene sig13 watch-cache wedge latch→condition.
 		"ApiserverWatchCacheWedged": {"APIServerWatchCacheOk", "apiserver watch-cache tracks etcd revision"},
+		// workerhygiene PID1-frozen latch→condition surface.
+		"SystemdUnresponsive": {"SystemdResponsive", "systemd PID1 answering manager probes"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

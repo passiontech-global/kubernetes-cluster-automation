@@ -163,6 +163,7 @@ var logRules = []logRule{
 	{nodecond.CPUStealPressure, latchdefs.StateEnterRe(latchdefs.LatchCPUStealPressure)},
 	{nodecond.CgroupDyingLeak, latchdefs.StateEnterRe(latchdefs.LatchCgroupDyingLeak)},
 	{nodecond.SystemdSessionBloat, latchdefs.StateEnterRe(latchdefs.LatchSystemdSessionBloat)},
+	{nodecond.SystemdUnresponsive, latchdefs.StateEnterRe(latchdefs.LatchSystemdUnresponsive)},
 	// recent-latches latches that had conditions (conditions.go) but no
 	// filelog rule — kubelet-pleg-unhealthy and disk-slow-io
 	// previously entered without ever emitting an Event.
