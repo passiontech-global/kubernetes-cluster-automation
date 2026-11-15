@@ -2,11 +2,13 @@ package httpx
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -312,6 +314,21 @@ func TestOptsTimeoutsAndPooledTransport(t *testing.T) {
 	trDefault := PooledTransport(0, nil)
 	if trDefault.MaxIdleConnsPerHost != 0 {
 		t.Fatalf("PooledTransport(0) perHost=%d, want 0", trDefault.MaxIdleConnsPerHost)
+	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
+	trTLS := PooledTransport(8, tlsCfg)
+	if trTLS.TLSClientConfig != tlsCfg || trTLS.MaxIdleConnsPerHost != 8 {
+		t.Fatalf("PooledTransport with tlsCfg mismatch: perHost=%d tls=%v", trTLS.MaxIdleConnsPerHost, trTLS.TLSClientConfig)
+	}
+
+	// Timeout with empty msg must fall back to "request timed out".
+	h := Timeout(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+	}), 5*time.Millisecond, "")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != "request timed out" {
+		t.Fatalf("Timeout default msg: code=%d body=%q", rec.Code, rec.Body.String())
 	}
 }
 

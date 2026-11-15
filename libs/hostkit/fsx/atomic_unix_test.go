@@ -95,3 +95,43 @@ func TestFileStatKey(t *testing.T) {
 		t.Fatalf("FileStatKey(missing) = %v, want ErrNotExist", err)
 	}
 }
+
+func TestWriteFileAtomicNoSyncFallbackAndError(t *testing.T) {
+	for _, errno := range []error{syscall.EBUSY, syscall.EXDEV} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "metric.prom")
+
+			orig := RenameFile
+			RenameFile = func(string, string) error { return errno }
+			t.Cleanup(func() { RenameFile = orig })
+
+			if err := WriteFileAtomicNoSync(path, "up 1\n"); err != nil {
+				t.Fatalf("WriteFileAtomicNoSync: %v", err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "up 1\n" {
+				t.Fatalf("fallback content = %q, want %q", got, "up 1\n")
+			}
+		})
+	}
+
+	t.Run("other_error", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "metric.prom")
+
+		orig := RenameFile
+		RenameFile = func(string, string) error { return syscall.EACCES }
+		t.Cleanup(func() { RenameFile = orig })
+
+		if err := WriteFileAtomicNoSync(path, "up 1\n"); !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("WriteFileAtomicNoSync = %v, want EACCES", err)
+		}
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("non-fallback error must not install the target")
+		}
+	})
+}

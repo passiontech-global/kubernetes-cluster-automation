@@ -274,3 +274,23 @@ func TestGetJSONDrainsBodyForKeepAliveReuse(t *testing.T) {
 		t.Fatalf("TCP connections=%d want 1 (keep-alive reuse requires the body drained)", got)
 	}
 }
+
+func TestSafeBaseURL(t *testing.T) {
+	cases := []struct {
+		name string
+		base string
+		want string
+	}{
+		{"plain", "https://ci.example.com", "https://ci.example.com"},
+		{"strips_userinfo", "https://user:secret@ci.example.com/path", "https://ci.example.com/path"},
+		{"invalid_url", "://bad-url", "://bad-url"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Client{BaseURL: tc.base}
+			if got := c.SafeBaseURL(); got != tc.want {
+				t.Fatalf("SafeBaseURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
