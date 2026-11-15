@@ -565,3 +565,28 @@ func TestGatewayRouteHealthResolvedClearsGauge(t *testing.T) {
 		t.Fatal("gauge not cleared after the route healed")
 	}
 }
+
+func TestGatewayRouteCarryRouteSignature(t *testing.T) {
+	p := &gatewayRouteHealthCheck{
+		liveLast: map[string][]string{
+			"HTTPRoute/apps/r1/backend_zero_endpoints": {"HTTPRoute", "apps", "r1", "backend_zero_endpoints"},
+			"HTTPRoute/apps/r2/accepted_false":         {"HTTPRoute", "apps", "r2", "accepted_false"},
+		},
+		zeroLast: map[string][]string{
+			"HTTPRoute/apps/r1/web-svc": {"HTTPRoute", "apps", "r1", "web-svc"},
+			"HTTPRoute/apps/r2/other":   {"HTTPRoute", "apps", "r2", "other"},
+		},
+	}
+	live := map[string][]string{}
+	zeroNow := map[string][]string{}
+
+	p.carryRouteSignature("HTTPRoute", "apps", "r1", routeReasonZeroEndpoints, live, zeroNow)
+	if len(live) != 1 || len(zeroNow) != 1 {
+		t.Fatalf("zero-endpoints carry: live=%v zeroNow=%v", live, zeroNow)
+	}
+
+	p.carryRouteSignature("HTTPRoute", "apps", "r2", "accepted_false", live, zeroNow)
+	if len(live) != 2 || len(zeroNow) != 1 {
+		t.Fatalf("non-zero carry should not copy zeroLast: live=%v zeroNow=%v", live, zeroNow)
+	}
+}

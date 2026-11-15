@@ -372,3 +372,27 @@ func TestCooldownSetConcurrentAccess(t *testing.T) {
 		t.Fatal("concurrent stamps left the ledger empty")
 	}
 }
+
+func TestStreakLedgerClearAndMax(t *testing.T) {
+	var s StreakLedger
+	if got := s.Max(); got != 0 {
+		t.Fatalf("empty Max() = %d, want 0", got)
+	}
+	s.Hit("a")
+	s.Hit("b")
+	s.Hit("b")
+	s.Hit("b")
+	s.Hit("c")
+	s.Hit("c")
+	if got := s.Max(); got != 3 {
+		t.Fatalf("Max() = %d, want 3", got)
+	}
+	s.Clear()
+	if s.Len() != 0 || s.Max() != 0 || s.Count("b") != 0 {
+		t.Fatalf("after Clear: len=%d max=%d count(b)=%d, want all 0", s.Len(), s.Max(), s.Count("b"))
+	}
+	// Re-arming after Clear works.
+	if n := s.Hit("b"); n != 1 {
+		t.Fatalf("Hit after Clear = %d, want 1", n)
+	}
+}

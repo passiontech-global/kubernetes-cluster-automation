@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 var ctx = context.Background()
@@ -206,5 +208,22 @@ func TestSweepNilHooks(t *testing.T) {
 	if deleted != 0 || failed != 2 || dels != 2 {
 		t.Fatalf("Sweep = (%d,%d) dels=%d, want (0,2) dels=2",
 			deleted, failed, dels)
+	}
+}
+
+func TestDeleteErrorHandler(t *testing.T) {
+	var errs int
+	cb := DeleteErrorHandler("pod", func(s string) string { return s }, func() { errs++ })
+
+	gr := schema.GroupResource{Resource: "pods"}
+	cb(logr.Discard(), "p1", apierrors.NewNotFound(gr, "p1"))
+	cb(logr.Discard(), "p2", apierrors.NewConflict(gr, "p2", errors.New("uid mismatch")))
+	if errs != 0 {
+		t.Fatalf("NotFound/Conflict incremented error count: %d", errs)
+	}
+
+	cb(logr.Discard(), "p3", errors.New("apiserver down"))
+	if errs != 1 {
+		t.Fatalf("generic error count = %d, want 1", errs)
 	}
 }

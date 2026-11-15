@@ -93,3 +93,12 @@ func TestCmdHostnameFallback(t *testing.T) {
 		t.Fatalf("CmdWith(no node name, missing topology)=%d want 1", code)
 	}
 }
+
+func TestCmdDelegatesUsageErrors(t *testing.T) {
+	if code := Cmd(context.Background(), []string{"--bogus"}); code != 2 {
+		t.Fatalf("Cmd(--bogus) = %d, want 2", code)
+	}
+	if code := Cmd(context.Background(), []string{"--help"}); code != 0 {
+		t.Fatalf("Cmd(--help) = %d, want 0", code)
+	}
+}

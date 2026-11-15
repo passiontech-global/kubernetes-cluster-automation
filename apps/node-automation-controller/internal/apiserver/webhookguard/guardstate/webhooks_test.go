@@ -10,6 +10,7 @@ import (
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -269,5 +270,42 @@ func TestForEachWebhookConfig(t *testing.T) {
 	}
 	if len(seen) != len(want) || seen[0] != want[0] || seen[1] != want[1] {
 		t.Fatalf("ForEachWebhookConfig saw %v, want %v", seen, want)
+	}
+}
+
+func TestCompactCRDFromTyped(t *testing.T) {
+	crdNoConv := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-conv.example.com"},
+	}
+	u1 := compactCRDFromTyped(crdNoConv)
+	if u1.GetName() != "no-conv.example.com" {
+		t.Fatalf("GetName() = %q", u1.GetName())
+	}
+	if _, found, _ := unstructured.NestedFieldNoCopy(u1.Object, "spec", "conversion"); found {
+		t.Fatal("expected no spec.conversion when Conversion is nil")
+	}
+
+	var port int32 = 8443
+	crdWithConv := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "with-conv.example.com"},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Conversion: &apiextensionsv1.CustomResourceConversion{
+				Strategy: apiextensionsv1.WebhookConverter,
+				Webhook: &apiextensionsv1.WebhookConversion{
+					ClientConfig: &apiextensionsv1.WebhookClientConfig{
+						Service: &apiextensionsv1.ServiceReference{
+							Namespace: "ns",
+							Name:      "svc",
+							Port:      &port,
+						},
+					},
+				},
+			},
+		},
+	}
+	u2 := compactCRDFromTyped(crdWithConv)
+	gotPort, found, err := unstructured.NestedInt64(u2.Object, "spec", "conversion", "webhook", "clientConfig", "service", "port")
+	if err != nil || !found || gotPort != 8443 {
+		t.Fatalf("nested port = (%d,%v,%v), want (8443,true,nil)", gotPort, found, err)
 	}
 }

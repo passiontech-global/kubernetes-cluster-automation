@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -468,5 +469,17 @@ func TestGoAndProcessRuntimeMetricsRegistered(t *testing.T) {
 		if !names[want] {
 			t.Fatalf("registry missing runtime metric %q", want)
 		}
+	}
+}
+
+func TestLeasePreemptRunnable(t *testing.T) {
+	var r leasePreemptRunnable
+	if r.NeedLeaderElection() {
+		t.Fatal("leasePreemptRunnable.NeedLeaderElection() = true, want false")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := r.Start(ctx); err != nil {
+		t.Fatalf("Start with cancelled ctx: %v", err)
 	}
 }

@@ -12,10 +12,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
+
+	sdbus "github.com/coreos/go-systemd/v22/dbus"
 )
 
 func TestNormalizeUnit(t *testing.T) {
@@ -108,5 +113,87 @@ func TestSignalNumber(t *testing.T) {
 	}
 	if _, ok := signalNumber("SIGBOGUS"); ok {
 		t.Fatal("unknown signal must not resolve")
+	}
+}
+
+func TestDBusHelpersAndDisabledPaths(t *testing.T) {
+	if _, _, err := dialSystemdPrivate(filepath.Join(t.TempDir(), "missing.sock")); err == nil {
+		t.Fatal("expected dialSystemdPrivate on missing socket to fail")
+	}
+
+	if !isTransportDead(io.EOF) || !isTransportDead(net.ErrClosed) || !isTransportDead(errors.New("connection reset by peer")) {
+		t.Fatal("isTransportDead missed transport error")
+	}
+	if isTransportDead(errors.New("other")) {
+		t.Fatal("isTransportDead matched unrelated error")
+	}
+
+	ctx, cancel := opCtx(context.Background())
+	defer cancel()
+	if _, ok := ctx.Deadline(); !ok {
+		t.Fatal("opCtx did not set deadline")
+	}
+
+	if v, ok := propUint32(uint32(7)); !ok || v != 7 {
+		t.Fatalf("propUint32(7) = (%d,%v)", v, ok)
+	}
+	if v, ok := propUint32("9"); !ok || v != 9 {
+		t.Fatalf("propUint32('9') = (%d,%v)", v, ok)
+	}
+	if _, ok := propUint32("bad"); ok {
+		t.Fatal("propUint32('bad') returned ok")
+	}
+
+	b := newDBusBackend(t.TempDir())
+	b.maybeDisable(errors.New("transient"))
+	if b.disabled.Load() {
+		t.Fatal("transient error disabled backend")
+	}
+	b.maybeDisable(os.ErrNotExist)
+	if !b.disabled.Load() {
+		t.Fatal("ErrNotExist did not disable backend")
+	}
+	b.close()
+	b.dropConn(&sdbus.Conn{})
+
+	// Exercise all dbus* entry points against the disabled backend (returns errDBusUnavailable cleanly).
+	if err := b.dbusJob(ctx, "restart", "foo.service"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusJob = %v", err)
+	}
+	if err := b.dbusSignal(ctx, "foo.service", "SIGTERM"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusSignal = %v", err)
+	}
+	if err := b.dbusDaemonReload(ctx); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusDaemonReload = %v", err)
+	}
+	if err := b.dbusResetFailed(ctx, "foo.service"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusResetFailed = %v", err)
+	}
+	if _, err := b.unitProp(ctx, "foo.service", "ActiveState"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("unitProp = %v", err)
+	}
+	if _, err := b.dbusActive(ctx, "foo.service"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusActive = %v", err)
+	}
+	if _, err := b.dbusExists(ctx, "foo.service"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusExists = %v", err)
+	}
+	if _, err := b.dbusActiveAge(ctx, "foo.service", "/proc/uptime"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusActiveAge = %v", err)
+	}
+	if _, err := b.dbusActiveEnterUSec(ctx, "foo.service"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusActiveEnterUSec = %v", err)
+	}
+	if _, err := b.dbusMainPID(ctx, "foo.service"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusMainPID = %v", err)
+	}
+	if _, err := b.dbusListUnitsByPatterns(ctx, []string{"*.service"}); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusListUnitsByPatterns = %v", err)
+	}
+	if _, err := b.dbusEnabled(ctx, "foo.service"); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusEnabled = %v", err)
+	}
+	if _, err := b.dbusSystemState(ctx); !errors.Is(err, errDBusUnavailable) {
+		t.Fatalf("dbusSystemState = %v", err)
 	}
 }

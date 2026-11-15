@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envdoc/scan"
 )
 
 func captureStdout(t *testing.T, fn func()) string {
@@ -165,5 +167,27 @@ func TestMainFatalOnBadRoot(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "genenvdoc:") {
 		t.Fatalf("stderr missing fatal prefix: %q", stderr)
+	}
+}
+
+func TestWriteEnvDoc(t *testing.T) {
+	c, err := scan.CollectContract(moduleRoot)
+	if err != nil {
+		t.Fatalf("CollectContract: %v", err)
+	}
+	gates, err := scan.ScanGates(moduleRoot, c)
+	if err != nil {
+		t.Fatalf("ScanGates: %v", err)
+	}
+	outPath := filepath.Join(t.TempDir(), "ENV.md")
+	if err := writeEnvDoc(moduleRoot, outPath, c, gates); err != nil {
+		t.Fatalf("writeEnvDoc: %v", err)
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(data), "## Knobs by package") {
+		t.Fatalf("generated ENV.md missing expected section:\n%s", string(data))
 	}
 }

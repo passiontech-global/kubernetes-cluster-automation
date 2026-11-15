@@ -18,6 +18,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 func TestRabbitMQQuorumAlarmFails(t *testing.T) {
@@ -679,5 +680,17 @@ func TestRabbitMQQuorumOnePodPerClusterPerSweep(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("mq").
 		Get(ctx, "rabbitmq-server-2", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("the first stuck-unready candidate must be the one healed, err=%v", err)
+	}
+}
+
+func TestRabbitSeriesClusterID(t *testing.T) {
+	if got := rabbitSeriesClusterID(promq.Sample{Metric: map[string]string{"rabbitmq_cluster": "rmq-a", "cluster": "other"}}); got != "rmq-a" {
+		t.Fatalf("got %q, want rmq-a", got)
+	}
+	if got := rabbitSeriesClusterID(promq.Sample{Metric: map[string]string{"instance": "10.0.0.1:15692"}}); got != "10.0.0.1:15692" {
+		t.Fatalf("got %q, want 10.0.0.1:15692", got)
+	}
+	if got := rabbitSeriesClusterID(promq.Sample{}); got != "-" {
+		t.Fatalf("got %q, want -", got)
 	}
 }

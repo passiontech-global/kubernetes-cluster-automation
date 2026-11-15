@@ -7,6 +7,9 @@ package nethealth
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +19,9 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
@@ -323,4 +328,27 @@ func mustNode(t *testing.T, cs *fake.Clientset, name string) *corev1.Node {
 		t.Fatalf("get node %s: %v", name, err)
 	}
 	return n
+}
+
+func TestApiserverNodeReachabilityProbe(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "ok-node") {
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		http.Error(w, "unreachable", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	cs, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatalf("NewForConfig: %v", err)
+	}
+	chk := &apiserverNodeReachabilityCheck{Deps: probetest.NewDeps(cs, nil)}
+	if !chk.probe(ctx, "ok-node") {
+		t.Fatal("expected ok-node probe to return true")
+	}
+	if chk.probe(ctx, "bad-node") {
+		t.Fatal("expected bad-node probe to return false")
+	}
 }

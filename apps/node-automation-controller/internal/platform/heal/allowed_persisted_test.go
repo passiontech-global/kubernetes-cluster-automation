@@ -120,3 +120,41 @@ func TestAllowedVPersistedClearGateProceeds(t *testing.T) {
 			proceed, unverifiable)
 	}
 }
+
+func TestAllowedOnNodePersistedAndUpgradeOnlyPersisted(t *testing.T) {
+	now := time.Now()
+	obj := allowedPersistedObj()
+	obj.Annotations["passiontech.dev/last-heal"] =
+		now.Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+	var ledger state.CooldownSet
+
+	// Inside persisted cooldown -> blocked without calling maintenance check.
+	if proceed, unver := AllowedOnNodePersisted(t.Context(),
+		logr.Discard(), &maintenance.Verdict{}, fake.NewSimpleClientset(),
+		nil, &ledger, obj, "passiontech.dev/last-heal", "k", "node-1",
+		time.Hour, now); proceed || unver {
+		t.Fatalf("AllowedOnNodePersisted inside cooldown = (%v,%v), want (false,false)", proceed, unver)
+	}
+	if proceed, unver := AllowedUpgradeOnlyPersisted(t.Context(),
+		logr.Discard(), &maintenance.Verdict{}, fake.NewSimpleClientset(),
+		nil, &ledger, obj, "passiontech.dev/last-heal", "k",
+		time.Hour, now); proceed || unver {
+		t.Fatalf("AllowedUpgradeOnlyPersisted inside cooldown = (%v,%v), want (false,false)", proceed, unver)
+	}
+
+	// Expired persisted stamp -> falls through to AllowedOnNode / AllowedUpgradeOnly.
+	obj.Annotations["passiontech.dev/last-heal"] =
+		now.Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	if proceed, unver := AllowedOnNodePersisted(t.Context(),
+		logr.Discard(), &maintenance.Verdict{}, fake.NewSimpleClientset(),
+		testhelp.NewDynamicClient(), &ledger, obj, "passiontech.dev/last-heal", "k", "node-1",
+		time.Hour, now); !proceed || unver {
+		t.Fatalf("AllowedOnNodePersisted expired = (%v,%v), want (true,false)", proceed, unver)
+	}
+	if proceed, unver := AllowedUpgradeOnlyPersisted(t.Context(),
+		logr.Discard(), &maintenance.Verdict{}, fake.NewSimpleClientset(),
+		testhelp.NewDynamicClient(), &ledger, obj, "passiontech.dev/last-heal", "k",
+		time.Hour, now); !proceed || unver {
+		t.Fatalf("AllowedUpgradeOnlyPersisted expired = (%v,%v), want (true,false)", proceed, unver)
+	}
+}

@@ -352,3 +352,23 @@ func TestCloseRacesServe(t *testing.T) {
 		}
 	}
 }
+
+func TestListenLoopback(t *testing.T) {
+	ln, err := ListenLoopback(0)
+	if err != nil {
+		t.Fatalf("ListenLoopback(0): %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	host, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", ln.Addr().String(), err)
+	}
+	if host != "127.0.0.1" || port == "0" {
+		t.Fatalf("ListenLoopback(0) addr = %s, want 127.0.0.1:<ephemeral>", ln.Addr().String())
+	}
+	// Negative port should fail.
+	if bad, err := ListenLoopback(-1); err == nil {
+		_ = bad.Close()
+		t.Fatal("ListenLoopback(-1) unexpectedly succeeded")
+	}
+}

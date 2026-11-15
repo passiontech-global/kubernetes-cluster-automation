@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -315,4 +316,38 @@ func reconcileErrorCount(t *testing.T, name string) float64 {
 		}
 	}
 	return 0
+}
+
+func TestNodeUpdatePredicateAndRequeueAfter(t *testing.T) {
+	p := NodeUpdatePredicate(true, func(oldNode, newNode *corev1.Node) bool {
+		return oldNode.Name != newNode.Name
+	})
+	if !p.Create(event.CreateEvent{}) || !p.Delete(event.DeleteEvent{}) || !p.Generic(event.GenericEvent{}) {
+		t.Fatal("Create/Delete/Generic must always return true")
+	}
+	if !p.Update(event.UpdateEvent{}) {
+		t.Fatal("missing objects should return fallbackOnMissing=true")
+	}
+	n1 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "a"}}
+	n2 := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "b"}}
+	if p.Update(event.UpdateEvent{ObjectOld: n1, ObjectNew: n1}) {
+		t.Fatal("equal nodes should return false")
+	}
+	if !p.Update(event.UpdateEvent{ObjectOld: n1, ObjectNew: n2}) {
+		t.Fatal("different nodes should return true")
+	}
+
+	if got := RequeueAfter(0); got != 0 {
+		t.Fatalf("RequeueAfter(0) = %v, want 0", got)
+	}
+	if got := RequeueAfter(-time.Second); got != -time.Second {
+		t.Fatalf("RequeueAfter(-1s) = %v, want -1s", got)
+	}
+	base := 10 * time.Second
+	for range 10 {
+		got := RequeueAfter(base)
+		if got < 9*time.Second || got >= 11*time.Second {
+			t.Fatalf("RequeueAfter(10s) = %v outside [9s, 11s)", got)
+		}
+	}
 }

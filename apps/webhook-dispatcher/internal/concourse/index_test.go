@@ -1137,3 +1137,28 @@ func TestResourcesColdStartJoinerDeadlineFallback(t *testing.T) {
 		t.Fatalf("cold-start joiner deadline err=%v want context.DeadlineExceeded", err)
 	}
 }
+
+func TestEnsureIndexAndRefreshIndex(t *testing.T) {
+	stub := newATCStub(t, stubRoutes())
+	clk := newFakeClock()
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Hour, now: clk.Now}
+
+	if err := c.EnsureIndex(t.Context()); err != nil {
+		t.Fatalf("EnsureIndex: %v", err)
+	}
+	if matches := c.Match("git", map[string]struct{}{"org/repo": {}}); len(matches) == 0 {
+		t.Fatal("expected Match to find org/repo after EnsureIndex")
+	}
+
+	// RefreshIndex inside throttle window succeeds without hitting ATC again.
+	if err := c.RefreshIndex(t.Context()); err != nil {
+		t.Fatalf("RefreshIndex throttled: %v", err)
+	}
+
+	// Advance past throttle window and make ATC fail -> RefreshIndex returns error.
+	clk.Advance(c.minRefreshInterval() + time.Second)
+	stub.fail("/api/v1/teams/main/pipelines", 500)
+	if err := c.RefreshIndex(t.Context()); err == nil {
+		t.Fatal("expected RefreshIndex error on 500")
+	}
+}

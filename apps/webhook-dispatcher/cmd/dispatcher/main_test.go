@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"flag"
+	"os"
+	"testing"
+)
 
 func TestParseLocalUsers(t *testing.T) {
 	cases := []struct {
@@ -71,4 +75,16 @@ func TestParseLocalUsersEnv(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMainVersionFlag(t *testing.T) {
+	origArgs := os.Args
+	origCmd := flag.CommandLine
+	t.Cleanup(func() {
+		os.Args = origArgs
+		flag.CommandLine = origCmd
+	})
+	os.Args = []string{"webhook-dispatcher", "-version"}
+	flag.CommandLine = flag.NewFlagSet("webhook-dispatcher", flag.ContinueOnError)
+	main()
 }

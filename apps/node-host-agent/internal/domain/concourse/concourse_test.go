@@ -40,3 +40,18 @@ func TestWithNoFollowFDRejectsSymlinkAndType(t *testing.T) {
 		t.Fatalf("perm=%o, want 640", fi.Mode().Perm())
 	}
 }
+
+func TestDefaultChownFD(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "chown-fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	// -1/-1 is a no-op chown on an open fd that succeeds even unprivileged.
+	if err := DefaultChownFD(f.Name(), int(f.Fd()), -1, -1); err != nil {
+		t.Fatalf("DefaultChownFD(-1,-1): %v", err)
+	}
+	if err := DefaultChownFD("bad", -1, -1, -1); err == nil {
+		t.Fatal("expected error for invalid fd -1")
+	}
+}

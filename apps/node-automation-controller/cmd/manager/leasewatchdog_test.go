@@ -226,3 +226,10 @@ func TestWatchdogReadErrorIsNotLoss(t *testing.T) {
 	cancel()
 	<-done
 }
+
+func TestWatchdogNeedLeaderElection(t *testing.T) {
+	var w leaseLossWatchdog
+	if !w.NeedLeaderElection() {
+		t.Fatal("leaseLossWatchdog.NeedLeaderElection() = false, want true")
+	}
+}

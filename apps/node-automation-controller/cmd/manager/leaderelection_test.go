@@ -7,11 +7,13 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -205,5 +207,29 @@ func TestLeaseEventSinkWriteIsBounded(t *testing.T) {
 		if elapsed := time.Since(start); elapsed > 5*time.Second {
 			t.Fatalf("%s: sink write unbounded — took %v", name, elapsed)
 		}
+	}
+}
+
+func TestBuildLeaderLock(t *testing.T) {
+	t.Setenv("POD_NAME", "nac-pod-1")
+	var stolen atomic.Bool
+	done := make(chan struct{})
+	defer close(done)
+	lock, err := buildLeaderLock(&rest.Config{Host: "https://127.0.0.1:6443"}, runtime.NewScheme(), "kube-system", 10*time.Second, &stolen, done)
+	if err != nil {
+		t.Fatalf("buildLeaderLock(POD_NAME): %v", err)
+	}
+	if !strings.HasPrefix(lock.Identity(), "nac-pod-1_") {
+		t.Fatalf("Identity() = %q, want prefix nac-pod-1_", lock.Identity())
+	}
+
+	// Hostname fallback when POD_NAME is unset.
+	t.Setenv("POD_NAME", "")
+	lock2, err := buildLeaderLock(&rest.Config{Host: "https://127.0.0.1:6443"}, runtime.NewScheme(), "kube-system", 10*time.Second, &stolen, done)
+	if err != nil {
+		t.Fatalf("buildLeaderLock(hostname): %v", err)
+	}
+	if lock2.Identity() == "" {
+		t.Fatal("expected non-empty Identity from hostname fallback")
 	}
 }

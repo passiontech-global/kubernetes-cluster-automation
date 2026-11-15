@@ -133,3 +133,35 @@ func TestLivenessUnregister(t *testing.T) {
 	// Double-unregister is a safe no-op.
 	l.Unregister(b)
 }
+
+func TestEveryExemptAndRunWithHeartbeat(t *testing.T) {
+	l := NewLiveness()
+	ctx, cancel := context.WithCancel(WithLiveness(context.Background(), l))
+	defer cancel()
+
+	// Heartbeat outside/inside liveness ctx.
+	Heartbeat(context.Background()) // no-op
+	Heartbeat(ctx)
+
+	var ran bool
+	RunWithHeartbeat(ctx, 5*time.Millisecond, func(c context.Context) {
+		time.Sleep(15 * time.Millisecond)
+		ran = true
+	})
+	if !ran {
+		t.Fatal("RunWithHeartbeat did not run fn")
+	}
+
+	var calls int
+	looper := EveryExempt("aux-watch", time.Hour, func(context.Context) {
+		calls++
+		cancel()
+	})
+	looper.Run(ctx)
+	if calls != 1 {
+		t.Fatalf("EveryExempt calls = %d, want 1", calls)
+	}
+	if !l.IsExempt() {
+		t.Fatal("EveryExempt.Run did not exempt ctx liveness")
+	}
+}

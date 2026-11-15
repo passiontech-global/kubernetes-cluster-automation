@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/webhook-dispatcher/internal/concourse"
@@ -1044,6 +1045,50 @@ func TestAdmissionRefusalsReturn503(t *testing.T) {
 		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status=%d want 503", rec.Code)
+		}
+	})
+}
+
+func TestRegisterMetricsAndFailBodyRead(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	RegisterMetrics(reg)
+	// Trigger a metric observation so Gather sees the registered families.
+	deliveriesTotal.WithLabelValues("push", "accepted").Inc()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	if len(mfs) == 0 {
+		t.Fatal("expected registered metrics on registry")
+	}
+
+	// Duplicate registration must panic.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic on duplicate RegisterMetrics")
+			}
+		}()
+		RegisterMetrics(reg)
+	}()
+
+	h := New(testSecret, &fakeBackend{})
+
+	t.Run("max_bytes_error", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+		h.failBodyRead(rec, req, "del-1", "push", "push", &http.MaxBytesError{Limit: 10})
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status=%d want 413", rec.Code)
+		}
+	})
+
+	t.Run("generic_read_error", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+		h.failBodyRead(rec, req, "del-2", "push", "push", errors.New("unexpected EOF"))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d want 400", rec.Code)
 		}
 	})
 }

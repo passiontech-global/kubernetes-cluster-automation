@@ -459,3 +459,49 @@ func TestShellQuote(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteFileDirectNoSync(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "direct-nosync")
+	if err := WriteFileDirectNoSync(path, "first\n"); err != nil {
+		t.Fatalf("WriteFileDirectNoSync: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "first\n" {
+		t.Fatalf("content = %q, want %q", got, "first\n")
+	}
+	// Overwrite truncates instead of appending.
+	if err := WriteFileDirectNoSync(path, "second\n"); err != nil {
+		t.Fatalf("WriteFileDirectNoSync overwrite: %v", err)
+	}
+	got, _ = os.ReadFile(path)
+	if string(got) != "second\n" {
+		t.Fatalf("overwrite content = %q, want %q", got, "second\n")
+	}
+	// Missing parent dir fails.
+	if err := WriteFileDirectNoSync(filepath.Join(dir, "missing", "f"), "x"); err == nil {
+		t.Fatal("expected error for missing parent dir")
+	}
+}
+
+func TestWriteFileAtomicBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bytes")
+	payload := []byte{0x00, 0x01, 0xfe, 0xff}
+	if err := WriteFileAtomicBytes(path, payload); err != nil {
+		t.Fatalf("WriteFileAtomicBytes: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("content = %x, want %x", got, payload)
+	}
+	if err := WriteFileAtomicBytes(filepath.Join(dir, "missing", "f"), payload); err == nil {
+		t.Fatal("expected error for missing parent dir")
+	}
+}
