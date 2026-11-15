@@ -217,7 +217,8 @@ func (c *Config) applyDefaults() {
 	// 30s timeout matches the previous inline bound. The Config
 	// fields stay the call indirection so tests can still re-stub
 	// n.cfg.runHostCmd/runMountCmd after New.
-	hostRunner := hostexec.New(hostexec.Config{HostRoot: c.HostRoot})
+	hostRunner := hostexec.New(hostexec.Config{HostRoot: c.HostRoot,
+		ScrubSystemdEnv: true})
 	if c.runHostCmd == nil {
 		c.runHostCmd = func(ctx context.Context, argv []string) (string, error) {
 			return hostRunner.ExecCombined(ctx, hostexec.NSNet,

@@ -63,6 +63,49 @@ func TestTryReserveWorkloadDisruption(t *testing.T) {
 	}
 }
 
+// A Deployment mid-rollout runs TWO ReplicaSets — pods of the old
+// and new RS normalize onto the same "ns/Deployment/<deploy>" slot
+// so two checks cannot each spend a disruption and take the
+// workload to zero. A workload-key reservation (the
+// RestartTemplatePatch restart sites) shares that same slot.
+func TestDisruptionKeyNormalizesReplicaSetHash(t *testing.T) {
+	ctx := WithSweepOverlay(t.Context())
+
+	oldRS := controllerRef("ReplicaSet", "web-6d9f8b7c5d")
+	newRS := controllerRef("ReplicaSet", "web-1a2b3c4d5e")
+	if !TryReserveWorkloadDisruption(ctx, overlayPod("web-old-0", oldRS)) {
+		t.Fatal("first RS pod reservation must succeed")
+	}
+	if TryReserveWorkloadDisruption(ctx, overlayPod("web-new-0", newRS)) {
+		t.Fatal("new-RS pod must share the Deployment slot — mid-rollout quorum guard")
+	}
+
+	// The restart-patch reservation keys on the same identity.
+	ctx2 := WithSweepOverlay(t.Context())
+	if !TryReserveWorkloadKey(ctx2, "ns/Deployment/web") {
+		t.Fatal("workload-key reservation must succeed")
+	}
+	if TryReserveWorkloadDisruption(ctx2, overlayPod("web-x", oldRS)) {
+		t.Fatal("pod delete must see the restart's spent slot")
+	}
+
+	// A name with NO hash-shaped tail (no "-<alnum≤12>" suffix —
+	// "web-6d9f" now normalizes under the widened {1,12} window)
+	// keeps its own ReplicaSet identity — it must NOT merge into
+	// the Deployment slot.
+	ctx3 := WithSweepOverlay(t.Context())
+	if !TryReserveWorkloadKey(ctx3, "ns/Deployment/web") {
+		t.Fatal("deployment slot reservation must succeed")
+	}
+	plain := controllerRef("ReplicaSet", "web_rs_canary")
+	if !TryReserveWorkloadDisruption(ctx3, overlayPod("p1", plain)) {
+		t.Fatal("unhashed RS keeps its own key — must not merge into Deployment/web")
+	}
+	if TryReserveWorkloadDisruption(ctx3, overlayPod("p2", oldRS)) {
+		t.Fatal("hashed RS pod shares the spent Deployment slot — must be denied")
+	}
+}
+
 func TestTryReserveWorkloadDisruptionOutsideSweep(t *testing.T) {
 	// No overlay on ctx — every call is permissive (direct-Run
 	// checks and module periodics never share a sweep).

@@ -104,6 +104,7 @@ func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 		return fmt.Errorf("list pods (kube-state-metrics wedge scan): %w", err)
 	}
 	wedgeLive := map[string]bool{}
+	scanLive := map[string]bool{}
 	for i := range pods {
 		pod := &pods[i]
 		if !isKSMPod(pod) || pod.DeletionTimestamp != nil ||
@@ -111,6 +112,7 @@ func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 			continue
 		}
 		key := pod.Namespace + "/" + pod.Name
+		scanLive[key] = true
 		// stampPatch delivers this pod's first-seen merge patch —
 		// the durable half of the wedge window below: the window
 		// gates a pod bounce, so the stamp lives on the pod itself
@@ -186,6 +188,15 @@ func (p *controllerLeaseGuardCheck) checkKSMWedged(ctx context.Context,
 			kube.PodControllerKey(pod), pod, ksmPodHealCooldown, now)
 	}
 	p.wedgeSeen.Prune(func(k string) bool { return wedgeLive[k] })
+	// The scan clock only tracks pods the log channel could still
+	// see — entries for pods that left the candidate set (deleted,
+	// stopped, or lost the ksm label) are dropped so a pod
+	// re-entering later bootstraps against its own last read.
+	for k := range p.logScanAt {
+		if !scanLive[k] {
+			delete(p.logScanAt, k)
+		}
+	}
 	return nil
 }
 
@@ -212,12 +223,36 @@ func (p *controllerLeaseGuardCheck) ksmWedgeReason(ctx context.Context,
 
 	probe := p.ksmLogProbe
 	if probe == nil {
-		probe = func(ctx context.Context, pod *corev1.Pod) (string, error) {
+		probe = func(ctx context.Context, pod *corev1.Pod) (string, time.Time, time.Time, error) {
 			return ksmLogTailWedge(ctx, p.CS, pod)
 		}
 	}
 	var logErr error
-	reason, logErr := probe(ctx, pod)
+	reason, newest, streamNewest, logErr := probe(ctx, pod)
+	if logErr == nil {
+		// The scan boundary advances on every successful read — a
+		// failed fetch must not push it forward. It advances in the
+		// KUBELET's clock domain: streamNewest is the newest stamp
+		// on any line read; p.Now() (controller clock) is only the
+		// fallback for a stream with no parseable timestamp at
+		// all. Freshness: the signature needs a line newer than
+		// this pod's previous scan; a stale-only tail reads as "no
+		// fresh log evidence" and falls through to the metrics
+		// channel below.
+		key := pod.Namespace + "/" + pod.Name
+		if p.logScanAt == nil {
+			p.logScanAt = map[string]time.Time{}
+		}
+		prevScan, scanned := p.logScanAt[key]
+		if streamNewest.IsZero() {
+			p.logScanAt[key] = p.Now()
+		} else {
+			p.logScanAt[key] = streamNewest
+		}
+		if reason != "" && !newest.IsZero() && scanned && !newest.After(prevScan) {
+			reason = ""
+		}
+	}
 	if reason != "" {
 		return reason, nil
 	}
@@ -240,16 +275,18 @@ func (p *controllerLeaseGuardCheck) ksmWedgeReason(ctx context.Context,
 // ksmLogTailWedge is the production log-tail probe: the pod's last
 // ksmLogTailLines lines (bounded by ksmLogMaxBytes / ksmLogTimeout)
 // scanned for the wedge signatures — the reason of the first hit,
-// "" when clean. A fetch failure is inconclusive, not healthy.
+// the newest matching line's kubelet timestamp, "" when clean. A
+// fetch failure is inconclusive, not healthy.
 func ksmLogTailWedge(ctx context.Context, cs kubernetes.Interface,
-	pod *corev1.Pod) (string, error) {
+	pod *corev1.Pod) (string, time.Time, time.Time, error) {
 
 	reason := ""
-	hit, err := kube.ReadPodLogTail(ctx, cs, pod, kube.PodLogOpts{
+	matched, newest, streamNewest, err := kube.ReadPodLogTailTimed(ctx, cs, pod, kube.PodLogOpts{
 		TailLines:    ksmLogTailLines,
-		SinceSeconds: 900,
+		SinceSeconds: 360,
 		MaxBytes:     ksmLogMaxBytes,
 		Timeout:      ksmLogTimeout,
+		Timestamps:   true,
 	}, func(line string) bool {
 		l := strings.ToLower(line)
 		for _, sig := range ksmWedgeSignatures {
@@ -260,10 +297,13 @@ func ksmLogTailWedge(ctx context.Context, cs kubernetes.Interface,
 		}
 		return false
 	})
-	if err != nil || !hit {
-		return "", err
+	if err != nil {
+		return "", time.Time{}, time.Time{}, err
 	}
-	return reason, nil
+	if !matched {
+		return "", time.Time{}, streamNewest, nil
+	}
+	return reason, newest, streamNewest, nil
 }
 
 // ksmReflectorErrorIncrease is the metrics half of the wedge OR: KSM

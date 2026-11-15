@@ -10,7 +10,9 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
@@ -44,7 +46,13 @@ func (c *cyc) groupAPILB() {
 		logger().Warn("T12: kubelet.conf unreadable — skipping server-URL check",
 			"path", "/var/lib/k0s/kubelet.conf", "error", err)
 	}
-	tctx := c.tplCtx() // includes api_lb_probe_reachable (names)
+	tctx := c.tplCtx()
+	// Probe lazily HERE (T12): tplCtx memoized at T5b would carry a
+	// pre-Nebula/pre-route dial result, and the dials belong to this
+	// group's error accounting anyway. Mutating the shared memo is
+	// safe — the fresh value is strictly better for any later
+	// consumer of the same key.
+	tctx["api_lb_probe_reachable"] = &jinja.List{V: strSliceToAny(c.probeReachable())}
 	cfg, err := r.render("api-local-lb.haproxy.cfg.j2", tctx)
 	if err != nil {
 		c.err("T12 render", "error", err)
@@ -195,17 +203,64 @@ table ip api_local_dnat {
 	}
 	// Gate: LB must accept on 127.0.0.1:6443 before /etc/hosts pin —
 	// pinning against a dead LB kills the node's API path entirely.
-	probe := `timeout 15 bash -c 'until timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/6443" 2>/dev/null; do sleep 0.3; done'`
-	if _, err := r.run(ctx, "sh", "-c", probe); err != nil {
-		c.err("T12: 127.0.0.1:6443 not serving in 15s — /etc/hosts NOT pinned", "error", err)
+	// The in-process dial loop replaces the nested bash /dev/tcp
+	// retry — same ~15s budget (50 tries at the old 0.3s cadence),
+	// 1s per-attempt timeout.
+	up := false
+	for i := 0; i < 50; i++ {
+		if err := c.r.cfg.TCPProbe(c.ctx, "127.0.0.1:6443", time.Second); err == nil {
+			up = true
+			break
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	if !up {
+		c.err("T12: 127.0.0.1:6443 not serving in 15s — /etc/hosts NOT pinned")
 		return
 	}
 	c.pinHosts()
 }
 
+// apilbIdentRe gates vars-derived haproxy identifiers — the `server
+// <name>` / `frontend <name>_local` / `backend <name>_local_back`
+// tokens the template renders verbatim. Letters, digits, '.', '_'
+// and '-' cover every legitimate name; anything else (space, '#',
+// quote, newline, ';') would splice directives into haproxy.cfg.
+var apilbIdentRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+func apilbIdentOK(s string) bool { return apilbIdentRe.MatchString(s) }
+
+// apilbAddrOK gates a vars-derived `server <name> <addr>` token: one
+// printable non-space ASCII word minus the characters that re-open
+// haproxy syntax — '"'/#' quote or comment the rest of the line,
+// '\' escapes, whitespace splits the directive. ':' and '[' ']' stay
+// for host:port and [v6]:port literals.
+func apilbAddrOK(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= 0x20 || c > 0x7e || c == '"' || c == '\'' ||
+			c == '\\' || c == '#' {
+			return false
+		}
+	}
+	return true
+}
+
 // apiLBExtraLanes — the {name, port} entries of api_lb_extra_lanes
 // (Phase 2: extra local proxy lanes, e.g. konnectivity :8132 and
-// k0sjoin :9443). Entries missing name or port are skipped.
+// k0sjoin :9443) that survive validation. Entries missing name or
+// port — or carrying an identifier/port the haproxy + nft renders
+// cannot safely interpolate — are skipped; the SAME filtered set
+// feeds the DNAT ports below and the template's lane loop via
+// tplCtx, so a bad entry drops out of both sides consistently
+// instead of rendering into haproxy.cfg while the nft side refuses.
 func (c *cyc) apiLBExtraLanes() [][2]string {
 	var out [][2]string
 	for _, it := range c.vl("api_lb_extra_lanes") {
@@ -214,12 +269,53 @@ func (c *cyc) apiLBExtraLanes() [][2]string {
 			continue
 		}
 		n, p := m.Str("name"), m.Str("port")
-		if n == "" || p == "" {
+		if !apilbIdentOK(n) || !converge.SHPortReq(p) {
+			if n != "" || p != "" {
+				logger().Warn("T12: api_lb_extra_lanes entry skipped — unsafe name/port",
+					"name", n, "port", p)
+			}
 			continue
 		}
 		out = append(out, [2]string{n, p})
 	}
 	return out
+}
+
+// apiLBExtraLaneList is apiLBExtraLanes in template shape — the
+// validated {name, port} OMap entries as a *jinja.List for tplCtx.
+func (c *cyc) apiLBExtraLaneList() *jinja.List {
+	var out []any
+	for _, it := range c.vl("api_lb_extra_lanes") {
+		m, _ := it.(*jinja.OMap)
+		if m == nil {
+			continue
+		}
+		if apilbIdentOK(m.Str("name")) && converge.SHPortReq(m.Str("port")) {
+			out = append(out, m)
+		}
+	}
+	return &jinja.List{V: out}
+}
+
+// apiLBBackendList is the validated api_lb_backends list for
+// tplCtx: entries whose name is not a haproxy-safe identifier or
+// whose addr is not a single safe token are dropped — the template
+// renders both verbatim into `server <name> <addr>` lines.
+func (c *cyc) apiLBBackendList() *jinja.List {
+	var out []any
+	for _, it := range c.vl("api_lb_backends") {
+		m, _ := it.(*jinja.OMap)
+		if m == nil {
+			continue
+		}
+		if !apilbIdentOK(m.Str("name")) || !apilbAddrOK(m.Str("addr")) {
+			logger().Warn("T12: api_lb_backends entry skipped — unsafe name/addr",
+				"name", m.Str("name"), "addr", m.Str("addr"))
+			continue
+		}
+		out = append(out, m)
+	}
+	return &jinja.List{V: out}
 }
 
 // apiLBDnatPorts — the VIP dports redirected to 127.0.0.1: the main
@@ -265,17 +361,18 @@ func (c *cyc) probeReachable() []string {
 		if port == "" {
 			port = "6443"
 		}
-		// host/port land inside the single-quoted bash -c argument —
-		// gate them so a vars typo can never inject shell (a quote in
-		// host would close the '...' wrapper).
+		// host/port land inside net.JoinHostPort — gate them so a
+		// vars typo can never smuggle a malformed address (the old
+		// bash /dev/tcp probe needed shell-quoting safety; the
+		// dialer needs syntactic safety).
 		if !c.shToken("api_lb_backends addr host", host) ||
 			!c.shPort("api_lb_backends addr port", port) {
 			continue
 		}
-		// ansible: timeout 5 bash -c 'cat < /dev/null > /dev/tcp/h/p'
-		// — /dev/tcp is a bashism; sh/dash has no such device.
-		cmd := fmt.Sprintf("timeout 5 bash -c 'cat < /dev/null > /dev/tcp/%s/%s'", host, port)
-		if _, err := c.r.run(c.ctx, "sh", "-c", cmd); err == nil {
+		// In-process TCP dial replaces `timeout 5 bash -c 'cat <
+		// /dev/null > /dev/tcp/h/p'` — same connect-or-fail signal,
+		// no fork per backend.
+		if err := c.r.cfg.TCPProbe(c.ctx, net.JoinHostPort(host, port), 5*time.Second); err == nil {
 			out = append(out, ns)
 		}
 	}

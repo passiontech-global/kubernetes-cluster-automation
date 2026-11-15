@@ -220,6 +220,9 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		// the stamp this sweep instead of the pre-patch snapshot.
 		kube.RecordAnnoPatch(ctx, csv, patch)
 		p.csvPatched.Stamp(key, now) // delivered-only contract
+		// The CSV spec changed — later checks must not evaluate the
+		// pre-patch unstructured snapshot.
+		p.InvalidateUnstructured(ctx)
 		log.Info("PATCH: olm csv durable spec patch re-applied",
 			"csv", csv.GetNamespace()+"/"+csv.GetName())
 	}
@@ -364,25 +367,43 @@ func stripManagerLeaderElect(obj map[string]any) bool {
 			}
 			kept := make([]any, 0, len(args))
 			stripped := false
-			for i, a := range args {
-				if s, ok := a.(string); ok &&
-					(s == "--leader-elect" || s == "--leader-elect=true") {
-					stripped = true
+			for i := 0; i < len(args); i++ {
+				s, ok := args[i].(string)
+				if !ok {
+					kept = append(kept, args[i])
 					continue
 				}
-				// Two-arg form: "--leader-elect false" strips the
-				// flag AND its value token — leaving the bare
-				// "false" would hand the manager a stray
-				// positional arg. Only a literal true/false is
-				// consumed; a following real flag is kept.
-				if stripped && i > 0 {
-					if prev, _ := args[i-1].(string); prev == "--leader-elect" {
-						if s, ok := a.(string); ok && (s == "true" || s == "false") {
-							continue
+				switch {
+				case s == "--leader-elect=false":
+					// Explicit leader-election OFF — dropping the
+					// pair would let the manager fall back to its
+					// leader-elect default (usually true). Keep it.
+					kept = append(kept, args[i])
+				case s == "--leader-elect=true":
+					stripped = true
+				case s == "--leader-elect":
+					// Two-arg form: a following literal bool is the
+					// flag's value. "false" is an explicit disable —
+					// the pair stays; only "true" (or a bare flag,
+					// which cobra reads as true) strips.
+					if i+1 < len(args) {
+						if v, ok := args[i+1].(string); ok {
+							switch v {
+							case "true":
+								stripped = true
+								i++
+								continue
+							case "false":
+								kept = append(kept, args[i], args[i+1])
+								i++
+								continue
+							}
 						}
 					}
+					stripped = true
+				default:
+					kept = append(kept, args[i])
 				}
-				kept = append(kept, a)
 			}
 			if stripped {
 				changed = true

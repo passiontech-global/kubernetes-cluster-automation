@@ -64,6 +64,14 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 			Namespace:   cj.Namespace,
 			Labels:      labels,
 			Annotations: annotations,
+			// Owner the catch-up Job to its CronJob: the Job
+			// controller's concurrencyPolicy (Forbid/Replace)
+			// counts only owned Jobs, and ownerRef GC reaps the
+			// catch-up with its CronJob instead of stranding it.
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(cj,
+					batchv1.SchemeGroupVersion.WithKind("CronJob")),
+			},
 		},
 		Spec: *cj.Spec.JobTemplate.Spec.DeepCopy(),
 	}

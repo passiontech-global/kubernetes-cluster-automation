@@ -218,8 +218,9 @@ func (c *volumeAttachmentCleaner) nodePodList(ctx context.Context,
 		return pr, pr.err
 	}
 	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		FieldSelector: "spec.nodeName=" + node,
-		Limit:         kube.DefaultListPageSize,
+		FieldSelector: "spec.nodeName=" + node +
+			",status.phase!=Succeeded,status.phase!=Failed",
+		Limit: kube.DefaultListPageSize,
 	}, kube.Pods(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		err = fmt.Errorf("list pods on %s: %w", node, err)

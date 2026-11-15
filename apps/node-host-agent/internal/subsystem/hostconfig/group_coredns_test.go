@@ -5,6 +5,7 @@ package hostconfig
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,7 +25,7 @@ func TestCoreDNSWorkerStub(t *testing.T) {
 		"dig @127.0.0.1":                  "10.0.1.10",
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DownloadDir: t.TempDir()}, nil)
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DownloadDir: t.TempDir(), DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +88,7 @@ func TestCoreDNSInjectionFailsClosed(t *testing.T) {
 			}, nil)
 			r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 				VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr,
-				DownloadDir: t.TempDir()}, nil)
+				DownloadDir: t.TempDir(), DNSProbe: dnsProbeAnyOK()}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -105,9 +106,10 @@ func TestCoreDNSInjectionFailsClosed(t *testing.T) {
 
 func TestCoreDNSSkipsResolvConfWhenDigFails(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := newScripted(map[string]string{"/usr/local/bin/coredns -version": "CoreDNS-1.14.7"}, map[string]bool{"dig @127.0.0.1": true})
+	sr := newScripted(map[string]string{"/usr/local/bin/coredns -version": "CoreDNS-1.14.7"}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
+		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir(),
+		DNSProbe: dnsProbeErr(errors.New("lookup: connection refused"))}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +130,7 @@ func TestCoreDNSHubZoneFile(t *testing.T) {
 		"dig @127.0.0.1":                  "172.29.0.10",
 	}, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
-		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DownloadDir: t.TempDir()}, nil)
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DownloadDir: t.TempDir(), DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +195,7 @@ node-z:
 	}
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +251,7 @@ func TestCoreDNSBinarySwapRestartsService(t *testing.T) {
 		"dig @127.0.0.1":                  "10.0.1.10",
 	}, nil)
 	rA, err := New(Config{NodeName: "node-b", HostRoot: hostRoot,
-		VarsDir: vars, Runner: srA, DownloadDir: dl}, nil)
+		VarsDir: vars, Runner: srA, DownloadDir: dl, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +269,7 @@ func TestCoreDNSBinarySwapRestartsService(t *testing.T) {
 		"dig @127.0.0.1":                  "10.0.1.10",
 	}, nil)
 	rB, err := New(Config{NodeName: "node-b", HostRoot: hostRoot,
-		VarsDir: vars, Runner: srB, DownloadDir: dl}, nil)
+		VarsDir: vars, Runner: srB, DownloadDir: dl, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +291,7 @@ func TestCoreDNSEmptyVersionPinSkips(t *testing.T) {
 	}, nil)
 	dl := t.TempDir()
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr, DownloadDir: dl}, nil)
+		VarsDir: vars, Runner: sr, DownloadDir: dl, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +317,7 @@ func TestCoreDNSZoneNameFallback(t *testing.T) {
 		"dig @127.0.0.1": "10.0.1.10",
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +335,7 @@ func TestCoreDNSTincOverlayUnit(t *testing.T) {
 		"dig @127.0.0.1": "10.0.1.10",
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +360,7 @@ func TestCoreDNSHubFallbackResolverLine(t *testing.T) {
 		"dig @127.0.0.1": "172.29.0.10",
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,12 +383,12 @@ func TestCoreDNSHubFallbackResolverLine(t *testing.T) {
 // repoint, and the failure counts.
 func TestCoreDNSWorkerFallbackNameProbeFails(t *testing.T) {
 	vars := writeVarsDir(t, "")
-	sr := newScripted(map[string]string{
-		"dig @127.0.0.1 api.test.internal": "203.0.113.14",
-	}, nil)
-	sr.FailOn("dig @127.0.0.1 api2.test.internal", nil)
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr,
+		DNSProbe: dnsProbeFake(map[string][]string{
+			"api.test.internal": {"203.0.113.14"},
+		})}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +409,7 @@ func TestCoreDNSHubDigRetryCtxCancel(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
-		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +458,7 @@ node_records: false
 `)
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
-		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr, DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,7 +510,7 @@ func TestCoreDNSInstallBadTarball(t *testing.T) {
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr,
-		DownloadDir: t.TempDir()}, nil)
+		DownloadDir: t.TempDir(), DNSProbe: dnsProbeAnyOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -19,7 +19,7 @@ import (
 func (g *Guard) guardRun(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string)) {
 
-	out, err := g.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := g.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameCompact, fmt.Sprintf(
 		"SELECT COALESCE((SELECT MAX(id) FROM %s),0), "+
 			"COALESCE((SELECT MAX(prev_revision) FROM %s WHERE name='%s'),0), "+
 			"COUNT(*), COALESCE(MIN(id),0) FROM %[1]s",
@@ -106,11 +106,17 @@ func (g *Guard) guardRun(ctx context.Context, pg, user, pass string,
 	} else {
 		script = g.buildCompactScript(crev, target)
 	}
-	sout, err := g.d.PsqlScript(ctx, pg, user, pass, script)
+	// MaintMu serializes this advisory-locked session against the
+	// maint loop's heavy window on this host — the pg advisory
+	// lock remains the cross-session arbiter; the mutex just keeps
+	// the two local loops from racing to discover it.
+	g.d.MaintMu.Lock()
+	sout, err := g.d.PsqlScript(ctx, pg, user, pass, kdeps.AppNameCompact, script)
+	g.d.MaintMu.Unlock()
 	if err != nil && g.d.LongBudgetExceeded(t0, err) {
 		// The client kill can orphan the server-side session —
 		// still holding the advisory lock. Reap it now.
-		if n, rerr := g.d.ReapOrphanedMaintSessions(ctx, pg, user, pass); rerr != nil {
+		if n, rerr := g.d.ReapOrphanedMaintSessions(ctx, pg, user, pass, kdeps.AppNameCompact, "pg_dump"); rerr != nil {
 			note(fmt.Sprintf("orphan-reap-fail: %v", rerr))
 		} else if n > 0 {
 			note(fmt.Sprintf("terminated %d orphaned maintenance backend(s) after exec timeout", n))
@@ -132,7 +138,7 @@ func (g *Guard) guardRun(ctx context.Context, pg, user, pass string,
 		// how far the chunks actually got and the post-VACUUM
 		// table size. Failure only means the after-gauges go
 		// stale, never the run.
-		if aout, aerr := g.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+		if aout, aerr := g.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameCompact, fmt.Sprintf(
 			"SELECT COALESCE((SELECT MAX(prev_revision) FROM %s WHERE name='%s'),0), "+
 				"COUNT(*) FROM %[1]s",
 			kdeps.SQLIdent(g.d.Cfg.Table), kdeps.CompactRevKey)); aerr == nil {

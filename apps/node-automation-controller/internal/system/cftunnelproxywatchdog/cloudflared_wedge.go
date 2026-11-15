@@ -88,6 +88,7 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	// per pod inside scanConnectorTarget — only the mutex and budget
 	// gates apply here, shared via w.verdict so the sweep pays one
 	// evaluation.
+	gateTaken := false
 	if w.dyn != nil {
 		proceed, unverifiable := heal.Gate(ctx, log, w.verdict,
 			w.cs, w.dyn, "cloudflared-wedges", now)
@@ -98,13 +99,20 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 		if !proceed {
 			return 0, nil
 		}
+		gateTaken = true
 	}
 	healed := 0
+	errN := 0
 	for _, c := range candidates {
 		delivered, err := w.deleteConnectorPod(ctx, c.pod, c.reason, now)
 		if err != nil {
+			// Tolerated sub-failure — the run absorbs it, so the
+			// queue error counter is the only accounting (the
+			// outer Periodic never sees this error).
+			metrics.IncError(w.queue)
 			log.Error(err, "delete wedged connector pod failed",
 				"pod", c.pod.Namespace+"/"+c.pod.Name)
+			errN++
 			continue
 		}
 		if !delivered {
@@ -120,10 +128,13 @@ func (w *cfTunnelProxyWatchdog) healCloudflaredWedges(ctx context.Context) (int,
 	}
 	if healed > 0 {
 		log.Info("ACTION: deleted wedged cloudflared pod(s)", "deleted", healed)
-	} else {
-		// The gate consumed one fleet grant but every candidate
-		// delete was refused or already-gone — nothing was
-		// delivered, so the grant goes back (refund-on-skip).
+	} else if gateTaken && errN == 0 {
+		// Refund ONLY when the gate actually consumed a fleet
+		// grant (w.dyn == nil takes none — refunding would hand
+		// back a grant this sweep never spent) and every candidate
+		// was refused as already-gone/held: no mutation executed.
+		// A delete error keeps the grant consumed — the API may
+		// have partially applied it, so fail closed on the budget.
 		heal.RefundGrant(now)
 	}
 	return healed, nil
@@ -329,9 +340,10 @@ func (w *cfTunnelProxyWatchdog) deleteConnectorPod(ctx context.Context,
 func (w *cfTunnelProxyWatchdog) podLogWedged(ctx context.Context,
 	p *corev1.Pod) (bool, error) {
 	text, err := kube.ReadPodLogText(ctx, w.cs, p, kube.PodLogOpts{
-		TailLines: cfTunnelLogTailLines,
-		MaxBytes:  cfTunnelLogMaxBytes,
-		Timeout:   cfTunnelLogTimeout,
+		TailLines:    cfTunnelLogTailLines,
+		MaxBytes:     cfTunnelLogMaxBytes,
+		Timeout:      cfTunnelLogTimeout,
+		SinceSeconds: cfTunnelLogSinceSeconds,
 	})
 	if err != nil {
 		return false, err

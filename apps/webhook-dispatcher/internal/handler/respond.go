@@ -96,6 +96,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// skippedBodies pre-renders the skip responses — the reasons are
+// internal literals, so the JSON body is built once instead of
+// paying a map+Encoder alloc per filtered delivery. The fallback
+// keeps writeSkipped total over any future reason.
+var skippedBodies = map[string][]byte{
+	"action":  []byte("{\"matched\":0,\"skipped\":\"action\"}\n"),
+	"deleted": []byte("{\"matched\":0,\"skipped\":\"deleted\"}\n"),
+}
+
 // writeSkipped acknowledges an authenticated delivery that was
 // filtered before the index lookup — 200 (not 202) with the skip
 // reason so operators can tell "matched nothing" from "never
@@ -103,6 +112,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeSkipped(w http.ResponseWriter, reason string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	if body, ok := skippedBodies[reason]; ok {
+		_, _ = w.Write(body)
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"matched": 0,
 		"skipped": reason,

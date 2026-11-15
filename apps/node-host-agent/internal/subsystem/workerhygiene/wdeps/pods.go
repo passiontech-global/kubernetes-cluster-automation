@@ -158,6 +158,14 @@ var EvictProtectedNamespaces = map[string]bool{
 	"scylla":           true,
 	"scylla-manager":   true,
 	"flux-system":      true,
+	// CNI/datapath operators and storage data planes — evicting
+	// their pods under disk pressure removes the networking and
+	// volume plumbing the node needs to recover.
+	"calico-system":   true,
+	"tigera-operator": true,
+	"longhorn-system": true,
+	"rook-ceph":       true,
+	"spegel":          true,
 }
 
 // EvictCriticalPriorityClasses are the priority classes the

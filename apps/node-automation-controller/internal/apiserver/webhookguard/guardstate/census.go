@@ -134,8 +134,32 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	for key, svcPorts := range probeSet {
 		probePrefs[key] = resolveSlicePortPref(snap, key, svcPorts)
 	}
-	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: ListPageSize},
+	// Targeted census: every consumer looks up ns/name keys that
+	// only webhook-backend Services can produce, so the slice walk
+	// is label-filtered server-side to those services instead of
+	// paging the whole cluster's EndpointSlice table each sweep.
+	// Same-named Services in OTHER namespaces also match the
+	// name-only selector — harmless: their rows land under their
+	// own ns/name keys no consumer reads.
+	sel, filtered := backendSliceSelector(probeSet)
+	if len(probeSet) == 0 {
+		// No webhook backends: the census has no consumed keys —
+		// skip the list entirely rather than walk every slice for
+		// data nobody reads.
+		return ready, nil
+	}
+	// filtered==false with a NON-empty probeSet means the selector
+	// could not express the backend set (>64 distinct service
+	// names, or unparseable keys) — fall back to the unfiltered
+	// cluster-wide walk. Returning the empty census here would
+	// read as "0 ready endpoints for every webhook backend" and
+	// trip the circuit breaker into failurePolicy=Ignore on ALL
+	// admission webhooks.
+	listOpts := metav1.ListOptions{Limit: ListPageSize}
+	if filtered {
+		listOpts.LabelSelector = sel
+	}
+	err := kube.ListEach(ctx, listOpts,
 		kube.EndpointSlices(g.CS, metav1.NamespaceAll),
 		func(items []discoveryv1.EndpointSlice) error {
 			for _, s := range items {
@@ -227,6 +251,32 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 		ready.Responsive[v.key] = v.responsive
 	}
 	return ready, nil
+}
+
+// backendSliceSelector builds the EndpointSlice label selector that
+// restricts the ready census to slices owned by webhook-backend
+// Services: kubernetes.io/service-name in (<names>). Names are
+// deduplicated across namespaces (the selector cannot express
+// ns/name pairs — over-inclusion is harmless, see the call site).
+// Returns ("", false) when the probe set is empty OR too large for
+// a sane selector — the caller skips the list only for the empty
+// case and falls back to an unfiltered walk otherwise.
+func backendSliceSelector(probeSet map[string][]int32) (string, bool) {
+	if len(probeSet) == 0 {
+		return "", false
+	}
+	names := map[string]bool{}
+	for key := range probeSet {
+		_, name, ok := strings.Cut(key, "/")
+		if ok && name != "" {
+			names[name] = true
+		}
+	}
+	if len(names) == 0 || len(names) > 64 {
+		return "", false
+	}
+	list := slices.Sorted(maps.Keys(names))
+	return discoveryv1.LabelServiceName + " in (" + strings.Join(list, ",") + ")", true
 }
 
 // webhookBackendServices maps each "namespace/name" Service key

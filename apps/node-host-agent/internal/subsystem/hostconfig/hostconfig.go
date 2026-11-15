@@ -17,6 +17,7 @@ package hostconfig
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
@@ -104,6 +106,21 @@ type Config struct {
 	Runner         Runner
 	Watcher        Watcher
 	HTTPTimeout    time.Duration
+	// TCPProbe reports whether addr accepts a TCP connection within
+	// timeout — the in-process replacement for the bash /dev/tcp
+	// reachability probe (no fork per backend per render). addr is
+	// net.JoinHostPort form. Nil → net.Dialer.
+	TCPProbe func(ctx context.Context, addr string, timeout time.Duration) error
+	// DNSProbe resolves name against the local stub resolver —
+	// the in-process replacement for `dig @127.0.0.1`. A non-empty
+	// address list is the +short "answered" signal. Nil → a Go
+	// resolver pinned to 127.0.0.1:53.
+	DNSProbe func(ctx context.Context, name string) ([]string, error)
+	// ListenAddrs returns the bound local endpoints ("ip:port",
+	// "[v6]:port") for pid's netns — the in-process `ss -lntu`
+	// replacement the nodelocaldns guard uses. Nil →
+	// netlinkx.ListenAddrs.
+	ListenAddrsFn func(pid int) (map[string]struct{}, error)
 	// DownloadDir caches fetched archives (nebula/coredns/haproxy deb).
 	DownloadDir string
 	// Standalone marks the on-host systemd deployment (hub/infra/API-LB
@@ -131,6 +148,46 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Runner == nil {
 		c.Runner = NsenterRunner{}
+	}
+	if c.TCPProbe == nil {
+		c.TCPProbe = func(ctx context.Context, addr string, timeout time.Duration) error {
+			dial := func() error {
+				var d net.Dialer
+				d.Timeout = timeout
+				conn, err := d.DialContext(ctx, "tcp", addr)
+				if err != nil {
+					return err
+				}
+				return conn.Close()
+			}
+			// Pod mode (HostRoot != "/"): 127.0.0.1 is the POD's
+			// loopback, not the host's — the apilb self-check and
+			// backend probes must dial inside the host netns
+			// (pid 1 = host init under hostPID).
+			if c.HostRoot != "/" {
+				return netlinkx.InNetNS(1, func() error { return dial() })
+			}
+			return dial()
+		}
+	}
+	if c.DNSProbe == nil {
+		c.DNSProbe = func(ctx context.Context, name string) ([]string, error) {
+			// Same netns rule as TCPProbe: the stub at
+			// 127.0.0.1:53 only exists on the host.
+			if c.HostRoot != "/" {
+				var out []string
+				err := netlinkx.InNetNS(1, func() error {
+					var e error
+					out, e = probeLocalDNS(ctx, name)
+					return e
+				})
+				return out, err
+			}
+			return probeLocalDNS(ctx, name)
+		}
+	}
+	if c.ListenAddrsFn == nil {
+		c.ListenAddrsFn = netlinkx.ListenAddrs
 	}
 	if c.Clock == nil {
 		c.Clock = timex.NewCell(nil)
@@ -243,7 +300,12 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 	cycle.RunAll(ctx,
 		cycle.Every("hostconfig", r.cfg.Interval, r.runCycle),
-		cycle.Every("hostconfig-watch", defaultWatchPoll,
+		// The watch poller is auxiliary — a wedged fsnotify/poll
+		// must never trip /healthz and kill the agent while the
+		// interval converge keeps working. EveryExempt gives it a
+		// child Liveness registry marked invisible to the staleness
+		// check.
+		cycle.EveryExempt("hostconfig-watch", defaultWatchPoll,
 			func(ctx context.Context) {
 				if r.cfg.Watcher != nil && r.cfg.Watcher.Changed() {
 					logger().Info("hostconfig: vars/certs changed — converging",

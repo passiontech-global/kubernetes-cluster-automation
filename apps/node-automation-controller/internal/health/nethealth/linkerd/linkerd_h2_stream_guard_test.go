@@ -18,6 +18,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -34,6 +35,20 @@ func meshedPod(ns, name string, ready bool, owner types.UID) *corev1.Pod {
 	return pod
 }
 
+// runPastSigWindow runs the check twice — the first sweep only arms
+// the linkerdH2SigMinAge signature-persistence window, the second
+// (clock advanced past it) is the sweep whose verdict the test
+// asserts on.
+func runPastSigWindow(t *testing.T, p *probetest.Prober) probefw.Result {
+	t.Helper()
+	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
+	base := time.Now()
+	probetest.FreezeNow(p.Deps, base)
+	chk.Run(probetest.SweepCtx(ctx))
+	probetest.FreezeNow(p.Deps, base.Add(linkerdH2SigMinAge+time.Minute))
+	return chk.Run(probetest.SweepCtx(ctx))
+}
+
 func TestLinkerdH2StormDeletesPodWithReadySibling(t *testing.T) {
 	owner := types.UID("rs-shared")
 	bad := meshedPod("apps", "web-1", true, owner)
@@ -46,7 +61,7 @@ func TestLinkerdH2StormDeletesPodWithReadySibling(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"linkerd-proxy ERR Http2 stream error: ENHANCE_YOUR_CALM\n", nil))
 	p := testProber(cs)
-	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := runPastSigWindow(t, p)
 	if res.Pass {
 		t.Fatalf("h2 storm signature must fail: %+v", res)
 	}
@@ -67,7 +82,7 @@ func TestLinkerdH2StormSkipsPodWithoutSibling(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"linkerd-proxy ERR too_many_pings\n", nil))
 	p := testProber(cs)
-	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := runPastSigWindow(t, p)
 	if res.Pass {
 		t.Fatalf("h2 storm signature must still fail: %+v", res)
 	}
@@ -113,7 +128,7 @@ func TestLinkerdIdentityStallMarkers(t *testing.T) {
 			cs := fake.NewSimpleClientset(bad, good)
 			cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(line+"\n", nil))
 			p := testProber(cs)
-			res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+			res := runPastSigWindow(t, p)
 			if res.Pass {
 				t.Fatalf("identity-stall signature must fail: %q", line)
 			}
@@ -138,7 +153,7 @@ func TestLinkerdIdentityStallSkipsLoneReplica(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"linkerd-proxy ERR CertificateExpired\n", nil))
 	p := testProber(cs)
-	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := runPastSigWindow(t, p)
 	if res.Pass {
 		t.Fatalf("identity-stall signature must still fail: %+v", res)
 	}
@@ -161,7 +176,7 @@ func TestLinkerdIdentityStallEvictsUnreadyPodWithTwoSiblings(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"linkerd-proxy ERR failed to certify identity\n", nil))
 	p := testProber(cs)
-	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := runPastSigWindow(t, p)
 	if res.Pass {
 		t.Fatalf("identity-stall signature must fail: %+v", res)
 	}
@@ -187,6 +202,10 @@ func TestLinkerdIdentityStallGaugeClears(t *testing.T) {
 		"linkerd-proxy ERR certificate_expired\n", nil))
 	p := testProber(cs)
 	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
+	base := time.Now()
+	probetest.FreezeNow(p.Deps, base)
+	chk.Run(probetest.SweepCtx(ctx)) // arms the signature window
+	probetest.FreezeNow(p.Deps, base.Add(linkerdH2SigMinAge+time.Minute))
 	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
 		t.Fatal("identity-stall signature must fail")
 	}

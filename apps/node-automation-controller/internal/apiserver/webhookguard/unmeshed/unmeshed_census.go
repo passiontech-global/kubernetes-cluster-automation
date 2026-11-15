@@ -15,29 +15,91 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
-// nsInjectDirectives folds the snapshot's namespace census into the
-// ns-level linkerd.io/inject directive map. An empty list is an API
-// flap — a pod whose namespace cannot be checked must never be
-// classified, so the error aborts the audit before anything is
-// emitted or deleted.
-func nsInjectDirectives(snap *guardstate.Snapshot) (map[string]string, error) {
+// nsAudit bundles one namespace's audit inputs: the linkerd.io/inject
+// directive plus the label set (with kubernetes.io/metadata.name
+// merged, the same synthetic label the criticalns matcher adds) the
+// injector webhook's namespaceSelector matches against.
+type nsAudit struct {
+	directive string
+	labels    labels.Set
+}
+
+// nsAudits folds the snapshot's namespace census into the per-ns
+// audit map. An empty list is an API flap — a pod whose namespace
+// cannot be checked must never be classified, so the error aborts
+// the audit before anything is emitted or deleted.
+func nsAudits(snap *guardstate.Snapshot) (map[string]nsAudit, error) {
 	if snap.NSErr != nil {
 		return nil, fmt.Errorf("list namespaces — unmeshed audit skipped: %w", snap.NSErr)
 	}
 	if len(snap.NS.Items) == 0 {
 		return nil, errors.New("empty namespace list (API flap) — unmeshed audit skipped")
 	}
-	nsInject := make(map[string]string, len(snap.NS.Items))
-	for _, ns := range snap.NS.Items {
-		nsInject[ns.Name] = injectDirective(ns.Labels, ns.Annotations)
+	out := make(map[string]nsAudit, len(snap.NS.Items))
+	for i := range snap.NS.Items {
+		ns := &snap.NS.Items[i]
+		merged := make(labels.Set, len(ns.Labels)+1)
+		for k, v := range ns.Labels {
+			merged[k] = v
+		}
+		merged["kubernetes.io/metadata.name"] = ns.Name
+		out[ns.Name] = nsAudit{
+			directive: injectDirective(ns.Labels, ns.Annotations),
+			labels:    merged,
+		}
 	}
-	return nsInject, nil
+	return out, nil
+}
+
+// injectorSelectors resolves the live linkerd-proxy-injector mutating
+// webhook's namespace/object selectors — the ground truth for "would
+// the injector even look at this pod". The linkerd.io/inject
+// directive alone is not sufficient: the webhook's own selectors can
+// exclude namespaces/pods the directive logic would flag, and
+// evicting those just recreates them unmeshed forever. A nil
+// selector or absent injector webhook degrades to match-all so the
+// directive logic stays the fallback; an MWCErr is a hard error — a
+// pod whose injector scope cannot be checked must never be
+// classified.
+func injectorSelectors(snap *guardstate.Snapshot) (labels.Selector, labels.Selector, error) {
+	nsSel, objSel := labels.Everything(), labels.Everything()
+	if snap.MWCErr != nil {
+		return nil, nil, fmt.Errorf("list mutatingwebhookconfigurations — injector selectors unknown: %w", snap.MWCErr)
+	}
+	if snap.MWC == nil {
+		return nsSel, objSel, nil
+	}
+	for i := range snap.MWC.Items {
+		cfg := &snap.MWC.Items[i]
+		for j := range cfg.Webhooks {
+			w := &cfg.Webhooks[j]
+			if w.Name != kube.LinkerdInjectorWebhook {
+				continue // exact match — a lookalike is not the injector
+			}
+			// A malformed selector fails LabelSelectorAsSelector —
+			// keep match-all rather than suppress detection on a
+			// config the apiserver itself would reject.
+			if w.NamespaceSelector != nil {
+				if s, err := metav1.LabelSelectorAsSelector(w.NamespaceSelector); err == nil {
+					nsSel = s
+				}
+			}
+			if w.ObjectSelector != nil {
+				if s, err := metav1.LabelSelectorAsSelector(w.ObjectSelector); err == nil {
+					objSel = s
+				}
+			}
+			return nsSel, objSel, nil
+		}
+	}
+	return nsSel, objSel, nil
 }
 
 // censusUnmeshed pages the Running pods cluster-wide and applies the
@@ -52,8 +114,12 @@ func nsInjectDirectives(snap *guardstate.Snapshot) (map[string]string, error) {
 // each page's backing array reachable until the deletes finish.
 // Returns the emitted-tuple count for the done-line.
 func (a *Auditor) censusUnmeshed(ctx context.Context, snap *guardstate.Snapshot,
-	nsInject map[string]string, now time.Time, log logr.Logger) (int, []corev1.Pod, error) {
+	nss map[string]nsAudit, now time.Time, log logr.Logger) (int, []corev1.Pod, error) {
 	g := snap.G
+	injNS, injObj, err := injectorSelectors(snap)
+	if err != nil {
+		return 0, nil, err
+	}
 	unmeshed := 0 // UnmeshedPods tuples re-asserted this sweep
 	var candidates []corev1.Pod
 	// Server-side phase filter (the informer cache is list/watch-
@@ -67,7 +133,7 @@ func (a *Auditor) censusUnmeshed(ctx context.Context, snap *guardstate.Snapshot,
 		FieldSelector: "status.phase=Running",
 		Limit:         guardstate.ListPageSize,
 	}
-	err := kube.ListEach(ctx, listOpts,
+	err = kube.ListEach(ctx, listOpts,
 		kube.Pods(g.CS, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
 			for i := range items {
@@ -75,7 +141,12 @@ func (a *Auditor) censusUnmeshed(ctx context.Context, snap *guardstate.Snapshot,
 				if p.Status.Phase != corev1.PodRunning {
 					continue // mirrors the FieldSelector for fake clients
 				}
-				if !podWantsMesh(p, nsInject[p.Namespace]) {
+				// A namespace missing from the census keeps the
+				// zero nsAudit — directive "" and nil labels — so a
+				// pod-level inject=enabled can still classify while
+				// the injector selectors judge the empty label set.
+				nsv := nss[p.Namespace]
+				if !podWantsMesh(p, nsv.directive, nsv.labels, injNS, injObj) {
 					continue
 				}
 				if podHasSidecar(p) {
@@ -105,8 +176,13 @@ func (a *Auditor) censusUnmeshed(ctx context.Context, snap *guardstate.Snapshot,
 // the pod's own linkerd.io/inject directive decides first (disabled
 // opts out even inside an enabled namespace, enabled opts in even
 // inside a disabled one); when the pod says nothing the namespace
-// directive applies.
-func podWantsMesh(p *corev1.Pod, nsDirective string) bool {
+// directive applies. The injector webhook's live namespace/object
+// selectors (injNS/injObj — match-all when the injector config is
+// absent) gate BOTH paths: a pod they reject can never gain a
+// sidecar, so flagging or evicting it just recreates it unmeshed
+// forever.
+func podWantsMesh(p *corev1.Pod, nsDirective string, nsLabels labels.Set,
+	injNS, injObj labels.Selector) bool {
 	if p.Spec.HostNetwork {
 		return false // hostNetwork pods are never injected
 	}
@@ -114,6 +190,9 @@ func podWantsMesh(p *corev1.Pod, nsDirective string) bool {
 		if ref.Kind == "Job" || ref.Kind == "CronJob" {
 			return false // batch pods are never injected
 		}
+	}
+	if !injNS.Matches(nsLabels) || !injObj.Matches(labels.Set(p.Labels)) {
+		return false
 	}
 	switch d := injectDirective(p.Labels, p.Annotations); d {
 	case "disabled":

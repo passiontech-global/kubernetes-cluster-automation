@@ -154,12 +154,17 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
-	findings := rabbitPromFindings(ctx, p.Deps, log, census)
+	findings, promDegraded := rabbitPromFindings(ctx, p.Deps, log, census)
 
 	hp := newRabbitHealPass(p, log, now, census, findings)
 	hp.scanUnready(ctx)
 	hp.healPromFindings(ctx)
-	hp.clearQuiet(ctx)
+	if !promDegraded {
+		// A degraded Prometheus sweep cannot prove a signal went
+		// quiet — clearing first-seen stamps now would read the
+		// outage as recovery and re-arm healed wedges.
+		hp.clearQuiet(ctx)
+	}
 
 	var rep probefw.SweepReport
 	for key, reasons := range findings {
@@ -186,6 +191,29 @@ func (p *rabbitMQQuorumHealthCheck) Run(ctx context.Context) probefw.Result {
 				[]string{ns, pod.Name, joined})
 		}
 		rep.Find(key + "(" + joined + ")")
+	}
+	if promDegraded {
+		// Any failed PromQL family leaves findings incomplete —
+		// reconciling against them would read the gap as recovery
+		// and wipe gauges still backed by the failed query. Carry
+		// every held series; fresh flags above win on key overlap.
+		// A carried series is still a live finding — Find
+		// accompanies every Carry or the check reports Pass while
+		// the gauge stays 1. And a pod re-flagged THIS sweep under
+		// a different reason-set must not keep its stale series:
+		// the emitted key is findingsKey+"/"+reasons, so keys
+		// sharing the pod's prefix are skipped wholesale.
+		fresh := make(map[string]bool, len(findings))
+		for k := range findings {
+			fresh[k] = true
+		}
+		for k, lv := range p.emitted.Last() {
+			if i := strings.LastIndex(k, "/"); i > 0 && fresh[k[:i]] {
+				continue
+			}
+			rep.Carry(k, lv)
+			rep.Find(k)
+		}
 	}
 	return rep.Result(&p.emitted, rabbitMQQuorumUnhealthyGauge.DeleteLabelValues,
 		"rabbitmq quorum/partition signals: ", ", ")

@@ -183,7 +183,7 @@ func sortKeyRank(v any) int {
 		return 1
 	}
 	switch v.(type) {
-	case *List, []any:
+	case *List, []any, []string:
 		return 2
 	}
 	return 3
@@ -255,6 +255,10 @@ func seqSortFirst(v any) (any, bool) {
 			return t.V[0], true
 		}
 	case []any:
+		if len(t) > 0 {
+			return t[0], true
+		}
+	case []string:
 		if len(t) > 0 {
 			return t[0], true
 		}
@@ -348,6 +352,27 @@ func sortKeyExactCmp(a, b sortKey) (int, bool) {
 	if au, aok := sortKeyAsUint64(a); aok {
 		if bu, bok := sortKeyAsUint64(b); bok {
 			return cmp.Compare(au, bu), true
+		}
+	}
+	// int-vs-float beyond the convertible range: a float64 >= 2^64
+	// ties an integer's float64(num) only with uint64s in
+	// (2^64-2048, 2^64) whose float rounds up to it — and every
+	// such integer is strictly BELOW 2^64, so the float sorts
+	// after it. (f < -2^63 can never tie: ints floor at -2^63.)
+	if a.numKind == numFloat && a.num >= 18446744073709551616.0 {
+		if _, ok := sortKeyAsUint64(b); ok {
+			return 1, true
+		}
+		if _, ok := sortKeyAsInt64(b); ok {
+			return 1, true
+		}
+	}
+	if b.numKind == numFloat && b.num >= 18446744073709551616.0 {
+		if _, ok := sortKeyAsUint64(a); ok {
+			return -1, true
+		}
+		if _, ok := sortKeyAsInt64(a); ok {
+			return -1, true
 		}
 	}
 	return 0, false

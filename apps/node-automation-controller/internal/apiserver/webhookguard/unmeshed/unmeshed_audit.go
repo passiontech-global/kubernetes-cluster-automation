@@ -43,6 +43,11 @@ const (
 	// apiserver in partial outage) would be retried for every
 	// candidate, turning the sweep itself into an API storm.
 	unmeshedDeleteAttempts = 4
+	// unmeshedWorkloadCooldown paces repeat evictions per workload —
+	// a pod recreated unmeshed again (injector selector drift,
+	// webhook flap) must not be deleted every sweep while the same
+	// controller keeps producing the same shape.
+	unmeshedWorkloadCooldown = 30 * time.Minute
 )
 
 // ---------------------------------------------------------------------------
@@ -67,6 +72,11 @@ type Auditor struct {
 	// ("namespace/pod") — deleted pods and pods that gained the
 	// sidecar get their series pruned each sweep.
 	unmeshedEmitted state.GaugeLedger[string]
+	// evictCooldown is the per-workload 30m cooldown for
+	// remediation, keyed on the pod's controller (ns/Kind/name) —
+	// a workload churning unmeshed recreates gets one eviction per
+	// window, not one per pod per sweep.
+	evictCooldown state.CooldownSet
 }
 
 // Sweep audits Running Pods that opted into linkerd
@@ -80,15 +90,15 @@ func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 	g := snap.G
 	log := logf.FromContext(ctx)
 
-	// Census phase (unmeshed_census.go) — the namespace inject map
+	// Census phase (unmeshed_census.go) — the namespace audit map
 	// first: a pod whose namespace cannot be checked must never be
 	// classified.
-	nsInject, err := nsInjectDirectives(snap)
+	nss, err := nsAudits(snap)
 	if err != nil {
 		return err
 	}
 	now := g.Now.Now()
-	unmeshed, candidates, err := a.censusUnmeshed(ctx, snap, nsInject, now, log)
+	unmeshed, candidates, err := a.censusUnmeshed(ctx, snap, nss, now, log)
 	if err != nil {
 		return err
 	}

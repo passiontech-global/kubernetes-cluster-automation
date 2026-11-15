@@ -33,6 +33,21 @@ func (d *Deps) AllPVCs(ctx context.Context) ([]corev1.PersistentVolumeClaim, err
 	return kube.FilterPVCTombstones(ctx, pvcs), nil
 }
 
+// AllPersistentVolumes is the PV census twin — cluster-scoped, so
+// no namespace arg; the stranded-localpv and VA-cleaner checks
+// share one paged read per sweep instead of each listing the whole
+// volume fleet.
+func (d *Deps) AllPersistentVolumes(ctx context.Context) ([]corev1.PersistentVolume, error) {
+	s := sweepSnap(ctx)
+	return s.pvs.get(func(bool) ([]corev1.PersistentVolume, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.PersistentVolumes(d.CS))
+	})
+}
+
 // AllStatefulSets is the statefulset twin.
 func (d *Deps) AllStatefulSets(ctx context.Context) ([]appsv1.StatefulSet, error) {
 	s := sweepSnap(ctx)

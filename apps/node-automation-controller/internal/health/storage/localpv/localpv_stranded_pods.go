@@ -13,7 +13,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -328,21 +327,19 @@ func (p *localPVStrandedCheck) collectLocalPVSnapshot(ctx context.Context) (*loc
 		}
 	}
 
-	// Paged cluster-wide reads — the same full-truth posture as the
-	// masterless EndpointSlice census: a partial read cannot tell
-	// "stranded" from "no data", so a list error aborts the check.
-	snap.pvsByName = map[string]*corev1.PersistentVolume{}
-	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.PersistentVolumes(p.CS),
-		func(items []corev1.PersistentVolume) error {
-			for i := range items {
-				snap.pvsByName[items[i].Name] = &items[i]
-			}
-			return nil
-		})
+	// Sweep-memoized cluster-wide reads — the same full-truth
+	// posture as the masterless EndpointSlice census: a partial
+	// read cannot tell "stranded" from "no data", so a list error
+	// aborts the check. AllPersistentVolumes rides the shared
+	// snapshot memo so a second PV consumer in the same sweep
+	// does not re-list the fleet.
+	pvs, err := p.AllPersistentVolumes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list persistentvolumes: %w", err)
+	}
+	snap.pvsByName = map[string]*corev1.PersistentVolume{}
+	for i := range pvs {
+		snap.pvsByName[pvs[i].Name] = &pvs[i]
 	}
 	snap.pvcsByKey = map[string]*corev1.PersistentVolumeClaim{}
 	pvcs, err := p.AllPVCs(ctx)

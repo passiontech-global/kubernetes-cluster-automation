@@ -74,6 +74,17 @@ const walkMaxDepth = 200
 // rather than hang+OOM on the append.
 const rangeMaxOut = 1_000_000
 
+// maxStringBytes bounds a single produced string — ~ and +
+// concatenation, |join, |regex_replace and the Render output
+// buffer. A template loop growing a string 16MiB per iteration is
+// an OOM, not a render; the cap fails the expression instead.
+const maxStringBytes = 16 << 20
+
+// maxSeqElems bounds list growth from ~ / + concat, .append(),
+// |join's element count and range() — the sequence-level twin of
+// maxStringBytes (rangeMaxOut already covers range() itself).
+const maxSeqElems = 1_000_000
+
 // Env carries render-time hooks.
 type Env struct {
 	// FileLookup resolves lookup('file'|'ansible.builtin.file', path).

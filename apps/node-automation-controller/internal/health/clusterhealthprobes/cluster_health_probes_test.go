@@ -280,8 +280,10 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// Plus cilium-l2-lease-guard and apiserver-relist-storm-breaker /
 	// argocd-agent-spin / apiserver-node-reachability added to bring
 	// fleetCheckRegs to parity with the 56-check registry -> twenty-nine total.
-	if got := errCount() - before; got != 29 {
-		t.Fatalf("run errors delta = %v, want 29", got)
+	// cilium-bpf-map-pressure now reports Infra (not silent pass) on
+	// the Prometheus outage this fake produces -> thirty total.
+	if got := errCount() - before; got != 30 {
+		t.Fatalf("run errors delta = %v, want 30", got)
 	}
 }
 

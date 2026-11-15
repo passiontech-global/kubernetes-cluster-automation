@@ -146,12 +146,12 @@ type kernelLine struct {
 // past the cap is still replay, not live history (a stale hung-task
 // line would otherwise latch a PERMANENT KernelDeadlock on a fresh
 // agent start). Journald fallback: permanent once kmsg cannot be
-// opened, fed by the shared journalwatch mux — the pending queue's
-// lookback age filter below is the replay bound.
+// opened, fed by the dedicated kernelJournal mux — the pending
+// queue's lookback age filter below is the replay bound.
 func (m *Monitor) kernelLines(ctx context.Context) ([]kernelLine, bool, error) {
 	for {
 		if m.kmsgJournalMode {
-			entries, err := m.pollJournal(ctx, journalSubKernel)
+			entries, err := m.pollKernelJournal(ctx)
 			if err != nil {
 				return nil, false, err
 			}
@@ -253,7 +253,7 @@ func (m *Monitor) SyncKernelMonitor(ctx context.Context, s Sink) error {
 	// journal-side equivalent). kmsg records have entry==nil: ring
 	// reads carry no cursor, so a failed emit there is best-effort
 	// loss, same as before the mux.
-	if err := m.journal.Requeue(journalSubKernel, failed); err != nil {
+	if err := m.kernelJournal.Requeue(journalSubKernel, failed); err != nil {
 		logger().Error("nodereporter: journal requeue failed",
 			"subscriber", journalSubKernel, "error", err)
 	}

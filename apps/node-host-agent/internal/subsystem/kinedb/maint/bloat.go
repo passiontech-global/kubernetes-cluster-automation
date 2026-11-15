@@ -87,7 +87,7 @@ func (m *Maint) urgentReindex(ctx context.Context, pg, user, pass string,
 	// shape (try-lock → REINDEX TABLE CONCURRENTLY → unlock); a busy
 	// lock skips WITHOUT stamping the cooldown — the compact ends in
 	// VACUUM anyway and the bloat persists (heavy-block parity).
-	if pout, perr := m.d.PsqlScript(ctx, pg, user, pass, m.buildLockProbe()); perr != nil {
+	if pout, perr := m.d.PsqlScript(ctx, pg, user, pass, kdeps.AppNameMaint, m.buildLockProbe()); perr != nil {
 		note(fmt.Sprintf("urgent-reindex-lock-probe-fail: %v", perr))
 		res.urgentState = "skipped-lock-busy"
 		return
@@ -98,7 +98,7 @@ func (m *Maint) urgentReindex(ctx context.Context, pg, user, pass string,
 		return
 	}
 	t0 := m.d.Cfg.Clock.Now()
-	sout, serr := m.d.PsqlScript(ctx, pg, user, pass,
+	sout, serr := m.d.PsqlScript(ctx, pg, user, pass, kdeps.AppNameMaint,
 		m.buildHeavyScript(false))
 	if serr != nil {
 		if m.d.LongBudgetExceeded(t0, serr) {

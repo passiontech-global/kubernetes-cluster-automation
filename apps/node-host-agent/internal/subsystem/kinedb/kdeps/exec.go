@@ -11,8 +11,10 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 )
 
@@ -50,11 +52,21 @@ func (d *Deps) ExecCombined(ctx context.Context, argv []string) (string, error) 
 
 // ExecLongEnv runs argv under the maintenance budget with extra
 // child environment (see ExecEnv — the only channel a secret may
-// take).
+// take). Every long-budget exec is a legitimately long-running
+// child (compact session, REINDEX/FREEZE script, pg_repack,
+// pg_dump, backup cp) whose runtime can outlive the loop's own
+// liveness budget — RunWithHeartbeat keeps stamping the ctx's
+// beat every minute so /healthz never mistakes a healthy 20-minute
+// pg_repack for a wedge.
 func (d *Deps) ExecLongEnv(ctx context.Context, env, argv []string, stdin string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, d.Cfg.LongCmdTimeout)
 	defer cancel()
-	return d.Cfg.Run(cctx, env, argv, stdin)
+	var out string
+	var err error
+	cycle.RunWithHeartbeat(cctx, time.Minute, func(hctx context.Context) {
+		out, err = d.Cfg.Run(hctx, env, argv, stdin)
+	})
+	return out, err
 }
 
 // DiscoverContainer returns preferred when it exists, else the first
@@ -82,15 +94,50 @@ func (d *Deps) DiscoverContainer(ctx context.Context, preferred string, match, e
 }
 
 // PGContainerName resolves the postgres container — configured name
-// first, then the percona|postgres auto-discovery.
+// first, then the percona|postgres auto-discovery. The result rides
+// the Deps name memo (nameMemoTTL) so coincident probe/compact/maint
+// cycles share one inspect+ps resolution instead of each paying it.
 func (d *Deps) PGContainerName(ctx context.Context) string {
-	return d.DiscoverContainer(ctx, d.Cfg.PGContainer, rePGName, rePGExclude)
+	return d.memoizedContainerName(ctx, "pg",
+		func(ctx context.Context) string {
+			return d.DiscoverContainer(ctx, d.Cfg.PGContainer, rePGName, rePGExclude)
+		})
 }
 
 // PGBContainerName resolves the pgbouncer container — configured
-// name first, then the pgbouncer|pgb auto-discovery.
+// name first, then the pgbouncer|pgb auto-discovery (same memo).
 func (d *Deps) PGBContainerName(ctx context.Context) string {
-	return d.DiscoverContainer(ctx, d.Cfg.PGBouncerContainer, rePGBName, nil)
+	return d.memoizedContainerName(ctx, "pgb",
+		func(ctx context.Context) string {
+			return d.DiscoverContainer(ctx, d.Cfg.PGBouncerContainer, rePGBName, nil)
+		})
+}
+
+// memoizedContainerName serves key's resolved name from the Deps
+// memo while it is younger than nameMemoTTL, resolving through fn
+// otherwise. The memo keys on the ROLE ("pg"/"pgb"), not the
+// configured name — a cfg re-point mid-process still resolves
+// through fn's fresh DiscoverContainer call on expiry, and the
+// memo entry simply carries whichever name that returned.
+func (d *Deps) memoizedContainerName(ctx context.Context, key string,
+	fn func(context.Context) string) string {
+	d.nameMu.Lock()
+	defer d.nameMu.Unlock()
+	if d.nameCache != nil {
+		if m, ok := d.nameCache[key]; ok &&
+			d.Cfg.Clock.Now().Sub(m.at) < nameMemoTTL {
+			return m.name
+		}
+	}
+	name := fn(ctx)
+	if name == "" {
+		return name // a failed discovery must not pin for the TTL
+	}
+	if d.nameCache == nil {
+		d.nameCache = map[string]nameMemo{}
+	}
+	d.nameCache[key] = nameMemo{name: name, at: d.Cfg.Clock.Now()}
+	return name
 }
 
 // ContainerRunning reports whether `Runtime inspect -f
@@ -176,22 +223,28 @@ func (d *Deps) psqlExecArgs(pg, user string, interactive bool,
 	return append(argv, extra...)
 }
 
-// PGAPPNAME is the application_name every maint/compact-side psql
-// session presents in pg_stat_activity — the marker the probe's
-// stuck-session reaper exempts (stuckSessionPredicate's
-// application_name NOT IN ('pg_repack', 'pg_dump',
-// 'node_host_agent_maint')). Without it our own psql children show
-// up as application_name='psql' and the reaper would terminate the
-// very maintenance/remediation sessions it shares the DB with.
-const PGAPPNAME = "node_host_agent_maint"
+// Per-loop application_name markers every psql session presents in
+// pg_stat_activity. One name per loop (probe/compact/maint) so the
+// orphan-session reaper kills only ITS OWN loop's timed-out
+// backends — a shared name let the compact guard terminate a
+// healthy maint pg_repack (and vice versa). The probe's
+// stuck-session reaper exempts all three (stuckSessionPredicate's
+// application_name NOT IN list); without them our own psql children
+// show up as application_name='psql' and the reaper would terminate
+// the very maintenance/remediation sessions it shares the DB with.
+const (
+	AppNameProbe   = "nha_probe"
+	AppNameCompact = "nha_compact"
+	AppNameMaint   = "nha_maint"
+)
 
 // PsqlPassEnv is the env half of the password hand-off — paired with
 // the bare `-e PGPASSWORD` in PsqlArgs/the exec call sites. It also
-// pins PGAPPNAME (see PGAPPNAME): the env is the only channel a
-// dynamic value may take, and the application_name marker must ride
-// every session built from this helper.
-func PsqlPassEnv(pass string) []string {
-	return []string{"PGPASSWORD=" + pass, "PGAPPNAME=" + PGAPPNAME}
+// pins PGAPPNAME (see the AppName* consts): the env is the only
+// channel a dynamic value may take, and the application_name marker
+// must ride every session built from this helper.
+func PsqlPassEnv(pass, appName string) []string {
+	return []string{"PGPASSWORD=" + pass, "PGAPPNAME=" + appName}
 }
 
 const (
@@ -232,13 +285,13 @@ func (d *Deps) maintPGOptions() string {
 // timeout hardening). Restricted to psql: pg_dump is also a libpq
 // client but its per-table COPY streams must not inherit a
 // statement cap, so backup.go keeps PsqlPassEnv.
-func (d *Deps) PsqlMaintEnv(pass string) []string {
-	return append(PsqlPassEnv(pass), "PGOPTIONS="+d.maintPGOptions())
+func (d *Deps) PsqlMaintEnv(pass, appName string) []string {
+	return append(PsqlPassEnv(pass, appName), "PGOPTIONS="+d.maintPGOptions())
 }
 
 // PsqlQuery runs one statement with -tAc (unaligned, tuples only).
-func (d *Deps) PsqlQuery(ctx context.Context, pg, user, pass, sql string) (string, error) {
-	return d.ExecEnv(ctx, PsqlPassEnv(pass), d.PsqlArgs(pg, user, false, "-tAc", sql), "")
+func (d *Deps) PsqlQuery(ctx context.Context, pg, user, pass, appName, sql string) (string, error) {
+	return d.ExecEnv(ctx, PsqlPassEnv(pass, appName), d.PsqlArgs(pg, user, false, "-tAc", sql), "")
 }
 
 // PsqlScript runs a multi-statement script in ONE psql session via
@@ -246,8 +299,8 @@ func (d *Deps) PsqlQuery(ctx context.Context, pg, user, pass, sql string) (strin
 // chunk loop + vacuum. Every caller is maintenance-class work
 // (compact guard, heavy reindex/freeze, lock probes, dead-tuple
 // vacuum), so the session carries the PGOPTIONS timeouts.
-func (d *Deps) PsqlScript(ctx context.Context, pg, user, pass, script string) (string, error) {
-	return d.ExecLongEnv(ctx, d.PsqlMaintEnv(pass), d.PsqlMaintArgs(pg, user, true,
+func (d *Deps) PsqlScript(ctx context.Context, pg, user, pass, appName, script string) (string, error) {
+	return d.ExecLongEnv(ctx, d.PsqlMaintEnv(pass, appName), d.PsqlMaintArgs(pg, user, true,
 		"-v", "ON_ERROR_STOP=1", "-f", "-"), script)
 }
 
@@ -264,19 +317,30 @@ func (d *Deps) LongBudgetExceeded(start time.Time, err error) bool {
 }
 
 // ReapOrphanedMaintSessions terminates maintenance backends carrying
-// our own application_names that are at least a minute old — the
-// exec-timeout backstop: when `runtime exec` is killed client-side
-// the server-side psql/pg_repack session can survive it (the runtime
-// does not always propagate the kill), still holding the advisory
-// lock or a pg_repack shadow table. The age guard spares a session
-// that started after the timeout — a concurrent compact's own psql
-// carries the same app_name — and pid<>pg_backend_pid() spares the
-// reaper query itself. Best-effort: callers note the error.
-func (d *Deps) ReapOrphanedMaintSessions(ctx context.Context, pg, user, pass string) (int, error) {
-	out, err := d.PsqlQuery(ctx, pg, user, pass,
+// the CALLING loop's own application_names that are at least a
+// minute old — the exec-timeout backstop: when `runtime exec` is
+// killed client-side the server-side psql/pg_repack session can
+// survive it (the runtime does not always propagate the kill),
+// still holding the advisory lock or a pg_repack shadow table.
+// apps scopes the kill to the caller's loop: the maint loop passes
+// its own name plus the child binaries it spawns (pg_repack,
+// pg_dump), the compact loop passes its own — a shared name let one
+// loop's timeout reap a sibling's healthy session. The age guard
+// spares a session that started after the timeout, and
+// pid<>pg_backend_pid() spares the reaper query itself.
+// Best-effort: callers note the error.
+func (d *Deps) ReapOrphanedMaintSessions(ctx context.Context, pg, user, pass string, apps ...string) (int, error) {
+	if len(apps) == 0 {
+		return 0, nil
+	}
+	quoted := make([]string, len(apps))
+	for i, a := range apps {
+		quoted[i] = "'" + strings.ReplaceAll(a, "'", "''") + "'"
+	}
+	out, err := d.PsqlQuery(ctx, pg, user, pass, AppNameMaint,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "+
 			"WHERE datname IN ('postgres', 'kine') "+
-			"AND application_name IN ('pg_repack', 'pg_dump', '"+PGAPPNAME+"') "+
+			"AND application_name IN ("+strings.Join(quoted, ", ")+") "+
 			"AND backend_start < now() - interval '1 minute' "+
 			"AND pid <> pg_backend_pid()")
 	if err != nil {
@@ -299,4 +363,155 @@ func (d *Deps) EmitTextfile(name string, p *promfile.Builder) {
 		func(_, name string, err error) {
 			logger().Warn("kinedb textfile write failed", "file", name, "error", err)
 		})
+}
+
+// holdStmtTimeoutMargin keeps the hold session's server-side
+// statement bound ABOVE LongCmdTimeout: the session's pg_sleep is
+// a single 86400s statement that must outlive the caller's whole
+// work window (pg_repack runs up to LongCmdTimeout) — the
+// maintenance margin (LongCmdTimeout-1m) would abort the sleep
+// BEFORE the work budget ends and drop the advisory lock while
+// pg_repack is still running.
+const holdStmtTimeoutMargin = 5 * time.Minute
+
+// holdNonce disambiguates concurrent HoldAdvisoryLock sessions —
+// each hold presents application_name "<app>-hold-<pid>-<n>" so the
+// confirmation poll and release()'s pg_terminate_backend hit OUR
+// backend exactly, never a sibling loop's session.
+var holdNonce atomic.Uint64
+
+// holdPGOptions is maintPGOptions with statement_timeout lifted
+// past LongCmdTimeout (see holdStmtTimeoutMargin).
+func (d *Deps) holdPGOptions() string {
+	stmt := d.Cfg.LongCmdTimeout + holdStmtTimeoutMargin
+	return fmt.Sprintf("-c statement_timeout=%d -c lock_timeout=%d",
+		stmt.Milliseconds(), maintLockTimeout.Milliseconds())
+}
+
+// HoldAdvisoryLock takes the shared maintenance advisory lock
+// (Cfg.AdvisoryLockID, 20260921) on a DEDICATED psql session and
+// returns a release func — for work that cannot carry the lock
+// inside its own session script (pg_repack/pg_dump are separate
+// binaries, not psql statements). The hold session runs
+// `pg_try_advisory_lock` + `pg_sleep(86400)` under a nonce
+// application_name: try_lock never creates a granted=false
+// pg_locks row (unlike the blocking pg_advisory_lock, whose
+// pending row previously read as "held" to the poll and let a
+// second maint run pg_repack ON TOP of the compact guard), and a
+// busy lock exits the session immediately instead of queueing
+// server-side. Acquisition is confirmed by polling pg_locks for
+// OUR backend's GRANTED row (classid=0/objsubid=1 pin the
+// single-bigint lock form) before returning held=true — callers
+// must skip, not queue. The poll is bounded by holdTimeout;
+// release() terminates the hold backend by application_name so
+// the lock drops NOW rather than whenever the orphaned psql's
+// pg_sleep statement_timeout would fire.
+func (d *Deps) HoldAdvisoryLock(ctx context.Context, pg, user, pass,
+	appName string, holdTimeout time.Duration) (release func(), held bool, err error) {
+
+	holdApp := fmt.Sprintf("%s-hold-%d-%d", appName, os.Getpid(),
+		holdNonce.Add(1))
+	script := fmt.Sprintf(
+		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS hold_got\n"+
+			"\\gset\n\\if :hold_got\n"+
+			"SELECT pg_sleep(86400);\n"+
+			"\\else\n\\echo 'advisory-lock-busy'\n\\endif\n",
+		d.Cfg.AdvisoryLockID)
+
+	holdCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// The hold must outlive the caller's whole work window —
+		// ExecLongEnv's fixed LongCmdTimeout budget would expire
+		// FIRST (the hold starts before the work it guards) and
+		// drop the lock early, so the session gets its own
+		// LongCmdTimeout+margin ctx with the same heartbeat
+		// liveness stamp.
+		cctx, ccancel := context.WithTimeout(holdCtx,
+			d.Cfg.LongCmdTimeout+holdStmtTimeoutMargin)
+		defer ccancel()
+		cycle.RunWithHeartbeat(cctx, time.Minute, func(hctx context.Context) {
+			_, _ = d.Cfg.Run(hctx,
+				append(PsqlPassEnv(pass, holdApp),
+					"PGOPTIONS="+d.holdPGOptions()),
+				d.PsqlMaintArgs(pg, user, true, "-f", "-"), script)
+		})
+	}()
+
+	releaseFn := func() {
+		// Terminate OUR hold backend BEFORE cancelling the exec —
+		// cancel alone kills only the host-side docker/podman
+		// exec; the server-side psql would keep sleeping until its
+		// statement_timeout and squat on the advisory lock the
+		// whole time, blocking compact and emergency VACUUM.
+		// WithoutCancel keeps the kill working when the caller's
+		// ctx already expired; ExecEnv's own CmdTimeout still
+		// bounds the query.
+		_, _ = d.PsqlQuery(context.WithoutCancel(ctx), pg, user, pass,
+			AppNameMaint, fmt.Sprintf(
+				"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "+
+					"WHERE application_name = '%s' AND pid <> pg_backend_pid()",
+				strings.ReplaceAll(holdApp, "'", "''")))
+		cancel()
+		<-done
+	}
+
+	// lockHeld reports whether OUR nonce-named backend holds the
+	// GRANTED advisory lock — classid=0/objsubid=1 pin the
+	// single-bigint form, granted excludes waiters.
+	lockHeld := func() bool {
+		out, qerr := d.PsqlQuery(ctx, pg, user, pass, AppNameMaint, fmt.Sprintf(
+			"SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a "+
+				"ON l.pid = a.pid WHERE l.locktype = 'advisory' "+
+				"AND l.classid = 0 AND l.objid = %d AND l.objsubid = 1 "+
+				"AND l.granted AND a.application_name = '%s'",
+			d.Cfg.AdvisoryLockID, strings.ReplaceAll(holdApp, "'", "''")))
+		if qerr != nil {
+			return false
+		}
+		n := strings.TrimSpace(FirstLine(out))
+		return n != "" && n != "0"
+	}
+
+	// The bound is an ITERATION count, not the injected clock: the
+	// poll sleeps are real time and a frozen test clock must not
+	// turn the wait into an infinite loop.
+	polls := int(holdTimeout / (500 * time.Millisecond))
+	if polls < 1 {
+		polls = 1
+	}
+	for i := 0; i < polls; i++ {
+		// A dead hold session can never hold the lock — check the
+		// lock row once more (a just-released row can linger a
+		// poll) then bail instead of sleeping out the budget.
+		select {
+		case <-done:
+			if lockHeld() {
+				return releaseFn, true, nil
+			}
+			cancel()
+			<-done
+			return nil, false, nil
+		default:
+		}
+		if lockHeld() {
+			return releaseFn, true, nil
+		}
+		if ctx.Err() != nil {
+			cancel()
+			<-done
+			return nil, false, ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			cancel()
+			<-done
+			return nil, false, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	return nil, false, nil
 }

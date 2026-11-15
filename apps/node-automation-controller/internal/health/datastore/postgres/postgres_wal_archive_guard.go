@@ -155,6 +155,16 @@ var (
 		Help: "Retained WAL bytes behind an inactive replication slot (pg_replication_slots_active==0) past the 5GiB floor — the bloat that precedes the pg_wal disk-full crash.",
 	}, []string{"namespace", "cluster", "slot"})
 
+	// walPromReasons are the finding reasons Prometheus alone can
+	// produce — the carry pass freezes exactly these series while a
+	// query is degraded; CR-condition and pod-log reasons re-derive
+	// from Kubernetes every sweep.
+	walPromReasons = map[string]bool{
+		"archiver_failing":    true,
+		"inactive_slot":       true,
+		"wal_volume_pressure": true,
+	}
+
 	// cnpg-health — a CloudNativePG Cluster.postgresql.cnpg.io whose
 	// failover never lands (phase wedged Failing over / Waiting for
 	// the instances to become active), whose ready instances stay
@@ -345,6 +355,43 @@ func (p *postgresWALArchiveGuardCheck) Run(ctx context.Context) probefw.Result {
 	for k, f := range s.findings {
 		rep.Emit(postgresWALUnhealthyGauge, k,
 			[]string{f.ns, f.cluster, f.reason}, k)
+	}
+	if s.promSlotDegraded || s.promVolumeDegraded {
+		// A degraded Prometheus family cannot prove its signals
+		// went quiet — freeze last sweep's series for THAT family
+		// rather than letting Close read the outage as recovery.
+		// K8s-sourced findings (CR conditions, pod logs) still
+		// emit fresh above, and a family whose queries ALL
+		// succeeded keeps reconciling normally: its absent series
+		// ARE proof of recovery.
+		reasonDegraded := func(reason string) bool {
+			switch reason {
+			case "archiver_failing", "inactive_slot":
+				return s.promSlotDegraded
+			case "wal_volume_pressure":
+				return s.promVolumeDegraded
+			}
+			return false
+		}
+		for k, lv := range p.emitted.Last() {
+			reason := k[strings.LastIndex(k, "/")+1:]
+			if !walPromReasons[reason] || !reasonDegraded(reason) {
+				continue
+			}
+			if _, fresh := s.findings[k]; fresh {
+				continue
+			}
+			rep.Carry(k, lv)
+			rep.Find(k + " (carried — prometheus unavailable)")
+		}
+		if s.promSlotDegraded {
+			// The slot-bloat gauge is entirely slot-family
+			// Prometheus-derived — carry every held tuple while
+			// that channel is degraded.
+			for k, lv := range p.emittedSlot.Last() {
+				s.slotRep.Carry(k, lv)
+			}
+		}
 	}
 	s.slotRep.Close(&p.emittedSlot, postgresInactiveSlotWALGauge.DeleteLabelValues)
 	return rep.Result(&p.emitted, postgresWALUnhealthyGauge.DeleteLabelValues,

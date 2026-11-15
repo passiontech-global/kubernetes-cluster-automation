@@ -152,20 +152,35 @@ func metaUnsupported(err error) bool {
 }
 
 // listPartialViaMeta pages the metadata client. PartialObjectMetadataList
-// embeds ListMeta, so GetContinue supplies the next-page token.
+// embeds ListMeta, so GetContinue supplies the next-page token. An
+// unset Limit takes the shared page bound — metadata reads are cheap
+// but an unbounded first page still pins every object's ObjectMeta
+// across the wire at once. A 410 Gone mid-walk restarts once from
+// the first page (the continue token's RV expired — same contract
+// as ListAll).
 func listPartialViaMeta(ctx context.Context, meta metadata.Interface,
 	gvr schema.GroupVersionResource, namespace string,
 	opts metav1.ListOptions) ([]metav1.PartialObjectMetadata, error) {
 
+	if opts.Limit <= 0 {
+		opts.Limit = DefaultListPageSize
+	}
 	getter := meta.Resource(gvr)
 	var ri metadata.ResourceInterface = getter
 	if namespace != "" {
 		ri = getter.Namespace(namespace)
 	}
 	var out []metav1.PartialObjectMetadata
+	retried := false
 	for {
 		list, err := ri.List(ctx, pageOpts(opts))
 		if err != nil {
+			if !retried && apierrors.IsResourceExpired(err) {
+				retried = true
+				opts.Continue = ""
+				out = nil
+				continue
+			}
 			return nil, err
 		}
 		out = append(out, list.Items...)
@@ -213,9 +228,16 @@ func listPartialViaDynamic(ctx context.Context, dyn dynamic.Interface,
 	if namespace != "" {
 		ri = getter.Namespace(namespace)
 	}
+	retried := false
 	for {
 		list, lerr := ri.List(ctx, pageOpts(opts))
 		if lerr != nil {
+			if !retried && apierrors.IsResourceExpired(lerr) {
+				retried = true
+				opts.Continue = ""
+				out = nil
+				continue
+			}
 			return nil, lerr
 		}
 		for i := range list.Items {

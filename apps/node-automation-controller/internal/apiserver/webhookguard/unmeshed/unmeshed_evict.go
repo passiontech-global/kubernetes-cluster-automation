@@ -15,6 +15,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -92,7 +93,19 @@ func (a *Auditor) evictCandidates(ctx context.Context, g *guardstate.Guard,
 		if deleted >= unmeshedDeleteCap || attempts >= unmeshedDeleteAttempts {
 			break
 		}
-		attempts++
+		// Per-workload cooldown: pods sharing a controller share one
+		// stamp — a workload churning unmeshed recreates is paced to
+		// one eviction per window instead of one per pod per sweep.
+		wlKey := ""
+		if owner := metav1.GetControllerOf(p); owner != nil {
+			wlKey = p.Namespace + "/" + owner.Kind + "/" + owner.Name
+		}
+		if wlKey != "" && a.evictCooldown.CooledDown(wlKey,
+			unmeshedWorkloadCooldown, now) {
+			log.Info("DEFER: workload inside unmeshed cooldown — skipping eviction",
+				"pod", p.Namespace+"/"+p.Name, "workload", wlKey)
+			continue
+		}
 		log.Info("EVICT: unmeshed pod — owner controller recreates it meshed",
 			"pod", p.Namespace+"/"+p.Name,
 			"age", now.Sub(p.CreationTimestamp.Time).Truncate(time.Second))
@@ -107,11 +120,15 @@ func (a *Auditor) evictCandidates(ctx context.Context, g *guardstate.Guard,
 		_, refused, err := heal.EvictPod(ctx, g.CS, nil, "", p, now)
 		if refused {
 			// HTTP 429 / workload disruption / local remediation hold:
-			// deferral, not a failure.
+			// deferral, not a failure — and NOT an attempt: a PDB at
+			// its floor refused before any disruption was delivered,
+			// so it must not burn the per-sweep attempt budget that
+			// exists to bound real API churn.
 			log.Info("DEFER: PDB refused eviction of unmeshed pod — keeping pod alive",
 				"pod", p.Namespace+"/"+p.Name)
 			continue
 		}
+		attempts++
 		if err != nil {
 			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 				// The pod was deleted under us or recreated since
@@ -130,6 +147,9 @@ func (a *Auditor) evictCandidates(ctx context.Context, g *guardstate.Guard,
 		}
 		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues(p.Namespace).Inc()
 		deleted++
+		if wlKey != "" {
+			a.evictCooldown.Stamp(wlKey, now)
+		}
 	}
 	// The pass delivered no heal when NOTHING evicted and no
 	// actuation even errored — every attempt PDB-refused, or the

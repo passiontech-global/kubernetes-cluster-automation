@@ -1185,3 +1185,57 @@ func TestDeadNodeSweeperFencedWithoutSNRSeriesPrunedOnNodeGone(t *testing.T) {
 		t.Fatalf("fence counter series survived its node: %d series left", got)
 	}
 }
+
+// volumeAttachmentRWO's access-mode resolution: RWOP counts as
+// single-writer just like RWO (a not-really-dead node breaks it just
+// as loudly), and every unresolvable shape fails CLOSED — a missing
+// PV, empty modes, or no volume source must veto the fence rather
+// than wave a single-writer volume through.
+func TestVolumeAttachmentRWOFailsClosed(t *testing.T) {
+	pvRef := func(name string) *storagev1.VolumeAttachment {
+		return &storagev1.VolumeAttachment{
+			Spec: storagev1.VolumeAttachmentSpec{
+				Source: storagev1.VolumeAttachmentSource{
+					PersistentVolumeName: ptr.To(name),
+				},
+			},
+		}
+	}
+	inline := func(modes ...corev1.PersistentVolumeAccessMode) *storagev1.VolumeAttachment {
+		return &storagev1.VolumeAttachment{
+			Spec: storagev1.VolumeAttachmentSpec{
+				Source: storagev1.VolumeAttachmentSource{
+					InlineVolumeSpec: &corev1.PersistentVolumeSpec{
+						AccessModes: modes,
+					},
+				},
+			},
+		}
+	}
+	census := map[string][]corev1.PersistentVolumeAccessMode{
+		"pv-rwop":  {corev1.ReadWriteOncePod},
+		"pv-rox":   {corev1.ReadWriteMany},
+		"pv-empty": {},
+	}
+	for _, tc := range []struct {
+		name string
+		va   *storagev1.VolumeAttachment
+		want bool
+	}{
+		{"pv-ref-rwop", pvRef("pv-rwop"), true},
+		{"pv-ref-rox", pvRef("pv-rox"), false},
+		{"pv-ref-missing-from-census", pvRef("pv-ghost"), true},
+		{"pv-ref-empty-modes", pvRef("pv-empty"), true},
+		{"inline-rwop", inline(corev1.ReadWriteOncePod), true},
+		{"inline-rwo", inline(corev1.ReadWriteOnce), true},
+		{"inline-rox", inline(corev1.ReadWriteMany), false},
+		{"inline-empty-modes", inline(), true},
+		{"no-source", &storagev1.VolumeAttachment{}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := volumeAttachmentRWO(tc.va, census); got != tc.want {
+				t.Fatalf("volumeAttachmentRWO = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

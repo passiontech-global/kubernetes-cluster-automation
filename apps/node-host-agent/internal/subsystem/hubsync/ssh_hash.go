@@ -14,6 +14,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
@@ -223,6 +224,12 @@ func putAtomic(ctx context.Context, c Conn, remotePath string, r io.Reader, mode
 // next dial without a pod restart.
 type sshDialer struct {
 	cfg sshclient.Config
+	// opTimeout is the absolute budget for one session BODY
+	// (Config.TargetTimeout) — distinct from cfg.Timeout, the
+	// dial/handshake/channel-open budget. streamCmd slides an
+	// idle deadline per written chunk under this cap so a slow
+	// WAN upload is not killed by the 15s dial bound.
+	opTimeout time.Duration
 	// policy resolves host-key trust per dialed hostname — pin
 	// spec (single or host=fp map), operator known_hosts, and the
 	// persistent TOFU store (hostkeys.go). nil only in hand-built

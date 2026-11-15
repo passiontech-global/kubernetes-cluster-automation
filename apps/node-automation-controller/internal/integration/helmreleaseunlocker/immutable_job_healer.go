@@ -33,9 +33,18 @@ const (
 	immutableJobHealAnno = kube.AnnoLastImmutableJobHeal
 )
 
-// immutableJobRe extracts the Job name out of the kustomize apply
-// error `Job.batch "<name>" is invalid: ... field is immutable`.
-var immutableJobRe = regexp.MustCompile(`Job\.batch "([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)" is invalid`)
+// immutableJobRe extracts the Job reference out of the kustomize
+// apply error `Job.batch "<name>" is invalid: ... field is
+// immutable`. The apiserver qualifies the name as "ns/name" when the
+// request carried a namespace — capture both halves so the healer
+// targets the namespace the apply actually failed in, not a guess.
+var immutableJobRe = regexp.MustCompile(`Job\.batch "([a-z0-9](?:[a-z0-9.-]*/)?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)" is invalid`)
+
+// fluxJobRefRe catches Flux's resource-ref rendering `Job/<ns>/<name>`
+// inside Ready=False messages — kustomize-controller reports apply
+// failures against the inventory ref, which always carries the
+// namespace the object lives in.
+var fluxJobRefRe = regexp.MustCompile(`\bJob/([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)/([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)\b`)
 
 // healImmutableJobs scans Kustomizations (listed by the caller —
 // shared with the artifact-source healer so the sweep pages it
@@ -66,6 +75,17 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 		if m == nil {
 			continue
 		}
+		// The captured ref is "name" or "ns/name" — split it so the
+		// namespace the apiserver rejected is used verbatim.
+		jobRefNS, jobName := "", m[1]
+		if i := strings.LastIndex(jobName, "/"); i >= 0 {
+			jobRefNS, jobName = jobName[:i], jobName[i+1:]
+		}
+		if fm := fluxJobRefRe.FindStringSubmatch(c.Message); fm != nil {
+			// Flux's `Job/<ns>/<name>` ref is authoritative when
+			// present — it names the object the apply targeted.
+			jobRefNS, jobName = fm[1], fm[2]
+		}
 		since := c.LastTransitionTime
 		if since.IsZero() {
 			since = k.GetCreationTimestamp().Time
@@ -79,17 +99,22 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 			immutableJobHealAnno, key, immutableJobCooldown, now) {
 			continue
 		}
-		// The Job lives where the manifests apply — spec.targetNamespace
-		// wins, else the Kustomization's own namespace.
+		// The Job lives where the manifests apply — the namespace
+		// the Flux/apiserver message named wins; absent that,
+		// spec.targetNamespace wins, else the Kustomization's own
+		// namespace.
 		jobNS := k.GetNamespace()
 		if tns, _ := kube.NestedString(k.Object, "spec", "targetNamespace"); tns != "" {
 			jobNS = tns
 		}
-		job, err := u.cs.BatchV1().Jobs(jobNS).Get(ctx, m[1], metav1.GetOptions{})
+		if jobRefNS != "" {
+			jobNS = jobRefNS
+		}
+		job, err := u.cs.BatchV1().Jobs(jobNS).Get(ctx, jobName, metav1.GetOptions{})
 		gone, err := kube.ConfirmAbsent(err)
 		if err != nil {
 			metrics.IncError(u.queue)
-			log.Error(err, "immutable-job lookup failed", "kustomization", key, "job", jobNS+"/"+m[1])
+			log.Error(err, "immutable-job lookup failed", "kustomization", key, "job", jobNS+"/"+jobName)
 			continue
 		}
 		if gone {

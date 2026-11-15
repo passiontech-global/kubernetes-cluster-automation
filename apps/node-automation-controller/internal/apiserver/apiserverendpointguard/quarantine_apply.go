@@ -23,6 +23,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
@@ -102,8 +103,30 @@ func (g *apiServerEndpointGuard) applyEndpointsQuarantine(ctx context.Context, l
 	// otherwise churn a no-op Endpoints update every sweep. A
 	// reconciler-wiped annotation still diffs and gets restored.
 	if !reflect.DeepEqual(mutated.Object, ep.Object) {
-		if _, err := g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
-			Update(ctx, mutated, metav1.UpdateOptions{}); err != nil {
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Re-GET inside the retry: the endpointslicemirroring
+			// controller (and on >=1.33 the apiserver's own
+			// reconciler) rewrites this object constantly — a
+			// resourceVersion conflict must re-read and re-apply
+			// the quarantine diff, not just replay the stale body.
+			fresh, err := g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
+				Get(ctx, endpointGuardName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			m := fresh.DeepCopy()
+			for _, ip := range toRemove {
+				removeEndpointIP(m, ip)
+			}
+			for _, ip := range toAdd {
+				addEndpointIP(m, ip)
+			}
+			writeQuarantineAnnotation(m, quarantinedIPs)
+			_, err = g.dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
+				Update(ctx, m, metav1.UpdateOptions{})
+			return err
+		})
+		if err != nil {
 			return fmt.Errorf("update endpoints/%s: %w", endpointGuardName, err)
 		}
 	}

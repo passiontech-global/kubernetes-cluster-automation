@@ -41,10 +41,11 @@ func TestPortsGuardInetTableTightened(t *testing.T) {
 		t.Fatalf("ports guard not on the inet table:\n%s", portsNFT)
 	}
 	// The blanket pod/VLAN accepts must stay gone — the ONLY pod-iface
-	// rules allowed are the dport-scoped hubble-peer exemptions.
-	for _, iface := range []string{`iifname "cilium*"`, `iifname "lxc*"`, `iifname "cali*"`} {
+	// rules allowed are the dport-scoped exemptions (pod veths AND the
+	// CNI tunnel devices pods legitimately arrive on).
+	for _, iface := range hostPortsGuardPodIFaces {
 		for line := range strings.SplitSeq(portsNFT, "\n") {
-			if strings.Contains(line, iface) && !strings.Contains(line, "tcp dport") {
+			if strings.Contains(line, fmt.Sprintf("iifname %q", iface)) && !strings.Contains(line, "tcp dport") {
 				t.Fatalf("ports guard still opens %s unscoped — the tenant-pod path the roadmap closes:\n%s",
 					iface, portsNFT)
 			}
@@ -86,37 +87,42 @@ func TestPortsGuardPortCoverage(t *testing.T) {
 	}
 }
 
-// TestPortsGuardPodExemptPorts — two internal ports must still
+// TestPortsGuardPodExemptPorts — three internal ports must still
 // answer pod-originated LOCAL-delivery traffic over the pod-veth
-// wildcards: :4244 (the hubble-peer Service pins
+// wildcards and the CNI tunnel interfaces: :4240 (the Cilium agent's
+// mesh health endpoint — cluster probes must reach it or the mesh
+// reports every node dark), :4244 (the hubble-peer Service pins
 // internalTrafficPolicy: Local) and :10250 (the kubelet API —
 // konnectivity-agent pods carry the apiserver→kubelet dial and
 // hairpin it to the SAME node's public IP, landing on a pod-veth
 // iif; incident 2026-11-14 cicd). Remote delivery already traverses
-// neb1, so the exemptions open nothing the overlay did not expose —
-// while every other internal port stays closed to tenant pods.
+// the nebula dev, so the exemptions open nothing the overlay did not
+// expose — while every other internal port stays closed to tenant
+// pods.
 func TestPortsGuardPodExemptPorts(t *testing.T) {
 	_, portsNFT := convergeNLDWithVars(t, "")
-	for _, p := range []int{4244, 10250} {
-		for _, iface := range []string{`iifname "cilium*"`, `iifname "lxc*"`, `iifname "cali*"`} {
-			if want := fmt.Sprintf("%s tcp dport %d accept", iface, p); !strings.Contains(portsNFT, want) {
+	for _, p := range hostPortsGuardPodExemptPorts {
+		for _, iface := range hostPortsGuardPodIFaces {
+			if want := fmt.Sprintf("iifname %q tcp dport %d accept", iface, p); !strings.Contains(portsNFT, want) {
 				t.Fatalf("ports guard missing pod-exempt %q:\n%s", want, portsNFT)
 			}
 		}
 	}
-	// No other port may ride the pod-veth path — the exporters and
-	// the kubelet read-only/healthz listeners must still drop for
-	// tenant pods.
+	// No other port may ride the pod/tunnel-iface path — the
+	// exporters, the probe port and the kubelet read-only/healthz
+	// listeners must still drop for tenant pods.
 	for _, bad := range []string{
-		"tcp dport 9100 accept", "tcp dport 9962 accept",
+		"tcp dport 9100 accept", "tcp dport 9115 accept",
+		"tcp dport 9962 accept", "tcp dport 39901 accept",
 		"tcp dport 10248 accept", "tcp dport 10256 accept",
+		"tcp dport 20256 accept",
 	} {
 		if strings.Contains(portsNFT, bad) {
-			t.Fatalf("ports guard exempts %q on a pod iface — guard hole:\n%s", bad, portsNFT)
+			t.Fatalf("ports guard exempts %q on a pod/tunnel iface — guard hole:\n%s", bad, portsNFT)
 		}
 	}
 	// The exemptions must sit BEFORE the drop rule to take effect.
-	for _, p := range []int{4244, 10250} {
+	for _, p := range hostPortsGuardPodExemptPorts {
 		if strings.Index(portsNFT, fmt.Sprintf("tcp dport %d accept", p)) >
 			strings.Index(portsNFT, "tcp dport {") {
 			t.Fatalf("ports guard exemption for :%d renders after the drop rule:\n%s", p, portsNFT)
@@ -131,7 +137,9 @@ func TestPortsGuardPodExemptPorts(t *testing.T) {
 func TestPortsGuardAllowExtraVar(t *testing.T) {
 	_, portsNFT := convergeNLDWithVars(t,
 		"host_internal_ports_guard_allow_extra: [203.0.113.9, fd00:203:0:113::9]\n")
-	if !strings.Contains(portsNFT, "ip saddr { 10.0.1.10, 10.0.1.30, 10.0.2.20, 203.0.113.9 } accept") {
+	// The fixture's three registry nodes also contribute their
+	// marker IPs (172.29.0.{10,20,30} — marker_base + last ip octet).
+	if !strings.Contains(portsNFT, "ip saddr { 10.0.1.10, 10.0.1.30, 10.0.2.20, 172.29.0.10, 172.29.0.20, 172.29.0.30, 203.0.113.9 } accept") {
 		t.Fatalf("ports guard v4 accept set missing the monitoring IP:\n%s", portsNFT)
 	}
 	if !strings.Contains(portsNFT, "ip6 saddr { fd00:203:0:113::9 } accept") {
@@ -172,8 +180,8 @@ node-c:
 	if !strings.Contains(portsNFT, "ip6 saddr { fd00:10:0:1::10 } accept") {
 		t.Fatalf("ports guard v6 accept set missing the registry ip6:\n%s", portsNFT)
 	}
-	if !strings.Contains(portsNFT, "ip saddr { 10.0.1.10, 10.0.1.30, 10.0.2.20 } accept") {
-		t.Fatalf("ports guard v4 accept set missing the registry ips:\n%s", portsNFT)
+	if !strings.Contains(portsNFT, "ip saddr { 10.0.1.10, 10.0.1.30, 10.0.2.20, 172.29.0.10, 172.29.0.20, 172.29.0.30 } accept") {
+		t.Fatalf("ports guard v4 accept set missing the registry ips + markers:\n%s", portsNFT)
 	}
 }
 
@@ -187,7 +195,7 @@ func TestNLDGuardInetScopedAccepts(t *testing.T) {
 	if !strings.Contains(nldNFT, "table inet nodelocaldns_guard") {
 		t.Fatalf("nodelocaldns guard not on the inet table:\n%s", nldNFT)
 	}
-	if !strings.Contains(nldNFT, "ip saddr { 10.0.0.0/8, 10.0.1.10, 10.0.1.30, 10.0.2.20 } tcp dport 53 accept") {
+	if !strings.Contains(nldNFT, "ip saddr { 10.0.0.0/8, 10.0.1.10, 10.0.1.30, 10.0.2.20, 172.29.0.10, 172.29.0.20, 172.29.0.30 } tcp dport 53 accept") {
 		t.Fatalf("nld guard missing the scoped v4 accept:\n%s", nldNFT)
 	}
 	if !strings.Contains(nldNFT, "udp dport 53 accept") {
@@ -202,6 +210,80 @@ func TestNLDGuardInetScopedAccepts(t *testing.T) {
 		if !strings.Contains(nldNFT, want) {
 			t.Fatalf("nld guard missing %q:\n%s", want, nldNFT)
 		}
+	}
+}
+
+// TestPortsGuardCustomNebDev — the trunk accept follows
+// interdc_nebula_dev (c.nebDev), not a hardcoded "neb1": a cluster
+// whose nebula device is named differently must still accept
+// cluster traffic on the guard.
+func TestPortsGuardCustomNebDev(t *testing.T) {
+	_, portsNFT := convergeNLDWithVars(t, "interdc_nebula_dev: neb9\n")
+	if !strings.Contains(portsNFT, `iifname "neb9" accept`) {
+		t.Fatalf("ports guard missing the custom dev accept:\n%s", portsNFT)
+	}
+	if strings.Contains(portsNFT, `iifname "neb1" accept`) {
+		t.Fatalf("ports guard still accepts the default dev:\n%s", portsNFT)
+	}
+}
+
+// TestPortsGuardUnsafeDevSkipsInstall — a dev name that fails the
+// shell-token charset gate must NOT render (it would splice nft
+// rules inside the quoted iifname) and must not install a guard
+// missing the trunk accept: the whole converge skips for the cycle.
+func TestPortsGuardUnsafeDevSkipsInstall(t *testing.T) {
+	vars := writeVarsDir(t, "interdc_nebula_dev: 'neb1\" ; accept'\n")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.convergeHostPortsGuard()
+	if hostExists(r, "/etc/host-internal-ports-guard.nft") ||
+		hostExists(r, "/etc/systemd/system/host-internal-ports-guard.service") {
+		t.Fatal("unsafe dev still rendered a guard")
+	}
+}
+
+// TestPortsGuardFailOpenEmptyRegistry — a node absent from the
+// registry with NO allow sources at all (standalone host, no vars)
+// must not get the guard: its only accepts would be lo/dev/
+// established, which drops apiserver→kubelet on a single-node
+// cluster. Fail-open = skip the install with a warning, not a
+// whiteout table.
+func TestPortsGuardFailOpenEmptyRegistry(t *testing.T) {
+	vars := writeVarsDir(t, "")
+	patchVarsFile(t, vars, "interdc_nodes.yaml", "{}\n")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-z", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-z")
+	c.convergeHostPortsGuard()
+	if hostExists(r, "/etc/host-internal-ports-guard.nft") ||
+		hostExists(r, "/etc/systemd/system/host-internal-ports-guard.service") {
+		t.Fatal("guard installed on a registry-less node with an empty allow set")
+	}
+	// ...but the SAME node WITH an operator-declared allow source
+	// still gets the guard — fail-open only covers the nothing-known
+	// case.
+	vars2 := writeVarsDir(t,
+		"host_internal_ports_guard_allow_extra: [203.0.113.9]\n")
+	patchVarsFile(t, vars2, "interdc_nodes.yaml", "{}\n")
+	sr2 := newScripted(nil, nil)
+	r2, err := New(Config{NodeName: "node-z", HostRoot: t.TempDir(),
+		VarsDir: vars2, Runner: sr2}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2 := loadCyc(t, r2, vars2, "node-z")
+	c2.convergeHostPortsGuard()
+	if !hostExists(r2, "/etc/host-internal-ports-guard.nft") {
+		t.Fatal("guard not installed despite a declared allow source")
 	}
 }
 

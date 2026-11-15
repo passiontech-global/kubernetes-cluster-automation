@@ -28,6 +28,11 @@ tasks:
       # envdoc's source-coverage test reads docs/env.md — a doc-only
       # edit must invalidate this task or CI skips the check.
       - 'docs/env.md'
+      # internal/releaseglob tests parse these workflows — a yaml-only
+      # edit must invalidate the test cache or CI skips the drift guard.
+      - '/.github/workflows/ci.yml'
+      - '/.github/workflows/release-app.yml'
+      - '/.github/workflows/release-webhook-dispatcher.yml'
 
   vet:
     inputs:

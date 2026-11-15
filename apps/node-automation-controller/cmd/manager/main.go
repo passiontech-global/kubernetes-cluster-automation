@@ -208,11 +208,17 @@ func run(sigCtx context.Context, args []string) error {
 	// cancelling propagates to every runnable group (leader-gated
 	// modules included) and the deferred leader-election release
 	// runs under releaseGuardedLock, which leaseStolen has already
-	// armed against clobbering the new holder's record. Created
-	// before buildLeaderLock so the election broadcaster's
-	// Shutdown rides the same cancellation.
+	// armed against clobbering the new holder's record.
 	workCtx, workCancel := context.WithCancel(sigCtx)
 	defer workCancel()
+	// mgrDone closes when run() returns — i.e. after mgr.Start has
+	// fully exited (or on any earlier boot failure, where the
+	// process exits anyway). The election broadcaster's Shutdown
+	// rides THIS channel, not workCtx.Done(): the watchdog's
+	// workCancel fires mid-drain and must not kill the event sink
+	// while leader-gated runnables are still stopping.
+	mgrDone := make(chan struct{})
+	defer close(mgrDone)
 	// The guarded resource lock is built only when election is on —
 	// ctrl.Options ignores the interface otherwise, and building it
 	// unconditionally would spend three client constructions on a
@@ -221,7 +227,7 @@ func run(sigCtx context.Context, args []string) error {
 	if leaderElect {
 		var err error
 		leaderLock, err = buildLeaderLock(cfg, scheme, leaderNS,
-			renewDeadline, &leaseStolen, workCtx.Done())
+			renewDeadline, &leaseStolen, mgrDone)
 		if err != nil {
 			log.Error(err, "unable to build leader election lock")
 			return err

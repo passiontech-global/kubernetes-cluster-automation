@@ -67,8 +67,25 @@ func (f FS) PIDs() ([]int, error) {
 	return pids, nil
 }
 
-// Cmdline returns the argv of pid (NUL-separated in /proc).
+// mmBlocked reports whether pid's stat state forbids reading
+// mm-backed files: cmdline/environ are backed by mm->mmap_lock, so
+// a read on a D-state (uninterruptible sleep) process wedges the
+// caller forever — the /metrics deadlock this guard exists for —
+// and a zombie already released its mm (the files read empty
+// anyway). An unreadable/missing stat fails OPEN to the file read:
+// test fixtures that plant cmdline without stat keep working, and
+// a hidepid race degrades to the pre-guard behavior.
+func (f FS) mmBlocked(pid int) bool {
+	st, ok := f.Stat(pid)
+	return ok && (st.Fields[0] == "D" || st.Fields[0] == "Z")
+}
+
+// Cmdline returns the argv of pid (NUL-separated in /proc) — nil
+// for a D/Z-state pid without ever touching the mm-backed file.
 func (f FS) Cmdline(pid int) []string {
+	if f.mmBlocked(pid) {
+		return nil
+	}
 	data, err := os.ReadFile(f.File(pid, "cmdline"))
 	if err != nil {
 		return nil
@@ -77,8 +94,11 @@ func (f FS) Cmdline(pid int) []string {
 }
 
 // EnvValue reads KEY=<value> from /proc/<pid>/environ — "" when the
-// file is unreadable or the key is absent.
+// file is unreadable, the key is absent, or the pid is D/Z-state.
 func (f FS) EnvValue(pid int, key string) string {
+	if f.mmBlocked(pid) {
+		return ""
+	}
 	data, err := os.ReadFile(f.File(pid, "environ"))
 	if err != nil {
 		return ""
@@ -241,4 +261,38 @@ func (f FS) comm(pid int) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(string(data)), true
+}
+
+// CgroupContains reports whether /proc/<pid>/cgroup mentions
+// substr — the identity check kill paths run before signalling a
+// pid whose number may have been recycled onto an unrelated
+// process. false on an unreadable cgroup file: an unverifiable pid
+// is never signalled (fail closed).
+func (f FS) CgroupContains(pid int, substr string) bool {
+	data, err := os.ReadFile(f.File(pid, "cgroup"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), substr)
+}
+
+// FindByCommInCgroup is FindByComm scoped to one cgroup subtree —
+// the lowest pid whose comm equals name AND whose
+// /proc/<pid>/cgroup contains cgroupSubstr. 0 when the root is
+// unreadable or no pid satisfies BOTH conditions: a same-named
+// process outside the expected cgroup (a foreign daemon, a
+// recycled pid) must never inherit the check's trust.
+func (f FS) FindByCommInCgroup(name, cgroupSubstr string) int {
+	pids, err := f.PIDs()
+	if err != nil {
+		return 0
+	}
+	slices.Sort(pids) // lowest pid wins — pgrep | head -1 parity
+	for _, pid := range pids {
+		if comm, ok := f.comm(pid); ok && comm == name &&
+			f.CgroupContains(pid, cgroupSubstr) {
+			return pid
+		}
+	}
+	return 0
 }

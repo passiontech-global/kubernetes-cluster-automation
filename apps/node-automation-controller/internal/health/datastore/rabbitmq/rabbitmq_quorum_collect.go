@@ -9,6 +9,7 @@ package rabbitmq
 
 import (
 	"context"
+	"strings"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -46,7 +47,7 @@ func collectRabbitCensus(ctx context.Context, d *probefw.Deps,
 		return nil, err
 	}
 	crs, err := d.AllUnstructured(ctx, kube.GVRRabbitMQCluster)
-	downscaled, err := kube.DownscaledClusterCRs(crs, err)
+	downscaled, err := kube.DownscaledClusterCRs(ctx, crs, err)
 	if err != nil {
 		log.Info("WARN: list rabbitmqclusters failed — downscaler awareness off",
 			"error", err)
@@ -107,13 +108,17 @@ func (c *rabbitCensus) resolvePod(ns, name string) *corev1.Pod {
 // skew — and folds every attributed series into one findings map
 // keyed "ns/pod" (or "cluster/<reason>" for a series with no pod
 // label). Query failures warn and skip their family; the pod-side
-// signatures are unaffected.
+// signatures are unaffected. The second return reports whether ANY
+// family failed — a degraded sweep must not run clearQuiet, or a
+// Prometheus flap would wipe first-seen stamps and read as
+// recovery.
 func rabbitPromFindings(ctx context.Context, d *probefw.Deps,
-	log logr.Logger, c *rabbitCensus) map[string]map[string]bool {
-	findings := rabbitAlarmFindings(ctx, d, log, c)
-	rabbitLeaderlessFindings(ctx, d, log, c, findings)
-	rabbitSkewFindings(ctx, d, log, c, findings)
-	return findings
+	log logr.Logger, c *rabbitCensus) (map[string]map[string]bool, bool) {
+	degraded := false
+	findings := rabbitAlarmFindings(ctx, d, log, c, &degraded)
+	rabbitLeaderlessFindings(ctx, d, log, c, findings, &degraded)
+	rabbitSkewFindings(ctx, d, log, c, findings, &degraded)
+	return findings, degraded
 }
 
 // rabbitSeriesClusterID picks the best cluster discriminator a
@@ -130,7 +135,7 @@ func rabbitSeriesClusterID(s promq.Sample) string {
 // rabbitAlarmFindings runs the four watermark / dist-partition
 // instant queries and seeds the findings map.
 func rabbitAlarmFindings(ctx context.Context, d *probefw.Deps,
-	log logr.Logger, c *rabbitCensus) map[string]map[string]bool {
+	log logr.Logger, c *rabbitCensus, degraded *bool) map[string]map[string]bool {
 	type sig struct{ q, reason string }
 	queries := []sig{
 		{`rabbitmq_alarms_file_descriptor_limit == 1`, "fd_limit_alarm"},
@@ -144,6 +149,7 @@ func rabbitAlarmFindings(ctx context.Context, d *probefw.Deps,
 		if err != nil {
 			log.Info("WARN: rabbitmq prom query failed — signal skipped",
 				"query", q.q, "error", err)
+			*degraded = true
 			continue
 		}
 		for _, s := range series {
@@ -190,38 +196,42 @@ func rabbitAlarmFindings(ctx context.Context, d *probefw.Deps,
 // the leader side, and PromQL `and` intersects it away) — same
 // shape as the NATS meta-leaderless check.
 func rabbitLeaderlessFindings(ctx context.Context, d *probefw.Deps,
-	log logr.Logger, c *rabbitCensus, findings map[string]map[string]bool) {
-	counts, errC := d.PromQuery(ctx,
-		`count by (namespace, pod) (rabbitmq_raft_role)`)
-	sums, errS := d.PromQuery(ctx,
-		`sum by (namespace, pod) (rabbitmq_raft_role)`)
-	if errC != nil || errS != nil {
-		log.Info("WARN: rabbitmq raft-role queries failed — quorum_leaderless signal skipped",
-			"countErr", errC, "sumErr", errS)
+	log logr.Logger, c *rabbitCensus, findings map[string]map[string]bool,
+	degraded *bool) {
+	// One raw rabbitmq_raft_role read replaces the old count-by +
+	// sum-by pair (same metric family): the client aggregates both
+	// per (namespace,pod) — count = series seen, sum = role values
+	// summed. A member whose series exist but sum to 0 holds no
+	// queue leadership.
+	series, err := d.PromQuery(ctx, `rabbitmq_raft_role`)
+	if err != nil {
+		log.Info("WARN: rabbitmq raft-role query failed — quorum_leaderless signal skipped",
+			"error", err)
+		*degraded = true
 		return
 	}
+	countByPod := map[string]float64{}
 	sumByPod := map[string]float64{}
-	for _, s := range sums {
-		sumByPod[s.Label("namespace")+"/"+s.Label("pod", "pod_name")] = s.Value
-	}
-	for _, s := range counts {
+	for _, s := range series {
 		podName := s.Label("pod", "pod_name")
 		// Fail-closed like the alarm loop: no namespace label →
 		// unattributable series, never resolved by bare pod name.
 		ns := s.Metric["namespace"]
-		if ns == "" {
+		if ns == "" || podName == "" {
 			continue
 		}
-		if podName == "" || s.Value <= 0 {
-			continue
-		}
-		if sumByPod[ns+"/"+podName] != 0 {
+		key := ns + "/" + podName
+		countByPod[key]++
+		sumByPod[key] += s.Value
+	}
+	for key, count := range countByPod {
+		ns, podName, _ := strings.Cut(key, "/")
+		if count <= 0 || sumByPod[key] != 0 {
 			continue // at least one queue leadership role held — healthy
 		}
 		if kube.DownscaledMemberPod(ns, podName, c.downscaled) {
 			continue // parked cluster — stale series, not quorum evidence
 		}
-		key := ns + "/" + podName
 		if findings[key] == nil {
 			findings[key] = map[string]bool{}
 		}
@@ -235,12 +245,14 @@ func rabbitLeaderlessFindings(ctx context.Context, d *probefw.Deps,
 // behind the cluster's, and its queue replicas cannot vote
 // meaningfully.
 func rabbitSkewFindings(ctx context.Context, d *probefw.Deps,
-	log logr.Logger, c *rabbitCensus, findings map[string]map[string]bool) {
+	log logr.Logger, c *rabbitCensus, findings map[string]map[string]bool,
+	degraded *bool) {
 	terms, errT := d.PromQuery(ctx,
 		`max by (namespace, pod) (rabbitmq_raft_term)`)
 	if errT != nil {
 		log.Info("WARN: rabbitmq raft-term query failed — quorum_skew signal skipped",
 			"error", errT)
+		*degraded = true
 		return
 	}
 	// Pool the max term per RabbitmqCLUSTER, not per namespace —

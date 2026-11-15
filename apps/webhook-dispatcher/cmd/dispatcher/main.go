@@ -276,7 +276,15 @@ func main() {
 		logger().Error("binding public listener", "addr", listenAddr, "error", err)
 		os.Exit(1)
 	}
-	internalSrv, err := httpx.New(metricsAddr, internalMux, httpx.Opts{})
+	// Internal listener (metrics + pprof): loopback-only peers, so the
+	// hostile-peer posture is lighter — but still bound header read
+	// time and size (a stalled scrape conn must not park a goroutine
+	// forever). WriteTimeout stays 0: /debug/pprof/profile streams
+	// until the client disconnects.
+	internalSrv, err := httpx.New(metricsAddr, internalMux, httpx.Opts{
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    8 << 10,
+	})
 	if err != nil {
 		logger().Error("binding metrics listener", "addr", metricsAddr, "error", err)
 		os.Exit(1)

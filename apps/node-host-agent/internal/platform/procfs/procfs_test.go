@@ -87,6 +87,100 @@ func TestCmdlineSplitsNulSeparatedArgv(t *testing.T) {
 	}
 }
 
+func TestCmdlineSkipsDAndZState(t *testing.T) {
+	fs := New(t.TempDir())
+	// D-state: cmdline sits behind mm->mmap_lock — reading it would
+	// wedge the caller. Z-state: the mm is already gone. Both must
+	// return nil WITHOUT the read (the fixture can't prove the read
+	// was skipped, but the verdict is the contract).
+	for i, state := range []string{"D", "Z"} {
+		pid := 100 + i
+		testutil.WriteFile(t, fs.File(pid, "stat"),
+			"100 (k0s) "+state+" 1 2 3")
+		testutil.WriteFile(t, fs.File(pid, "cmdline"), "k0s\x00worker\x00")
+		if got := fs.Cmdline(pid); got != nil {
+			t.Fatalf("Cmdline on %s-state pid = %v, want nil", state, got)
+		}
+	}
+	// R/S-state reads normally; a missing stat fails OPEN to the
+	// file read (fixtures that plant cmdline without stat).
+	testutil.WriteFile(t, fs.File(200, "stat"), "200 (k0s) S 1 2 3")
+	testutil.WriteFile(t, fs.File(200, "cmdline"), "k0s\x00worker\x00")
+	if got, want := fs.Cmdline(200), []string{"k0s", "worker"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Cmdline on S-state pid = %v, want %v", got, want)
+	}
+	testutil.WriteFile(t, fs.File(300, "cmdline"), "bare\x00")
+	if got, want := fs.Cmdline(300), []string{"bare"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Cmdline with no stat = %v, want fail-open %v", got, want)
+	}
+}
+
+func TestEnvValueSkipsDAndZState(t *testing.T) {
+	fs := New(t.TempDir())
+	for i, state := range []string{"D", "Z"} {
+		pid := 100 + i
+		testutil.WriteFile(t, fs.File(pid, "stat"), "100 (x) "+state+" 1")
+		testutil.WriteFile(t, fs.File(pid, "environ"), "KEY=secret\x00")
+		if got := fs.EnvValue(pid, "KEY"); got != "" {
+			t.Fatalf("EnvValue on %s-state pid = %q, want \"\"", state, got)
+		}
+	}
+}
+
+func TestCgroupContains(t *testing.T) {
+	fs := New(t.TempDir())
+	testutil.WriteFile(t, fs.File(1, "cgroup"),
+		"0::/kubepods.slice/kubepods-burstable.slice/pod.slice/cri-containerd-x.scope\n")
+	if !fs.CgroupContains(1, "kubepods") {
+		t.Fatal("kubepods substr not found in pod cgroup")
+	}
+	if fs.CgroupContains(1, "k0scontroller") {
+		t.Fatal("foreign substr matched pod cgroup")
+	}
+	// v1 layout: multiple controller lines, substr still matches.
+	testutil.WriteFile(t, fs.File(2, "cgroup"),
+		"4:memory:/kubepods/pod1\n3:cpu:/kubepods/pod1\n")
+	if !fs.CgroupContains(2, "kubepods") {
+		t.Fatal("v1 cgroup lines not matched")
+	}
+	// Unreadable cgroup file → false: an unverifiable pid is never
+	// signalled (fail closed).
+	if fs.CgroupContains(3, "kubepods") {
+		t.Fatal("missing cgroup file must read as not-contained")
+	}
+}
+
+func TestFindByCommInCgroup(t *testing.T) {
+	root := t.TempDir()
+	fs := New(root)
+	mk := func(pid int, comm, cgroup string) {
+		d := fs.File(pid)
+		mkDir(t, d)
+		testutil.WriteFile(t, filepath.Join(d, "comm"), comm+"\n")
+		testutil.WriteFile(t, filepath.Join(d, "cgroup"), cgroup)
+	}
+	// Two "kine" procs: the in-cgroup one is pid 300, the foreign
+	// same-named daemon is pid 100 — lowest pid does NOT win when
+	// only the scoped one qualifies.
+	mk(100, "kine", "0::/system.slice/other.service\n")
+	mk(300, "kine", "0::/system.slice/k0scontroller.service\n")
+	mk(400, "other", "0::/system.slice/k0scontroller.service\n")
+	mk(500, "kine", "") // comm match, empty cgroup — unverifiable
+
+	if got := fs.FindByCommInCgroup("kine", "k0scontroller"); got != 300 {
+		t.Fatalf("FindByCommInCgroup = %d, want 300", got)
+	}
+	if got := fs.FindByCommInCgroup("absent", "k0scontroller"); got != 0 {
+		t.Fatalf("FindByCommInCgroup(absent) = %d, want 0", got)
+	}
+	if got := fs.FindByCommInCgroup("kine", "nosuchslice"); got != 0 {
+		t.Fatalf("FindByCommInCgroup wrong slice = %d, want 0", got)
+	}
+	if got := New(filepath.Join(t.TempDir(), "gone")).FindByCommInCgroup("kine", "x"); got != 0 {
+		t.Fatalf("FindByCommInCgroup unreadable root = %d, want 0", got)
+	}
+}
+
 func TestEnvValue(t *testing.T) {
 	fs := New(t.TempDir())
 	testutil.WriteFile(t, fs.File(1, "environ"), "HOME=/root\x00FOO=bar\x00FOOBAR=x\x00EMPTY=\x00")

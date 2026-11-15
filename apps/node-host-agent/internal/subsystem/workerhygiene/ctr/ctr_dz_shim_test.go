@@ -33,6 +33,17 @@ func TestCtrTasksUnkillableShimEscalates(t *testing.T) {
 			wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "9400", "cmdline"),
 				"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+
 					sid+"\x00-address\x00/run/k0s/containerd.sock\x00")
+			// D/Z-state cmdline is unreadable (mm->mmap_lock) — the
+			// shim's fd table carries the task-dir evidence instead:
+			// an orphan's log fd reads "<taskdir>/log.json (deleted)".
+			fdDir := filepath.Join(e.ProcDir, "9400", "fd")
+			if err := os.MkdirAll(fdDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(e.CtrDir, sid, "log.json")+" (deleted)",
+				filepath.Join(fdDir, "9")); err != nil {
+				t.Fatal(err)
+			}
 			// Age the /proc entry past the 5m orphan window.
 			old := e.Now.Add(-time.Hour)
 			if err := os.Chtimes(filepath.Join(e.ProcDir, "9400"), old, old); err != nil {

@@ -13,20 +13,44 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
 
 func TestCoreDNSUpstreamDeletesIsolatedFailingPod(t *testing.T) {
 	srv := coreDNSUpstreamPromServer(t)
+	// Both pods must share one controller — the healthy-sibling
+	// check keys on PodControllerKey, and two standalone pods share
+	// no controller.
+	owner := []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "coredns-7c65d6f9b4", Controller: ptr.To(true),
+	}}
 	bad := probetest.PodWithPhase("kube-system", "coredns-bad", corev1.PodRunning, false, time.Hour)
+	bad.OwnerReferences = owner
 	good := probetest.PodWithPhase("kube-system", "coredns-good", corev1.PodRunning, true, time.Hour)
+	good.OwnerReferences = owner
 	cs := fake.NewSimpleClientset(bad, good)
 	p := testProber(cs)
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*coreDNSUpstreamCheck](t, p).Run(probetest.SweepCtx(ctx))
+	check := probetest.MustCheck[*coreDNSUpstreamCheck](t, p)
+	base := time.Now()
+	// First sight tracks the signature inside the 10m persistence
+	// window — detection fails but no delete yet.
+	probetest.FreezeNow(p.Deps, base)
+	if res := check.Run(probetest.SweepCtx(ctx)); res.Pass {
+		t.Fatalf("isolated upstream failure must fail: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "coredns-bad", metav1.GetOptions{}); err != nil {
+		t.Fatalf("first sweep must not delete before persistence: %v", err)
+	}
+
+	// Past the window the persisted signature heals the isolated pod.
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	res := check.Run(probetest.SweepCtx(ctx))
 	if res.Pass {
 		t.Fatalf("isolated upstream failure must fail: %+v", res)
 	}

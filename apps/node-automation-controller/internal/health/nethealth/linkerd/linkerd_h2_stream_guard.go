@@ -56,6 +56,16 @@ type linkerdH2StreamGuardCheck struct {
 	balancerEmitted state.GaugeLedger[string]
 	oomEmitted      state.GaugeLedger[string]
 	balancerSeen    state.FirstSeenLedger
+	// sigSeen is the storm/identity signature persistence ledger —
+	// a proxy-log signature must hold across linkerdH2SigMinAge
+	// before it flags or heals, so one stale error line inside the
+	// log-lookback window cannot trigger a pod delete on its own.
+	sigSeen state.FirstSeenLedger
+	// logScanAt is the per-pod last-log-scan clock — the freshness
+	// gate requires a matching line newer than the pod's previous
+	// scan so the overlapping SinceSeconds window cannot re-flag a
+	// signature that already stopped (and possibly self-healed).
+	logScanAt map[string]time.Time
 }
 
 // The constructor lives in the package facade (linkerd.go).
@@ -75,6 +85,11 @@ const (
 	// shape this long before it counts as failure-accrual lockout
 	// rather than ordinary failover churn.
 	linkerdBalancerWedgeMinAge = 10 * time.Minute
+	// linkerd-h2-stream-guard — a storm/identity log signature must persist this
+	// long before it reports or heals: the log tail is a bounded
+	// lookback, so a single sweep's hit can be residue of an
+	// already-recovered incident.
+	linkerdH2SigMinAge = 10 * time.Minute
 )
 
 var (
@@ -139,6 +154,13 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 	// full-mesh scan runs.
 	suspect := p.linkerdSuspectPods(ctx, log)
 	var cands []*corev1.Pod
+	// scanLive is the log-scan boundary's retention set: every meshed
+	// pod old enough to scan — NOT just this sweep's Prometheus
+	// suspects. A pod that flaps out of the suspect set for one
+	// sweep still exists; dropping its boundary would make the next
+	// suspect sweep bootstrap fresh and re-flag stale storm/identity
+	// lines the overlapping tail still carries.
+	scanLive := map[string]bool{}
 	for i := range pods {
 		pod := &pods[i]
 		if pod.DeletionTimestamp != nil ||
@@ -148,6 +170,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		key := pod.Namespace + "/" + pod.Name
+		scanLive[key] = true
 		lv := []string{pod.Namespace, pod.Name}
 		// linkerd-h2-stream-guard — an OOM-killed linkerd-proxy loses its whole
 		// connection table and balancer state on restart: report
@@ -172,29 +195,90 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 	// inconclusive result — never a process crash.
 	h2sigs := kube.ScanPodLogs(ctx, cands, linkerdH2LogWorkers,
 		func(ctx context.Context, pod *corev1.Pod) (logSignals, error) {
-			storm, identity, err := p.linkerdH2LogSignals(ctx, pod)
-			return logSignals{storm: storm, identity: identity}, err
+			storm, identity, stormTS, identityTS, streamNewest, err := p.linkerdH2LogSignals(ctx, pod)
+			return logSignals{storm: storm, identity: identity,
+				stormTS: stormTS, identityTS: identityTS,
+				streamNewest: streamNewest}, err
 		})
 
 	// Phase 3 — the serial verdict + heal pass over the fetched
 	// signatures (gauge ledgers, the heal mutex and the cooldown
 	// set are all single-writer by design).
+	sigKeep := map[string]bool{}
 	for i := range cands {
 		pod := cands[i]
 		key := pod.Namespace + "/" + pod.Name
 		lv := []string{pod.Namespace, pod.Name}
 		if err := h2sigs[i].Err; err != nil {
 			// Inconclusive, not clean — a broken pod-log path must
-			// not silently read as "no signature".
+			// not silently read as "no signature". Carry the pod's
+			// held series and keep its first-seen clocks so one
+			// kubelet flap cannot reset the persistence window or
+			// prune a live storm/identity alert.
 			log.Info("WARN: linkerd-proxy log fetch failed — log signatures inconclusive",
 				"pod", pod.Namespace+"/"+pod.Name, "error", err)
+			sigKeep[key+"/storm"] = true
+			sigKeep[key+"/identity"] = true
+			// Emitted ledger keys ARE the bare "ns/pod" key — a
+			// prefix match on key+"/" can never hit, so the carry
+			// was dead code and a log flap pruned live series.
+			for k, lv := range p.emitted.Last() {
+				if k == key {
+					rep.Carry(k, lv)
+					rep.Find(k)
+				}
+			}
+			for k, lv := range p.identityEmitted.Last() {
+				if k == key {
+					identityRep.Carry(k, lv)
+					rep.Find(k)
+				}
+			}
+			// oomEmitted needs no carry: the OOMKilled shape is
+			// read from pod status in Phase 1, independent of this
+			// log fetch — a held series re-flags or clears on its
+			// own evidence.
 			continue
 		}
-		storm, identity := h2sigs[i].Value.storm, h2sigs[i].Value.identity
+		// Freshness gate per family: the signature needs a matching
+		// line newer than this pod's previous scan — the 360s
+		// window overlaps across sweeps, so without it an error
+		// that already stopped re-flags for extra cycles. An
+		// unparseable stamp counts as fresh — fail toward
+		// alerting. The scan boundary advances on every successful
+		// fetch (err==nil path only).
+		if p.logScanAt == nil {
+			p.logScanAt = map[string]time.Time{}
+		}
+		prevScan, scanned := p.logScanAt[key]
+		// The boundary advances in the KUBELET's clock domain —
+		// streamNewest is the newest stamp on any line read; `now`
+		// (controller clock) is only the fallback for a stream
+		// that carried no parseable timestamp at all.
+		if h2sigs[i].Value.streamNewest.IsZero() {
+			p.logScanAt[key] = now
+		} else {
+			p.logScanAt[key] = h2sigs[i].Value.streamNewest
+		}
+		fresh := func(ts time.Time) bool {
+			return !scanned || ts.IsZero() || ts.After(prevScan)
+		}
+		storm, identity := h2sigs[i].Value.storm && fresh(h2sigs[i].Value.stormTS),
+			h2sigs[i].Value.identity && fresh(h2sigs[i].Value.identityTS)
 		if !storm && !identity {
 			continue
 		}
-		if storm {
+		// Persistence gate: the signature must hold for
+		// linkerdH2SigMinAge before it flags or heals — a bounded
+		// log tail can carry residue of an incident the proxy
+		// already recovered from.
+		stormPast := storm && probefw.Persisted(&p.sigSeen,
+			key+"/storm", now, linkerdH2SigMinAge, log)
+		identityPast := identity && probefw.Persisted(&p.sigSeen,
+			key+"/identity", now, linkerdH2SigMinAge, log)
+		sigKeep[key+"/storm"] = storm
+		sigKeep[key+"/identity"] = identity
+		if stormPast {
 			rep.Flag(linkerdH2StreamStalledGauge, key, lv)
 			rep.Find(key)
 			// The storming pod itself counts toward its owner's
@@ -205,9 +289,9 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 			p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
 				pod, readyByOwner, 1, linkerdH2HealCool, now)
 		}
-		if identity {
+		if identityPast {
 			identityRep.Flag(linkerdProxyIdentityStalledGauge, key, lv)
-			if !storm {
+			if !stormPast {
 				rep.Find(key)
 			}
 			// The safe-evict gate: the stalled pod may still report
@@ -219,6 +303,21 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 			// delete heals both signatures.
 			p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
 				pod, readyByOwner, 1, linkerdH2HealCool, now)
+		}
+	}
+	// Drop first-seen entries whose signature cleared — "persisted"
+	// means continuously observed, so a clean sweep re-arms the
+	// window. Keys belonging to pods skipped this sweep (inconclusive
+	// log fetch) are likewise dropped: a flapping log path must not
+	// accumulate persistence it never re-proved.
+	p.sigSeen.Prune(func(k string) bool { return sigKeep[k] })
+	// The scan clock tracks every meshed pod still alive — entries
+	// for pods that left the scan universe (deleted, unmeshed,
+	// too fresh) are dropped so a re-entering pod bootstraps
+	// against its own last read.
+	for k := range p.logScanAt {
+		if !scanLive[k] {
+			delete(p.logScanAt, k)
 		}
 	}
 	rep.Close(&p.emitted, linkerdH2StreamStalledGauge.DeleteLabelValues)

@@ -230,7 +230,7 @@ func kargoPhaseStuck(phase string) bool {
 func (p *kargoPromotionHealthCheck) maybeRefreshKargoWarehouse(ctx context.Context,
 	log logr.Logger, wh *unstructured.Unstructured, key string, now time.Time) {
 
-	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+	proceed, unverifiable := p.HealAllowedUpgradeOnlyPersisted(ctx, log,
 		&p.warehouseRefreshHealed, wh, kube.AnnoLastKargoRefresh, key,
 		kargoWarehouseRefreshCool, now)
 	if unverifiable {

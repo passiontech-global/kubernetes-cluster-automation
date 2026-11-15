@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -48,6 +49,15 @@ func (c *cronJobCatchup) unfreezeDeadline(ctx context.Context, log logr.Logger, 
 	if err != nil {
 		metrics.IncError(c.queue)
 		log.Error(err, "marshal deadline patch",
+			"cronjob", cj.Namespace+"/"+cj.Name)
+		return false
+	}
+	// Flux-owned CronJobs get their spec reverted by the GitOps
+	// reconcile — stamping startingDeadlineSeconds on one is the
+	// patch half of a Heal-Revert Loop, so the shared conflict gate
+	// decides (report, never fight).
+	if !heal.FluxPatchGate("cronjob", cj, cj.Namespace+"/"+cj.Name, now) {
+		log.Info("skip: startingDeadlineSeconds patch gated — Flux owns this CronJob",
 			"cronjob", cj.Namespace+"/"+cj.Name)
 		return false
 	}

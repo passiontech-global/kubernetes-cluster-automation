@@ -11,6 +11,7 @@ package jinja
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"math/bits"
 )
 
@@ -299,6 +300,31 @@ func exactUint64Sum(aneg bool, am uint64, bneg bool, bm uint64) (uint64, bool) {
 	return 0, false // negative result
 }
 
+// magFloatCmp orders an exact integer magnitude (neg, mag) against
+// a FINITE float64 without float64 rounding — big.Rat holds the
+// float's exact binary value (every float64 is k×2^e), so
+// uint64(2^64-1) correctly compares below 2^64.0 where float64
+// math collapsed both onto the same value and broke == transitivity
+// across the int/float boundary.
+func magFloatCmp(neg bool, mag uint64, f float64) int {
+	r := new(big.Rat).SetUint64(mag)
+	if neg {
+		r.Neg(r)
+	}
+	return r.Cmp(new(big.Rat).SetFloat64(f))
+}
+
+// finiteFloat reports whether v is a float64 that is neither NaN
+// nor ±Inf — the only float64 magFloatCmp can order exactly
+// (SetFloat64 returns nil for non-finite input).
+func finiteFloat(v any) (float64, bool) {
+	f, ok := v.(float64)
+	if !ok || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
+}
+
 // numAsFloat converts only plain, finite numbers — no strings, no
 // bools. numEq uses it to keep bool==number numeric (python
 // True == 1) while bool==string stays unequal.
@@ -378,6 +404,20 @@ func numEq(l, r any) bool {
 			return magCmp(lneg, lm, rneg, rm) == 0
 		}
 	}
+	// Mixed integer/float pairs compare EXACTLY — routing a uint64
+	// past 2^53 through float64 rounds it onto a neighboring float,
+	// so two distinct integers could equal the same float and ==
+	// lost transitivity. big.Rat keeps the pair honest.
+	if lneg, lm, lok := numMag(l); lok {
+		if f, ok := finiteFloat(r); ok {
+			return magFloatCmp(lneg, lm, f) == 0
+		}
+	}
+	if rneg, rm, rok := numMag(r); rok {
+		if f, ok := finiteFloat(l); ok {
+			return magFloatCmp(rneg, rm, f) == 0
+		}
+	}
 	lf, lok := toFloat(l)
 	rf, rok := toFloat(r)
 	if lok && rok {
@@ -429,6 +469,18 @@ func numCmp(a, b any) (int, bool) {
 	if aneg, am, aok := numMag(a); aok {
 		if bneg, bm, bok := numMag(b); bok {
 			return magCmp(aneg, am, bneg, bm), true
+		}
+		// Mixed integer/float ordering is exact too — the float64
+		// fallback below rounds a uint64 past 2^53 onto a neighbor,
+		// so uint64max < 2^64.0 used to answer "equal".
+		if f, ok := finiteFloat(b); ok {
+			return magFloatCmp(aneg, am, f), true
+		}
+	}
+	if bneg, bm, bok := numMag(b); bok {
+		if f, ok := finiteFloat(a); ok {
+			// compare(a, b) = -(compare(b, a)).
+			return -magFloatCmp(bneg, bm, f), true
 		}
 	}
 	af, aok := toFloat(a)

@@ -43,10 +43,14 @@ func (d *Deps) RefreshWatchdogConf() {
 	}
 	// Each knob only moves when it still carries the previous
 	// conf-derived value — a knob set from elsewhere (env wiring)
-	// keeps its override.
+	// keeps its override. The Hub triple is rewritten under hubMu:
+	// the feeder goroutine snapshots it via HubConf while this
+	// refresh runs on the cycle goroutine.
+	d.hubMu.Lock()
 	applyField(&d.Cfg.Hub.SelfAPI, old.APISelf, wd.APISelf)
 	applyField(&d.Cfg.Hub.PeerAPI, old.APIPeer, wd.APIPeer)
 	applyField(&d.Cfg.Hub.KineDBProbe, old.KineDBProbe, wd.KineDBProbe)
+	d.hubMu.Unlock()
 	applyNonEmpty(&d.Cfg.Sig13.Mode, old.Sig13Autofix, wd.Sig13Autofix)
 	applyNonEmpty(&d.Cfg.KineTTL.Mode, old.KineTTLAutofix, wd.KineTTLAutofix)
 	applyNonEmpty(&d.Cfg.KinePool.Mode, old.KinePoolAutofix, wd.KinePoolAutofix)

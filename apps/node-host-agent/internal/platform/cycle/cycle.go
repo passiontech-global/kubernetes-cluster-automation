@@ -58,6 +58,30 @@ func EverySafe(name string, interval time.Duration,
 		}}
 }
 
+// exemptRunner wraps a *Runner so RunAll's `l.(*Runner)` type
+// check fails — the loop gets a CHILD Liveness registry instead of
+// sharing the subsystem's, and Run exempts that child up front.
+// Exempt is registry-wide, so this is the only way to hide ONE
+// auxiliary loop's beats from /healthz without blinding the whole
+// subsystem: a wedged file-watch poll must never kill the agent —
+// the interval converge is the load-bearing loop.
+type exemptRunner struct{ *Runner }
+
+// Run exempts the child registry RunAll installed, then drives the
+// wrapped Runner normally.
+func (e exemptRunner) Run(ctx context.Context) {
+	Exempt(ctx)
+	e.Runner.Run(ctx)
+}
+
+// EveryExempt is Every for auxiliary loops whose wedge must never
+// reach /healthz (hostconfig-watch's vars/certs poller). The
+// returned Looper is deliberately NOT a *Runner — see exemptRunner.
+func EveryExempt(name string, interval time.Duration,
+	fn func(context.Context)) Looper {
+	return exemptRunner{Every(name, interval, fn)}
+}
+
 // Name identifies the runner for logging.
 func (r *Runner) Name() string { return r.name }
 

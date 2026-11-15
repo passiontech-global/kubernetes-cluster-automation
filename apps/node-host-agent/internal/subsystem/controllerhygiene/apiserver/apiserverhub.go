@@ -143,8 +143,13 @@ func (c *HubCheck) Run(ctx context.Context) {
 }
 
 func (c *HubCheck) checkCacheStale(ctx context.Context, now time.Time) int {
-	cacheErrs := cdeps.CountMatches(cacheErrRe,
-		c.d.JournalText(ctx, now.Add(-6*time.Minute)))
+	jout, jerr := c.d.JournalText(ctx, now.Add(-6*time.Minute))
+	if jerr != nil {
+		// Journal unreadable → inconclusive: keep the existing
+		// latch verdict instead of clearing it on "0 hits".
+		return 0
+	}
+	cacheErrs := cdeps.CountMatches(cacheErrRe, jout)
 	if cacheErrs >= c.d.Cfg.Sig13.StaleMinErrs {
 		c.d.State.Enter(cdeps.StateCacheStale,
 			fmt.Sprintf("errors=%d/6min", cacheErrs))
@@ -367,10 +372,18 @@ func (c *HubCheck) deadFallback(ctx context.Context) {
 	}
 	switch c.d.Cfg.Sig13.Mode {
 	case cdeps.ModeEnforce:
+		// Check+spend atomically right before the restart — the
+		// RateOK gate above is only the early-exit log; two checks
+		// racing past it must not both spend.
+		if !c.d.State.RateTrySpend(cdeps.FileRateRestart, c.d.Cfg.Sig13.MinRestart) {
+			c.d.State.SuspectLog(cdeps.LogKeyDeadFallbkCool, fmt.Sprintf(
+				"suspect: apiserver dead + kine db ok but in restart cooldown (<%dm), skip",
+				int(c.d.Cfg.Sig13.MinRestart.Minutes())), c.d.Cfg.SuspectLogCadence)
+			return
+		}
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: restarting k0scontroller - apiserver unresponsive, kine db %s healthy (dead-fallback %dx)",
 			c.d.Cfg.Hub.KineDBProbe, dn))
-		c.d.State.RateSpend(cdeps.FileRateRestart)
 		c.d.State.ResetCounter(cdeps.FileCtrDead)
 		if err := c.d.Restart(ctx, c.d.Cfg.RestartUnit); err != nil {
 			c.d.State.AppendLogWarn(fmt.Sprintf(
@@ -378,12 +391,17 @@ func (c *HubCheck) deadFallback(ctx context.Context) {
 		}
 		c.d.Actions.WithLabelValues(cdeps.CheckHub, "restart_controller").Inc()
 	case cdeps.ModeDryRun:
+		if !c.d.State.RateTrySpend(cdeps.FileRateRestart, c.d.Cfg.Sig13.MinRestart) {
+			c.d.State.SuspectLog(cdeps.LogKeyDeadFallbkCool, fmt.Sprintf(
+				"suspect: apiserver dead + kine db ok but in restart cooldown (<%dm), skip",
+				int(c.d.Cfg.Sig13.MinRestart.Minutes())), c.d.Cfg.SuspectLogCadence)
+			return
+		}
 		c.d.State.AppendLog(fmt.Sprintf(
 			"DRY-RUN: would restart k0scontroller - apiserver dead, kine db ok (dead-fallback %dx)", dn))
 		// Spend the same budget enforce would — a dry-run that
 		// ignores the restart cooldown logs an action every cycle
 		// and misrepresents what enforce would actually do.
-		c.d.State.RateSpend(cdeps.FileRateRestart)
 		c.d.State.ResetCounter(cdeps.FileCtrDead)
 		c.d.Actions.WithLabelValues(cdeps.CheckHub, "dryrun_restart").Inc()
 	}

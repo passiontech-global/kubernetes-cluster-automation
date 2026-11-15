@@ -30,12 +30,33 @@ import (
 func pdwBlockedPDB(ns, name string, expected, desired, current int32) *policyv1.PodDisruptionBudget {
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		// A real selector — policy/v1 nil selects NOTHING, and the
+		// cordoned-node check lists pods through it.
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"pdw": "protected"},
+			},
+		},
 		Status: policyv1.PodDisruptionBudgetStatus{
 			ExpectedPods:       expected,
 			DesiredHealthy:     desired,
 			CurrentHealthy:     current,
 			DisruptionsAllowed: 0,
 		},
+	}
+}
+
+// pdwPod is a Running pod carrying the pdw=protected label the test
+// PDBs select, pinned to nodeName — the cordoned-node check only
+// counts pods that actually sit on a cordoned node.
+func pdwPod(ns, name, nodeName string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: name,
+			Labels: map[string]string{"pdw": "protected"},
+		},
+		Spec:   corev1.PodSpec{NodeName: nodeName},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 }
 
@@ -194,6 +215,8 @@ func TestPDBWatchdogCordonedNodeBlocked(t *testing.T) {
 	t.Cleanup(func() { pdwClearMetrics(t, [2]string{"pdw-c", "drain-wedged"}) })
 	cs := fake.NewSimpleClientset(
 		pdwCordonedNode("n1"),
+		pdwPod("pdw-c", "w1", "n1"),
+		pdwPod("pdw-c", "w2", "n1"),
 		pdwBlockedPDB("pdw-c", "drain-wedged", 3, 1, 1))
 	w := newPDWWatchdog(cs, &now)
 	if err := w.run(ctx); err != nil {
@@ -309,6 +332,8 @@ func TestPDBWatchdogMultipleReasonsCoexist(t *testing.T) {
 	t.Cleanup(func() { pdwClearMetrics(t, [2]string{"pdw-f", "triple"}) })
 	cs := fake.NewSimpleClientset(
 		pdwCordonedNode("n1"),
+		pdwPod("pdw-f", "t1", "n1"),
+		pdwPod("pdw-f", "t2", "n1"),
 		pdwBlockedPDB("pdw-f", "triple", 2, 2, 2))
 	w := newPDWWatchdog(cs, &now)
 	if err := w.run(ctx); err != nil {
@@ -461,6 +486,8 @@ func TestPDBWatchdogReasonsResolveIndependently(t *testing.T) {
 	t.Cleanup(func() { pdwClearMetrics(t, [2]string{"pdw-j", "mixed"}) })
 	cs := fake.NewSimpleClientset(
 		pdwCordonedNode("n1"),
+		pdwPod("pdw-j", "m1", "n1"),
+		pdwPod("pdw-j", "m2", "n1"),
 		pdwBlockedPDB("pdw-j", "mixed", 2, 2, 2))
 	w := newPDWWatchdog(cs, &now)
 	if err := w.run(ctx); err != nil {

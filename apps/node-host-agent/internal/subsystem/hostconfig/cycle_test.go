@@ -25,8 +25,9 @@ func cycleFixture(t *testing.T, varsDir string) *Reconciler {
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: varsDir, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
-		DownloadDir: t.TempDir(), Runner: sr,
-		Clock: timex.NewCell(func() time.Time { return time.Unix(1_700_000_000, 0) })}, nil)
+		DownloadDir: t.TempDir(), Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(),
+		ListenAddrsFn: listenAddrsFake(),
+		Clock:         timex.NewCell(func() time.Time { return time.Unix(1_700_000_000, 0) })}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +81,7 @@ node-c:
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
-		Runner: sr}, nil)
+		Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -35,7 +35,8 @@ import (
 // hostRoot. Production gets a hostexec.Runner entering every host
 // PID-1 namespace; HostRoot "/" (standalone) runs unwrapped.
 func defaultRunHostCmd(hostRoot string) func(ctx context.Context, argv ...string) (string, error) {
-	runner := hostexec.New(hostexec.Config{HostRoot: hostRoot})
+	runner := hostexec.New(hostexec.Config{HostRoot: hostRoot,
+		ScrubSystemdEnv: true})
 	return func(ctx context.Context, argv ...string) (string, error) {
 		if len(argv) == 0 {
 			return "", errors.New("hostmetrics: empty host argv")

@@ -242,7 +242,23 @@ func (p *linkerdSidecarOOMCheck) scanInitDeadlock(
 				}, func(line string) bool {
 					return strings.Contains(line, linkerdInitDeadlockRefused)
 				})
-			if err != nil || !matched {
+			if err != nil {
+				// Inconclusive, not clean — carry the pod's held
+				// deadlock series so a kubelet log flap cannot
+				// read as recovery. deadlockSince keeps its
+				// first-seen entry via shape[key] above, and
+				// live[key] keeps the deadlockEvented marker so
+				// the prune below cannot re-fire the Event.
+				live[key] = true
+				for k, lv := range p.deadlockEmitted.Last() {
+					if k == key {
+						rep.Carry(k, lv)
+						rep.Find(key)
+					}
+				}
+				continue
+			}
+			if !matched {
 				continue
 			}
 		}

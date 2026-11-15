@@ -55,6 +55,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -196,6 +197,35 @@ func EffectiveAnno(ctx context.Context, obj metav1.Object, key string) string {
 		ov.mu.RUnlock()
 	}
 	return obj.GetAnnotations()[key]
+}
+
+// EffectiveAnnos returns obj's effective annotation MAP — the
+// object's own annotations overlaid with every recorded patch delta
+// (a recorded null deletes the key) — for sweep readers that must
+// scan keys rather than fetch one value (prefix matches, opt-out
+// vetoes). Outside a sweep it is a copy of the object's own map.
+func EffectiveAnnos(ctx context.Context, obj metav1.Object) map[string]string {
+	if obj == nil {
+		return nil
+	}
+	out := make(map[string]string, len(obj.GetAnnotations())+4)
+	for k, v := range obj.GetAnnotations() {
+		out[k] = v
+	}
+	if ov := sweepOverlay(ctx); ov != nil {
+		ov.mu.RLock()
+		if m, ok := ov.annos[overlayObjKey(obj)]; ok {
+			for k, v := range m {
+				if v == nil {
+					delete(out, k)
+				} else {
+					out[k] = *v
+				}
+			}
+		}
+		ov.mu.RUnlock()
+	}
+	return out
 }
 
 // RecordAnnoPatch records a landed metadata.annotations merge patch
@@ -484,12 +514,91 @@ func TryReserveWorkloadDisruption(ctx context.Context, pod *corev1.Pod) bool {
 // the pod's own "<ns>/Pod/<name>" when it is bare (a bare pod's
 // disruption only ever threatens itself, and its UID tombstone
 // already covers the same-pod case; keying it here still stops two
-// checks racing the same bare pod).
+// checks racing the same bare pod). ReplicaSet owners normalize to
+// their Deployment ("<deploy>-<pod-template-hash>" →
+// "<ns>/Deployment/<deploy>"): a Deployment rolling update runs
+// TWO ReplicaSets at once, and keying on the RS would hand each
+// RS its own slot — two checks deleting one pod of each could
+// still take a 2-replica Deployment to zero mid-rollout.
 func disruptionKey(pod *corev1.Pod) string {
 	for _, ref := range pod.OwnerReferences {
-		if ref.Controller != nil && *ref.Controller {
-			return pod.Namespace + "/" + ref.Kind + "/" + ref.Name
+		if ref.Controller == nil || !*ref.Controller {
+			continue
 		}
+		if ref.Kind == "ReplicaSet" {
+			if deploy := deploymentFromReplicaSetName(ref.Name); deploy != "" {
+				return pod.Namespace + "/Deployment/" + deploy
+			}
+		}
+		return pod.Namespace + "/" + ref.Kind + "/" + ref.Name
 	}
 	return pod.Namespace + "/Pod/" + pod.Name
+}
+
+// disruptionRSHashRe matches the trailing pod-template-hash segment
+// a Deployment controller appends to its ReplicaSet names —
+// lowercase alphanumeric; rand.String(10) in practice but the
+// floor is 1 so a short-hash ReplicaSet still normalizes onto its
+// Deployment's slot (a conservative merge — shared disruption
+// budget — never a split).
+var disruptionRSHashRe = regexp.MustCompile(`^(.+)-[a-z0-9]{1,12}$`)
+
+// deploymentFromReplicaSetName strips the pod-template-hash suffix
+// from a ReplicaSet name, returning "" when the name has no
+// hash-shaped tail (a hand-named RS keeps its own identity).
+func deploymentFromReplicaSetName(rsName string) string {
+	m := disruptionRSHashRe.FindStringSubmatch(rsName)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// TryReserveWorkloadKey is TryReserveWorkloadDisruption's
+// key-addressed form for callers that hold a workload identity
+// rather than a pod — the RestartTemplatePatch rollout-restart
+// sites (DaemonSet/Deployment annotation nudges) reserve
+// "<ns>/<Kind>/<name>" so a template restart and a pod delete in
+// the same sweep share ONE disruption slot instead of double-
+// booking the workload mid-rollout.
+func TryReserveWorkloadKey(ctx context.Context, key string) bool {
+	ov := sweepOverlay(ctx)
+	if ov == nil || key == "" {
+		return true
+	}
+	ov.mu.Lock()
+	defer ov.mu.Unlock()
+	if _, taken := ov.ownerDisrupt[key]; taken {
+		return false
+	}
+	ov.ownerDisrupt[key] = struct{}{}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// Sweep-scoped O(1) lookups — probefw installs these beside the
+// overlay so heal paths inside a sweep read the memoized census
+// instead of a live GET per pod.
+// ---------------------------------------------------------------------------
+
+// sweepNodeLookupKey carries the per-sweep node lookup
+// probefw.WithSweepSnapshot installs when it has Deps to bind.
+type sweepNodeLookupKey struct{}
+
+// SweepNodeLookup returns the sweep-scoped node lookup, or nil
+// outside a sweep / when the snapshot was built without Deps —
+// callers fall back to a live Nodes().Get. Contract: (nil, nil)
+// means "no such node" (the GET's NotFound); any error is
+// inconclusive and must fail closed exactly like the GET error.
+func SweepNodeLookup(ctx context.Context) func(context.Context, string) (*corev1.Node, error) {
+	fn, _ := ctx.Value(sweepNodeLookupKey{}).(func(context.Context, string) (*corev1.Node, error))
+	return fn
+}
+
+// WithSweepNodeLookup installs fn on ctx — probefw's sweep-root
+// wiring; exported because probefw is a sibling leaf package.
+func WithSweepNodeLookup(ctx context.Context,
+	fn func(context.Context, string) (*corev1.Node, error)) context.Context {
+
+	return context.WithValue(ctx, sweepNodeLookupKey{}, fn)
 }

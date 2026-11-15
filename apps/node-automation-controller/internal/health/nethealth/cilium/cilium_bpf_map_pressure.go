@@ -79,21 +79,24 @@ func (p *ciliumBPFMapPressureCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		log.Info("WARN: cilium bpf map pressure query failed — check inconclusive",
 			"error", err)
+		// Inconclusive, not clean: carry the held series AND report
+		// the infra error — Pass:true here would claim healthy while
+		// a red gauge stays live.
+		rep.InfraErr(fmt.Errorf("cilium bpf map pressure query: %w", err))
 		for k, lv := range p.emitted.Last() {
 			rep.Carry(k, lv)
 		}
-		rep.Close(&p.emitted, ciliumBPFMapPressureGauge.DeleteLabelValues)
-		return probefw.Result{Pass: true}
-	}
-	for _, s := range series {
-		node := s.Label("node", "kubernetes_node", "instance")
-		mapName := s.Metric["map_name"]
-		if node == "" || mapName == "" {
-			continue
+	} else {
+		for _, s := range series {
+			node := s.Label("node", "kubernetes_node", "instance")
+			mapName := s.Metric["map_name"]
+			if node == "" || mapName == "" {
+				continue
+			}
+			rep.Set(ciliumBPFMapPressureGauge, s.Value, node+"/"+mapName,
+				[]string{node, mapName})
+			rep.Find(fmt.Sprintf("%s/%s=%.2f", node, mapName, s.Value))
 		}
-		rep.Set(ciliumBPFMapPressureGauge, s.Value, node+"/"+mapName,
-			[]string{node, mapName})
-		rep.Find(fmt.Sprintf("%s/%s=%.2f", node, mapName, s.Value))
 	}
 	return rep.Result(&p.emitted, ciliumBPFMapPressureGauge.DeleteLabelValues,
 		fmt.Sprintf("cilium_bpf_map_pressure>%s: ",

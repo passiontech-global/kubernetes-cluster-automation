@@ -79,9 +79,9 @@ const (
 const maintSessionMaxAge = "45 minutes"
 
 const stuckSessionPredicate = "WHERE datname IN ('postgres', 'kine') " +
-	"AND ((application_name IN ('pg_repack', 'pg_dump', 'node_host_agent_maint') " +
+	"AND ((application_name IN ('pg_repack', 'pg_dump', 'nha_probe', 'nha_compact', 'nha_maint') " +
 	"AND backend_start < now() - interval '" + maintSessionMaxAge + "') OR " +
-	"(application_name NOT IN ('pg_repack', 'pg_dump', 'node_host_agent_maint') " +
+	"(application_name NOT IN ('pg_repack', 'pg_dump', 'nha_probe', 'nha_compact', 'nha_maint') " +
 	"AND ((state = 'idle in transaction' " +
 	"AND state_change < now() - interval '5 minutes') OR " +
 	"(state = 'active' AND query_start < now() - interval '10 minutes' " +
@@ -94,7 +94,7 @@ func (p *Probe) reapStuckSessions(ctx context.Context, pg, user, pass string,
 	note func(string)) {
 	if p.d.Cfg.ReadOnly {
 		// COUNT what the reaper WOULD kill — diagnostics only.
-		out, err := p.d.PsqlQuery(ctx, pg, user, pass,
+		out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
 			"SELECT COUNT(pid) FROM pg_stat_activity "+stuckSessionPredicate)
 		if err != nil {
 			note(fmt.Sprintf("reap-sessions-fail: %v", err))
@@ -105,7 +105,7 @@ func (p *Probe) reapStuckSessions(ctx context.Context, pg, user, pass string,
 		}
 		return
 	}
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "+
 			stuckSessionPredicate)
 	if err != nil {
@@ -139,7 +139,7 @@ func (p *Probe) reapStuckSessions(ctx context.Context, pg, user, pass string,
 // real backend load — a RECONNECT flushes them, not a backend fix.
 func (p *Probe) activeBackendQueries(ctx context.Context, pg, user, pass string,
 	note func(string)) (int64, bool) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
 		"SELECT COUNT(pid) FROM pg_stat_activity "+
 			"WHERE datname IN ('postgres', 'kine') AND state = 'active' "+
 			"AND pid <> pg_backend_pid()")
@@ -305,7 +305,7 @@ func (p *Probe) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	// restart` would kill. Saturation/auth wedges skip it: a queue
 	// past WaitMax or a broken auth path wants the full bounce.
 	if starveFire && !saturated && fails < fires {
-		if _, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass), []string{p.d.Cfg.Runtime, "exec",
+		if _, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass, kdeps.AppNameProbe), []string{p.d.Cfg.Runtime, "exec",
 			"-e", "PGPASSWORD", pg,
 			"psql", "-h", pgb, "-p", p.d.Cfg.PoolerPort,
 			"-U", user, "-d", pgbAdminDB, "-Aqc", "RECONNECT"}, ""); err == nil {

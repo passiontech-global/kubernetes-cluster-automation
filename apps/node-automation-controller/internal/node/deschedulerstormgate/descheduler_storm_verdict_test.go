@@ -113,7 +113,7 @@ func TestStormGateMidSweepHoldConflictDefers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a lost race must defer, not error the reconcile: %v", err)
 	}
-	if res.RequeueAfter != 5*time.Minute {
+	if res.RequeueAfter < 4*time.Minute+30*time.Second || res.RequeueAfter >= 5*time.Minute+30*time.Second {
 		t.Fatalf("deferred sweep lost the regular 5m requeue: %+v", res)
 	}
 	if got := getDeschedulerReplicas(t, cs); got != 2 {

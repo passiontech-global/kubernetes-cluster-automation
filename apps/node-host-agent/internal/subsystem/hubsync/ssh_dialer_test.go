@@ -55,7 +55,7 @@ func TestSyncerName(t *testing.T) {
 // missing key file is NOT an error at construction (Dial loads the
 // signer), and a nil log falls back to the package logger.
 func TestNewSSHDialer(t *testing.T) {
-	d, err := newSSHDialer("/no/such/key", 2222, 7*time.Second, "", true, "", nil)
+	d, err := newSSHDialer("/no/such/key", 2222, 7*time.Second, time.Minute, "", true, "", nil)
 	if err != nil {
 		t.Fatalf("construct err=%v", err)
 	}
@@ -73,7 +73,7 @@ func TestNewSSHDialer(t *testing.T) {
 // either half of the pair re-enables dialing.
 func TestSSHDialerHostKeyFailClosed(t *testing.T) {
 	ctx := context.Background()
-	closed, err := newSSHDialer("/no/such/key", 22, time.Second, "", false, "", nil)
+	closed, err := newSSHDialer("/no/such/key", 22, time.Second, time.Minute, "", false, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestSSHDialerHostKeyFailClosed(t *testing.T) {
 		!strings.Contains(err.Error(), "host key verification unavailable") {
 		t.Fatalf("unpinned dial err=%v, want fail-closed", err)
 	}
-	allowed, err := newSSHDialer("/no/such/key", 22, time.Second, "", true, "", nil)
+	allowed, err := newSSHDialer("/no/such/key", 22, time.Second, time.Minute, "", true, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +343,7 @@ func TestSSHConnLiveServer(t *testing.T) {
 			}
 		})
 
-	d, err := newSSHDialer(keyPath, srv.port(), 5*time.Second, "", true, "", nil)
+	d, err := newSSHDialer(keyPath, srv.port(), 5*time.Second, time.Minute, "", true, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestSSHConnLiveServer(t *testing.T) {
 	_ = conn.Close()
 
 	// Dial against a closed port → transport error.
-	down, err := newSSHDialer(keyPath, 1, time.Second, "", true, "", nil)
+	down, err := newSSHDialer(keyPath, 1, time.Second, time.Minute, "", true, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +426,7 @@ func TestSSHConnPutAtomicAndStageSuffix(t *testing.T) {
 			return ""
 		})
 
-	d, err := newSSHDialer(keyPath, srv.port(), 5*time.Second, "", true, "", nil)
+	d, err := newSSHDialer(keyPath, srv.port(), 5*time.Second, time.Minute, "", true, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +476,7 @@ func TestSSHConnPutAtomicAndStageSuffix(t *testing.T) {
 	failSrv := newTestSSHServerOpts(t, keyPath,
 		func(string, []byte) string { return "" },
 		sshServerOpts{failOn: map[string]string{"sh -c": "perm denied"}})
-	failDialer, err := newSSHDialer(keyPath, failSrv.port(), 5*time.Second, "", true, "", nil)
+	failDialer, err := newSSHDialer(keyPath, failSrv.port(), 5*time.Second, time.Minute, "", true, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,6 +8,7 @@ package maintenance
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -153,17 +154,35 @@ func controllerOwnedStamp(value string, now time.Time) bool {
 }
 
 // maintenanceStampTargets resolves which nodes the active
-// maintenance signals cover, plus whether every consulted signal
-// read succeeded. Read failures degrade to "no targets" per source —
-// stamping is a hint, and the held verdict that triggered this call
-// already proved maintenance is real — but they also clear `complete`
-// so the caller skips the unstamp half: dropping a hold on a signal
-// we could not observe is the unsafe direction.
+// maintenance signals cover for the STAMP path — the 2h cordon
+// horizon wrapper over the shared maintenanceTargets resolver
+// Verdict.Scope also uses (at the narrower 45m verdict window).
 func maintenanceStampTargets(ctx context.Context, cs kubernetes.Interface,
 	dyn dynamic.Interface, nodes []corev1.Node, now time.Time) (all bool,
 	names map[string]bool, complete bool) {
+	all, names, complete, _ = maintenanceTargets(ctx, cs, dyn, nodes,
+		now, maintenanceStampCordonMaxAge)
+	return all, names, complete
+}
+
+// maintenanceTargets is the shared target resolver behind both the
+// stamp writer (2h cordon horizon) and the Verdict.Scope read (45m
+// verdict horizon): cordon-fresh nodes, kured-lock targets and live
+// medik8s remediation targets land in `names`, cluster-wide signals
+// (autopilot Plan, unscoped kured lock, an unresolvable medik8s CR)
+// land in `all`. Read failures degrade to "no targets" per source —
+// stamping is a hint — but they also clear `complete` so callers
+// that unstamp or fail closed can tell a degraded read apart;
+// Scope maps !complete to its unverifiable error. The fourth return
+// is the first held signal's evidence string in the canonical
+// a→b→c→d order — the stamp path ignores it.
+func maintenanceTargets(ctx context.Context, cs kubernetes.Interface,
+	dyn dynamic.Interface, nodes []corev1.Node, now time.Time,
+	cordonMaxAge time.Duration) (all bool,
+	names map[string]bool, complete bool, why string) {
 	names = map[string]bool{}
 	complete = true
+	var whyCordon, whyKured, whyAutopilot, whyMedik8s string
 	nodeNames := map[string]bool{}
 	for i := range nodes {
 		nodeNames[nodes[i].Name] = true
@@ -172,8 +191,11 @@ func maintenanceStampTargets(ctx context.Context, cs kubernetes.Interface,
 		// drain window for stamping purposes — agents holding
 		// local remediation longer than the verdict needs is
 		// cheap, resuming it mid-drain is not.
-		if kube.NodeCordonedFresh(&nodes[i], now, maintenanceStampCordonMaxAge) {
+		if kube.NodeCordonedFresh(&nodes[i], now, cordonMaxAge) {
 			names[nodes[i].Name] = true
+			if whyCordon == "" {
+				whyCordon = "node " + nodes[i].Name + " actively cordoned"
+			}
 		}
 	}
 	if dyn == nil {
@@ -182,21 +204,49 @@ func maintenanceStampTargets(ctx context.Context, cs kubernetes.Interface,
 		complete = false
 	} else {
 		for _, gvr := range kube.Medik8sRemediationGVRs {
-			items, err := listLiveMedik8s(ctx, dyn, gvr)
+			items, err := listLiveMedik8s(ctx, dyn, gvr, now)
 			if err != nil {
 				complete = false
 				continue // list failure — no targets from it
 			}
 			for i := range items {
-				if n := medik8sTargetNode(&items[i], nodeNames); n != "" {
+				n := medik8sTargetNode(&items[i], nodeNames)
+				// Only a target that resolves to a LIVE node scopes
+				// the hold — the annotation path returns its raw
+				// value, so a remediation naming an already-deleted
+				// (or garbage) node cannot be pinned to a census
+				// entry and degrades to the cluster-wide hold.
+				if n != "" && nodeNames[n] {
 					names[n] = true
+				} else {
+					// A live remediation CR we cannot scope
+					// to any node must hold EVERYTHING —
+					// dropping it would read "no maintenance"
+					// while fencing is in flight.
+					all = true
+				}
+				if whyMedik8s == "" {
+					obj := &items[i]
+					kind := obj.GetKind()
+					if kind == "" {
+						kind = gvr.Resource
+					}
+					whyMedik8s = fmt.Sprintf("medik8s remediation %s %s in flight",
+						kind, obj.GetNamespace()+"/"+obj.GetName())
 				}
 			}
 		}
 		if plans, err := activeAutopilotPlans(ctx, dyn); err != nil {
 			complete = false
-		} else if len(plans) > 0 {
-			all = true // cluster upgrade — every node holds
+		} else {
+			for i := range plans {
+				all = true // cluster upgrade — every node holds
+				if whyAutopilot == "" {
+					state, _ := kube.NestedString(plans[i].Object, "status", "state")
+					whyAutopilot = fmt.Sprintf("autopilot plan %s state=%s",
+						plans[i].GetName(), state)
+				}
+			}
 		}
 	}
 	if holder, err := kuredLockHolder(ctx, cs); err == nil {
@@ -213,11 +263,20 @@ func maintenanceStampTargets(ctx context.Context, cs kubernetes.Interface,
 			} else {
 				all = true
 			}
+			whyKured = "kured lock held by " + holder
 		}
 	} else {
 		complete = false
 	}
-	return all, names, complete
+	// Canonical a→b→c→d evidence order — the same "first held
+	// signal answers" contract the short-circuit verdict kept.
+	for _, w := range []string{whyCordon, whyKured, whyAutopilot, whyMedik8s} {
+		if w != "" {
+			why = w
+			break
+		}
+	}
+	return all, names, complete, why
 }
 
 // medik8sTargetNode extracts the node a remediation CR works on:

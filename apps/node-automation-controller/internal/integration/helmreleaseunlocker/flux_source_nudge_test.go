@@ -91,7 +91,13 @@ func TestFluxSourceNudgeStampsSource(t *testing.T) {
 func TestFluxSourceNudgeSkippedWhileMaintenanceActive(t *testing.T) {
 	base := time.Now()
 	k := nudgeKust("flux-system", "apps", base.Add(-20*time.Minute))
-	dyn := testutil.NewDynamicClient(k, nudgeRepo("flux-system", "repo", nil))
+	// Cluster-wide hold: an in-flight autopilot Plan is the only
+	// maintenance signal AllowedUpgradeOnly still defers on — the
+	// cordoned node below scopes to w1 and must NOT hold the nudge.
+	plan := testutil.Unstructured(
+		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", "upgrade-1", nil)
+	plan.Object["status"] = map[string]any{"state": "Running"}
+	dyn := testutil.NewDynamicClient(k, nudgeRepo("flux-system", "repo", nil), plan)
 	fresh := metav1.NewTime(base.Add(-time.Minute))
 	cs := kfake.NewSimpleClientset(&corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "w1"},

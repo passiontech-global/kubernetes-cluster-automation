@@ -7,6 +7,7 @@
 package ctr
 
 import (
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -20,6 +21,25 @@ var (
 	// extraction (shell sed pattern).
 	shimIDRe = regexp.MustCompile(`-id ([0-9a-f]{64})`)
 )
+
+// procCommKnown returns the pid's comm when the cycle's stat
+// snapshot (StatsOnce, or a direct stat for hand-built envs)
+// positively identifies it — known=false means "cannot rule the
+// pid out", and callers take the old full-read path. The shim
+// scans use it to skip the mm-backed cmdline read for every
+// non-shim pid.
+func procCommKnown(e *wdeps.CycleEnv, d *wdeps.Deps, pid int) (comm string, known bool) {
+	if e != nil && e.StatsOnce != nil {
+		if st, ok := e.StatsOnce()[pid]; ok && st.HasComm {
+			return st.Comm, true
+		}
+		return "", false
+	}
+	if st, ok := d.Proc.Stat(pid); ok && st.HasComm {
+		return st.Comm, true
+	}
+	return "", false
+}
 
 // shimFlagValue extracts `-name value` / `-name=value` (double-dash
 // forms tolerated) from a shim argv. ok=false when the flag is absent
@@ -112,4 +132,70 @@ func ctrShimScope(d *wdeps.Deps, argv []string) (ns, sid string, inScope bool) {
 		return "", "", false
 	}
 	return ns, m[1], true
+}
+
+// relInside reports target's path relative to base, ok=false when
+// target escapes base (".." segments) or equals it — the containment
+// gate every fd-path scope check runs before trusting a component.
+func relInside(base, target string) (string, bool) {
+	rel, err := filepath.Rel(base, target)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return rel, true
+}
+
+// dzShimScope is the D/Z-state fallback for the shim scan: a wedged
+// shim's cmdline is mm-backed and unreadable (the read would hang
+// on mmap_lock — the D-state deadlock the procfs guard exists for),
+// but its stat comm and open-fd readlinks are mmap_lock-free. The
+// shim keeps fds into its task dir — <taskParent>/<ns>/<64hex>/…
+// (or <CtrTaskRoot>/<sid>/… for k8s.io) — and the path's root doubles
+// as the -address scope proof: a foreign containerd's shim holds fds
+// under ITS root, never ours. ok=false for non-D/Z states, non-shim
+// comms, or no fd evidence — an unverifiable shim is never
+// escalated (fail closed, same posture as ctrShimScope).
+func dzShimScope(d *wdeps.Deps, pid int) (ns, sid string, ok bool) {
+	st, sok := d.Proc.Stat(pid)
+	if !sok || !st.HasComm ||
+		!strings.HasPrefix(st.Comm, "containerd-shim") ||
+		(st.Fields[0] != "D" && st.Fields[0] != "Z") {
+		return "", "", false
+	}
+	fdDir := d.Proc.File(pid, "fd")
+	fds, err := os.ReadDir(fdDir)
+	if err != nil {
+		return "", "", false
+	}
+	taskParent := filepath.Dir(d.Cfg.CtrTaskRoot)
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+		if err != nil {
+			continue
+		}
+		// An orphan's task dir is already unlinked — the readlink
+		// target keeps the path with a " (deleted)" suffix.
+		target = strings.TrimSuffix(target, " (deleted)")
+		// k8s.io task dir: <CtrTaskRoot>/<sid>/…
+		if rel, inside := relInside(d.Cfg.CtrTaskRoot, target); inside {
+			if parts := strings.Split(rel, string(filepath.Separator)); len(parts) >= 1 && hexTaskIDRe.MatchString(parts[0]) {
+				return "k8s.io", parts[0], true
+			}
+			continue
+		}
+		// Foreign namespace on the same containerd:
+		// <taskParent>/<ns>/<sid>/…
+		rel, inside := relInside(taskParent, target)
+		if !inside {
+			continue
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) < 2 || !validShimNamespace(parts[0]) ||
+			!hexTaskIDRe.MatchString(parts[1]) {
+			continue
+		}
+		return parts[0], parts[1], true
+	}
+	return "", "", false
 }

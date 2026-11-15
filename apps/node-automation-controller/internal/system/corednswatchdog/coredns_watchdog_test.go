@@ -815,6 +815,19 @@ func svcListCounter(cs *fake.Clientset) *int {
 	return &n
 }
 
+// svcGetCounter counts Service get API calls through a reactor —
+// the targeted-refresh path's footprint (one GET per refresh vs a
+// cluster-wide list per re-pick).
+func svcGetCounter(cs *fake.Clientset) *int {
+	n := 0
+	cs.PrependReactor("get", "services",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			n++
+			return false, nil, nil
+		})
+	return &n
+}
+
 func TestCoreDNSProbeFQDNCacheTTL(t *testing.T) {
 	ready := true
 	pinned := time.Unix(1700000000, 0)
@@ -828,6 +841,7 @@ func TestCoreDNSProbeFQDNCacheTTL(t *testing.T) {
 	w := newCDNSWatchdog(fake.NewSimpleClientset(svc, es))
 	w.now = func() time.Time { return clock }
 	lists := svcListCounter(w.cs.(*fake.Clientset))
+	gets := svcGetCounter(w.cs.(*fake.Clientset))
 
 	fqdn, _ := w.probeFQDN(ctx)
 	if fqdn != "fresh-svc.app-ns.svc.cluster.local" {
@@ -848,17 +862,22 @@ func TestCoreDNSProbeFQDNCacheTTL(t *testing.T) {
 		t.Fatalf("TTL hit re-listed services (%d lists, want 1)", got)
 	}
 
-	// Past the TTL: a MISS — exactly one re-list, and the refreshed
-	// answer re-arms the cache.
+	// Past the TTL: the target's identity is still valid, so the
+	// refresh is TARGETED — one Service GET + one namespaced
+	// EndpointSlice list — not another cluster-wide Service scan.
+	// The refreshed answer re-arms the cache.
 	clock = pinned.Add(corednsFQDNCacheTTL + time.Minute)
 	if fqdn3, _ := w.probeFQDN(ctx); fqdn3 != fqdn {
 		t.Fatalf("post-TTL pick changed: %q != %q", fqdn3, fqdn)
 	}
-	if got := *lists; got != 2 {
-		t.Fatalf("TTL expiry did not re-list (%d lists, want 2)", got)
+	if got := *lists; got != 1 {
+		t.Fatalf("TTL expiry re-scanned services (%d lists, want 1)", got)
+	}
+	if got := *gets; got != 1 {
+		t.Fatalf("TTL expiry made %d service gets, want 1 (targeted refresh)", got)
 	}
 	clock = clock.Add(time.Minute)
-	if _, _ = w.probeFQDN(ctx); *lists != 2 {
+	if _, _ = w.probeFQDN(ctx); *lists != 1 || *gets != 1 {
 		t.Fatal("refreshed answer not re-cached")
 	}
 }
@@ -1160,8 +1179,15 @@ func TestCoreDNSRecoverNotFoundDelete(t *testing.T) {
 		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
 			t.Fatal("live suspect not deleted")
 		}
-		if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a == "" {
-			t.Fatal("cooldown not stamped although one delete was delivered")
+		// Partial pass (ghost never resolved): the Deployment-level
+		// 30m stamp is withheld — only a FULL eviction earns it; the
+		// delivered pod carries the per-UID cooldown instead.
+		if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a != "" {
+			t.Fatal("Deployment cooldown stamped on a partial recovery")
+		}
+		if !w.podHeals.CooledDown("cdns-a", corednsCooldownS*time.Second,
+			w.now.Now()) {
+			t.Fatal("per-UID cooldown missing for the delivered pod")
 		}
 	})
 

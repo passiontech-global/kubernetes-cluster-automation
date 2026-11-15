@@ -133,10 +133,11 @@ func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, n
 
 // tmpOrphanMinAge is the in-flight window sweepTmpOrphans honors:
 // a staging file younger than this may belong to a live upload
-// (the put streams for seconds, WAN included); older than it the
-// writer is gone — crash, cancel or a pre-trap build — and the
-// file is an orphan.
-const tmpOrphanMinAge = 15
+// (streamCmd bounds one body at TargetTimeout=3m — 60min leaves
+// an order of magnitude of headroom); older than it the writer
+// is gone — crash, cancel or a pre-trap build — and the file is
+// an orphan.
+const tmpOrphanMinAge = 60
 
 // sweepTmpOrphans deletes `.<name>.tmp[.<nonce>]` staging leftovers
 // older than tmpOrphanMinAge inside dir — one `find` listing plus

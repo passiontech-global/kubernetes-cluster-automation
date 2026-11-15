@@ -189,9 +189,12 @@ func (d *Deps) OwnerGone(ctx context.Context, ns string,
 		var liveUID types.UID
 		switch ref.Kind {
 		case "Pod":
-			if pods, err := d.AllPods(ctx); err == nil {
-				found, liveUID = censusHit(pods, ns, ref.Name,
-					func(p *corev1.Pod) metav1.Object { return p })
+			// Direct GET, not the census: a pod created after the
+			// sweep snapshot loaded would read as a false "owner
+			// gone" and unlock finalizer strips on a live object —
+			// the same miss/error fallthrough the other kinds keep.
+			if o, err := d.Pod(ctx, ns, ref.Name); err == nil && o != nil {
+				found, liveUID = true, o.UID
 			}
 		case "ReplicaSet":
 			if o, err := d.ReplicaSet(ctx, ns, ref.Name); err == nil && o != nil {

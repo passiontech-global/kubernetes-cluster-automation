@@ -258,8 +258,9 @@ func cleanCycleFixture(t *testing.T) (*Reconciler, *testutil.FakeRunner) {
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
-		DownloadDir: t.TempDir(), Runner: sr,
-		Clock: timex.NewCell(func() time.Time { return time.Unix(1_700_000_000, 0) })}, nil)
+		DownloadDir: t.TempDir(), Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(),
+		ListenAddrsFn: listenAddrsFake(),
+		Clock:         timex.NewCell(func() time.Time { return time.Unix(1_700_000_000, 0) })}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +324,7 @@ func TestGroupRecordsOkErrorPanic(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +365,7 @@ func TestGroupWriteFailureCountedViaHelper(t *testing.T) {
 	sr := newScripted(nil, nil)
 	hr := t.TempDir()
 	r, err := New(Config{NodeName: "node-b", HostRoot: hr,
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +391,7 @@ func journaldEnv(t *testing.T, res map[string]string, errs map[string]bool) (*cy
 	vars := writeVarsDir(t, "")
 	sr := newScripted(res, errs)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +407,7 @@ func TestApplyNftUnitRejectsBeforePromote(t *testing.T) {
 		"nft -c -f": true,
 	})
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +437,7 @@ func TestApplyNftUnitPromotesValidCandidate(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +522,7 @@ func TestApplyNftUnitSweepsStaleCandidate(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

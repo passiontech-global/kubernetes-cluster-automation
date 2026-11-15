@@ -11,6 +11,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
@@ -78,11 +79,13 @@ func TestAllowedCooledDownShortCircuits(t *testing.T) {
 }
 
 // A held mutex defers without the unverifiable flag — normal
-// operation, no IncError owed by the caller.
+// operation, no IncError owed by the caller. The Scope verdict
+// evaluates ALL four signals, so the dyn client must be wired —
+// nil dyn is unverifiable by contract (see the next test).
 func TestAllowedMaintenanceHeld(t *testing.T) {
 	cs := fake.NewSimpleClientset(cordonedNow("w1"))
-	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil, cs, nil,
-		&state.CooldownSet{}, "k", time.Minute, time.Now())
+	proceed, unverifiable := AllowedV(ctx, logr.Discard(), nil, cs,
+		planAwareDyn(), &state.CooldownSet{}, "k", time.Minute, time.Now())
 	if proceed || unverifiable {
 		t.Fatalf("held AllowedV = (%v,%v), want (false,false)",
 			proceed, unverifiable)
@@ -517,5 +520,147 @@ func TestEvictPodQuorumReservation(t *testing.T) {
 	if _, gerr := cs.CoreV1().Pods("ns1").Get(ctx, "web-1",
 		metav1.GetOptions{}); gerr != nil {
 		t.Fatal("denied pod must survive — no eviction was issued")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AllowedOnNode / AllowedUpgradeOnly — the tiered-Scope gates: a
+// node-scoped hold blocks only its own node's DaemonSet heals, and
+// only a cluster-wide hold blocks annotation-only nudges.
+// ---------------------------------------------------------------------------
+
+// clusterWidePlan builds an autopilot Plan mid-upgrade — mutex
+// signal (c), the ClusterWide half of the Scope.
+func clusterWidePlan() *unstructured.Unstructured {
+	u := testhelp.Unstructured(
+		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"),
+		"", "upgrading", nil)
+	u.Object["status"] = map[string]any{"state": "Upgrading"}
+	return u
+}
+
+func TestAllowedOnNodeScope(t *testing.T) {
+	resetBudget(t)
+	cs := fake.NewSimpleClientset(cordonedNow("w1"))
+	dyn := planAwareDyn()
+	now := time.Now()
+
+	// The held node defers — normal operation, no IncError owed.
+	proceed, unverifiable := AllowedOnNode(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "k", "w1", time.Minute, now)
+	if proceed || unverifiable {
+		t.Fatalf("held-node AllowedOnNode = (%v,%v), want (false,false)",
+			proceed, unverifiable)
+	}
+	// A DIFFERENT node proceeds — the drain is scoped, not
+	// cluster-wide.
+	proceed, unverifiable = AllowedOnNode(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "k", "w2", time.Minute, now)
+	if !proceed || unverifiable {
+		t.Fatalf("other-node AllowedOnNode = (%v,%v), want (true,false)",
+			proceed, unverifiable)
+	}
+}
+
+func TestAllowedOnNodeClusterWideDefers(t *testing.T) {
+	resetBudget(t)
+	cs := fake.NewSimpleClientset()
+	dyn := planAwareDyn(clusterWidePlan())
+	proceed, unverifiable := AllowedOnNode(ctx, logr.Discard(), nil,
+		cs, dyn, nil, "k", "w1", time.Minute, time.Now())
+	if proceed || unverifiable {
+		t.Fatalf("cluster-wide AllowedOnNode = (%v,%v), want (false,false)",
+			proceed, unverifiable)
+	}
+}
+
+func TestAllowedUpgradeOnlyScope(t *testing.T) {
+	resetBudget(t)
+	now := time.Now()
+
+	// Node-scoped hold does NOT block an annotation-only nudge.
+	cs := fake.NewSimpleClientset(cordonedNow("w1"))
+	proceed, unverifiable := AllowedUpgradeOnly(ctx, logr.Discard(),
+		nil, cs, planAwareDyn(), "k", now)
+	if !proceed || unverifiable {
+		t.Fatalf("node-scoped AllowedUpgradeOnly = (%v,%v), want (true,false)",
+			proceed, unverifiable)
+	}
+	// Cluster-wide hold DOES.
+	proceed, unverifiable = AllowedUpgradeOnly(ctx, logr.Discard(),
+		nil, fake.NewSimpleClientset(), planAwareDyn(clusterWidePlan()),
+		"k", now)
+	if proceed || unverifiable {
+		t.Fatalf("cluster-wide AllowedUpgradeOnly = (%v,%v), want (false,false)",
+			proceed, unverifiable)
+	}
+	// Unverifiable fails closed like every gate.
+	proceed, unverifiable = AllowedUpgradeOnly(ctx, logr.Discard(),
+		nil, fake.NewSimpleClientset(), nil, "k", now)
+	if proceed || !unverifiable {
+		t.Fatalf("unverifiable AllowedUpgradeOnly = (%v,%v), want (false,true)",
+			proceed, unverifiable)
+	}
+}
+
+// DeletePod/EvictPod map 404 and 409 to clean deferrals — the pod
+// is already gone or was recreated under a new UID, so no heal was
+// needed, no error is owed, and (for EvictPod) the grant refunds.
+func TestDeletePodNotFoundConflict(t *testing.T) {
+	p := pod("ns1", "gone", "u1", corev1.PodRunning, time.Now())
+
+	// 404: fake clientset has no such pod.
+	deleted, err := DeletePod(ctx, fake.NewSimpleClientset(), nil,
+		"k", p, time.Now())
+	if err != nil || deleted {
+		t.Fatalf("404 DeletePod = (%v,%v), want (false,nil)", deleted, err)
+	}
+
+	// 409: UID precondition loses to a recreated pod.
+	ctrl := true
+	repl := p.DeepCopy()
+	repl.UID = "u2"
+	repl.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "rs-x", Controller: &ctrl}}
+	p.OwnerReferences = repl.OwnerReferences
+	cs := fake.NewSimpleClientset(repl)
+	cs.PrependReactor("delete", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewConflict(
+				corev1.Resource("pods"), "gone",
+				errors.New("the object has been modified"))
+		})
+	deleted, err = DeletePod(ctx, cs, nil, "k", p, time.Now())
+	if err != nil || deleted {
+		t.Fatalf("409 DeletePod = (%v,%v), want (false,nil)", deleted, err)
+	}
+}
+
+func TestEvictPodNotFoundConflict(t *testing.T) {
+	p := pod("ns1", "gone", "u1", corev1.PodRunning, time.Now())
+
+	evicted, refused, err := EvictPod(ctx, fake.NewSimpleClientset(),
+		nil, "k", p, time.Now())
+	if err != nil || evicted || !refused {
+		t.Fatalf("404 EvictPod = (%v,%v,%v), want (false,true,nil)",
+			evicted, refused, err)
+	}
+
+	ctrl := true
+	p.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "rs-y", Controller: &ctrl}}
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewConflict(
+				corev1.Resource("pods"), "gone",
+				errors.New("the object has been modified"))
+		})
+	evicted, refused, err = EvictPod(ctx, cs, nil, "k", p, time.Now())
+	if err != nil || evicted || !refused {
+		t.Fatalf("409 EvictPod = (%v,%v,%v), want (false,true,nil)",
+			evicted, refused, err)
 	}
 }

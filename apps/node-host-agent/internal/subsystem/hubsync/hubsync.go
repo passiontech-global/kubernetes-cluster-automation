@@ -81,6 +81,13 @@ type Syncer struct {
 	// cycleCh signals "lease freshly held — converge now" from the
 	// renew loop to the cycle driver (buffered 1, drop-when-full).
 	cycleCh chan struct{}
+	// cycleCancel cancels the in-flight converge's context the
+	// moment the lease is lost or a renew fails — the per-target
+	// leaseHeld() gate only stops the NEXT target; without this a
+	// multi-minute WAN syncTarget keeps running while a second pod
+	// has already taken the lease (split-brain overlap on the
+	// target mid-flight).
+	cycleCancel context.CancelFunc
 
 	// leaseArmed keeps the lease heartbeater single-flight: the
 	// agent supervisor re-invokes Run on the SAME ctx after a Cycle
@@ -118,8 +125,8 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 	s.dialer = cfg.Dialer
 	if s.dialer == nil {
 		d, err := newSSHDialer(cfg.SSHKeyPath, cfg.SSHPort, cfg.SSHTimeout,
-			cfg.SSHHostKeyFingerprint, cfg.SSHAllowInsecureHostKey,
-			cfg.StateDir, cfg.Log)
+			cfg.TargetTimeout, cfg.SSHHostKeyFingerprint,
+			cfg.SSHAllowInsecureHostKey, cfg.StateDir, cfg.Log)
 		if err != nil {
 			return nil, fmt.Errorf("hubsync: ssh key: %w", err)
 		}

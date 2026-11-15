@@ -324,6 +324,15 @@ func TestStreakLedgerSetForces(t *testing.T) {
 	if s.Count("b") != 0 {
 		t.Fatal("Set to 0 should count 0")
 	}
+	// Set(key, <=0) must DROP the key, not store a 0 — Len counts
+	// tracked keys and a stored 0 would over-report them.
+	if s.Len() != 1 {
+		t.Fatalf("Len after Set(b,0) = %d, want 1 (b dropped)", s.Len())
+	}
+	s.Set("a", -3)
+	if s.Len() != 0 || s.Count("a") != 0 {
+		t.Fatal("Set to a negative count should drop the key")
+	}
 }
 
 func TestStreakLedgerPrune(t *testing.T) {

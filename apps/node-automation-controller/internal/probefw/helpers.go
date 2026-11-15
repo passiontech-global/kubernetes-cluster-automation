@@ -97,18 +97,48 @@ func (d *Deps) PromQuery(ctx context.Context, query string) ([]promq.Sample, err
 	// pair raced: a sibling get between the unlock and the reset
 	// replayed the just-cached error to the whole sweep.)
 	v, err := m.getLive(func() ([]promq.Sample, error) {
-		// The query runs under the SNAPSHOT's ctx (sweep parent +
-		// snapshotListTimeout), not the calling check's PerCheck
-		// ctx — the census-listCtx contract: one check's expiring
-		// deadline must not cache a DeadlineExceeded every later
-		// identical query then reads as a real Prometheus failure.
-		// c.Timeout still bounds the wire call itself.
-		lctx, cancel := s.listCtx(ctx)
+		// Per-sweep circuit breaker: once Prometheus has proven
+		// unreachable (promCircuitThreshold consecutive transport
+		// failures), every NEW query fast-fails for the rest of
+		// the sweep instead of each of the ~40 Prom-backed checks
+		// paying its own dial timeout. Already-memoized successes
+		// still serve — the circuit only gates wire calls.
+		if s.promCircuitOpen() {
+			return nil, errPromCircuitOpen
+		}
+		// The query runs under the CALLING check's ctx bounded by
+		// snapshotListTimeout — the PerCheck deadline is honored
+		// (a check whose budget is nearly spent fails fast rather
+		// than blocking the pool), and because failures are never
+		// memoized an expiring check ctx cannot poison a later
+		// identical query the way the old shared-ctx design could.
+		lctx, cancel := context.WithTimeout(ctx, snapshotListTimeout)
 		defer cancel()
-		return c.InstantQuery(lctx, endpoint, query)
+		samples, queryErr := c.InstantQuery(lctx, endpoint, query)
+		// Only feed the circuit when the CALLER's ctx is still
+		// alive: a check whose own cctx deadline expired makes
+		// lctx fail with a local timeout that promq wraps as
+		// TransportError — counting those would let ONE slow
+		// check's budget trip promOpen and blind the other ~54
+		// checks for the rest of the sweep. With ctx alive, a
+		// transport error is genuine endpoint evidence.
+		if ctx.Err() == nil {
+			s.promNoteResult(queryErr)
+		}
+		return samples, queryErr
 	})
 	return v, err
 }
+
+// errPromCircuitOpen is the fast-fail PromQuery returns once the
+// sweep's Prometheus circuit has tripped — the endpoint produced
+// promCircuitThreshold consecutive transport failures, so further
+// queries this sweep skip the wire entirely. It is a plain error,
+// not a sentinel callers match on: every Prom-backed check already
+// treats a PromQuery error as inconclusive/infra, which is exactly
+// the right verdict for "Prometheus is down".
+var errPromCircuitOpen = errors.New(
+	"prometheus circuit open: endpoint unreachable this sweep")
 
 // SelfHealKey composes the shared heal-ledger key —
 // "selfheal/<check>/<target>" — DeletePodHeal stamps on
@@ -189,6 +219,47 @@ func (d *Deps) HealAllowedPersisted(ctx context.Context, log logr.Logger,
 		heals, obj, annoKey, key, cooldown, now)
 }
 
+// HealAllowedOnNode is HealAllowed's node-scoped sibling for heals
+// that touch ONE node's DaemonSet pods: the maintenance Scope
+// defers only on a cluster-wide hold or a hold naming nodeName —
+// a drain scoped to a different node does not block the bounce.
+// Cooldown/budget gates are unchanged; there is no persisted
+// variant on Deps — callers needing the wider-of window call
+// heal.AllowedOnNodePersisted through their own verdict.
+func (d *Deps) HealAllowedOnNode(ctx context.Context, log logr.Logger,
+	heals *state.CooldownSet, key, nodeName string,
+	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
+	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
+	return heal.AllowedOnNode(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+		heals, key, nodeName, cooldown, now)
+}
+
+// HealAllowedUpgradeOnly gates the annotation-only nudges: it
+// defers ONLY on a cluster-wide maintenance hold — a node-scoped
+// drain does not block a metadata write, and no heal-budget grant
+// is consumed.
+func (d *Deps) HealAllowedUpgradeOnly(ctx context.Context, log logr.Logger,
+	key string, now time.Time) (proceed, unverifiable bool) {
+	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
+	return heal.AllowedUpgradeOnly(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+		key, now)
+}
+
+// HealAllowedUpgradeOnlyPersisted is HealAllowedUpgradeOnly with the
+// cooldown widened to the target's persisted stamp — the gate every
+// annotation-only nudge (Flux requestedAt stamps, ArgoCD sync
+// requests, Kargo promotion stamps, force-sync annotations) runs:
+// wider-of in-RAM+annotation cooldown first, then ONLY the
+// cluster-wide maintenance Scope. Node-scoped drains do not defer a
+// metadata write and no heal-budget grant is consumed.
+func (d *Deps) HealAllowedUpgradeOnlyPersisted(ctx context.Context, log logr.Logger,
+	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
+	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
+	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
+	return heal.AllowedUpgradeOnlyPersisted(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+		heals, obj, annoKey, key, cooldown, now)
+}
+
 // maintenanceVerdict resolves the verdict the heal gates memoize
 // on: the sweep-shared Maintenance pointer when the module wired
 // one, else this Deps' own fallback (nil Maintenance on a
@@ -262,6 +333,66 @@ func (d *Deps) DeletePodHeal(ctx context.Context, log logr.Logger,
 	log.Info("DELETE: pod heal — forcing pod restart",
 		"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
 	return true
+}
+
+// DeletePodHealOnNode is DeletePodHeal's node-scoped sibling for
+// DaemonSet pod bounces: the maintenance gate defers only on a
+// cluster-wide hold or a hold naming pod.Spec.NodeName — a drain
+// scoped to a different node does not block this pod's restart.
+// Cooldown, budget, delete and metric contracts are identical.
+func (d *Deps) DeletePodHealOnNode(ctx context.Context, log logr.Logger,
+	checkName, targetKey string, pod *corev1.Pod,
+	cooldown time.Duration, now time.Time) bool {
+
+	key := SelfHealKey(checkName, targetKey)
+	proceed, unverifiable := d.HealAllowedOnNode(ctx, log,
+		&d.Heals, key, pod.Spec.NodeName, cooldown, now)
+	if unverifiable {
+		metrics.IncError(d.Name)
+		return false
+	}
+	if !proceed {
+		return false
+	}
+	deleted, err := heal.DeletePod(ctx, d.CS, &d.Heals, key, pod, now)
+	if err != nil {
+		metrics.IncError(d.Name)
+		log.Error(err, "heal pod delete failed",
+			"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
+		return false
+	}
+	if !deleted {
+		heal.RefundGrant(now)
+		log.Info("DEFER: workload disruption already reserved this sweep",
+			"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
+		return false
+	}
+	metrics.ControlPlanePodHealsTotal.WithLabelValues(checkName).Inc()
+	log.Info("DELETE: pod heal — forcing pod restart",
+		"check", checkName, "pod", pod.Namespace+"/"+pod.Name)
+	return true
+}
+
+// DeletePodHealScoped is the owner-aware dispatcher for heals whose
+// pod population mixes DaemonSet agents with Deployment/StatefulSet
+// workloads: a DaemonSet-owned pod bounces under the node-scoped
+// hold (DeletePodHealOnNode — a drain of another node must not
+// block it), everything else gates cluster-wide (DeletePodHeal).
+// AllowedOnNode is only sound for DS pods: a Deployment replica's
+// Spec.NodeName says nothing about where its SIBLINGS run, so a
+// drain of worker-1 must never green-light deleting the last
+// healthy replica sitting on worker-2.
+func (d *Deps) DeletePodHealScoped(ctx context.Context, log logr.Logger,
+	checkName, targetKey string, pod *corev1.Pod,
+	cooldown time.Duration, now time.Time) bool {
+
+	if ctrl := metav1.GetControllerOf(pod); ctrl != nil &&
+		ctrl.Kind == "DaemonSet" {
+		return d.DeletePodHealOnNode(ctx, log, checkName, targetKey,
+			pod, cooldown, now)
+	}
+	return d.DeletePodHeal(ctx, log, checkName, targetKey, pod,
+		cooldown, now)
 }
 
 // PodUnreadySince returns when the pod's Ready condition last went

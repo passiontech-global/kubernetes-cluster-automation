@@ -106,6 +106,16 @@ func TestCtrTasksOrphanShimDStateEscalates(t *testing.T) {
 	e.MkProc(t, 9360, "D",
 		"containerd-shim-runc-v2\x00-id\x00"+sid+
 			"\x00-namespace\x00k8s.io\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	// D-state cmdline is unreadable (mm->mmap_lock) — the fd
+	// table carries the task-dir evidence for the orphan check.
+	fdDir := filepath.Join(e.ProcDir, "9360", "fd")
+	if err := os.MkdirAll(fdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(e.CtrDir, sid, "log.json")+" (deleted)",
+		filepath.Join(fdDir, "9")); err != nil {
+		t.Fatal(err)
+	}
 	old := e.Now.Add(-10 * time.Minute)
 	if err := os.Chtimes(filepath.Join(e.ProcDir, "9360"), old, old); err != nil {
 		t.Fatal(err)
@@ -129,6 +139,9 @@ func TestCtrTasksOrphanShimDStateEscalates(t *testing.T) {
 func TestCtrTasksInitKillFailureLogged(t *testing.T) {
 	e := fixture(t)
 	e.MkProc(t, 77777, "S", "", "")
+	// The init-kill identity check requires a pod cgroup.
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "77777", "cgroup"),
+		"0::/kubepods.slice/kubepods-burstable.slice/pod.slice/cri-containerd-77777.scope\n")
 	dir := filepath.Join(e.CtrDir, strings.Repeat("7", 64))
 	wdepstest.WriteFile(t, filepath.Join(dir, "init.pid"), "77777")
 	wdepstest.WriteFile(t, filepath.Join(dir, "config.json"), `{"annotations":{}}`)
@@ -287,6 +300,34 @@ func TestCtrTasksLeftoverHolderKilled(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatal("wedged dir kept after the holder kill")
+	}
+}
+
+// TestCtrTasksInitKillRefusesNonPodCgroup — init.pid is written
+// once at task create; a pid recycled onto an unrelated host
+// process must not eat the SIGKILL. The cgroup identity check
+// refuses the signal while the wedged dir is still cleaned.
+func TestCtrTasksInitKillRefusesNonPodCgroup(t *testing.T) {
+	e := fixture(t)
+	e.MkProc(t, 9103, "S", "", "")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "9103", "cgroup"),
+		"0::/system.slice/ssh.service\n")
+	dir := filepath.Join(e.CtrDir, "0fa11cf"+strings.Repeat("e", 57))
+	wdepstest.WriteFile(t, filepath.Join(dir, "init.pid"), "9103")
+	wdepstest.WriteFile(t, filepath.Join(dir, "config.json"), `{"annotations":{}}`)
+	e.H.Cycle(context.Background()) // marker
+	e.Now = e.Now.Add(6 * time.Minute)
+	e.H.Cycle(context.Background()) // confirm → refuse kill → rm dir
+	for _, k := range e.Kills {
+		if k.PID == 9103 {
+			t.Fatalf("non-pod pid SIGKILLed via init.pid: %v", e.Kills)
+		}
+	}
+	if !strings.Contains(e.LogLines(t), "not in a pod cgroup") {
+		t.Fatalf("missing kill-refused line:\n%s", e.LogLines(t))
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("wedged dir kept after the refused init kill")
 	}
 }
 

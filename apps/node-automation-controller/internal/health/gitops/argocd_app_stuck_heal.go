@@ -41,7 +41,7 @@ func (p *argoCDAppStuckCheck) refreshArgoCDApp(ctx context.Context,
 
 	ck := probefw.SelfHealKey(CheckNameArgoCDAppStuck,
 		"refresh/"+app.GetNamespace()+"/"+app.GetName())
-	proceed, unverifiable := p.HealAllowedPersisted(ctx, log, &p.Heals,
+	proceed, unverifiable := p.HealAllowedUpgradeOnlyPersisted(ctx, log, &p.Heals,
 		app, argoCDRefreshHealAnno, ck, argocdRefreshCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)

@@ -73,9 +73,17 @@ type controllerLeaseGuardCheck struct {
 	thrashEmitted state.GaugeLedger[string]
 
 	// ksmLogProbe is the pod log-tail seam — tests inject a
-	// fixture; the zero value runs the real bounded GetLogs tail
-	// through kube.ReadPodLogTail.
-	ksmLogProbe func(ctx context.Context, pod *corev1.Pod) (string, error)
+	// fixture; the zero value runs the real bounded GetLogs tail.
+	// The two time.Time returns are the newest matching line's
+	// kubelet timestamp and the newest stamp on ANY line read
+	// (both zero = no stamp info — injected fixtures and
+	// unparseable lines count as FRESH, never as stale).
+	ksmLogProbe func(ctx context.Context, pod *corev1.Pod) (string, time.Time, time.Time, error)
+	// logScanAt is the per-pod last-log-scan clock — the freshness
+	// gate requires a matching line newer than the pod's previous
+	// scan so the overlapping SinceSeconds window cannot re-flag a
+	// wedge signature that already stopped minutes ago.
+	logScanAt map[string]time.Time
 }
 
 // leaseTransitionSample is one sweep's observation of a lease's

@@ -342,6 +342,19 @@ func (c *Client) ActiveAge(ctx context.Context, unit string) (time.Duration, err
 	return c.cliActiveAge(ctx, unit)
 }
 
+// ActiveEnterUSec returns the unit's ActiveEnterTimestamp as µs
+// since the epoch — the D-Bus integer form, no locale-dependent
+// date parsing. D-Bus only: the systemctl CLI prints the formatted
+// wall-clock string for this property and there is no --value
+// integer equivalent, so a dbus-unavailable host gets an error and
+// callers keep their own fallback. 0 = never activated this boot.
+func (c *Client) ActiveEnterUSec(ctx context.Context, unit string) (uint64, error) {
+	if c.dbus == nil {
+		return 0, fmt.Errorf("%s: ActiveEnterUSec needs the dbus backend", unit)
+	}
+	return c.dbus.dbusActiveEnterUSec(ctx, unit)
+}
+
 // MainPID mirrors `systemctl show -p MainPID --value <unit>` — the
 // unit's main process pid, 0 when the unit is inactive, masked or
 // not-found (systemctl answers 0 with exit 0 for all of those). A
@@ -394,4 +407,26 @@ func (c *Client) ListUnitsByPatterns(ctx context.Context, patterns ...string) ([
 		}
 	}
 	return c.cliListUnits(ctx, patterns)
+}
+
+// SystemState mirrors `systemctl is-system-running` — the manager's
+// health word via the D-Bus SystemState property, with the CLI verb
+// as the unavailable-transport fallback. It replaces the per-cycle
+// fork+exec probe: a D-Bus property read answers in microseconds
+// where the systemctl spawn cost a process. The error contract
+// matches Exec's — a non-zero is-system-running exit (degraded and
+// friends) returns the state word AND the exec error, so callers
+// measuring liveness still see "answered" distinctly from "no
+// answer".
+func (c *Client) SystemState(ctx context.Context) (string, error) {
+	if c.dbus != nil {
+		state, err := c.dbus.dbusSystemState(ctx)
+		if err == nil {
+			return state, nil
+		}
+		if !c.dbusUnavailable(err) {
+			return "", err
+		}
+	}
+	return c.cliSystemState(ctx)
 }

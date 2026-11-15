@@ -17,7 +17,6 @@ import (
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -31,15 +30,14 @@ import (
 func (c *apiserverNodeReachabilityCheck) webhookBackendPods(
 	ctx context.Context, darkNodes map[string]bool) (map[string][]string, error) {
 
-	// Paged lists — a cluster with many webhook configs must not
-	// silently truncate at the apiserver's default page size.
-	vwcs, err := kube.ListAll(ctx, metav1.ListOptions{},
-		kube.ValidatingWebhookConfigurations(c.Deps.CS))
+	// The webhook census rides the sweep snapshot — one LIST pair
+	// per run() shared with every other consumer instead of a
+	// fresh paged read per check.
+	vwcs, err := c.Deps.AllValidatingWebhookConfigurations(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list validatingwebhookconfigurations: %w", err)
 	}
-	mwcs, err := kube.ListAll(ctx, metav1.ListOptions{},
-		kube.MutatingWebhookConfigurations(c.Deps.CS))
+	mwcs, err := c.Deps.AllMutatingWebhookConfigurations(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list mutatingwebhookconfigurations: %w", err)
 	}

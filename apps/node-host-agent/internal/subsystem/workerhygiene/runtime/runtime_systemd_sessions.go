@@ -125,19 +125,25 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	latency := -1.0
 	probeTimedOut := false
 	if sd != nil {
-		// The is-system-running call is itself the D-Bus probe —
+		// The SystemState read is itself the D-Bus probe —
 		// ANY answer (running/degraded/offline) means D-Bus replied
 		// and only the round-trip TIME is the signal. The
 		// measurement uses the seam clock, not time.Now: the test
-		// seam keeps latency deterministic. ExecBounded at
+		// seam keeps latency deterministic. Bounded at
 		// systemdInitProbeBudget: a manager that cannot answer
 		// inside the budget is the PID1-frozen signature (a
 		// SIGQUIT'd init stops servicing the manager socket while
 		// kubelet keeps the node Ready — vmi3507437, 2026-11-07),
 		// NOT merely slow — answered errors still count as alive.
 		t0 := c.d.Cfg.Seams.Host.Clock.Now()
-		_, probeErr := sd.ExecBounded(ctx, systemdInitProbeBudget,
-			"systemctl", "is-system-running")
+		// D-Bus SystemState property replaces the forked
+		// `systemctl is-system-running` — same answered-vs-wedged
+		// signal at property-read cost. The caller ctx carries the
+		// probe budget so a manager that accepts the bus but never
+		// answers still reads as the PID1-frozen signature.
+		probeCtx, cancel := context.WithTimeout(ctx, systemdInitProbeBudget)
+		_, probeErr := sd.SystemState(probeCtx)
+		cancel()
 		elapsed := c.d.Cfg.Seams.Host.Clock.Now().Sub(t0)
 		latency = elapsed.Seconds()
 		c.d.SystemdDbusLatencySec = latency

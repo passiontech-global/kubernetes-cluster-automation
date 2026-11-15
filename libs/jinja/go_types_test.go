@@ -267,3 +267,36 @@ func TestUint64BeyondMaxInt64(t *testing.T) {
 		}
 	}
 }
+
+// TestGoStringSlice exercises the []string fast paths added for
+// YAML/Go-native values: iteration/indexing, join, sort, flatten,
+// to_json and List.extend's iterable arm — the four spots that
+// used to fall through to the generic any-slice handling.
+func TestGoStringSlice(t *testing.T) {
+	ctx := map[string]any{"ss": []string{"b", "a", "c"}}
+	cases := map[string]string{
+		`{{ ss | length }}`:                       "3",
+		`{{ ss[0] }}`:                             "b",
+		`{{ ss | join('-') }}`:                    "b-a-c",
+		`{{ ss | sort | join(',') }}`:             "a,b,c",
+		`{{ ss | first }}`:                        "b",
+		`{{ ss is iterable }}`:                    "True",
+		`{{ [ss, ['x']] | flatten | join(',') }}`: "b,a,c,x",
+		`{{ ss | to_json }}`:                      `["b","a","c"]`,
+		`{% set l = ['a'] %}{% set _ = l.extend(ss) %}{{ l | join(',') }}`: "a,b,a,c",
+	}
+	for tpl, want := range cases {
+		got, err := renderBounded(t, tpl, ctx)
+		if err != nil {
+			t.Fatalf("render %q: %v", tpl, err)
+		}
+		if got != want {
+			t.Fatalf("render %q = %q want %q", tpl, got, want)
+		}
+	}
+	// extend on a []string must fail loudly — it is immutable.
+	if _, err := renderBounded(t,
+		`{% set _ = ss.extend(['x']) %}`, ctx); err == nil {
+		t.Fatal("extend on []string succeeded — immutability guard missing")
+	}
+}

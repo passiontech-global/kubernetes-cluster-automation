@@ -271,7 +271,7 @@ func TestPGBStarveHalfOpenSvActive(t *testing.T) {
 // be terminated, or the bloat remediation reaps itself.
 func TestStuckSessionPredicateExemptions(t *testing.T) {
 	for _, want := range []string{
-		"application_name NOT IN ('pg_repack', 'pg_dump', 'node_host_agent_maint')",
+		"application_name NOT IN ('pg_repack', 'pg_dump', 'nha_probe', 'nha_compact', 'nha_maint')",
 		"query NOT ILIKE '%VACUUM%'",
 		"query NOT ILIKE '%REINDEX%'",
 		"query NOT ILIKE '%pg_repack%'",
@@ -289,7 +289,7 @@ func TestStuckSessionPredicateExemptions(t *testing.T) {
 // TestProbePsqlSessionsCarryAppName: every psql session the probe
 // loop spawns must present the exempted application_name — the
 // predicate matches on application_name, not on pid, so a session
-// without kdeps.PGAPPNAME shows up as 'psql' in pg_stat_activity
+// without kdeps.AppNameProbe shows up as 'psql' in pg_stat_activity
 // and the reaper would terminate our own long-running maintenance /
 // remediation statements. PsqlPassEnv pins the marker; this walks
 // the recorded child envs of one full probe cycle.
@@ -310,7 +310,7 @@ func TestProbePsqlSessionsCarryAppName(t *testing.T) {
 			if strings.HasPrefix(kv, "PGPASSWORD=") {
 				hasPass = true
 			}
-			if kv == "PGAPPNAME="+kdeps.PGAPPNAME {
+			if kv == "PGAPPNAME="+kdeps.AppNameProbe {
 				hasAppName = true
 			}
 		}
@@ -318,7 +318,7 @@ func TestProbePsqlSessionsCarryAppName(t *testing.T) {
 			seenPG = true
 			if !hasAppName {
 				t.Fatalf("psql child env missing PGAPPNAME=%s: %v",
-					kdeps.PGAPPNAME, env)
+					kdeps.AppNameProbe, env)
 			}
 		}
 	}

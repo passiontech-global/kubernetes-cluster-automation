@@ -273,6 +273,18 @@ func UnitWindowArgv(unit, since string) []string {
 	return []string{"journalctl", "-u", unit, "--since", since, "--no-pager"}
 }
 
+// UnitWindowGrepArgv is UnitWindowArgv plus a server-side MESSAGE
+// filter — `journalctl -u <unit> --since <since> --grep=<pattern>`
+// returns only entries whose MESSAGE matches the PCRE2 pattern
+// (systemd ≥237), so a grep-count check pays wire+parse cost only
+// for hits instead of the whole unit window. The pattern must be
+// PCRE2, not Go regexp — the simple literal/alternation shapes the
+// TTL/cache signatures use compile identically under both.
+func UnitWindowGrepArgv(unit, since, pattern string) []string {
+	return []string{"journalctl", "-u", unit, "--since", since,
+		"--grep=" + pattern, "--no-pager"}
+}
+
 // AnyLineArgv is the unfiltered second probe — `journalctl -n 1
 // --no-pager` — that disambiguates a quiet unit window from
 // journald-level blindness (ClassifyRead's empty branch): journald

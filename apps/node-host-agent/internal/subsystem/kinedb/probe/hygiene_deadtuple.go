@@ -1,61 +1,27 @@
-// hygiene_deadtuple.go — items 1–2: the idle-in-transaction census
-// and the dead-tuple ratio with its advisory-locked emergency
-// VACUUM (ANALYZE) remediation.
+// hygiene_deadtuple.go — item 2's dead-tuple remediation: the
+// dead/live tuple READ moved into hygiene_stats.go's merged census;
+// this file keeps the advisory-locked emergency VACUUM (ANALYZE)
+// trigger when autovacuum is visibly losing.
 package probe
 
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
-// hygieneIdleInTx — item 1: sessions idle-in-transaction >3min on
-// the postgres/kine databases. COUNT(pid) rather than COUNT(*): the
-// probe contract bans a bare COUNT(*) in the 2-minute loop (the
-// tests guard against the kine heap seq-scan creeping back), and
-// counting a NOT NULL column is identical semantics on a stats view.
-func (p *Probe) hygieneIdleInTx(ctx context.Context, pg, user, pass string,
-	h *hygieneResult, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
-		"SELECT COUNT(pid) FROM pg_stat_activity "+
-			"WHERE datname IN ('postgres', 'kine') "+
-			"AND state = 'idle in transaction' "+
-			"AND state_change < now() - interval '3 minutes'")
-	if err != nil {
-		note(fmt.Sprintf("idle-tx-fail: %v", err))
-		return
-	}
-	v, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
-	if perr != nil {
-		note(fmt.Sprintf("idle-tx-unparsed: %v", perr))
-		return
-	}
-	h.idleInTx, h.idleSeen = v, true
-}
-
-// hygieneDeadTuple — item 2: dead-tuple ratio plus the emergency
-// VACUUM trigger when autovacuum is visibly losing.
+// hygieneDeadTuple — item 2's REMEDIATION half: the dead/live
+// tuple read itself moved into hygieneScalarStats' merged census
+// (h.deadTup/h.deadSeen/h.deadRatio are already filled); this
+// function only judges the ratio and fires the emergency VACUUM.
 func (p *Probe) hygieneDeadTuple(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-		"SELECT n_dead_tup, n_live_tup FROM pg_stat_user_tables "+
-			"WHERE relname=%s", kdeps.SQLQuote(p.d.Cfg.Table)))
-	if err != nil {
-		note(fmt.Sprintf("dead-tuple-fail: %v", err))
-		return
+	if !h.deadSeen {
+		return // census failed or unparsed — nothing to judge
 	}
-	dead, live, perr := kdeps.ParsePair(out)
-	if perr != nil {
-		// An empty result means the stats view has no row for the
-		// table yet — inconclusive, like a parse failure.
-		note(fmt.Sprintf("dead-tuple-unparsed: %v", perr))
-		return
-	}
-	h.deadTup, h.deadSeen = dead, true
-	h.deadRatio = float64(dead) / float64(max(live, 1))
+	dead := h.deadTup
 	if h.deadRatio <= deadTupleRatioMax || dead <= deadTupleMinCount {
 		return
 	}
@@ -85,7 +51,7 @@ func (p *Probe) deadTupleVacuum(ctx context.Context, pg, user, pass string,
 	}
 	script := kdeps.WrapAdvisoryLockScript(p.d.Cfg.AdvisoryLockID, "kh_locked",
 		fmt.Sprintf("VACUUM (ANALYZE) %s;\n", kdeps.SQLIdent(p.d.Cfg.Table)))
-	sout, err := p.d.PsqlScript(ctx, pg, user, pass, script)
+	sout, err := p.d.PsqlScript(ctx, pg, user, pass, kdeps.AppNameProbe, script)
 	switch {
 	case err != nil:
 		note(fmt.Sprintf("dead-tuple-vacuum-fail: %v", err))

@@ -12,7 +12,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +43,31 @@ func normalizeUnit(unit string) string {
 	return unit + ".service"
 }
 
+// dbusOpTimeout bounds every READ-side D-Bus call. Callers pass
+// the long-lived subsystem ctx — a wedged PID 1 that accepts the
+// connection but never answers would otherwise park the check
+// forever (godbus waits on the reply channel; ctx is the only
+// escape). Job verbs keep caller ctx: a unit restart legitimately
+// takes minutes.
+const dbusOpTimeout = 15 * time.Second
+
+// isTransportDead reports whether err is a dead-transport failure —
+// EOF after a daemon-reexec/socket drop, a closed conn, or a reset
+// peer. These mean "the conn is useless", not "the call failed" —
+// callers retry once on a fresh conn and the Client layer falls
+// back to the systemctl CLI.
+func isTransportDead(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		strings.Contains(err.Error(), "use of closed network connection") ||
+		strings.Contains(err.Error(), "connection reset by peer")
+}
+
+// opCtx derives the bounded per-call ctx for read verbs.
+func opCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, dbusOpTimeout)
+}
+
 // unitProp fetches ONE unit property — GetUnitPropertyContext
 // (org.freedesktop.DBus.Properties.Get on the Unit interface)
 // instead of GetAllPropertiesContext, which decoded ~200 properties
@@ -53,12 +80,36 @@ func normalizeUnit(unit string) string {
 // decoded Go value (string for state words, uint64 for the
 // monotonic timestamp).
 func (b *dbusBackend) unitProp(ctx context.Context, unit, prop string) (any, error) {
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	conn, err := b.systemConn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	p, err := conn.GetUnitPropertyContext(ctx, normalizeUnit(unit), prop)
+	if err != nil && (isTransportDead(err) ||
+		errors.Is(err, context.DeadlineExceeded)) {
+		// Reconnect once: drop the dead/hung generation and retry
+		// the read on a fresh conn — a daemon-reexec drops the
+		// socket mid-call and the lazy rebuild only fires on the
+		// NEXT systemConn, leaving this call to surface a spurious
+		// unavailable to the CLI fallback. DeadlineExceeded counts:
+		// an RPC that outlived its op budget leaves godbus reply
+		// state ambiguous, so the conn generation is suspect too.
+		// Caller cancellation (context.Canceled) never retries —
+		// the work is already abandoned.
+		b.dropConn(conn)
+		conn, err = b.systemConn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		p, err = conn.GetUnitPropertyContext(ctx, normalizeUnit(unit), prop)
+	}
 	if err != nil {
+		if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: dbus Get %s %s: %v",
+				errDBusUnavailable, prop, unit, err)
+		}
 		return nil, err
 	}
 	return p.Value.Value(), nil
@@ -178,6 +229,25 @@ func (b *dbusBackend) dbusActiveAge(ctx context.Context, unit string,
 	return activeAgeFromMonoUS(unit, monoUS, procUptimeFile)
 }
 
+// dbusActiveEnterUSec reads ActiveEnterTimestamp — the WALL-CLOCK
+// enter stamp as µs since the epoch (type 't' on the Unit
+// interface), the locale-free integer form of the formatted
+// "Mon 2006-01-02 15:04:05 MST" string systemctl show prints. The
+// feeder's fresh-start grace needs exactly this: parsing the
+// formatted string breaks under any TZ/systemd locale the agent's
+// time.Local does not share. 0 = never activated this boot.
+func (b *dbusBackend) dbusActiveEnterUSec(ctx context.Context, unit string) (uint64, error) {
+	v, err := b.unitProp(ctx, unit, "ActiveEnterTimestamp")
+	if err != nil {
+		return 0, fmt.Errorf("dbus Get ActiveEnterTimestamp %s: %w", unit, err)
+	}
+	us, ok := propUint64(v)
+	if !ok {
+		return 0, fmt.Errorf("%s: unusable ActiveEnterTimestamp %v", unit, v)
+	}
+	return us, nil
+}
+
 // dbusMainPID mirrors `systemctl show -p MainPID --value` — the
 // unit's main process pid. A unit that is not running answers 0;
 // the manager answers 0 the same way for a not-found name (systemctl
@@ -205,17 +275,38 @@ func (b *dbusBackend) dbusMainPID(ctx context.Context, unit string) (uint32, err
 // call. Unit-name glob matching stays PID 1's, exactly like the
 // systemctl argv form.
 func (b *dbusBackend) dbusListUnitsByPatterns(ctx context.Context, patterns []string) ([]UnitInfo, error) {
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	conn, err := b.systemConn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var units []sdbus.UnitStatus
-	if len(patterns) == 0 {
-		units, err = conn.ListUnitsContext(ctx)
-	} else {
-		units, err = conn.ListUnitsByPatternsContext(ctx, nil, patterns)
+	list := func(c *sdbus.Conn) ([]sdbus.UnitStatus, error) {
+		if len(patterns) == 0 {
+			return c.ListUnitsContext(ctx)
+		}
+		return c.ListUnitsByPatternsContext(ctx, nil, patterns)
+	}
+	units, err = list(conn)
+	if err != nil && (isTransportDead(err) ||
+		errors.Is(err, context.DeadlineExceeded)) {
+		// Same reconnect-once contract as unitProp: a daemon-reexec
+		// drops the socket mid-call (and an over-budget RPC leaves
+		// the conn generation suspect); retry on a fresh conn
+		// before surfacing unavailable to the CLI fallback.
+		b.dropConn(conn)
+		conn, err = b.systemConn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		units, err = list(conn)
 	}
 	if err != nil {
+		if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: dbus ListUnits: %v",
+				errDBusUnavailable, err)
+		}
 		return nil, fmt.Errorf("dbus ListUnits: %w", err)
 	}
 	out := make([]UnitInfo, 0, len(units))
@@ -239,32 +330,90 @@ func (b *dbusBackend) dbusListUnitsByPatterns(ctx context.Context, patterns []st
 // masked-runtime/bad); a systemd unit error (e.g. NoSuchUnit) is
 // returned directly while transport failures wrap errDBusUnavailable.
 func (b *dbusBackend) dbusEnabled(ctx context.Context, unit string) (bool, error) {
-	b.mu.Lock()
-	_, err := b.systemConnLocked(ctx)
-	raw := b.rawSys
-	b.mu.Unlock()
-	if err != nil {
-		return false, err
-	}
-	if raw == nil {
-		return false, fmt.Errorf("%w: no sysconn for GetUnitFileState", errDBusUnavailable)
-	}
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
 	unit = normalizeUnit(unit)
-	var state string
-	call := raw.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1").
-		CallWithContext(ctx, "org.freedesktop.systemd1.Manager.GetUnitFileState", 0, unit)
-	if err := call.Store(&state); err != nil {
-		var derr godbus.Error
-		if errors.As(err, &derr) && strings.HasPrefix(derr.Name, "org.freedesktop.systemd1.") {
-			return false, fmt.Errorf("systemctl is-enabled %s: %w", unit, err)
+	for attempt := 0; ; attempt++ {
+		b.mu.Lock()
+		conn, err := b.systemConnLocked(ctx)
+		raw := b.rawSys
+		b.mu.Unlock()
+		if err != nil {
+			return false, err
 		}
-		return false, fmt.Errorf("%w: dbus GetUnitFileState %s: %v", errDBusUnavailable, unit, err)
+		if raw == nil {
+			return false, fmt.Errorf("%w: no sysconn for GetUnitFileState", errDBusUnavailable)
+		}
+		var state string
+		call := raw.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1").
+			CallWithContext(ctx, "org.freedesktop.systemd1.Manager.GetUnitFileState", 0, unit)
+		err = call.Store(&state)
+		if err != nil && attempt == 0 && (isTransportDead(err) ||
+			errors.Is(err, context.DeadlineExceeded)) {
+			// Reconnect once on a dead/hung transport — same
+			// contract as unitProp. Caller cancellation is NOT
+			// retried: the work is already abandoned, and the
+			// unavailable wrap below still lets the CLI fallback
+			// answer if the cycle ctx merely timed out.
+			b.dropConn(conn)
+			continue
+		}
+		if err != nil {
+			var derr godbus.Error
+			if errors.As(err, &derr) && strings.HasPrefix(derr.Name, "org.freedesktop.systemd1.") {
+				return false, fmt.Errorf("systemctl is-enabled %s: %w", unit, err)
+			}
+			return false, fmt.Errorf("%w: dbus GetUnitFileState %s: %v", errDBusUnavailable, unit, err)
+		}
+		if enabled, ok := parseEnabledStateWord(state); ok {
+			return enabled, nil
+		}
+		logger().Warn("systemd: unexpected unit-file state word — "+
+			"treating unit as not enabled this probe",
+			"unit", unit, "state", state)
+		return false, nil
 	}
-	if enabled, ok := parseEnabledStateWord(state); ok {
-		return enabled, nil
+}
+
+// dbusSystemState reads Manager.SystemState — the manager's own
+// health word (running/starting/stopping/degraded/offline/
+// maintenance) — via org.freedesktop.DBus.Properties.Get on the
+// manager object path. go-systemd wraps no manager-property getter,
+// so the raw sysconn issues the call directly (the dbusEnabled
+// pattern). Properties.Get returns a VARIANT — Store decodes it
+// into godbus.Variant and Value() unwraps the string.
+func (b *dbusBackend) dbusSystemState(ctx context.Context) (string, error) {
+	ctx, cancel := opCtx(ctx)
+	defer cancel()
+	for attempt := 0; ; attempt++ {
+		b.mu.Lock()
+		conn, err := b.systemConnLocked(ctx)
+		raw := b.rawSys
+		b.mu.Unlock()
+		if err != nil {
+			return "", err
+		}
+		if raw == nil {
+			return "", fmt.Errorf("%w: no sysconn for SystemState", errDBusUnavailable)
+		}
+		var v godbus.Variant
+		call := raw.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1").
+			CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0,
+				"org.freedesktop.systemd1.Manager", "SystemState")
+		err = call.Store(&v)
+		if err != nil && attempt == 0 && (isTransportDead(err) ||
+			errors.Is(err, context.DeadlineExceeded)) {
+			b.dropConn(conn)
+			continue
+		}
+		if err != nil {
+			if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
+				return "", fmt.Errorf("%w: dbus Get SystemState: %v",
+					errDBusUnavailable, err)
+			}
+			return "", fmt.Errorf("dbus Get SystemState: %w", err)
+		}
+		state, _ := v.Value().(string)
+		return state, nil
 	}
-	logger().Warn("systemd: unexpected unit-file state word — "+
-		"treating unit as not enabled this probe",
-		"unit", unit, "state", state)
-	return false, nil
 }

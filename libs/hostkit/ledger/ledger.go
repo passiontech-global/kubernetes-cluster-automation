@@ -278,7 +278,14 @@ func (s *StreakLedger) Hit(key string) int {
 // Set forces key's streak to n — e.g. pinning an already-flagged
 // key at its threshold so it stays acted-on instead of counting
 // up forever (corednswatchdog's `streak[name] = corednsStreakMax`).
+// n <= 0 drops the key outright: streaks are always >=1 once
+// tracked, so a stored 0 would break Len()'s "tracked keys" count
+// while Count() already reports 0 as absent.
 func (s *StreakLedger) Set(key string, n int) {
+	if n <= 0 {
+		delete(s.streaks, key)
+		return
+	}
 	if s.streaks == nil {
 		s.streaks = map[string]int{}
 	}

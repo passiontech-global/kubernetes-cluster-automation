@@ -63,7 +63,7 @@ func (p *Probe) probeTopChurn(ctx context.Context, pg, user, pass string,
 	if now-prevTS < int64(defaultChurnWindow.Seconds()) {
 		return // window still filling — keep the last result
 	}
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
 		"SELECT split_part(name,'/',3) AS res, COUNT(*) FROM %[1]s "+
 			"WHERE id > %[2]d AND name LIKE '/registry/%%' "+
 			"GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT %d",
@@ -109,7 +109,7 @@ func (p *Probe) probeTopChurn(ctx context.Context, pg, user, pass string,
 // contract as the prefix query: never fabricate a zero series.
 func (p *Probe) probeTopHotkeys(ctx context.Context, pg, user, pass string,
 	prevHead int64, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
 		"SELECT name, COUNT(*) FROM %[1]s "+
 			"WHERE id > %[2]d AND name LIKE '/registry/%%' "+
 			"AND name NOT LIKE '/registry/leases/%%' "+
@@ -146,7 +146,7 @@ func (p *Probe) probeTopHotkeys(ctx context.Context, pg, user, pass string,
 // a failed read writes 0, which makes the next window count "id>0"
 // and safely degrade to a full-table count once.
 func (p *Probe) resHead(ctx context.Context, pg, user, pass string) int64 {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
 		"SELECT COALESCE((SELECT MAX(id) FROM %s),0)", kdeps.SQLIdent(p.d.Cfg.Table)))
 	if err != nil {
 		return 0

@@ -217,6 +217,63 @@ func TestScanTreeRawReadsDenied(t *testing.T) {
 	}
 }
 
+func TestScanTreeRangeDynamicElements(t *testing.T) {
+	root := t.TempDir()
+	envxDir := filepath.Join(root, "envxlib")
+	fixtureEnvx(t, envxDir)
+	modRoot := filepath.Join(root, "mod")
+	writeFile(t, filepath.Join(modRoot, "main.go"), `package main
+
+import "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+
+func dynKey() string { return "X" }
+
+func main() {
+	// A literal with ONLY dynamic elements feeding an env read —
+	// the loop var can never be named: Unresolved.
+	for _, k := range []string{dynKey()} {
+		_ = envx.Getenv(k, "")
+	}
+	// A mixed literal feeding an env read — the var MIGHT carry the
+	// dynamic element: still Unresolved.
+	for _, k := range []string{"MIXED_STATIC", dynKey()} {
+		_ = envx.Getenv(k, "")
+	}
+	// The same dynamic element in a loop whose body NEVER reads env
+	// — nothing to resolve, no Unresolved (the pre-split scanner
+	// flagged this eagerly).
+	for _, p := range []string{"TCP", dynKey()} {
+		_ = p
+	}
+	// Map literal: keys cover the key binding, values the value
+	// binding — a dynamic key used as env name is Unresolved while
+	// the static-key loop stays clean.
+	for k := range map[string]string{dynKey(): "v"} {
+		_ = envx.Getenv(k, "")
+	}
+	for k := range map[string]string{"MAP_KEY_OK": dynKey()} {
+		_ = envx.Getenv(k, "")
+	}
+}
+`)
+	res, err := ScanTree(Options{Root: modRoot, EnvxDir: envxDir})
+	if err != nil {
+		t.Fatalf("ScanTree: %v", err)
+	}
+	// Static elements still record as env reads.
+	for _, want := range []string{"MIXED_STATIC", "TCP", "MAP_KEY_OK"} {
+		if _, ok := res.Referenced[want]; !ok {
+			t.Errorf("Referenced missing %s", want)
+		}
+	}
+	// Exactly three unresolvable env-key uses: the dyn-only loop,
+	// the mixed loop, and the dynamic map key. The non-env loop and
+	// the static map key contribute nothing.
+	if len(res.Unresolved) != 3 {
+		t.Fatalf("Unresolved = %v, want exactly 3 entries", res.Unresolved)
+	}
+}
+
 func TestPackageStringConstsBareRows(t *testing.T) {
 	// A bare const row repeats the previous expression — B must
 	// resolve to A's literal, and non-string rows contribute

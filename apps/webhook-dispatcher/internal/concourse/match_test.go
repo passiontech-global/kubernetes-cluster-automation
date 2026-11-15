@@ -44,6 +44,7 @@ func TestNormalizeRepo(t *testing.T) {
 		{"github.com/org/repo", "org/repo"},
 		{"org/repo", "org/repo"},
 		{"org/repo.git", "org/repo"},
+		{"org/repo/.git", "org/repo"},
 		{"Org/Repo", "org/repo"},
 		{"  git@github.com:Org/Repo.git  ", "org/repo"},
 		{"", ""},

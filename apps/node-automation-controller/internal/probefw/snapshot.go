@@ -55,11 +55,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -164,18 +166,24 @@ type memo[T any] struct {
 	// only under verifySnapshots (test binaries); "" disables the
 	// per-get re-check.
 	verifyHash string
-	// fetchedAt is the wall-clock instant the load ran — the
-	// "as-of" timestamp age-window checks must measure against.
-	// p.Now() at CHECK-run time lags the fetch by however long the
-	// worker queue delayed this check (up to PerCheck × pool depth
-	// behind the sweep's first reader), which would overstate every
-	// window the census feeds — a Lease renewed 9m before the fetch
-	// reads 11m-stale to a check that ran 2m late. Real time.Now,
-	// not the injected clock: renewTime is an apiserver wall-clock
-	// value and the honest "when did we read it" is wall-clock too
-	// (production Deps.Now IS time.Now; test fixtures derive their
-	// timestamps from time.Now() as well).
+	// fetchedAt is the instant the load ran — the "as-of" timestamp
+	// age-window checks must measure against, stamped by the
+	// snapshot's clock (Deps.Now when WithSweepSnapshot got Deps,
+	// else time.Now). p.Now() at CHECK-run time lags the fetch by
+	// however long the worker queue delayed this check (up to
+	// PerCheck × pool depth behind the sweep's first reader), which
+	// would overstate every window the census feeds — a Lease
+	// renewed 9m before the fetch reads 11m-stale to a check that
+	// ran 2m late. The injected clock keeps test fixtures that
+	// freeze Deps.Now consistent: their renewTime/annotation
+	// timestamps derive from the same frozen base, so age windows
+	// measured against a real wall clock would misjudge them.
 	fetchedAt time.Time
+	// now stamps fetchedAt — armed by newSweepSnapshot for every
+	// declared memo and copied onto lazily-created ones (unstruct
+	// reads, prom dedup). Nil falls back to time.Now so a bare
+	// &memo[T]{} literal still works.
+	now func() time.Time
 	// forceCS is the nodes-only one-shot: InvalidateNodes arms it so
 	// the NEXT load reads d.CS directly instead of the informer
 	// cache (which lags a just-patched node by the sync delay). It
@@ -200,7 +208,7 @@ func (m *memo[T]) get(load func(forceCS bool) (T, error)) (T, error) {
 		force := m.forceCS
 		m.forceCS = false
 		m.items, m.err = load(force)
-		m.fetchedAt = time.Now()
+		m.fetchedAt = m.nowTime()
 		if verifySnapshots.Load() {
 			m.verifyHash = fingerprintValue(m.items)
 		}
@@ -235,12 +243,25 @@ func (m *memo[T]) getLive(load func() (T, error)) (T, error) {
 		return items, err
 	}
 	m.items, m.err, m.set = items, nil, true
-	m.fetchedAt = time.Now()
+	m.fetchedAt = m.nowTime()
 	if verifySnapshots.Load() {
 		m.verifyHash = fingerprintValue(m.items)
 	}
 	return m.items, nil
 }
+
+// nowTime stamps fetchedAt — the armed snapshot clock, or
+// time.Now for a bare memo literal.
+func (m *memo[T]) nowTime() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+// setNow arms the fetch stamp — newSweepSnapshot calls it on every
+// declared memo so they share the sweep's clock.
+func (m *memo[T]) setNow(fn func() time.Time) { m.now = fn }
 
 // verifyLocked re-checks the load-time fingerprint — caller MUST
 // hold m.mu. Shared by get/getLive's hit path and verify()'s
@@ -324,6 +345,7 @@ type sweepSnapshot struct {
 	namespaces   memo[[]corev1.Namespace]
 	events       memo[[]corev1.Event]
 	pvcs         memo[[]corev1.PersistentVolumeClaim]
+	pvs          memo[[]corev1.PersistentVolume]
 	statefulSets memo[[]appsv1.StatefulSet]
 	deployments  memo[[]appsv1.Deployment]
 	daemonSets   memo[[]appsv1.DaemonSet]
@@ -339,13 +361,24 @@ type sweepSnapshot struct {
 	cronJobs    memo[[]batchv1.CronJob]
 	jobs        memo[[]batchv1.Job]
 	pdbs        memo[[]policyv1.PodDisruptionBudget]
+	// Webhook configurations — cluster-scoped admission objects the
+	// apiserver-reachability heal reads to map webhook backends onto
+	// dark nodes; memoized so N checks pay one LIST pair per sweep.
+	validatingWebhooks memo[[]admissionv1.ValidatingWebhookConfiguration]
+	mutatingWebhooks   memo[[]admissionv1.MutatingWebhookConfiguration]
 
 	// Derived joins — memoized like the censuses: the derived error
 	// is the census's own, and each drops WITH its census (a join
 	// built from the pre-mutation view is the same stale read in
 	// map form).
-	nodeZones    memo[map[string]string]
-	podNodes     memo[podNodeIndex]
+	nodeZones memo[map[string]string]
+	podNodes  memo[podNodeIndex]
+	// nodeByName is the O(1) name → *Node join over the shared node
+	// census — the sweep-scoped lookup heal's local-remediation
+	// yield resolves pod.Spec.NodeName through instead of a live
+	// Nodes().Get per heal. Values point into the memoized census
+	// slice (read-only contract, same as every census consumer).
+	nodeByName   memo[map[string]*corev1.Node]
 	leaseIndex   memo[map[types.NamespacedName]*coordinationv1.Lease]
 	serviceIndex memo[map[types.NamespacedName]*corev1.Service]
 
@@ -411,6 +444,22 @@ type sweepSnapshot struct {
 	// second round-trip.
 	promMu      sync.Mutex
 	promQueries map[string]*memo[[]promq.Sample]
+	// promFails/promOpen are the per-sweep Prometheus circuit
+	// breaker: promCircuitThreshold consecutive transport-level
+	// failures (dial/TLS/timeout — promq.TransportError, never a
+	// server-side answer) open the circuit for the rest of the
+	// sweep so ~40 Prom-backed checks stop each paying a dial
+	// timeout against a dead endpoint. promOpen is sticky — a
+	// sweep that proved Prometheus unreachable does not re-probe
+	// it; the next sweep gets a fresh snapshot and tries again.
+	promFails int
+	promOpen  bool
+
+	// nowFn is the sweep's fetch-stamp clock — Deps.Now when the
+	// snapshot was built with Deps, time.Now otherwise. Declared
+	// memos are armed in newSweepSnapshot; lazily-created memos
+	// (unstruct reads, prom dedup) copy it at creation.
+	nowFn func() time.Time
 
 	// memos and resets hold every registered census/index member bound ONCE
 	// at construction: InvalidateSweep resets both, and verifyUnmutated
@@ -423,22 +472,30 @@ type sweepSnapshot struct {
 type memoMember interface {
 	reset()
 	verify()
+	setNow(func() time.Time)
 }
 
 // newSweepSnapshot builds an empty snapshot and binds its blanket
 // reset and verify lists — every memo declared on the struct joins memos
 // at construction so InvalidateSweep and VerifySweepSnapshotUnmutated can
 // never drift behind the field set.
-func newSweepSnapshot(ctx context.Context) *sweepSnapshot {
-	s := &sweepSnapshot{ctx: ctx}
+func newSweepSnapshot(ctx context.Context, nowFn func() time.Time) *sweepSnapshot {
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	s := &sweepSnapshot{ctx: ctx, nowFn: nowFn}
 	s.memos = []memoMember{
 		&s.pods, &s.nodes, &s.slices,
 		&s.services, &s.namespaces, &s.events,
-		&s.pvcs, &s.statefulSets, &s.deployments,
+		&s.pvcs, &s.pvs, &s.statefulSets, &s.deployments,
 		&s.daemonSets, &s.leases,
 		&s.replicaSets, &s.cronJobs, &s.jobs, &s.pdbs,
-		&s.nodeZones, &s.podNodes,
+		&s.validatingWebhooks, &s.mutatingWebhooks,
+		&s.nodeZones, &s.podNodes, &s.nodeByName,
 		&s.leaseIndex, &s.serviceIndex,
+	}
+	for _, mm := range s.memos {
+		mm.setNow(nowFn)
 	}
 	s.resets = []func(){
 		s.deploymentsIdx.reset, s.statefulSetsIdx.reset,
@@ -461,10 +518,43 @@ func (s *sweepSnapshot) promMemo(key string) *memo[[]promq.Sample] {
 	}
 	m, ok := s.promQueries[key]
 	if !ok {
-		m = &memo[[]promq.Sample]{}
+		m = &memo[[]promq.Sample]{now: s.nowFn}
 		s.promQueries[key] = m
 	}
 	return m
+}
+
+// promCircuitThreshold is the consecutive transport-failure count
+// that opens the per-sweep Prometheus circuit — three strikes means
+// the endpoint is down, not flaky.
+const promCircuitThreshold = 3
+
+// promCircuitOpen reports whether the sweep's Prometheus circuit
+// has tripped — callers fast-fail instead of paying another dial.
+func (s *sweepSnapshot) promCircuitOpen() bool {
+	s.promMu.Lock()
+	defer s.promMu.Unlock()
+	return s.promOpen
+}
+
+// promNoteResult feeds one query outcome into the circuit breaker.
+// Only transport-level failures (promq.TransportError — the request
+// never got an HTTP response) advance the streak; a success OR any
+// server-side answer proves reachability and resets it. promOpen,
+// once set, stays set for the sweep.
+func (s *sweepSnapshot) promNoteResult(err error) {
+	var te *promq.TransportError
+	transportFail := err != nil && errors.As(err, &te)
+	s.promMu.Lock()
+	defer s.promMu.Unlock()
+	if !transportFail {
+		s.promFails = 0
+		return
+	}
+	s.promFails++
+	if s.promFails >= promCircuitThreshold {
+		s.promOpen = true
+	}
 }
 
 // resetUnstructs drops every per-GVR dynamic memo — the unstructured
@@ -495,8 +585,28 @@ func (s *sweepSnapshot) resetUnstructs() {
 // mutating the shared objects (the data race the overlay exists to
 // remove) or invalidating whole censuses (the re-LIST storm
 // MarkPodDeleted replaces).
-func WithSweepSnapshot(ctx context.Context) context.Context {
-	snap := newSweepSnapshot(ctx)
+func WithSweepSnapshot(ctx context.Context, deps ...*Deps) context.Context {
+	var nowFn func() time.Time
+	if len(deps) > 0 && deps[0] != nil && deps[0].Now != nil {
+		nowFn = deps[0].Now
+	}
+	snap := newSweepSnapshot(ctx, nowFn)
 	ctx = context.WithValue(ctx, sweepCtxKey{}, snap)
-	return kube.WithSweepOverlay(ctx)
+	ctx = kube.WithSweepOverlay(ctx)
+	// Bind the O(1) node lookup heal's local-remediation yield
+	// prefers over a live GET — only when the caller can supply
+	// Deps (the production sweep root does; bare test ctxs keep
+	// the GET fallback).
+	if len(deps) > 0 && deps[0] != nil {
+		d := deps[0]
+		ctx = kube.WithSweepNodeLookup(ctx,
+			func(lctx context.Context, name string) (*corev1.Node, error) {
+				idx, err := d.nodeIndex(lctx)
+				if err != nil {
+					return nil, err
+				}
+				return idx[name], nil // absent → (nil,nil) = NotFound
+			})
+	}
+	return ctx
 }

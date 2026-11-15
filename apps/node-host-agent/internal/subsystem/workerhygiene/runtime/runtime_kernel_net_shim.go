@@ -110,7 +110,7 @@ func (c *KernelNetShimCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	var maxRSS, totalRSS int64
 	worstPID, worstTask := 0, ""
 	for _, pid := range e.PidsOnce() {
-		if !isContainerdShim(d, pid) {
+		if !isContainerdShim(d, e, pid) {
 			continue
 		}
 		rss := shimRSSBytes(d, pid)
@@ -223,16 +223,30 @@ func (c *KernelNetShimCheck) softnetStats() (int64, int64, bool) {
 	return drops, squeeze, seen
 }
 
-// isContainerdShim reports whether /proc/<pid>/comm (truncated to 15
+// isContainerdShim reports whether the pid's comm (truncated to 15
 // bytes "containerd-shim" by TASK_COMM_LEN on Linux) and argv[0]
 // basename identify a containerd-shim-runc-v2 process — not a
 // cmdline substring (a pod could carry the string in its own argv).
-func isContainerdShim(d *wdeps.Deps, pid int) bool {
-	data, err := os.ReadFile(d.Proc.File(pid, "comm"))
-	if err != nil {
-		return false
+// The comm comes from the cycle's StatsOnce snapshot when present —
+// a known non-shim comm skips both the comm-file and cmdline reads;
+// an unknown comm falls back to the comm file (fake-proc parity).
+func isContainerdShim(d *wdeps.Deps, e *wdeps.CycleEnv, pid int) bool {
+	var comm string
+	known := false
+	if e != nil && e.StatsOnce != nil {
+		if st, ok := e.StatsOnce()[pid]; ok && st.HasComm {
+			comm, known = st.Comm, true
+		}
+	} else if st, ok := d.Proc.Stat(pid); ok && st.HasComm {
+		comm, known = st.Comm, true
 	}
-	comm := strings.TrimSpace(string(data))
+	if !known {
+		data, err := os.ReadFile(d.Proc.File(pid, "comm"))
+		if err != nil {
+			return false
+		}
+		comm = strings.TrimSpace(string(data))
+	}
 	if comm != "containerd-shim" && comm != "containerd-shim-runc-v2" {
 		return false
 	}

@@ -71,7 +71,10 @@ func (c *PoolCheck) Name() string { return cdeps.CheckKinePool }
 // a SIGTERM delivered on a cancelled context races the supervisor's
 // own shutdown stop.
 func (c *PoolCheck) Run(ctx context.Context) {
-	kpid := c.d.Proc.FindByComm("kine")
+	// cgroup-scoped lookup: a same-named process outside
+	// k0scontroller.service (foreign daemon, recycled pid) must
+	// never inherit the kill trust.
+	kpid := c.d.Proc.FindByCommInCgroup("kine", cdeps.K0sControllerCgroupSubstr)
 	if kpid == 0 {
 		// No kine process: etcd controller or k0s not initialised —
 		// the probe is a silent no-op (the shell exited the same way).

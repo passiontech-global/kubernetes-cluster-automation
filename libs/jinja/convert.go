@@ -48,11 +48,15 @@ func toYAMLNode(v any) (*yaml3.Node, error) {
 // keeps the document acyclic and marshal-safe, while an
 // exponentially branching structure errors the render.
 func yamlValueAt(v any, depth int, steps *int) (*yaml3.Node, error) {
-	if depth > walkMaxDepth {
-		return yamlLeafNode("[...]")
-	}
+	// The step budget runs BEFORE the depth early-out: a wide
+	// structure sitting exactly at the depth cap would otherwise
+	// spawn unbounded "[...]" leaf encodes that never consume
+	// budget — every recursive call must burn a step.
 	if stepBudgetExhausted(steps) {
 		return nil, fmt.Errorf("yaml: value walk exceeds %d steps (exponentially branching value?)", walkMaxSteps)
+	}
+	if depth > walkMaxDepth {
+		return yamlLeafNode("[...]")
 	}
 	switch t := v.(type) {
 	case *OMap:
@@ -67,6 +71,12 @@ func yamlValueAt(v any, depth int, steps *int) (*yaml3.Node, error) {
 		return yamlSeqNode(t.V, depth, steps)
 	case []any:
 		return yamlSeqNode(t, depth, steps)
+	case []string:
+		items := make([]any, len(t))
+		for i, x := range t {
+			items[i] = x
+		}
+		return yamlSeqNode(items, depth, steps)
 	case map[string]any:
 		return yamlMapNode(slices.Sorted(maps.Keys(t)), func(k string) any { return t[k] }, depth, steps)
 	case map[string]string:

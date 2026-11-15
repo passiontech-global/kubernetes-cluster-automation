@@ -505,11 +505,11 @@ func TestAPIServiceGuardUnblockStandaloneFallbackOnUnrelatedWedge(t *testing.T) 
 	if testutil.PodExists(t, cs, "kube-system", "ms-0") {
 		t.Fatal("unrelated wedged namespace masked the standalone unblock")
 	}
-	if _, stamped := g.unblockHealer.standaloneUnblocked.Last("v1beta1.metrics.k8s.io"); !stamped {
-		t.Fatal("standalone unblock did not stamp its own cooldown ledger")
-	}
-	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); stamped {
-		t.Fatal("wedge-evidence ledger stamped without wedge evidence")
+	// The shared cooldown ledger stamps on ANY delivered heal —
+	// wedge-evidence and standalone paths share it so one cannot
+	// re-fire inside the other's window.
+	if _, stamped := g.unblockHealer.unblocked.Last("v1beta1.metrics.k8s.io"); !stamped {
+		t.Fatal("standalone unblock did not stamp the shared cooldown ledger")
 	}
 }
 
@@ -602,7 +602,10 @@ func TestAPIServiceGuardUnblockCooldownPrunesOnListError(t *testing.T) {
 	g := asgGuard(fake.NewSimpleClientset(), asgDynFake())
 	u := &unblockHealer{}
 	const key = "v1alpha1.dead.example.com"
-	t0 := time.Now().Add(-apiServiceUnblockCooldown - time.Minute)
+	// The shared ledger prunes under the WIDER standalone window —
+	// the stamp must outlive apiServiceStandaloneUnblockCooldown to
+	// be expirable.
+	t0 := time.Now().Add(-apiServiceStandaloneUnblockCooldown - time.Minute)
 	u.unblocked.Stamp(key, t0)
 	snap := &apiServiceSnapshot{g: g, err: errors.New("list apiservices boom")}
 	if err := u.sweepUnblock(t.Context(), snap); err == nil {
@@ -610,7 +613,7 @@ func TestAPIServiceGuardUnblockCooldownPrunesOnListError(t *testing.T) {
 	}
 	// CooledDown judged AT a point inside the (now-gone) stamp's window:
 	// true only if the expired stamp survived the prune.
-	if u.unblocked.CooledDown(key, apiServiceUnblockCooldown, t0.Add(30*time.Second)) {
+	if u.unblocked.CooledDown(key, apiServiceStandaloneUnblockCooldown, t0.Add(30*time.Second)) {
 		t.Fatal("expired unblock stamp survived the error cycle — ledger not pruned")
 	}
 }

@@ -144,3 +144,40 @@ func AllowedVPersisted(ctx context.Context, log logr.Logger,
 	// AllowedV runs only its mutex + budget gates.
 	return AllowedV(ctx, log, v, cs, dyn, nil, key, cooldown, now)
 }
+
+// AllowedOnNodePersisted is AllowedOnNode with the cooldown widened
+// to the persisted stamp — the node-scoped sibling of
+// AllowedVPersisted for heals that bounce ONE node's DaemonSet pods
+// and persist their cooldown on the pod/object itself: the wider-of
+// in-RAM+annotation window runs first, then the node-scoped
+// maintenance Scope and the heal budget. A nil obj/empty annoKey
+// collapses to plain AllowedOnNode.
+func AllowedOnNodePersisted(ctx context.Context, log logr.Logger,
+	v *maintenance.Verdict, cs kubernetes.Interface, dyn dynamic.Interface,
+	heals *state.CooldownSet, obj metav1.Object, annoKey, key, nodeName string,
+	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
+	if obj != nil && annoKey != "" &&
+		PersistedCooledDown(ctx, heals, obj, annoKey, key, cooldown, now) {
+		log.Info("skip heal: persisted stamp inside cooldown", "target", key)
+		return false, false
+	}
+	return AllowedOnNode(ctx, log, v, cs, dyn, nil, key, nodeName, 0, now)
+}
+
+// AllowedUpgradeOnlyPersisted is AllowedUpgradeOnly with the
+// cooldown widened to the persisted stamp — for the annotation-only
+// nudges that stamp their own cooldown on the target object. The
+// wider-of window runs first, then the cluster-wide-only maintenance
+// Scope; node-scoped holds and the heal budget never apply (the
+// nudge writes metadata, not pods).
+func AllowedUpgradeOnlyPersisted(ctx context.Context, log logr.Logger,
+	v *maintenance.Verdict, cs kubernetes.Interface, dyn dynamic.Interface,
+	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
+	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
+	if obj != nil && annoKey != "" &&
+		PersistedCooledDown(ctx, heals, obj, annoKey, key, cooldown, now) {
+		log.Info("skip heal: persisted stamp inside cooldown", "target", key)
+		return false, false
+	}
+	return AllowedUpgradeOnly(ctx, log, v, cs, dyn, key, now)
+}

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -365,6 +366,7 @@ func promTestBody(samples []PromTestSample) string {
 func PromTestServer(t *testing.T, respond func(query string) []PromTestSample) (*httptest.Server, *string) {
 	t.Helper()
 	var lastQuery string
+	var lastQueryMu sync.Mutex // concurrent query fan-out writes race without it
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/query" {
 			w.WriteHeader(http.StatusNotFound)
@@ -374,9 +376,16 @@ func PromTestServer(t *testing.T, respond func(query string) []PromTestSample) (
 		// URL access logs); ParseForm covers both that and any
 		// legacy GET caller.
 		_ = r.ParseForm()
-		lastQuery = r.FormValue("query")
+		// Local copy for the responder: callers now issue queries
+		// concurrently (observability-pipeline parallel fan-out),
+		// and reading the shared lastQuery back would cross-wire
+		// request A's query into request B's response.
+		q := r.FormValue("query")
+		lastQueryMu.Lock()
+		lastQuery = q
+		lastQueryMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, promTestBody(respond(lastQuery)))
+		_, _ = fmt.Fprint(w, promTestBody(respond(q)))
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &lastQuery

@@ -39,6 +39,11 @@ on:
         required: false
         default: "libs/hostkit/**"
         type: string
+      uses_buildx:
+        description: "App image builds via docker buildx (moon image task) instead of ko — sets up the docker-container driver"
+        required: false
+        default: false
+        type: boolean
     outputs:
       rel_tag:
         description: "Release tag created (e.g. <app>/v1.2.3)"
@@ -324,6 +329,23 @@ jobs:
             (cd "apps/$APP/dist" && sha256sum "$APP-linux-amd64" > "$APP-linux-amd64.sha256")
           fi
           cat "apps/$APP/dist/SHA256SUMS.txt"
+
+      - name: Set up Docker Buildx
+        # docker-container driver: the image-build scripts export
+        # type=gha BuildKit cache (scope=<app>) which the default
+        # docker driver cannot persist. Only apps whose moon `image`
+        # task runs `docker buildx` need it — ko-built apps skip.
+        if: inputs.uses_buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Export GHA cache env for buildx
+        # JS actions are the only step kind GitHub injects
+        # ACTIONS_RUNTIME_TOKEN/ACTIONS_CACHE_URL/ACTIONS_RESULTS_URL
+        # into — this hop lands them in $GITHUB_ENV so the moon
+        # image task's type=gha cache check sees them and the
+        # release build actually hits the layer cache.
+        if: inputs.uses_buildx
+        uses: ./.github/actions/gha-cache-env
 
       - name: Build and push GHCR image (ko, see apps/<app>/.ko.yaml)
         env:

@@ -36,7 +36,7 @@ func (p *Probe) hygieneLargeKeys(ctx context.Context, pg, user, pass string,
 	}
 	// `bytes|name` field order: name lands LAST so a key containing
 	// '|' still parses (Cut takes the first separator only).
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
 		"SELECT OCTET_LENGTH(value), name FROM ("+
 			"SELECT DISTINCT ON (name) name, value, deleted "+
 			"FROM %s ORDER BY name, id DESC) latest "+

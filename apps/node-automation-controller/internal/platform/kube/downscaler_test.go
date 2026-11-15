@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -69,7 +70,7 @@ func TestDownscaledClusterCRs(t *testing.T) {
 		}},
 	}
 
-	got, err := DownscaledClusterCRs(items, nil)
+	got, err := DownscaledClusterCRs(context.Background(), items, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -82,14 +83,14 @@ func TestDownscaledClusterCRs(t *testing.T) {
 		apierrors.NewNotFound(schema.GroupResource{Group: "g", Resource: "r"}, "x"),
 		&meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{Resource: "r"}},
 	} {
-		got, err := DownscaledClusterCRs(nil, listErr)
+		got, err := DownscaledClusterCRs(context.Background(), nil, listErr)
 		if err != nil || len(got) != 0 {
 			t.Fatalf("expected empty map and nil err for %v, got %v, %v", listErr, got, err)
 		}
 	}
 
 	// Other errors propagate.
-	if _, err := DownscaledClusterCRs(nil, errors.New("apiserver down")); err == nil {
+	if _, err := DownscaledClusterCRs(context.Background(), nil, errors.New("apiserver down")); err == nil {
 		t.Fatal("expected error to propagate")
 	}
 }

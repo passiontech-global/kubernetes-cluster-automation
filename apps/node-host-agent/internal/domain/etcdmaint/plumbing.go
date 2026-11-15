@@ -169,15 +169,41 @@ func newRescuer(cfg Config, out io.Writer) *rescuer {
 	}
 }
 
+// tempEtcdClientURL is the loopback client port the standalone
+// defrag etcd binds (see tempEtcdArgs) — deliberately NOT the real
+// :2379 endpoint: while k0scontroller is stopped nothing may answer
+// on the live client shape, and etcdctl reaches the temp member
+// through this throwaway address with no client certs (plain http).
+const tempEtcdClientURL = "http://127.0.0.1:22379"
+
 // etcdctl runs `etcdctl <certs> --command-timeout=<timeout> args...`
 // (the script's e() wrapper). Empty timeout → 600s like e().
 func (r *rescuer) etcdctl(ctx context.Context, timeout string,
 	args ...string) ([]byte, error) {
+	return r.etcdctlPrefix(ctx, timeout, r.certArgs, args...)
+}
+
+// etcdctlTemp is etcdctl aimed at the standalone defrag etcd — same
+// wrapper, a bare loopback endpoint prefix instead of certArgs: the
+// temp listener is http on 127.0.0.1:22379, so the
+// apiserver-etcd-client certs neither apply nor are needed.
+func (r *rescuer) etcdctlTemp(ctx context.Context, timeout string,
+	args ...string) ([]byte, error) {
+	return r.etcdctlPrefix(ctx, timeout,
+		[]string{"--endpoints=" + tempEtcdClientURL}, args...)
+}
+
+// etcdctlPrefix is the shared argv builder: <prefix> then
+// --command-timeout=<timeout> then args — prefix carries the
+// endpoint+auth flags (certArgs for the live member, the bare
+// loopback endpoint for the temp one).
+func (r *rescuer) etcdctlPrefix(ctx context.Context, timeout string,
+	prefix []string, args ...string) ([]byte, error) {
 	if timeout == "" {
 		timeout = defaultEtcdTimeout
 	}
-	argv := make([]string, 0, len(r.certArgs)+len(args)+1)
-	argv = append(argv, r.certArgs...)
+	argv := make([]string, 0, len(prefix)+len(args)+1)
+	argv = append(argv, prefix...)
 	argv = append(argv, "--command-timeout="+timeout)
 	argv = append(argv, args...)
 	cctx, cancel := context.WithTimeout(ctx, r.cfg.CallTimeout)

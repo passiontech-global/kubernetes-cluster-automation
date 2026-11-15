@@ -192,7 +192,7 @@ func TestStormGateNoDeschedulerDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter != 5*time.Minute {
+	if res.RequeueAfter < 4*time.Minute+30*time.Second || res.RequeueAfter >= 5*time.Minute+30*time.Second {
 		t.Fatalf("expected 5m requeue, got %s", res.RequeueAfter)
 	}
 }

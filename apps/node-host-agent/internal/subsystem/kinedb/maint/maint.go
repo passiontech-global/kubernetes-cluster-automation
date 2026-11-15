@@ -198,7 +198,7 @@ func (m *Maint) stampMaintEpoch() {
 // effort — a failed reap only notes.
 func (m *Maint) reapOrphanedMaint(ctx context.Context, pg, user, pass string,
 	note func(string)) {
-	n, err := m.d.ReapOrphanedMaintSessions(ctx, pg, user, pass)
+	n, err := m.d.ReapOrphanedMaintSessions(ctx, pg, user, pass, kdeps.AppNameMaint, "pg_repack", "pg_dump")
 	switch {
 	case err != nil:
 		note(fmt.Sprintf("orphan-reap-fail: %v", err))
@@ -213,7 +213,7 @@ func (m *Maint) reapOrphanedMaint(ctx context.Context, pg, user, pass string,
 // gauges and the repack gate consume (the (c) block of maintRun).
 func (m *Maint) readSizes(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string)) {
-	out, err := m.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := m.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameMaint, fmt.Sprintf(
 		"SELECT pg_relation_size(%[1]s), pg_indexes_size(%[1]s), "+
 			"COALESCE((SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname=%[1]s),0), "+
 			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%[1]s),0)",
@@ -243,7 +243,7 @@ func (m *Maint) readSizes(ctx context.Context, pg, user, pass string,
 // long budget (CONCURRENTLY waits on concurrent snapshots).
 func (m *Maint) reapInvalidIndexes(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string)) {
-	out, err := m.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := m.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameMaint, fmt.Sprintf(
 		"SELECT indexrelid::regclass::text FROM pg_index "+
 			"WHERE NOT indisvalid AND indrelid = %s::regclass",
 		kdeps.SQLQuote(m.d.Cfg.Table)))
@@ -270,7 +270,7 @@ func (m *Maint) reapInvalidIndexes(ctx context.Context, pg, user, pass string,
 			logger().Warn("kinedb: invalid index on kine table kept (not a reindex orphan)",
 				"index", base)
 		default:
-			if _, derr := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass), m.d.PsqlMaintArgs(pg, user, false,
+			if _, derr := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass, kdeps.AppNameMaint), m.d.PsqlMaintArgs(pg, user, false,
 				"-qc", "DROP INDEX CONCURRENTLY IF EXISTS "+
 					kdeps.SQLIdent(base)), ""); derr != nil {
 				note(fmt.Sprintf("drop-index-%s-fail: %v", base, derr))

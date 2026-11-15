@@ -24,6 +24,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // DaemonSetSpec is one pinned DaemonSet the framework reconciles.
@@ -74,7 +75,7 @@ type DaemonSetSpec struct {
 // builder.Complete IncErrors it exactly once.
 func (s DaemonSetSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	res := ctrl.Result{RequeueAfter: RequeueInterval}
+	res := ctrl.Result{RequeueAfter: shared.RequeueAfter(RequeueInterval)}
 	ref := s.Namespace + "/" + s.Name
 
 	ds, err := kube.GetDaemonSetCached(ctx, s.Reader, s.CS, s.Namespace, s.Name)

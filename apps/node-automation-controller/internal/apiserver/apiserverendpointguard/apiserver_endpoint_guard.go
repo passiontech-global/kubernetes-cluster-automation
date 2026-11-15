@@ -220,6 +220,13 @@ type apiServerEndpointGuard struct {
 	// quarantined backend. Bounded by distinct backend IPs ever
 	// seen; run() is the only writer and sweeps serially.
 	peerHighWater map[string]bool
+	// peerNodeIPs is the high-water set of InternalIPs ever observed
+	// on a control-plane Node — provenance for peerHighWater: an IP
+	// whose ONLY evidence was a CP node that no longer exists is
+	// pruned from peerHighWater on the next successful node read, so
+	// a decommissioned backend's address cannot justify re-adding an
+	// IP later reused by a worker (ssotPeerIPs).
+	peerNodeIPs map[string]bool
 }
 
 // Setup registers the 30s wedge sweep. Gated through

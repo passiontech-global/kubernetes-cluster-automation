@@ -72,7 +72,7 @@ func sweepSnap(ctx context.Context) *sweepSnapshot {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
 		return s
 	}
-	return newSweepSnapshot(ctx)
+	return newSweepSnapshot(ctx, nil)
 }
 
 // listCtx returns the ctx one memoized LIST runs under: the
@@ -121,6 +121,7 @@ func (d *Deps) InvalidateNodes(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
 		s.nodes.resetForced()
 		s.nodeZones.reset()
+		s.nodeByName.reset()
 	}
 }
 
@@ -145,6 +146,45 @@ func (d *Deps) InvalidateLeases(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
 		s.leases.reset()
 		s.leaseIndex.reset()
+	}
+}
+
+// InvalidateDeployments drops the Deployment census AND its
+// by-namespace index — the workload twin of InvalidateNodes for a
+// check that patched a Deployment's spec mid-sweep: later checks
+// must re-list instead of evaluating the pre-patch replica count or
+// template. A no-op outside a sweep.
+func (d *Deps) InvalidateDeployments(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.deployments.reset()
+		s.deploymentsIdx.reset()
+	}
+}
+
+// InvalidateStatefulSets is the StatefulSet twin of
+// InvalidateDeployments.
+func (d *Deps) InvalidateStatefulSets(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.statefulSets.reset()
+		s.statefulSetsIdx.reset()
+	}
+}
+
+// InvalidateCronJobs is the CronJob twin — a suspend/spec patch
+// mid-sweep must be visible to later schedule audits.
+func (d *Deps) InvalidateCronJobs(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.cronJobs.reset()
+		s.cronJobsIdx.reset()
+	}
+}
+
+// InvalidateUnstructured drops every per-GVR dynamic memo — the
+// unstructured twin for checks that patched a CR (CSV, InstallPlan,
+// HelmRelease, Argo Rollout) mid-sweep.
+func (d *Deps) InvalidateUnstructured(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.resetUnstructs()
 	}
 }
 

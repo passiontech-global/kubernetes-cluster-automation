@@ -68,7 +68,16 @@ func writeStringify(v any, b *strings.Builder) {
 // elided tail (the budget bail degrades instead of erroring —
 // Stringify's signature is public API).
 func writeStringifyAt(v any, b *strings.Builder, depth int, steps *int) {
-	if depth > walkMaxDepth || stepBudgetExhausted(steps) {
+	// The byte budget is the size-level twin of the step budget:
+	// N references to one big string pass the step count while
+	// writing N× its bytes — past maxStringBytes the tail elides
+	// like the other budget bails (Stringify's signature is public
+	// API and cannot error).
+	// stepBudgetExhausted FIRST — same short-circuit rule as
+	// deepEqAt/yamlValueAt: depth-exceeded calls must still burn
+	// a step or a wide structure at the cap walks unbounded.
+	if stepBudgetExhausted(steps) || depth > walkMaxDepth ||
+		b.Len() > maxStringBytes {
 		b.WriteString("[...]")
 		return
 	}
@@ -98,6 +107,10 @@ func writeStringifyAt(v any, b *strings.Builder, depth int, steps *int) {
 		}
 		return
 	case string:
+		if b.Len()+len(t) > maxStringBytes {
+			b.WriteString("[...]")
+			return
+		}
 		b.WriteString(t)
 		return
 	case []string:
@@ -105,9 +118,17 @@ func writeStringifyAt(v any, b *strings.Builder, depth int, steps *int) {
 		// string slice renders exactly like []any of strings
 		// (verbatim elements, ", " joined) — previously it fell to
 		// fmt.Sprint's "[a b]" repr, inconsistent with every other
-		// sequence shape.
+		// sequence shape. Elements bypass writeStringifyAt, so the
+		// byte budget is checked per element here.
 		b.WriteByte('[')
 		for i, x := range t {
+			if b.Len() > maxStringBytes || b.Len()+len(x) > maxStringBytes {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString("[...]")
+				break
+			}
 			if i > 0 {
 				b.WriteString(", ")
 			}
@@ -135,6 +156,13 @@ func writeStringifyAt(v any, b *strings.Builder, depth int, steps *int) {
 	case *OMap:
 		b.WriteByte('{')
 		for i, k := range t.Keys() {
+			if b.Len() > maxStringBytes {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString("[...]")
+				break
+			}
 			if i > 0 {
 				b.WriteString(", ")
 			}
@@ -170,6 +198,13 @@ func writeStringifyMap[V any](m map[string]V, b *strings.Builder, depth int, ste
 	keys := slices.Sorted(maps.Keys(m))
 	b.WriteByte('{')
 	for i, k := range keys {
+		if b.Len() > maxStringBytes {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString("[...]")
+			break
+		}
 		if i > 0 {
 			b.WriteString(", ")
 		}
@@ -190,14 +225,20 @@ func writeStringifyMap[V any](m map[string]V, b *strings.Builder, depth int, ste
 // map[string]any + encoding/json would sort the keys and silently
 // reorder the mappings these filters regenerate.
 func writeJSONAt(v any, b *strings.Builder, depth int, steps *int) error {
+	// Step budget before the depth early-out — every recursive
+	// call burns a step (see yamlValueAt); a wide structure at the
+	// depth cap must not walk "[...]" leaves unbounded.
+	if stepBudgetExhausted(steps) {
+		return fmt.Errorf("json: value walk exceeds %d steps (exponentially branching value?)", walkMaxSteps)
+	}
 	if depth > walkMaxDepth {
 		// A cyclic value can't be marshaled anyway — a "[...]"
 		// string placeholder keeps the document marshal-safe.
 		b.WriteString(`"[...]"`)
 		return nil
 	}
-	if stepBudgetExhausted(steps) {
-		return fmt.Errorf("json: value walk exceeds %d steps (exponentially branching value?)", walkMaxSteps)
+	if b.Len() > maxStringBytes {
+		return fmt.Errorf("json: output exceeds %d bytes", maxStringBytes)
 	}
 	switch t := v.(type) {
 	case *OMap:
@@ -212,6 +253,12 @@ func writeJSONAt(v any, b *strings.Builder, depth int, steps *int) error {
 		return writeJSONList(t.V, b, depth, steps)
 	case []any:
 		return writeJSONList(t, b, depth, steps)
+	case []string:
+		items := make([]any, len(t))
+		for i, x := range t {
+			items[i] = x
+		}
+		return writeJSONList(items, b, depth, steps)
 	case map[string]any:
 		// Plain Go maps carry no order — sort keys for deterministic
 		// output, same as encoding/json did.
@@ -238,7 +285,19 @@ func writeJSONAt(v any, b *strings.Builder, depth int, steps *int) error {
 		}
 		return nil
 	case string:
+		// Necessary bound up front: even an unescaped s plus its
+		// two quotes must fit the remaining budget. The escaped
+		// form can still overshoot (up to ~6x) — writeJSONString
+		// is void, so the b.Len() check right after catches it.
+		// Checking rem/6 here instead would falsely reject every
+		// valid ASCII string over ~2.67MiB.
+		if rem := maxStringBytes - b.Len() - 2; len(s) > rem {
+			return fmt.Errorf("json: output exceeds %d bytes", maxStringBytes)
+		}
 		writeJSONString(s, b)
+		if b.Len() > maxStringBytes {
+			return fmt.Errorf("json: output exceeds %d bytes", maxStringBytes)
+		}
 		return nil
 	case int64:
 		b.WriteString(strconv.FormatInt(s, 10))
@@ -268,6 +327,9 @@ func writeJSONAt(v any, b *strings.Builder, depth int, steps *int) error {
 	if err != nil {
 		return err
 	}
+	if b.Len()+len(bb) > maxStringBytes {
+		return fmt.Errorf("json: output exceeds %d bytes", maxStringBytes)
+	}
 	b.Write(bb)
 	return nil
 }
@@ -276,10 +338,21 @@ func writeJSONAt(v any, b *strings.Builder, depth int, steps *int) error {
 func writeJSONMap(keys []string, get func(string) any, b *strings.Builder, depth int, steps *int) error {
 	b.WriteByte('{')
 	for i, k := range keys {
+		if b.Len() > maxStringBytes {
+			return fmt.Errorf("json: output exceeds %d bytes", maxStringBytes)
+		}
 		if i > 0 {
 			b.WriteByte(',')
 		}
+		// Keys escape like string values — same necessary-bound +
+		// post-write check pair as the string arm above.
+		if rem := maxStringBytes - b.Len() - 2; len(k) > rem {
+			return fmt.Errorf("json: output exceeds %d bytes", maxStringBytes)
+		}
 		writeJSONString(k, b)
+		if b.Len() > maxStringBytes {
+			return fmt.Errorf("json: output exceeds %d bytes", maxStringBytes)
+		}
 		b.WriteByte(':')
 		if err := writeJSONAt(get(k), b, depth+1, steps); err != nil {
 			return err
@@ -292,6 +365,9 @@ func writeJSONMap(keys []string, get func(string) any, b *strings.Builder, depth
 func writeJSONList(items []any, b *strings.Builder, depth int, steps *int) error {
 	b.WriteByte('[')
 	for i, x := range items {
+		if b.Len() > maxStringBytes {
+			return fmt.Errorf("json: output exceeds %d bytes", maxStringBytes)
+		}
 		if i > 0 {
 			b.WriteByte(',')
 		}

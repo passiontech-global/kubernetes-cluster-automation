@@ -15,20 +15,37 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 )
 
 // waitHealthy polls `endpoint health` up to tries times (1s cadence)
 // — the post-stop/start equivalent of the script's `ss -tln | grep
-// :2379` loop, but asserting an actual healthy member.
+// :2379` loop, but asserting an actual healthy member. It probes the
+// LIVE endpoint (certArgs): only the post-restart wait uses it.
 func (r *rescuer) waitHealthy(ctx context.Context, tries int) error {
+	return r.waitHealthyVia(ctx, tries, r.etcdctl, "etcd")
+}
+
+// waitTempHealthy is waitHealthy aimed at the standalone defrag
+// etcd — etcdctlTemp's bare loopback endpoint, no certs.
+func (r *rescuer) waitTempHealthy(ctx context.Context, tries int) error {
+	return r.waitHealthyVia(ctx, tries, r.etcdctlTemp, "standalone etcd")
+}
+
+// waitHealthyVia is the shared health-poll body: call is the
+// etcdctl flavour (live certArgs vs temp loopback endpoint) and
+// what names the member in the timeout error.
+func (r *rescuer) waitHealthyVia(ctx context.Context, tries int,
+	call func(context.Context, string, ...string) ([]byte, error),
+	what string) error {
 	if cycle.Poll(ctx, tries, time.Second, func() bool {
-		_, err := r.etcdctl(ctx, healthProbeTimeout,
+		_, err := call(ctx, healthProbeTimeout,
 			"endpoint", "health")
 		return err == nil
 	}, r.cfg.SleepFn) {
 		return nil
 	}
-	return fmt.Errorf("etcd still unhealthy after %ds", tries)
+	return fmt.Errorf("%s still unhealthy after %ds", what, tries)
 }
 
 // offlineDefrag is the script's `systemctl stop -> standalone etcd ->
@@ -84,11 +101,13 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 	_, _ = fmt.Fprintf(r.out,
 		">>> standalone etcd log: %s/etcd-standalone-*/etcd-standalone-*.log\n",
 		os.TempDir())
-	tmp, terr := r.cfg.StartTempEtcd(ctx, r.etcdBin, flags, os.TempDir())
+	tmp, terr := r.cfg.StartTempEtcd(ctx, r.etcdBin,
+		tempEtcdArgs(flags, filepath.Join(r.cfg.K0sDir, "etcd")),
+		os.TempDir())
 	if terr != nil {
 		return fmt.Errorf("start standalone etcd: %w", terr)
 	}
-	if herr := r.waitHealthy(ctx, tempEtcdHealthTries); herr != nil {
+	if herr := r.waitTempHealthy(ctx, tempEtcdHealthTries); herr != nil {
 		if kerr := tmp.Kill(); kerr != nil { // SIGTERM — grace before reap
 			_, _ = fmt.Fprintf(r.out, "(kill standalone etcd: %v)\n", kerr)
 		}
@@ -96,7 +115,7 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 		return fmt.Errorf("standalone etcd never came up: %w", herr)
 	}
 
-	_, derr := r.etcdctl(ctx, offlineDefragTimeout, "defrag")
+	_, derr := r.etcdctlTemp(ctx, offlineDefragTimeout, "defrag")
 	if kerr := tmp.Kill(); kerr != nil {
 		_, _ = fmt.Fprintf(r.out, "(kill standalone etcd: %v)\n", kerr)
 	}
@@ -106,6 +125,39 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 	}
 	_, _ = fmt.Fprintln(r.out, ">>> offline defrag done")
 	return nil
+}
+
+// tempEtcdPeerURL is the throwaway peer port the standalone defrag
+// etcd binds — paired with tempEtcdClientURL (plumbing.go) so the
+// whole member lives on loopback ports nothing else uses.
+const tempEtcdPeerURL = "http://127.0.0.1:22380"
+
+// tempEtcdArgs builds the fully isolated argv for the standalone
+// defrag etcd. The captured live flags CANNOT be reused verbatim:
+// their --listen-*/--advertise-*/--initial-* entries still name the
+// real :2379/:2380 member — a temp etcd inheriting them would try
+// to serve (and rejoin) the live cluster shape while
+// k0scontroller is stopped, and its client listener would answer on
+// the production port with throwaway state. Only --data-dir,
+// --quota-backend-bytes and --name carry over; every URL and the
+// cluster bootstrap are pinned to loopback throwaway ports and
+// --force-new-cluster re-initializes the single-member store from
+// the existing data-dir (the disaster-recovery flag etcd documents
+// for exactly this offline-rewrite case).
+func tempEtcdArgs(flags []string, dataDirDef string) []string {
+	name := flagValue(flags, "--name", "default")
+	return []string{
+		"--data-dir=" + flagValue(flags, "--data-dir", dataDirDef),
+		"--name=" + name,
+		"--quota-backend-bytes=" +
+			flagValue(flags, "--quota-backend-bytes", defaultQuotaFlag),
+		"--initial-cluster=" + name + "=" + tempEtcdPeerURL,
+		"--listen-peer-urls=" + tempEtcdPeerURL,
+		"--initial-advertise-peer-urls=" + tempEtcdPeerURL,
+		"--listen-client-urls=" + tempEtcdClientURL,
+		"--advertise-client-urls=" + tempEtcdClientURL,
+		"--force-new-cluster=true",
+	}
 }
 
 // --- production TempEtcd impl ---
@@ -183,6 +235,11 @@ func startTempEtcdExec(ctx context.Context, bin string,
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
+	// Scrub the sd_notify vars: on a standalone host the temp etcd
+	// must not inherit NOTIFY_SOCKET and sd_notify back into OUR
+	// unit on exit (systemd>=255 auto-sends EXIT_STATUS on exec) —
+	// the same hazard hostexec.RunEnv exists for.
+	cmd.Env = hostexec.ScrubSystemdEnv(os.Environ())
 	// A cancelled ctx must NOT SIGKILL etcd mid-defrag — a hard kill
 	// on live bbolt data files risks corruption and leaves the
 	// data-dir lock unreleased. Send SIGTERM (the script's

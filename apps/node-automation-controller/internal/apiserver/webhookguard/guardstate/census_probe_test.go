@@ -456,3 +456,37 @@ func TestProbePoolBounded(t *testing.T) {
 		}
 	}
 }
+
+// TestBackendSliceSelectorBound pins the >64-name fallback: the
+// label selector cannot express an unbounded service-name set, so
+// the census must signal "unfiltered" (ok=false) rather than
+// silently returning an empty ready census that would trip the
+// circuit breaker cluster-wide.
+func TestBackendSliceSelectorBound(t *testing.T) {
+	if sel, ok := backendSliceSelector(nil); ok || sel != "" {
+		t.Fatalf("empty probeSet: sel=%q ok=%v, want unfiltered", sel, ok)
+	}
+	// 64 distinct service names still fits the selector budget.
+	set := map[string][]int32{}
+	for i := 0; i < 64; i++ {
+		set[fmt.Sprintf("ns%d/svc-%02d", i%8, i)] = nil
+	}
+	sel, ok := backendSliceSelector(set)
+	if !ok || !strings.Contains(sel, "kubernetes.io/service-name in (") {
+		t.Fatalf("64-name probeSet: sel=%q ok=%v, want filtered", sel, ok)
+	}
+	// Names dedup across namespaces — 64 keys over 8 namespaces
+	// still carry 64 distinct names.
+	if n := strings.Count(sel, "svc-"); n != 64 {
+		t.Fatalf("selector carries %d names, want 64", n)
+	}
+	// 65 distinct names exceeds the budget → unfiltered fallback.
+	set["one-more/svc-65"] = nil
+	if sel, ok := backendSliceSelector(set); ok || sel != "" {
+		t.Fatalf("65-name probeSet: sel=%q ok=%v, want unfiltered", sel, ok)
+	}
+	// Keys without a namespace/name shape contribute no names.
+	if _, ok := backendSliceSelector(map[string][]int32{"bogus": nil}); ok {
+		t.Fatal("unparseable key produced a selector")
+	}
+}

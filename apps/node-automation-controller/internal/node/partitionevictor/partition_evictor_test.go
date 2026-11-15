@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -33,8 +34,16 @@ func pePartitionedNode(name string, condType corev1.NodeConditionType, age time.
 
 func pePod(ns, nodeName, name string) *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
-		Spec:       corev1.PodSpec{NodeName: nodeName},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns, Name: name,
+			// partitionEvictable requires a controller owner —
+			// standalone pods are never evicted (nothing recreates
+			// them). Tests needing the bare shape clear this.
+			OwnerReferences: []metav1.OwnerReference{{
+				Kind: "ReplicaSet", Name: "rs-" + name,
+				Controller: ptr.To(true)}},
+		},
+		Spec: corev1.PodSpec{NodeName: nodeName},
 	}
 }
 

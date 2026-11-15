@@ -26,6 +26,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -158,11 +159,12 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 		if now.Sub(since) < esStuckAge {
 			continue // fresh failure — still inside normal reconcile, don't poke
 		}
-		// Eligibility: the recovery edge nudges every stuck ES (the
-		// fast path); without an edge only ESs whose referenced
-		// stores are ALL Ready=True ClusterSecretStores qualify — an
-		// ES hanging off a still-broken store gets nothing by design.
-		if !recovered && !n.esStoreReady(es) {
+		// Eligibility: EVERY stuck ES must reference only Ready=True
+		// ClusterSecretStores — the recovery edge does not bypass
+		// the per-store check. An ES hanging off a still-broken
+		// store gets nothing by design: a force-sync against a
+		// down store just burns a reconcile and re-fails.
+		if !n.esStoreReady(es) {
 			continue
 		}
 		// Persisted cooldown — survives restarts: a force-sync /
@@ -171,6 +173,21 @@ func (n *externalSecretNudge) nudge(ctx context.Context, recovered, anyReady boo
 		if last, ok := esNudgeStamp(es); ok && now.Sub(last) < esNudgeCooldown {
 			log.Info("skip: persisted nudge stamp inside cooldown",
 				"es", key, "ago", now.Sub(last).Truncate(time.Minute))
+			continue
+		}
+		// Maintenance gate — the nudge is annotation-only, so it
+		// defers solely on a cluster-wide hold (AllowedUpgradeOnly:
+		// node-scoped drains do not block a metadata write and no
+		// heal-budget grant is consumed). Unverifiable is
+		// fail-closed per ES, same tolerated-failure accounting as
+		// the patch below.
+		proceed, unverifiable := heal.AllowedUpgradeOnly(ctx, log,
+			n.verdict, n.cs, n.dyn, key, now)
+		if unverifiable {
+			metrics.IncError(n.queue)
+			continue
+		}
+		if !proceed {
 			continue
 		}
 		// empty-key-audit — clear the empty skeleton BEFORE stamping: ESO can

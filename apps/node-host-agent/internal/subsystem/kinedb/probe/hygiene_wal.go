@@ -12,21 +12,14 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
-// hygieneWAL — item 4: pg_wal size, wal/datafs ratio, archiver
-// staleness and inactive-slot retention (with the orphan-slot drop).
+// hygieneWAL — item 4's REMAINDER: the wal-bytes and archiver
+// reads moved into hygieneScalarStats' merged census (h.walBytes/
+// h.walSeen/h.archiveStale/h.archiveSeen are already filled); this
+// function keeps the parts that are NOT single-row reads — the
+// wal/datafs ratio df probe and the inactive replication-slot
+// census with the orphan-slot drop.
 func (p *Probe) hygieneWAL(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-
-	// (a) total WAL bytes — same pg_ls_waldir read repackHeadroom does.
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
-		"SELECT COALESCE((SELECT SUM(size) FROM pg_ls_waldir()),0)")
-	if err != nil {
-		note(fmt.Sprintf("wal-size-fail: %v", err))
-	} else if wal, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64); perr != nil {
-		note(fmt.Sprintf("wal-size-unparsed: %v", perr))
-	} else {
-		h.walBytes, h.walSeen = wal, true
-	}
 
 	// (b) WAL as a fraction of the data filesystem capacity —
 	// --output=size (total, not avail: the ratio measures retention
@@ -55,25 +48,12 @@ func (p *Probe) hygieneWAL(ctx context.Context, pg, user, pass string,
 		}
 	}
 
-	// (c) archiver staleness — a failed attempt newer than the last
-	// success is "failing"; it only counts as STALE once the last
-	// success (or, when it never archived, the stats reset) is >30m
-	// old. A recent failure that then succeeded reads clean.
-	out, err = p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
-		"SELECT CASE WHEN failed_count > 0 "+
-			"AND last_failed_time > COALESCE(last_archived_time, '-infinity'::timestamptz) "+
-			"AND EXTRACT(EPOCH FROM now() - COALESCE(last_archived_time, stats_reset)) > %d "+
-			"THEN 1 ELSE 0 END FROM pg_stat_archiver", archiveStaleSecs))
-	if err != nil {
-		note(fmt.Sprintf("archiver-fail: %v", err))
-	} else if v, perr := strconv.ParseInt(kdeps.FirstLine(out), 10, 64); perr != nil {
-		note(fmt.Sprintf("archiver-unparsed: %v", perr))
-	} else {
-		h.archiveStale, h.archiveSeen = v, true
-	}
+	// (c) archiver staleness moved into hygieneScalarStats — the
+	// CASE...END single-row read is one of its five merged
+	// statements (h.archiveStale/h.archiveSeen already filled).
 
 	// (d) inactive replication slots — retained WAL since restart_lsn.
-	out, err = p.d.PsqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
 		"SELECT slot_name, "+
 			"COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn),0)::bigint "+
 			"FROM pg_replication_slots WHERE NOT active")
@@ -96,7 +76,7 @@ func (p *Probe) hygieneWAL(ctx context.Context, pg, user, pass string,
 			}
 			note(fmt.Sprintf("inactive slot %s pins %dB WAL (>%dGiB) — dropping",
 				s.name, s.retained, slotRetainedDrop>>30))
-			if _, derr := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+			if _, derr := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
 				"SELECT pg_drop_replication_slot(%s)", kdeps.SQLQuote(s.name))); derr != nil {
 				note(fmt.Sprintf("drop-slot-%s-fail: %v", s.name, derr))
 			} else {

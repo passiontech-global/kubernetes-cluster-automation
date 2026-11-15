@@ -109,7 +109,7 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	log := logf.FromContext(ctx)
 	// 30m safety net replacing the old crontab: catches a wiped
 	// rolled-config-hash annotation even without a secret event.
-	res := ctrl.Result{RequeueAfter: 30 * time.Minute}
+	res := ctrl.Result{RequeueAfter: shared.RequeueAfter(30 * time.Minute)}
 
 	sec, err := kube.GetSecretCached(ctx, r.secretReader, r.cs, "fluent-system", "passiontech-pipeline")
 	if apierrors.IsNotFound(err) {
@@ -233,8 +233,12 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	// sharing r.verdict. Unverifiable fails closed: IncError the
 	// queue and skip; the drift clears on the next reconcile once
 	// maintenance is verifiable again.
+	// One timestamp for the whole gate chain: RefundGrant matches the
+	// grant by its recorded `now`, so a second Now() call would never
+	// Equal it on a real clock and every refund would leak the grant.
+	gateNow := r.now.Now()
 	proceed, unverifiable := heal.Gate(ctx, log, r.verdict,
-		r.cs, r.dyn, "fluent-system/fluent-bit", r.now.Now())
+		r.cs, r.dyn, "fluent-system/fluent-bit", gateNow)
 	if unverifiable {
 		metrics.IncError(r.queue)
 		log.Info("SKIP roll: maintenance mutex unverifiable",
@@ -243,6 +247,27 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 	}
 	if !proceed {
 		log.Info("SKIP roll: maintenance active (cordon/kured/autopilot)",
+			"daemonset", "fluent-system/fluent-bit")
+		return res, nil
+	}
+	// Quorum guard: a pod-delete check acting on fluent-bit pods
+	// later in the same sweep shares this workload's one
+	// disruption slot — a full-fleet roll plus a pod delete would
+	// double-book it. Denial defers to the next reconcile; the
+	// grant goes back since no mutation executed.
+	if !kube.TryReserveWorkloadKey(ctx, "fluent-system/DaemonSet/fluent-bit") {
+		heal.RefundGrant(gateNow)
+		log.Info("SKIP roll: workload disruption slot already spent this sweep",
+			"daemonset", "fluent-system/fluent-bit")
+		return res, nil
+	}
+	// SSA ping-pong defense: a GitOps-managed DaemonSet belongs to
+	// Flux — patching it fights the reconciler. Gate denial refunds
+	// the heal grant (no mutation executed).
+	if !heal.FluxPatchGate("daemonset", ds,
+		"fluent-system/fluent-bit", gateNow) {
+		heal.RefundGrant(gateNow)
+		log.Info("SKIP roll: Flux patch gate — GitOps owns this object",
 			"daemonset", "fluent-system/fluent-bit")
 		return res, nil
 	}

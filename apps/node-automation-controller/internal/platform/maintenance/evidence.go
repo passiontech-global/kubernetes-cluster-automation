@@ -31,6 +31,11 @@ const (
 	// KuredLockAnno is the reboot-coordination annotation kured holds
 	// while a node drains for its reboot window.
 	KuredLockAnno = "weave.works/kured-node-lock"
+	// medik8sRemediationMaxAge caps how old a live remediation CR may
+	// be before it stops counting as maintenance evidence — the same
+	// shape as kube's 45m cordon window: a wedged SelfNodeRemediation
+	// that never completes must not hold every gated heal forever.
+	medik8sRemediationMaxAge = 90 * time.Minute
 )
 
 // kube.AutopilotPlanGVR moved to gvr.go — the named GVR registry — same
@@ -151,9 +156,11 @@ func activeAutopilotPlans(ctx context.Context, dyn dynamic.Interface) ([]unstruc
 }
 
 // listLiveMedik8s lists one medik8s remediation GVR and returns only active
-// items (excluding finished NodeMaintenance with status.phase=="Succeeded").
-// An absent CRD returns (nil, nil).
-func listLiveMedik8s(ctx context.Context, dyn dynamic.Interface, gvr schema.GroupVersionResource) ([]unstructured.Unstructured, error) {
+// items (excluding finished NodeMaintenance with status.phase=="Succeeded",
+// and CRs older than medik8sRemediationMaxAge — a stuck remediation must
+// not hold the mutex forever). An absent CRD returns (nil, nil).
+func listLiveMedik8s(ctx context.Context, dyn dynamic.Interface,
+	gvr schema.GroupVersionResource, now time.Time) ([]unstructured.Unstructured, error) {
 	items, err := kube.ListAllUnstructured(ctx, dyn.Resource(gvr),
 		metav1.ListOptions{Limit: kube.DefaultListPageSize})
 	if err != nil {
@@ -171,6 +178,14 @@ func listLiveMedik8s(ctx context.Context, dyn dynamic.Interface, gvr schema.Grou
 			if phase, _ := kube.NestedString(obj.Object, "status", "phase"); phase == "Succeeded" {
 				continue
 			}
+		}
+		// Age cap: a remediation CR older than the horizon is a stuck
+		// record, not a drain in flight — same fail-open direction as
+		// the cordon freshness window (a timestamp-less CR stays live:
+		// unverifiable creation time fails closed).
+		if ts := obj.GetCreationTimestamp(); !ts.IsZero() &&
+			now.Sub(ts.Time) >= medik8sRemediationMaxAge {
+			continue
 		}
 		live = append(live, *obj)
 	}
@@ -214,12 +229,20 @@ func AutopilotPlanEvidence(ctx context.Context, dyn dynamic.Interface) ([]string
 // dynamic client is unverifiable — the mutex never reads "cannot
 // verify" as "clear".
 func Medik8sRemediationEvidence(ctx context.Context, dyn dynamic.Interface) ([]string, error) {
+	return medik8sRemediationEvidence(ctx, dyn, time.Now())
+}
+
+// medik8sRemediationEvidence is Medik8sRemediationEvidence with the
+// clock injected — the verdict path passes its own `now` so the 90m
+// remediation age cap and the verdict memo age on ONE clock.
+func medik8sRemediationEvidence(ctx context.Context, dyn dynamic.Interface,
+	now time.Time) ([]string, error) {
 	if dyn == nil {
 		return nil, errors.New("no dynamic client — medik8s remediation check unverifiable (maintenance mutex)")
 	}
 	var ev []string
 	for _, gvr := range kube.Medik8sRemediationGVRs {
-		items, err := listLiveMedik8s(ctx, dyn, gvr)
+		items, err := listLiveMedik8s(ctx, dyn, gvr, now)
 		if err != nil {
 			return nil, fmt.Errorf("list %s (maintenance mutex): %w", gvr.Resource, err)
 		}
@@ -289,7 +312,7 @@ func maintenanceActive(ctx context.Context, cs kubernetes.Interface,
 		func() ([]string, error) { return nodeCordonEvidence(ctx, cs, nodeReader, now) },
 		func() ([]string, error) { return KuredLockEvidence(ctx, cs) },
 		func() ([]string, error) { return AutopilotPlanEvidence(ctx, dyn) },
-		func() ([]string, error) { return Medik8sRemediationEvidence(ctx, dyn) },
+		func() ([]string, error) { return medik8sRemediationEvidence(ctx, dyn, now) },
 	} {
 		ev, err := signal()
 		if err != nil {

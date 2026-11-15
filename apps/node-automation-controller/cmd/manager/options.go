@@ -73,6 +73,11 @@ func buildCacheOptions(crdSize *kube.CRDSizeTable) cache.Options {
 				Namespaces: map[string]cache.Config{"kube-system": {}},
 			},
 			&corev1.Secret{}: {
+				// fluent-system only — the sole consumer is
+				// fluentbitroller's passiontech-pipeline watch; a
+				// cluster-wide Secret informer would cache every
+				// TLS key and image-pull credential in the fleet.
+				Namespaces: map[string]cache.Config{"fluent-system": {}},
 				Field: fields.SelectorFromSet(
 					fields.Set{"metadata.name": "passiontech-pipeline"}),
 			},
@@ -181,6 +186,12 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 		// whole manager down — controller-runtime recovers per
 		// invocation and surfaces the panic as a reconcile error.
 		Controller: config.Controller{RecoverPanic: ptr.To(true)},
+		// 5s graceful-shutdown budget: on leader loss / signal the
+		// manager gives runnables a short drain window, then
+		// returns — the deployment's pod restart (not an in-place
+		// re-election) is what re-seats leadership, so lingering
+		// goroutines past this only delay the next campaign.
+		GracefulShutdownTimeout: ptr.To(5 * time.Second),
 	}
 	if leaseDuration > 0 {
 		mgrOptions.LeaseDuration = &leaseDuration

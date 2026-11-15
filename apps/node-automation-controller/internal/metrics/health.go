@@ -9,6 +9,10 @@
 package metrics
 
 import (
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -27,10 +31,53 @@ var healthCheckStatus = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Kuberhealthy-compatible check result (status=OK|FAIL) emitted by the in-process prober.",
 }, []string{"check", "namespace", "status"})
 
-var healthCheckSecondsSinceSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "kuberhealthy_check_seconds_since_success",
-	Help: "Seconds since the check last reported OK (kuberhealthy-compatible).",
-}, []string{"check", "namespace"})
+// healthCheckStalenessDesc is the Desc behind the scrape-time
+// staleness collector below — same fqName + label names as the
+// GaugeVec it replaces so the KuberhealthyCheckStale alert and any
+// dashboard keyed on {check,namespace} keep working unchanged.
+var healthCheckStalenessDesc = prometheus.NewDesc(
+	"kuberhealthy_check_seconds_since_success",
+	"Seconds since the check last reported OK (kuberhealthy-compatible).",
+	[]string{"check", "namespace"}, nil)
+
+// lastSuccessAt maps "check\x00namespace" to the wall-clock instant
+// the check last reported OK. ObserveHealthCheck reconstructs it
+// from the caller's secondsSinceSuccess argument — 0 on a pass,
+// now-minus-lastPass on a fail — so the stored instant stays fixed
+// while the reported staleness climbs between calls.
+var (
+	staleMu       sync.Mutex
+	lastSuccessAt = map[string]time.Time{}
+)
+
+// stalenessCollector emits kuberhealthy_check_seconds_since_success
+// computed at SCRAPE time as max(0, now-lastSuccess) rather than a
+// value frozen at the last ObserveHealthCheck call. A check whose
+// sweep stops running entirely — leader failover onto a pod whose
+// roster dropped it, a gated-off module — keeps reporting a growing
+// staleness, which is exactly what KuberhealthyCheckStale alerts
+// on; a frozen gauge would sit at whatever value the last call
+// wrote and could mask the outage.
+type stalenessCollector struct{}
+
+func (stalenessCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- healthCheckStalenessDesc
+}
+
+func (stalenessCollector) Collect(ch chan<- prometheus.Metric) {
+	staleMu.Lock()
+	defer staleMu.Unlock()
+	now := time.Now()
+	for key, last := range lastSuccessAt {
+		check, ns, _ := strings.Cut(key, "\x00")
+		d := now.Sub(last).Seconds()
+		if d < 0 {
+			d = 0 // wall-clock step-back must not emit negative staleness
+		}
+		ch <- prometheus.MustNewConstMetric(healthCheckStalenessDesc,
+			prometheus.GaugeValue, d, check, ns)
+	}
+}
 
 // ControlPlanePodHealsTotal counts control-plane/operator pods deleted
 // by the cluster-health mesh watchdogs — cilium-operator on
@@ -48,7 +95,7 @@ var ControlPlanePodHealsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // healthCollectors lists every vector declared in this file, in
 // declaration order; the single init() below registers the table.
 var healthCollectors = []prometheus.Collector{
-	healthCheckStatus, healthCheckSecondsSinceSuccess,
+	healthCheckStatus, stalenessCollector{},
 	ControlPlanePodHealsTotal,
 }
 
@@ -71,6 +118,9 @@ func ObserveHealthCheck(check string, ok bool, secondsSinceSuccess float64) {
 	}
 	healthCheckStatus.WithLabelValues(check, healthCheckMetricNamespace, "OK").Set(okV)
 	healthCheckStatus.WithLabelValues(check, healthCheckMetricNamespace, "FAIL").Set(failV)
-	healthCheckSecondsSinceSuccess.
-		WithLabelValues(check, healthCheckMetricNamespace).Set(secondsSinceSuccess)
+	staleMu.Lock()
+	lastSuccessAt[check+"\x00"+healthCheckMetricNamespace] =
+		time.Now().Add(-time.Duration(secondsSinceSuccess *
+			float64(time.Second)))
+	staleMu.Unlock()
 }

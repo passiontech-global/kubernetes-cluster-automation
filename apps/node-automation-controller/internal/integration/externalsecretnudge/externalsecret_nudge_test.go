@@ -144,8 +144,11 @@ func setStoreReady(t *testing.T, dyn *fake.FakeDynamicClient, name, ready string
 // nothing.
 func TestExternalSecretNudgeRecoveryTransition(t *testing.T) {
 	old := esObj("apps", "es-stuck", "False", 20*time.Minute)
+	esStoreRef(old, "ClusterSecretStore", "css1")
 	young := esObj("apps", "es-fresh", "False", 5*time.Minute)
+	esStoreRef(young, "ClusterSecretStore", "css1")
 	healthy := esObj("apps", "es-ok", "True", 2*time.Hour)
+	esStoreRef(healthy, "ClusterSecretStore", "css1")
 	dyn := newDynFake(cssObj("css1", "False"), old, young, healthy)
 	n := newNudge(dyn)
 
@@ -186,8 +189,9 @@ func TestExternalSecretNudgeRecoveryTransition(t *testing.T) {
 
 // Rate limit: a second recovery inside the hour must not re-stamp.
 func TestExternalSecretNudgeRateLimit(t *testing.T) {
-	dyn := newDynFake(cssObj("css1", "False"),
-		esObj("apps", "es-stuck", "False", time.Hour))
+	stuck := esObj("apps", "es-stuck", "False", time.Hour)
+	esStoreRef(stuck, "ClusterSecretStore", "css1")
+	dyn := newDynFake(cssObj("css1", "False"), stuck)
 	n := newNudge(dyn)
 
 	if err := n.run(ctx); err != nil { // seed: False
@@ -336,6 +340,7 @@ func TestExternalSecretNudgeReadySinceFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	es.SetCreationTimestamp(metav1.NewTime(time.Now().Add(-time.Hour)))
+	esStoreRef(es, "ClusterSecretStore", "css1")
 	dyn := newDynFake(cssObj("css1", "False"), es)
 	n := newNudge(dyn)
 
@@ -358,16 +363,20 @@ func TestExternalSecretNudgeReadySinceFallback(t *testing.T) {
 func TestExternalSecretNudgeNudgedCooldown(t *testing.T) {
 	now := time.Now()
 	live := esObj("apps", "es-live", "False", 30*time.Minute)
+	esStoreRef(live, "ClusterSecretStore", "css1")
 	live.SetAnnotations(map[string]string{
 		esForceSyncAnno: strconv.FormatInt(now.Add(-10*time.Minute).Unix(), 10),
 	})
 	expired := esObj("apps", "es-expired", "False", 2*time.Hour)
+	esStoreRef(expired, "ClusterSecretStore", "css1")
 	expired.SetAnnotations(map[string]string{
 		esLastNudgeAnno: now.Add(-esNudgeCooldown - time.Minute).UTC().Format(time.RFC3339),
 	})
 	healed := esObj("apps", "es-healed", "True", 3*time.Hour)
+	esStoreRef(healed, "ClusterSecretStore", "css1")
 	dyn := newDynFake(live, expired, healed)
 	n := newNudge(dyn)
+	n.storeReady["ClusterSecretStore//css1"] = true
 	freshStamp := esAnnotation(t, dyn, externalSecretGVRs[0], "apps", "es-live", esForceSyncAnno)
 
 	if err := n.nudge(ctx, true, true); err != nil { // edge path — all stuck ESs eligible
@@ -449,9 +458,11 @@ func TestReadyConditionHelpersEdgeCases(t *testing.T) {
 // delivered nudge, and the absorbed failure still IncErrors once (the
 // run returns nil so the periodic wrapper never sees it).
 func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
-	dyn := newDynFake(
-		esObj("apps", "es-bad", "False", 30*time.Minute),
-		esObj("apps", "es-good", "False", 30*time.Minute))
+	esBad := esObj("apps", "es-bad", "False", 30*time.Minute)
+	esStoreRef(esBad, "ClusterSecretStore", "css1")
+	esGood := esObj("apps", "es-good", "False", 30*time.Minute)
+	esStoreRef(esGood, "ClusterSecretStore", "css1")
+	dyn := newDynFake(esBad, esGood)
 	dyn.PrependReactor("patch", "externalsecrets",
 		func(a ktesting.Action) (bool, runtime.Object, error) {
 			if pa, ok := a.(ktesting.PatchAction); ok && pa.GetName() == "es-bad" {
@@ -460,6 +471,7 @@ func TestExternalSecretNudgePatchErrorTolerated(t *testing.T) {
 			return false, nil, nil
 		})
 	n := newNudge(dyn)
+	n.storeReady["ClusterSecretStore//css1"] = true
 	before := testutil.QueueErrorCount(t, "externalsecret-nudge")
 	if err := n.nudge(ctx, true, true); err != nil {
 		t.Fatalf("per-ES patch failure must not fail the nudge: %v", err)
@@ -850,6 +862,7 @@ func TestExternalSecretEmptyKeyOptOutAndTargetName(t *testing.T) {
 func TestExternalSecretSkeletonSecretDeleted(t *testing.T) {
 	es := esObj("apps", "es-stuck", "False", time.Hour)
 	es.SetUID("es-uid-1")
+	esStoreRef(es, "ClusterSecretStore", "css1")
 	skeleton := esSecret("apps", "es-stuck", nil, &metav1.OwnerReference{
 		APIVersion: "external-secrets.io/v1", Kind: "ExternalSecret",
 		Name: "es-stuck", UID: "es-uid-1",
@@ -866,7 +879,8 @@ func TestExternalSecretSkeletonSecretDeleted(t *testing.T) {
 			return false, nil, nil
 		})
 	n := &externalSecretNudge{queue: "externalsecret-nudge",
-		cs: cs, dyn: dyn, storeReady: map[string]bool{}}
+		cs: cs, dyn: dyn,
+		storeReady: map[string]bool{"ClusterSecretStore//css1": true}}
 	if err := n.nudge(ctx, true, true); err != nil {
 		t.Fatal(err)
 	}
@@ -888,10 +902,13 @@ func TestExternalSecretSkeletonSecretDeleted(t *testing.T) {
 func TestExternalSecretSkeletonSecretKept(t *testing.T) {
 	noOwner := esObj("apps", "es-noowner", "False", time.Hour)
 	noOwner.SetUID("es-uid-2")
+	esStoreRef(noOwner, "ClusterSecretStore", "css1")
 	mismatched := esObj("apps", "es-mismatch", "False", time.Hour)
 	mismatched.SetUID("es-uid-3")
+	esStoreRef(mismatched, "ClusterSecretStore", "css1")
 	withData := esObj("apps", "es-data", "False", time.Hour)
 	withData.SetUID("es-uid-4")
+	esStoreRef(withData, "ClusterSecretStore", "css1")
 	dyn := newDynFake(noOwner, mismatched, withData)
 	cs := kfake.NewSimpleClientset(
 		// Same name, no ownerReferences — could be hand-made: keep.
@@ -910,7 +927,8 @@ func TestExternalSecretSkeletonSecretKept(t *testing.T) {
 			}),
 	)
 	n := &externalSecretNudge{queue: "externalsecret-nudge",
-		cs: cs, dyn: dyn, storeReady: map[string]bool{}}
+		cs: cs, dyn: dyn,
+		storeReady: map[string]bool{"ClusterSecretStore//css1": true}}
 	if err := n.nudge(ctx, true, true); err != nil {
 		t.Fatal(err)
 	}

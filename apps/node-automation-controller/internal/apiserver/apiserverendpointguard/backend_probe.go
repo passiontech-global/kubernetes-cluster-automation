@@ -79,11 +79,16 @@ func (g *apiServerEndpointGuard) probe(ctx context.Context, ip string) apiProbeR
 	if err != nil {
 		return apiProbeResult{err: fmt.Errorf("live rv: %w", err)}
 	}
-	// resourceVersion=0 + no limit: the watch cache rejects Limit
-	// on RV=0 reads anyway, and the cluster-wide lease set is what
-	// keeps cache_rv advancing through a total worker outage.
+	// resourceVersion=0 namespaced to kube-system + limit=1: the
+	// cache read returns ONE lease row instead of serializing the
+	// whole cluster-wide lease table (~360–1,080 probes/hour made
+	// that the guard's dominant apiserver cost). kube-system
+	// leader-election leases renew every ~10s on the control
+	// plane, so cache_rv keeps advancing through a total worker
+	// outage — the property the earlier kube-node-lease pairing
+	// lacked.
 	cacheRV, err := fetchListRV(ctx, client, ip,
-		"/apis/coordination.k8s.io/v1/leases?resourceVersion=0")
+		"/apis/coordination.k8s.io/v1/namespaces/kube-system/leases?limit=1&resourceVersion=0")
 	if err != nil {
 		return apiProbeResult{err: fmt.Errorf("cache rv: %w", err)}
 	}

@@ -213,11 +213,29 @@ func veleroBackupDoneAt(b *unstructured.Unstructured) time.Time {
 // cannot prove is infrequent still gets the stale check.
 func scheduleRunsWeeklyOrMonthly(s *unstructured.Unstructured) bool {
 	cron, _ := kube.NestedString(s.Object, "spec", "schedule")
+	cron = strings.TrimSpace(cron)
+	// Macro cadences: the weekly-or-slower aliases exempt; the
+	// daily-or-faster ones (@hourly/@daily/@reboot) do not.
+	switch cron {
+	case "@weekly", "@monthly", "@yearly", "@annually":
+		return true
+	}
 	f := strings.Fields(cron)
-	if len(f) < 5 {
+	// 5-field cron (min hour dom mon dow) or 6-field with a
+	// leading seconds field (sec min hour dom mon dow) — pick the
+	// day-of-month / day-of-week slots for either shape.
+	var dom, dow string
+	switch len(f) {
+	case 5:
+		dom, dow = f[2], f[4]
+	case 6:
+		dom, dow = f[3], f[5]
+	default:
 		return false
 	}
-	// Standard 5-field cron: min hour dom mon dow — f[2] is
-	// day-of-month, f[4] is day-of-week.
-	return f[2] != "*" || f[4] != "*"
+	// "?" is the Quartz "no specific value" marker — it reads
+	// exactly like "*" for restriction purposes, so a schedule
+	// like "0 0 ? * MON" is still weekly via its day-of-week.
+	restricted := func(v string) bool { return v != "*" && v != "?" }
+	return restricted(dom) || restricted(dow)
 }

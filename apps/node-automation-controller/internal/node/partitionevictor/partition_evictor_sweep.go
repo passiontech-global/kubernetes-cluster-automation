@@ -336,8 +336,9 @@ loop:
 			continue
 		}
 		pods, err := kube.ListAll(ctx, metav1.ListOptions{
-			FieldSelector: "spec.nodeName=" + name,
-			Limit:         kube.DefaultListPageSize,
+			FieldSelector: "spec.nodeName=" + name +
+				",status.phase!=Succeeded,status.phase!=Failed",
+			Limit: kube.DefaultListPageSize,
 		}, kube.Pods(s.e.cs, metav1.NamespaceAll))
 		if err != nil {
 			metrics.IncError(s.e.queue)

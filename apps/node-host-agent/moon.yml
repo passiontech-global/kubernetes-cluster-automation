@@ -41,6 +41,11 @@ tasks:
       - 'ENV.md'
       - 'internal/subsystem/hostconfig/templates/**'
       - 'internal/subsystem/hubsync/testdata/**'
+      # internal/releaseglob tests parse these workflows — a yaml-only
+      # edit must invalidate the test cache or CI skips the drift guard.
+      - '/.github/workflows/ci.yml'
+      - '/.github/workflows/release-app.yml'
+      - '/.github/workflows/release-node-host-agent.yml'
 
   vet:
     inputs:
@@ -132,7 +137,27 @@ tasks:
       for t in $(echo "${TAGS:-latest}" | tr ',' ' '); do
         args="$args -t ${KO_DOCKER_REPO:?KO_DOCKER_REPO unset}:$t"
       done
-      docker build --build-arg "VERSION=${VERSION:-dev}" $args -f "$PWD/Dockerfile" "$PWD/../.."
+      cache_args=""
+      # GHA BuildKit cache needs the Actions cache runtime env —
+      # ACTIONS_RUNTIME_TOKEN + ACTIONS_CACHE_URL/ACTIONS_RESULTS_URL.
+      # GitHub injects those ONLY into JS actions (docker/
+      # build-push-action), never into `run:` shell steps, so the
+      # release pipeline's `moon run $APP:image` sees them absent
+      # and must skip type=gha (an empty ACTIONS_RUNTIME_TOKEN makes
+      # the gha exporter die with "url cannot be empty"). Checking
+      # the vars themselves — not GITHUB_ACTIONS — keeps local runs
+      # and any future env-exporting step correct in both directions.
+      if [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] &&
+         { [ -n "${ACTIONS_CACHE_URL:-}" ] || [ -n "${ACTIONS_RESULTS_URL:-}" ]; }; then
+        # GHA BuildKit cache, scoped per app — release legs never
+        # poison each other's layer cache (ci.yml docker-build
+        # parity).
+        cache_args="--cache-from type=gha,scope=node-host-agent --cache-to type=gha,scope=node-host-agent,mode=max"
+      fi
+      # --load: buildx's container driver (release-app.yml sets up
+      # buildx) does not auto-load; the local docker driver ignores
+      # the flag harmlessly. image-push needs the tag in the daemon.
+      docker buildx build --load $cache_args --build-arg "VERSION=${VERSION:-dev}" $args -f "$PWD/Dockerfile" "$PWD/../.."
     toolchains: 'system'
     inputs:
       - 'cmd/**/*.go'

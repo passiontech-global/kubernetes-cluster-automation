@@ -427,9 +427,13 @@ func TestWebhookGuardListsClusterStateOncePerRun(t *testing.T) {
 		"namespaces":                      1,
 		"mutatingwebhookconfigurations":   1,
 		"validatingwebhookconfigurations": 1,
-		"endpointslices":                  1,
+		"endpointslices":                  0, // no webhook backends → targeted census skips the list
 		"pods":                            1,
-		"services":                        1,
+		// Services are no longer a cluster-wide LIST — the snapshot
+		// GETs exactly the webhook/CRD-conversion backends
+		// (webhookBackendServices' key set); this fixture declares
+		// none, so neither a list nor a get fires.
+		"services": 0,
 		// endpoint-census — the node census feeds the effective-ready math.
 		"nodes": 1,
 	} {

@@ -107,6 +107,28 @@ func TestK0sChildLabelFallbacks(t *testing.T) {
 	}
 }
 
+// TestK0sChildLabelDStateSkipsCmdline — a D/Z-state child's cmdline
+// sits behind mm->mmap_lock: the label must resolve via comm
+// instead of wedging the collect on the read.
+func TestK0sChildLabelDStateSkipsCmdline(t *testing.T) {
+	dir := t.TempDir()
+	for _, state := range []string{"D", "Z"} {
+		p := filepath.Join(dir, state)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// cmdline would label it kube-apiserver; comm says etcd —
+		// the D/Z gate must skip cmdline and answer via comm.
+		testutil.WriteFile(t, filepath.Join(p, "cmdline"), "/x/kube-apiserver\x00")
+		testutil.WriteFile(t, filepath.Join(p, "comm"), "etcd\n")
+		testutil.WriteFile(t, filepath.Join(p, "stat"),
+			"1 ("+state+") "+state+" 0 0 0")
+		if got := k0sChildLabel(p); got != "etcd" {
+			t.Fatalf("%s-state label=%q want comm fallback etcd", state, got)
+		}
+	}
+}
+
 // TestProcVMRSSMalformed: a status without a VmRSS line, a bare
 // "VmRSS:" header and a non-numeric size are all unparseable —
 // never a silent 0.

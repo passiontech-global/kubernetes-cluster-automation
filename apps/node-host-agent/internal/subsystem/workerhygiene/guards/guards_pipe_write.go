@@ -73,18 +73,20 @@ func (c *PipeWriteCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	podByUID := e.PodByUID()
 	blocked := map[pipeWriteKey]bool{}
 	for _, pid := range e.PidsOnce() {
-		uid := podUIDForPID(c.d, pid)
-		if uid == "unknown" {
-			continue // host process, shim, kubelet — outside pod cgroups
-		}
 		// TASK_INTERRUPTIBLE is the frozen writer's state — a
 		// full pipe parks write(2) on an interruptible wait, so
 		// state "D" (the DstateCheck signal) never appears.
+		// Cheap snapshot checks first: the cgroup read below runs
+		// only for pids already parked in pipe_write.
 		if _, state, ok := procStatCommState(e, c.d, pid); !ok || state != "S" {
 			continue
 		}
 		if procWchan(c.d, pid) != "pipe_write" {
 			continue
+		}
+		uid := podUIDForPID(c.d, pid)
+		if uid == "unknown" {
+			continue // host process, shim, kubelet — outside pod cgroups
 		}
 		st, ok := statFor(e, c.d, pid)
 		key := pipeWriteKey{uid: uid, pid: pid, start: procStartTime(st, ok)}

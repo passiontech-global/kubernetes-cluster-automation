@@ -55,16 +55,15 @@ func NewBudget(max int, window time.Duration) *Budget {
 	return &Budget{max: max, window: window}
 }
 
-// trimWindow drops timestamps at or before cut from an ascending slice.
+// trimWindow drops every timestamp NOT after cut. slices.DeleteFunc
+// scans the whole slice rather than assuming ascending order — grant
+// `now` values arrive from different modules' clocks, so an
+// out-of-order stamp used to survive IndexFunc's first-After cutoff
+// and keep an expired grant counted against the window.
 func trimWindow(stamps []time.Time, cut time.Time) []time.Time {
-	if i := slices.IndexFunc(stamps, func(t time.Time) bool {
-		return t.After(cut)
-	}); i > 0 {
-		return append([]time.Time{}, stamps[i:]...)
-	} else if i < 0 {
-		return stamps[:0]
-	}
-	return stamps
+	return slices.DeleteFunc(stamps, func(t time.Time) bool {
+		return !t.After(cut)
+	})
 }
 
 // Allow consumes a grant at now and reports whether the budget had

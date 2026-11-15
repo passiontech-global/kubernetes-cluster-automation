@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/crypto/ssh"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/sshclient"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
@@ -68,7 +66,7 @@ func tmpPath(p, suffix string) string {
 // TOFU known_hosts (<stateDir>/hubsync_known_hosts); "" disables
 // TOFU. The operator known_hosts is the file next to the converge
 // key (/etc/node-converge-ssh/known_hosts by default).
-func newSSHDialer(keyPath string, port int, timeout time.Duration,
+func newSSHDialer(keyPath string, port int, timeout, opTimeout time.Duration,
 	hostKeySpec string, allowInsecureHostKey bool, stateDir string,
 	log *slog.Logger) (*sshDialer, error) {
 	if log == nil {
@@ -87,6 +85,7 @@ func newSSHDialer(keyPath string, port int, timeout time.Duration,
 			// hubsync audit-logs every accepted host key — Log set.
 			Log: log,
 		},
+		opTimeout: opTimeout,
 		policy: newHostKeyPolicy(hostKeySpec, knownHosts, tofu,
 			port, allowInsecureHostKey, log),
 		log: log,
@@ -123,7 +122,7 @@ func (d *sshDialer) Dial(ctx context.Context, t Target) (Conn, error) {
 		return nil, err
 	}
 	return &sshConn{link: link, sudo: needsSudo(t.SSHUser),
-		timeout: cfg.Timeout, log: d.log,
+		timeout: cfg.Timeout, opTimeout: d.opTimeout, log: d.log,
 		nonce: nextStageNonce()}, nil
 }
 
@@ -211,10 +210,14 @@ func needsSudo(user string) bool { return user != "" && user != "root" }
 // converge-specific parts that stayed.
 type sshConn struct {
 	link    *sshclient.Link
-	sudo    bool // non-root SSH user → wrap ops in sudo -n
-	timeout time.Duration
-	log     *slog.Logger
-	nonce   string // per-dial staging suffix (StageSuffix)
+	sudo    bool          // non-root SSH user → wrap ops in sudo -n
+	timeout time.Duration // dial/handshake/channel-open budget
+	// opTimeout caps one session body's absolute lifetime
+	// (TargetTimeout); the body itself rides a sliding idle
+	// deadline re-armed per written chunk (streamCmd).
+	opTimeout time.Duration
+	log       *slog.Logger
+	nonce     string // per-dial staging suffix (StageSuffix)
 }
 
 func (c *sshConn) Close() error { return c.link.Close() }
@@ -222,10 +225,6 @@ func (c *sshConn) Close() error { return c.link.Close() }
 // StageSuffix returns this dial's staging nonce — putAtomic appends
 // it to the tmp path so concurrent runs never share a staging inode.
 func (c *sshConn) StageSuffix() string { return c.nonce }
-
-func (c *sshConn) newSession(ctx context.Context) (*ssh.Session, func(), error) {
-	return c.link.NewSession(ctx, c.log, c.timeout)
-}
 
 func (c *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	if c.sudo {
@@ -297,14 +296,42 @@ func (c *sshConn) PutAtomic(ctx context.Context, remotePath string,
 	return nil
 }
 
+// deadlineWriter re-arms the conn's idle deadline after every
+// successful write — the sliding bound streamCmd's upload rides.
+type deadlineWriter struct {
+	w   io.Writer
+	arm func()
+}
+
+func (d *deadlineWriter) Write(p []byte) (int, error) {
+	n, err := d.w.Write(p)
+	if n > 0 {
+		d.arm()
+	}
+	return n, err
+}
+
 // streamCmd runs cmd on one session with r piped to its stdin —
-// the shared body of Write and PutAtomic.
+// the shared body of Write and PutAtomic. The channel OPEN stays
+// on the dial budget (timeout); the BODY rides a sliding idle
+// deadline instead of the old fixed min(timeout, ctx) bound that
+// killed any upload slower than the 15s dial budget: each
+// successful stdin write re-arms SetDeadline(now+idle), capped at
+// the ctx deadline (the per-target TargetTimeout) or
+// now+opTimeout. A slow-but-progressing WAN upload of the ~15MiB
+// binary survives to the target budget; a blackholed transport
+// still dies on the first idle quantum, and ctx cancel + link
+// Close remain the hard stop. Bastion note: DeadlineConn() is the
+// jump's shared TCP conn — deadlines stay ≤ one idle quantum and
+// clear on return, and the converge loop serializes targets, so no
+// long deadline is ever parked on it for other channels.
 func (c *sshConn) streamCmd(ctx context.Context, cmd string, r io.Reader) error {
-	sess, unbind, err := c.newSession(ctx)
+	clear := sshclient.BoundOp(ctx, c.log, c.link.DeadlineConn(), c.timeout)
+	sess, err := c.link.Client.NewSession()
+	clear()
 	if err != nil {
 		return err
 	}
-	defer unbind()
 	defer func() { _ = sess.Close() }()
 	stdin, err := sess.StdinPipe()
 	if err != nil {
@@ -313,14 +340,38 @@ func (c *sshConn) streamCmd(ctx context.Context, cmd string, r io.Reader) error 
 	if err := sess.Start(cmd); err != nil {
 		return err
 	}
+	dc := c.link.DeadlineConn()
+	var capDL time.Time
+	if c.opTimeout > 0 {
+		capDL = time.Now().Add(c.opTimeout)
+	}
+	if cdl, ok := ctx.Deadline(); ok && (capDL.IsZero() || cdl.Before(capDL)) {
+		capDL = cdl
+	}
+	idle := c.timeout
+	if idle <= 0 {
+		idle = 15 * time.Second
+	}
+	arm := func() {
+		dl := time.Now().Add(idle)
+		if !capDL.IsZero() && capDL.Before(dl) {
+			dl = capDL
+		}
+		_ = dc.SetDeadline(dl)
+	}
+	arm()
+	defer func() { _ = dc.SetDeadline(time.Time{}) }()
 	done := make(chan error, 1)
 	go func() {
-		_, cerr := io.Copy(stdin, r)
+		_, cerr := io.Copy(&deadlineWriter{w: stdin, arm: arm}, r)
 		_ = stdin.Close()
 		if cerr != nil {
 			done <- cerr
 			return
 		}
+		// Re-arm once for the remote tail (chmod/sync/mv after the
+		// last stdin byte) — same idle quantum, still under capDL.
+		arm()
 		done <- sess.Wait()
 	}()
 	select {

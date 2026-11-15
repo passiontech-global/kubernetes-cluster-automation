@@ -10,7 +10,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
@@ -44,9 +46,18 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		return
 	}
 
+	// Serialize the whole heavy window (reindex → freeze → sizes →
+	// urgent reindex → repack) against the compact guard's
+	// advisory-locked session — MaintMu is the local half; the pg
+	// advisory lock (and the repack hold session) stays the
+	// cross-session arbiter.
+	m.d.MaintMu.Lock()
+	defer m.d.MaintMu.Unlock()
+
 	stampEpoch = m.runHeavyReindexAndFreeze(ctx, pg, user, pass, freeze, res, note)
 
 	// (c) sizes + dead-tuple estimate from pg_stat_user_tables.
+	cycle.Heartbeat(ctx) // step boundary between the heavy script and the size census
 	m.readSizes(ctx, pg, user, pass, res, note)
 	if !res.statsOK {
 		res.okRepack = false
@@ -54,6 +65,7 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 		return
 	}
 	m.urgentReindex(ctx, pg, user, pass, res, note)
+	cycle.Heartbeat(ctx) // step boundary before the repack gate
 
 	// (d) pg_repack ONLY when the heap is genuinely bloated.
 	m.runRepackIfBloated(ctx, pg, user, pass, res, note)
@@ -67,7 +79,7 @@ func (m *Maint) runHeavyReindexAndFreeze(
 	note func(string),
 ) (stampEpoch bool) {
 	t0 := m.d.Cfg.Clock.Now()
-	sout, serr := m.d.PsqlScript(ctx, pg, user, pass,
+	sout, serr := m.d.PsqlScript(ctx, pg, user, pass, kdeps.AppNameMaint,
 		m.buildHeavyScript(freeze))
 	if serr != nil && m.d.LongBudgetExceeded(t0, serr) {
 		m.reapOrphanedMaint(ctx, pg, user, pass, note)
@@ -119,13 +131,13 @@ func (m *Maint) runRepackIfBloated(
 		logger().Warn("kinedb: pg_repack skipped — insufficient disk headroom, VACUUM only",
 			"free", free, "heap", res.heapBytes, "wal", wal)
 		res.repackState = "skipped-headroom"
-		if _, err := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass), m.d.PsqlMaintArgs(pg, user, false,
+		if _, err := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass, kdeps.AppNameMaint), m.d.PsqlMaintArgs(pg, user, false,
 			"-qc", "VACUUM (ANALYZE) "+kdeps.SQLIdent(m.d.Cfg.Table)), ""); err != nil {
 			note(fmt.Sprintf("fallback-vacuum-fail: %v", err))
 		}
 		return
 	}
-	if pout, perr := m.d.PsqlScript(ctx, pg, user, pass, m.buildLockProbe()); perr != nil {
+	if pout, perr := m.d.PsqlScript(ctx, pg, user, pass, kdeps.AppNameMaint, m.buildLockProbe()); perr != nil {
 		note(fmt.Sprintf("repack-lock-probe-fail: %v", perr))
 	} else if strings.Contains(pout, kdeps.LockBusyMarker) {
 		res.repackState = "skipped-lock-busy"
@@ -144,15 +156,35 @@ func (m *Maint) runRepackIfBloated(
 			"repack-needed-no-binary (heap=%dB dead=%d%%)", res.heapBytes, res.deadPct))
 		return
 	}
-	if _, err := m.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass), m.d.PsqlArgs(pg, user, false,
+	if _, err := m.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass, kdeps.AppNameMaint), m.d.PsqlArgs(pg, user, false,
 		"-qc", "CREATE EXTENSION IF NOT EXISTS pg_repack"), ""); err != nil {
 		res.okRepack = false
 		res.repackState = "fail"
 		note(fmt.Sprintf("repack-ext-fail: %v", err))
 		return
 	}
+	// pg_repack is a separate binary — it cannot carry the advisory
+	// lock inside a psql script, so a dedicated session holds
+	// pg_advisory_lock(20260921) for the whole repack window. The
+	// probe above already proved the lock free; a hold failure here
+	// means the compact guard won the race in between — skip rather
+	// than run unguarded alongside it.
+	release, held, herr := m.d.HoldAdvisoryLock(ctx, pg, user, pass,
+		kdeps.AppNameMaint, 30*time.Second)
+	if herr != nil {
+		res.okRepack = false
+		res.repackState = "fail"
+		note(fmt.Sprintf("repack-lock-hold-fail: %v", herr))
+		return
+	}
+	if !held {
+		res.repackState = "skipped-lock-busy"
+		note("repack skipped: advisory lock taken between probe and hold")
+		return
+	}
+	defer release()
 	rt0 := m.d.Cfg.Clock.Now()
-	if _, err := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass), []string{m.d.Cfg.Runtime, "exec",
+	if _, err := m.d.ExecLongEnv(ctx, m.d.PsqlMaintEnv(pass, kdeps.AppNameMaint), []string{m.d.Cfg.Runtime, "exec",
 		"-e", "PGPASSWORD", "-e", "PGOPTIONS", pg, repackBin,
 		"-h", "127.0.0.1", "-U", user, "-d", "postgres",
 		"-t", "public." + m.d.Cfg.Table,
@@ -182,11 +214,19 @@ func (m *Maint) runRepackIfBloated(
 // (CREATE EXTENSION IF NOT EXISTS) anyway.
 func (m *Maint) dropRepackLeftovers(ctx context.Context, pg, user, pass string,
 	note func(string)) {
+	// Orphan repack schema: a killed pg_repack can leave the
+	// `repack` schema (log/table shadow objects) behind even after
+	// DROP EXTENSION CASCADE — drop it too, but ONLY when no
+	// pg_repack backend is live (a concurrent repack on another
+	// table owns that schema legitimately).
 	script := "SET lock_timeout = '5s';\n" +
-		"DROP EXTENSION IF EXISTS pg_repack CASCADE;"
-	if _, err := m.d.PsqlScript(ctx, pg, user, pass, script); err != nil {
+		"DROP EXTENSION IF EXISTS pg_repack CASCADE;\n" +
+		"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_stat_activity " +
+		"WHERE application_name = 'pg_repack' AND pid <> pg_backend_pid()) " +
+		"THEN EXECUTE 'DROP SCHEMA IF EXISTS repack CASCADE'; END IF; END $$;"
+	if _, err := m.d.PsqlScript(ctx, pg, user, pass, kdeps.AppNameMaint, script); err != nil {
 		note(fmt.Sprintf("repack-leftover-cleanup-fail: %v", err))
 		return
 	}
-	note("repack leftovers cleared (DROP EXTENSION pg_repack CASCADE)")
+	note("repack leftovers cleared (DROP EXTENSION pg_repack CASCADE + orphan repack schema)")
 }

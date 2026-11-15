@@ -32,6 +32,11 @@ type coreDNSUpstreamCheck struct {
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
 	emitted state.GaugeLedger[string]
+	// seen is the PromQL-path first-seen ledger — an upstream
+	// failure signature must persist coreDNSUpstreamMinAge before
+	// the isolated-failure heal fires, same posture the readiness
+	// fallback gets from its 10m unready window.
+	seen state.FirstSeenLedger
 }
 
 // newCoreDNSUpstreamCheck builds the coredns-upstream check — its only state
@@ -47,6 +52,9 @@ const (
 	// coredns-upstream — coredns-upstream knobs.
 	coreDNSUpstreamHealCool = 30 * time.Minute
 	coreDNSFallbackMinAge   = 10 * time.Minute
+	// coreDNSUpstreamMinAge is the PromQL-path persistence window —
+	// a single-sweep upstream blip must not delete a DNS pod.
+	coreDNSUpstreamMinAge = 10 * time.Minute
 )
 
 var (
@@ -185,14 +193,35 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 		// still honors the window; the ledger stamp going from
 		// missing/stale to `now` is how a DELIVERED delete reads
 		// (DeletePodHeal swallows cooldown/mutex/delete failures).
-		if pod != nil && !healed && hasHealthySibling(pod, dnsByNS[ns], flagged) {
+		if pod != nil && !healed && hasHealthySibling(pod, dnsByNS[ns], flagged) &&
+			probefw.Persisted(&p.seen, key, now, coreDNSUpstreamMinAge, log) {
 			target := kube.PodControllerKey(pod)
 			hk := probefw.SelfHealKey(CheckNameCoreDNSUpstream, target)
 			before, _ := p.Heals.Last(hk)
-			p.DeletePodHeal(ctx, log, CheckNameCoreDNSUpstream,
+			p.DeletePodHealScoped(ctx, log, CheckNameCoreDNSUpstream,
 				target, pod, coreDNSUpstreamHealCool, now)
 			if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
 				healed = true
+			}
+		}
+	}
+	// Drop first-seen entries whose signature cleared — "persisted"
+	// means continuously flagged, so a clean sweep re-arms the
+	// window. A degraded query family cannot prove quiet: skip the
+	// prune entirely so a Prometheus flap cannot reset persistence
+	// for pods the failed query alone was flagging.
+	if errH == nil && errS == nil {
+		p.seen.Prune(func(k string) bool { _, ok := flagged[k]; return ok })
+	} else {
+		// Carry held series the surviving query did not re-flag —
+		// otherwise reconcile deletes gauges the failed family
+		// alone was backing. Find accompanies every Carry: a held
+		// series is still a live finding, and without it the check
+		// would report Pass while the gauge stays 1.
+		for k, lv := range p.emitted.Last() {
+			if _, ok := flagged[k]; !ok {
+				rep.Carry(k, lv)
+				rep.Find(k)
 			}
 		}
 	}
@@ -207,8 +236,16 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 // absorb traffic).
 func hasHealthySibling(pod *corev1.Pod, siblings []*corev1.Pod,
 	flagged map[string]string) bool {
+	// The sibling must be a replica of the SAME controller — a
+	// Ready node-local-dns pod is no proof a wedged coredns member
+	// can be replaced safely, and two standalone dns pods share no
+	// controller key at all.
+	want := kube.PodControllerKey(pod)
 	for _, s := range siblings {
 		if s.Name == pod.Name {
+			continue
+		}
+		if kube.PodControllerKey(s) != want {
 			continue
 		}
 		if _, bad := flagged[s.Namespace+"/"+s.Name]; bad {
@@ -275,13 +312,24 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 			target := kube.PodControllerKey(pod)
 			hk := probefw.SelfHealKey(CheckNameCoreDNSUpstream, target)
 			before, _ := p.Heals.Last(hk)
-			p.DeletePodHeal(ctx, log, CheckNameCoreDNSUpstream,
+			p.DeletePodHealScoped(ctx, log, CheckNameCoreDNSUpstream,
 				target, pod, coreDNSUpstreamHealCool, now)
 			if stamp, ok := p.Heals.Last(hk); ok && stamp.After(before) {
 				healed = true
 			}
 		}
 		rep.Find(key + "(" + detail + ")")
+	}
+	// Prometheus was unreachable — the readiness scan can only
+	// re-flag the unready subset. Carry every held series it did
+	// not re-flag, or reconcile would read the outage as recovery
+	// and prune live alerts (same contract as the degraded-family
+	// carry above).
+	for k, lv := range p.emitted.Last() {
+		if _, ok := flagged[k]; !ok {
+			rep.Carry(k, lv)
+			rep.Find(k)
+		}
 	}
 	return rep.Result(&p.emitted, coreDNSUpstreamFailingGauge.DeleteLabelValues,
 		"coredns/node-local-dns unready pods (prometheus fallback): ", ", ")

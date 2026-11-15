@@ -28,6 +28,7 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 | `NODE_AUTOMATION_KUBE_CLIENT_TIMEOUT` | manager | `30s` | Per-request timeout on the direct (uncached) typed/dynamic clients the sweep loops use — bounds a hung apiserver call. NOT applied to the manager's client, where it would cut informer watch streams. |
 | `NODE_AUTOMATION_PROBE_CLIENT_QPS` | manager | `20` | client-go QPS on the SECOND rest.Config built for the latency-sensitive probe modules (apiserver-endpoint-guard, kubelet-liveness-reaper, dead-node-sweeper — the `Module.ProbeClients` registry rows): their own token bucket, so janitor delete bursts draining the shared `NODE_AUTOMATION_KUBE_CLIENT_*` bucket cannot queue-delay a probe verdict mid-incident. |
 | `NODE_AUTOMATION_PROBE_CLIENT_BURST` | manager | `40` | client-go burst paired with the probe QPS knob above; shares the per-request timeout inherited from the direct clients. |
+| `POD_NAME` | manager (leader election) | downward-API pod name | Preferred prefix for the leader-election `HolderIdentity` (`<pod>_<uuid>`) over `os.Hostname()` — `spec.hostname` can differ from `metadata.name`, and the lease preemptor parses the pod name back out of the holder identity, so a mismatched hostname would make a live leader read as `pod_missing`. Not a `NODE_AUTOMATION_*` knob — the standard Kubernetes downward-API variable. |
 
 ## Global heal budget
 

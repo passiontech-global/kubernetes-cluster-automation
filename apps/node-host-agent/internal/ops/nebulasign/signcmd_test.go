@@ -193,7 +193,7 @@ func TestNebulaSignErrorPaths(t *testing.T) {
 // dial both error without touching a real host.
 func TestSSHFetchHostPub(t *testing.T) {
 	if _, err := sshFetchHostPub(context.Background(),
-		signJob{Name: "n"}, "interdc", "/tmp/key"); err == nil ||
+		signJob{Name: "n"}, "interdc", "/tmp/key", true); err == nil ||
 		!strings.Contains(err.Error(), "no ip in registry") {
 		t.Fatalf("no-ip err=%v", err)
 	}
@@ -202,7 +202,7 @@ func TestSSHFetchHostPub(t *testing.T) {
 	// Dial honours the ctx budget — a cancelled ctx errors before any
 	// packet goes out.
 	if _, err := sshFetchHostPub(ctx,
-		signJob{Name: "n", IP: "127.0.0.1"}, "interdc", "/tmp/key"); err == nil {
+		signJob{Name: "n", IP: "127.0.0.1"}, "interdc", "/tmp/key", true); err == nil {
 		t.Fatal("cancelled dial want error")
 	}
 }

@@ -8,10 +8,12 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -393,22 +395,22 @@ func TestKernelShimHelpers(t *testing.T) {
 		"/usr/bin/containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00task7", "")
 	wdepstest.WriteFile(t, filepath.Join(d.Cfg.ProcRoot, "700", "comm"),
 		"containerd-shim\n")
-	if !isContainerdShim(d, 700) {
+	if !isContainerdShim(d, nil, 700) {
 		t.Fatal("shim comm + matching argv[0] must classify as shim")
 	}
 	wdepstest.WriteFile(t, filepath.Join(d.Cfg.ProcRoot, "700", "comm"),
 		"containerd-shim-runc-v2\n")
-	if !isContainerdShim(d, 700) {
+	if !isContainerdShim(d, nil, 700) {
 		t.Fatal("full shim comm must also classify")
 	}
 	// A pod process carrying the string in its argv is NOT a shim.
 	f.MkProc(t, 701, "S", "pod-containerd-shim-runc-v2-simulator", "")
 	wdepstest.WriteFile(t, filepath.Join(d.Cfg.ProcRoot, "701", "comm"),
 		"fakeproc\n")
-	if isContainerdShim(d, 701) {
+	if isContainerdShim(d, nil, 701) {
 		t.Fatal("wrong comm must not classify")
 	}
-	if isContainerdShim(d, 702) {
+	if isContainerdShim(d, nil, 702) {
 		t.Fatal("missing proc must not classify")
 	}
 
@@ -743,7 +745,10 @@ func TestRunTmpfsOpenFDSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := NewRunTmpfs(d)
-	set := c.runTmpfsOpenFDs()
+	set, ok := c.runTmpfsOpenFDs()
+	if !ok {
+		t.Fatal("open-fd census reported failure on a readable proc root")
+	}
 	if set == nil {
 		t.Fatal("open-fd set is nil on a readable proc root")
 	}
@@ -761,14 +766,121 @@ func TestRunTmpfsOpenFDSet(t *testing.T) {
 	if runTmpfsFDHeld(ofi, set) {
 		t.Fatal("unheld file reported as fd-held")
 	}
-	// A nil set (proc pass failed) fails open for every candidate.
+	// A nil set can't prove held — production aborts the sweep
+	// before this point now (ok=false fails closed); the helper
+	// itself stays fail-open for uncomparable stats.
 	if runTmpfsFDHeld(hfi, nil) {
 		t.Fatal("nil set must fail open")
 	}
 	// No pid dirs at all → empty non-nil set, still fail-open reads.
 	empty := procfs.New(t.TempDir())
 	d.Proc = empty
-	if got := c.runTmpfsOpenFDs(); got == nil || len(got) != 0 {
-		t.Fatalf("empty proc root set=%v want empty non-nil", got)
+	got, ok := c.runTmpfsOpenFDs()
+	if !ok || got == nil || len(got) != 0 {
+		t.Fatalf("empty proc root set=%v ok=%v want empty non-nil ok", got, ok)
+	}
+	// A missing proc root → the census cannot run → ok=false, and
+	// the sweep must fail CLOSED (remove nothing) rather than
+	// delete .tmp files it cannot prove are orphaned.
+	d.Proc = procfs.New(filepath.Join(t.TempDir(), "missing-proc"))
+	if _, ok := c.runTmpfsOpenFDs(); ok {
+		t.Fatal("unreadable proc root must report census failure")
+	}
+}
+
+// --- run_tmpfs.go: mount boundary + fail-closed fd census ---
+
+// statFI is a minimal os.FileInfo whose Sys() returns a canned
+// value — enough to drive runTmpfsForeignDev's st_dev compare
+// without a real foreign mount.
+type statFI struct{ sys any }
+
+func (s statFI) Name() string       { return "d" }
+func (s statFI) Size() int64        { return 0 }
+func (s statFI) Mode() fs.FileMode  { return fs.ModeDir }
+func (s statFI) ModTime() time.Time { return time.Time{} }
+func (s statFI) IsDir() bool        { return true }
+func (s statFI) Sys() any           { return s.sys }
+
+// runTmpfsForeignDev is the find -xdev predicate: a walked dir on a
+// different st_dev than the walk root is pruned outright.
+func TestRunTmpfsForeignDev(t *testing.T) {
+	same := statFI{sys: &syscall.Stat_t{Dev: 42}}
+	if runTmpfsForeignDev(same, 42, true) {
+		t.Fatal("same-st_dev dir reported foreign")
+	}
+	if !runTmpfsForeignDev(statFI{sys: &syscall.Stat_t{Dev: 43}}, 42, true) {
+		t.Fatal("different-st_dev dir not reported foreign")
+	}
+	// Unknown root dev or uncomparable stat → never foreign: the
+	// sweep degrades to the pre-boundary walk, never prunes blind.
+	if runTmpfsForeignDev(statFI{sys: &syscall.Stat_t{Dev: 43}}, 42, false) {
+		t.Fatal("unknown root dev must not mark foreign")
+	}
+	if runTmpfsForeignDev(statFI{sys: "junk"}, 42, true) {
+		t.Fatal("uncomparable stat must not mark foreign")
+	}
+}
+
+// TestRunTmpfsSweepFailsClosedOnProcError — when the /proc/*/fd
+// census cannot run, the .tmp sweep must remove NOTHING: deleting
+// blind could unlink a live spool file. Regression for the old
+// nil-map fail-open.
+func TestRunTmpfsSweepFailsClosedOnProcError(t *testing.T) {
+	d, f := rtDeps(t)
+	runDir := t.TempDir()
+	d.Cfg.Disk.HostRunDir = runDir
+	f.DiskUsed = 0.85 // above the 0.80 sweep trigger
+	stale := filepath.Join(runDir, "spool.tmp")
+	wdepstest.WriteFile(t, stale, "data")
+	past := f.Now.Add(-3 * time.Hour)
+	if err := os.Chtimes(stale, past, past); err != nil {
+		t.Fatal(err)
+	}
+	d.Proc = procfs.New(filepath.Join(t.TempDir(), "missing-proc"))
+	NewRunTmpfs(d).runTmpfsGuard(context.Background())
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("fail-closed sweep removed .tmp despite failed fd census: %v", err)
+	}
+}
+
+// TestRunTmpfsSweepSkipsForeignMount — the /run sweep must prune
+// directories on a different st_dev (bind-mounted container rootfs
+// trees under /run): find -xdev semantics. A stale .tmp inside the
+// foreign mount survives while a same-fs orphan is still removed.
+// Needs CAP_SYS_ADMIN for the tmpfs mount — skips unprivileged.
+func TestRunTmpfsSweepSkipsForeignMount(t *testing.T) {
+	d, f := rtDeps(t)
+	runDir := t.TempDir()
+	d.Cfg.Disk.HostRunDir = runDir
+	f.DiskUsed = 0.85
+	foreign := filepath.Join(runDir, "k0s", "pods", "abc", "rootfs")
+	if err := os.MkdirAll(foreign, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount("tmpfs", foreign, "tmpfs", 0, "size=4m"); err != nil {
+		t.Skipf("tmpfs mount needs CAP_SYS_ADMIN: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(foreign, unix.MNT_DETACH) })
+	appDir := filepath.Join(foreign, "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inside := filepath.Join(appDir, "spool.tmp")
+	outside := filepath.Join(runDir, "orphan.tmp")
+	wdepstest.WriteFile(t, inside, "pod data")
+	wdepstest.WriteFile(t, outside, "host orphan")
+	past := f.Now.Add(-3 * time.Hour)
+	for _, p := range []string{inside, outside} {
+		if err := os.Chtimes(p, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+	NewRunTmpfs(d).runTmpfsGuard(context.Background())
+	if _, err := os.Stat(inside); err != nil {
+		t.Fatalf("foreign-mount .tmp swept across the st_dev boundary: %v", err)
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatal("same-fs orphan .tmp not removed")
 	}
 }

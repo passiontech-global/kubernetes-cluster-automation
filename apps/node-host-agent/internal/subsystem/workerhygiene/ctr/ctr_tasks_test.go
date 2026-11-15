@@ -129,6 +129,9 @@ func TestCtrTasksMissingLogJSONKillsInit(t *testing.T) {
 	wdepstest.WriteFile(t, filepath.Join(dir, "config.json"), `{"annotations":{}}`)
 	// No log.json + LIVE init on a container task → dead wedge.
 	e.MkProc(t, 9102, "S", "", "")
+	// The init-kill identity check requires a pod cgroup.
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "9102", "cgroup"),
+		"0::/kubepods.slice/kubepods-burstable.slice/pod.slice/cri-containerd-9102.scope\n")
 	e.H.Cycle(context.Background()) // marker
 	e.Now = e.Now.Add(6 * time.Minute)
 	e.H.Cycle(context.Background()) // confirm + clean

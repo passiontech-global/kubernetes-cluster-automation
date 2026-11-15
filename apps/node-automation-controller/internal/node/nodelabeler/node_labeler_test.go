@@ -64,7 +64,7 @@ func TestNodeLabelerWorkerRoleVariants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RequeueAfter != 30*time.Minute {
+	if res.RequeueAfter < 27*time.Minute || res.RequeueAfter >= 33*time.Minute {
 		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
 	}
 
@@ -92,7 +92,7 @@ func TestNodeLabelerMissingConfigFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RequeueAfter != 30*time.Minute {
+	if res.RequeueAfter < 27*time.Minute || res.RequeueAfter >= 33*time.Minute {
 		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
 	}
 	if _, ok := testutil.GetNode(t, cs, "w1").Labels[workerRoleLabel]; !ok {
@@ -111,7 +111,7 @@ func TestNodeLabelerEmptyConfigFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RequeueAfter != 30*time.Minute {
+	if res.RequeueAfter < 27*time.Minute || res.RequeueAfter >= 33*time.Minute {
 		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
 	}
 	if _, ok := testutil.GetNode(t, cs, "w1").Labels[workerRoleLabel]; !ok {
@@ -151,7 +151,7 @@ key-without-equals-sign-and-no-nodes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RequeueAfter != 30*time.Minute {
+	if res.RequeueAfter < 27*time.Minute || res.RequeueAfter >= 33*time.Minute {
 		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
 	}
 

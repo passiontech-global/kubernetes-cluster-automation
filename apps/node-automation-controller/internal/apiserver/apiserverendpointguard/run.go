@@ -96,7 +96,7 @@ func (g *apiServerEndpointGuard) run(ctx context.Context) error {
 	reconcilerDriven := primary != nil && !mirrorManagedSlice(primary)
 	var peerIPs map[string]bool
 	if len(quarantinedIPs) > 0 && !reconcilerDriven {
-		peerIPs = g.ssotPeerIPs(ctx)
+		peerIPs = g.ssotPeerIPs(ctx, activeIPs)
 	}
 
 	toRemove, toAdd, healthyActive := g.decideQuarantine(log, results,

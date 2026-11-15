@@ -357,14 +357,6 @@ func (u *helmReleaseUnlocker) unwedgeAct(ctx context.Context,
 		return false, fmt.Errorf("scale down replicaset %s/%s: %w",
 			dep.Namespace, plan.target.Name, err)
 	}
-	// The destructive half already landed — stamp the 24h cooldown
-	// in RAM NOW, before the HR annotation patch: if that patch
-	// fails, the next sweep must still see this HR inside its
-	// cooldown window instead of re-planning a scale-down that
-	// already happened (the persisted half lands with the HR patch
-	// below; the RAM half cannot wait for it).
-	u.stall.unwedged.Stamp(key, u.now.Now())
-
 	// helm-stall-unwedge: the failed upgrade usually left a Failed helm-hook Job
 	// behind in the release namespace — helm refuses to re-run a
 	// hook while its Job object still exists, so the retry would
@@ -390,8 +382,18 @@ func (u *helmReleaseUnlocker) unwedgeAct(ctx context.Context,
 	}
 	if _, err := u.dyn.Resource(gvr).Namespace(hr.GetNamespace()).Patch(ctx, hr.GetName(),
 		types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		// The 24h cooldown stamps ONLY on a landed HR patch — a
+		// failed patch means the retry token never persisted, so
+		// the next sweep must re-plan rather than sit out a
+		// cooldown for an unwedge that did not happen. Reap the
+		// failed hook Jobs once more on the way out so a partial
+		// earlier pass cannot leave the wedge in place.
+		u.cleanFailedHookJobs(ctx, hrReleaseNS(hr), hrReleaseName(hr))
 		return false, fmt.Errorf("annotate helmrelease %s: %w", key, err)
 	}
+	// The HR patch landed — NOW the 24h cooldown may stamp (RAM +
+	// persisted anno went out in the same merge patch above).
+	u.stall.unwedged.Stamp(key, u.now.Now())
 	log.Info("ACTION: requested HR reconcile + failure-counter reset",
 		"hr", key, "deployment", dep.Namespace+"/"+dep.Name)
 	metrics.HelmStallUnwedgesTotal.

@@ -236,7 +236,12 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 		for k, detail := range p.wsrepLast {
 			if lv, held := p.perconaDegradedEmitted.Last()[k]; held {
 				rep.Carry(k, lv)
-				rep.Find(detail)
+				// carryWsrep runs once per FAILED query — up to
+				// three times a sweep. The finding must land once
+				// per tuple, not once per failed query.
+				if _, done := carried[k]; !done {
+					rep.Find(detail)
+				}
 				carried[k] = detail
 			}
 		}

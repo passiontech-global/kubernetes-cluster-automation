@@ -178,6 +178,15 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 	if err != nil {
 		log.Info("WARN: linkerd balancer endpoints query failed — wedge signal skipped",
 			"error", err)
+		// Inconclusive, not clean — carry the held wedge series so
+		// the Close below cannot read a Prometheus flap as
+		// recovery and prune live alerts. Find lands on rep (the
+		// report Verdict reads), not balancerRep: a carried series
+		// is still a live finding.
+		for k, lv := range p.balancerEmitted.Last() {
+			balancerRep.Carry(k, lv)
+			rep.Find(k)
+		}
 		return
 	}
 	readySeries, err := p.PromQuery(ctx,
@@ -185,6 +194,10 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 	if err != nil {
 		log.Info("WARN: linkerd balancer ready-endpoints query failed — wedge signal skipped",
 			"error", err)
+		for k, lv := range p.balancerEmitted.Last() {
+			balancerRep.Carry(k, lv)
+			rep.Find(k)
+		}
 		return
 	}
 	readyByTarget := map[string]float64{}
@@ -230,15 +243,19 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 			continue // balancer still has a live endpoint — healthy
 		}
 		key := ns + "/" + podName + "/" + target
-		keep[key] = true
 		if svcNS, svcName, ok := linkerdTargetService(target); ok {
 			if n, censusOK := serviceReadyEndpoints(svcNS, svcName); censusOK && n == 0 {
 				// The target Service genuinely has zero ready
 				// endpoints cluster-wide — a real outage, not a
-				// wedge. The proxy is reporting honestly.
+				// wedge. The proxy is reporting honestly. The
+				// first-seen entry is NOT kept: a scaled-to-zero
+				// backend must not bank wedge age it never proved.
 				continue
 			}
 		}
+		// Only now does the tuple count as wedge evidence — keep
+		// marks it for the balancerSeen prune below.
+		keep[key] = true
 		if !probefw.Persisted(&p.balancerSeen, key, now,
 			linkerdBalancerWedgeMinAge, log) {
 			continue

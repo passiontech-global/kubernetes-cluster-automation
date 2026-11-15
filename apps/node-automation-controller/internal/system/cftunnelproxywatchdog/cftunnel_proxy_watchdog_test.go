@@ -72,7 +72,12 @@ func proxyDeploy(conds []appsv1.DeploymentCondition) *appsv1.Deployment {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: cfTunnelProxyDeployName, Namespace: cfWatchdogTestNS,
 		},
-		Status: appsv1.DeploymentStatus{Conditions: conds},
+		// Recovered-rollout shape: desired 1, ready 1 — the stale
+		// ProgressDeadlineExceeded marker is what clearStaleStall
+		// exists to remove. Tests needing the still-stalled shape
+		// (ready < desired) override Status.ReadyReplicas.
+		Spec:   appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
+		Status: appsv1.DeploymentStatus{Conditions: conds, ReadyReplicas: 1},
 	}
 }
 
@@ -985,7 +990,7 @@ func TestWatchdogDeleteConnectorPodOutcomes(t *testing.T) {
 	pod := staleUnreadyProxyPod("proxy-wedged",
 		now.Add(-time.Hour), now.Add(-10*time.Minute))
 
-	t.Run("uid conflict — error, no counter", func(t *testing.T) {
+	t.Run("uid conflict — clean deferral, no counter", func(t *testing.T) {
 		testutil.CleanupMetric(t, metrics.CFTunnelWedgePodsDeletedTotal,
 			cfWatchdogTestNS, "fatal_logs")
 		repl := pod.DeepCopy()
@@ -1004,8 +1009,15 @@ func TestWatchdogDeleteConnectorPodOutcomes(t *testing.T) {
 			})
 		w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS,
 			now: shared.Clock(func() time.Time { return now })}
-		if _, err := w.deleteConnectorPod(t.Context(), pod, "fatal_logs", now); err == nil {
-			t.Fatal("precondition miss must propagate the Conflict error")
+		// heal.DeletePod maps the UID-precondition Conflict to a
+		// clean (false, nil) deferral — the pod was recreated mid-
+		// sweep, no heal was needed, and no phantom IncError fires.
+		delivered, err := w.deleteConnectorPod(t.Context(), pod, "fatal_logs", now)
+		if err != nil {
+			t.Fatalf("uid conflict must defer cleanly, got error: %v", err)
+		}
+		if delivered {
+			t.Fatal("a conflicted delete is not a delivered heal")
 		}
 		if got := wedgeDeletedCount(t, "fatal_logs"); got != 0 {
 			t.Fatalf("failed delete counted %v heals", got)
@@ -1202,5 +1214,29 @@ func TestWatchdogSyncErrorPartialReplicaReadKeepsGauge(t *testing.T) {
 	}
 	if _, ok := w.syncErrLast.Last(cfWatchdogTestNS); !ok {
 		t.Fatal("partial-read sweep cleared the errored stamp")
+	}
+}
+
+// A deployment still short of ready replicas is legitimately
+// ProgressDeadlineExceeded — the stale-stall clear must NOT remove
+// the marker (helm would upgrade onto a still-dead fleet).
+func TestWatchdogStallClearSkippedWhileReplicasUnready(t *testing.T) {
+	d := proxyDeploy([]appsv1.DeploymentCondition{
+		{Type: appsv1.DeploymentProgressing, Reason: "ProgressDeadlineExceeded"},
+	})
+	d.Status.ReadyReplicas = 0
+	cs := fake.NewSimpleClientset(proxyPod("proxy-1", true), d)
+	patched := false
+	cs.PrependReactor("patch", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patched = true
+			return true, nil, nil
+		})
+	w := &cfTunnelProxyWatchdog{cs: cs, namespace: cfWatchdogTestNS}
+	if err := w.run(t.Context()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if patched {
+		t.Fatal("ProgressDeadlineExceeded cleared while replicas still unready")
 	}
 }

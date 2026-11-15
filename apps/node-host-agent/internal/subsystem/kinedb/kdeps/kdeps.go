@@ -15,6 +15,7 @@ package kdeps
 
 import (
 	"sync"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
@@ -49,6 +50,39 @@ type Deps struct {
 	ChurnMu   sync.RWMutex
 	ChurnTop  []ChurnEntry
 	ChurnKeys []ChurnKeyEntry
+
+	// MaintMu serializes the heavy maintenance windows on this
+	// host: the compact guard's advisory-locked session and the
+	// maint loop's reindex/freeze/repack block. The Postgres
+	// advisory lock already serializes ACROSS hosts, but both
+	// loops live on this one VM — without the mutex a maint
+	// pg_repack and a compact chunk session start in the same
+	// instant, one loses the advisory-lock race late (after
+	// container discovery + credential reads) and burns a whole
+	// long-budget timeout pointlessly.
+	MaintMu sync.Mutex
+
+	// nameMu guards the container-name memo: DiscoverContainer
+	// costs an inspect exec (plus a `ps` fallback) per name, and
+	// the probe/compact/maint loops resolve the same two names on
+	// their own cadences — a short TTL shares one resolution
+	// across coincident cycles. 60s is far below every loop
+	// interval, so a stack-redeploy rename is still picked up on
+	// the next resolution window; the staleness cost is a bounded
+	// delay, never a wrong verdict (a stale name just reads
+	// "containers down" until expiry).
+	nameMu    sync.Mutex
+	nameCache map[string]nameMemo
+}
+
+// nameMemoTTL bounds how long a resolved container name is reused —
+// see the nameMu comment for the staleness contract.
+const nameMemoTTL = 60 * time.Second
+
+// nameMemo is one cached discovery result.
+type nameMemo struct {
+	name string
+	at   time.Time
 }
 
 // ChurnEntry is one resource prefix's revision count in the last

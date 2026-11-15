@@ -94,14 +94,20 @@ ClientAliveCountMax 2
 					"out", out, "error", err)
 			}
 		}
-		if out, err := r.run(ctx, "sshd", "-T", "-C", "user=root,host=localhost,addr=127.0.0.1"); err != nil {
-			// Best-effort verify only — a failed probe proves nothing
-			// about the applied config.
-			logger().Warn("ssh-hardening: sshd -T failed — cannot verify effective config",
-				"error", err)
-		} else if !strings.Contains(out, "passwordauthentication no") {
-			c.err("ssh-hardening: passwordauthentication still enabled — drop-in not effective",
-				"path", "/etc/ssh/sshd_config.d/00-passiontech-hardening.conf")
+		// sshd -T verify runs only when the drop-in content actually
+		// changed this cycle — an unchanged config cannot have drifted
+		// effective state, and the fork+full-config dump every
+		// converge was pure cost.
+		if ch {
+			if out, err := r.run(ctx, "sshd", "-T", "-C", "user=root,host=localhost,addr=127.0.0.1"); err != nil {
+				// Best-effort verify only — a failed probe proves nothing
+				// about the applied config.
+				logger().Warn("ssh-hardening: sshd -T failed — cannot verify effective config",
+					"error", err)
+			} else if !strings.Contains(out, "passwordauthentication no") {
+				c.err("ssh-hardening: passwordauthentication still enabled — drop-in not effective",
+					"path", "/etc/ssh/sshd_config.d/00-passiontech-hardening.conf")
+			}
 		}
 	} else if _, u := c.t.Vars.Get("ssh_hardening_enabled").(jinja.Undefined); !u {
 		rm1, _ := r.removeManaged("/etc/ssh/sshd_config.d/00-passiontech-hardening.conf")

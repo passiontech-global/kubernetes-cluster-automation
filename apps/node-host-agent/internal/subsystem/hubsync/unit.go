@@ -22,10 +22,24 @@ import (
 // target (systemd watchdog rides sd_notify, not HTTP), and the
 // port sits clear of both the :9115 metrics listener and the
 // :8081/:8091 probe convention the DaemonSet uses.
+// systemdEsc renders s for interpolation inside a double-quoted
+// systemd config value: backslash and double-quote escape, and every
+// % doubles — systemd expands % specifiers (%s hostname, %i instance,
+// …) lexically on the whole line BEFORE unquoting, so an unescaped %
+// in a vars dir or binary path would silently rewrite the unit (or
+// fail it: "invalid specifier").
+func systemdEsc(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return strings.ReplaceAll(s, "%", "%%")
+}
+
 // node-name is shell-quoted: systemd strips the quotes when splitting
 // ExecStart argv, so a config-derived name with spaces stays one
-// argument instead of smuggling extra flags.
+// argument instead of smuggling extra flags. % still doubles inside
+// the quotes — specifier expansion precedes unquoting.
 func systemdUnit(t Target, remoteBinary, remoteVarsDir, remoteCertsDir string) string {
+	name := fsx.ShellQuote(strings.ReplaceAll(t.Name, "%", "%%"))
 	return fmt.Sprintf(`[Unit]
 Description=node-host-agent (standalone host converge agent)
 Documentation=https://github.com/passiontech-global/kubernetes-cluster-automation
@@ -34,10 +48,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=NODE_HOST_AGENT_HOST_ROOT=/
-Environment=NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR=%s
-Environment=NODE_HOST_AGENT_NEBULA_CERTS_DIR=%s
-ExecStart=%s --standalone --node-name=%s --health-probe-bind-address=127.0.0.1:9117
+Environment="NODE_HOST_AGENT_HOST_ROOT=/"
+Environment="NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR=%s"
+Environment="NODE_HOST_AGENT_NEBULA_CERTS_DIR=%s"
+ExecStart="%s" --standalone --node-name=%s --health-probe-bind-address=127.0.0.1:9117
 Restart=always
 RestartSec=5s
 # sd-watchdog self-watchdog: the agent sd_notifies READY=1 + WATCHDOG=1
@@ -47,11 +61,12 @@ RestartSec=5s
 # outside the cluster).
 WatchdogSec=120s
 MemoryMax=512M
-Environment=GOMEMLIMIT=400MiB
+Environment="GOMEMLIMIT=400MiB"
 
 [Install]
 WantedBy=multi-user.target
-`, remoteVarsDir, remoteCertsDir, remoteBinary, fsx.ShellQuote(t.Name))
+`, systemdEsc(remoteVarsDir), systemdEsc(remoteCertsDir),
+		systemdEsc(remoteBinary), name)
 }
 
 // unitName derives the systemd unit name from UnitPath.

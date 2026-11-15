@@ -50,6 +50,9 @@ var maintBloatRules = []testutil.ExecRule{
 	// 300MB heap (needs >= 2.5*heap).
 	{Substr: "pg_ls_waldir", Out: "0\n"},
 	{Substr: "df", Out: "Avail\n107374182400\n"},
+	// HoldAdvisoryLock's pg_locks confirmation poll — count>0 means
+	// our hold session owns the advisory lock, so pg_repack runs.
+	{Substr: "pg_locks", Out: "1\n"},
 }
 
 func TestMaintCycleRepacksWhenBloated(t *testing.T) {
@@ -167,6 +170,9 @@ func TestMaintCycleRepackFailure(t *testing.T) {
 		{Substr: "pg_indexes_size", Out: "300000000|14572800|800000|800000\n"},
 		{Substr: "pg_ls_waldir", Out: "0\n"},
 		{Substr: "df", Out: "Avail\n107374182400\n"},
+		// HoldAdvisoryLock's pg_locks confirmation — count>0 lets
+		// the pg_repack exec run (and fail, per the rule above).
+		{Substr: "pg_locks", Out: "1\n"},
 	})
 	res := k.Cycle(context.Background())
 	if res.okRepack || res.repackState != "fail" {

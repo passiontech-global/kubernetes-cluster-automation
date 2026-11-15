@@ -45,7 +45,7 @@ import (
 // (probe_test.go) airtight.
 func (p *Probe) hygieneCatalog(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
 		"SELECT COALESCE(MAX(age(datminmxid)),0) FROM pg_database; "+
 			"SELECT COUNT(indexrelid) FROM pg_index WHERE NOT indisvalid; "+
 			"SELECT COALESCE(seq_scan,0), COALESCE(seq_tup_read,0) "+

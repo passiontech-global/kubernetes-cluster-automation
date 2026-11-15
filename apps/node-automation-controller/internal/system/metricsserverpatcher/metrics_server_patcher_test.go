@@ -221,7 +221,7 @@ func TestMetricsServerPatcherAppliesPatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 	if strings.Contains(string(got), `"replicas"`) {
@@ -348,7 +348,7 @@ func TestMetricsServerPatcherNoOpWhenCorrect(t *testing.T) {
 	if patched {
 		t.Fatal("patched an already-correct Deployment")
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -373,7 +373,7 @@ func TestMetricsServerPatcherMissingContainerNoPatch(t *testing.T) {
 		t.Fatal("patched a Deployment whose metrics-server container is absent — " +
 			"the name-only container entry has no image and the apiserver rejects it")
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -385,7 +385,7 @@ func TestMetricsServerPatcherMissingDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }

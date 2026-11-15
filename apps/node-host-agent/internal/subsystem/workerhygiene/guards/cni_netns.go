@@ -214,6 +214,17 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				continue
 			}
 		}
+		// Fresh liveness sweep immediately before the delete:
+		// `live` is the cycle-start snapshot — a process (or a
+		// just-issued CNI ADD) that joined this netns since then
+		// is invisible to it. Re-stat every /proc/*/ns/net NOW so
+		// the umount+rm can never race a fresh bind.
+		if fresh, err := c.d.Proc.PIDs(); err == nil {
+			if ino3, ok3 := netnsInode(path); ok3 &&
+				liveNetnsInodes(c.d, fresh)[ino3] {
+				continue
+			}
+		}
 		if reaped >= cniNetnsMaxReapPerCycle {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: cni-netns-gc reap cap %d reached — remaining orphans drain next cycle",

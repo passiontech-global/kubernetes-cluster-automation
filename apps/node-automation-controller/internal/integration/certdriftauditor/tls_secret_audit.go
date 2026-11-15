@@ -32,12 +32,13 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	a.seenSecrets.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
-	// replicator-cert-drift — the sweep collects two extra payloads on the same
-	// paged read: tlsData snapshots every TLS secret's raw tls.crt
-	// (parseable or not — drift is a byte comparison, not a cert
-	// parse), and replicated holds every destination carrying the
-	// replicated-from annotation for the source-diff pass.
-	tlsData := map[string][]byte{}
+	// replicator-cert-drift — the sweep collects one extra payload on
+	// the same paged read: replicated holds every destination
+	// carrying the replicated-from annotation for the source-diff
+	// pass. tls.crt bytes are NOT retained cluster-wide — the
+	// replicated diff GETs each source on demand (replicated secrets
+	// are a handful per cluster; holding every TLS secret's PEM for
+	// the whole audit was the map this used to keep).
 	var replicated []replicatedSecretRef
 	// Server-side type filter + continue-token pagination: the
 	// all-namespaces secret read is the biggest this module makes —
@@ -56,7 +57,6 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 				if s.Type != corev1.SecretTypeTLS {
 					continue
 				}
-				tlsData[s.Namespace+"/"+s.Name] = s.Data["tls.crt"]
 				if src := strings.TrimSpace(s.Annotations[replicatedFromAnno]); src != "" {
 					replicated = append(replicated, replicatedSecretRef{
 						namespace: s.Namespace, name: s.Name,
@@ -105,8 +105,9 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 
 	// replicator-cert-drift — the replicator drift diff rides the same read: every
 	// replicated destination's tls.crt is compared against its
-	// source (the TLS map first, a direct Get for non-TLS sources).
-	a.auditReplicatedSecrets(ctx, tlsData, replicated)
+	// source via a direct Get (replicated secrets are rare — a
+	// cluster-wide tls.crt byte map was not worth retaining).
+	a.auditReplicatedSecrets(ctx, replicated)
 	return nil
 }
 
@@ -186,6 +187,18 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 		metrics.IncError(a.queue)
 		return
 	case !proceed:
+		return
+	}
+	// Quorum guard + SSA ping-pong defense, same pairing as every
+	// workload restart: the slot keeps a sibling pod-delete check
+	// from double-booking linkerd-identity this sweep, and the Flux
+	// gate keeps a GitOps-owned Deployment from being fought —
+	// either denial refunds the heal grant (no mutation executed).
+	if !kube.TryReserveWorkloadKey(ctx,
+		kube.LinkerdNS+"/Deployment/"+kube.LinkerdIdentityName) ||
+		!heal.FluxPatchGate("deployment", deploy,
+			kube.LinkerdNS+"/"+kube.LinkerdIdentityName, now) {
+		heal.RefundGrant(now)
 		return
 	}
 	// The rollout stamp rides the shared kube.RestartTemplatePatch

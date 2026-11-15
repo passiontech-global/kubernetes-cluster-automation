@@ -43,5 +43,12 @@ func (s *Store) Incr(name string) int {
 func (s *Store) ResetCounter(name string) {
 	s.shared.mu.Lock()
 	defer s.shared.mu.Unlock()
-	_ = os.Remove(filepath.Join(s.Dir, name))
+	p := filepath.Join(s.Dir, name)
+	_ = os.Remove(p)
+	// Drop any RAM fallback entry too — a counter reset must
+	// clear the ENOSPC/EROFS mirror or Epoch keeps resurrecting
+	// the streak the reset just ended.
+	s.shared.ramMu.Lock()
+	delete(s.shared.ramEpochs, filepath.Clean(p))
+	s.shared.ramMu.Unlock()
 }

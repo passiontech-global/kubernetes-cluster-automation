@@ -90,11 +90,10 @@ func TestHelmReleaseUnlockerUnlockFailureIncError(t *testing.T) {
 }
 
 // A failing requestedAt patch on the HR surfaces as an unlock error —
-// the secret is already gone and the RAM cooldown is already stamped
-// (the destructive half landed; only the reconcile hint + persisted
-// stamp were lost). The next sweep must NOT re-delete a fresh
-// pending-* revision helm-controller's retry creates inside the 24h
-// window — that is exactly what the early in-RAM stamp buys.
+// the secret is already gone but the reconcile hint + persisted stamp
+// never landed, so the 24h cooldown must NOT be stamped: the next
+// sweep re-evaluates the HR instead of hiding an unlock whose retry
+// token never persisted.
 func TestHelmReleaseUnlockerAnnotateError(t *testing.T) {
 	dyn, secrets := stuckHRFixture()
 	dyn.PrependReactor("patch", "helmreleases",
@@ -109,8 +108,8 @@ func TestHelmReleaseUnlockerAnnotateError(t *testing.T) {
 	if secretExists(t, cs, "apps", "sh.helm.release.v1.myapp.v2") {
 		t.Fatal("pending secret kept although its delete succeeded")
 	}
-	if _, ok := u.pending.unlocked.Entries()["apps/myapp"]; !ok {
-		t.Fatal("pending-secret delete landed but the 24h cooldown was not stamped — a retried pending revision could be re-deleted next sweep")
+	if _, ok := u.pending.unlocked.Entries()["apps/myapp"]; ok {
+		t.Fatal("HR patch failed but the 24h cooldown was stamped — the retry token never persisted, next sweep must re-evaluate")
 	}
 }
 

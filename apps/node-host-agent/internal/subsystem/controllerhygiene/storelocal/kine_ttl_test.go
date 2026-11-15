@@ -134,22 +134,30 @@ func TestTTLLoopSuspectLogDeduped(t *testing.T) {
 		t.Fatalf("suspect repeated inside cadence window: %d", n)
 	}
 
-	// Latch exit (clean journal) drops the dedupe budget, so a
-	// re-entry logs a fresh line even inside the cadence window.
+	// Latch exit needs a pid the journal never flagged: the recorded
+	// wedged pid can never un-wedge (its single boot-time line ages
+	// out of the bounded lookback while cooldowns hold remediation),
+	// so a clean journal on the SAME pid must NOT clear the latch —
+	// only a fresh pid + clean journal is the real "loop broken"
+	// signal. Swap in pid 3004 with an empty journal for the exit.
 	e.Journal = ""
+	if err := os.RemoveAll(filepath.Join(e.Proc, "3003")); err != nil {
+		t.Fatal(err)
+	}
+	e.MkProc(t, 3004, "kine", []string{"kine"}, 400)
 	e.H.Cycle(ctx)
 	if e.HasState(cdeps.StateKineTTLLoop) || e.HasState(cdeps.StateKineTTLDead) {
 		t.Fatal("clean kine did not clear the TTL latches")
 	}
 	e.Journal = "E TTL event watch failed\n"
-	e.H.Cycle(ctx) // pid 3003 wedges again: rew=1 — no loop yet
+	e.H.Cycle(ctx) // pid 3004 wedges again: rew=1 — no loop yet
 	if n := e.CountLogLines(line); n != 2 {
 		t.Fatalf("unexpected suspect before loop re-entry: %d", n)
 	}
-	if err := os.RemoveAll(filepath.Join(e.Proc, "3003")); err != nil {
+	if err := os.RemoveAll(filepath.Join(e.Proc, "3004")); err != nil {
 		t.Fatal(err)
 	}
-	e.MkProc(t, 3004, "kine", []string{"kine"}, 400)
+	e.MkProc(t, 3005, "kine", []string{"kine"}, 400)
 	e.H.Cycle(ctx) // rew=2 → latch re-entered
 	if !e.HasState(cdeps.StateKineTTLLoop) {
 		t.Fatal("kine-ttl-loop not re-latched")
@@ -214,6 +222,12 @@ func TestTTLAgeUnreadableWarns(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(pidDir, "stat"), []byte("3009 (kine broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The comm→pid lookup is cgroup-scoped — this proc must sit
+	// under k0scontroller.service to be found at all.
+	if err := os.WriteFile(filepath.Join(pidDir, "cgroup"),
+		[]byte("0::/system.slice/k0scontroller.service\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	e.Journal = "E TTL initial list failed\n"

@@ -42,6 +42,12 @@ type natsJetstreamHealthCheck struct {
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1.
 	emitted state.GaugeLedger[string]
+	// logScanAt is the per-pod last-log-scan clock — the freshness
+	// gate requires a matching line whose kubelet timestamp
+	// post-dates the pod's previous scan, so the overlapping
+	// SinceSeconds window cannot re-flag an error that already
+	// stopped minutes ago.
+	logScanAt map[string]time.Time
 }
 
 // NewNatsJetstreamHealthCheck builds the nats-jetstream-health check — its state
@@ -187,10 +193,16 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 	s := newNatsSweep(p, log, now, census, &rep)
 	if _, err := p.PromEndpoint(); err == nil {
 		s.promSignals(ctx)
+	} else {
+		// No Prometheus endpoint — every prom-derived signal is
+		// unverifiable this sweep; carry last sweep's series and
+		// first-seen clocks rather than reading the gap as recovery.
+		s.promDegraded = true
 	}
 	s.logScan(ctx)
 	s.applyPersistence()
 	s.emitPodFindings()
+	s.carryUnverifiable()
 	s.bounceWedged(ctx)
 
 	return rep.Result(&p.emitted, natsJetstreamUnhealthyGauge.DeleteLabelValues,

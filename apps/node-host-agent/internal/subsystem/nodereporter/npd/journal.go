@@ -45,19 +45,33 @@ var kubeletJournalRules = []rule{
 	{"KubeletObjectNotRegistered", regexp.MustCompile(`not registered|no relationship found between node`)},
 }
 
-// pollJournal drains one mux subscriber's pending queue, fetching
-// the shared journal window first when the last fetch is older
-// than PollEvery. Lookback is re-read per poll so a post-New cfg
-// re-point still lands (the Deps late-binding contract).
+// pollJournal drains the kubelet subscriber's pending queue,
+// fetching the unit window first when the last fetch is older than
+// PollEvery. Lookback is re-read per poll so a post-New cfg
+// re-point still lands (the Deps late-binding contract). The args
+// carry ONLY the unit match — kernel transport lines moved to the
+// dedicated kernelJournal mux so a healthy kmsg never pays for
+// them.
 func (m *Monitor) pollJournal(ctx context.Context, sub string) ([]journalwatch.Entry, error) {
 	cfg := m.cfg()
 	m.journal.Lookback = cfg.LogLookback
 	if cfg.KubeletJournalUnit != "" {
-		m.journal.Args = []string{"_SYSTEMD_UNIT=" + cfg.KubeletJournalUnit, "+", "_TRANSPORT=kernel"}
+		m.journal.Args = []string{"_SYSTEMD_UNIT=" + cfg.KubeletJournalUnit}
 	} else {
+		// Degenerate config (no unit to tail): keep the historical
+		// kernel-only fetch — the subscriber's Unit=="" match then
+		// sees exactly what it always did.
 		m.journal.Args = []string{"_TRANSPORT=kernel"}
 	}
 	return m.journal.Poll(ctx, sub)
+}
+
+// pollKernelJournal drains the kernel fallback's pending queue on
+// its dedicated mux — journal-mode only (kernelLines gates the
+// call), so the stream exists exactly when kmsg cannot.
+func (m *Monitor) pollKernelJournal(ctx context.Context) ([]journalwatch.Entry, error) {
+	m.kernelJournal.Lookback = m.cfg().LogLookback
+	return m.kernelJournal.Poll(ctx, journalSubKernel)
 }
 
 // SyncKubeletJournal is the kubelet-stale-monitor port: new

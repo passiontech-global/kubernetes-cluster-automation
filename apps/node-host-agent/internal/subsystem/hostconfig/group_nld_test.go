@@ -4,6 +4,7 @@
 package hostconfig
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,10 +19,10 @@ func TestNLDRefusePathSkipsWrite(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(map[string]string{
 		"systemctl show systemd-resolved.service": "active",
-		"ss -lntu": "tcp  LISTEN 0  4096  127.0.0.53:53  0.0.0.0:*",
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr,
+		ListenAddrsFn: listenAddrsFake("127.0.0.53:53")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,10 +51,10 @@ func TestResolvConfAtomicRepoint(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(map[string]string{
 		"systemctl show systemd-resolved.service": "active",
-		"ss -lntu": "tcp  LISTEN 0  4096  127.0.0.53:53  0.0.0.0:*",
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr,
+		ListenAddrsFn: listenAddrsFake("127.0.0.53:53")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +81,8 @@ func nldFixture(t *testing.T) (*Reconciler, *testutil.FakeRunner, *cyc) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr,
+		ListenAddrsFn: listenAddrsFake("127.0.0.53:53")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,8 +93,8 @@ func nldFixture(t *testing.T) (*Reconciler, *testutil.FakeRunner, *cyc) {
 // stubListening=false and the rest of T4 still converges (best-effort
 // detection, not a gate).
 func TestNLDSSProbeFailureContinues(t *testing.T) {
-	r, sr, c := nldFixture(t)
-	sr.FailOn("ss -lntu", nil)
+	r, _, c := nldFixture(t)
+	r.cfg.ListenAddrsFn = listenAddrsErr(errors.New("sock_diag: permission denied"))
 	c.groupNLD()
 	if c.errs != 0 {
 		t.Fatalf("errs = %d — the failed probe is best-effort", c.errs)
@@ -192,10 +194,18 @@ node-c: gateway-vm
 	c := loadCyc(t, r, vars, "node-b")
 	allow := c.guardAllowSources()
 	// defaults fixture contributes nodelocaldns_guard_allow_private
-	// (10.0.0.0/8); the scalar gateway entry contributes nothing.
-	want := []string{"10.0.0.0/8", "10.0.1.10", "10.0.2.20"}
-	if len(allow) != len(want) || allow[0] != want[0] || allow[1] != want[1] || allow[2] != want[2] {
+	// (10.0.0.0/8); the scalar gateway entry contributes nothing —
+	// but the two mapping nodes DO contribute their marker IPs
+	// (interdc_markers join the allow set: marker-subnet sources are
+	// cluster nodes too).
+	want := []string{"10.0.0.0/8", "10.0.1.10", "10.0.2.20", "172.29.0.10", "172.29.0.20"}
+	if len(allow) != len(want) {
 		t.Fatalf("guardAllowSources = %v, want %v", allow, want)
+	}
+	for i := range want {
+		if allow[i] != want[i] {
+			t.Fatalf("guardAllowSources = %v, want %v", allow, want)
+		}
 	}
 }
 

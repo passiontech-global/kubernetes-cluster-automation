@@ -114,6 +114,14 @@ func (b *dbusBackend) dbusSignal(ctx context.Context, unit, sig string) error {
 		return err
 	}
 	if err := conn.KillUnitWithTarget(ctx, normalizeUnit(unit), sdbus.All, n); err != nil {
+		if isTransportDead(err) {
+			// daemon-reexec drops the socket mid-call — drop the
+			// dead generation so the next systemConn rebuilds, and
+			// surface unavailable so THIS call falls back to CLI.
+			b.dropConn(conn)
+			return fmt.Errorf("%w: dbus kill -s %s %s: %v",
+				errDBusUnavailable, sig, unit, err)
+		}
 		return fmt.Errorf("dbus kill -s %s %s: %w", sig, unit, err)
 	}
 	return nil
@@ -139,6 +147,11 @@ func (b *dbusBackend) dbusDaemonReload(ctx context.Context) error {
 		return err
 	}
 	if err := conn.ReloadContext(ctx); err != nil {
+		if isTransportDead(err) {
+			b.dropConn(conn)
+			return fmt.Errorf("%w: dbus daemon-reload: %v",
+				errDBusUnavailable, err)
+		}
 		return fmt.Errorf("dbus daemon-reload: %w", err)
 	}
 	return nil
@@ -156,6 +169,11 @@ func (b *dbusBackend) dbusResetFailed(ctx context.Context, unit string) error {
 		return err
 	}
 	if err := conn.ResetFailedUnitContext(ctx, normalizeUnit(unit)); err != nil {
+		if isTransportDead(err) {
+			b.dropConn(conn)
+			return fmt.Errorf("%w: dbus reset-failed %s: %v",
+				errDBusUnavailable, unit, err)
+		}
 		return fmt.Errorf("dbus reset-failed %s: %w", unit, err)
 	}
 	return nil

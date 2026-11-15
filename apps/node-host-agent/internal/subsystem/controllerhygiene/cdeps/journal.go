@@ -33,6 +33,36 @@ func (d *Deps) journalRead(ctx context.Context, unit string, since time.Time) (s
 	return d.Cfg.HostExecFn(cctx, true, 0, argv[0], argv[1:]...)
 }
 
+// journalGrepRead is journalRead with a server-side MESSAGE filter —
+// `--grep=<pattern>` (PCRE2, systemd ≥237) returns only matching
+// entries, so a signature count pays for hits, not the whole unit
+// window. Same stderr-fold + timeout contract.
+func (d *Deps) journalGrepRead(ctx context.Context, unit string,
+	since time.Time, pattern string) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, defaultJournalTimeout)
+	defer cancel()
+	argv := journalwatch.UnitWindowGrepArgv(unit,
+		since.Format(journalwatch.SinceLayout), pattern)
+	return d.Cfg.HostExecFn(cctx, true, 0, argv[0], argv[1:]...)
+}
+
+// JournalTextGrep is JournalText's filtered sibling — the read error
+// contract is identical (unreadable journal = inconclusive, never
+// "0 hits"), only the returned window is pre-filtered to entries
+// whose MESSAGE matches pattern.
+func (d *Deps) JournalTextGrep(ctx context.Context, since time.Time,
+	pattern string) (string, error) {
+	out, err := d.journalGrepRead(ctx, d.Cfg.JournalUnit, since, pattern)
+	d.noteJournalRead(ctx, out, err)
+	if err != nil {
+		d.State.AppendLogWarn(fmt.Sprintf(
+			"controllerhygiene: journal read failed (unit=%s): %v — journal checks see 0 hits",
+			d.Cfg.JournalUnit, err))
+		return "", err
+	}
+	return out, nil
+}
+
 // journalAnyRead is the unfiltered second probe used to classify an
 // empty unit-window read — `journalctl -n 1 --no-pager` with stderr
 // folded in. A quiet unit on a healthy journald must NOT count as
@@ -45,23 +75,24 @@ func (d *Deps) journalAnyRead(ctx context.Context) (string, error) {
 	return d.Cfg.HostExecFn(cctx, true, 0, argv[0], argv[1:]...)
 }
 
-// JournalText returns the unit journal since `since`, mapping errors
-// to empty — `journalctl ... 2>/dev/null | grep -c` parity (a failed
-// journal read counts as 0 hits, never as wedge evidence). Every
-// read also feeds the journal-unreadable accounting: a journald that
-// persistently answers nothing while journal storage exists blinds
-// ALL journal-grep checks, and that blindness must latch+log, not
-// stay a per-cycle warning line.
-func (d *Deps) JournalText(ctx context.Context, since time.Time) string {
+// JournalText returns the unit journal since `since` AND its read
+// error — callers that gate latch clearing on journal evidence
+// (kine_ttl) must see the failure: an unreadable journal is
+// inconclusive, never "0 hits". Every read also feeds the
+// journal-unreadable accounting: a journald that persistently
+// answers nothing while journal storage exists blinds ALL
+// journal-grep checks, and that blindness must latch+log, not stay
+// a per-cycle warning line.
+func (d *Deps) JournalText(ctx context.Context, since time.Time) (string, error) {
 	out, err := d.journalRead(ctx, d.Cfg.JournalUnit, since)
 	d.noteJournalRead(ctx, out, err)
 	if err != nil {
 		d.State.AppendLogWarn(fmt.Sprintf(
 			"controllerhygiene: journal read failed (unit=%s): %v — journal checks see 0 hits",
 			d.Cfg.JournalUnit, err))
-		return ""
+		return "", err
 	}
-	return out
+	return out, nil
 }
 
 // classifyJournalRead reduces one journal-read result to the

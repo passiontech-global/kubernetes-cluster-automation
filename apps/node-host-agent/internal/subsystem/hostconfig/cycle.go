@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/topology"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
@@ -60,6 +61,10 @@ func (r *Reconciler) CycleWithErrors(ctx context.Context) int {
 	// Order mirrors node_tuning.yaml + hub_converge.yaml.
 	for _, g := range c.groups() {
 		c.group(g.name, g.run)
+		// Step boundary: a converge runs 17 groups of exec/file
+		// work — stamp the loop's liveness beat between them so a
+		// legitimately slow group never reads as a wedge.
+		cycle.Heartbeat(ctx)
 	}
 	// Vars lazily resolve during the groups too — eval failures and
 	// reference cycles land in Vars.Errors (fail-closed Undefined).
@@ -85,6 +90,11 @@ type cyc struct {
 	// journaldIntegrity's silent-journald remedy reads it so one
 	// converge never spends the restart budget on a second bounce.
 	journaldRestarted bool
+	// tplCtxMemo caches the template var context for the cycle —
+	// tplCtx embeds live probes (api_lb_probe_reachable dials every
+	// backend, zoneSerial hashes the topology) and five groups
+	// render against it; one build per converge is enough.
+	tplCtxMemo map[string]any
 }
 
 // err logs at Error level AND marks the current cycle (and the group
@@ -151,6 +161,12 @@ func (c *cyc) group(name string, fn func()) {
 }
 
 func (c *cyc) v(name string) string { return c.t.Vars.Str(name) }
+
+// nebDev resolves the nebula tunnel device (interdc_nebula_dev,
+// default "neb1") in ONE place so the nft ports guard, the
+// policy-routing converge and the systemd drop-ins cannot drift on
+// the default. Callers gate the value for their render target.
+func (c *cyc) nebDev() string { return c.t.Vars.StrDef("interdc_nebula_dev", "neb1") }
 
 // dpkgInstalled reports whether pkg is fully installed
 // ("install ok installed") — the apt-get skip gate so a converge
@@ -291,7 +307,13 @@ func (c *cyc) applyNftUnit(name, path string, content []byte, desc string) {
 }
 
 // tplCtx builds the interdc_* var context the .j2 templates expect.
+// Memoized per cycle: the context embeds live probe results
+// (api_lb_probe_reachable dials each backend) that cannot meaningfully
+// change mid-converge, and five groups render against it.
 func (c *cyc) tplCtx() map[string]any {
+	if c.tplCtxMemo != nil {
+		return c.tplCtxMemo
+	}
 	t := c.t
 	lh := jinja.NewOMap()
 	for _, l := range t.Lighthouses {
@@ -326,7 +348,7 @@ func (c *cyc) tplCtx() map[string]any {
 	strv := func(name, def string) any {
 		return c.t.Vars.StrDef(name, def)
 	}
-	return map[string]any{
+	c.tplCtxMemo = map[string]any{
 		"interdc_node":                 t.Node,
 		"interdc_nebula_node":          t.Node,
 		"interdc_nodes":                t.Nodes,
@@ -353,14 +375,25 @@ func (c *cyc) tplCtx() map[string]any {
 		"interdc_dns_resolvers":        &jinja.List{V: strSliceToAny(t.DNSResolvers)},
 		"interdc_stub_public_upstream": strv("interdc_stub_public_upstream", "1.1.1.1 8.8.8.8"),
 		"cp_endpoint":                  c.v("cp_endpoint"),
-		"api_lb_backends":              c.t.Vars.Get("api_lb_backends"),
-		"api_lb_extra_lanes":           c.t.Vars.Get("api_lb_extra_lanes"),
-		"api_lb_vip_ip":                c.v("api_lb_vip_ip"),
-		"api_lb_probe_reachable":       &jinja.List{V: strSliceToAny(c.probeReachable())},
-		"fail2ban_ignoreip":            c.fail2banIgnoreIP(),
-		"interdc_hub_zone_serial":      c.zoneSerial(),
-		"ansible_facts":                map[string]any{"hostname": c.r.cfg.NodeName},
+		// Sanitized views — the template renders name/addr/port
+		// verbatim into haproxy.cfg directives, so only entries
+		// passing the apilb identifier/addr/port gates reach it
+		// (group_apilb.go; the nft DNAT set derives from the same
+		// validated lanes).
+		"api_lb_backends":    c.apiLBBackendList(),
+		"api_lb_extra_lanes": c.apiLBExtraLaneList(),
+		"api_lb_vip_ip":      c.v("api_lb_vip_ip"),
+		// api_lb_probe_reachable stays EMPTY here: tplCtx is first
+		// built by groupNebula (T5b) — before Nebula/routes exist —
+		// so probing now would dial dead backends and misattribute
+		// the failures to group="nebula". groupAPILB fills the key
+		// with a fresh probeReachable() right before it renders.
+		"api_lb_probe_reachable":  &jinja.List{},
+		"fail2ban_ignoreip":       c.fail2banIgnoreIP(),
+		"interdc_hub_zone_serial": c.zoneSerial(),
+		"ansible_facts":           map[string]any{"hostname": c.r.cfg.NodeName},
 	}
+	return c.tplCtxMemo
 }
 
 func omapOf(m map[string]string) *jinja.OMap {

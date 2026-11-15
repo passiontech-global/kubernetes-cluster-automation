@@ -13,18 +13,29 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
+// mergedStatsSubstr uniquely matches the hygieneScalarStats
+// multi-statement exec — FakeExec's longest-substr rule lets it
+// shadow every shorter per-statement rule the old separate queries
+// used to carry.
+const mergedStatsSubstr = "3 minutes'; SELECT COALESCE((SELECT n_dead_tup"
+
+// mergedStatsOut renders the five positional output lines the merged
+// census emits, in statement order: idle-in-tx, dead|live tuples,
+// XID age, WAL bytes, archiver staleness.
+func mergedStatsOut(idle, deadLive, xid, wal, arch string) string {
+	return idle + "\n" + deadLive + "\n" + xid + "\n" + wal + "\n" + arch + "\n"
+}
+
 // hygieneRules is kdepstest.ProbeOKRules plus canned replies for the
-// kine-pg-hygiene + WAL archive guard queries — 2 idle-in-tx
-// sessions, a quiet dead-tuple ratio, healthy XID age, 1GiB WAL on
-// a 100GiB filesystem, clean archiver and no inactive slots.
+// kine-pg-hygiene + WAL archive guard queries — the merged scalar
+// census (2 idle-in-tx sessions, quiet dead-tuple ratio, healthy XID
+// age, 1GiB WAL, clean archiver), a 100GiB filesystem for the df
+// ratio and no inactive slots.
 var hygieneRules = append(append([]testutil.ExecRule{}, kdepstest.ProbeOKRules...),
 	testutil.ExecRule{Substr: "pg_terminate_backend", Out: "t\nt\n"},
-	testutil.ExecRule{Substr: "COUNT(pid)", Out: "2\n"},
-	testutil.ExecRule{Substr: "n_dead_tup, n_live_tup", Out: "100|1000\n"},
-	testutil.ExecRule{Substr: "datfrozenxid", Out: "5000000\n"},
-	testutil.ExecRule{Substr: "pg_ls_waldir", Out: "1073741824\n"},
+	testutil.ExecRule{Substr: mergedStatsSubstr,
+		Out: mergedStatsOut("2", "100|1000", "5000000", "1073741824", "0")},
 	testutil.ExecRule{Substr: "--output=size", Out: "Size\n107374182400\n"},
-	testutil.ExecRule{Substr: "pg_stat_archiver", Out: "0\n"},
 	testutil.ExecRule{Substr: "pg_replication_slots", Out: ""},
 )
 
@@ -113,7 +124,7 @@ func TestDeadTupleVacuumFiresAndCoolsDown(t *testing.T) {
 	k, fr, _ := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
 		testutil.ExecRule{Substr: "ON_ERROR_STOP", Out: "VACUUM\n"},
 	))
-	fr.On("n_dead_tup, n_live_tup", "60000|30000\n")
+	fr.On(mergedStatsSubstr, mergedStatsOut("2", "60000|30000", "5000000", "1073741824", "0"))
 	res := k.Cycle(context.Background())
 	if !res.hyg.vacuumFired {
 		t.Fatalf("vacuum did not fire: notes=%v", res.notes)
@@ -149,7 +160,7 @@ func TestDeadTupleVacuumFiresAndCoolsDown(t *testing.T) {
 // the compact session ends in VACUUM itself.
 func TestDeadTupleVacuumLockBusy(t *testing.T) {
 	k, fr, _ := fixture(t, hygieneRules)
-	fr.On("n_dead_tup, n_live_tup", "60000|30000\n")
+	fr.On(mergedStatsSubstr, mergedStatsOut("2", "60000|30000", "5000000", "1073741824", "0"))
 	fr.On("ON_ERROR_STOP", kdeps.LockBusyMarker+"\n")
 	res := k.Cycle(context.Background())
 	if res.hyg.vacuumFired {
@@ -215,7 +226,7 @@ func TestInactiveSlotDropAndWarn(t *testing.T) {
 
 func TestProbeArchiveStaleEmitsOne(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
-	fr.On("pg_stat_archiver", "1\n")
+	fr.On(mergedStatsSubstr, mergedStatsOut("2", "100|1000", "5000000", "1073741824", "1"))
 	k.Cycle(context.Background())
 	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	if !strings.Contains(content, "kine_db_wal_archive_stale 1") {
@@ -478,7 +489,7 @@ func TestProbeHygieneReadOnlyDiagnostics(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
 	k.d.Cfg.ReadOnly = true
 	fr.On("pg_prepared_xacts", "gid-one\ngid-two\n")
-	fr.On("n_dead_tup, n_live_tup", "60000|30000\n")
+	fr.On(mergedStatsSubstr, mergedStatsOut("2", "60000|30000", "5000000", "1073741824", "0"))
 	fr.On("pg_replication_slots", "slot-orphan|16106127360\n") // 15GiB > 10GiB gate
 	fr.On("SHOW POOLS", `database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode
 postgres|postgres|4|50|3|7|0|0|0|0|0|transaction
@@ -578,37 +589,43 @@ func TestHygieneItemQueryFailures(t *testing.T) {
 		name string
 		rule string
 		want string
+		n    int // expected note count — the merged census fails all five at once
 		run  func(*Probe, *hygieneResult, func(string))
 	}{
-		{"prepared", "pg_prepared_xacts", "prepared-xacts-fail",
+		{"prepared", "pg_prepared_xacts", "prepared-xacts-fail", 1,
 			func(p *Probe, h *hygieneResult, n func(string)) {
 				p.hygienePreparedXacts(ctx, "pg", "postgres", "secret", h, n)
 			}},
-		{"idle", "idle in transaction", "idle-tx-fail",
+		// The merged census is ONE exec — any failure fails all five
+		// statements, so each case keys on the merged rule substr and
+		// asserts its own -fail tag is among the five notes.
+		{"idle", mergedStatsSubstr, "idle-tx-fail", 5,
 			func(p *Probe, h *hygieneResult, n func(string)) {
-				p.hygieneIdleInTx(ctx, "pg", "postgres", "secret", h, n)
+				p.hygieneScalarStats(ctx, "pg", "postgres", "secret", h, n)
 			}},
-		{"dead", "n_dead_tup, n_live_tup", "dead-tuple-fail",
+		{"dead", mergedStatsSubstr, "dead-tuple-fail", 5,
 			func(p *Probe, h *hygieneResult, n func(string)) {
-				p.hygieneDeadTuple(ctx, "pg", "postgres", "secret", h, n)
+				p.hygieneScalarStats(ctx, "pg", "postgres", "secret", h, n)
 			}},
-		{"xid", "datfrozenxid", "xid-age-fail",
+		{"xid", mergedStatsSubstr, "xid-age-fail", 5,
 			func(p *Probe, h *hygieneResult, n func(string)) {
-				p.hygieneXID(ctx, "pg", "postgres", "secret", h, n)
+				p.hygieneScalarStats(ctx, "pg", "postgres", "secret", h, n)
 			}},
-		{"slots", "pg_replication_slots", "slots-fail",
-			func(p *Probe, h *hygieneResult, n func(string)) {
-				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
-			}},
-		{"wal-df", "--output=size", "wal-df-fail",
-			func(p *Probe, h *hygieneResult, n func(string)) {
-				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
-			}},
-		{"wal-df-unparsed", "--output=size", "wal-df-unparsed",
+		{"slots", "pg_replication_slots", "slots-fail", 1,
 			func(p *Probe, h *hygieneResult, n func(string)) {
 				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
 			}},
-		{"large-keys", "OCTET_LENGTH", "large-keys-fail",
+		{"wal-df", "--output=size", "wal-df-fail", 1,
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				h.walSeen, h.walBytes = true, 1 // census filled upstream
+				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
+			}},
+		{"wal-df-unparsed", "--output=size", "wal-df-unparsed", 1,
+			func(p *Probe, h *hygieneResult, n func(string)) {
+				h.walSeen, h.walBytes = true, 1
+				p.hygieneWAL(ctx, "pg", "postgres", "secret", h, n)
+			}},
+		{"large-keys", "OCTET_LENGTH", "large-keys-fail", 1,
 			func(p *Probe, h *hygieneResult, n func(string)) {
 				p.hygieneLargeKeys(ctx, "pg", "postgres", "secret", h, n)
 			}},
@@ -626,7 +643,16 @@ func TestHygieneItemQueryFailures(t *testing.T) {
 		h := &hygieneResult{}
 		var notes []string
 		tc.run(k, h, func(s string) { notes = append(notes, s) })
-		if len(notes) != 1 || !strings.Contains(notes[0], tc.want) {
+		if len(notes) != tc.n {
+			t.Fatalf("%s: notes=%v want %d", tc.name, notes, tc.n)
+		}
+		found := false
+		for _, n := range notes {
+			if strings.Contains(n, tc.want) {
+				found = true
+			}
+		}
+		if !found {
 			t.Fatalf("%s: notes=%v want %q", tc.name, notes, tc.want)
 		}
 	}
@@ -658,7 +684,6 @@ func TestInactiveSlotDropFailure(t *testing.T) {
 // next probe past the cooldown retries.
 func TestDeadTupleVacuumScriptFailure(t *testing.T) {
 	k, fr, _ := fixture(t, hygieneRules)
-	fr.On("n_dead_tup, n_live_tup", "60000|30000\n")
 	fr.FailOn("ON_ERROR_STOP", errors.New("vacuum aborted"))
 	var notes []string
 	if k.deadTupleVacuum(context.Background(), "pg", "postgres", "secret",

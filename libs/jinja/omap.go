@@ -88,7 +88,7 @@ func (m *OMap) Del(k string) {
 	delete(m.vals, k)
 	for i, kk := range m.keys {
 		if kk == k {
-			m.keys = append(m.keys[:i], m.keys[i+1:]...)
+			m.keys = slices.Delete(m.keys, i, i+1)
 			return
 		}
 	}

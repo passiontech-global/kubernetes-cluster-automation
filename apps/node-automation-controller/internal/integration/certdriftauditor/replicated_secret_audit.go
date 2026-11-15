@@ -34,7 +34,9 @@ func replStreakKey(k replicationMetricKey) string {
 }
 
 // auditReplicatedSecrets diffs each replicated TLS secret's tls.crt
-// against its source. The comparison is bytes — the replicator
+// against its source — the source is a direct Secret GET per replica
+// (replicated secrets are rare; the audit no longer retains a
+// cluster-wide tls.crt map). The comparison is bytes — the replicator
 // copies data verbatim, so ANY byte difference is drift (a rotated
 // source cert the copy missed, or a hand-edited destination). A
 // mismatch must persist replicationDriftScans consecutive sweeps
@@ -42,21 +44,22 @@ func replStreakKey(k replicationMetricKey) string {
 // mid-sync, not a wedge. A matched copy resets the streak and drops
 // any held series via DeleteLabelValues.
 func (a *certDriftAuditor) auditReplicatedSecrets(ctx context.Context,
-	tlsData map[string][]byte, replicated []replicatedSecretRef) {
+	replicated []replicatedSecretRef) {
 	a.seenReplication.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	for _, d := range replicated {
 		k := replicationMetricKey{
 			namespace: d.namespace, name: d.name, source: d.source}
-		src, ok := tlsData[d.source]
-		if !ok {
-			// Source not in the TLS sweep — it may be a non-TLS
-			// (Opaque) secret; a direct Get resolves it. Malformed
-			// refs and genuinely-missing sources are skipped —
-			// "can't compare" is not drift. A transient Get failure
-			// carries the last verdict forward (same shape as the
-			// cainjector path's carry-forward).
+		// The source is fetched directly — replicated secrets are a
+		// handful per cluster, so one GET each beats retaining every
+		// TLS secret's tls.crt bytes for the whole audit. A
+		// malformed ref or genuinely-missing source is skipped —
+		// "can't compare" is not drift. A transient Get failure
+		// carries the last verdict forward (same shape as the
+		// cainjector path's carry-forward).
+		var src []byte
+		{
 			srcNS, srcName, refOK := splitNSName(d.source)
 			if !refOK {
 				log.Info("skip: malformed replicated-from annotation",

@@ -6,6 +6,7 @@ package sweeper
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -276,20 +277,35 @@ func (s *Sweeper) releaseStalePV(
 	// A Released PV can hold the pv-protection finalizer when
 	// the provisioner was evicted at the wrong moment — strip,
 	// then delete; the re-GET below returns NotFound → rm dir.
+	// The strip is UID+resourceVersion-preconditioned: between
+	// the vetting GET and this patch the PV could be deleted and
+	// RECREATED under the same pvc-<uuid> name — an
+	// unconditional merge patch would strip the replacement's
+	// finalizers too. A stale object fails the test op with 409.
 	log.Info("PV Released+Delete, claimRef gone — deleting PV object",
 		"pv", name, "pvc", orDash(cns)+"/"+orDash(cname))
-	apiCtx, cancel := s.apiCtx(ctx)
-	_, err := s.cfg.Client.CoreV1().PersistentVolumes().Patch(apiCtx, name,
-		types.MergePatchType,
-		[]byte(`{"metadata":{"finalizers":null}}`),
-		metav1.PatchOptions{})
-	cancel()
-	if err != nil {
-		log.Info("SKIP: patch finalizers failed", "dir", name, "error", err)
-		s.skips.WithLabelValues(skipPVPatchFailed).Inc()
-		return false
+	var err error
+	if len(pv.Finalizers) > 0 {
+		fpatch, _ := json.Marshal([]map[string]any{
+			{"op": "test", "path": "/metadata/uid",
+				"value": string(pv.UID)},
+			{"op": "test", "path": "/metadata/resourceVersion",
+				"value": pv.ResourceVersion},
+			{"op": "replace", "path": "/metadata/finalizers",
+				"value": []any{}},
+		})
+		apiCtx, cancel := s.apiCtx(ctx)
+		_, err = s.cfg.Client.CoreV1().PersistentVolumes().Patch(apiCtx, name,
+			types.JSONPatchType, fpatch,
+			metav1.PatchOptions{})
+		cancel()
+		if err != nil {
+			log.Info("SKIP: patch finalizers failed", "dir", name, "error", err)
+			s.skips.WithLabelValues(skipPVPatchFailed).Inc()
+			return false
+		}
 	}
-	apiCtx, cancel = s.apiCtx(ctx)
+	apiCtx, cancel := s.apiCtx(ctx)
 	// UID precondition: between the vetting GET and this
 	// delete the PV could be recreated under the same
 	// pvc-<uuid> name — the precondition refuses to kill

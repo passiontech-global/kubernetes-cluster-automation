@@ -38,6 +38,15 @@ type walGuardSweep struct {
 	slotRep  probefw.SweepReport
 	findings map[string]walFinding
 	pgPVCs   map[string]string // "ns/pvc" -> owning operator cluster
+	// promSlotDegraded/promVolumeDegraded mark a failed Prometheus
+	// signal FAMILY — the findings that family alone can produce
+	// are then unverifiable, so Run carries last sweep's emitted
+	// series for THAT family instead of letting Close read the gap
+	// as recovery. Split per family: a volume-query flap must not
+	// freeze archiver/slot series the slot queries still prove
+	// fresh, and vice versa.
+	promSlotDegraded   bool
+	promVolumeDegraded bool
 }
 
 func newWALGuardSweep(p *postgresWALArchiveGuardCheck, log logr.Logger,
@@ -172,8 +181,17 @@ func (s *walGuardSweep) scanPromSignals(ctx context.Context) {
 	family := func(prefix, slotJoin string) string {
 		return fmt.Sprintf(
 			`(increase(%[1]sstat_archiver_failed_count[30m]) > 0) or `+
-				`(%[1]sreplication_slots_retained_bytes{active="false"} > %[2]d) or `+
-				`(%[1]sreplication_slots_active == 0 and on(namespace, pod, slot_name) %[3]s)`,
+				// The two slot spellings group explicitly: the
+				// `or on(slot identity)` dedup must bind the
+				// retained_bytes series against the value-0
+				// active-flag spelling for the SAME slot —
+				// without parens the chain parses as
+				// ((A or B) or on(...) C), leaving the dedup
+				// scope implicit and the byte count losable to
+				// whichever spelling lands last.
+				`((%[1]sreplication_slots_retained_bytes{active="false"} > %[2]d) `+
+				`or on(namespace, pod, slot_name) `+
+				`(%[1]sreplication_slots_active == 0 and on(namespace, pod, slot_name) %[3]s))`,
 			prefix, pgWALSlotRetainMax, slotJoin)
 	}
 	promFamilies := []struct {
@@ -201,6 +219,7 @@ func (s *walGuardSweep) scanPromSignals(ctx context.Context) {
 		if qerr != nil {
 			s.log.Info("WARN: archiver/slot query failed — evidence incomplete",
 				"error", qerr)
+			s.promSlotDegraded = true
 			continue
 		}
 		for _, series := range series {
@@ -238,6 +257,7 @@ func (s *walGuardSweep) scanPromSignals(ctx context.Context) {
 			fmt.Sprintf("%.2f", pgWALVolumeRatio)); qerr != nil {
 		s.log.Info("WARN: volume stats query failed — volume evidence incomplete",
 			"error", qerr)
+		s.promVolumeDegraded = true
 	} else {
 		for _, series := range series {
 			ns := series.Label("namespace")

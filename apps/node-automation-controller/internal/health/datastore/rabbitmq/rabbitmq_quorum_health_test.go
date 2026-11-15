@@ -453,14 +453,15 @@ func rabbitMQOwnedPod(ns, name string, ready bool, ownerUID string) *corev1.Pod 
 func TestRabbitMQQuorumLeaderlessFlagged(t *testing.T) {
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 		switch {
-		case strings.Contains(query, "sum by"):
-			return []probetest.PromTestSample{{
-				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
-				Value:  0}}
-		case strings.Contains(query, "count by"):
-			return []probetest.PromTestSample{{
-				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
-				Value:  3}}
+		case strings.Contains(query, "rabbitmq_raft_role"):
+			// Raw role series for the leaderless member — three
+			// replicated queues, every role value 0 → count 3,
+			// role sum 0.
+			return []probetest.PromTestSample{
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0", "queue": "q1"}, Value: 0},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0", "queue": "q2"}, Value: 0},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0", "queue": "q3"}, Value: 0},
+			}
 		case strings.Contains(query, "raft_term"):
 			return nil
 		}
@@ -502,14 +503,14 @@ func TestRabbitMQQuorumLeaderlessFlagged(t *testing.T) {
 func TestRabbitMQQuorumLeaderWithRolesPasses(t *testing.T) {
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 		switch {
-		case strings.Contains(query, "sum by"):
-			return []probetest.PromTestSample{{
-				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
-				Value:  2}}
-		case strings.Contains(query, "count by"):
-			return []probetest.PromTestSample{{
-				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},
-				Value:  3}}
+		case strings.Contains(query, "rabbitmq_raft_role"):
+			// Role series summing to 2 — the member leads at least
+			// one replicated queue.
+			return []probetest.PromTestSample{
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0", "queue": "q1"}, Value: 1},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0", "queue": "q2"}, Value: 1},
+				{Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0", "queue": "q3"}, Value: 0},
+			}
 		case strings.Contains(query, "raft_term"):
 			return []probetest.PromTestSample{{
 				Labels: map[string]string{"namespace": "mq", "pod": "rabbitmq-server-0"},

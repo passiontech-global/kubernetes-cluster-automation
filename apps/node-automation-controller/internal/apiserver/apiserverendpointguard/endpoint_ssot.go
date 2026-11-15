@@ -82,7 +82,8 @@ func (g *apiServerEndpointGuard) kubernetesSlices(ctx context.Context) ([]*disco
 // InternalIPs AND no backend IP was ever seen): callers treat that
 // as "no peer evidence" and keep the reconciler-listing rule (fail
 // closed — an unverifiable peer set never re-adds).
-func (g *apiServerEndpointGuard) ssotPeerIPs(ctx context.Context) map[string]bool {
+func (g *apiServerEndpointGuard) ssotPeerIPs(ctx context.Context,
+	activeIPs []string) map[string]bool {
 	set := map[string]bool{}
 	// High-water first: it needs no API read at all.
 	for ip := range g.peerHighWater {
@@ -90,18 +91,44 @@ func (g *apiServerEndpointGuard) ssotPeerIPs(ctx context.Context) map[string]boo
 	}
 	nodes, err := kube.ListNodesCached(ctx, g.nodeReader, g.cs)
 	if err != nil {
+		// Fail closed: an unverifiable node census prunes nothing —
+		// stale peer evidence is safer than losing live peer IPs.
 		logf.FromContext(ctx).Error(err,
 			"peer discovery failed — re-adds keep the reconciler-listing rule")
 	} else {
+		if g.peerNodeIPs == nil {
+			g.peerNodeIPs = map[string]bool{}
+		}
+		current := map[string]bool{}
 		for i := range nodes {
 			if !kube.IsControlPlane(&nodes[i]) {
 				continue
 			}
 			for _, a := range nodes[i].Status.Addresses {
 				if a.Type == corev1.NodeInternalIP && a.Address != "" {
+					current[a.Address] = true
 					set[a.Address] = true
+					g.peerNodeIPs[a.Address] = true
 				}
 			}
+		}
+		// Prune node-sourced high-water entries whose node is gone:
+		// an IP still carried by the live endpoint set keeps its
+		// peerHighWater seat on endpoint evidence alone, but an IP
+		// backed ONLY by a deleted CP node is stale evidence — drop
+		// it so a later worker reusing the address cannot be
+		// mistaken for a legit backend peer.
+		active := map[string]bool{}
+		for _, ip := range activeIPs {
+			active[ip] = true
+		}
+		for ip := range g.peerNodeIPs {
+			if current[ip] || active[ip] {
+				continue
+			}
+			delete(g.peerNodeIPs, ip)
+			delete(g.peerHighWater, ip)
+			delete(set, ip)
 		}
 	}
 	if len(set) == 0 {

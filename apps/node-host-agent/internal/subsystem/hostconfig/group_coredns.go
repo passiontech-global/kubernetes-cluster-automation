@@ -203,9 +203,9 @@ WantedBy=multi-user.target
 		timer := time.NewTimer(2 * time.Second)
 		defer timer.Stop()
 		for i := 0; i < 15; i++ {
-			out, err := r.run(ctx, "dig", "@127.0.0.1", "ns1."+zone, "+short", "+time=3", "+tries=1")
+			addrs, err := c.r.cfg.DNSProbe(ctx, "ns1."+zone)
 			lastErr = err
-			if err == nil && strings.TrimSpace(out) != "" {
+			if err == nil && len(addrs) > 0 {
 				ok = true
 				break
 			}
@@ -224,15 +224,15 @@ WantedBy=multi-user.target
 	} else {
 		// Worker: stub must answer the internal zone before resolv.conf
 		// repoints at it (single-shot, ansible failed_when parity).
-		if out, err := r.run(ctx, "dig", "@127.0.0.1", c.v("cp_endpoint"), "+short", "+time=3", "+tries=1"); err != nil || strings.TrimSpace(out) == "" {
+		if addrs, err := c.r.cfg.DNSProbe(ctx, c.v("cp_endpoint")); err != nil || len(addrs) == 0 {
 			c.err("T9: stub does not answer cp_endpoint — resolv.conf NOT repointed",
-				"cp_endpoint", c.v("cp_endpoint"), "out", strings.TrimSpace(out), "error", err)
+				"cp_endpoint", c.v("cp_endpoint"), "addrs", len(addrs), "error", err)
 			return
 		}
 		if fb := c.vs("cp_endpoint_fallback_names"); len(fb) > 0 {
-			if out, err := r.run(ctx, "dig", "@127.0.0.1", fb[0], "+short", "+time=3", "+tries=1"); err != nil || strings.TrimSpace(out) == "" {
+			if addrs, err := c.r.cfg.DNSProbe(ctx, fb[0]); err != nil || len(addrs) == 0 {
 				c.err("T9: stub fails external recursion — resolv.conf NOT repointed",
-					"name", fb[0], "out", strings.TrimSpace(out), "error", err)
+					"name", fb[0], "addrs", len(addrs), "error", err)
 				return
 			}
 		}

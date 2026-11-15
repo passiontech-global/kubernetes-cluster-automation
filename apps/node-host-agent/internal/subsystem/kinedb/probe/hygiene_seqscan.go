@@ -58,7 +58,7 @@ func (p *Probe) hygieneSeqScan(ctx context.Context, pg, user, pass string,
 		note("kine-analyze cooldown (<30m)")
 		return
 	}
-	if _, aerr := p.d.ExecLongEnv(ctx, p.d.PsqlMaintEnv(pass), p.d.PsqlMaintArgs(pg, user, false,
+	if _, aerr := p.d.ExecLongEnv(ctx, p.d.PsqlMaintEnv(pass, kdeps.AppNameProbe), p.d.PsqlMaintArgs(pg, user, false,
 		"-qc", "ANALYZE "+kdeps.SQLIdent(p.d.Cfg.Table)), ""); aerr != nil {
 		note(fmt.Sprintf("kine-analyze-fail: %v", aerr))
 		return

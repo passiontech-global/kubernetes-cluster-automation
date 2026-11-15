@@ -121,6 +121,13 @@ type coreDNSWatchdog struct {
 	// stale signature. nil → dnsExchange (real net.Resolver dial).
 	dnsExchangeFn func(ctx context.Context, network, podIP, fqdn string) ([]string, error)
 	panicsFn      func(ctx context.Context, podIP string) (float64, bool)
+	// podHeals is the per-UID/pod cooldown for PARTIAL recovery
+	// passes: the Deployment-level 30m stamp only lands when every
+	// suspect was evicted in one pass, so a capped/PDB-refused/
+	// already-cooled remainder must not re-evict pods this window —
+	// keyed by UID (a recreated pod arrives under a new UID and is
+	// judged on fresh evidence, not this stamp).
+	podHeals state.CooldownSet
 	// fqdnMu guards the layer-2 probe-target cache below — runs are
 	// serialized by the periodic loop, but the probe seams make a
 	// concurrent caller possible and the guard is one mutex.
@@ -136,6 +143,17 @@ type coreDNSWatchdog struct {
 	cachedFQDN string
 	cachedWant map[string]bool
 	cachedAt   time.Time
+	// cachedNS/cachedName/cachedFresh keep the picked target's
+	// identity so an expired or invalidated entry refreshes through
+	// one Service GET + one namespaced EndpointSlice list instead
+	// of re-scanning every Service in the cluster. cachedFresh
+	// records which selection path produced the target: the
+	// <10m-old-Service path (fresh=true) must re-prove its age
+	// window on refresh, while the EndpointSlice fallback
+	// (fresh=false) only needs live endpoints + a want-set.
+	cachedNS    string
+	cachedName  string
+	cachedFresh bool
 	// nodeReader is the informer-cache client for the storm-gate
 	// node census (CountNotReadyNodesCached): the manager cache
 	// mirrors Nodes, so the 60s sweep's not-ready count costs no
@@ -164,16 +182,37 @@ func (w *coreDNSWatchdog) probeFQDN(ctx context.Context) (string, map[string]boo
 func (w *coreDNSWatchdog) probeFQDNState(ctx context.Context) (string, map[string]bool, bool) {
 	w.fqdnMu.Lock()
 	fqdn, want, at := w.cachedFQDN, w.cachedWant, w.cachedAt
+	ns, name, fresh := w.cachedNS, w.cachedName, w.cachedFresh
 	w.fqdnMu.Unlock()
 	if fqdn != "" && w.now.Now().Sub(at) < corednsFQDNCacheTTL {
 		return fqdn, want, true
 	}
-	fqdn, want = w.probeFQDNUncached(ctx)
+	// TTL expired (or the entry was invalidated mid-cycle): refresh
+	// the SAME target's want-set through targeted reads first — the
+	// steady-state fallback target lives for many cycles and only
+	// its endpoint IPs churn, so a cluster-wide re-pick every 10m
+	// (and every invalidate-reprobe) is wasted apiserver load. A
+	// dead/aged-out/unqualifying target falls through to the full
+	// pick, preserving the original selection semantics.
+	if ns != "" {
+		if fqdn, want, ok := w.refreshProbeTarget(ctx, ns, name, fresh); ok {
+			w.fqdnMu.Lock()
+			w.cachedFQDN, w.cachedWant, w.cachedAt = fqdn, want, w.now.Now()
+			w.fqdnMu.Unlock()
+			return fqdn, want, false
+		}
+	}
+	fqdn, want, ns, name, fresh = w.probeFQDNUncached(ctx)
 	if fqdn == "" {
+		w.fqdnMu.Lock()
+		w.cachedFQDN, w.cachedWant, w.cachedAt = "", nil, time.Time{}
+		w.cachedNS, w.cachedName, w.cachedFresh = "", "", false
+		w.fqdnMu.Unlock()
 		return "", nil, false
 	}
 	w.fqdnMu.Lock()
 	w.cachedFQDN, w.cachedWant, w.cachedAt = fqdn, want, w.now.Now()
+	w.cachedNS, w.cachedName, w.cachedFresh = ns, name, fresh
 	w.fqdnMu.Unlock()
 	return fqdn, want, false
 }
@@ -189,6 +228,11 @@ func (w *coreDNSWatchdog) probeFQDNState(ctx context.Context) (string, map[strin
 // verdict lands.
 func (w *coreDNSWatchdog) invalidateFQDNCache() {
 	w.fqdnMu.Lock()
+	// The want-set is what's distrusted — the target's identity is
+	// not. Keeping ns/name/fresh lets the next probeFQDNState
+	// refresh the same target's want-set through targeted reads
+	// instead of paying a cluster-wide re-pick; a target that no
+	// longer qualifies falls through to the full pick anyway.
 	w.cachedFQDN, w.cachedWant, w.cachedAt = "", nil, time.Time{}
 	w.fqdnMu.Unlock()
 }
@@ -313,6 +357,9 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 		_, ok := podIP[name]
 		return ok
 	})
+	// podHeals entries older than the cooldown can never gate a
+	// delete again — prune them so the map only tracks live keys.
+	w.podHeals.PruneExpired(w.now.Now(), corednsCooldownS*time.Second)
 	stale := map[string]bool{}
 
 	// ===== Layer 1: log fast-path =====

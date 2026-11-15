@@ -52,7 +52,7 @@ func (d *Deps) PodsIn(ctx context.Context, ns string) ([]*corev1.Pod, error) {
 	if err != nil {
 		return nil, err
 	}
-	byNS, _ := sweepSnap(ctx).podPlacement.lookup(ctx, pods)
+	byNS, _, _ := sweepSnap(ctx).podPlacement.lookup(ctx, pods)
 	return slices.Clone(byNS[ns]), nil
 }
 
@@ -67,8 +67,24 @@ func (d *Deps) PodsOnNode(ctx context.Context, node string) ([]*corev1.Pod, erro
 	if err != nil {
 		return nil, err
 	}
-	_, byNode := sweepSnap(ctx).podPlacement.lookup(ctx, pods)
+	_, byNode, _ := sweepSnap(ctx).podPlacement.lookup(ctx, pods)
 	return slices.Clone(byNode[node]), nil
+}
+
+// Pod resolves one pod by (namespace, name) against the shared
+// census — the O(1) replacement for a live Pods(ns).Get inside a
+// sweep: the podPlacement index joins the same tombstone-filtered
+// view AllPods serves, so a mid-sweep MarkPodDeleted hides the pod
+// here exactly like it does in the census. Absent → (nil, nil),
+// matching the nodeIndex NotFound convention; the returned pod
+// aliases snapshot state — read-only.
+func (d *Deps) Pod(ctx context.Context, ns, name string) (*corev1.Pod, error) {
+	pods, err := d.AllPods(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_, _, byKey := sweepSnap(ctx).podPlacement.lookup(ctx, pods)
+	return byKey[types.NamespacedName{Namespace: ns, Name: name}], nil
 }
 
 // PodsMatching filters the shared census to one namespace (""

@@ -20,7 +20,7 @@ import (
 // rollback is noted and retried next round, never fatal.
 func (p *Probe) hygienePreparedXacts(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
 		"SELECT gid FROM pg_prepared_xacts "+
 			"WHERE database IN ('postgres','kine') "+
 			"AND prepared < now() - interval '%s'", preparedXactOrphanAge))
@@ -34,7 +34,7 @@ func (p *Probe) hygienePreparedXacts(ctx context.Context, pg, user, pass string,
 		if p.d.Cfg.ReadOnly {
 			continue // diagnostics only — no ROLLBACK PREPARED
 		}
-		if _, rerr := p.d.PsqlQuery(ctx, pg, user, pass,
+		if _, rerr := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
 			"ROLLBACK PREPARED "+kdeps.SQLQuote(gid)); rerr != nil {
 			note(fmt.Sprintf("rollback-prepared-%s-fail: %v", gid, rerr))
 			continue

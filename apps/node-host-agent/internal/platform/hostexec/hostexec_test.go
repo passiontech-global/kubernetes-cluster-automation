@@ -298,6 +298,39 @@ func TestRunCombinedEnvReplacesEnvironment(t *testing.T) {
 	}
 }
 
+// TestRunCombinedScrubsNotifySocket: the nil-env inherit path must
+// drop the sd_notify variables — a standalone-host child holding
+// NOTIFY_SOCKET would sd_notify back into OUR unit on exec
+// (systemd>=255 auto-sends EXIT_STATUS).
+func TestRunCombinedScrubsNotifySocket(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh on PATH")
+	}
+	t.Setenv("NOTIFY_SOCKET", "/run/systemd/notify")
+	t.Setenv("WATCHDOG_USEC", "30000")
+
+	for name, fn := range map[string]func(context.Context, ...string) (string, error){
+		"RunCombined": RunCombined,
+	} {
+		out, err := fn(context.Background(),
+			"sh", "-c", `echo "${NOTIFY_SOCKET:-unset}/${WATCHDOG_USEC:-unset}"`)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if strings.TrimSpace(out) != "unset/unset" {
+			t.Fatalf("%s out=%q want unset/unset — sd_notify vars leaked", name, out)
+		}
+	}
+	out, err := RunCombinedEnv(context.Background(), nil,
+		"sh", "-c", `echo "${NOTIFY_SOCKET:-unset}"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "unset" {
+		t.Fatalf("RunCombinedEnv(nil) out=%q want unset", out)
+	}
+}
+
 // TestRunSeparatesStreamsAndFeedsStdin: the container-side Run keeps
 // stdout machine-clean (stderr in its own buffer) and feeds stdin —
 // the psql/etcdctl parser contract.

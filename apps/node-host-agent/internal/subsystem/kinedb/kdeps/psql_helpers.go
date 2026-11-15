@@ -28,7 +28,7 @@ func (d *Deps) GuardRateSpend(name string) {
 func WrapAdvisoryLockScript(lockID int64, varName, body string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b,
-		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS %s;\n",
+		"SELECT CASE WHEN pg_try_advisory_lock(%d) THEN 'on' ELSE 'off' END AS %s\n",
 		lockID, varName)
 	fmt.Fprintf(&b, "\\gset\n\\if :%s\n", varName)
 	b.WriteString(body)
@@ -38,8 +38,8 @@ func WrapAdvisoryLockScript(lockID int64, varName, body string) string {
 }
 
 // QueryXidAge reads COALESCE(MAX(age(datfrozenxid)), 0) across pg_database.
-func (d *Deps) QueryXidAge(ctx context.Context, pg, user, pass string) (int64, error) {
-	out, err := d.PsqlQuery(ctx, pg, user, pass,
+func (d *Deps) QueryXidAge(ctx context.Context, pg, user, pass, appName string) (int64, error) {
+	out, err := d.PsqlQuery(ctx, pg, user, pass, appName,
 		"SELECT COALESCE(MAX(age(datfrozenxid)),0) FROM pg_database")
 	if err != nil {
 		return 0, fmt.Errorf("xid-age-fail: %w", err)

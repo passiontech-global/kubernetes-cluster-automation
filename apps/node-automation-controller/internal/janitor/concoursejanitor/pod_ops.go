@@ -39,14 +39,16 @@ func (j *concourseWorkdirJanitor) getPod(ctx context.Context, name string) (*cor
 func (j *concourseWorkdirJanitor) readyWorkerSiblings(ctx context.Context, exclude string) (int, error) {
 	cctx, cancel := context.WithTimeout(ctx, j.cfg.reqTimeout)
 	defer cancel()
-	pods, err := j.cs.CoreV1().Pods(cjNamespace).List(cctx, metav1.ListOptions{})
+	pods, err := kube.ListAll(cctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.Pods(j.cs, cjNamespace))
 	if err != nil {
 		return 0, fmt.Errorf("list worker pods: %w", err)
 	}
 	prefix := cjStatefulSet + "-"
 	ready := 0
-	for i := range pods.Items {
-		p := &pods.Items[i]
+	for i := range pods {
+		p := &pods[i]
 		if p.Name == exclude || p.DeletionTimestamp != nil ||
 			!strings.HasPrefix(p.Name, prefix) {
 			continue

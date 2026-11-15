@@ -97,6 +97,11 @@ const (
 	cfTunnelLogTailLines = 200
 	cfTunnelLogMaxBytes  = 256 << 10
 	cfTunnelLogTimeout   = 8 * time.Second
+	// cfTunnelLogSinceSeconds bounds the wedge-signature scan to the
+	// last 15m of container log — a fatal startup error from a PREVIOUS
+	// incident (pod restarted since, logs still in the ring buffer)
+	// must not trigger a fresh delete of a now-healthy connector.
+	cfTunnelLogSinceSeconds = 900
 
 	// cf-gateway-sync-error — gateway controller sync-error audit. The controller
 	// logs "failed to update tunnel configuration" (Cloudflare API
@@ -381,6 +386,21 @@ func (w *cfTunnelProxyWatchdog) clearStaleStall(ctx context.Context) (bool, erro
 		}
 	}
 	if idx < 0 {
+		return false, nil
+	}
+	// Only clear the stall marker once the rollout actually
+	// recovered: a deployment still short of its desired ready
+	// replicas IS legitimately ProgressDeadlineExceeded — removing
+	// the condition would let helm start an upgrade on top of a
+	// still-dead fleet and mask the real stall from every alert.
+	desired := int32(1)
+	if d.Spec.Replicas != nil {
+		desired = *d.Spec.Replicas
+	}
+	if d.Status.ReadyReplicas < desired {
+		log.Info("stale-stall clear skipped — deployment still short of ready replicas",
+			"deployment", w.namespace+"/"+cfTunnelProxyDeployName,
+			"ready", d.Status.ReadyReplicas, "desired", desired)
 		return false, nil
 	}
 	// TOCTOU: the deployment controller rewrites .status.conditions

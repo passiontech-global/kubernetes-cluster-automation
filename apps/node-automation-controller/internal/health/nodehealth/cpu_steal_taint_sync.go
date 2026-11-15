@@ -56,6 +56,10 @@ const (
 	cpuStealCondMinAge  = 5 * time.Minute
 	cpuStealClearMinAge = 10 * time.Minute
 	cpuStealMinHealthy  = 2
+	// cpuStealTaintCool is the heal-gate cooldown on the taint
+	// mutation — a node that keeps re-pressuring inside the window
+	// does not re-spend a budget grant every sweep.
+	cpuStealTaintCool = 15 * time.Minute
 
 	// cpuStealCond is the NodeCondition the node-agent latches while
 	// hypervisor steal time crosses its threshold — spelled by
@@ -165,32 +169,56 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 			if age, ok := pressured[n.Name]; ok {
 				rep.Find(fmt.Sprintf("%s(%s)", n.Name, age.Truncate(time.Minute)))
 				if !tainted && p.stealHealthyWorkers(nodes, n.Name, now) >= cpuStealMinHealthy {
-					// Per-target non-convergent circuit breaker — the
-					// 4th taint of the same worker inside the window
-					// defers: steal pressure that keeps coming back
-					// despite repeated taints is hypervisor-side, and
-					// re-patching the same node every sweep is churn
-					// the breaker stops. Defer semantics: log, skip —
-					// the check still FAILs below so the pressure
-					// stays visible; never an error. The untaint path
-					// clears the history the moment the steal clears.
-					// The module label is the check's canonical name
-					// (the const), not Deps.Name — the latter is the
-					// harness's shared name in tests.
-					if allowed, reason := heal.TryAcquireTarget(
-						CheckNameCPUStealTaintSync, n.Name, now); !allowed {
-						log.Info("DEFER: heal target circuit open — taint skipped",
-							"node", n.Name, "reason", reason)
-					} else if err := kube.TaintNode(ctx, p.CS, n.Name,
-						kube.TaintCPUSteal, cpuStealTaintValue,
-						corev1.TaintEffectPreferNoSchedule); err != nil {
-						metrics.IncError(p.Name)
-						log.Error(err, "cpu-steal taint failed", "node", n.Name)
-					} else {
-						p.InvalidateNodes(ctx) // node taints changed
-						tainted = true
-						log.Info("TAINT: worker under sustained CPUStealPressure — PreferNoSchedule",
-							"node", n.Name, "for", age.Truncate(time.Minute))
+					// The taint is a scheduling mutation on a live
+					// node — the shared heal gate (cooldown →
+					// maintenance mutex → fleet budget) runs BEFORE
+					// the per-target circuit so a maintenance hold
+					// defers without burning breaker credit.
+					proceed, unverifiable := p.HealAllowed(ctx, log, &p.Heals,
+						CheckNameCPUStealTaintSync+"/taint/"+n.Name,
+						cpuStealTaintCool, now)
+					switch {
+					case unverifiable:
+						rep.InfraErr(fmt.Errorf(
+							"maintenance verdict unverifiable — cpu-steal taint %s deferred", n.Name))
+					case !proceed:
+						log.Info("heal gate deferred cpu-steal taint",
+							"node", n.Name)
+					default:
+						// Per-target non-convergent circuit breaker — the
+						// 4th taint of the same worker inside the window
+						// defers: steal pressure that keeps coming back
+						// despite repeated taints is hypervisor-side, and
+						// re-patching the same node every sweep is churn
+						// the breaker stops. Defer semantics: log, skip —
+						// the check still FAILs below so the pressure
+						// stays visible; never an error. The untaint path
+						// clears the history the moment the steal clears.
+						// The module label is the check's canonical name
+						// (the const), not Deps.Name — the latter is the
+						// harness's shared name in tests.
+						if allowed, reason := heal.TryAcquireTarget(
+							CheckNameCPUStealTaintSync, n.Name, now); !allowed {
+							// The budget grant buys a mutation —
+							// the circuit denial means none happens.
+							heal.RefundGrant(now)
+							log.Info("DEFER: heal target circuit open — taint skipped",
+								"node", n.Name, "reason", reason)
+						} else if err := kube.TaintNode(ctx, p.CS, n.Name,
+							kube.TaintCPUSteal, cpuStealTaintValue,
+							corev1.TaintEffectPreferNoSchedule); err != nil {
+							metrics.IncError(p.Name)
+							log.Error(err, "cpu-steal taint failed", "node", n.Name)
+						} else {
+							p.InvalidateNodes(ctx) // node taints changed
+							// Stamp the per-target cooldown — without
+							// it cpuStealTaintCool never engages and
+							// the node re-taints every sweep.
+							p.Heals.Stamp(CheckNameCPUStealTaintSync+"/taint/"+n.Name, now)
+							tainted = true
+							log.Info("TAINT: worker under sustained CPUStealPressure — PreferNoSchedule",
+								"node", n.Name, "for", age.Truncate(time.Minute))
+						}
 					}
 				}
 			}

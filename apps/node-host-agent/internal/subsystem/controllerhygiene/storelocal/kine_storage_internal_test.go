@@ -103,15 +103,20 @@ exit 1`)
 		for _, want := range []string{
 			"DB:/db/state.db",
 			"SQL:PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);",
-			// sqlite3 implements no sd_notify protocol, so the
-			// daemon env rides through unscrubbed — only the
-			// systemctl/journalctl paths needed the drop.
-			"NS:set",
-			"WP:set",
 			"KEEP:set",
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("missing %q in: %s", want, err)
+			}
+		}
+		// The shared hostexec runners scrub the sd_notify
+		// variables unconditionally — no helper child may
+		// sd_notify back into OUR unit, and sqlite3 never
+		// reads them anyway.
+		for _, notWant := range []string{"NS:set", "WP:set"} {
+			if strings.Contains(err.Error(), notWant) {
+				t.Fatalf("sd_notify env leaked to child: %q in %s",
+					notWant, err)
 			}
 		}
 	})

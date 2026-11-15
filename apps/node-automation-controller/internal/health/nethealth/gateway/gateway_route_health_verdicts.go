@@ -11,7 +11,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -212,7 +211,7 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 			}
 			c.workloads[ns] = append(c.workloads[ns], routeWorkload{
 				templateLabels: d.Spec.Template.Labels,
-				annotations:    d.Annotations,
+				annotations:    kube.EffectiveAnnos(ctx, d),
 				replicas:       d.Spec.Replicas})
 		}
 	}
@@ -229,7 +228,7 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 			}
 			c.workloads[ns] = append(c.workloads[ns], routeWorkload{
 				templateLabels: s.Spec.Template.Labels,
-				annotations:    s.Annotations,
+				annotations:    kube.EffectiveAnnos(ctx, s),
 				replicas:       s.Spec.Replicas})
 		}
 	}
@@ -245,7 +244,10 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 		// NoMatch = the cluster has no Argo Rollouts CRD — there are
 		// simply no rollout workloads to exempt, the same verdict a
 		// successful empty list produces. Not an infra failure.
-		if !meta.IsNoMatchError(err) {
+		// IsCRDAbsent (not meta.IsNoMatchError) also covers the
+		// fake-dynamic-client "no kind registered" shape the
+		// CRD-aware test client produces.
+		if !kube.IsCRDAbsent(err) {
 			metrics.IncError(p.Name)
 			log.Info("WARN: gateway route health — rollout census failed, downscaler verdict off",
 				"namespace", ns, "error", err)
@@ -266,7 +268,7 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 		}
 		c.workloads[ns] = append(c.workloads[ns], routeWorkload{
 			templateLabels: tl,
-			annotations:    r.GetAnnotations(),
+			annotations:    kube.EffectiveAnnos(ctx, r),
 			replicas:       replicas})
 	}
 }

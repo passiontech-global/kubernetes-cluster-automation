@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -66,7 +67,11 @@ func mkPVC(t *testing.T, base, name string, age time.Duration) string {
 func mkPV(name, phase string, reclaim corev1.PersistentVolumeReclaimPolicy,
 	claimNS, claimName string) *corev1.PersistentVolume {
 	pv := &corev1.PersistentVolume{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			UID:             types.UID("uid-" + name),
+			ResourceVersion: "1",
+		},
 		Spec: corev1.PersistentVolumeSpec{
 			PersistentVolumeReclaimPolicy: reclaim,
 		},
@@ -675,6 +680,7 @@ func TestMountsFileUnreadableSkips(t *testing.T) {
 
 func TestReleasedPVPatchFailsSkips(t *testing.T) {
 	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
+	pv.Finalizers = []string{"kubernetes.io/pv-protection"}
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
 	cs := nhatestutil.FakeKube(pv, other)

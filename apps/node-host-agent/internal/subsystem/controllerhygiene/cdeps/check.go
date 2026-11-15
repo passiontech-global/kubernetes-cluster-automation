@@ -129,6 +129,13 @@ const (
 	// ClkTck is getconf CLK_TCK on x86_64 Linux — the /proc stat
 	// starttime unit the pid-age math needs.
 	ClkTck = 100.0
+	// K0sControllerCgroupSubstr scopes the comm→pid lookups that
+	// feed kills and oom_score_adj writes: every control-plane
+	// child (kine, kube-apiserver, konnectivity-server, etcd, ...)
+	// lives under the k0scontroller.service cgroup, so a same-named
+	// process outside it — a foreign daemon or a recycled pid —
+	// must never inherit the check's trust.
+	K0sControllerCgroupSubstr = "k0scontroller"
 	// tcpStateListen is the hex st column of /proc/net/tcp(6) rows
 	// in LISTEN — excluded from the kine conn-spiral count.
 	TCPStateListen = "0A"

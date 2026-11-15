@@ -33,6 +33,11 @@ var (
 	// id (pkill -f parity). Gate the id first, or a stray dir named
 	// "kubelet" would make that scan SIGKILL the kubelet itself.
 	hexTaskIDRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	// podCgroupSubstr scopes the init-kill identity check: a
+	// container init lives under the kubepods cgroup tree, so a
+	// pid recycled onto an unrelated host process fails the check
+	// and is never signalled.
+	podCgroupSubstr = "kubepods"
 )
 
 // runtimeKillComm reports whether comm names a containerd runtime
@@ -129,12 +134,30 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			killCapHit = true
 			break
 		}
-		argv := c.d.Proc.Cmdline(pid)
-		joined := strings.Join(argv, " ")
-		if !strings.Contains(joined, "containerd-shim-runc-v2") {
+		// Comm pre-filter: only containerd-shim* pids can scope —
+		// the prefix matches dzShimScope's own gate, so D/Z-state
+		// shims still reach the fd-table fallback while every
+		// other pid skips the mm-backed cmdline read. An
+		// unidentifiable comm falls through to the old path.
+		if comm, known := procCommKnown(e, c.d, pid); known &&
+			!strings.HasPrefix(comm, "containerd-shim") {
 			continue
 		}
-		ns, sid, inScope := ctrShimScope(c.d, argv)
+		argv := c.d.Proc.Cmdline(pid)
+		joined := strings.Join(argv, " ")
+		var ns, sid string
+		var inScope bool
+		switch {
+		case strings.Contains(joined, "containerd-shim-runc-v2"):
+			ns, sid, inScope = ctrShimScope(c.d, argv)
+		case len(argv) == 0:
+			// D/Z-state (or raced-exit) procs return no argv —
+			// cmdline is mm-backed and the read would hang on
+			// mmap_lock. A wedged orphan shim is exactly the case
+			// this reaper must still see: comm + the shim's own
+			// fd table replace the unreadable cmdline.
+			ns, sid, inScope = dzShimScope(c.d, pid)
+		}
 		if !inScope {
 			continue
 		}
@@ -265,15 +288,25 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// dirs re-confirm for another 5m forever.
 		c.d.State.ClearBudget("wedged-seen-" + id)
 		// Live init with missing log.json → SIGKILL it first so the
-		// shim can drain and exit (shell's kill -9 init).
+		// shim can drain and exit (shell's kill -9 init). The
+		// cgroup check proves the pid still IS a pod container
+		// init: init.pid is written once at task create, so a
+		// recycled pid could name an unrelated host process —
+		// signalling it would be a false-positive kill.
 		if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err == nil {
 			if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil &&
 				pid > 0 && c.d.PidLive(pid) {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
-				if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
+				if !c.d.Proc.CgroupContains(pid, podCgroupSubstr) {
 					c.d.State.AppendLog(fmt.Sprintf(
-						"suspect: kill init %d of %.12s failed: %v", pid, id, err))
+						"suspect: init pid=%d of %.12s not in a pod cgroup — kill refused (recycled pid?)",
+						pid, id))
+				} else {
+					c.d.State.AppendLog(fmt.Sprintf(
+						"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
+					if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
+						c.d.State.AppendLog(fmt.Sprintf(
+							"suspect: kill init %d of %.12s failed: %v", pid, id, err))
+					}
 				}
 			}
 		}

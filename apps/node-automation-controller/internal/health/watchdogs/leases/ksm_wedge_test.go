@@ -201,8 +201,8 @@ func TestKSMWedgeInconclusiveKeepsTracking(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	// Arm the wedge first — the pod is one sweep past first-seen.
-	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
-		return leaseReasonKSMUnauthorized, nil
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, time.Time, time.Time, error) {
+		return leaseReasonKSMUnauthorized, time.Time{}, time.Time{}, nil
 	}
 	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
 		t.Fatalf("first wedge sighting must pass: %+v", res)
@@ -215,8 +215,8 @@ func TestKSMWedgeInconclusiveKeepsTracking(t *testing.T) {
 	// The read goes inconclusive past the window — the pod survives
 	// AND the tracking is not pruned (a clear would re-arm the
 	// window for a signature that was never proven resolved).
-	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
-		return "", errors.New("log tail unreachable")
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, time.Time, time.Time, error) {
+		return "", time.Time{}, time.Time{}, errors.New("log tail unreachable")
 	}
 	probetest.FreezeNow(p.Deps, base.Add(ksmWedgeMinAge+time.Minute))
 	res := ch.Run(probetest.SweepCtx(ctx))
@@ -247,8 +247,8 @@ func TestKSMWedgeResolveClearsPersistedStamp(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
-	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
-		return "", nil // clean tail AND a quiet counter — resolved
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, time.Time, time.Time, error) {
+		return "", time.Time{}, time.Time{}, nil // clean tail AND a quiet counter — resolved
 	}
 
 	res := ch.Run(probetest.SweepCtx(ctx))
@@ -281,8 +281,8 @@ func TestKSMWedgePodListErrorIsInfraAndCarries(t *testing.T) {
 	cs := fake.NewSimpleClientset(pod)
 	p, ch := leaseGuardProber(cs)
 	probetest.FreezeNow(p.Deps, base)
-	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
-		return leaseReasonKSMUnauthorized, nil
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, time.Time, time.Time, error) {
+		return leaseReasonKSMUnauthorized, time.Time{}, time.Time{}, nil
 	}
 	// Seed the window already past minAge so this sweep emits.
 	ch.wedgeSeen.Observe("monitoring/kube-state-metrics-carry",
@@ -375,7 +375,7 @@ func TestKSMWedgeMarkerPrecision(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := fake.NewSimpleClientset(pod)
 			cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(tc.log, nil))
-			reason, err := ksmLogTailWedge(ctx, cs, pod)
+			reason, _, _, err := ksmLogTailWedge(ctx, cs, pod)
 			if err != nil {
 				t.Fatalf("ksmLogTailWedge err = %v", err)
 			}
@@ -394,7 +394,7 @@ func TestKSMWedgeMarkerPrecision(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cs := fake.NewSimpleClientset(pod)
 			cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(tc.log, nil))
-			reason, err := ksmLogTailWedge(ctx, cs, pod)
+			reason, _, _, err := ksmLogTailWedge(ctx, cs, pod)
 			if err != nil {
 				t.Fatalf("ksmLogTailWedge err = %v", err)
 			}
@@ -418,8 +418,8 @@ func TestKSMWedgeUnownedPodNotBounced(t *testing.T) {
 	cs := fake.NewSimpleClientset(pod)
 	p, ch := leaseGuardProber(cs)
 	probetest.FreezeNow(p.Deps, base)
-	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
-		return leaseReasonKSMUnauthorized, nil
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, time.Time, time.Time, error) {
+		return leaseReasonKSMUnauthorized, time.Time{}, time.Time{}, nil
 	}
 	t.Cleanup(func() {
 		controllerLeaseUnhealthyGauge.DeleteLabelValues(
@@ -460,8 +460,8 @@ func TestKSMWedgeCooldownFollowsController(t *testing.T) {
 	cs := fake.NewSimpleClientset(podA)
 	p, ch := leaseGuardProber(cs)
 	probetest.FreezeNow(p.Deps, base)
-	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
-		return leaseReasonKSMUnauthorized, nil
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, time.Time, time.Time, error) {
+		return leaseReasonKSMUnauthorized, time.Time{}, time.Time{}, nil
 	}
 	t.Cleanup(func() {
 		controllerLeaseUnhealthyGauge.DeleteLabelValues(

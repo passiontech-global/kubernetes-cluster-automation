@@ -238,7 +238,7 @@ func FingerprintMatches(pin string, key ssh.PublicKey) bool {
 // FingerprintMatches.
 func checkHostKeyFingerprint(pin string, key ssh.PublicKey) error {
 	if !FingerprintMatches(pin, key) {
-		return fmt.Errorf("sshclient: host key fingerprint mismatch: got SHA256:%s, want pinned %s",
+		return fmt.Errorf("sshclient: host key fingerprint mismatch: got %s, want pinned %s",
 			ssh.FingerprintSHA256(key), pin)
 	}
 	return nil

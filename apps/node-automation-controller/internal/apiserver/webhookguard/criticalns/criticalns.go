@@ -48,8 +48,14 @@ var webhookHeartbeatResources = map[string]bool{
 	"pods/status":   true,
 	"pods/eviction": true,
 	"leases":        true,
-	"*":             true,
-	"*/*":           true,
+	// Resource wildcards: "pods/*" covers every pod subresource
+	// (status AND eviction), "nodes/*" every node subresource —
+	// a webhook listing them intercepts the heartbeat path without
+	// ever naming a heartbeat literal.
+	"pods/*":  true,
+	"nodes/*": true,
+	"*":       true,
+	"*/*":     true,
 }
 
 // heartbeatClusterScopedResources are the heartbeat hits a
@@ -62,8 +68,51 @@ var webhookHeartbeatResources = map[string]bool{
 var heartbeatClusterScopedResources = map[string]bool{
 	"nodes/status":  true,
 	"pods/eviction": true,
-	"*":             true,
-	"*/*":           true,
+	// "pods/*" covers pods/eviction (unconditional) and "nodes/*"
+	// covers nodes/status — both wildcards therefore carry an
+	// unconditional heartbeat hit even though they also cover
+	// selector-dependent siblings.
+	"pods/*":  true,
+	"nodes/*": true,
+	"*":       true,
+	"*/*":     true,
+}
+
+// heartbeatNamespacedResources are the heartbeat literals whose
+// underlying resources are namespaced — pods and coordination leases
+// live in a namespace, so a Cluster-scoped rule can NEVER intercept
+// them (flagging one would be a false positive: the rule's scope
+// already makes the exposure impossible).
+var heartbeatNamespacedResources = map[string]bool{
+	"pods/status":   true,
+	"pods/eviction": true,
+	"leases":        true,
+	"pods/*":        true,
+}
+
+// heartbeatClusterResources are the cluster-scoped heartbeat
+// literals — nodes are cluster-scoped, so a Namespaced-scoped rule
+// can never intercept them.
+var heartbeatClusterResources = map[string]bool{
+	"nodes/status": true,
+	"nodes/*":      true,
+}
+
+// heartbeatScopeAllows reports whether a rule carrying the given
+// Scope can actually intercept the heartbeat literal. Scope nil or
+// "*" covers both scopes; "Cluster" rules only see cluster-scoped
+// objects and "Namespaced" rules only namespaced ones.
+func heartbeatScopeAllows(scope *admissionv1.ScopeType, res string) bool {
+	if scope == nil || *scope == admissionv1.AllScopes {
+		return true
+	}
+	switch *scope {
+	case admissionv1.ClusterScope:
+		return !heartbeatNamespacedResources[res]
+	case admissionv1.NamespacedScope:
+		return !heartbeatClusterResources[res]
+	}
+	return true
 }
 
 // CriticalNSEnforceEnabled reads the critical-ns auto-patch gate EVERY
@@ -283,7 +332,13 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 		var merges []map[string]any
 		var queued []guardstate.WebhookView // webhooks whose exclusion the patch carries
 		for _, w := range cfg.Hooks {
-			if !guardstate.FailClosed(w.FailurePolicy) || !matchesCriticalNS(w.NamespaceSelector) {
+			// A webhook whose rules are ALL cluster-scoped never
+			// consults its namespaceSelector — the missing
+			// exclusion is not a finding and the patch would be a
+			// no-op.
+			if !guardstate.FailClosed(w.FailurePolicy) ||
+				!matchesCriticalNS(w.NamespaceSelector) ||
+				allClusterScopedRules(w.Rules) {
 				continue
 			}
 			if !enforce || criticalNSPatchAllowlist[cfg.Name+"/"+w.Name] {
@@ -326,6 +381,11 @@ func heartbeatRuleHits(rule admissionv1.RuleWithOperations) []string {
 		if !webhookHeartbeatResources[res] {
 			continue
 		}
+		// The rule's Scope bounds what it can intercept — a hit
+		// outside the scope is impossible, not an exposure.
+		if !heartbeatScopeAllows(rule.Scope, res) {
+			continue
+		}
 		switch {
 		case res == "leases":
 			if !slices.Contains(rule.APIGroups, "coordination.k8s.io") {
@@ -334,6 +394,9 @@ func heartbeatRuleHits(rule admissionv1.RuleWithOperations) []string {
 		case res == "*" || res == "*/*":
 			// Wildcard resources cover every group by definition.
 		default:
+			// pods/*, nodes/* and the typed literals are all
+			// core-group resources — a wildcard APIGroups ["*"]
+			// must not claim them for a foreign group.
 			if !slices.Contains(rule.APIGroups, "") {
 				continue
 			}
@@ -341,6 +404,23 @@ func heartbeatRuleHits(rule admissionv1.RuleWithOperations) []string {
 		hits = append(hits, res)
 	}
 	return hits
+}
+
+// allClusterScopedRules reports whether every admission rule is
+// cluster-scoped — such a webhook's namespaceSelector is never
+// consulted (cluster-scoped objects carry no namespace), so a
+// missing critical-namespace exclusion is not a finding for it and
+// patching the selector would change nothing.
+func allClusterScopedRules(rules []admissionv1.RuleWithOperations) bool {
+	if len(rules) == 0 {
+		return false
+	}
+	for _, r := range rules {
+		if r.Scope == nil || *r.Scope != admissionv1.ClusterScope {
+			return false
+		}
+	}
+	return true
 }
 
 // auditHeartbeat audits live Mutating/Validating admission

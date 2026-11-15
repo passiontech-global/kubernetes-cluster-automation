@@ -55,9 +55,11 @@ func HasTaint(taints []corev1.Taint, key string) bool {
 	return false
 }
 
-// nodeCordonActiveMaxAge is how old a cordon may be before it reads as
-// deliberate static state rather than a drain in flight.
-const nodeCordonActiveMaxAge = 45 * time.Minute
+// NodeCordonActiveMaxAge is how old a cordon may be before it reads
+// as deliberate static state rather than a drain in flight. Exported
+// so the maintenance Scope resolver can ask for the verdict's 45m
+// window while the stamp path keeps its wider 2h horizon.
+const NodeCordonActiveMaxAge = 45 * time.Minute
 
 // NodeActivelyCordoned reports whether the node is cordoned AND the
 // cordon looks like a drain in flight — spec.unschedulable plus the
@@ -75,7 +77,7 @@ const nodeCordonActiveMaxAge = 45 * time.Minute
 // exactly while the cluster is sick (node-hang-precordon — self-inflicted
 // maintenance lockout).
 func NodeActivelyCordoned(n *corev1.Node, now time.Time) bool {
-	return NodeCordonedFresh(n, now, nodeCordonActiveMaxAge)
+	return NodeCordonedFresh(n, now, NodeCordonActiveMaxAge)
 }
 
 // NodeCordonedFresh is NodeActivelyCordoned with the freshness window

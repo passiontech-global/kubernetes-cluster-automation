@@ -7,10 +7,12 @@
 package hoststate
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
@@ -19,15 +21,21 @@ import (
 // --- epoch files ---
 
 // Epoch reads an epoch file — absent/garbage → 0 (rate_ok parity:
-// non-numeric content collapses to 0).
+// non-numeric content collapses to 0). The RAM fallback entry (a
+// write that hit ENOSPC/EROFS) counts as max(disk, ram) so state
+// written while the disk was full stays visible in-process.
 func (s *Store) Epoch(path string) int64 {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0
+	var v int64
+	if data, err := os.ReadFile(path); err == nil {
+		if n, perr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); perr == nil {
+			v = n
+		}
 	}
-	v, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil {
-		return 0
+	s.shared.ramMu.RLock()
+	ram := s.shared.ramEpochs[filepath.Clean(path)]
+	s.shared.ramMu.RUnlock()
+	if ram > v {
+		v = ram
 	}
 	return v
 }
@@ -37,10 +45,33 @@ func (s *Store) Epoch(path string) int64 {
 // leading dot keeps the tmp name out of hostmetrics' state-* scan.
 func (s *Store) WriteEpochFile(path string, epoch int64) bool {
 	if err := writeEpochFile(path, epoch); err != nil {
+		// ENOSPC/EROFS: the disk cannot take the write but the
+		// state still has to work in-process — park the epoch in
+		// the RAM fallback table so Epoch/Exists keep answering.
+		// Process restart loses it (same as before), but the
+		// running agent's latches/counters/budgets do not flap.
+		if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
+			key := filepath.Clean(path)
+			s.shared.ramMu.Lock()
+			if s.shared.ramEpochs == nil {
+				s.shared.ramEpochs = map[string]int64{}
+			}
+			s.shared.ramEpochs[key] = epoch
+			s.shared.ramMu.Unlock()
+			s.log().Warn("state file write failed — RAM fallback armed",
+				"path", path, "error", err)
+			return true
+		}
 		s.log().Warn("state file write failed",
 			"path", path, "error", err)
 		return false
 	}
+	// Disk write landed — the RAM entry (if any) is stale and
+	// must not shadow newer disk state via the max() read.
+	key := filepath.Clean(path)
+	s.shared.ramMu.Lock()
+	delete(s.shared.ramEpochs, key)
+	s.shared.ramMu.Unlock()
 	return true
 }
 
@@ -167,6 +198,9 @@ func (s *Store) ClearBudget(name string) {
 			"name", name, "error", err)
 	}
 	delete(s.shared.lastSpent, rateSpendKey(filepath.Clean(s.Dir), name))
+	s.shared.ramMu.Lock()
+	delete(s.shared.ramEpochs, filepath.Join(s.Dir, name))
+	s.shared.ramMu.Unlock()
 	s.shared.mu.Unlock()
 }
 
@@ -192,7 +226,11 @@ func (s *Store) RateTrySpend(name string, interval time.Duration) bool {
 // returns (false, true) once minAge has elapsed, or (false, false)
 // while still cooling down.
 func (s *Store) ConfirmMarker(marker string, minAge time.Duration) (firstSeen, confirmed bool) {
-	if _, err := os.Stat(filepath.Join(s.Dir, marker)); err != nil {
+	// Epoch (not os.Stat) so a marker whose disk write hit
+	// ENOSPC/EROFS still counts as seen — the RAM fallback table is
+	// part of the same state contract, and os.Stat alone would
+	// report first-seen again and double-spend the marker.
+	if s.Epoch(filepath.Join(s.Dir, marker)) == 0 {
 		s.RateSpend(marker)
 		return true, false
 	}

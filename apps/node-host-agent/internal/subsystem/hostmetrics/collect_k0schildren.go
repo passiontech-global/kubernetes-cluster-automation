@@ -37,14 +37,32 @@ var descK0sChildrenRSS = prometheus.NewDesc(
 	"RSS bytes per child process of k0scontroller.service (summed when several pids share a label).",
 	[]string{"node", "child"}, nil)
 
+// procMMBlocked reports whether the pid dir's stat state forbids
+// reading mm-backed files: cmdline/environ sit behind
+// mm->mmap_lock, so a read on a D-state child wedges the collect
+// (and every scrape queued behind it) forever; a zombie already
+// released its mm. An unreadable stat fails OPEN — the file read
+// then decides, same as before the guard.
+func procMMBlocked(procDir string) bool {
+	b, err := os.ReadFile(filepath.Join(procDir, "stat"))
+	if err != nil {
+		return false
+	}
+	state, _ := parseStatHead(b)
+	return state == 'D' || state == 'Z'
+}
+
 // k0sChildLabel resolves a pid's {child} label from argv0's
 // basename, falling back to comm — comm is TASK_COMM_LEN-truncated
 // ("kube-controller-manager" reads "kube-controller"), so argv0 is
-// the precise source.
+// the precise source. A D/Z-state pid skips the cmdline read
+// entirely (mm->mmap_lock) and resolves via comm.
 func k0sChildLabel(procDir string) string {
-	if b, err := os.ReadFile(filepath.Join(procDir, "cmdline")); err == nil {
-		if i := strings.IndexByte(string(b), 0); i > 0 {
-			return k0sChildLabels[filepath.Base(string(b[:i]))]
+	if !procMMBlocked(procDir) {
+		if b, err := os.ReadFile(filepath.Join(procDir, "cmdline")); err == nil {
+			if i := strings.IndexByte(string(b), 0); i > 0 {
+				return k0sChildLabels[filepath.Base(string(b[:i]))]
+			}
 		}
 	}
 	if b, err := os.ReadFile(filepath.Join(procDir, "comm")); err == nil {

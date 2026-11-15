@@ -218,7 +218,7 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 	// Cheap pass first: any cluster carrying the annotation at all?
 	var fenced []*unstructured.Unstructured
 	for _, cr := range clusters {
-		if instances := cnpgFencedInstanceList(cr); len(instances) > 0 {
+		if instances := cnpgFencedInstanceList(ctx, cr); len(instances) > 0 {
 			fenced = append(fenced, cr)
 		}
 	}
@@ -260,7 +260,7 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 
 	for _, cr := range fenced {
 		ns, name := cr.GetNamespace(), cr.GetName()
-		instances := cnpgFencedInstanceList(cr)
+		instances := cnpgFencedInstanceList(ctx, cr)
 
 		// Detection: the signature is the annotation itself —
 		// persist minAge like the other reason keys.
@@ -345,10 +345,11 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 }
 
 // cnpgFencedInstanceList parses the fencedInstances annotation into
-// instance names — empty list when absent or blank.
-func cnpgFencedInstanceList(cr *unstructured.Unstructured) []string {
-	raw, _ := kube.NestedString(
-		cr.Object, "metadata", "annotations", cnpgFencedInstancesAnno)
+// instance names — empty list when absent or blank. Reads through
+// EffectiveAnno so a fence/unfence patch recorded on the sweep
+// overlay earlier this sweep is visible to later checks.
+func cnpgFencedInstanceList(ctx context.Context, cr *unstructured.Unstructured) []string {
+	raw := kube.EffectiveAnno(ctx, cr, cnpgFencedInstancesAnno)
 	var out []string
 	for s := range strings.SplitSeq(raw, ",") {
 		if s = strings.TrimSpace(s); s != "" {

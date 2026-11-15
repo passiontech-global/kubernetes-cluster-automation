@@ -21,7 +21,7 @@ type boundMethod struct {
 var methodNames = map[string]bool{
 	"items": true, "append": true, "keys": true, "values": true,
 	"get": true, "endswith": true, "startswith": true, "split": true,
-	"strip": true, "index": true, "pop": true,
+	"strip": true, "index": true, "pop": true, "extend": true,
 }
 
 func getAttr(v any, key string) any {
@@ -55,7 +55,7 @@ func getAttr(v any, key string) any {
 			return boundMethod{v, key}
 		}
 		return Undefined{key}
-	case []any:
+	case []any, []string:
 		if methodNames[key] {
 			return boundMethod{v, key}
 		}
@@ -87,6 +87,18 @@ func getIndex(v any, k any) (any, error) {
 		}
 		return getIndex(t.V, k)
 	case []any:
+		i, ok := ToInt(k)
+		if !ok {
+			return nil, fmt.Errorf("non-integer index %v", k)
+		}
+		if i < 0 {
+			i += int64(len(t))
+		}
+		if i < 0 || i >= int64(len(t)) {
+			return Undefined{"index"}, nil
+		}
+		return t[i], nil
+	case []string:
 		i, ok := ToInt(k)
 		if !ok {
 			return nil, fmt.Errorf("non-integer index %v", k)
@@ -143,8 +155,29 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 			return &List{pairs}, nil
 		}
 	case "append":
+		if _, isStrs := m.obj.([]string); isStrs {
+			return nil, errors.New("append: cannot mutate a []string value")
+		}
 		if l, ok := m.obj.(*List); ok && l != nil {
+			if len(l.V)+len(args) > maxSeqElems {
+				return nil, fmt.Errorf("append: list exceeds %d elements", maxSeqElems)
+			}
 			l.V = append(l.V, args...)
+			return nil, nil
+		}
+	case "extend":
+		if len(args) != 1 {
+			return nil, errors.New("extend: expected exactly one iterable argument")
+		}
+		if _, isStrs := m.obj.([]string); isStrs {
+			return nil, errors.New("extend: cannot mutate a []string value")
+		}
+		if l, ok := m.obj.(*List); ok && l != nil {
+			exts := ToIter(args[0])
+			if len(l.V)+len(exts) > maxSeqElems {
+				return nil, fmt.Errorf("extend: list exceeds %d elements", maxSeqElems)
+			}
+			l.V = append(l.V, exts...)
 			return nil, nil
 		}
 	case "keys":
@@ -205,6 +238,9 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 		}
 		return nil, errors.New("index: not found")
 	case "pop":
+		if _, isStrs := m.obj.([]string); isStrs {
+			return nil, errors.New("pop: cannot mutate a []string value")
+		}
 		if l, ok := m.obj.(*List); ok && l != nil {
 			if len(l.V) == 0 {
 				return nil, errors.New("pop: empty list")
@@ -225,7 +261,7 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 				return nil, fmt.Errorf("pop: index %d out of range", i)
 			}
 			v := l.V[i]
-			l.V = append(l.V[:i], l.V[i+1:]...)
+			l.V = slices.Delete(l.V, int(i), int(i)+1)
 			return v, nil
 		}
 	}
@@ -265,7 +301,11 @@ func deepEq(l, r any) bool {
 // short-circuit true so `l == l` stays true even for a
 // self-referential list.
 func deepEqAt(l, r any, depth int, steps *int) bool {
-	if depth > walkMaxDepth || stepBudgetExhausted(steps) {
+	// stepBudgetExhausted FIRST: `depth > max || budget` short-
+	// circuits the counter on depth-exceeded calls, leaving a
+	// wide structure at the cap unbounded — every call must burn
+	// a step no matter which bail fires.
+	if stepBudgetExhausted(steps) || depth > walkMaxDepth {
 		return false
 	}
 	switch lt := l.(type) {
@@ -318,6 +358,24 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 	}
 	if isMappingValue(r) {
 		return false
+	}
+	// []string is the Go-native string-slice shape — normalize to
+	// []any once so sequence equality covers all three list
+	// representations element-wise instead of falling to the
+	// Stringify compare.
+	if ss, ok := l.([]string); ok {
+		cv := make([]any, len(ss))
+		for i, x := range ss {
+			cv[i] = x
+		}
+		l = cv
+	}
+	if ss, ok := r.([]string); ok {
+		cv := make([]any, len(ss))
+		for i, x := range ss {
+			cv[i] = x
+		}
+		r = cv
 	}
 	switch lt := l.(type) {
 	case []any:

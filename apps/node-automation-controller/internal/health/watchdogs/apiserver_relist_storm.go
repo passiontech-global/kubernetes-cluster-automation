@@ -324,6 +324,9 @@ func (p *apiserverRelistStormCheck) suspendOptedInCronJobs(ctx context.Context,
 	// storm sweep's retry for the whole window.
 	if patched > 0 {
 		p.Heals.Stamp(ck, now)
+		// spec.suspend landed — later checks must see the patched
+		// CronJobs, not the pre-patch census.
+		p.InvalidateCronJobs(ctx)
 	}
 }
 
@@ -366,6 +369,11 @@ func (p *apiserverRelistStormCheck) restoreSuspendedCronJobs(ctx context.Context
 		// check must not resurrect the cleared stamp off the
 		// pre-patch snapshot.
 		kube.RecordAnnoPatch(ctx, cj, patch)
+	}
+	if ok {
+		// Every restore patch landed — refresh the CronJob census
+		// for the checks still to run this sweep.
+		p.InvalidateCronJobs(ctx)
 	}
 	return ok
 }

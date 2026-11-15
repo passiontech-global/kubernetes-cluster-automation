@@ -100,6 +100,17 @@ func ResolveEndpoint(override, fallbackURL string) (string, error) {
 	return url.JoinPath(u.Scheme+"://"+u.Host+mount, "api", "v1", "query")
 }
 
+// TransportError marks a failure that never produced an HTTP
+// response — dial/TLS/timeout errors from Do and mid-body read
+// failures. Server-side outcomes (non-200 status, oversized or
+// undecodable body, status!="success") are NOT transport errors:
+// they prove Prometheus answered, so the per-sweep circuit breaker
+// must not count them toward "Prometheus unreachable".
+type TransportError struct{ err error }
+
+func (e *TransportError) Error() string { return e.err.Error() }
+func (e *TransportError) Unwrap() error { return e.err }
+
 // InstantQuery runs query against endpoint (a full /api/v1/query
 // URL — see ResolveEndpoint) and returns the vector samples. A
 // non-200 status or a status!="success" envelope is an error;
@@ -128,7 +139,8 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("prometheus query: %w", err)
+		return nil, fmt.Errorf("prometheus query: %w",
+			&TransportError{err: err})
 	}
 	defer func() {
 		// Drain before Close so the transport can reuse the
@@ -138,7 +150,8 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 	}()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read prometheus response: %w", err)
+		return nil, fmt.Errorf("read prometheus response: %w",
+			&TransportError{err: err})
 	}
 	if len(body) > maxResponseBytes {
 		return nil, fmt.Errorf("prometheus response exceeds %d MiB limit — "+

@@ -95,7 +95,7 @@ func TestFluentBitRollerSecretAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RequeueAfter != 30*time.Minute {
+	if res.RequeueAfter < 27*time.Minute || res.RequeueAfter >= 33*time.Minute {
 		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -141,7 +141,7 @@ func TestFluentBitRollerRollsOnDrift(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res.RequeueAfter != 30*time.Minute {
+			if res.RequeueAfter < 27*time.Minute || res.RequeueAfter >= 33*time.Minute {
 				t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
 			}
 
@@ -575,7 +575,7 @@ func TestFluentBitRollerCachedDriftConfirmSkipsSettled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter != 30*time.Minute {
+	if res.RequeueAfter < 27*time.Minute || res.RequeueAfter >= 33*time.Minute {
 		t.Fatalf("expected 30m requeue, got %s", res.RequeueAfter)
 	}
 	if dsPatches != 0 {

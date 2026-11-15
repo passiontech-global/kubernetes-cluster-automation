@@ -218,9 +218,11 @@ func (p *Probe) pgHygiene(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string)) {
 	h := &hygieneResult{}
 	res.hyg = h
-	p.hygieneIdleInTx(ctx, pg, user, pass, h, note)
+	// The merged scalar census runs FIRST — hygieneDeadTuple's
+	// vacuum gate and hygieneWAL's disk-ratio read consume the
+	// fields it fills (was five separate psql execs).
+	p.hygieneScalarStats(ctx, pg, user, pass, h, note)
 	p.hygieneDeadTuple(ctx, pg, user, pass, h, note)
-	p.hygieneXID(ctx, pg, user, pass, h, note)
 	p.hygieneWAL(ctx, pg, user, pass, h, note)
 	p.hygieneCatalog(ctx, pg, user, pass, h, note)
 	p.hygienePreparedXacts(ctx, pg, user, pass, h, note)

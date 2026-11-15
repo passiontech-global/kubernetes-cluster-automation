@@ -226,19 +226,24 @@ func sqlite3Host(dbPath string) (*hostexec.Runner, string) {
 		hr, host = "/host", "/"+rest
 	}
 	return hostexec.New(hostexec.Config{HostRoot: hr,
-		Timeout: kineCheckpointBudget}), host
+		Timeout: kineCheckpointBudget, ScrubSystemdEnv: true}), host
 }
 
 // sqlite3Missing reports whether an exec failure means "no sqlite3
-// binary" — the unwrapped standalone case surfaces exec.ErrNotFound
-// ("executable file not found in $PATH"); the nsenter-wrapped
-// DaemonSet case surfaces the child's own ENOENT text ("failed to
-// execute sqlite3: No such file or directory"). A missing DB file
-// does NOT match — sqlite3 runs and prints "unable to open" instead.
-func sqlite3Missing(err error) bool {
+// binary on the host" — checked against BOTH the error and the
+// combined output: the unwrapped standalone case surfaces
+// exec.ErrNotFound ("executable file not found in $PATH") while
+// the nsenter-wrapped DaemonSet case folds the child's own
+// "sqlite3: not found"/ENOENT text into out on stderr — the Go
+// error only carries the exit status there, so an output-only
+// match is the common real-world shape. A missing DB file does
+// NOT match — sqlite3 runs and prints "unable to open" instead.
+func sqlite3Missing(err error, out string) bool {
 	return errors.Is(err, exec.ErrNotFound) ||
 		strings.Contains(err.Error(), "executable file not found") ||
-		strings.Contains(err.Error(), "No such file or directory")
+		strings.Contains(err.Error(), "No such file or directory") ||
+		strings.Contains(out, "not found") ||
+		strings.Contains(out, "No such file or directory")
 }
 
 // reCheckpointRow matches the `busy|log_frames|checkpointed_frames`
@@ -277,7 +282,7 @@ func sqlite3WALCheckpoint(ctx context.Context, dbPath string) error {
 		kineCheckpointBudget, "sqlite3", hostDB,
 		"PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);")
 	if err != nil {
-		if sqlite3Missing(err) {
+		if sqlite3Missing(err, out) {
 			return ErrNoSQLite3
 		}
 		return fmt.Errorf("sqlite3 wal_checkpoint: %w: %s",
@@ -342,7 +347,7 @@ func sqlite3KineLargeObjects(ctx context.Context, dbPath string) ([]KineLargeObj
 		"PRAGMA busy_timeout=5000; SELECT name, length(value) "+
 			"FROM kine WHERE deleted = 0 ORDER BY length(value) DESC LIMIT 10;")
 	if err != nil {
-		if sqlite3Missing(err) {
+		if sqlite3Missing(err, out) {
 			return nil, ErrNoSQLite3
 		}
 		return nil, fmt.Errorf("sqlite3 kine large objects: %w: %s",

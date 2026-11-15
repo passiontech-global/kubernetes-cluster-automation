@@ -133,14 +133,16 @@ func TestJournalText(t *testing.T) {
 
 	// A healthy read passes through and feeds the tracker an ok.
 	script("INFO line one\n", nil, "", nil)
-	if got := d.JournalText(context.Background(), since); got != "INFO line one\n" {
-		t.Fatalf("JournalText=%q", got)
+	if got, err := d.JournalText(context.Background(), since); err != nil ||
+		got != "INFO line one\n" {
+		t.Fatalf("JournalText=%q err=%v", got, err)
 	}
 
-	// A failed read maps to empty (`|| true` parity) and warns.
+	// A failed read returns the error (never silently "0 hits")
+	// and warns.
 	script("", errors.New("signal: killed"), "", nil)
-	if got := d.JournalText(context.Background(), since); got != "" {
-		t.Fatalf("failed JournalText=%q want empty", got)
+	if got, err := d.JournalText(context.Background(), since); err == nil || got != "" {
+		t.Fatalf("failed JournalText=%q err=%v want empty+error", got, err)
 	}
 	if !strings.Contains(journalLog(t, d), "journal read failed") {
 		t.Fatal("failed journal read not warned")

@@ -45,7 +45,10 @@ func (c *TTLCheck) Name() string { return cdeps.CheckKineTTL }
 // kill only) when every respawned pid re-wedges from boot
 // (deterministic environment race, not chance).
 func (c *TTLCheck) Run(ctx context.Context) {
-	kpid := c.d.Proc.FindByComm("kine")
+	// cgroup-scoped lookup: a same-named process outside
+	// k0scontroller.service (foreign daemon, recycled pid) must
+	// never inherit the kill trust.
+	kpid := c.d.Proc.FindByCommInCgroup("kine", cdeps.K0sControllerCgroupSubstr)
 	if kpid == 0 {
 		c.d.StateExit(cdeps.StateKineTTLDead)
 		c.d.StateExit(cdeps.StateKineTTLLoop)
@@ -62,45 +65,80 @@ func (c *TTLCheck) Run(ctx context.Context) {
 			kpid, err))
 		kage = 0
 	}
-	since := now.Add(-time.Duration(kage) * time.Second)
-	// Bound the journalctl --since window: on a node up for days a
-	// healthy long-lived kine pid would otherwise dump tens of MiB of
-	// old unit logs into hostexec's 16 MiB head buffer and lose the
-	// newest tail — the TTL verdict only needs the boot window. While
-	// StateKineTTLDead is latched FOR THIS pid the full pid-age window
-	// stays: confirming the boot-time error line may still require
-	// reading back to process start.
-	//
-	// maxLookback MUST exceed the uptime gate (MinUptimeSeconds =
-	// 20m) plus one cycle of slack: this check's FIRST run happens at
-	// uptime ≥20m, so a TTL error logged in the first minutes of boot
-	// is already ~20m old — a 15m window slid past it before the
-	// check ever ran and the wedge was missed forever.
-	const maxLookback = time.Duration(cdeps.MinUptimeSeconds)*time.Second +
-		5*time.Minute
-	deadForThisPid := c.d.State.Exists(cdeps.StateKineTTLDead) &&
-		c.d.ReadState(cdeps.FileTTLWedgedPID) == strconv.Itoa(kpid)
-	if !deadForThisPid {
+	// A pid already recorded as TTL-wedged can never un-wedge —
+	// the workqueue ShutDown is permanent for that process — and
+	// its single boot-time journal line ages out of the bounded
+	// lookback (~25m) while kill cooldowns (state-kine-ttl-loop
+	// cadence, ModeDryRun, maintenance) can hold remediation off
+	// for hours. Re-scanning would then count 0 matches and run
+	// the clean-pid branch below: StateExit BOTH latches AND reset
+	// the rewedge counter, erasing the wedge evidence on a
+	// still-dead kine. Skip the journal entirely for the recorded
+	// pid — the dedupe below keeps rew and the kill cadences keep
+	// applying until the supervisor hands us a new pid.
+	ttlDead := c.d.ReadState(cdeps.FileTTLWedgedPID) == strconv.Itoa(kpid) &&
+		c.d.State.Exists(cdeps.StateKineTTLDead)
+	if !ttlDead {
+		since := now.Add(-time.Duration(kage) * time.Second)
+		// Bound the journalctl --since window: on a node up for
+		// days a healthy long-lived kine pid would otherwise dump
+		// tens of MiB of old unit logs into hostexec's 16 MiB head
+		// buffer and lose the newest tail — the TTL verdict only
+		// needs the boot window. While StateKineTTLDead is latched
+		// FOR THIS pid the full pid-age window stays: confirming
+		// the boot-time error line may still require reading back
+		// to process start.
+		//
+		// maxLookback MUST exceed the uptime gate (MinUptimeSeconds =
+		// 20m) plus one cycle of slack: this check's FIRST run
+		// happens at uptime ≥20m, so a TTL error logged in the
+		// first minutes of boot is already ~20m old — a 15m window
+		// slid past it before the check ever ran and the wedge was
+		// missed forever.
+		const maxLookback = time.Duration(cdeps.MinUptimeSeconds)*time.Second +
+			5*time.Minute
+		// The bounded window applies to ALREADY-LATCHED pids too:
+		// once StateKineTTLDead is recorded for this kinePID there
+		// is no reason to keep reading back to process start — the
+		// boot-window TTL lines either still sit inside maxLookback
+		// (verdict unchanged) or have aged out (the wedge aged out
+		// with them). Skipping the widening keeps the per-cycle
+		// journalctl window small on long-uptime nodes.
 		if floor := now.Add(-maxLookback); since.Before(floor) {
 			since = floor
 		}
-	}
-	// The window must also stop at the unit's CURRENT activation:
-	// journalctl --since reaches back across a unit restart, so a
-	// kine pid whose age exceeds the unit's active age (a leftover
-	// process the supervisor adopted, a pid-namespace edge) would
-	// read TTL errors logged by the PREVIOUS activation and flag a
-	// healthy respawn as wedged. ActiveAge errors (unit inactive,
-	// clocks unreadable) leave the pid-age window — best effort,
-	// same posture as the age-unreadable note above.
-	if sd := c.d.Cfg.Systemd; sd != nil {
-		if uage, uerr := sd.ActiveAge(ctx, c.d.Cfg.JournalUnit); uerr == nil && uage > 0 {
-			if unitStart := now.Add(-uage); since.Before(unitStart) {
-				since = unitStart
+		// The window must also stop at the unit's CURRENT
+		// activation: journalctl --since reaches back across a
+		// unit restart, so a kine pid whose age exceeds the unit's
+		// active age (a leftover process the supervisor adopted, a
+		// pid-namespace edge) would read TTL errors logged by the
+		// PREVIOUS activation and flag a healthy respawn as wedged.
+		// ActiveAge errors (unit inactive, clocks unreadable) leave
+		// the pid-age window — best effort, same posture as the
+		// age-unreadable note above.
+		if sd := c.d.Cfg.Systemd; sd != nil {
+			if uage, uerr := sd.ActiveAge(ctx, c.d.Cfg.JournalUnit); uerr == nil && uage > 0 {
+				if unitStart := now.Add(-uage); since.Before(unitStart) {
+					since = unitStart
+				}
 			}
 		}
+		// --grep pushes the TTL signature into journalctl itself
+		// (MESSAGE =~ PCRE2, systemd ≥237): the read returns only
+		// matching entries instead of the whole unit window — on a
+		// chatty controller unit that is the difference between a
+		// few lines and megabytes per cycle. The client-side
+		// CountMatches below still applies the Go regexp to the
+		// filtered output, so the verdict path is unchanged.
+		jout, jerr := c.d.JournalTextGrep(ctx, since, ttlErrRe.String())
+		if jerr != nil {
+			// Journal unreadable → inconclusive: keep the existing
+			// latch verdicts instead of clearing them on "0 hits".
+			c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "ok").Inc()
+			return
+		}
+		ttlDead = cdeps.CountMatches(ttlErrRe, jout) > 0
 	}
-	ttlDead := cdeps.CountMatches(ttlErrRe, c.d.JournalText(ctx, since)) > 0
 	if !ttlDead {
 		// Pid living clean past the seed window → loop broken:
 		// reset the counter and clear both latches.

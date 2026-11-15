@@ -79,11 +79,13 @@ type unblockHealer struct {
 	// bounds restart churn on a backend that wedges again right
 	// after its pods are recreated.
 	unblocked state.CooldownSet
-	// standaloneUnblocked is the same ledger for the apiservice-standalone-unblock
-	// standalone path (no Terminating-namespace evidence) — a
-	// separate keyspace so a standalone heal cannot mask or be
-	// masked by a wedge-evidence heal on the same APIService.
-	standaloneUnblocked state.CooldownSet
+	// ONE ledger serves both unblock paths (wedge-evidence and
+	// apiservice-standalone-unblock standalone): a delivered heal stamps the
+	// APIService name once, and BOTH paths check the shared stamp
+	// under the WIDER 30m window — a standalone heal must not leave
+	// the wedge path free to re-evict 15m later, and vice versa.
+	// (Previously two ledgers let the same backend be restarted
+	// twice inside one incident.)
 	// sweepEvicted counts DELIVERED evictions in the current sweep —
 	// apiServiceUnblockSweepCap bounds the whole pass, not each
 	// candidate: restarting one pod is enough to unstick an
@@ -124,8 +126,7 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 	// unblocked keys on APIService names that die with the resource —
 	// bound the map so decommissioned backends' stamps cannot
 	// accumulate in the first place.
-	u.unblocked.PruneExpired(now, apiServiceUnblockCooldown)
-	u.standaloneUnblocked.PruneExpired(now, apiServiceStandaloneUnblockCooldown)
+	u.unblocked.PruneExpired(now, apiServiceStandaloneUnblockCooldown)
 	u.sweepEvicted = 0
 	if snap.err != nil {
 		return fmt.Errorf("list apiservices — unblock pass skipped: %w", snap.err)
@@ -185,7 +186,7 @@ func (u *unblockHealer) sweepUnblock(ctx context.Context, snap *apiServiceSnapsh
 			continue
 		}
 		u.healCandidate(ctx, snap, c.svc, c.group, &u.unblocked,
-			apiServiceUnblockCooldown, now, refs)
+			apiServiceStandaloneUnblockCooldown, now, refs)
 	}
 	return nil
 }
@@ -219,7 +220,7 @@ func (u *unblockHealer) standaloneHealCandidate(ctx context.Context,
 		return
 	}
 	u.healCandidate(ctx, snap, c.svc, c.group,
-		&u.standaloneUnblocked, apiServiceStandaloneUnblockCooldown,
+		&u.unblocked, apiServiceStandaloneUnblockCooldown,
 		now, nil)
 }
 

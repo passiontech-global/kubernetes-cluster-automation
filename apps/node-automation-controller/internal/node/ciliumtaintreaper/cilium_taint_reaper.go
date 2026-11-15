@@ -119,7 +119,7 @@ func Setup(d shared.Deps) error {
 
 func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	res := ctrl.Result{RequeueAfter: 10 * time.Minute}
+	res := ctrl.Result{RequeueAfter: shared.RequeueAfter(10 * time.Minute)}
 
 	// Sweep every node like bash — a node/pod event is only the
 	// trigger, the verdict always covers the whole cluster.

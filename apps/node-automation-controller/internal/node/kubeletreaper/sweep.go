@@ -148,7 +148,10 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 				"node", name)
 			return nil
 		}
-		r.freshFail.Forget(name)
+		// freshFail is NOT forgotten here: the persistence window
+		// only clears once the taint is actually delivered below —
+		// a failed TaintNode must not reset the window it already
+		// earned, or every API flap would re-open the grace period.
 	} else {
 		r.freshFail.Forget(name)
 	}
@@ -174,9 +177,15 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 			return fmt.Errorf("taint %s on node %s: %w",
 				kubeletReaperTaint, name, err)
 		}
+		// Delivered — the persistence window's job is done; the next
+		// episode starts from zero.
+		r.freshFail.Forget(name)
 		log.Info("TAINT: kubelet :10250 down -> NoSchedule",
 			"node", name, "probes", kubeletReaperProbes)
 	} else {
+		// Taint already present — the episode is fenced; clear the
+		// window the same as a delivered taint would.
+		r.freshFail.Forget(name)
 		log.Info("KEEP-TAINT: kubelet dead (lease stale/missing or fake-ready persisted)", "node", name)
 	}
 	return nil

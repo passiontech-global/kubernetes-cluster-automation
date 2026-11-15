@@ -24,6 +24,18 @@ func filterUnique(v any) (any, error) {
 		}
 		return &List{out}, nil
 	}
+	if allPlainInts(items) {
+		seen := make(map[int64]struct{}, len(items))
+		var out []any
+		for _, it := range items {
+			i := it.(int64)
+			if _, dup := seen[i]; !dup {
+				seen[i] = struct{}{}
+				out = append(out, it)
+			}
+		}
+		return &List{out}, nil
+	}
 	return &List{appendUnique(nil, items)}, nil
 }
 
@@ -50,6 +62,19 @@ func filterDifference(v any, args []any) (any, error) {
 		}
 		return &List{out}, nil
 	}
+	if allPlainInts(items) && allPlainInts(excl) {
+		drop := make(map[int64]struct{}, len(excl))
+		for _, e := range excl {
+			drop[e.(int64)] = struct{}{}
+		}
+		var out []any
+		for _, it := range items {
+			if _, hit := drop[it.(int64)]; !hit {
+				out = append(out, it)
+			}
+		}
+		return &List{out}, nil
+	}
 	var out []any
 	for _, it := range items {
 		if !containsDeepEq(excl, it) {
@@ -67,11 +92,33 @@ func filterUnion(v any, args []any) (any, error) {
 	seed := ToIter(v)
 	rest := make([][]any, len(args))
 	allStrings := allPlainStrings(seed)
+	allInts := allPlainInts(seed)
 	for i, a := range args {
 		rest[i] = ToIter(a)
 		if allStrings && !allPlainStrings(rest[i]) {
 			allStrings = false
 		}
+		if allInts && !allPlainInts(rest[i]) {
+			allInts = false
+		}
+	}
+	if allInts {
+		seen := make(map[int64]struct{}, len(seed))
+		var out []any
+		add := func(items []any) {
+			for _, it := range items {
+				i := it.(int64)
+				if _, dup := seen[i]; !dup {
+					seen[i] = struct{}{}
+					out = append(out, it)
+				}
+			}
+		}
+		add(seed)
+		for _, items := range rest {
+			add(items)
+		}
+		return &List{out}, nil
 	}
 	if allStrings {
 		seen := make(map[string]struct{}, len(seed))
@@ -106,6 +153,21 @@ func filterUnion(v any, args []any) (any, error) {
 func allPlainStrings(items []any) bool {
 	for _, it := range items {
 		if _, ok := it.(string); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// allPlainInts reports whether every element is exactly int64 —
+// the gate for the O(N) hash-set dedupe fast paths alongside
+// allPlainStrings. deepEq on two int64s is integer equality, so
+// map[int64]struct{} membership is semantics-free; ANY other
+// numeric shape (uint64, float64, bool) disqualifies the input and
+// keeps the deepEq scan — 1 == 1.0 must still dedupe together.
+func allPlainInts(items []any) bool {
+	for _, it := range items {
+		if _, ok := it.(int64); !ok {
 			return false
 		}
 	}
@@ -203,6 +265,11 @@ func filterFlatten(v any) (any, error) {
 			items = t.V
 		case []any:
 			items = t
+		case []string:
+			items = make([]any, len(t))
+			for i, x := range t {
+				items[i] = x
+			}
 		default:
 			out = append(out, x)
 			return nil

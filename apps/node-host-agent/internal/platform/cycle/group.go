@@ -56,6 +56,11 @@ func RunAll(ctx context.Context, loops ...Looper) {
 		lctx := ctx
 		if _, isRunner := l.(*Runner); !isRunner {
 			child := NewLiveness()
+			// Stamp the child's fallback at spawn: a custom loop's
+			// first cycle can legitimately run long before its
+			// first Heartbeat lands, and an unstamped beat reads
+			// as never-progressed to /healthz.
+			stampLoop(child.Fallback())
 			if parent := LivenessFrom(ctx); parent != nil {
 				detaches = append(detaches, parent.Attach(child))
 			}

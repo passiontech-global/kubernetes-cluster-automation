@@ -270,15 +270,23 @@ func partitionEvictable(p *corev1.Pod, namespaces map[string]struct{}) bool {
 			return false
 		}
 	}
+	// A controller owner is REQUIRED: eviction only makes sense
+	// when something recreates the pod — a standalone pod deleted
+	// here is gone permanently, partition or not.
+	if metav1.GetControllerOf(p) == nil {
+		return false
+	}
 	if _, ok := namespaces[p.Namespace]; ok {
 		return true
 	}
 	return p.Annotations[partitionEvictAnno] == "true"
 }
 
-// nodePinnedPVCs returns the set of "ns/name" PVCs whose
-// spec.storageClassName is node-pinned (see
-// partitionNodePinnedStorageClasses). A list failure is a real
+// nodePinnedPVCs returns the set of "ns/name" PVCs whose pod can
+// only ever run on the node holding its data: a node-pinned storage
+// class (see partitionNodePinnedStorageClasses), OR a bound PV that
+// is itself node-pinned — spec.local (local PV) or
+// spec.nodeAffinity (topology-pinned). A list failure is a real
 // error — the caller fails the eviction pass closed rather than
 // evicting pods it cannot prove are movable.
 func (e *partitionEvictor) nodePinnedPVCs(ctx context.Context) (map[string]struct{}, error) {
@@ -289,9 +297,39 @@ func (e *partitionEvictor) nodePinnedPVCs(ctx context.Context) (map[string]struc
 		return nil, fmt.Errorf("list persistentvolumeclaims: %w", err)
 	}
 	out := map[string]struct{}{}
+	needsPV := false
 	for i := range pvcs {
 		sc := pvcs[i].Spec.StorageClassName
 		if sc != nil && partitionNodePinnedStorageClasses[*sc] {
+			out[pvcs[i].Namespace+"/"+pvcs[i].Name] = struct{}{}
+			continue
+		}
+		if pvcs[i].Spec.VolumeName != "" {
+			needsPV = true
+		}
+	}
+	if !needsPV {
+		return out, nil
+	}
+	// Bound PVCs resolve through their PV: a local PV or one with
+	// nodeAffinity pins the pod exactly like a pinned storage
+	// class does.
+	pvs, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.PersistentVolumes(e.cs))
+	if err != nil {
+		return nil, fmt.Errorf("list persistentvolumes: %w", err)
+	}
+	pvPinned := map[string]bool{}
+	for i := range pvs {
+		pvPinned[pvs[i].Name] = pvs[i].Spec.Local != nil ||
+			pvs[i].Spec.NodeAffinity != nil
+	}
+	for i := range pvcs {
+		if _, done := out[pvcs[i].Namespace+"/"+pvcs[i].Name]; done {
+			continue
+		}
+		if pvPinned[pvcs[i].Spec.VolumeName] {
 			out[pvcs[i].Namespace+"/"+pvcs[i].Name] = struct{}{}
 		}
 	}

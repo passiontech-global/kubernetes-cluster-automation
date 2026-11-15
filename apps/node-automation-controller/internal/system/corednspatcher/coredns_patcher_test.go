@@ -260,7 +260,7 @@ func TestCoreDNSPatcherAppliesPatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 	if !strings.Contains(string(got), `"minDomains":2`) {
@@ -446,7 +446,7 @@ func TestCoreDNSPatcherNoOpWhenCorrect(t *testing.T) {
 	if patched {
 		t.Fatal("patched an already-correct Deployment")
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -471,7 +471,7 @@ func TestCoreDNSPatcherMissingContainerNoPatch(t *testing.T) {
 		t.Fatal("patched a Deployment whose coredns container is absent — " +
 			"the name-only container entry has no image and the apiserver rejects it")
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -483,7 +483,7 @@ func TestCoreDNSPatcherMissingDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }

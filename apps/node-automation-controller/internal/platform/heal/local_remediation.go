@@ -67,8 +67,21 @@ func localRemediationHold(ctx context.Context, cs kubernetes.Interface,
 	if pod.Spec.NodeName == "" {
 		return false, nil // unscheduled — no node to ask
 	}
-	node, err := cs.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName,
-		metav1.GetOptions{})
+	// Inside a health sweep the ctx carries probefw's O(1) node
+	// index — a heal burst resolves every pod's node from the one
+	// memoized census instead of a live GET per pod. Outside a
+	// sweep (or a snapshot built without Deps) the live GET stands.
+	var node *corev1.Node
+	var err error
+	if fn := kube.SweepNodeLookup(ctx); fn != nil {
+		node, err = fn(ctx, pod.Spec.NodeName)
+		if err == nil && node == nil {
+			return false, nil // absent from census = the GET's NotFound
+		}
+	} else {
+		node, err = cs.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName,
+			metav1.GetOptions{})
+	}
 	if apierrors.IsNotFound(err) {
 		return false, nil
 	}

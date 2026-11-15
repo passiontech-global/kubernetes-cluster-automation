@@ -7,22 +7,32 @@ import (
 	"encoding/hex"
 	"io"
 	"strings"
+	"sync"
 )
 
-// signatureDigest decodes the "sha256=<hex>" header into the raw
-// signature bytes. ok=false covers every malformed shape — missing
-// prefix, non-hex, wrong length — so both verify entry points reject
-// identically before touching the body.
-func signatureDigest(header string) ([]byte, bool) {
+// hmacBufPool recycles the 32 KiB io.CopyBuffer scratch buffer —
+// io.Copy's implicit per-call allocation was pure GC churn on the
+// unauthenticated request path (every delivery pays one verify).
+var hmacBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 32<<10); return &b },
+}
+
+// signatureDigest decodes the "sha256=<hex>" header into dst — the
+// raw signature bytes on the caller's stack, no heap slice. ok=false
+// covers every malformed shape — missing prefix, non-hex, wrong
+// length — so both verify entry points reject identically before
+// touching the body.
+func signatureDigest(header string, dst *[sha256.Size]byte) bool {
 	got, ok := strings.CutPrefix(header, "sha256=")
-	if !ok {
-		return nil, false
+	if !ok || len(got) != sha256.Size*2 {
+		return false
 	}
-	sig, err := hex.DecodeString(got)
-	if err != nil {
-		return nil, false
-	}
-	return sig, true
+	// Stage the hex on the stack too — []byte(got) would heap-alloc
+	// 64 bytes per request for no reason.
+	var tmp [sha256.Size * 2]byte
+	copy(tmp[:], got)
+	n, err := hex.Decode(dst[:], tmp[:])
+	return err == nil && n == sha256.Size
 }
 
 // Signature reports whether header is the expected
@@ -37,15 +47,15 @@ func Signature(secret string, body []byte, header string) bool {
 	if secret == "" {
 		return false
 	}
-	sig, ok := signatureDigest(header)
-	if !ok {
+	var sig [sha256.Size]byte
+	if !signatureDigest(header, &sig) {
 		return false
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	var digest [sha256.Size]byte
 	mac.Sum(digest[:0])
-	return hmac.Equal(sig, digest[:])
+	return hmac.Equal(sig[:], digest[:])
 }
 
 // SignatureReader is Signature's streaming form: it hashes r
@@ -61,17 +71,20 @@ func SignatureReader(secret string, r io.Reader, header string) (bool, error) {
 	if secret == "" {
 		return false, nil
 	}
-	sig, ok := signatureDigest(header)
-	if !ok {
+	var sig [sha256.Size]byte
+	if !signatureDigest(header, &sig) {
 		return false, nil
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
-	if _, err := io.Copy(mac, r); err != nil {
+	bufp := hmacBufPool.Get().(*[]byte)
+	_, err := io.CopyBuffer(mac, r, *bufp)
+	hmacBufPool.Put(bufp)
+	if err != nil {
 		return false, err
 	}
 	var digest [sha256.Size]byte
 	mac.Sum(digest[:0])
-	return hmac.Equal(sig, digest[:]), nil
+	return hmac.Equal(sig[:], digest[:]), nil
 }
 
 // HasValidSignatureFormat reports whether sigHeader is plausibly a

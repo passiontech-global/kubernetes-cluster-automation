@@ -24,7 +24,8 @@ import (
 // Service <10m old having an EndpointSlice with a ready endpoint —
 // its delta certainly crossed a healthy watch — returning its
 // <name>.<ns>.svc.cluster.local FQDN plus nil wantIPs (any answer
-// proves freshness).
+// proves freshness), the target's namespace/name, and fresh=true
+// marking the <10m-Service selection path.
 //
 // coredns-probe-fallback fallback: on a quiet cluster no Service is <10m old, so the
 // old code skipped layer 2 entirely — exactly the steady-state where a
@@ -33,8 +34,9 @@ import (
 // ready endpoint and resolves its owning Service: the want set is the
 // Service's clusterIPs, or — for a headless service — the ready
 // endpoint pod IPs. A pod answering with anything else is serving a
-// frozen cache. Returns ("", nil) when nothing qualifies.
-func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[string]bool) {
+// frozen cache. Returns ("", nil, "", "", false) when nothing
+// qualifies.
+func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[string]bool, string, string, bool) {
 	log := logf.FromContext(ctx)
 	// Page the cluster-wide Service list — an unbounded List forces
 	// etcd to serialize every Service into one response; 500-per-page
@@ -48,15 +50,16 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 		kube.Services(w.cs, metav1.NamespaceAll))
 	if err != nil {
 		log.Info("dns: cannot list services — layer 2 inconclusive", "error", err)
-		return "", nil
+		return "", nil, "", "", false
 	}
 	slices.SortFunc(svcItems, func(a, b corev1.Service) int {
 		return -a.CreationTimestamp.Compare(b.CreationTimestamp.Time)
 	})
 	type svcCand struct {
-		ns, name string
-		created  time.Time
-		headless bool
+		ns, name        string
+		created         time.Time
+		headless        bool
+		publishNotReady bool
 	}
 	n := len(svcItems)
 	if n > 8 { // bash: top-8 newest BEFORE the age filter
@@ -76,6 +79,10 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 			// IP set to verify against, but a fresh service name
 			// resolving at all still proves the watch is live.
 			headless: s.Spec.ClusterIP == corev1.ClusterIPNone,
+			// publishNotReadyAddresses puts NotReady pod IPs into
+			// the DNS answer set too — headlessWantSet must expect
+			// them or every healthy answer reads stale.
+			publishNotReady: s.Spec.PublishNotReadyAddresses,
 		})
 	}
 	// Headless candidates win over ClusterIP ones (P0-11): a
@@ -117,7 +124,8 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 			continue
 		}
 		if svc.headless {
-			want, err := w.headlessWantSet(ctx, svc.ns, svc.name)
+			want, err := w.headlessWantSet(ctx, svc.ns, svc.name,
+				svc.publishNotReady)
 			if err != nil {
 				log.Info("dns: headless probe want-set failed — trying next candidate",
 					"service", svc.ns+"/"+svc.name, "error", err)
@@ -126,7 +134,8 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 			if len(want) == 0 {
 				continue // endpoints vanished between the two reads
 			}
-			return svc.name + "." + svc.ns + ".svc.cluster.local", want
+			return svc.name + "." + svc.ns + ".svc.cluster.local", want,
+				svc.ns, svc.name, true
 		}
 		if clusterIPPick == nil {
 			clusterIPPick = svc
@@ -137,7 +146,8 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 		// answer proves freshness for a <10m-old service (its IP
 		// was just allocated, so a frozen watch cannot know it).
 		return clusterIPPick.name + "." + clusterIPPick.ns +
-			".svc.cluster.local", nil
+				".svc.cluster.local", nil, clusterIPPick.ns,
+			clusterIPPick.name, true
 	}
 	svcItems = nil
 	return w.probeFQDNFromSlices(ctx)
@@ -159,7 +169,7 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 // until a headless service resolves; a ClusterIP service is kept
 // only as the last resort — strictly better than nothing, still no
 // worse than the old single-pick behavior.
-func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[string]bool) {
+func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[string]bool, string, string, bool) {
 	log := logf.FromContext(ctx)
 	type cand struct {
 		ns, svc string
@@ -196,10 +206,10 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 		})
 	if err != nil {
 		log.Info("dns: cannot list endpointslices — fallback inconclusive", "error", err)
-		return "", nil
+		return "", nil, "", "", false
 	}
 	if len(cands) == 0 {
-		return "", nil
+		return "", nil, "", "", false
 	}
 	slices.SortFunc(cands, func(a, b cand) int { return cmp.Compare(b.rv, a.rv) })
 	if len(cands) > 8 {
@@ -215,16 +225,18 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 			continue // service gone or unreadable — try the next slice
 		}
 		if svc.Spec.ClusterIP == corev1.ClusterIPNone {
-			want, err := w.headlessWantSet(ctx, c.ns, c.svc)
+			want, err := w.headlessWantSet(ctx, c.ns, c.svc,
+				svc.Spec.PublishNotReadyAddresses)
 			if err != nil {
 				log.Info("dns: headless fallback want-set failed — inconclusive",
 					"service", c.ns+"/"+c.svc, "error", err)
-				return "", nil
+				return "", nil, "", "", false
 			}
 			if len(want) == 0 {
 				continue
 			}
-			return c.svc + "." + c.ns + ".svc.cluster.local", want
+			return c.svc + "." + c.ns + ".svc.cluster.local", want,
+				c.ns, c.svc, false
 		}
 		if clusterIPFallback == nil {
 			clusterIPFallback, clusterIPRef = svc, c
@@ -232,7 +244,7 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 	}
 	if clusterIPFallback == nil {
 		log.Info("dns: no fallback slice's service resolvable — inconclusive")
-		return "", nil
+		return "", nil, "", "", false
 	}
 	// want is the expected answer set — nil (any answer counts)
 	// when the service carries no usable IPs (unallocated
@@ -249,14 +261,93 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 			want[ip] = true
 		}
 	}
-	return clusterIPRef.svc + "." + clusterIPRef.ns + ".svc.cluster.local", want
+	return clusterIPRef.svc + "." + clusterIPRef.ns + ".svc.cluster.local",
+		want, clusterIPRef.ns, clusterIPRef.svc, false
+}
+
+// refreshProbeTarget re-validates a cached probe target through
+// targeted reads — one Service GET plus one namespaced EndpointSlice
+// list — instead of the cluster-wide re-pick probeFQDNUncached pays
+// on every TTL expiry and invalidate-reprobe. The want-set is
+// rebuilt from CURRENT slices, which is exactly what an invalidated
+// cache needs (CoreDNS pod rolls change endpoint IPs, not the
+// Service's identity).
+//
+// Re-qualification mirrors the pick rules: a fresh=true target must
+// still sit inside the <10m age window its "delta crossed a healthy
+// watch" proof runs on; both kinds need at least one ready endpoint,
+// and headless targets need a non-empty want-set. Any failure
+// returns ok=false so the caller falls back to the full pick —
+// refresh can only ever REUSE a still-valid target, never stretch
+// the semantics of a dead one.
+func (w *coreDNSWatchdog) refreshProbeTarget(ctx context.Context,
+	ns, name string, fresh bool) (string, map[string]bool, bool) {
+	svc, err := w.cs.CoreV1().Services(ns).Get(ctx, name,
+		metav1.GetOptions{})
+	if err != nil {
+		return "", nil, false
+	}
+	if fresh && w.now.Now().Sub(svc.CreationTimestamp.Time) >=
+		corednsLogSinceS*time.Second {
+		return "", nil, false // aged out of the freshness window
+	}
+	eps, err := kube.ListAll(ctx,
+		metav1.ListOptions{
+			ResourceVersion: "0",
+			LabelSelector:   "kubernetes.io/service-name=" + name},
+		kube.EndpointSlices(w.cs, ns))
+	if err != nil {
+		return "", nil, false
+	}
+	ready := false
+	for _, es := range eps {
+		for _, ep := range es.Endpoints {
+			if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+				ready = true
+				break
+			}
+		}
+		if ready {
+			break
+		}
+	}
+	if !ready {
+		return "", nil, false
+	}
+	fqdn := name + "." + ns + ".svc.cluster.local"
+	if svc.Spec.ClusterIP == corev1.ClusterIPNone {
+		want, err := w.headlessWantSet(ctx, ns, name,
+			svc.Spec.PublishNotReadyAddresses)
+		if err != nil || len(want) == 0 {
+			return "", nil, false
+		}
+		return fqdn, want, true
+	}
+	// ClusterIP target: the exact-IP want-set (same construction as
+	// the fallback pick) — nil when the service carries no usable
+	// IPs, matching dnsAnswerFresh's any-answer contract.
+	var want map[string]bool
+	if svc.Spec.ClusterIP != "" || len(svc.Spec.ClusterIPs) > 0 {
+		want = map[string]bool{}
+		if svc.Spec.ClusterIP != "" {
+			want[svc.Spec.ClusterIP] = true
+		}
+		for _, ip := range svc.Spec.ClusterIPs {
+			want[ip] = true
+		}
+	}
+	return fqdn, want, true
 }
 
 // headlessWantSet builds the expected A-record set for a headless
 // service: every Ready endpoint address across ALL slices the
 // Service owns — a Ready IP in a second slice is a valid DNS answer
 // the single-slice want set would wrongly judge stale.
-func (w *coreDNSWatchdog) headlessWantSet(ctx context.Context, ns, svcName string) (map[string]bool, error) {
+// publishNotReady mirrors spec.publishNotReadyAddresses: when the
+// Service opts in, DNS publishes NotReady addresses too, so they
+// belong in the expected set as well.
+func (w *coreDNSWatchdog) headlessWantSet(ctx context.Context,
+	ns, svcName string, publishNotReady bool) (map[string]bool, error) {
 	eps, err := kube.ListAll(ctx,
 		metav1.ListOptions{
 			ResourceVersion: "0",
@@ -268,7 +359,8 @@ func (w *coreDNSWatchdog) headlessWantSet(ctx context.Context, ns, svcName strin
 	want := map[string]bool{}
 	for _, es := range eps {
 		for _, ep := range es.Endpoints {
-			if ep.Conditions.Ready == nil || !*ep.Conditions.Ready {
+			ready := ep.Conditions.Ready != nil && *ep.Conditions.Ready
+			if !ready && !publishNotReady {
 				continue
 			}
 			for _, a := range ep.Addresses {

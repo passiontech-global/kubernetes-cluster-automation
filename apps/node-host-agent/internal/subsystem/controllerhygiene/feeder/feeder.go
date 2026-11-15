@@ -214,9 +214,13 @@ func (f *Feeder) unitProp(ctx context.Context, unit, prop string) string {
 func (f *Feeder) RunRemediate(ctx context.Context) {
 	// Same narrow-snapshot rule as Run: a whole-Config copy
 	// would race Cycle's refreshWatchdogConf writes; Feeder.* and
-	// RestartUnit are immutable after New.
+	// RestartUnit are immutable after New. The Hub knobs ARE
+	// conf-derived — snapshot them once under hubMu so the gate
+	// sequence below reads a consistent triple while the cycle
+	// goroutine may be refreshing it.
 	fcfg := f.d.Cfg.Feeder
 	unit := f.d.Cfg.RestartUnit
+	hub := f.d.HubConf()
 	f.d.Actions.WithLabelValues(cdeps.CheckFeeder, "remediate").Inc()
 	f.d.State.AppendLog("remediate: OnFailure trigger — running ordered gates before restart of " + unit)
 
@@ -234,6 +238,21 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 	}
 	f.d.State.AppendLog("G1: apiserver failed 2 probes 3s apart — process-level wedge signature, continuing")
 
+	// G1b: external-Kine dead-fallback — when the cluster's datastore
+	// is an external Postgres (KINE_DB_PROBE configured) and its
+	// pg-wire endpoint is dead, restarting k0scontroller's apiserver
+	// cannot help: the apiserver will come up and immediately fail
+	// its own kine dial. Skip the restart — the DB outage is the
+	// thing to fix, and apiserverhub's own dead-DB path owns that
+	// verdict.
+	if probe := hub.KineDBProbe; probe != "" &&
+		!f.d.Cfg.PgWireFn(ctx, probe) {
+		f.d.State.AppendLog(fmt.Sprintf(
+			"G1b PASS: external kine DB %s not answering pg-wire — apiserver restart is futile while the datastore is down, stop",
+			probe))
+		return
+	}
+
 	// G2: unit not active = something else is already restarting it
 	// (operator, PartOf chain, OOM) — never pile on.
 	state := f.d.UnitActiveState(ctx, unit)
@@ -250,12 +269,28 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 	// passes the grace gate instantly and restarts mid-init. The
 	// wall-clock ActiveEnterTimestamp vs Clock.Now() is
 	// clock-consistent.
-	ts := f.unitProp(ctx, unit, "ActiveEnterTimestamp")
-	entered, terr := ParseSystemdTimestamp(ts)
+	// Prefer the D-Bus integer stamp: ActiveEnterTimestamp arrives
+	// as µs since the epoch — no locale/TZ parsing at all. The
+	// formatted-string path below stays as the fallback for
+	// dbus-less hosts and for the "never activated" (0) answer.
+	// readEnter is a closure so the G4b post-hold recheck re-reads
+	// the stamp instead of reusing the pre-hold value — 90s is long
+	// enough for someone else to have restarted the unit.
+	readEnter := func() (time.Time, string, error) {
+		if f.d.Cfg.Systemd != nil {
+			if us, uerr := f.d.Cfg.Systemd.ActiveEnterUSec(ctx, unit); uerr == nil && us > 0 {
+				return time.UnixMicro(int64(us)), "", nil
+			}
+		}
+		ts := f.unitProp(ctx, unit, "ActiveEnterTimestamp")
+		t, terr := ParseSystemdTimestamp(ts)
+		return t, ts, terr
+	}
+	entered, rawTS, terr := readEnter()
 	if terr != nil {
 		f.d.State.AppendLog(fmt.Sprintf(
 			"G3 PASS: unreadable ActiveEnterTimestamp='%s' (%v) — never restart blind, stop",
-			ts, terr))
+			rawTS, terr))
 		return
 	}
 	ageS := int64(f.d.Cfg.Clock.Now().Sub(entered).Seconds())
@@ -269,16 +304,89 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 
 	// G4: optional peer fence — WARN only, never blocks (a dead
 	// local apiserver is not made worse by restarting it).
+	peerDead := false
 	if peer := f.PeerAPIServer(); peer != "" {
 		if f.d.Cfg.ProbeFn(ctx, peer) {
 			f.d.State.AppendLog(fmt.Sprintf("G4: peer %s alive — wedge is local-only", peer))
 		} else {
+			peerDead = true
 			f.d.State.AppendLogWarn(fmt.Sprintf(
 				"G4 WARNING: peer %s ALSO not answering — both controllers may be triggering; restarting anyway (local is dead)",
 				peer))
 		}
 	} else {
 		f.d.State.AppendLog("G4: no PEER_APISERVER configured — peer fence skipped")
+	}
+
+	// G4b: dual-outage phase offset — when BOTH apiservers report
+	// dead, the SECONDARY controller (SelfAPI > PeerAPI, the same
+	// deterministic ordering Hub uses) holds 90s before restarting:
+	// an un-offset pair restarts in lockstep and a shared failure
+	// mode (network partition, shared datastore blip) takes down
+	// 100% of the control plane at once. The primary goes first;
+	// if it recovers inside the window the peer fence above already
+	// logged the local-only verdict.
+	if peerDead && hub.SelfAPI != "" && hub.PeerAPI != "" &&
+		hub.SelfAPI > hub.PeerAPI {
+		f.d.State.AppendLog(fmt.Sprintf(
+			"G4b: secondary controller (self=%s > peer=%s) and peer also dead — holding 90s so the primary recovers first",
+			hub.SelfAPI, hub.PeerAPI))
+		// SleepFn is the test seam — a real 90s block would make the
+		// hold path untestable; run it beside ctx.Done so cancel
+		// still aborts the wait promptly.
+		held := make(chan struct{})
+		go func() {
+			f.d.Cfg.SleepFn(90 * time.Second)
+			close(held)
+		}()
+		select {
+		case <-ctx.Done():
+			return
+		case <-held:
+		}
+		// Post-hold recheck: 90s is long enough for the primary to
+		// recover, the shared datastore to die, or the local
+		// apiserver to come up on its own — re-run the decisive
+		// probes before spending the restart budget on a verdict
+		// that was true when the hold began.
+		if f.d.Cfg.ProbeFn(ctx, fcfg.ProbeURL) {
+			f.d.State.AppendLog(
+				"G4b recheck: apiserver answers after the hold — recovered on its own, stop")
+			return
+		}
+		if probe := hub.KineDBProbe; probe != "" &&
+			!f.d.Cfg.PgWireFn(ctx, probe) {
+			f.d.State.AppendLog(fmt.Sprintf(
+				"G4b recheck: external kine DB %s not answering pg-wire — restart still futile, stop",
+				probe))
+			return
+		}
+		if peer := f.PeerAPIServer(); peer != "" && f.d.Cfg.ProbeFn(ctx, peer) {
+			f.d.State.AppendLog(fmt.Sprintf(
+				"G4b recheck: peer %s recovered during the hold — local wedge is now isolated, restarting",
+				peer))
+		}
+		// G2/G3 recheck: 90s is also long enough for an operator, a
+		// PartOf chain or a previous remediate to have restarted the
+		// unit — a non-active state means someone else owns the
+		// restart now, and a fresh ActiveEnterTimestamp means the
+		// apiserver is mid-init and must get its grace window
+		// instead of a second restart on top.
+		if state := f.d.UnitActiveState(ctx, unit); state != "active" {
+			f.d.State.AppendLog(fmt.Sprintf(
+				"G4b recheck: %s is-active='%s' (!= active) — already restarting, stop",
+				unit, state))
+			return
+		}
+		if entered2, _, terr2 := readEnter(); terr2 == nil {
+			if age2 := int64(f.d.Cfg.Clock.Now().Sub(entered2).Seconds()); age2 <
+				int64(fcfg.RemediateFreshGrace.Seconds()) {
+				f.d.State.AppendLog(fmt.Sprintf(
+					"G4b recheck: %s restarted %ds ago during the hold (< %ds grace) — still initialising, stop",
+					unit, age2, int(fcfg.RemediateFreshGrace.Seconds())))
+				return
+			}
+		}
 	}
 
 	// G5: rate-limit — at most one restart per RemediateMinRestart,

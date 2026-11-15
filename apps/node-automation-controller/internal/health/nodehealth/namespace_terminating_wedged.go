@@ -453,13 +453,14 @@ func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
 			// incarnation — the referenced one IS gone (the
 			// OwnerGone UID-match contract, applied to the dynamic
 			// read the typed whitelist cannot reach).
-			o, err := p.Dyn.Resource(kube.GVRArgoRollout).
-				Namespace(ns).Get(ctx, dref.Name, metav1.GetOptions{})
+			o, err := p.Unstructured(ctx, kube.GVRArgoRollout, ns, dref.Name)
 			switch {
-			case apierrors.IsNotFound(err):
-				return true
 			case err != nil:
 				return false
+			case o == nil:
+				// Absent from the per-sweep GVR census — the same
+				// NotFound answer the direct GET used to give.
+				return true
 			}
 			if dref.UID != "" && o.GetUID() != "" && o.GetUID() != dref.UID {
 				return true

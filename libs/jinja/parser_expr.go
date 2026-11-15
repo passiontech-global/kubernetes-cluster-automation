@@ -396,6 +396,13 @@ func (p *parser) parsePrimary() (expr, error) {
 		if i, err := strconv.ParseInt(t.val, base, 64); err == nil {
 			return litExpr{i}, nil
 		}
+		// (MaxInt64, MaxUint64] literals keep their exact uint64
+		// form — the engine's asUint64/numMag machinery carries
+		// uint64 end to end; ParseFloat would round them and a
+		// negative sign never reaches here (unary minus is an op).
+		if u, err := strconv.ParseUint(t.val, base, 64); err == nil {
+			return litExpr{u}, nil
+		}
 		if f, err := strconv.ParseFloat(t.val, 64); err == nil {
 			return litExpr{f}, nil
 		}

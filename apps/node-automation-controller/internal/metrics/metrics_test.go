@@ -3,10 +3,44 @@ package metrics
 import (
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
+
+// stalenessValue drains stalenessCollector and returns the gauge
+// value for the {check,namespace} series — the collector is
+// scrape-time computed, so the test reads it the same way
+// Prometheus does rather than through a GaugeVec handle.
+func stalenessValue(t *testing.T, check, ns string) float64 {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 16)
+	go func() {
+		stalenessCollector{}.Collect(ch)
+		close(ch)
+	}()
+	for m := range ch {
+		var dm dto.Metric
+		if err := m.Write(&dm); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		var c, n string
+		for _, lp := range dm.Label {
+			switch lp.GetName() {
+			case "check":
+				c = lp.GetValue()
+			case "namespace":
+				n = lp.GetValue()
+			}
+		}
+		if c == check && n == ns {
+			return dm.GetGauge().GetValue()
+		}
+	}
+	t.Fatalf("no staleness series for check=%q namespace=%q", check, ns)
+	return 0
+}
 
 // TestIncErrorIncrementsBothCounters pins the dual-metric contract:
 // every module error must bump the shell-operator-compatible counter
@@ -98,9 +132,12 @@ func TestObserveHealthCheck(t *testing.T) {
 		healthCheckStatus.WithLabelValues(check, "kuberhealthy", "FAIL")); got != 1 {
 		t.Fatalf("FAIL gauge = %v, want 1 on fail", got)
 	}
-	if got := testutil.ToFloat64(
-		healthCheckSecondsSinceSuccess.WithLabelValues(check, "kuberhealthy")); got != 913.5 {
-		t.Fatalf("seconds_since_success = %v, want 913.5", got)
+	// The staleness series is computed at collect time from
+	// lastSuccessAt, so the read is ~913.5 plus however long the
+	// test took between Observe and Collect — assert the band, not
+	// the exact float.
+	if got := stalenessValue(t, check, "kuberhealthy"); got < 913.5 || got > 914.5 {
+		t.Fatalf("seconds_since_success = %v, want ~913.5", got)
 	}
 }
 

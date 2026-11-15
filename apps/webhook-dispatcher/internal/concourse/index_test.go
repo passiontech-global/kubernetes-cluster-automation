@@ -720,6 +720,61 @@ func TestFetchIndexUsesCallerSnapshotForCarryover(t *testing.T) {
 	}
 }
 
+func TestFetchIndexManyPipelinesErrorsDoNotDeadlock(t *testing.T) {
+	// Regression: the per-pipeline listing workers used to `return`
+	// on the first 404/5xx — with more failing pipelines than workers
+	// (fetchIndexWorkers = 8) every worker retired early and the jobs
+	// feed deadlocked. 16 pipelines, half 404 (deleted between the
+	// listing and the fetch) and half 500 (unreadable, nothing to
+	// carry over), must still settle: the fetch fails on the missing
+	// data, but it must RETURN, not hang the feed.
+	var list strings.Builder
+	list.WriteByte('[')
+	for i := range 16 {
+		if i > 0 {
+			list.WriteByte(',')
+		}
+		fmt.Fprintf(&list, `{"name":"p%02d"}`, i)
+	}
+	list.WriteByte(']')
+	routes := map[string]string{
+		"/api/v1/teams/main/pipelines": list.String(),
+	}
+	stub := newATCStub(t, routes)
+	for i := range 16 {
+		path := fmt.Sprintf("/api/v1/teams/main/pipelines/p%02d/resources", i)
+		if i%2 == 0 {
+			stub.fail(path, http.StatusNotFound)
+		} else {
+			stub.fail(path, http.StatusInternalServerError)
+		}
+	}
+	c := &Client{BaseURL: stub.srv.URL, Team: "main"}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.fetchIndex(t.Context(), nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		// The eight 500s have no last-known resources to carry, so
+		// the fetch must fail — the point is that it returned.
+		if err == nil {
+			t.Fatal("fetchIndex err=nil want error (8 unreadable pipelines, no prev data)")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("fetchIndex deadlocked feeding jobs to retired workers")
+	}
+	// Every pipeline's listing was attempted — no worker bailed early.
+	for i := range 16 {
+		path := fmt.Sprintf("/api/v1/teams/main/pipelines/p%02d/resources", i)
+		if got := stub.hitCount(path); got != 1 {
+			t.Fatalf("%s hits=%d want 1", path, got)
+		}
+	}
+}
+
 func TestIndexFreshnessMetrics(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	RegisterMetrics(reg)
@@ -1059,5 +1114,26 @@ func BenchmarkEnsureIndexFreshPath(b *testing.B) {
 		if err := c.EnsureIndex(b.Context()); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestResourcesColdStartJoinerDeadlineFallback(t *testing.T) {
+	// A JOINER (not the fetch starter) whose wait budget expires on
+	// a cold start has no stale index to fall back to — it must get
+	// its own ctx.Err(), not hang behind the wedged ATC and not be
+	// served a fabricated success.
+	release := make(chan struct{})
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	defer closeRelease()
+	srv, entered, _ := slowATC(t, release, 1)
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+
+	go func() { _, _ = c.Resources(t.Context()) }()
+	waitInFlight(t, entered)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := c.Resources(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cold-start joiner deadline err=%v want context.DeadlineExceeded", err)
 	}
 }

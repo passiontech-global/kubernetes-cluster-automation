@@ -330,6 +330,38 @@ func TestPGPGBContainerNames(t *testing.T) {
 	}
 }
 
+// The name memo serves coincident probe/compact/maint resolutions
+// from ONE discover exec for nameMemoTTL, then re-resolves — the
+// rename-detection lag is bounded by the TTL, far under the ~2min
+// cycle cadence.
+func TestContainerNameMemoTTL(t *testing.T) {
+	d, fr, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Err: errors.New("gone")},
+		{Substr: "ps --format", Out: "kine-postgres\n"},
+	})
+	ctx := context.Background()
+	if got := d.PGContainerName(ctx); got != "kine-postgres" {
+		t.Fatalf("pg=%q", got)
+	}
+	fr.ClearLog()
+	if got := d.PGContainerName(ctx); got != "kine-postgres" {
+		t.Fatalf("memoized pg=%q", got)
+	}
+	if fr.Ran("ps --format") {
+		t.Fatal("in-TTL resolve re-ran discovery")
+	}
+	// Past the TTL the memo expires and discovery re-runs.
+	d.Cfg.Clock.Set(func() time.Time {
+		return time.Unix(1700000000, 0).Add(nameMemoTTL + time.Second)
+	})
+	if got := d.PGContainerName(ctx); got != "kine-postgres" {
+		t.Fatalf("post-TTL pg=%q", got)
+	}
+	if !fr.Ran("ps --format") {
+		t.Fatal("post-TTL resolve did not re-run discovery")
+	}
+}
+
 func TestContainerRunning(t *testing.T) {
 	d, _, _ := fixture(t, []testutil.ExecRule{
 		{Substr: "inspect -f {{.State.Running}} up", Out: "true\n"},
@@ -383,13 +415,12 @@ func TestPsqlArgsAndPassEnv(t *testing.T) {
 	if got := d.PsqlArgs("pg", "u", true); !strings.Contains(strings.Join(got, " "), "exec -i -e PGPASSWORD -e PGAPPNAME") {
 		t.Fatalf("interactive PsqlArgs=%v", got)
 	}
-	if got := PsqlPassEnv("s3cret"); len(got) != 2 ||
-		got[0] != "PGPASSWORD=s3cret" || got[1] != "PGAPPNAME="+PGAPPNAME {
+	if got := PsqlPassEnv("s3cret", AppNameMaint); len(got) != 2 ||
+		got[0] != "PGPASSWORD=s3cret" || got[1] != "PGAPPNAME="+AppNameMaint {
 		t.Fatalf("PsqlPassEnv=%v", got)
 	}
-	if PGAPPNAME != "node_host_agent_maint" {
-		t.Fatalf("PGAPPNAME=%q — the reaper's exemption list must match it",
-			PGAPPNAME)
+	if AppNameMaint != "nha_maint" || AppNameCompact != "nha_compact" || AppNameProbe != "nha_probe" {
+		t.Fatalf("AppName consts drifted: %q %q %q", AppNameProbe, AppNameCompact, AppNameMaint)
 	}
 }
 
@@ -398,7 +429,7 @@ func TestPsqlQueryAndScript(t *testing.T) {
 		{Substr: "-tAc", Out: "42\n"},
 		{Substr: "ON_ERROR_STOP", Out: "done\n"},
 	})
-	out, err := d.PsqlQuery(context.Background(), "kine-postgres", "postgres", "pw", "select 1")
+	out, err := d.PsqlQuery(context.Background(), "kine-postgres", "postgres", "pw", AppNameMaint, "select 1")
 	if err != nil || out != "42\n" {
 		t.Fatalf("PsqlQuery=%q err=%v", out, err)
 	}
@@ -409,10 +440,10 @@ func TestPsqlQueryAndScript(t *testing.T) {
 	envs := fr.Envs()
 	lastEnv := envs[len(envs)-1]
 	if len(envs) == 0 || len(lastEnv) != 2 ||
-		lastEnv[0] != "PGPASSWORD=pw" || lastEnv[1] != "PGAPPNAME="+PGAPPNAME {
+		lastEnv[0] != "PGPASSWORD=pw" || lastEnv[1] != "PGAPPNAME="+AppNameMaint {
 		t.Fatalf("query child env=%v", lastEnv)
 	}
-	out, err = d.PsqlScript(context.Background(), "kine-postgres", "postgres", "pw2", "LOCK; VACUUM;")
+	out, err = d.PsqlScript(context.Background(), "kine-postgres", "postgres", "pw2", AppNameMaint, "LOCK; VACUUM;")
 	if err != nil || out != "done\n" {
 		t.Fatalf("PsqlScript=%q err=%v", out, err)
 	}
@@ -616,7 +647,7 @@ func TestReapOrphanedMaintSessions(t *testing.T) {
 	d, _, _ := fixture(t, []testutil.ExecRule{
 		{Substr: "pg_terminate_backend", Out: "t\nf\n t \n\n"},
 	})
-	n, err := d.ReapOrphanedMaintSessions(ctx, "pg", "postgres", "secret")
+	n, err := d.ReapOrphanedMaintSessions(ctx, "pg", "postgres", "secret", AppNameMaint, "pg_repack")
 	if err != nil || n != 2 {
 		t.Fatalf("ReapOrphanedMaintSessions = %d, %v; want 2, nil", n, err)
 	}
@@ -624,7 +655,7 @@ func TestReapOrphanedMaintSessions(t *testing.T) {
 	d, _, _ = fixture(t, []testutil.ExecRule{
 		{Substr: "pg_terminate_backend", Err: errors.New("exec timeout")},
 	})
-	if n, err := d.ReapOrphanedMaintSessions(ctx, "pg", "postgres", "secret"); err == nil || n != 0 {
+	if n, err := d.ReapOrphanedMaintSessions(ctx, "pg", "postgres", "secret", AppNameMaint, "pg_repack"); err == nil || n != 0 {
 		t.Fatalf("ReapOrphanedMaintSessions on err = %d, %v; want 0, err", n, err)
 	}
 }

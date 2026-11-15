@@ -110,6 +110,9 @@ func NormalizeRepo(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.TrimRight(s, "/")
 	s = strings.TrimSuffix(s, ".git")
+	// "org/repo/.git" leaves a trailing "/" behind the ".git" strip —
+	// trim again so the path tail does not carry a stray slash.
+	s = strings.TrimRight(s, "/")
 	// Scan every occurrence of "github.com": the FIRST literal match
 	// is not necessarily the host — "github.com.evil.com/git@github.com:org/repo"
 	// has a lookalike in front of a real host. The first occurrence
@@ -287,7 +290,10 @@ func (c *Client) fetchIndex(ctx context.Context,
 						// listing and this fetch — it has no resources.
 						// Carrying prevByPipeline entries over would keep
 						// ghost resources of a dead pipeline in the index.
-						return
+						// Must NOT return: with >workers pipelines a batch
+						// of failures would retire every worker and the
+						// jobs feed below would deadlock.
+						continue
 					}
 					// One unreadable pipeline must not lose the whole
 					// index — and must not lose its own resources either:
@@ -309,7 +315,7 @@ func (c *Client) fetchIndex(ctx context.Context,
 					logger().Warn("pipeline resource listing failed — keeping last-known resources",
 						"concourse_url", c.safeBaseURL(), "team", c.Team,
 						"pipeline", p.Name, "error", err)
-					return
+					continue
 				}
 				for _, r := range resources {
 					repo := NormalizeRepo(sourceRepo(r.Source))

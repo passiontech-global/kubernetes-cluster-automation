@@ -31,14 +31,16 @@ import (
 // reason union, the emit-now subset, and the window-lapsed subset
 // applyPersistence computes.
 type natsSweep struct {
-	p          *natsJetstreamHealthCheck
-	log        logr.Logger
-	now        time.Time
-	census     *natsCensus
-	rep        *probefw.SweepReport
-	podReasons map[string]map[string]bool // "ns/name" -> reasons
-	emitNow    map[string]map[string]bool // reasons allowed to emit this sweep
-	past       map[string]map[string]bool // reasons whose 10m window lapsed
+	p            *natsJetstreamHealthCheck
+	log          logr.Logger
+	now          time.Time
+	census       *natsCensus
+	rep          *probefw.SweepReport
+	podReasons   map[string]map[string]bool // "ns/name" -> reasons
+	emitNow      map[string]map[string]bool // reasons allowed to emit this sweep
+	past         map[string]map[string]bool // reasons whose 10m window lapsed
+	promDegraded bool                       // a PromQuery/endpoint failed — prom evidence unverifiable
+	inconclusive map[string]bool            // member pods whose log tail failed this sweep
 }
 
 func newNatsSweep(p *natsJetstreamHealthCheck, log logr.Logger,
@@ -83,6 +85,7 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 		`nats_jetstream_server_jetstream_disabled > 0`); err != nil {
 		s.log.Info("WARN: nats jetstream-disabled query failed — signal skipped",
 			"error", err)
+		s.promDegraded = true
 	} else {
 		for _, series := range disabled {
 			podName := series.Label("pod", "pod_name")
@@ -108,6 +111,7 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 	if errC != nil || errS != nil {
 		s.log.Info("WARN: nats meta-leader queries failed — leaderless signal skipped",
 			"countErr", errC, "sumErr", errS)
+		s.promDegraded = true
 	} else {
 		sumByNS := map[string]float64{}
 		for _, series := range sums {
@@ -156,6 +160,7 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 	if errSC != nil || errSM != nil {
 		s.log.Info("WARN: nats stream-leader queries failed — stream-leaderless signal skipped",
 			"countErr", errSC, "minErr", errSM)
+		s.promDegraded = true
 	} else {
 		minByNS := map[string]float64{}
 		for _, series := range streamMins {
@@ -218,6 +223,7 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 	if errP != nil || errM != nil {
 		s.log.Info("WARN: nats consumer ack-floor queries failed — signal skipped",
 			"pendingErr", errP, "maxErr", errM)
+		s.promDegraded = true
 		return
 	}
 	maxByKey := map[string]float64{}
@@ -270,40 +276,95 @@ func (s *natsSweep) logScan(ctx context.Context) {
 		scanKeys = append(scanKeys, key)
 	}
 	slices.Sort(scanKeys)
+	// The scan clock only tracks pods actually tailed this sweep —
+	// entries for pods that left the candidate set are dropped so a
+	// pod re-entering later bootstraps against its own last read.
+	if s.p.logScanAt != nil {
+		inScan := make(map[string]bool, len(scanKeys))
+		for _, k := range scanKeys {
+			inScan[k] = true
+		}
+		for k := range s.p.logScanAt {
+			if !inScan[k] {
+				delete(s.p.logScanAt, k)
+			}
+		}
+	}
 	pods := make([]*corev1.Pod, len(scanKeys))
 	for j, key := range scanKeys {
 		pods[j] = s.census.memberByName[key]
 	}
 	scans := kube.ScanPodLogs(ctx, pods, natsLogScanWorkers,
-		func(ctx context.Context, pod *corev1.Pod) (string, error) {
-			reason := ""
-			hit, err := kube.ReadPodLogTail(ctx, s.p.CS, pod, kube.PodLogOpts{
+		func(ctx context.Context, pod *corev1.Pod) (natsLogScan, error) {
+			out := natsLogScan{}
+			matched, newest, streamNewest, err := kube.ReadPodLogTailTimed(ctx, s.p.CS, pod, kube.PodLogOpts{
 				TailLines:    probefw.DefaultTailLines,
-				SinceSeconds: 900,
+				SinceSeconds: 360,
 				MaxBytes:     probefw.LogMaxBytes,
 				Timeout:      probefw.LogTimeout,
+				Timestamps:   true,
 			}, func(line string) bool {
 				if r := natsLogReason(line); r != "" {
-					reason = r // the first marker wins
+					out.reason = r // last match wins — the tail is
+					// chronological, so the freshest marker is the
+					// live signal the freshness gate will weigh.
 					return true
 				}
 				return false
 			})
-			if err == nil && !hit {
-				reason = "" // clean tail — no marker
+			if err == nil {
+				out.newest = newest
+				out.streamNewest = streamNewest
+				if !matched {
+					out.reason = "" // clean tail — no marker
+				}
 			}
-			return reason, err
+			return out, err
 		})
+	inconclusive := map[string]bool{}
 	for j, scan := range scans {
+		key := scanKeys[j]
 		if scan.Err != nil {
 			s.log.Info("WARN: nats pod log tail failed — wedge evidence inconclusive",
-				"pod", scanKeys[j], "error", scan.Err)
+				"pod", key, "error", scan.Err)
+			inconclusive[key] = true
 			continue
 		}
-		if scan.Value != "" {
-			s.addReason(scanKeys[j], scan.Value, false)
+		if s.p.logScanAt == nil {
+			s.p.logScanAt = map[string]time.Time{}
+		}
+		prevScan, scanned := s.p.logScanAt[key]
+		// The boundary advances in the KUBELET's clock domain —
+		// streamNewest is the newest stamp on any line read; s.now
+		// (controller clock) is only the fallback for a stream
+		// that carried no parseable timestamp at all.
+		if scan.Value.streamNewest.IsZero() {
+			s.p.logScanAt[key] = s.now
+		} else {
+			s.p.logScanAt[key] = scan.Value.streamNewest
+		}
+		// Freshness gate: the marker must have a line newer than
+		// this pod's previous scan — the 360s window overlaps
+		// across 300s sweeps, so without it an error that stopped
+		// minutes ago re-flags for extra cycles. An unparseable
+		// stamp counts as fresh — fail toward alerting.
+		if scan.Value.reason != "" &&
+			(!scanned || scan.Value.newest.IsZero() || scan.Value.newest.After(prevScan)) {
+			s.addReason(key, scan.Value.reason, false)
 		}
 	}
+	s.inconclusive = inconclusive
+}
+
+// natsLogScan is one pod's log-tail verdict: the wedge reason of the
+// freshest matching line plus that line's kubelet timestamp (zero
+// when no matching line carried a parseable stamp), and
+// streamNewest — the newest stamp on ANY line read, the scan
+// boundary stored in the kubelet's clock domain.
+type natsLogScan struct {
+	reason       string
+	newest       time.Time
+	streamNewest time.Time
 }
 
 // applyPersistence runs the per-reason persistence pass: every
@@ -326,7 +387,34 @@ func (s *natsSweep) applyPersistence() {
 			}
 		}
 	}
-	s.p.seen.Prune(func(k string) bool { return seenKeep[k] })
+	// A degraded evidence channel must not read as "resolved": keep
+	// the first-seen clocks the sweep could not re-evaluate — every
+	// entry of a pod whose log tail failed, and prom-sourceable
+	// reasons cluster-wide while Prometheus is down (the reason
+	// strings overlap the log markers, so the suffix match is the
+	// only attribution available).
+	s.p.seen.Prune(func(k string) bool {
+		if seenKeep[k] {
+			return true
+		}
+		// seen keys are "ns/pod/reason" — recover the pod key.
+		i := strings.LastIndex(k, "/")
+		if i <= 0 {
+			return false
+		}
+		podKey := k[:i]
+		if s.inconclusive[podKey] {
+			return true
+		}
+		if s.promDegraded &&
+			(strings.HasSuffix(k, "/"+natsReasonJetStreamDisabled) ||
+				strings.HasSuffix(k, "/"+natsReasonStreamLeaderless)) {
+			if _, ok := s.census.memberByName[podKey]; ok {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // emitPodFindings emits the pod-local findings: a Prometheus-sourced
@@ -349,5 +437,43 @@ func (s *natsSweep) emitPodFindings() {
 		s.rep.Emit(natsJetstreamUnhealthyGauge, key+"/"+reason,
 			[]string{pod.Namespace, pod.Name, reason},
 			key+"("+reason+")")
+	}
+}
+
+// carryUnverifiable freezes last sweep's emitted series for evidence
+// the sweep could not re-evaluate — a Prometheus outage or a failed
+// pod-log tail must not read as "resolved" (one API flap would
+// otherwise prune live wedge series and reset their first-seen
+// clocks). Pods/members that left the census are genuinely gone and
+// their series still drop.
+func (s *natsSweep) carryUnverifiable() {
+	if !s.promDegraded && len(s.inconclusive) == 0 {
+		return
+	}
+	for k, lv := range s.p.emitted.Last() {
+		parts := strings.SplitN(k, "/", 3)
+		podKey := ""
+		if len(parts) == 3 && parts[1] != "" {
+			podKey = parts[0] + "/" + parts[1]
+			if _, ok := s.census.memberByName[podKey]; !ok {
+				continue // member gone — genuinely resolved
+			}
+			// A pod with fresh evidence emits its own series; only
+			// freeze pods whose evaluation was inconclusive.
+			if !s.promDegraded && !s.inconclusive[podKey] {
+				continue
+			}
+		} else {
+			// Namespace-scope series are all Prometheus-derived —
+			// carry while the channel is degraded and the namespace
+			// still hosts NATS members.
+			if !s.promDegraded || !s.census.namespaces[parts[0]] {
+				continue
+			}
+		}
+		s.rep.Carry(k, lv)
+		if podKey == "" || len(s.podReasons[podKey]) == 0 {
+			s.rep.Find(k + " (carried — evidence channel unavailable)")
+		}
 	}
 }

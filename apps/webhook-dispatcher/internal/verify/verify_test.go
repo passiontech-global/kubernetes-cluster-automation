@@ -1,11 +1,13 @@
 package verify
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -102,5 +104,32 @@ func TestSignatureReader(t *testing.T) {
 	ok, err = SignatureReader("s3cret", errReader{err: boom}, valid)
 	if !errors.Is(err, boom) || ok {
 		t.Fatalf("SignatureReader errReader = (%v, %v), want (false, %v)", ok, err, boom)
+	}
+}
+
+// TestSignatureReaderLargeBodyConcurrent exercises hmacBufPool under
+// -race: bodies larger than the 32 KiB scratch buffer force multiple
+// pool checkouts per verify, and concurrent deliveries must each
+// hash through a private buffer — a shared-buffer regression would
+// corrupt signatures (and the race detector would flag it).
+func TestSignatureReaderLargeBodyConcurrent(t *testing.T) {
+	body := bytes.Repeat([]byte("delivery-payload-"), 8192) // ~147 KiB
+	sig := sign("s3cret", body)
+	const callers = 16
+	bad := make(chan struct{}, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Go(func() {
+			ok, err := SignatureReader("s3cret",
+				bytes.NewReader(body), sig)
+			if err != nil || !ok {
+				bad <- struct{}{}
+			}
+		})
+	}
+	wg.Wait()
+	close(bad)
+	for range bad {
+		t.Fatal("concurrent large-body verify failed")
 	}
 }

@@ -244,15 +244,32 @@ func ScanTree(opts Options) (Result, error) {
 	return res, nil
 }
 
+// bindPos identifies which side of a `for K, V := range X` a name
+// binds — coverage is tracked per position because a slice literal's
+// elements bind the VALUE side while a map literal's keys and
+// values bind different positions.
+type bindPos uint8
+
+const (
+	bindKey bindPos = iota + 1
+	bindValue
+)
+
 // rangeFrame is one RangeStmt's binding scope on the AST stack: the
 // body positions an identifier must sit inside for the binding to
-// apply, the loop variable names, and whether the ranged expression
-// was a composite literal (only then are its string elements env
-// keys the scanner recorded).
+// apply, each bound name's position, and per-position coverage —
+// cover reports a static (literal or package-const) element can
+// bind that side, dyn reports a dynamic element can. A use of the
+// variable as an env key is cleanly covered only when cover holds
+// AND dyn does not: `[]string{"A", key()}` still leaves the scanner
+// unable to name every key the variable might carry.
 type rangeFrame struct {
-	body  *ast.BlockStmt
-	names map[string]bool
-	cover bool
+	body       *ast.BlockStmt
+	names      map[string]bindPos
+	coverKey   bool
+	coverValue bool
+	dynKey     bool
+	dynValue   bool
 }
 
 // fileScan carries one file's scan state: import aliases, the
@@ -327,35 +344,161 @@ func (s *fileScan) inspect(n ast.Node) bool {
 	return false
 }
 
-// scanRange records the string literals of a `for ... range
-// []string{...}` composite literal as env reads, then pushes the
-// loop variables' binding frame so identifiers inside the body
-// resolve as covered — and only there. Reports whether a frame was
-// pushed (a RangeStmt binding no identifiers pushes none).
+// scanRange classifies a `for ... range X` binding: a composite
+// literal contributes per-position cover/dyn flags (and every
+// literal element is recorded as a candidate env read), then the
+// loop variables' binding frame is pushed so identifiers inside the
+// body resolve against it — and only there. Reports whether a frame
+// was pushed (a RangeStmt binding no identifiers pushes none).
 func (s *fileScan) scanRange(e *ast.RangeStmt) bool {
-	cl, isLit := e.X.(*ast.CompositeLit)
-	if isLit {
-		for _, elt := range cl.Elts {
-			lit, ok := elt.(*ast.BasicLit)
-			if !ok || lit.Kind != token.STRING {
-				continue
-			}
-			if v, err := strconv.Unquote(lit.Value); err == nil {
-				s.record(s.fset, v, e.Pos())
-			}
-		}
+	var coverKey, coverValue, dynKey, dynValue bool
+	if cl, isLit := e.X.(*ast.CompositeLit); isLit {
+		coverKey, coverValue, dynKey, dynValue = s.scanRangeLit(cl, e.Pos())
 	}
-	names := map[string]bool{}
-	for _, id := range []ast.Expr{e.Key, e.Value} {
-		if ident, ok := id.(*ast.Ident); ok {
-			names[ident.Name] = true
-		}
+	names := map[string]bindPos{}
+	if id, ok := e.Key.(*ast.Ident); ok && id.Name != "_" {
+		names[id.Name] = bindKey
+	}
+	if id, ok := e.Value.(*ast.Ident); ok && id.Name != "_" {
+		names[id.Name] = bindValue
 	}
 	if len(names) == 0 {
 		return false
 	}
-	s.stack = append(s.stack, &rangeFrame{body: e.Body, names: names, cover: isLit})
+	s.stack = append(s.stack, &rangeFrame{
+		body: e.Body, names: names,
+		coverKey: coverKey, coverValue: coverValue,
+		dynKey: dynKey, dynValue: dynValue,
+	})
 	return true
+}
+
+// scanRangeLit walks a ranged composite literal: every literal
+// element is recorded as a candidate env read (the Referenced
+// over-approximation is unchanged), then the elements are split per
+// binding position — slice/array elements bind the value side (the
+// key side is the index, never an env name), map KeyValueExprs split
+// key vs value, and an opaque composite type (a named slice/map
+// literal the scanner cannot type) covers both sides like the
+// pre-split behavior did.
+func (s *fileScan) scanRangeLit(cl *ast.CompositeLit, pos token.Pos) (coverKey, coverValue, dynKey, dynValue bool) {
+	for _, elt := range cl.Elts {
+		s.scanRangeElt(elt, pos)
+	}
+	var keyElts, valElts []ast.Expr
+	splitKV := func(elts []ast.Expr) {
+		for _, elt := range elts {
+			if kv, ok := elt.(*ast.KeyValueExpr); ok {
+				keyElts = append(keyElts, kv.Key)
+				valElts = append(valElts, kv.Value)
+			} else {
+				keyElts = append(keyElts, elt)
+				valElts = append(valElts, elt)
+			}
+		}
+	}
+	switch cl.Type.(type) {
+	case *ast.MapType:
+		splitKV(cl.Elts)
+	case *ast.ArrayType:
+		valElts = cl.Elts
+	default:
+		splitKV(cl.Elts)
+	}
+	coverKey, dynKey = s.scanRangeCover(keyElts)
+	coverValue, dynValue = s.scanRangeCover(valElts)
+	return coverKey, coverValue, dynKey, dynValue
+}
+
+// scanRangeCover classifies one binding position's element list:
+// cover reports at least one static element (string literal or
+// package-level string const — both already recorded as env reads),
+// dyn reports at least one element the scanner cannot resolve. A
+// non-string literal counts as dynamic: it cannot be an env name,
+// so a binding that can take one is not provably covered.
+func (s *fileScan) scanRangeCover(elts []ast.Expr) (cover, dyn bool) {
+	var walk func(ast.Expr)
+	walk = func(e ast.Expr) {
+		switch v := e.(type) {
+		case *ast.KeyValueExpr:
+			walk(v.Key)
+			walk(v.Value)
+		case *ast.BasicLit:
+			if v.Kind == token.STRING {
+				if _, err := strconv.Unquote(v.Value); err == nil {
+					cover = true
+				}
+			} else {
+				dyn = true
+			}
+		case *ast.Ident:
+			if _, ok := s.consts[v.Name]; ok {
+				cover = true
+			} else {
+				dyn = true
+			}
+		default:
+			dyn = true
+		}
+	}
+	for _, elt := range elts {
+		walk(elt)
+	}
+	return cover, dyn
+}
+
+// scanRangeElt records one element of a ranged composite literal:
+// string literals and package-level string consts are env reads; a
+// KeyValueExpr (map literal) contributes BOTH sides — `for k := range`
+// binds keys while `for _, v := range` binds values, and the scanner
+// cannot tell which the caller treats as the env name.
+func (s *fileScan) scanRangeElt(elt ast.Expr, pos token.Pos) {
+	if kv, ok := elt.(*ast.KeyValueExpr); ok {
+		s.scanRangeElt(kv.Key, pos)
+		s.scanRangeElt(kv.Value, pos)
+		return
+	}
+	switch v := elt.(type) {
+	case *ast.BasicLit:
+		if v.Kind == token.STRING {
+			if lit, err := strconv.Unquote(v.Value); err == nil {
+				s.record(s.fset, lit, pos)
+			}
+		}
+	case *ast.Ident:
+		if c, ok := s.consts[v.Name]; ok {
+			s.record(s.fset, c, pos)
+		}
+	}
+}
+
+// rangeResolve reports whether name is bound by an enclosing range
+// frame at pos and, when it is, whether that binding is cleanly
+// covered — every element the variable can take was recorded as an
+// env read. Walking the stack top-down finds the innermost binding
+// first, so a non-literal inner range correctly shadows an outer
+// literal one. Unresolved reporting is deferred to the USE site:
+// a loop whose body never feeds an env read contributes nothing,
+// however dynamic its ranged literal is.
+func (s *fileScan) rangeResolve(name string, pos token.Pos) (bound, clean bool) {
+	for i := len(s.stack) - 1; i >= 0; i-- {
+		f := s.stack[i]
+		p, ok := f.names[name]
+		if !ok {
+			continue
+		}
+		if pos <= f.body.Pos() || pos >= f.body.End() {
+			continue
+		}
+		switch p {
+		case bindKey:
+			return true, f.coverKey && !f.dynKey
+		case bindValue:
+			return true, f.coverValue && !f.dynValue
+		}
+		return true, false
+	}
+	return false, false
 }
 
 // scanCall resolves env-reading call sites: raw os.Getenv-family
@@ -401,9 +544,12 @@ func (s *fileScan) addKey(expr ast.Expr, pos token.Pos) {
 			s.record(s.fset, v, pos)
 			return
 		}
-		if s.rangeCovered(k.Name, k.Pos()) {
+		if bound, clean := s.rangeResolve(k.Name, k.Pos()); bound && clean {
 			// Bound to a []string literal already recorded at the
-			// RangeStmt — the keys are covered.
+			// RangeStmt with no dynamic sibling — the keys are
+			// covered. Anything else bound-but-unclean (non-literal
+			// range, dynamic element, uncovered position) cannot be
+			// named and falls through to Unresolved.
 			return
 		}
 		// An identifier that is neither a string const nor a
@@ -413,24 +559,4 @@ func (s *fileScan) addKey(expr ast.Expr, pos token.Pos) {
 	default:
 		// Selector, concatenation, call result — a computed key.
 	}
-}
-
-// rangeCovered reports whether ident sits inside the body of the
-// innermost range frame binding it AND that frame's ranged
-// expression was a composite literal (whose string elements were
-// already recorded as env reads). Walking the stack top-down finds
-// the innermost binding first, so a non-literal inner range
-// correctly shadows an outer literal one.
-func (s *fileScan) rangeCovered(name string, pos token.Pos) bool {
-	for i := len(s.stack) - 1; i >= 0; i-- {
-		f := s.stack[i]
-		if !f.names[name] {
-			continue
-		}
-		if pos <= f.body.Pos() || pos >= f.body.End() {
-			continue
-		}
-		return f.cover
-	}
-	return false
 }

@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/cycle"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
@@ -226,6 +227,7 @@ func (g *Guard) Cycle(ctx context.Context) *Result {
 		note(fmt.Sprintf("postgres container %s down", pg))
 	default:
 		g.guardRun(ctx, pg, user, pass, res, note)
+		cycle.Heartbeat(ctx) // step boundary — a long compact session must not look wedged
 		// backup-health: physical-backup verifier — pg_dump -Fc
 		// every BackupInterval when free space allows, header
 		// verified; emits kine_db_backup_{age_seconds,valid} in

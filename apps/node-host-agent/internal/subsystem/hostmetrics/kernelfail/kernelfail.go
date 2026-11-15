@@ -248,7 +248,8 @@ func (r *Runner) Close() {
 // state they exist to check. The 30s cap sits on top of the
 // runner's own Config.Timeout default.
 func defaultRunHostCmd(hostRoot string) func(ctx context.Context, argv ...string) (string, error) {
-	runner := hostexec.New(hostexec.Config{HostRoot: hostRoot})
+	runner := hostexec.New(hostexec.Config{HostRoot: hostRoot,
+		ScrubSystemdEnv: true})
 	return func(ctx context.Context, argv ...string) (string, error) {
 		if len(argv) == 0 {
 			return "", errors.New("kernelfail: empty host argv")

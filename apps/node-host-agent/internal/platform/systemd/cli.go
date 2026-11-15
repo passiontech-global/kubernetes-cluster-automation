@@ -189,3 +189,12 @@ func (c *Client) Journal(ctx context.Context, unit, since string) (string, error
 	argv := journalwatch.UnitWindowArgv(unit, since)
 	return c.ExecCombined(ctx, argv[0], argv[1:]...)
 }
+
+// cliSystemState mirrors `systemctl is-system-running` — the state
+// word on stdout, trimmed. A non-zero exit (degraded/starting/…)
+// still carries the word alongside the exec error, matching the
+// Exec output+error contract SystemState documents.
+func (c *Client) cliSystemState(ctx context.Context) (string, error) {
+	out, err := c.systemctl(ctx, "is-system-running")
+	return strings.TrimSpace(out), err
+}

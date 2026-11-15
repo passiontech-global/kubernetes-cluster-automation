@@ -186,7 +186,7 @@ func SameOriginRedirectPolicy(base string) func(*http.Request, []*http.Request) 
 		if len(via) >= 10 {
 			return errors.New("stopped after 10 redirects")
 		}
-		if req.URL.Scheme != scheme || req.URL.Host != host {
+		if req.URL.Scheme != scheme || !strings.EqualFold(req.URL.Host, host) {
 			return fmt.Errorf(
 				"refusing cross-origin redirect from %s to %s — webhook_token would leak",
 				via[len(via)-1].URL.Host, req.URL.Host)

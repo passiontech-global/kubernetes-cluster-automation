@@ -48,6 +48,9 @@ type signConfig struct {
 	Node     string // registry key filter; "" = every registry node
 	Duration string
 	SSHKey   string
+	// InsecureIgnoreHostKey is the explicit opt-out for the
+	// fail-closed known_hosts contract (ssh.go).
+	InsecureIgnoreHostKey bool
 }
 
 // Cmd is the `nebula-sign` subcommand entrypoint: flag parsing +
@@ -64,6 +67,10 @@ func Cmd(ctx context.Context, args []string) int {
 	sshKey := fs.String("ssh-key",
 		envx.String(envnames.EnvConvergeSSHKey, "~/.ssh/id_ed25519"),
 		"SSH private key for the host.pub fetch fallback")
+	insecure := fs.Bool("insecure-ignore-host-key", false,
+		"dial without host-key verification when no known_hosts "+
+			"exists next to --ssh-key (known_hosts, when present, "+
+			"is always enforced)")
 	if code, ok := opsx.Parse(fs, args); !ok {
 		return code
 	}
@@ -75,6 +82,7 @@ func Cmd(ctx context.Context, args []string) int {
 	cfg := signConfig{
 		VarsDir: *varsDir, CaDir: *caDir, Node: *only,
 		Duration: *duration, SSHKey: *sshKey,
+		InsecureIgnoreHostKey: *insecure,
 	}
 	if err := nebulaSign(ctx, cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "nebula-sign:", err)
@@ -120,7 +128,8 @@ func nebulaSign(ctx context.Context, cfg signConfig) error {
 		if jobs[i].Pub != "" {
 			continue
 		}
-		pub, err := sshFetchHostPub(ctx, jobs[i], nebulaNet, cfg.SSHKey)
+		pub, err := sshFetchHostPub(ctx, jobs[i], nebulaNet, cfg.SSHKey,
+			cfg.InsecureIgnoreHostKey)
 		if err != nil {
 			fmt.Fprintf(os.Stderr,
 				"nebula-sign: host.pub fetch failed for %s (%s): %v\n",

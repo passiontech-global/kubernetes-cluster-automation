@@ -266,6 +266,13 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 			"pvc", pvc.Namespace+"/"+pvc.Name)
 		return false
 	}
+	// The live-pod scan sees only non-terminal claimants — a Failed
+	// pod on a node that stopped reporting can still hold the mount,
+	// and an attached VolumeAttachment on the claim's PV proves the
+	// volume outlives the pod scan. Either keeps the finalizer.
+	if j.pvcMountThreatenable(ctx, pvc) {
+		return false
+	}
 	log.Info("PATCH-FINALIZER: stuck PVC unreferenced by every live pod — removing pvc-protection",
 		"pvc", pvc.Namespace+"/"+pvc.Name,
 		"terminatingFor", j.now.Now().Sub(pvc.DeletionTimestamp.Time).Truncate(time.Minute))
@@ -301,6 +308,144 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 		return false
 	}
 	return true
+}
+
+// pvcMountThreatenable reports whether the claim's volume may still
+// be mounted despite zero live pod claimants — the two blind spots
+// of the claimedPVCNames scan. Both checks fail CLOSED: any read
+// error answers "still mounted" and keeps the finalizer.
+//
+//   - A Failed pod on a node that stopped reporting Ready (or is
+//     gone entirely) may never have released the mount — terminal
+//     phase only proves release once kubelet confirms it.
+//   - A VolumeAttachment bound to the claim's PV that still reports
+//     attached proves the kubelet-side mount outlives the pod scan.
+func (j *failedJobsJanitor) pvcMountThreatenable(ctx context.Context,
+	pvc *metav1.PartialObjectMetadata) bool {
+	log := logf.FromContext(ctx)
+
+	// Resolve the bound PV — metadata-only census objects carry no
+	// spec, so the full claim is fetched (rare path: only stuck
+	// pvc-protection candidates reach here).
+	full, err := j.cs.CoreV1().PersistentVolumeClaims(pvc.Namespace).
+		Get(ctx, pvc.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return false // claim already gone — nothing left to protect
+	}
+	if err != nil {
+		metrics.IncError(j.queue)
+		log.Error(err, "full pvc read failed — keeping pvc-protection finalizer (fail closed)",
+			"pvc", pvc.Namespace+"/"+pvc.Name)
+		return true
+	}
+	pvName := full.Spec.VolumeName
+
+	// VolumeAttachment check: any VA bound to the PV that still
+	// reports attached keeps the mount alive.
+	if pvName != "" {
+		attached, err := j.vaAttachedToPV(ctx, pvName)
+		if err != nil {
+			metrics.IncError(j.queue)
+			log.Error(err, "volumeattachment list failed — keeping pvc-protection finalizer (fail closed)",
+				"pvc", pvc.Namespace+"/"+pvc.Name, "pv", pvName)
+			return true
+		}
+		if attached {
+			log.Info("SKIP: volumeattachment still attached to the claim's PV — finalizer stays",
+				"pvc", pvc.Namespace+"/"+pvc.Name, "pv", pvName)
+			return true
+		}
+	}
+
+	// Failed pods on dead nodes: terminal phase does not prove the
+	// kubelet released the mount when the node itself is gone.
+	dead, err := j.failedPodOnDeadNode(ctx, pvc.Namespace, pvc.Name)
+	if err != nil {
+		metrics.IncError(j.queue)
+		log.Error(err, "dead-node pod scan failed — keeping pvc-protection finalizer (fail closed)",
+			"pvc", pvc.Namespace+"/"+pvc.Name)
+		return true
+	}
+	if dead != "" {
+		log.Info("SKIP: failed pod on unreachable node may still hold the mount — finalizer stays",
+			"pvc", pvc.Namespace+"/"+pvc.Name, "pod", dead)
+		return true
+	}
+	return false
+}
+
+// vaAttachedToPV reports whether any VolumeAttachment bound to pv
+// still reports attached (Status.Attached true, or attached state
+// unknown while the VA is not terminating — fail closed).
+func (j *failedJobsJanitor) vaAttachedToPV(ctx context.Context,
+	pvName string) (bool, error) {
+	vas, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.VolumeAttachments(j.cs))
+	if err != nil {
+		return false, err
+	}
+	for i := range vas {
+		v := &vas[i]
+		if v.Spec.Source.PersistentVolumeName == nil ||
+			*v.Spec.Source.PersistentVolumeName != pvName {
+			continue
+		}
+		if v.Status.Attached {
+			return true, nil
+		}
+		// Unknown attach state on a live VA: the attacher has not
+		// confirmed detach — treat as still mounted.
+		if v.DeletionTimestamp == nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// failedPodOnDeadNode returns the name of a Failed pod in ns that
+// claims pvcName and sits on a node that is not Ready (or missing
+// entirely). Returns "" when no such pod exists.
+func (j *failedJobsJanitor) failedPodOnDeadNode(ctx context.Context,
+	ns, pvcName string) (string, error) {
+	// Nodes first: a pod on a live node released its volumes on
+	// failure, so only unreachable nodes are suspect.
+	nodes, err := kube.ListNodes(ctx, j.cs)
+	if err != nil {
+		return "", err
+	}
+	ready := map[string]bool{}
+	for i := range nodes {
+		ready[nodes[i].Name] = kube.NodeReady(&nodes[i])
+	}
+
+	var stuckPod string
+	err = kube.ListEach(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.Pods(j.cs, ns),
+		func(page []corev1.Pod) error {
+			for i := range page {
+				p := &page[i]
+				if p.Status.Phase != corev1.PodFailed || p.Spec.NodeName == "" {
+					continue
+				}
+				alive, known := ready[p.Spec.NodeName]
+				if known && alive {
+					continue // kubelet confirmed release on a live node
+				}
+				for _, claim := range kube.PodClaimedPVCs(p) {
+					if claim == pvcName {
+						stuckPod = p.Name
+						return nil
+					}
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return "", err
+	}
+	return stuckPod, nil
 }
 
 // nsFinalizerNames renders .spec.finalizers — the list that actually

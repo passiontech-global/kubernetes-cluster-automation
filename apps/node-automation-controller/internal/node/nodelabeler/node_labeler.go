@@ -104,7 +104,7 @@ func configFromEnv() labelerConfig {
 
 func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	res := ctrl.Result{RequeueAfter: 30 * time.Minute}
+	res := ctrl.Result{RequeueAfter: shared.RequeueAfter(30 * time.Minute)}
 
 	// (a) worker role on every non-control-plane node lacking it.
 	nodes, err := kube.ListNodesCached(ctx, r.nodeReader, r.cs)

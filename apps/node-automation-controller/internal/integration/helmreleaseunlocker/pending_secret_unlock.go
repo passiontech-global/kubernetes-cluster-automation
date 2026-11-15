@@ -130,7 +130,8 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	secrets, err := kube.ListAll(ctx,
 		metav1.ListOptions{
 			Limit:         kube.DefaultListPageSize,
-			LabelSelector: "owner=helm,name=" + release},
+			LabelSelector: "owner=helm,name=" + release,
+			FieldSelector: "type=helm.sh/release.v1"},
 		kube.Secrets(u.cs, hrStorageNS(hr)))
 	if err != nil {
 		return false, fmt.Errorf("list release secrets in %s for %s: %w",
@@ -239,14 +240,6 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 		// refund only on the no-mutation paths.
 		return false, fmt.Errorf("delete pending secret %s/%s: %w", pending.Namespace, pending.Name, err)
 	}
-	// The destructive half already landed — stamp the 24h cooldown
-	// in RAM NOW, before the HR annotation patch: if that patch
-	// fails, the next sweep must still see this HR inside its
-	// cooldown instead of re-deleting release state that already
-	// moved (the persisted half rides the same patch below; the
-	// RAM half cannot wait for it).
-	u.pending.unlocked.Stamp(key, u.now.Now())
-
 	// reconcile.fluxcd.io/requestedAt is flux's "reconcile now" hint —
 	// only the value changing matters; RFC3339 is the convention. The
 	// same patch persists passiontech.dev/last-helm-unlock so the 24h
@@ -261,8 +254,18 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	}
 	if _, err := u.dyn.Resource(gvr).Namespace(hr.GetNamespace()).Patch(ctx, hr.GetName(),
 		types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		// The pending secret is already gone but the reconcile
+		// nudge + persisted cooldown never landed — still sweep
+		// the failed hook Jobs so the next attempt is not
+		// re-wedged by the same residue, then surface the error.
+		u.cleanFailedHookJobs(ctx, hrReleaseNS(hr), hrReleaseName(hr))
 		return false, fmt.Errorf("annotate helmrelease %s: %w", key, err)
 	}
+	// HR patch landed — the 24h cooldown may stamp now (the
+	// persisted half rode the same merge patch; the RAM half
+	// stamps only on success so a failed patch re-evaluates next
+	// sweep instead of hiding an unlock that did not happen).
+	u.pending.unlocked.Stamp(key, u.now.Now())
 	log.Info("ACTION: requested HR reconcile", "hr", key)
 
 	// C3a: failed helm-hook Jobs in the RELEASE namespace are the second

@@ -82,6 +82,13 @@ func (r *Reporter) syncLogEvents(ctx context.Context) error {
 	r.pruneEmitted()
 	allEmitted := true
 	for i, line := range lines {
+		if ctx.Err() != nil {
+			// Context dead — stop mid-window and roll the offset
+			// back so the unprocessed tail replays next cycle
+			// instead of being silently consumed.
+			allEmitted = false
+			break
+		}
 		if !r.processLogLine(ctx, line, i < replayCount) {
 			allEmitted = false
 		}
@@ -117,14 +124,21 @@ func (r *Reporter) processLogLine(ctx context.Context, line []byte, replay bool)
 func (r *Reporter) applyRules(ctx context.Context, rules []logRule, msg, eventType, errMsg string) bool {
 	ok := true
 	for _, rule := range rules {
+		if ctx.Err() != nil {
+			return false
+		}
 		if !rule.re.MatchString(msg) {
 			continue
 		}
-		r.problemCounter.WithLabelValues(rule.reason).Inc()
+		// problem_counter counts DELIVERED problems: bump only
+		// after the Event write lands, so a failed emit doesn't
+		// inflate the gauge for a line that will replay.
 		if err := r.emitEvent(ctx, rule.reason, msg, eventType); err != nil {
 			logger().Error(errMsg, "reason", rule.reason, "error", err)
 			ok = false
+			continue
 		}
+		r.problemCounter.WithLabelValues(rule.reason).Inc()
 	}
 	return ok
 }

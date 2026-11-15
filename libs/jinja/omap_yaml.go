@@ -78,14 +78,17 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 	if n == nil {
 		return nil, nil
 	}
-	if depth > yamlMaxDepth {
-		return nil, fmt.Errorf("yaml: nesting exceeds %d levels (anchor cycle?)", yamlMaxDepth)
-	}
+	// Step budget before the depth bail — same rule as the value
+	// walkers: every recursive call burns a step so a wide
+	// structure at the cap can't walk unbounded.
 	if stepBudgetExhausted(steps) {
 		// Depth alone can't catch billion-laughs: every alias
 		// re-walks its target, multiplying visits per level while
 		// staying shallow. The shared counter errors the decode.
 		return nil, fmt.Errorf("yaml: decode exceeds %d node steps (billion-laughs alias expansion?)", walkMaxSteps)
+	}
+	if depth > yamlMaxDepth {
+		return nil, fmt.Errorf("yaml: nesting exceeds %d levels (anchor cycle?)", yamlMaxDepth)
 	}
 	if n.Kind == yaml3.DocumentNode {
 		if len(n.Content) == 0 {
@@ -169,6 +172,16 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 			if i, err := strconv.ParseInt(n.Value, 10, 64); err == nil {
 				return i, nil
 			}
+			// (MaxInt64, MaxUint64] stays an exact uint64 — the
+			// engine's asUint64/numMag machinery carries it; the
+			// sign-less ParseUint rejects negatives, which keep
+			// the string fallback below.
+			if u, err := strconv.ParseUint(n.Value, 0, 64); err == nil {
+				return u, nil
+			}
+			if u, err := strconv.ParseUint(n.Value, 10, 64); err == nil {
+				return u, nil
+			}
 			return n.Value, nil
 		case "!!float":
 			if f, err := strconv.ParseFloat(n.Value, 64); err == nil {
@@ -211,7 +224,13 @@ func yamlNodeAt(n *yaml3.Node, depth int, steps *int) (any, error) {
 // non-scalar key (mapping/sequence) errors instead of silently
 // becoming the empty string.
 func yamlScalarKey(kn *yaml3.Node) (*yaml3.Node, error) {
-	if kn != nil && kn.Kind == yaml3.AliasNode {
+	// Dereference alias CHAINS recursively — `*a` where a anchors
+	// another alias used to leave an AliasNode in key position and
+	// error "not a scalar". Bounded by yamlMaxDepth: alias targets
+	// precede their references in document order so chains
+	// terminate, but a pathological self-referential anchor must
+	// not spin.
+	for i := 0; i < yamlMaxDepth && kn != nil && kn.Kind == yaml3.AliasNode; i++ {
 		kn = kn.Alias
 	}
 	if kn == nil {

@@ -80,6 +80,14 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 		d.State.AppendLog("suspect: konnectivity-server process not found — nothing to kill")
 		return
 	}
+	// L1↔L3 maintenance hold outranks the kill: a kured drain or
+	// control-plane upgrade is already bouncing this node's
+	// workloads — killing the konnectivity tunnel on top severs
+	// worker→apiserver connectivity mid-drain.
+	if d.HoldEmergencyHeal(ctx) {
+		d.State.AppendLog("suspect: konnectivity-server unhealthy but cluster maintenance in progress — holding kill")
+		return
+	}
 	switch d.Cfg.Sig13.Mode {
 	case cdeps.ModeEnforce:
 		// Check+spend atomically right before the action — off and
@@ -162,7 +170,8 @@ func (c *FreezeCheck) konnectivityPID() int {
 		if i := strings.LastIndex(base, "/"); i >= 0 {
 			base = base[i+1:]
 		}
-		if base == "konnectivity-server" {
+		if base == "konnectivity-server" &&
+			c.d.Proc.CgroupContains(pid, cdeps.K0sControllerCgroupSubstr) {
 			return pid
 		}
 	}

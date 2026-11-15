@@ -8,6 +8,7 @@ package linkerd
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -52,42 +53,64 @@ var linkerdIdentityStallMarkers = []string{
 // and identity-stall scans share the single bounded fetch
 // (probefw.LogTimeout / probefw.LogMaxBytes, same posture as the
 // scylla gossip probe) so a flagged pod costs one apiserver read.
-// The match closure only COLLECTS; it returns true early solely
-// when both families are already proven, so PodLogTail can stop
-// scanning. A fetch failure is inconclusive, not healthy.
+// Timestamps ride along so each family reports its NEWEST matching
+// line's kubelet stamp — the caller's freshness gate drops a family
+// whose only evidence predates the pod's previous scan (the
+// overlapping SinceSeconds window would otherwise re-flag a
+// self-healed signature for extra cycles). A fetch failure is
+// inconclusive, not healthy.
 func (p *linkerdH2StreamGuardCheck) linkerdH2LogSignals(ctx context.Context,
-	pod *corev1.Pod) (storm, identity bool, err error) {
+	pod *corev1.Pod) (storm, identity bool, stormTS, identityTS, streamNewest time.Time, err error) {
 
-	_, err = kube.ReadPodLogTail(ctx, p.CS, pod, kube.PodLogOpts{
+	text, err := kube.ReadPodLogText(ctx, p.CS, pod, kube.PodLogOpts{
 		Container:    kube.LinkerdProxyContainer,
 		TailLines:    probefw.DefaultTailLines,
-		SinceSeconds: 900,
+		SinceSeconds: 360,
 		MaxBytes:     probefw.LogMaxBytes,
 		Timeout:      probefw.LogTimeout,
-	}, func(line string) bool {
+		Timestamps:   true,
+	})
+	if err != nil {
+		return false, false, time.Time{}, time.Time{}, time.Time{}, err
+	}
+	for line := range strings.SplitSeq(text, "\n") {
 		l := strings.ToLower(line)
+		ts, hasTS := kube.PodLogLineTS(line)
+		if hasTS && ts.After(streamNewest) {
+			streamNewest = ts
+		}
 		for _, marker := range linkerdH2StormMarkers {
 			if strings.Contains(l, marker) {
 				storm = true
+				if hasTS && ts.After(stormTS) {
+					stormTS = ts
+				}
 				break
 			}
 		}
 		for _, marker := range linkerdIdentityStallMarkers {
 			if strings.Contains(l, marker) {
 				identity = true
+				if hasTS && ts.After(identityTS) {
+					identityTS = ts
+				}
 				break
 			}
 		}
-		return storm && identity
-	})
-	return storm, identity, err
+	}
+	return storm, identity, stormTS, identityTS, streamNewest, nil
 }
 
 // logSignals is one pod's proxy-log verdict collected by the phase-2
-// worker pool — same triple linkerdH2LogSignals returns, packaged
-// for the indexed results slice.
+// worker pool — the two family flags plus each family's newest
+// matching-line timestamp (zero when the family never matched or no
+// stamp parsed — the freshness gate counts that as fresh) and
+// streamNewest, the newest stamp on ANY line read: the scan
+// boundary lives in the kubelet's clock domain.
 type logSignals struct {
-	storm, identity bool
+	storm, identity     bool
+	stormTS, identityTS time.Time
+	streamNewest        time.Time
 }
 
 // linkerdSuspectPods pre-filters the log scan through Prometheus:

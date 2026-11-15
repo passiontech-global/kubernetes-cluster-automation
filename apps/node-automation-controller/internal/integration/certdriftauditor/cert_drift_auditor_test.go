@@ -739,8 +739,9 @@ func TestReplicatedDriftClearsOnResync(t *testing.T) {
 	}
 }
 
-// A source that is NOT a TLS secret resolves via the direct-Get
-// fallback, not the tlsData sweep map.
+// A source that is NOT a TLS secret still resolves via the same
+// direct-Get path every source takes now that the tlsData sweep map
+// is gone.
 func TestReplicatedDriftOpaqueSourceFallback(t *testing.T) {
 	testutil.CleanupMetric(t, metrics.ReplicatedSecretDrift, "apps", "tls-copy", "sec/tls-src")
 	src := &corev1.Secret{

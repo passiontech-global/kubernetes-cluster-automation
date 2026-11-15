@@ -227,7 +227,7 @@ func TestSSHFetchHostPubThroughBastion(t *testing.T) {
 	bastion.bridge = final.ln.Addr().String()
 
 	out, err := sshFetchHostPub(context.Background(),
-		fetchJob(bastion.port()), "interdc", fetchKey(t))
+		fetchJob(bastion.port()), "interdc", fetchKey(t), true)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestSSHFetchHostPubRemoteFailure(t *testing.T) {
 	bastion.bridge = final.ln.Addr().String()
 
 	_, err := sshFetchHostPub(context.Background(),
-		fetchJob(bastion.port()), "interdc", fetchKey(t))
+		fetchJob(bastion.port()), "interdc", fetchKey(t), true)
 	if err == nil ||
 		!strings.Contains(err.Error(), "read host.pub") ||
 		!strings.Contains(err.Error(), "No such file or directory") {
@@ -264,7 +264,7 @@ func TestSSHFetchHostPubSessionRejected(t *testing.T) {
 	bastion.bridge = final.ln.Addr().String()
 
 	_, err := sshFetchHostPub(context.Background(),
-		fetchJob(bastion.port()), "interdc", fetchKey(t))
+		fetchJob(bastion.port()), "interdc", fetchKey(t), true)
 	if err == nil || !strings.Contains(err.Error(), "rejected") {
 		t.Fatalf("err=%v", err)
 	}
@@ -281,7 +281,7 @@ func TestSSHFetchHostPubCancelMidCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 	_, err := sshFetchHostPub(ctx, fetchJob(bastion.port()),
-		"interdc", fetchKey(t))
+		"interdc", fetchKey(t), true)
 	if err == nil {
 		t.Fatal("hang want ctx error")
 	}

@@ -42,6 +42,8 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -132,13 +134,17 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
-	anyCordoned := false
+	// cordoned is the actively-cordoned node name set — cluster-wide
+	// evidence alone is not enough for cordoned_node_blocked: the
+	// PDB's own pods must actually sit on one of these nodes (an
+	// unrelated cordon must not pin every blocked PDB's series).
+	cordoned := map[string]bool{}
 	for i := range nodes {
 		if kube.NodeActivelyCordoned(&nodes[i], now) {
-			anyCordoned = true
-			break
+			cordoned[nodes[i].Name] = true
 		}
 	}
+	anyCordoned := len(cordoned) > 0
 	nodes = nil
 
 	pdbs, err := kube.ListAll(ctx,
@@ -160,6 +166,13 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 		// noise, not a deadlock); disruptionsAllowed > 0 means the
 		// eviction API can proceed.
 		blocked := p.Status.ExpectedPods > 0 && p.Status.DisruptionsAllowed == 0
+		// cordoned_node_blocked requires the PDB's own pods on a
+		// cordoned node — computed lazily so the pod list only runs
+		// for PDBs that are actually blocking right now.
+		cordonedBlocked := false
+		if blocked && anyCordoned {
+			cordonedBlocked = w.pdbPodsOnCordonedNodes(ctx, p, cordoned)
+		}
 		reasons := []struct {
 			name   string
 			holds  bool
@@ -168,7 +181,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 			{pdbReasonImpossiblePolicy,
 				blocked && p.Status.DesiredHealthy >= p.Status.ExpectedPods,
 				pdbImpossibleMinAge},
-			{pdbReasonCordonedNode, blocked && anyCordoned, pdbCordonedMinAge},
+			{pdbReasonCordonedNode, cordonedBlocked, pdbCordonedMinAge},
 			{pdbReasonProlonged, blocked, pdbProlongedMinAge},
 		}
 		reported := false
@@ -223,4 +236,47 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// tracked — the same set `seen` collected this cycle.
 	log.Info("sweep done", "flagged", flagged, "tracked", len(seen))
 	return nil
+}
+
+// pdbPodsOnCordonedNodes reports whether at least one pod the PDB
+// selects sits on an actively-cordoned node — the cordon keeps its
+// replacement from scheduling, which is what makes the drain
+// deadlock real. A pod in a terminal phase does not count (it is
+// already on its way out). Fail closed: an unreadable selector or a
+// failed pod list keeps the flag (a false cordoned_node_blocked is
+// loud; a silently-cleared one hides a live drain wedge).
+func (w *pdbDeadlockWatchdog) pdbPodsOnCordonedNodes(ctx context.Context,
+	p *policyv1.PodDisruptionBudget, cordoned map[string]bool) bool {
+
+	if p.Spec.Selector == nil {
+		return false // policy/v1 nil selector matches no pods
+	}
+	sel, err := metav1.LabelSelectorAsSelector(p.Spec.Selector)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "PDB selector unparseable — keeping cordoned verdict",
+			"pdb", p.Namespace+"/"+p.Name)
+		return true
+	}
+	pods, err := kube.ListAll(ctx, metav1.ListOptions{
+		Limit:         kube.DefaultListPageSize,
+		LabelSelector: sel.String(),
+	}, kube.Pods(w.cs, p.Namespace))
+	if err != nil {
+		metrics.IncError(w.queue)
+		logf.FromContext(ctx).Error(err, "PDB pod list failed — keeping cordoned verdict",
+			"pdb", p.Namespace+"/"+p.Name)
+		return true
+	}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Spec.NodeName == "" || !cordoned[pod.Spec.NodeName] {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		return true
+	}
+	return false
 }

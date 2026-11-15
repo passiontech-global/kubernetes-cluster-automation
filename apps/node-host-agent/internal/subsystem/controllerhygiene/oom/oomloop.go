@@ -249,9 +249,11 @@ func (c *LoopCheck) pruneKills(killsPath string, now int64) int {
 // setAdj writes oom_score_adj for the first process named comm —
 // `pgrep -x <comm> | head -1` + `echo adj > /proc/pid/oom_score_adj`.
 // Idempotent and silent when the process is absent (the shell's
-// `|| return 0` / `|| true`).
+// `|| return 0` / `|| true`). The lookup is cgroup-scoped: a
+// same-named process outside k0scontroller.service (foreign
+// daemon, recycled pid) must never get its adj rewritten.
 func (c *LoopCheck) setAdj(comm string, adj int) {
-	pid := c.d.Proc.FindByComm(comm)
+	pid := c.d.Proc.FindByCommInCgroup(comm, cdeps.K0sControllerCgroupSubstr)
 	if pid == 0 {
 		return
 	}

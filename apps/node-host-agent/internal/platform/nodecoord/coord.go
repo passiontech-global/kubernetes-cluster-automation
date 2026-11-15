@@ -118,6 +118,14 @@ type Coord struct {
 	// now < lastMaintUntil (a verified window), and fails open
 	// otherwise so a dead apiserver cannot freeze L1 self-heal.
 	lastMaintUntil time.Time
+	// maintUntilMono is the MONOTONIC-clock twin of
+	// lastMaintUntil, stamped at the same observation: the wall
+	// deadline alone races a skewed node clock — stepped backward
+	// the hold never expires, stepped forward it drops mid-
+	// maintenance while L3 still believes the window is open.
+	// time.Now() carries the monotonic reading, so the window
+	// counts REAL elapsed time regardless of wall jumps.
+	maintUntilMono time.Time
 	// lastKuredLocked/lastKuredAt record the kured drain-lock half
 	// of the last SUCCESSFUL annotation read — the TTL-bounded
 	// escape hatch for the same flap: a confirmed drain lock keeps
@@ -215,7 +223,7 @@ func (c *Coord) Maintenance(ctx context.Context) (Verdict, error) {
 			kured := c.lastKuredLocked &&
 				c.now().Sub(c.lastKuredAt) < kuredLockTTL
 			v.KuredLocked = kured
-			v.Active = kured || v.MaintenanceUntil.After(c.now())
+			v.Active = kured || c.maintActiveLocked()
 		}
 	} else {
 		c.cached = annos
@@ -227,6 +235,29 @@ func (c *Coord) Maintenance(ctx context.Context) (Verdict, error) {
 		if v.MaintenanceUntil.After(c.now()) &&
 			v.MaintenanceUntil.After(c.lastMaintUntil) {
 			c.lastMaintUntil = v.MaintenanceUntil
+			// Monotonic twin: c.now() is time.Now() in
+			// production — Add preserves its monotonic
+			// reading, so Before/After against it count REAL
+			// elapsed time. lastMaintUntil itself was parsed
+			// from an RFC3339 annotation (no monotonic
+			// component), which is exactly why the wall
+			// comparison raced clock steps. Under an injected
+			// test clock both sides stay deterministic.
+			c.maintUntilMono = c.now().Add(
+				v.MaintenanceUntil.Sub(c.now()))
+		} else if v.MaintenanceUntil.Before(c.lastMaintUntil) {
+			// L3 shortened or CLEARED the window (annotation
+			// removed → zero/past MaintenanceUntil): sync the
+			// monotonic twin to the new deadline — or drop it —
+			// so an apiserver outage can't resurrect the
+			// cancelled window via HoldEmergencyHeal. An
+			// unchanged value keeps the existing mono deadline.
+			c.lastMaintUntil = v.MaintenanceUntil
+			c.maintUntilMono = time.Time{}
+			if v.MaintenanceUntil.After(c.now()) {
+				c.maintUntilMono = c.now().Add(
+					v.MaintenanceUntil.Sub(c.now()))
+			}
 		}
 	}
 	f.v, f.err = v, err
@@ -291,10 +322,26 @@ func (c *Coord) HoldEmergencyHeal(ctx context.Context) bool {
 		return v.Active
 	}
 	c.mu.Lock()
-	until := c.lastMaintUntil
 	kured := c.lastKuredLocked && c.now().Sub(c.lastKuredAt) < kuredHealTTL
+	maintOpen := c.maintActiveLocked()
 	c.mu.Unlock()
-	return kured || (!until.IsZero() && c.now().Before(until))
+	return kured || maintOpen
+}
+
+// maintActiveLocked reports whether the last CONFIRMED maintenance
+// window is still open — measured on the monotonic clock so a
+// skewed node wall clock cannot stretch (backward step) or
+// truncate (forward step) the hold while L3's own window keeps
+// running. Falls back to the wall deadline for records written
+// before the monotonic twin existed.
+//
+// The window is CLOSED when !now.Before(deadline) — i.e. the hold
+// releases at the deadline, never one tick early.
+func (c *Coord) maintActiveLocked() bool {
+	if c.maintUntilMono.IsZero() {
+		return !c.lastMaintUntil.IsZero() && c.now().Before(c.lastMaintUntil)
+	}
+	return c.now().Before(c.maintUntilMono)
 }
 
 // StampLocalRemediation marks NodeCondition LocalRemediationInProgress

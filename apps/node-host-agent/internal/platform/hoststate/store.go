@@ -92,6 +92,20 @@ type sharedState struct {
 	// systemctl restart above all) storms until the disk recovers.
 	// Bounded by the fixed set of budget names callers use.
 	lastSpent map[string]int64
+	// ramMu guards ramEpochs — a SEPARATE mutex from mu because
+	// Epoch/Exists read it from paths that already hold mu
+	// (rateOKInLocked, enterLocked): a nested lock on mu would
+	// deadlock. Lock order is always mu → ramMu, never the
+	// reverse.
+	ramMu sync.RWMutex
+	// ramEpochs is the process-lifetime fallback for state files
+	// whose disk write hit ENOSPC/EROFS — key is the cleaned
+	// absolute path, value the epoch. Reads (Epoch/Exists)
+	// consult it as max(disk, ram) so latches, counters, markers
+	// and budgets keep working in-RAM until the disk recovers;
+	// a successful disk write clears the entry so a stale RAM
+	// value can never shadow newer disk state.
+	ramEpochs map[string]int64
 }
 
 // New returns a Store for dir/logFile. now and log may be nil. The
@@ -179,10 +193,17 @@ func (s *Store) Path(name string) string {
 }
 
 // Exists reports whether state-<name> is present (e.g. the
-// node-overloaded latch written by another writer).
+// node-overloaded latch written by another writer) — on disk OR in
+// the ENOSPC/EROFS RAM fallback table.
 func (s *Store) Exists(name string) bool {
-	_, err := os.Stat(s.Path(name))
-	return err == nil
+	p := s.Path(name)
+	if _, err := os.Stat(p); err == nil {
+		return true
+	}
+	s.shared.ramMu.RLock()
+	_, ok := s.shared.ramEpochs[filepath.Clean(p)]
+	s.shared.ramMu.RUnlock()
+	return ok
 }
 
 // Enter creates state-<name> with the current epoch — only when
@@ -237,6 +258,15 @@ func (s *Store) enterLocked(name string) bool {
 		}
 		return false
 	}
+	// RAM-fallback latch: the disk write hit ENOSPC/EROFS and the
+	// latch lives only in ramEpochs — it EXISTS, so EnterFresh
+	// must not re-fire STATE-ENTER every cycle.
+	s.shared.ramMu.RLock()
+	_, ramHeld := s.shared.ramEpochs[filepath.Clean(p)]
+	s.shared.ramMu.RUnlock()
+	if ramHeld {
+		return false
+	}
 	return s.WriteEpochFile(p, s.Now().Unix())
 }
 
@@ -289,13 +319,26 @@ func (s *Store) Exit(name string, cleanup func()) bool {
 func (s *Store) exitLocked(name string) bool {
 	p := s.Path(name)
 	if _, err := os.Stat(p); err != nil {
-		return false
+		// RAM-only latch (ENOSPC/EROFS write): clear the fallback
+		// entry — the latch existed, so this IS a real exit.
+		key := filepath.Clean(p)
+		s.shared.ramMu.Lock()
+		_, ramHeld := s.shared.ramEpochs[key]
+		delete(s.shared.ramEpochs, key)
+		s.shared.ramMu.Unlock()
+		return ramHeld
 	}
 	if err := os.Remove(p); err != nil {
 		s.log().Warn("state latch remove failed",
 			"state", name, "path", p, "error", err)
 		return false
 	}
+	// A latch written during an ENOSPC/EROFS episode can leave a
+	// stale ramEpochs entry beside the disk file — drop it too or
+	// Exists/Epoch keep reporting the ghost latch after exit.
+	s.shared.ramMu.Lock()
+	delete(s.shared.ramEpochs, filepath.Clean(p))
+	s.shared.ramMu.Unlock()
 	return true
 }
 

@@ -9,9 +9,10 @@
 //
 // Parity notes vs the removed private dialer:
 //   - Port 22 and the 15s Timeout reproduce the hard-coded knobs.
-//   - Config.Log stays nil → bare ssh.InsecureIgnoreHostKey,
-//     exactly the old silent tolerance (infra VMs rotate host keys
-//     on rebuild; hub_converge parity).
+//   - Host-key trust fails closed: a known_hosts file next to the
+//     SSH key is enforced; its absence is an error unless the
+//     operator passes --insecure-ignore-host-key (the old silent
+//     tolerance survives only behind that explicit flag).
 //   - sshclient bounds the bastion channel-open + tunneled
 //     handshake (this copy left them unbounded — a wedged bastion
 //     could hang forever) and warns on a rejected SetDeadline via
@@ -43,20 +44,30 @@ var nebulaNetRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // knownHostsVerify resolves the operator known_hosts file next to the
 // SSH client key — the documented trust source for converge-family
 // SSH traffic (ENV: NODE_HOST_AGENT_CONVERGE_SSH_KEY sits in a dir
-// with its known_hosts). An absent file means no trust material and
-// no verification: the historical tolerant dial stays, but a file
-// that EXISTS is enforced — an unlisted host or a key mismatch
-// fails the fetch closed.
-func knownHostsVerify(keyPath string) (func(hostname string, key ssh.PublicKey) error, error) {
+// with its known_hosts). Host-key trust fails CLOSED: an absent
+// known_hosts is an error unless the operator passed the explicit
+// --insecure-ignore-host-key opt-out; a file that EXISTS is always
+// enforced — an unlisted host or a key mismatch fails the fetch.
+func knownHostsVerify(keyPath string, insecure bool) (func(hostname string, key ssh.PublicKey) error, error) {
 	// Derive known_hosts after ExpandHome so "~/.ssh/id_ed25519" stats the
 	// expanded directory rather than literal "~/.ssh".
 	p := sshclient.KnownHostsPath(keyPath)
 	if p == "" {
-		return nil, nil
+		if insecure {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("no known_hosts trust material for %s — "+
+			"place a known_hosts next to the SSH key or pass "+
+			"--insecure-ignore-host-key", keyPath)
 	}
 	if _, err := os.Stat(p); err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil // no trust material — tolerant parity
+			if insecure {
+				return nil, nil // explicit opt-out — tolerant dial
+			}
+			return nil, fmt.Errorf("no known_hosts trust material at %s — "+
+				"place a known_hosts next to the SSH key or pass "+
+				"--insecure-ignore-host-key", p)
 		}
 		return nil, fmt.Errorf("stat %s: %w", p, err)
 	}
@@ -71,11 +82,11 @@ func knownHostsVerify(keyPath string) (func(hostname string, key ssh.PublicKey) 
 	}, nil
 }
 
-func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) (string, error) {
+func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string, insecure bool) (string, error) {
 	if j.IP == "" {
 		return "", errors.New("no ip in registry")
 	}
-	verify, err := knownHostsVerify(keyPath)
+	verify, err := knownHostsVerify(keyPath, insecure)
 	if err != nil {
 		return "", err
 	}
@@ -85,8 +96,8 @@ func sshFetchHostPub(ctx context.Context, j signJob, nebulaNet, keyPath string) 
 		Timeout: 15 * time.Second,
 		// Host key trust: a known_hosts file next to the SSH key
 		// pins every host it lists (mismatch and unlisted both
-		// reject); without it the documented rotating-infra-VM
-		// tolerance applies.
+		// reject); without it the fetch fails closed unless the
+		// operator passed --insecure-ignore-host-key.
 		HostKeyVerify: verify,
 	}
 	link, err := cfg.Dial(ctx, j.SSHUser, j.IP, j.ProxyJump)

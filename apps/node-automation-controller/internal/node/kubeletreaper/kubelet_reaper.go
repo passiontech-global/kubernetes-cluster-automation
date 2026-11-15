@@ -124,6 +124,12 @@ type kubeletReaper struct {
 	// the only writer and sweeps sequentially — no lock (the
 	// freshFail contract).
 	meshDark bool
+	// probeOutage latches when run() aborts on a broad probe-path
+	// failure (!anyOK guards): the next run that gets past them
+	// resets freshFail — persistence windows measured across the
+	// outage are stale, and a node failing NOW must earn a fresh
+	// grace window instead of inheriting the outage's age.
+	probeOutage bool
 }
 
 func Setup(d shared.Deps) error {
@@ -190,6 +196,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	// one wedged node.
 	if !anyOK && len(ok) > 1 {
 		log.Info("ABORT: no node probe succeeded — probe path broken?", "results", ok)
+		r.probeOutage = true
 		return nil
 	}
 	// One-worker tunnel protection: with a SINGLE probed node a
@@ -209,11 +216,13 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 		if err != nil {
 			log.Info("one-worker probe failed — konnectivity check errored, failing open",
 				"error", err, "results", ok)
+			r.probeOutage = true
 			return nil
 		}
 		if degraded {
 			log.Info("ABORT: single worker probe failed and konnectivity-agent degraded — tunnel suspect, not tainting",
 				"results", ok)
+			r.probeOutage = true
 			return nil
 		}
 	}
@@ -242,11 +251,20 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	// fake-ready case this module exists to fence (the dedicated
 	// konnectivityDegraded guard above already covers the tunnel
 	// suspect), so the fleet guard must not engage there.
+	wasDark := r.meshDark
 	r.meshDark = len(ok) > 1 && darkFresh > 0 && darkFresh*2 >= len(ok)
 	if r.meshDark {
 		log.Info("mesh-dark guard: >=half of probed workers fail with fresh leases — fresh-lease taints suppressed",
 			"darkFresh", darkFresh, "probed", len(ok))
 	}
+	// Broad-outage exit reset: freshFail windows measured while the
+	// probe path (or the mesh-dark suppression) was down are stale —
+	// restart them so each node earns a fresh persistence window
+	// against the recovered path instead of inheriting outage age.
+	if r.probeOutage || (wasDark && !r.meshDark) {
+		r.freshFail = state.FirstSeenLedger{}
+	}
+	r.probeOutage = false
 
 	sweepErrs := 0
 	for i := range nodes {

@@ -176,8 +176,15 @@ func TestCiliumIdentityAuditorEndpointListError(t *testing.T) {
 }
 
 // The pod annotation feed is also mandatory — same abort-on-empty rule.
+// The read rides ListPartialOrFallback: a typed-clientset failure
+// degrades to the dynamic fallback, so BOTH legs must fail for the
+// pod list to surface its error.
 func TestCiliumIdentityAuditorPodListError(t *testing.T) {
 	dyn := testutil.NewDynamicClient(ciliumIdentity("100"), ciliumEndpoint("app", "cep-1", 100))
+	dyn.PrependReactor("list", "pods",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
 	cs := fake.NewSimpleClientset()
 	cs.PrependReactor("list", "pods",
 		func(clienttesting.Action) (bool, runtime.Object, error) {

@@ -299,7 +299,21 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 	// cooldown. A patch failure leaves the in-RAM half (the delivered
 	// delete already stamped olmHealed) holding; nil ledger because
 	// the in-RAM key is the per-controller cooldown stamped above.
-	if err := heal.StampPersisted(ctx, nil,
+	// The Deployment object feeds RecordAnnoPatch so the stamp lands
+	// on the sweep overlay — later checks reading olmHealAnno via
+	// EffectiveAnno see this heal, not the pre-patch snapshot.
+	// Best-effort GET: a failure still stamps, just without overlay
+	// visibility.
+	var depObj metav1.Object
+	// Census lookup, not a live GET — the shared deployments
+	// snapshot already paid the LIST this sweep; a miss reads the
+	// same as the old NotFound (depObj stays nil, stamp lands
+	// without overlay visibility).
+	if dep, err := p.Deployment(ctx, olmOperatorNS,
+		olmOperatorPodPrefix); err == nil && dep != nil {
+		depObj = dep
+	}
+	if err := heal.StampPersisted(ctx, depObj,
 		func(ctx context.Context, data []byte) error {
 			_, err := p.CS.AppsV1().Deployments(olmOperatorNS).
 				Patch(ctx, olmOperatorPodPrefix, types.MergePatchType, data,

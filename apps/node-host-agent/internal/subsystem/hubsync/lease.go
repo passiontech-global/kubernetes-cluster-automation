@@ -221,6 +221,13 @@ func (s *Syncer) renewLease(ctx context.Context) bool {
 	if !held {
 		s.syncedWhileHeld = false
 		s.leaseExpiresAt = time.Time{}
+		// Any !held — genuine loss OR a renew error (we can't
+		// distinguish; leaseHeld() treats both as not-held) —
+		// kills the in-flight converge, not just the next target.
+		if s.cycleCancel != nil {
+			s.cycleCancel()
+			s.cycleCancel = nil
+		}
 	} else {
 		s.leaseExpiresAt = expiresAt
 	}

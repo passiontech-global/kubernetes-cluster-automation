@@ -15,6 +15,7 @@ package cilium
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -60,12 +61,6 @@ var ciliumDatapathQueries = []struct {
 	{"unreachable_health_endpoints",
 		`sum(cilium_unreachable_health_endpoints) > 0`,
 		"cilium health endpoints unreachable"},
-	{"invalid_identity_drops",
-		`sum(rate(cilium_drop_count_total{reason=~"Invalid identity|Unknown L3 target address"}[5m])) > 1`,
-		"drops from stale ipcache identities"},
-	{"nat_ct_map_exhaustion",
-		`sum by (node, reason) (rate(cilium_drop_count_total{reason=~"(?i).*nat.*|.*ct.*"}[5m])) > 1`,
-		"drops from NAT/CT map exhaustion (SNAT port or conntrack table full)"},
 }
 
 var (
@@ -108,6 +103,54 @@ func (p *ciliumDatapathMapCheck) Run(ctx context.Context) probefw.Result {
 		rep.Emit(ciliumDatapathDegradedGauge, q.reason,
 			[]string{q.reason},
 			fmt.Sprintf("%s (%s)", q.reason, q.desc))
+	}
+
+	// cilium_drop_count_total serves TWO signatures — merged into
+	// one wire call (same metric family): sum by (node,reason) over
+	// the union reason-set, then each signature re-filters rows
+	// client-side with the same matchers its old standalone query
+	// carried. invalid_identity_drops totals the two exact reasons
+	// cluster-wide (>1); nat_ct_map_exhaustion flags any
+	// (node,reason) row whose reason contains nat/ct case-
+	// insensitively (>1) — identical verdicts, half the round-trips.
+	dropSeries, dropErr := p.PromQuery(ctx,
+		`sum by (node, reason) (rate(cilium_drop_count_total{reason=~"Invalid identity|Unknown L3 target address|(?i).*(nat|ct).*"}[5m]))`)
+	if dropErr != nil {
+		for _, reason := range []string{"invalid_identity_drops", "nat_ct_map_exhaustion"} {
+			log.Info("WARN: cilium datapath query failed — signature inconclusive",
+				"reason", reason, "error", dropErr)
+			rep.InfraErr(dropErr)
+			if lv, held := last[reason]; held {
+				rep.Carry(reason, lv)
+			}
+		}
+	} else {
+		identityTotal := 0.0
+		natBreached := false
+		for _, s := range dropSeries {
+			reason := s.Label("reason")
+			lower := strings.ToLower(reason)
+			isIdentity := reason == "Invalid identity" ||
+				reason == "Unknown L3 target address"
+			isNatCT := strings.Contains(lower, "nat") ||
+				strings.Contains(lower, "ct")
+			if isIdentity {
+				identityTotal += s.Value
+			}
+			if isNatCT && s.Value > 1 {
+				natBreached = true
+			}
+		}
+		if identityTotal > 1 {
+			rep.Emit(ciliumDatapathDegradedGauge, "invalid_identity_drops",
+				[]string{"invalid_identity_drops"},
+				"invalid_identity_drops (drops from stale ipcache identities)")
+		}
+		if natBreached {
+			rep.Emit(ciliumDatapathDegradedGauge, "nat_ct_map_exhaustion",
+				[]string{"nat_ct_map_exhaustion"},
+				"nat_ct_map_exhaustion (drops from NAT/CT map exhaustion (SNAT port or conntrack table full))")
+		}
 	}
 	return rep.Result(&p.emitted, ciliumDatapathDegradedGauge.DeleteLabelValues,
 		"cilium datapath degraded: ", ", ")

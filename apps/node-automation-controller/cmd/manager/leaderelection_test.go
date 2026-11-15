@@ -130,6 +130,10 @@ func TestLeaderClientConfigNormalizesDeadline(t *testing.T) {
 		{"floor at 1s", time.Second, time.Second},
 		{"half of 4s", 4 * time.Second, 2 * time.Second},
 		{"half of 30s", 30 * time.Second, 15 * time.Second},
+		// The 15s ceiling: the deployment's 120s renew deadline
+		// must not license a 60s hung-request stall inside the
+		// renew window.
+		{"half of 120s capped", 120 * time.Second, 15 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			el := leaderClientConfig(cfg, tc.in)

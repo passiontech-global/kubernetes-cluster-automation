@@ -247,7 +247,7 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 	// per cycle); the ctx-carried memoizer turns that into one LIST
 	// per resource per run. Checks invalidate it on their own
 	// mutations via Deps.InvalidateSweep.
-	ctx = probefw.WithSweepSnapshot(ctx)
+	ctx = probefw.WithSweepSnapshot(ctx, p.Deps)
 	// Deps.Heals accumulates one stamp per healed target under keys
 	// that outlive the object (pod/controller names) — bound the
 	// shared ledger once per sweep at the widest cooldown it serves.
@@ -268,6 +268,7 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 	// the outcome), so the group's error is always nil and g.Wait
 	// just joins the pool.
 	outcomes := make([]checkOutcome, len(p.checks))
+	finished := make(chan int, len(p.checks))
 	var g errgroup.Group
 	g.SetLimit(checkParallelism)
 	for i := range p.checks {
@@ -282,8 +283,64 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 				outcomes[idx] = runCheckIsolated(entry, ctx,
 					p.Cfg.Timeouts.PerCheck)
 			}
+			finished <- idx
 			return nil
 		})
+	}
+
+	// commitIdx: workers signal each finished slot and this loop
+	// commits p.report in roster order the moment the prefix is
+	// complete — one slow check at the tail no longer holds every
+	// earlier check's metrics/log lines hostage until the whole
+	// pool drains. Ordering stays the deterministic serial
+	// contract: slot i reports only after slots 0..i-1 have.
+	done := make([]bool, len(p.checks))
+	next, remaining := 0, len(p.checks)
+	for remaining > 0 {
+		select {
+		case <-ctx.Done():
+			remaining = 0 // stop committing; g.Wait still joins
+		case idx := <-finished:
+			if ctx.Err() != nil {
+				// SIGTERM raced the completion signal — select
+				// picked finished over ctx.Done at random. Do not
+				// commit: reporting now would emit series for a
+				// sweep the dying pod never finished.
+				remaining = 0
+				continue
+			}
+			done[idx] = true
+			remaining--
+			for next < len(outcomes) && done[next] {
+				if ctx.Err() != nil {
+					remaining = 0
+					break
+				}
+				o := outcomes[next]
+				next++
+				if !o.ran {
+					continue // unreachable post-Wait without cancellation
+				}
+				if o.timedOut {
+					log.Info("health check exceeded per-check timeout",
+						"check", o.name)
+				}
+				p.report(o.name, o.pass)
+				// A check FAIL is the product — it is reported via
+				// metrics and logged, never as a run error. Only
+				// apiserver/client failures count against the
+				// queue's run-error counters.
+				if o.infra != nil {
+					metrics.IncError(p.Name)
+					log.Error(o.infra,
+						"health check probe errored — marked FAIL",
+						"check", o.name)
+				} else if !o.pass {
+					log.Info("health check FAIL",
+						"check", o.name, "reason", o.why)
+				}
+			}
+		}
 	}
 	_ = g.Wait()
 
@@ -311,29 +368,6 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 	// probetest.VerifySweep themselves.
 	probefw.VerifySweepSnapshotUnmutated(ctx)
 
-	// Report in roster order — the ops contract's deterministic
-	// series/log ordering — regardless of the order the pool
-	// finished the checks in.
-	for _, o := range outcomes {
-		if !o.ran {
-			continue // unreachable post-Wait without cancellation
-		}
-		if o.timedOut {
-			log.Info("health check exceeded per-check timeout",
-				"check", o.name)
-		}
-		p.report(o.name, o.pass)
-		// A check FAIL is the product — it is reported via metrics and
-		// logged, never as a run error. Only apiserver/client failures
-		// count against the queue's run-error counters.
-		if o.infra != nil {
-			metrics.IncError(p.Name)
-			log.Error(o.infra, "health check probe errored — marked FAIL",
-				"check", o.name)
-		} else if !o.pass {
-			log.Info("health check FAIL", "check", o.name, "reason", o.why)
-		}
-	}
 	// Drop lastPass entries for checks the pass did not sweep — a
 	// cancelled sweep bails above without pruning, so only a full
 	// pass shrinks the ledger.

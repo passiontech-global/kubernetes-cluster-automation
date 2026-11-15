@@ -117,6 +117,17 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	if !proceed {
 		return nil
 	}
+	// Quorum guard: the rollout restart spends coredns's one
+	// per-sweep disruption slot — a sibling check deleting a
+	// coredns pod later in the sweep must defer instead of
+	// double-booking the workload mid-rollout. Denial refunds
+	// the grant (no mutation executed).
+	if !kube.TryReserveWorkloadKey(ctx,
+		corednsNS+"/Deployment/coredns") {
+		heal.RefundGrant(gateNow)
+		log.Info("SKIP restart: workload disruption slot already spent this sweep")
+		return nil
+	}
 
 	// New stamps are always RFC3339 — the unix branch of
 	// ParseAnnoTime is read-compat only.
@@ -182,6 +193,19 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 					"cap", evictCap, "deleted", deleted, "remaining", len(suspects)-deleted)
 				break
 			}
+			// Per-UID/pod cooldown: a pod this watchdog already
+			// evicted inside the window is skipped — its
+			// replacement arrives under a NEW UID and is judged on
+			// fresh evidence, not this stamp. Keyed on the UID the
+			// sweep listed (name fallback for UID-less fixtures).
+			coolKey := string(podUID[name])
+			if coolKey == "" {
+				coolKey = name
+			}
+			if w.podHeals.CooledDown(coolKey,
+				corednsCooldownS*time.Second, gateNow) {
+				continue
+			}
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 				Name: name, Namespace: corednsNS, UID: podUID[name],
 			}}
@@ -211,19 +235,33 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 				break
 			}
 			deleted++
+			w.podHeals.Stamp(coolKey, gateNow)
 		}
 		// The cooldown annotation is stamped only for recovery we
 		// DELIVERED — zero deletes means nothing happened this cycle,
 		// and stamping anyway would suppress a needed recovery for a
-		// full cooldown window. If at least one eviction landed before
-		// a later pod errored, still stamp the cooldown before
-		// returning the error so the partial recovery is cooled down.
+		// full cooldown window. The DEPLOYMENT-level 30m stamp lands
+		// only when EVERY suspect was evicted this pass: a partial
+		// pass (cap reached, PDB refusals, per-UID cooldowns) leaves
+		// stale siblings the next sweep must still evaluate — the
+		// per-UID stamps above pace those, not the fleet stamp. If
+		// at least one eviction landed before a later pod errored,
+		// still evaluate the stamp before returning the error so a
+		// fully-delivered pass is cooled down.
 		if deleted == 0 {
 			if evictErr != nil {
 				return evictErr
 			}
 			heal.RefundGrant(gateNow)
 			log.Info("sweep done: no stale pod deleted (all already gone)", "pods", suspects)
+			return nil
+		}
+		if deleted < len(suspects) {
+			log.Info("partial recovery — per-UID cooldowns pace the remainder, Deployment stamp withheld",
+				"deleted", deleted, "suspects", len(suspects))
+			if evictErr != nil {
+				return evictErr
+			}
 			return nil
 		}
 		patch, err := kube.MergePatchAnnos(map[string]any{corednsTSAnno: stamp})

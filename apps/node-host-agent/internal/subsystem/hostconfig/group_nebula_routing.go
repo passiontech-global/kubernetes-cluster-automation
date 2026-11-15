@@ -21,7 +21,7 @@ import (
 // marker-daddr snat use the marker (--node-ip / registry marker).
 func (c *cyc) nebulaRouting() {
 	r, ctx, t := c.r, c.ctx, c.t
-	dev := c.t.Vars.StrDef("interdc_nebula_dev", "neb1")
+	dev := c.nebDev()
 	pub, mark, mb := c.tablePub(), c.tableMark(), c.markerBase()
 	pubIP := nodeIPStr(t.Node, "ip") // interdc_nebula_node.ip (public)
 	mkIP := t.Markers[t.MeshName]    // registry marker
@@ -117,7 +117,7 @@ func (c *cyc) nebulaRouting() {
 	// wildcard (probed via /sys/class/net; iptables matches the name
 	// pattern directly).
 	for _, chain := range []string{"POSTROUTING", "FORWARD"} {
-		for _, dev := range []string{"neb1", "cilium_wg0"} {
+		for _, dev := range []string{c.nebDev(), "cilium_wg0"} {
 			fmt.Fprintf(&rs,
 				`if ip link show dev %s >/dev/null 2>&1; then `+
 					`iptables -w 5 -t mangle -C %s -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || `+

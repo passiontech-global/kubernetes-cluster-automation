@@ -211,7 +211,17 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 				// instead of serializing doomed rebuilds.
 				continue
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				// Same rule as waitRefreshFlight and the starter
+				// wait below: cancellation reports itself; only a
+				// wait-budget DEADLINE falls back to whatever the
+				// flight may have just published — select can pick
+				// ctx.Done() when runFetch settled in the same
+				// instant, and the cold-start caller deserves the
+				// fresh index rather than a spurious error.
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return nil, ctx.Err()
+				}
+				return c.staleOrErr(ctx, clone)
 			}
 		}
 		// The last attempt failed inside the same TTL window — serve

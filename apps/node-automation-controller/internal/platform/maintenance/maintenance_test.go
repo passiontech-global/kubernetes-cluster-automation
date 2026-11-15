@@ -484,9 +484,11 @@ func TestVerdictActiveMemoizesWithinTTL(t *testing.T) {
 }
 
 // An unverifiable evaluation (nil dyn → the autopilot/medik8s plan
-// signals cannot be read) is memoized for the window too — a caller
-// looping targets does not re-pay three failing API reads per target,
-// and the fail-closed error never silently clears.
+// signals cannot be read) is memoized for the ERROR window too — a
+// caller looping targets does not re-pay three failing API reads
+// per target, but the shorter verdictErrorTTL (5s, vs the 60s
+// success TTL) lets the next gate retry quickly instead of
+// deferring every heal behind a stale failure.
 func TestVerdictActiveSticksErrorWithinTTL(t *testing.T) {
 	ctx := t.Context()
 	cs := fake.NewSimpleClientset()
@@ -496,15 +498,15 @@ func TestVerdictActiveSticksErrorWithinTTL(t *testing.T) {
 	if _, _, err := v.Active(ctx, cs, nil, base); err == nil {
 		t.Fatal("nil dyn must make the verdict unverifiable")
 	}
-	// Wire a working dyn mid-window — the memoized error still
-	// answers; only a TTL expiry re-evaluates.
+	// Wire a working dyn inside the error window — the memoized
+	// error still answers; only the 5s error TTL re-evaluates.
 	if _, _, err := v.Active(ctx, cs, maintenanceDynFake(),
-		base.Add(verdictTTL-time.Second)); err == nil {
-		t.Fatal("error verdict re-evaluated inside the TTL")
+		base.Add(verdictErrorTTL-time.Second)); err == nil {
+		t.Fatal("error verdict re-evaluated inside the error TTL")
 	}
 	if _, _, err := v.Active(ctx, cs, maintenanceDynFake(),
-		base.Add(verdictTTL+time.Second)); err != nil {
-		t.Fatalf("post-TTL re-evaluation kept the stale error: %v", err)
+		base.Add(verdictErrorTTL+time.Second)); err != nil {
+		t.Fatalf("post-error-TTL re-evaluation kept the stale error: %v", err)
 	}
 }
 
@@ -710,5 +712,54 @@ func TestStampMaintenanceTargetsClusterWide(t *testing.T) {
 		if n.Annotations["passiontech.dev/cluster-maintenance-until"] == "" {
 			t.Fatalf("cluster-wide maintenance left %s unstamped", name)
 		}
+	}
+}
+
+// Verdict.Scope is the tiered verdict the node-scoped heal gates
+// consume: a fresh cordon lands in Nodes (not ClusterWide), an
+// autopilot Plan is ClusterWide, and a clear cluster is neither.
+func TestVerdictScopeTiered(t *testing.T) {
+	ctx := t.Context()
+	now := time.Now()
+
+	// Node-scoped: w1 cordoned fresh, w2 cordoned past the window.
+	cs := fake.NewSimpleClientset(
+		maintenanceCordoned("w1", 10*time.Minute),
+		maintenanceCordoned("w2", 2*time.Hour))
+	var v Verdict
+	sc, err := v.Scope(ctx, cs, maintenanceDynFake(), now)
+	if err != nil {
+		t.Fatalf("scope eval: %v", err)
+	}
+	if !sc.Held || sc.ClusterWide {
+		t.Fatalf("cordoned scope = %+v, want Held node-scoped", sc)
+	}
+	if !sc.Nodes["w1"] || sc.Nodes["w2"] {
+		t.Fatalf("scope nodes = %v, want {w1} only", sc.Nodes)
+	}
+	if !strings.Contains(sc.Why, "w1") {
+		t.Fatalf("scope why = %q, want cordon evidence", sc.Why)
+	}
+
+	// Cluster-wide: a live autopilot Plan holds every node.
+	var v2 Verdict
+	sc2, err := v2.Scope(ctx, fake.NewSimpleClientset(),
+		maintenanceDynFake(maintenancePlan("up1", "Upgrading")), now)
+	if err != nil {
+		t.Fatalf("cluster-wide scope eval: %v", err)
+	}
+	if !sc2.Held || !sc2.ClusterWide || len(sc2.Nodes) != 0 {
+		t.Fatalf("plan scope = %+v, want Held+ClusterWide", sc2)
+	}
+
+	// Clear cluster: nothing held.
+	var v3 Verdict
+	sc3, err := v3.Scope(ctx, fake.NewSimpleClientset(),
+		maintenanceDynFake(), now)
+	if err != nil {
+		t.Fatalf("clear scope eval: %v", err)
+	}
+	if sc3.Held || sc3.ClusterWide || len(sc3.Nodes) != 0 {
+		t.Fatalf("clear scope = %+v, want empty", sc3)
 	}
 }

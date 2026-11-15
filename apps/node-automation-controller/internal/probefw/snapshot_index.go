@@ -185,31 +185,35 @@ type podPlacementIndex struct {
 	src    []corev1.Pod
 	byNS   map[string][]*corev1.Pod
 	byNode map[string][]*corev1.Pod
+	byKey  map[types.NamespacedName]*corev1.Pod
 	built  bool
 }
 
-// lookup returns the (byNS, byNode) pair for pods — the filtered
-// census slice AllPods hands out. Both maps are built together:
-// they share one pass and one validity key.
+// lookup returns the (byNS, byNode, byKey) triple for pods — the
+// filtered census slice AllPods hands out. All three maps are built
+// together: they share one pass and one validity key.
 func (ix *podPlacementIndex) lookup(ctx context.Context,
-	pods []corev1.Pod) (map[string][]*corev1.Pod, map[string][]*corev1.Pod) {
+	pods []corev1.Pod) (map[string][]*corev1.Pod, map[string][]*corev1.Pod,
+	map[types.NamespacedName]*corev1.Pod) {
 
 	gen := kube.PodTombstoneGen(ctx)
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	if ix.built && ix.gen == gen && elemSliceSame(ix.src, pods) {
-		return ix.byNS, ix.byNode
+		return ix.byNS, ix.byNode, ix.byKey
 	}
 	byNS := make(map[string][]*corev1.Pod)
 	byNode := make(map[string][]*corev1.Pod)
+	byKey := make(map[types.NamespacedName]*corev1.Pod, len(pods))
 	for i := range pods {
 		p := &pods[i]
 		byNS[p.Namespace] = append(byNS[p.Namespace], p)
 		byNode[p.Spec.NodeName] = append(byNode[p.Spec.NodeName], p)
+		byKey[types.NamespacedName{Namespace: p.Namespace, Name: p.Name}] = p
 	}
-	ix.gen, ix.src, ix.byNS, ix.byNode, ix.built =
-		gen, pods, byNS, byNode, true
-	return byNS, byNode
+	ix.gen, ix.src, ix.byNS, ix.byNode, ix.byKey, ix.built =
+		gen, pods, byNS, byNode, byKey, true
+	return byNS, byNode, byKey
 }
 
 // sliceServiceIndex lazily indexes the EndpointSlice census by its

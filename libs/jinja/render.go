@@ -296,6 +296,12 @@ func renderNodes(nodes []tnode, s *scope, b *strings.Builder) error {
 		if err := n.render(s, b); err != nil {
 			return err
 		}
+		// Per-node check bounds the Render buffer: a {% for %}
+		// writing maxStringBytes+ per iteration is an OOM, not a
+		// render — overshoot is capped at one node's output.
+		if b.Len() > maxStringBytes {
+			return fmt.Errorf("render: output exceeds %d bytes", maxStringBytes)
+		}
 	}
 	return nil
 }

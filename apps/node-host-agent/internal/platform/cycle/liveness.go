@@ -261,6 +261,38 @@ func Heartbeat(ctx context.Context) {
 	}
 }
 
+// RunWithHeartbeat runs fn on the caller's goroutine while a
+// helper goroutine stamps the ctx's liveness fallback beat every
+// interval — for legitimately long-running child commands
+// (pg_repack, pg_dump, REINDEX, apt-get, dd) whose runtime
+// outlives the loop's own tick cadence. Without it a multi-minute
+// exec looks identical to a wedge: the loop's Runner stamps only
+// bracket fn, so a 20m pg_repack would trip the staleness budget
+// mid-run. fn keeps its own ctx for cancellation; the heartbeat
+// goroutine exits when fn returns, ctx is cancelled, or the
+// ticker stops — it never outlives the call.
+func RunWithHeartbeat(ctx context.Context, interval time.Duration,
+	fn func(context.Context)) {
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				Heartbeat(ctx)
+			}
+		}
+	}()
+	fn(ctx)
+}
+
 // Exempt marks the ctx's liveness registry invisible to /healthz —
 // cycle.Idle uses it; a no-op outside a supervised ctx.
 func Exempt(ctx context.Context) {

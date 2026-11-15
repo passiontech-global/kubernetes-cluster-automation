@@ -74,7 +74,7 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 	// outlasts the 2-minute ExecEnv cap (same class of work as
 	// VACUUM/REINDEX).
 	tmp := "/tmp/kine-backup.dump"
-	if _, err := g.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass), []string{g.d.Cfg.Runtime,
+	if _, err := g.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass, kdeps.AppNameCompact), []string{g.d.Cfg.Runtime,
 		"exec", "-e", "PGPASSWORD", pg,
 		"pg_dump", "-Fc", "-U", user, "-d", "postgres", "-f", tmp}, ""); err != nil {
 		note(fmt.Sprintf("pg_dump-fail: %v", err))

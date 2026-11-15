@@ -5,7 +5,6 @@ package hostconfig
 import (
 	"fmt"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 
@@ -15,17 +14,22 @@ import (
 
 // ---------- T4 nodelocaldns guard ----------
 
-var resolvedStubRe = regexp.MustCompile(`127\.0\.0\.5[34]:53`)
-
 func (c *cyc) groupNLD() {
 	r, ctx := c.r, c.ctx
 	stubListening := false
-	if out, err := r.run(ctx, "ss", "-lntu"); err == nil {
-		stubListening = resolvedStubRe.MatchString(out)
+	// netlinkx sock_diag replaces the `ss -lntu` fork — pid 1 is
+	// host init, so its netns is the host table systemd-resolved
+	// binds. The resolved stub always binds TCP+UDP :53 together,
+	// so the TCP-LISTEN + bound-UDP census sees it either way.
+	if addrs, err := c.r.cfg.ListenAddrsFn(1); err == nil {
+		_, stubListening = addrs["127.0.0.53:53"]
+		if !stubListening {
+			_, stubListening = addrs["127.0.0.54:53"]
+		}
 	} else {
 		// Best-effort detection — a failed probe leaves
 		// stubListening=false and the rest of T4 still converges.
-		logger().Warn("T4: ss -lntu failed — cannot detect resolved stub listener; continuing",
+		logger().Warn("T4: listener census failed — cannot detect resolved stub listener; continuing",
 			"error", err)
 	}
 	if c.resolvedRunning() {
@@ -164,8 +168,10 @@ func (c *cyc) nftAllowFilter(what string, addrs []string) []string {
 
 // registryNodeIPs collects every node's registry addresses — the
 // `ip` v4 entry plus the `ip6` v6 entry when the registry carries
-// one. Non-mapping registry entries are skipped, not a panic (the
-// TestNLDAllowSourcesScalarNode contract).
+// one — plus every mesh marker IP (interdc_markers): marker-subnet
+// sources are cluster nodes too and must reach the guarded ports
+// over the overlay. Non-mapping registry entries are skipped, not a
+// panic (the TestNLDAllowSourcesScalarNode contract).
 func (c *cyc) registryNodeIPs() []string {
 	var ips []string
 	for _, k := range c.t.Nodes.Keys() {
@@ -180,6 +186,11 @@ func (c *cyc) registryNodeIPs() []string {
 					ips = append(ips, s)
 				}
 			}
+		}
+	}
+	for _, ip := range c.t.Markers {
+		if ip != "" {
+			ips = append(ips, ip)
 		}
 	}
 	return ips
@@ -260,12 +271,25 @@ const hostPortsGuardNodePortRange = "30000-32767"
 // scoping these exemptions to the pod-veth wildcards opens nothing
 // the overlay did not already expose — while every other internal
 // port stays closed to tenant pods.
-var hostPortsGuardPodExemptPorts = []int{4244, 10250}
+// :4240 joins the exemption set: it is the Cilium agent's mesh
+// health endpoint — cluster probes (and the agent's own peer probes
+// arriving over a tunnel iface) must still reach it or the mesh
+// reports every node dark.
+var hostPortsGuardPodExemptPorts = []int{4240, 4244, 10250}
 
 // hostPortsGuardPodIFaces are the pod-veth interface wildcards the
-// pre-roadmap-1.2 blanket accepts used, reused here ONLY in
-// combination with hostPortsGuardPodExemptPorts.
-var hostPortsGuardPodIFaces = []string{"cilium*", "lxc*", "cali*"}
+// pre-roadmap-1.2 blanket accepts used — pod veths (cilium*/lxc*/
+// cali*, "lxc*" already covers lxc_health) — plus the CNI tunnel
+// interfaces pod traffic legitimately arrives on: Calico's IPIP
+// tunnel (tunl0), its VXLAN devices (vxlan.calico / vxlan-v6.calico)
+// and WireGuard devices (wireguard.cali / wg-v6.cali). Reused here
+// ONLY in combination with hostPortsGuardPodExemptPorts — every
+// other internal port stays closed to tenant pods.
+var hostPortsGuardPodIFaces = []string{
+	"cilium*", "lxc*", "cali*",
+	"tunl0", "vxlan.calico", "vxlan-v6.calico",
+	"wireguard.cali", "wg-v6.cali",
+}
 
 // convergeHostPortsGuard deploys the host-internal-ports nft guard
 // + its boot oneshot (host-internal-ports): inbound TCP to the internal
@@ -315,6 +339,17 @@ func (c *cyc) convergeHostPortsGuard() {
 	}
 	fmt.Fprintf(&ports, ", %s", hostPortsGuardNodePortRange)
 	allow := c.portsGuardAllowSources()
+	// Fail-open: a node absent from the registry with NO allow
+	// sources at all (a standalone/single-node host without vars)
+	// would get a guard whose only accepts are lo / the nebula dev /
+	// established — apiserver→kubelet and every local admin path
+	// drops. Skip the install entirely; the warning keeps the
+	// unguarded state visible instead of silently whitelisting
+	// nothing.
+	if !c.t.Found && len(allow) == 0 {
+		logger().Warn("host-internal-ports guard skipped — node not in registry and allow set empty; ports left unguarded")
+		return
+	}
 	allowV4, allowV6 := splitAddrFamilies(allow)
 	var saddr strings.Builder
 	// Family-scoped accepts — an inet table's ip6 packets never
@@ -337,18 +372,29 @@ func (c *cyc) convergeHostPortsGuard() {
 			fmt.Fprintf(&podExempt, "        iifname %q tcp dport %d accept\n", iface, p)
 		}
 	}
+	// The nebula trunk accept follows interdc_nebula_dev — the same
+	// var the routing converge and the unit templates render. It
+	// lands inside an nft quoted string: the shell-token charset
+	// keeps '"', '\\' and ';' out so the value cannot splice rules.
+	// A refused value skips the WHOLE install — a guard missing the
+	// trunk accept would sever cluster traffic anyway, which is
+	// worse than leaving the ports unguarded for one cycle.
+	dev := c.nebDev()
+	if !c.shToken("interdc_nebula_dev", dev) {
+		return
+	}
 	nft := fmt.Sprintf(`# Managed by node-config-agent - drop non-cluster traffic to node-internal ports
 destroy table inet host_internal_ports_guard
 table inet host_internal_ports_guard {
     chain input {
         type filter hook input priority filter - 5; policy accept;
         iifname "lo" accept
-        iifname "neb1" accept
+        iifname %q accept
         ct state { established, related } accept
 %s%s        tcp dport { %s } drop
     }
 }
-`, saddr.String(), podExempt.String(), ports.String())
+`, dev, saddr.String(), podExempt.String(), ports.String())
 	c.applyNftUnit("host-internal-ports-guard", "/etc/host-internal-ports-guard.nft",
 		[]byte(nft), "host internal ports guard (drop non-cluster sources to node-internal listeners)")
 }

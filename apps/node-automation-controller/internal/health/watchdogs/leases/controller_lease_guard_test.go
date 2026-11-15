@@ -558,8 +558,8 @@ func TestLeaseGuardKSMWedgeBounce(t *testing.T) {
 	pod.OwnerReferences = ksmOwnerRef("kube-state-metrics-6cc5c9d9b4")
 	cs := fake.NewSimpleClientset(pod)
 	p, ch := leaseGuardProber(cs)
-	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
-		return leaseReasonKSMUnauthorized, nil
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, time.Time, time.Time, error) {
+		return leaseReasonKSMUnauthorized, time.Time{}, time.Time{}, nil
 	}
 	probetest.FreezeNow(p.Deps, base)
 
@@ -598,8 +598,8 @@ func TestLeaseGuardKSMWedgeRestartResume(t *testing.T) {
 				UTC().Format(time.RFC3339) + `"}`}
 	cs := fake.NewSimpleClientset(pod)
 	_, ch := leaseGuardProber(cs)
-	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, error) {
-		return leaseReasonKSMUnauthorized, nil
+	ch.ksmLogProbe = func(context.Context, *corev1.Pod) (string, time.Time, time.Time, error) {
+		return leaseReasonKSMUnauthorized, time.Time{}, time.Time{}, nil
 	}
 
 	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass {

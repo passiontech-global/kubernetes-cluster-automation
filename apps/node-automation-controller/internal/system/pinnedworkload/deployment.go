@@ -24,6 +24,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
 // RequeueInterval is the safety-net requeue every pinned-workload
@@ -87,7 +88,7 @@ type DeploymentSpec struct {
 // module's builder.Complete IncErrors it exactly once.
 func (s DeploymentSpec) Reconcile(ctx context.Context) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	res := ctrl.Result{RequeueAfter: RequeueInterval}
+	res := ctrl.Result{RequeueAfter: shared.RequeueAfter(RequeueInterval)}
 	ref := s.Namespace + "/" + s.Name
 
 	d, err := kube.GetDeploymentCached(ctx, s.Reader, s.CS, s.Namespace, s.Name)

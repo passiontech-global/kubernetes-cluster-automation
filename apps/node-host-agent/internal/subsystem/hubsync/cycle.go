@@ -24,6 +24,21 @@ func (s *Syncer) Cycle(ctx context.Context) {
 	// metered + logged, and the retry cadence is SyncInterval /
 	// watcher edges, not the renew tick.
 	s.markSynced()
+	// Derive a cancellable ctx the lease renewer can kill mid-cycle:
+	// lease loss (or a renew error, indistinguishable) must abort an
+	// in-flight WAN converge, not just gate the next target — two
+	// holders SSH-converging the same target is the split-brain the
+	// Lease exists to prevent.
+	cctx, ccancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	s.cycleCancel = ccancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.cycleCancel = nil
+		s.mu.Unlock()
+		ccancel()
+	}()
 	targets, dropped, notes, err := loadTargets(s.cfg.VarsDir)
 	if err != nil {
 		s.cfg.Log.Error("hubsync: target aggregation failed", "error", err)
@@ -61,7 +76,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 	var token, ca []byte
 	guardOK := true
 	if anyAPILB(targets) {
-		token, ca, err = s.guardCreds(ctx)
+		token, ca, err = s.guardCreds(cctx)
 		if err != nil {
 			// Only api-lb targets consume the guard credentials —
 			// the failure scopes to them; interdc/infra targets
@@ -88,7 +103,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 		return
 	}
 
-	converged, skipped, failed, complete := s.convergeTargets(ctx, targets, token, ca, localSum, guardOK)
+	converged, skipped, failed, complete := s.convergeTargets(cctx, targets, token, ca, localSum, guardOK)
 	if complete {
 		s.cfg.Log.Info("hubsync: converge cycle complete",
 			"targets", len(targets), "converged", converged,

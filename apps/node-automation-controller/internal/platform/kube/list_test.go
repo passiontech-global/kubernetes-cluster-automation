@@ -13,6 +13,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -383,5 +384,60 @@ func TestPageOptsSanitizesListOptions(t *testing.T) {
 	}
 	if got[0].ResourceVersion != "0" {
 		t.Fatalf("RV=0 page lost ResourceVersion: %+v", got[0])
+	}
+}
+
+// A 410 Gone mid-walk (continue token's resourceVersion aged out —
+// the Kine compaction-pressure case) must restart ListAll's walk
+// ONCE from the first page with Continue cleared; a second 410
+// surfaces the error instead of looping forever.
+func TestListAllRetriesOnceOnResourceExpired(t *testing.T) {
+	var continues []string
+	calls := 0
+	page := func(_ context.Context, opts metav1.ListOptions) ([]int, string, error) {
+		continues = append(continues, opts.Continue)
+		calls++
+		switch calls {
+		case 1:
+			return []int{1}, "tok-1", nil
+		case 2:
+			return nil, "", apierrors.NewResourceExpired(
+				"the server could not find the requested resource")
+		case 3:
+			// Restarted walk — fresh snapshot from page 1.
+			return []int{1, 2}, "", nil
+		default:
+			return nil, "", errors.New("unexpected extra call")
+		}
+	}
+	out, err := ListAll(ctx, metav1.ListOptions{}, page)
+	if err != nil {
+		t.Fatalf("ListAll err=%v", err)
+	}
+	if fmt.Sprint(out) != "[1 2]" {
+		t.Fatalf("out=%v, want the restarted walk's pages only", out)
+	}
+	wantCont := []string{"", "tok-1", ""}
+	if fmt.Sprint(continues) != fmt.Sprint(wantCont) {
+		t.Fatalf("continue tokens=%v want %v (retry must clear Continue)",
+			continues, wantCont)
+	}
+}
+
+func TestListAllSecondResourceExpiredPropagates(t *testing.T) {
+	calls := 0
+	page := func(_ context.Context, opts metav1.ListOptions) ([]int, string, error) {
+		calls++
+		if calls%2 == 1 {
+			return []int{calls}, fmt.Sprintf("tok-%d", calls), nil
+		}
+		return nil, "", apierrors.NewResourceExpired("expired again")
+	}
+	_, err := ListAll(ctx, metav1.ListOptions{}, page)
+	if err == nil || !apierrors.IsResourceExpired(err) {
+		t.Fatalf("err=%v want the second ResourceExpired to propagate", err)
+	}
+	if calls != 4 {
+		t.Fatalf("page calls=%d want 4 (two walks, one retry only)", calls)
 	}
 }

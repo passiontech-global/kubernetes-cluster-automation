@@ -172,7 +172,7 @@ func (c *ClockJumpCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		latchdefs.ReasonKonnectivityAgentRecreate +
 		fmt.Sprintf(" %s/%s - fresh clock-step marker + 401/x509 in log",
 			konn.Namespace, konn.Name))
-	if pods.DeleteKonnectivityPod(c.d, ctx, e.Pods) {
+	if pods.DeleteKonnectivityPod(c.d, ctx, e.Pods) == pods.KonnDeleted {
 		c.d.Actions.WithLabelValues(wdeps.CheckClockJump, "pod_delete").Inc()
 	}
 	c.d.CycleResult(wdeps.CheckClockJump, "ok")

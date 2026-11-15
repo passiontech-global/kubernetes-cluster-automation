@@ -98,6 +98,9 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		}
 		kube.RecordAnnoPatch(ctx, plan, patch)
 		p.plansApproved.Stamp(key, now) // delivered-only contract
+		// spec.approved flipped — later checks must not evaluate
+		// the pre-patch InstallPlan snapshot.
+		p.InvalidateUnstructured(ctx)
 		log.Info("PATCH: everest installplan auto-approved",
 			"installplan", plan.GetNamespace()+"/"+plan.GetName())
 	}

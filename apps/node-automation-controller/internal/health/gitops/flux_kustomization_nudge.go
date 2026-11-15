@@ -80,7 +80,7 @@ func (p *fluxKustomizationHealthCheck) maybeNudgeKustomization(ctx context.Conte
 	// stamp a previous patch — ours or `flux reconcile`'s — left; only
 	// after it clears do the maintenance mutex + global heal budget
 	// evaluate (fail closed), on the Deps-wide memoized verdict.
-	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+	proceed, unverifiable := p.HealAllowedUpgradeOnlyPersisted(ctx, log,
 		&p.reconcileHealed, kust,
 		kube.AnnoFluxRequestedAt, ck, fluxKustHealCooldown, now)
 	if unverifiable {
@@ -132,16 +132,21 @@ func (p *fluxKustomizationHealthCheck) nudgeFluxSourceArtifact(ctx context.Conte
 	if !ok {
 		return
 	}
-	src, err := p.Dyn.Resource(gvr).Namespace(ns).
-		Get(ctx, name, metav1.GetOptions{})
+	// Census lookup, not a live GET — the per-GVR unstructured
+	// snapshot pays the source LIST once per sweep; a deleted
+	// source reads nil (same skip the NotFound branch took).
+	src, err := p.Unstructured(ctx, gvr, ns, name)
 	if err != nil {
 		log.V(1).Info("source artifact nudge — source lookup failed",
 			"kind", kind, "source", ns+"/"+name, "error", err)
 		return
 	}
+	if src == nil {
+		return
+	}
 	ck := probefw.SelfHealKey(CheckNameFluxKustomizationHealth,
 		"source/"+kind+"/"+ns+"/"+name)
-	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+	proceed, unverifiable := p.HealAllowedUpgradeOnlyPersisted(ctx, log,
 		&p.sourceNudgeHealed, src,
 		kube.AnnoFluxRequestedAt, ck, fluxKustHealCooldown, now)
 	if unverifiable {
@@ -196,12 +201,14 @@ func (p *fluxKustomizationHealthCheck) fluxSourceNudgeFresh(ctx context.Context,
 	if !ok {
 		return false
 	}
-	src, err := p.Dyn.Resource(gvr).Namespace(ns).
-		Get(ctx, name, metav1.GetOptions{})
+	src, err := p.Unstructured(ctx, gvr, ns, name)
 	if err != nil {
 		logf.FromContext(ctx).V(1).Info(
 			"source nudge lookup failed — deferral guard fails open",
 			"kind", kind, "source", ns+"/"+name, "error", err)
+		return false
+	}
+	if src == nil {
 		return false
 	}
 	return flux.FluxSourceNudgeFresh(ctx, src, now, sourceNudgeFreshWindow)

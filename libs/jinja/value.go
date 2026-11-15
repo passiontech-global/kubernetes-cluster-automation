@@ -33,6 +33,8 @@ func Truthy(v any) bool {
 		return t != ""
 	case []any:
 		return len(t) > 0
+	case []string:
+		return len(t) > 0
 	case *List:
 		// A typed-nil *List is an empty list, not a panic.
 		return t != nil && len(t.V) > 0
@@ -83,6 +85,12 @@ func ToIter(v any) []any {
 		return t.V
 	case []any:
 		return t
+	case []string:
+		out := make([]any, len(t))
+		for i, x := range t {
+			out[i] = x
+		}
+		return out
 	case *OMap:
 		if t == nil {
 			return nil
@@ -203,6 +211,12 @@ func seqElems(v any) ([]any, bool) {
 		return t.V, true
 	case []any:
 		return t, true
+	case []string:
+		out := make([]any, len(t))
+		for i, x := range t {
+			out[i] = x
+		}
+		return out, true
 	}
 	return nil, false
 }

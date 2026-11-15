@@ -247,7 +247,7 @@ func (p *fluxHRRetriesCheck) maybePatchHRRetry(ctx context.Context, log logr.Log
 	gvr schema.GroupVersionResource, hr *unstructured.Unstructured,
 	key string, now time.Time) {
 	ck := probefw.SelfHealKey(CheckNameFluxHRRetries, key)
-	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
+	proceed, unverifiable := p.HealAllowedUpgradeOnlyPersisted(ctx, log,
 		&p.hrRetryHealed, hr, kube.AnnoFluxRequestedAt, ck,
 		fluxHRHealCooldown, now)
 	if unverifiable {

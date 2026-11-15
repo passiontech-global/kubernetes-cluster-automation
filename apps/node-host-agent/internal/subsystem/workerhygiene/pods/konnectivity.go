@@ -25,13 +25,18 @@ import (
 // previously matched konnectivity-agent-patcher-* and coredns-* job
 // pods → wrong pause killed, incident 2026-09-26).
 var (
-	// --node-ip=<ip> inside the k0sworker unit's ExecStart.
-	nodeIPRe = regexp.MustCompile(`--node-ip=([0-9.]+)`)
+	// --node-ip=<ip> inside the k0sworker unit's ExecStart. The
+	// value class is deliberately wide — IPv6 literals and
+	// hostnames are legal node identifiers, and a narrow [0-9.]+
+	// silently read them as "no node-ip" (inconclusive forever).
+	// \s/& bound the capture: unit-file and cmdline args are
+	// space-separated, and & is the shell background operator.
+	nodeIPRe = regexp.MustCompile(`--node-ip=([^\s&]+)`)
 	// --agent-identifiers=host=<ip> inside proxy-agent cmdline —
 	// fallback when environ is unreadable. NEVER grep bare 'host='
 	// (matches --proxy-server-host first — the false positive that
 	// caused the 163x pause-kill loop of 2026-09-19..23).
-	agentHostRe = regexp.MustCompile(`--agent-identifiers=host=([0-9.]+)`)
+	agentHostRe = regexp.MustCompile(`--agent-identifiers=host=([^\s&]+)`)
 	// DaemonSet pod names only (anchored — see comment block above).
 	KonnPodRe = regexp.MustCompile(`^konnectivity-agent-[a-z0-9]+$`)
 )
@@ -47,6 +52,27 @@ func k0sWorkerNodeIP(d *wdeps.Deps) string {
 		return string(m[1])
 	}
 	return ""
+}
+
+// proxyAgentComm reports whether the pid's comm can carry a
+// proxy-agent argv — the dedicated proxy-agent binary or the
+// konnectivity-agent (stat comm truncates to "konnectivity-agen").
+// known=false (unreadable stat) means "cannot rule the pid out" —
+// the caller falls through to the cmdline read as before.
+func proxyAgentComm(e *wdeps.CycleEnv, d *wdeps.Deps, pid int) (match, known bool) {
+	var comm string
+	if e != nil && e.StatsOnce != nil {
+		if st, ok := e.StatsOnce()[pid]; ok && st.HasComm {
+			comm, known = st.Comm, true
+		}
+	} else if st, ok := d.Proc.Stat(pid); ok && st.HasComm {
+		comm, known = st.Comm, true
+	}
+	if !known {
+		return false, false
+	}
+	return strings.Contains(comm, "proxy") ||
+		strings.HasPrefix(comm, "konnectivity"), true
 }
 
 // isProxyAgent matches `pgrep -f 'proxy-agent --'` on the joined
@@ -72,19 +98,33 @@ func proxyAgentHost(d *wdeps.Deps, pid int, argv []string) string {
 	return ""
 }
 
-// deleteKonnectivityPod deletes this node's konnectivity-agent pod in
+// KonnDeleteResult is the tri-state outcome of DeleteKonnectivityPod.
+// The caller MUST distinguish KonnNoPod (no matching pod exists —
+// the stale-process fallback may run) from KonnHeldOrErr (maintenance
+// hold or a failed DELETE — the API is unwell, so killing the agent
+// blind would sever the very control path a recovery needs).
+type KonnDeleteResult int
+
+const (
+	KonnDeleted KonnDeleteResult = iota
+	KonnHeldOrErr
+	KonnNoPod
+)
+
+// DeleteKonnectivityPod deletes this node's konnectivity-agent pod in
 // kube-system (grace 5 — the Running DaemonSet pod gets a bounded
 // shutdown window instead of an instant SIGKILL) — the DaemonSet
 // recreates the pod with freshly baked env.
 // Anchored name match + namespace pin (see KonnPodRe comment).
-func DeleteKonnectivityPod(d *wdeps.Deps, ctx context.Context, pods []corev1.Pod) bool {
+func DeleteKonnectivityPod(d *wdeps.Deps, ctx context.Context, pods []corev1.Pod) KonnDeleteResult {
 	// L1↔L3 hold: deleting the konnectivity agent mid cluster-
 	// maintenance severs the very control path a drain needs.
 	if d.HoldLocalAction(ctx) {
 		d.State.AppendLog("suspect: konnectivity pod delete held — " +
 			"cluster maintenance in progress")
-		return false
+		return KonnHeldOrErr
 	}
+	sawErr := false
 	for i := range pods {
 		p := &pods[i]
 		if p.Namespace != "kube-system" || !KonnPodRe.MatchString(p.Name) ||
@@ -95,11 +135,15 @@ func DeleteKonnectivityPod(d *wdeps.Deps, ctx context.Context, pods []corev1.Pod
 			d.State.AppendLog(fmt.Sprintf(
 				"suspect: konnectivity pod delete %s/%s failed: %v",
 				p.Namespace, p.Name, err))
+			sawErr = true
 			continue // a stale entry must not block the next candidate
 		}
-		return true
+		return KonnDeleted
 	}
-	return false
+	if sawErr {
+		return KonnHeldOrErr
+	}
+	return KonnNoPod
 }
 
 // KonnCheck is the 30-konnectivity stale-identifier guard as a
@@ -129,6 +173,11 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	agentHost := ""
 	stalePID := 0
 	for _, pid := range e.PidsOnce() {
+		// Comm pre-filter: only proxy/konnectivity comms can match
+		// isProxyAgent — every other pid skips the cmdline read.
+		if match, known := proxyAgentComm(e, c.d, pid); known && !match {
+			continue
+		}
 		argv := c.d.Proc.Cmdline(pid)
 		if !isProxyAgent(argv) {
 			continue
@@ -167,22 +216,35 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			latchdefs.ReasonKonnectivityAgentRecreate +
 			fmt.Sprintf(" sandbox - stale identifier host=%s != node-ip=%s",
 				agentHost, nodeIP))
-		if DeleteKonnectivityPod(c.d, ctx, e.Pods) {
+		switch DeleteKonnectivityPod(c.d, ctx, e.Pods) {
+		case KonnDeleted:
 			c.d.Actions.WithLabelValues(wdeps.CheckKonn, "pod_delete").Inc()
-		} else if stalePID > 0 {
-			// No API pod found (list failed or pod renamed) — kill
-			// the stale proxy-agent directly. Least-bad: a container
-			// restart alone can't fix env baked at pod create, but
-			// it still clears a hung agent while humans look.
-			if err := c.d.Cfg.Seams.Host.KillFn(stalePID, syscall.SIGKILL); err != nil {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"suspect: kill stale proxy-agent pid=%d failed: %v", stalePID, err))
-			} else {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"ACTION: killed stale proxy-agent pid=%d — no API pod found",
-					stalePID))
+		case KonnNoPod:
+			// The fallback SIGKILL is only safe when the pod LIST
+			// was healthy: !e.APIOK means e.Pods may be empty
+			// because the read failed, not because no agent pod
+			// exists — and killing the agent while the API is
+			// unwell severs the control path the recovery needs.
+			if !e.APIOK {
+				c.d.State.AppendLog("suspect: konnectivity stale-id " +
+					"remediation held — apiserver unhealthy, proxy-agent kept")
+			} else if stalePID > 0 {
+				// No API pod found (list succeeded but pod renamed)
+				// — kill the stale proxy-agent directly. Least-bad:
+				// a container restart alone can't fix env baked at
+				// pod create, but it still clears a hung agent
+				// while humans look.
+				if err := c.d.Cfg.Seams.Host.KillFn(stalePID, syscall.SIGKILL); err != nil {
+					c.d.State.AppendLog(fmt.Sprintf(
+						"suspect: kill stale proxy-agent pid=%d failed: %v", stalePID, err))
+				} else {
+					c.d.State.AppendLog(fmt.Sprintf(
+						"ACTION: killed stale proxy-agent pid=%d — no API pod found",
+						stalePID))
+				}
+				c.d.Actions.WithLabelValues(wdeps.CheckKonn, "sigkill").Inc()
 			}
-			c.d.Actions.WithLabelValues(wdeps.CheckKonn, "sigkill").Inc()
+		default: // KonnHeldOrErr — maintenance hold or delete error; keep the agent
 		}
 	} else {
 		// NPD contract: "konnectivity stale identifier ..." fires the

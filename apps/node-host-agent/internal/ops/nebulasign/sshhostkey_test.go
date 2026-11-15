@@ -1,6 +1,7 @@
 // sshhostkey_test.go — known_hosts host-key verification for the
 // nebula-sign fetch: a known_hosts file next to the SSH key pins the
-// hosts it lists; its absence keeps the tolerant dial.
+// hosts it lists; its absence fails closed unless the operator
+// passes --insecure-ignore-host-key.
 package nebulasign
 
 import (
@@ -45,7 +46,7 @@ func TestKnownHostsVerifyPinsListedHost(t *testing.T) {
 	line := string(ssh.MarshalAuthorizedKey(hostKey))
 	writeKnownHosts(t, keyPath, "127.0.0.1 "+line, "hub-b "+line)
 
-	verify, err := knownHostsVerify(keyPath)
+	verify, err := knownHostsVerify(keyPath, false)
 	if err != nil || verify == nil {
 		t.Fatalf("verify==nil:%v err=%v — want verifier", verify == nil, err)
 	}
@@ -60,13 +61,17 @@ func TestKnownHostsVerifyPinsListedHost(t *testing.T) {
 	}
 }
 
-// No known_hosts next to the key → no verifier, the documented
-// tolerant parity for infra VMs whose keys rotate on rebuild.
+// No known_hosts next to the key fails CLOSED by default — the
+// tolerant dial only survives under the explicit insecure opt-out.
 func TestKnownHostsVerifyAbsent(t *testing.T) {
-	verify, err := knownHostsVerify(
-		filepath.Join(t.TempDir(), "id_ed25519"))
+	keyPath := filepath.Join(t.TempDir(), "id_ed25519")
+	if _, err := knownHostsVerify(keyPath, false); err == nil {
+		t.Fatal("absent known_hosts want fail-closed error")
+	}
+	verify, err := knownHostsVerify(keyPath, true)
 	if err != nil || verify != nil {
-		t.Fatalf("verify!=nil:%v err=%v — want nil,nil", verify != nil, err)
+		t.Fatalf("verify!=nil:%v err=%v — want nil,nil under insecure",
+			verify != nil, err)
 	}
 }
 
@@ -75,7 +80,7 @@ func TestKnownHostsVerifyAbsent(t *testing.T) {
 func TestKnownHostsVerifyUnparseable(t *testing.T) {
 	keyPath := filepath.Join(t.TempDir(), "id_ed25519")
 	writeKnownHosts(t, keyPath, "not a known_hosts line")
-	if _, err := knownHostsVerify(keyPath); err == nil {
+	if _, err := knownHostsVerify(keyPath, true); err == nil {
 		t.Fatal("expected parse error")
 	}
 }

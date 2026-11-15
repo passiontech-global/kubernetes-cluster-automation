@@ -16,11 +16,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	sdbus "github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
@@ -67,6 +69,14 @@ func newDBusBackend(hostRoot string) *dbusBackend {
 	}
 }
 
+// dbusHandshakeTimeout bounds the dial + SASL auth + Subscribe
+// exchange. These run while systemConnLocked holds b.mu — an
+// unbounded read against a wedged PID 1 would park every later
+// systemd.Client call behind the mutex forever (the deadlock this
+// bound exists to prevent). 5s is generous for a local socket
+// handshake and still lands far inside any caller's op budget.
+const dbusHandshakeTimeout = 5 * time.Second
+
 // dialSystemdPrivate opens ONE authenticated connection to the
 // systemd private socket. godbus.Connect is FORBIDDEN here: it ends
 // in org.freedesktop.DBus.Hello, which the peer-to-peer
@@ -76,18 +86,46 @@ func newDBusBackend(hostRoot string) *dbusBackend {
 // handshake this socket accepts — the same shape go-systemd's own
 // NewSystemdConnectionContext uses (it skips Hello for exactly this
 // reason). The host's private socket is root-only anyway.
-func dialSystemdPrivate(path string) (*godbus.Conn, error) {
-	c, err := godbus.Dial("unix:path=" + path)
+//
+// The dial goes through net.DialTimeout + godbus.NewConn (not
+// godbus.Dial) so the raw net.Conn stays reachable: its deadline is
+// armed across Auth and cleared before return — the conn then lives
+// deadline-free for signal traffic. The net.Conn comes back beside
+// the godbus.Conn so systemConnLocked can arm the same bound across
+// Subscribe, which likewise runs under b.mu.
+func dialSystemdPrivate(path string) (*godbus.Conn, net.Conn, error) {
+	nc, err := net.DialTimeout("unix", path, dbusHandshakeTimeout)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := c.Auth([]godbus.Auth{
-		godbus.AuthExternal(strconv.Itoa(os.Getuid())),
-	}); err != nil {
-		_ = c.Close()
-		return nil, err
+	if err := nc.SetDeadline(time.Now().Add(dbusHandshakeTimeout)); err != nil {
+		_ = nc.Close()
+		return nil, nil, err
 	}
-	return c, nil
+	c, err := godbus.NewConn(nc)
+	if err == nil {
+		err = c.Auth([]godbus.Auth{
+			godbus.AuthExternal(strconv.Itoa(os.Getuid())),
+		})
+	}
+	// Clear BEFORE inspecting err: a failed handshake still leaves
+	// the reader goroutine parked on this conn until Close, and a
+	// live deadline would turn that park into a spin of i/o
+	// timeouts. Close handles both the godbus wrapper and the
+	// transport. A clear failure leaves the deadline armed — the
+	// conn would die on its next read — so it fails the dial too.
+	if cerr := nc.SetDeadline(time.Time{}); cerr != nil && err == nil {
+		err = cerr
+	}
+	if err != nil {
+		if c != nil {
+			_ = c.Close()
+		} else {
+			_ = nc.Close()
+		}
+		return nil, nil, err
+	}
+	return c, nc, nil
 }
 
 // systemConn returns a live conn, rebuilding it when the previous
@@ -132,16 +170,18 @@ func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error)
 		b.rawSig = nil
 	}
 	var rawSys, rawSig *godbus.Conn
+	var netSys, netSig net.Conn
 	conn, err := sdbus.NewConnection(func() (*godbus.Conn, error) {
-		c, err := dialSystemdPrivate(b.path)
+		c, nc, err := dialSystemdPrivate(b.path)
 		if err == nil {
 			// NewConnection dials sysconn first, sigconn second —
 			// capture each so loadUnit gets sysconn and dbusJob can
-			// watch BOTH transports for death.
+			// watch BOTH transports for death; the net.Conns let
+			// Subscribe run under the same handshake deadline.
 			if rawSys == nil {
-				rawSys = c
+				rawSys, netSys = c, nc
 			} else {
-				rawSig = c
+				rawSig, netSig = c, nc
 			}
 		}
 		return c, err
@@ -156,10 +196,45 @@ func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error)
 	// depend on — every restart would hang until ctx timeout. A
 	// refused Subscribe kills the conn and reports unavailable so
 	// the CLI fallback serves instead of a silently deaf bus.
-	if err := conn.Subscribe(); err != nil {
+	// The call runs under b.mu with no ctx deadline of its own —
+	// arm the handshake bound on both transports so a wedged PID 1
+	// cannot park the mutex (and every later systemd.Client call)
+	// on a Subscribe reply that never comes.
+	deadline := time.Now().Add(dbusHandshakeTimeout)
+	var armErr error
+	for _, nc := range []net.Conn{netSys, netSig} {
+		if nc == nil {
+			continue
+		}
+		if err := nc.SetDeadline(deadline); err != nil && armErr == nil {
+			armErr = err
+		}
+	}
+	// A transport that refused the deadline arm cannot bound
+	// Subscribe — skip the call entirely rather than park b.mu on
+	// an unbounded wait, and report unavailable for the CLI
+	// fallback.
+	var subErr error
+	if armErr != nil {
+		subErr = armErr
+	} else {
+		subErr = conn.Subscribe()
+	}
+	for _, nc := range []net.Conn{netSys, netSig} {
+		if nc == nil {
+			continue
+		}
+		// A clear failure strands the deadline — the conn dies on
+		// its next read and the lazy reconnect path serves; still
+		// surface it as a subscribe failure when nothing else did.
+		if err := nc.SetDeadline(time.Time{}); err != nil && subErr == nil {
+			subErr = err
+		}
+	}
+	if subErr != nil {
 		conn.Close()
 		return nil, fmt.Errorf("%w: systemd dbus subscribe: %v",
-			errDBusUnavailable, err)
+			errDBusUnavailable, subErr)
 	}
 	b.conn = conn
 	b.rawSys = rawSys

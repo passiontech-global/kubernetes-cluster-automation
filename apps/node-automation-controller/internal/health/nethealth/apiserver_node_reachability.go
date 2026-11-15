@@ -248,21 +248,16 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 		_, wasDark := dark[n.Name]
 		if persistedDark[n.Name] && !hasTaint {
 			// Taint/untaint are scheduling mutations — same heal
-			// contract as the pod deletes below: the per-target
-			// circuit first (no grant spent on a denied target),
-			// then the shared HealAllowed gate (cooldown → mutex →
-			// fleet budget; a proceed consumes one grant, which the
-			// mutation below spends — a failed TaintNode is an
-			// attempted mutation, never refunded).
-			if allowed, reason := heal.TryAcquireTarget(
-				CheckNameApiserverNodeReachability, n.Name, now); !allowed {
-				log.Info("DEFER: heal target circuit open — fence skipped",
-					"node", n.Name, "reason", reason)
-				continue
-			}
-			proceed, unverifiable := c.HealAllowed(ctx, log, &c.Heals,
+			// contract as the pod deletes below. HealAllowedOnNode
+			// runs FIRST (cooldown → node-scoped mutex → fleet
+			// budget): a cluster-wide hold or a drain naming THIS
+			// node must defer before the per-target circuit is
+			// consulted, while a drain scoped to a different node
+			// does not — or every held sweep would burn breaker
+			// credit on a fence it could never deliver.
+			proceed, unverifiable := c.HealAllowedOnNode(ctx, log, &c.Heals,
 				CheckNameApiserverNodeReachability+"/fence/"+n.Name,
-				darkHealCool, now)
+				n.Name, darkHealCool, now)
 			if unverifiable {
 				rep.InfraErr(fmt.Errorf(
 					"maintenance verdict unverifiable — fence %s deferred", n.Name))
@@ -271,6 +266,15 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 			if !proceed {
 				log.Info("heal gate deferred apiserver-dark fence",
 					"node", n.Name)
+				continue
+			}
+			if allowed, reason := heal.TryAcquireTarget(
+				CheckNameApiserverNodeReachability, n.Name, now); !allowed {
+				// The budget grant HealAllowed spent buys a
+				// mutation — the circuit denial means none happens.
+				heal.RefundGrant(now)
+				log.Info("DEFER: heal target circuit open — fence skipped",
+					"node", n.Name, "reason", reason)
 				continue
 			}
 			if err := kube.TaintNode(ctx, c.Deps.CS, n.Name,
@@ -381,5 +385,17 @@ func (c *apiserverNodeReachabilityCheck) probeSafe(ctx context.Context,
 			ok = true
 		}
 	}()
-	return c.probeFn(ctx, node)
+	if ctx.Err() != nil {
+		// The sweep budget is spent — every remaining probe would
+		// fail on OUR deadline, not the node's reachability.
+		// Inconclusive, never dark evidence.
+		return true
+	}
+	ok = c.probeFn(ctx, node)
+	if ctx.Err() != nil {
+		// The deadline landed mid-probe — a transport error caused
+		// by our own timeout must not read as a dark node.
+		return true
+	}
+	return ok
 }

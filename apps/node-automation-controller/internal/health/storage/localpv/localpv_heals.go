@@ -175,7 +175,11 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 	// cooldown. A patch failure leaves the in-RAM half (the delivered
 	// delete already stamped pvcProvHealed) holding; nil ledger
 	// because the in-RAM key is shared with DeletePod's own stamps.
-	if err := heal.StampPersisted(ctx, nil,
+	// `obj` (the census Deployment, possibly nil) feeds
+	// RecordAnnoPatch so the stamp lands on the sweep overlay —
+	// later checks reading pvcProvHealAnno via EffectiveAnno see
+	// this heal, not the pre-patch snapshot.
+	if err := heal.StampPersisted(ctx, obj,
 		func(ctx context.Context, data []byte) error {
 			_, err := p.CS.AppsV1().Deployments(openebsProvisionerNS).
 				Patch(ctx, openebsProvisionerName, types.MergePatchType, data,

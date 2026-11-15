@@ -56,7 +56,12 @@ func TestCiliumBPFMapPressureEmptyPasses(t *testing.T) {
 func TestCiliumBPFMapPressurePromDownInconclusive(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset()) // httpURL is dead by default
 	res := probetest.MustCheck[*ciliumBPFMapPressureCheck](t, p).Run(probetest.SweepCtx(ctx))
-	if !res.Pass {
-		t.Fatalf("prometheus outage must be inconclusive-pass, got %+v", res)
+	// A Prometheus outage is infra-inconclusive, never a clean pass:
+	// the check must not claim health it could not verify.
+	if res.Pass {
+		t.Fatalf("prometheus outage must not pass, got %+v", res)
+	}
+	if res.Infra == nil {
+		t.Fatalf("prometheus outage must report Infra, got %+v", res)
 	}
 }

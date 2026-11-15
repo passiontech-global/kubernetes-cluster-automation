@@ -22,7 +22,7 @@ func runTest(name string, v any, args []any) (bool, error) {
 		return isMappingValue(v), nil
 	case "iterable", "sequence":
 		switch v.(type) {
-		case []any, *List, *OMap, map[string]any, map[string]string, string:
+		case []any, []string, *List, *OMap, map[string]any, map[string]string, string:
 			return true, nil
 		}
 		return false, nil

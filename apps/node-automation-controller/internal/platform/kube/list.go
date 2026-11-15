@@ -21,6 +21,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
@@ -90,17 +91,33 @@ func ListEach[T any](ctx context.Context, opts metav1.ListOptions,
 // slice — the `items = append(items, page.Items...)` shape most
 // modules wanted. Returns nil (not an empty slice) when the first
 // page errors, matching the hand-rolled loops' `return nil, err`.
+//
+// A 410 Gone mid-walk (apierrors.IsResourceExpired — the continue
+// token's resourceVersion aged out from under a long paged read,
+// exactly what a Kine-backed apiserver produces under compaction
+// pressure) restarts the walk ONCE from the first page: the token
+// is dead, so the only correct continuation is a fresh snapshot.
+// ListEach callers keep the raw error — they process pages inline
+// and cannot un-visit them.
 func ListAll[T any](ctx context.Context, opts metav1.ListOptions,
 	page PageFunc[T]) ([]T, error) {
-	var out []T
-	err := ListEach(ctx, opts, page, func(items []T) error {
-		out = append(out, items...)
-		return nil
-	})
-	if err != nil {
-		return nil, err
+	collect := func() ([]T, error) {
+		var out []T
+		err := ListEach(ctx, opts, page, func(items []T) error {
+			out = append(out, items...)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
 	}
-	return out, nil
+	out, err := collect()
+	if err != nil && apierrors.IsResourceExpired(err) {
+		opts.Continue = ""
+		return collect()
+	}
+	return out, err
 }
 
 // DynamicPage adapts a dynamic.ResourceInterface's List to a PageFunc

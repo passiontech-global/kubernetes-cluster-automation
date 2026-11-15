@@ -92,14 +92,19 @@ type Cond struct {
 type Monitor struct {
 	deps Deps
 
-	// journal is the ONE shared `journalctl -o json` tail both
-	// journald consumers poll — the kubelet-stale monitor's
-	// _SYSTEMD_UNIT match and the kernel fallback's
-	// _TRANSPORT=kernel match (journalctl -k's own match, applied
-	// client-side) fan out of a single exec per poll window instead
-	// of two journalctl forks per cycle. The shared __CURSOR and
-	// per-subscriber pending queues live inside the mux.
+	// journal is the kubelet-stale monitor's journal tail — unit
+	// lines only. Kernel transport entries are deliberately NOT
+	// fetched here: while /dev/kmsg owns the kernel source they
+	// would be pure waste (kernel logs are the journal's volume),
+	// so the kernel fallback rides its own lighter stream below.
 	journal *journalwatch.Multiplexer
+	// kernelJournal is the journalctl -k fallback's OWN mux —
+	// created at New but only polled once kmsgJournalMode latches,
+	// so its first fetch's --since lookback IS the replay window
+	// the old birth-subscription pending queue used to provide.
+	// Separate cursor = no gap and no double-delivery against the
+	// unit stream.
+	kernelJournal *journalwatch.Multiplexer
 
 	kmsgTail        *kmsg.Tailer // the /dev/kmsg tail — handle, carry, backlog gates
 	kmsgScanned     bool         // mirrors the tail's caught-up flag (kernelLines)
@@ -136,15 +141,16 @@ func New(d Deps) *Monitor {
 	m := &Monitor{deps: d}
 	m.journal = journalwatch.New(d.JournalFetch)
 	m.journal.Now = d.Now
-	// The kernel fallback subscribes from birth: its pending queue
-	// accumulates _TRANSPORT=kernel entries even while kmsg owns the
-	// source (bounded by the mux cap, oldest dropped), so the
-	// fallback's first drain replays exactly the lookback window —
-	// the same coverage the old `journalctl -k --since` first fetch
-	// gave — instead of missing the gap between kmsg failure and
-	// subscription.
+	m.kernelJournal = journalwatch.New(d.JournalFetch)
+	m.kernelJournal.Now = d.Now
+	m.kernelJournal.Args = []string{"_TRANSPORT=kernel"}
+	// The kernel subscriber lives on the fallback mux from birth —
+	// subscribing costs nothing (no fetch until Poll), and the
+	// first journal-mode Poll's cursor-less --since lookback fetch
+	// replays exactly the window the old shared-queue accumulation
+	// covered.
 	// Subscribe cannot fail on a constant non-empty id.
-	_ = m.journal.Subscribe(journalSubKernel, func(e journalwatch.Entry) bool {
+	_ = m.kernelJournal.Subscribe(journalSubKernel, func(e journalwatch.Entry) bool {
 		return e.Transport == "kernel"
 	})
 	m.kmsgTail = kmsg.NewTailer(kmsg.TailerOptions{

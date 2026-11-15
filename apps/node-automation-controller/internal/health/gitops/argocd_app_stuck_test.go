@@ -476,7 +476,13 @@ func TestArgoCDRefreshDefersUnderMaintenance(t *testing.T) {
 	app.SetAnnotations(map[string]string{
 		kube.AnnoFirstSeenArgoCDAppStuck: `{"prog/argocd/maint-app":"` +
 			base.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`})
-	dyn := probetest.OpDyn(app)
+	// Cluster-wide hold: an in-flight autopilot Plan is the only
+	// maintenance signal AllowedUpgradeOnly still defers on — a
+	// node-scoped cordon no longer gates annotation-only nudges.
+	plan := testutil.Unstructured(
+		kube.AutopilotPlanGVR.GroupVersion().WithKind("Plan"), "", "upgrade-1", nil)
+	plan.Object["status"] = map[string]any{"state": "Running"}
+	dyn := probetest.OpDyn(app, plan)
 	cordoned := testutil.Node("w1", corev1.ConditionTrue, nil)
 	cordoned.Spec.Unschedulable = true
 	cs := fake.NewSimpleClientset(cordoned)

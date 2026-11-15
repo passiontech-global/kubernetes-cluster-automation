@@ -104,7 +104,7 @@ func (c *CtrMetaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			evidence = "journal: " + m
 		}
 	}
-	if orphans := countMetaOrphanShims(c.d, e.PidsOnce()); orphans > 0 {
+	if orphans := countMetaOrphanShims(c.d, e, e.PidsOnce()); orphans > 0 {
 		if evidence != "" {
 			evidence += "; "
 		}
@@ -171,9 +171,15 @@ func (c *CtrMetaCheck) measureMetaProbeLatency(ctx context.Context) {
 // whose k8s.io task dir still exists with a dead/missing init —
 // wdeps.CheckCtrTasks owns the missing-dir orphan case and live-init dirs
 // are normal tasks, so both are excluded here.
-func countMetaOrphanShims(d *wdeps.Deps, pids []int) int {
+func countMetaOrphanShims(d *wdeps.Deps, e *wdeps.CycleEnv, pids []int) int {
 	n := 0
 	for _, pid := range pids {
+		// Same comm pre-filter as the ctr-tasks shim scan — a
+		// non-shim comm cannot produce the argv match below.
+		if comm, known := procCommKnown(e, d, pid); known &&
+			!strings.HasPrefix(comm, "containerd-shim") {
+			continue
+		}
 		argv := d.Proc.Cmdline(pid)
 		if len(argv) == 0 ||
 			!strings.Contains(strings.Join(argv, " "), "containerd-shim-runc-v2") {

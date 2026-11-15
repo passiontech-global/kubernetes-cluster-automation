@@ -265,7 +265,7 @@ func TestIsActiveProbesAndFoldsProbeFailure(t *testing.T) {
 		"systemctl is-active k0sworker.service": "active\n",
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: writeVarsDir(t, ""), Runner: sr}, nil)
+		VarsDir: writeVarsDir(t, ""), Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestStopReloadServiceActionsAndErrorAttribution(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestEnsureServiceStopAndFailureAttribution(t *testing.T) {
 	sr.FailOn("systemctl start", nil)
 	sr.FailOn("systemctl restart", nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +430,7 @@ func TestShPortRefusalCounts(t *testing.T) {
 	vars := writeVarsDir(t, "")
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,8 +478,9 @@ func TestRunWatchEdgeConverges(t *testing.T) {
 	}, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
-		DownloadDir: t.TempDir(), Runner: sr,
-		Clock: timex.NewCell(func() time.Time { return time.Unix(1_700_000_000, 0) })}, nil)
+		DownloadDir: t.TempDir(), Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(),
+		ListenAddrsFn: listenAddrsFake(),
+		Clock:         timex.NewCell(func() time.Time { return time.Unix(1_700_000_000, 0) })}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -554,7 +555,7 @@ func TestStopServiceFailureAttribution(t *testing.T) {
 	sr := newScripted(nil, nil)
 	sr.FailOn("systemctl stop unit-b.service", nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr, DNSProbe: dnsProbeAnyOK(), TCPProbe: tcpProbeAllOK(), ListenAddrsFn: listenAddrsFake()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

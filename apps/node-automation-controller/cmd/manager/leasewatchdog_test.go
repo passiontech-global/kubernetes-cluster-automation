@@ -1,6 +1,9 @@
 // leasewatchdog_test.go — the LeaseLossWatchdog contract: only a
-// definitive FOREIGN HolderIdentity trips the cancel; self, empty,
-// missing, and unreadable leases must never bounce a healthy leader.
+// definitive FOREIGN HolderIdentity trips the cancel immediately;
+// self, empty, missing, and unreadable leases are inconclusive —
+// never instant loss — but they DO run the self-fence clock, so a
+// sustained unverifiable window cancels the leader before a
+// standby's lease hand-off can overlap.
 package main
 
 import (
@@ -27,6 +30,10 @@ func leaseObj(holder string) *coordinationv1.Lease {
 	if holder != "" {
 		l.Spec.HolderIdentity = ptrTo(holder)
 	}
+	// A verified self-hold requires a FRESH RenewTime — the
+	// watchdog treats holder==self with a stale/missing renew
+	// stamp as inconclusive (dead hold coasting on the lease term).
+	l.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
 	return l
 }
 
@@ -64,7 +71,7 @@ func TestWatchdogForeignHolderCancels(t *testing.T) {
 	go func() { done <- w.Start(ctx) }()
 	select {
 	case <-cancelled:
-	case <-time.After(10 * w.interval):
+	case <-time.After(5 * time.Second):
 		t.Fatal("watchdog did not cancel on foreign holder")
 	}
 	if !stolen.Load() {
@@ -126,6 +133,78 @@ func TestWatchdogEmptyAndMissingLeaseSafe(t *testing.T) {
 	}
 }
 
+// TestWatchdogSelfFencesOnSustainedReadFailure: an apiserver
+// partition leaves the leader unable to verify its hold — after
+// fenceAfter of inconclusive reads it must fence itself (the
+// split-brain guard's other half: no foreign holder is ever
+// observed, so only the unverifiable clock can stop it).
+func TestWatchdogSelfFencesOnSustainedReadFailure(t *testing.T) {
+	w, stolen, cancelled := newWatchdog(t, leaseObj("pod-a_1234"))
+	w.fenceAfter = 40 * time.Millisecond
+	w.cs.(*fake.Clientset).PrependReactor("get", "leases",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, context.DeadlineExceeded
+		})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx) }()
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchdog did not self-fence on sustained read failure")
+	}
+	if !stolen.Load() {
+		t.Fatal("stolen flag not set before self-fence cancel")
+	}
+	<-done
+}
+
+// TestWatchdogSelfFencesOnEmptyHolder: a lease that never names a
+// holder is just as unverifiable as a failed read — the fence must
+// cover it (our renews are not landing, so the hold is unproven).
+func TestWatchdogSelfFencesOnEmptyHolder(t *testing.T) {
+	w, stolen, cancelled := newWatchdog(t, leaseObj(""))
+	w.fenceAfter = 40 * time.Millisecond
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx) }()
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchdog did not self-fence on persistent empty holder")
+	}
+	if !stolen.Load() {
+		t.Fatal("stolen flag not set before self-fence cancel")
+	}
+	<-done
+}
+
+// TestWatchdogVerifiedReadsHoldOffFence: confirmed self-holder
+// reads refresh lastVerified — a leader whose apiserver answers
+// keeps running however long it likes (the fence only fires on
+// UNVERIFIED time, never on verified time).
+func TestWatchdogVerifiedReadsHoldOffFence(t *testing.T) {
+	w, _, cancelled := newWatchdog(t, leaseObj("pod-a_1234"))
+	w.fenceAfter = 30 * time.Millisecond // far below the sleep below
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx) }()
+	time.Sleep(10 * w.fenceAfter)
+	select {
+	case <-cancelled:
+		t.Fatal("watchdog fenced despite verified self-holder reads")
+	default:
+	}
+	cancel()
+	<-done
+}
+
+// TestWatchdogReadErrorIsNotLoss pins the INSTANT-loss contract:
+// within the fence window a read error must not cancel — the
+// self-fence (tested above) owns the sustained-outage case.
 func TestWatchdogReadErrorIsNotLoss(t *testing.T) {
 	w, _, cancelled := newWatchdog(t, leaseObj("pod-b_5678"))
 	// Force every GET to fail — a transient apiserver error must

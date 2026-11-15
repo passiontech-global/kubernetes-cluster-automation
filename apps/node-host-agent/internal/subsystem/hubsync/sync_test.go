@@ -903,16 +903,16 @@ func TestSystemdUnitContent(t *testing.T) {
 		"/usr/local/bin/node-host-agent",
 		"/etc/node-host-agent/vars", "/etc/node-host-agent/nebula-certs")
 	for _, want := range []string{
-		"ExecStart=/usr/local/bin/node-host-agent --standalone --node-name='db-vm' --health-probe-bind-address=127.0.0.1:9117",
-		"Environment=NODE_HOST_AGENT_HOST_ROOT=/",
-		"Environment=NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR=/etc/node-host-agent/vars",
-		"Environment=NODE_HOST_AGENT_NEBULA_CERTS_DIR=/etc/node-host-agent/nebula-certs",
+		`ExecStart="/usr/local/bin/node-host-agent" --standalone --node-name='db-vm' --health-probe-bind-address=127.0.0.1:9117`,
+		`Environment="NODE_HOST_AGENT_HOST_ROOT=/"`,
+		`Environment="NODE_HOST_AGENT_HOSTCONFIG_VARS_DIR=/etc/node-host-agent/vars"`,
+		`Environment="NODE_HOST_AGENT_NEBULA_CERTS_DIR=/etc/node-host-agent/nebula-certs"`,
 		"Type=simple",
 		"Restart=always",
 		"RestartSec=5s",
 		"WatchdogSec=120s",
 		"MemoryMax=512M",
-		"Environment=GOMEMLIMIT=400MiB",
+		`Environment="GOMEMLIMIT=400MiB"`,
 		"WantedBy=multi-user.target",
 	} {
 		if !strings.Contains(u, want) {

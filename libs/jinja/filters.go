@@ -108,9 +108,25 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if len(args) > 0 {
 			sep = Stringify(args[0])
 		}
-		parts := []string{}
-		for _, it := range ToIter(v) {
-			parts = append(parts, Stringify(it))
+		items := ToIter(v)
+		if len(items) > maxSeqElems {
+			return nil, fmt.Errorf("join: %d elements exceeds cap %d", len(items), maxSeqElems)
+		}
+		parts := make([]string, 0, len(items))
+		total := 0
+		for _, it := range items {
+			p := Stringify(it)
+			total += len(p)
+			if total > maxStringBytes {
+				return nil, fmt.Errorf("join: output exceeds %d bytes", maxStringBytes)
+			}
+			parts = append(parts, p)
+		}
+		// The separator bytes count toward the output too —
+		// range(1e6) | join(sep_1MiB) passed the per-item check
+		// while strings.Join allocated ~1 TiB.
+		if total+(len(parts)-1)*len(sep) > maxStringBytes {
+			return nil, fmt.Errorf("join: output exceeds %d bytes", maxStringBytes)
 		}
 		return strings.Join(parts, sep), nil
 	case "list":
@@ -126,6 +142,8 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			// multibyte string reports ~3x its real length.
 			return int64(utf8.RuneCountInString(t)), nil
 		case []any:
+			return int64(len(t)), nil
+		case []string:
 			return int64(len(t)), nil
 		case *List:
 			if t == nil {
@@ -282,7 +300,33 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if err != nil {
 			return nil, err
 		}
-		return re.ReplaceAllString(Stringify(v), Stringify(args[1])), nil
+		s := Stringify(v)
+		repl := Stringify(args[1])
+		if len(s) > maxStringBytes {
+			return nil, fmt.Errorf("regex_replace: input exceeds %d bytes", maxStringBytes)
+		}
+		// Expand match-by-match so the output cap fires mid-stream —
+		// ReplaceAllString would allocate the whole multiplied
+		// result before any bound could reject it. ExpandString gives
+		// byte-identical $N/${name} expansion to ReplaceAllString.
+		var b strings.Builder
+		b.Grow(len(s) + len(repl) + 64)
+		last := 0
+		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
+			b.WriteString(s[last:m[0]])
+			exp := re.ExpandString(nil, repl, s, m)
+			if b.Len()+len(exp) > maxStringBytes {
+				return nil, fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+			}
+			b.Write(exp)
+			last = m[1]
+		}
+		b.WriteString(s[last:])
+		out := b.String()
+		if len(out) > maxStringBytes {
+			return nil, fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+		}
+		return out, nil
 	case "regex_findall":
 		if len(args) == 0 {
 			return &List{}, nil
@@ -412,9 +456,23 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		// historical first-line indent the vendored templates are
 		// rendered with — jinja2's own default is first=False.
 		blank := Truthy(kw["blank"])
-		lines := strings.Split(Stringify(v), "\n")
+		s := Stringify(v)
+		lines := strings.Split(s, "\n")
+		// Output ≈ input + pad per indented line — a 16MiB input of
+		// short lines under a 10KB indent is GiB-scale. Count only
+		// lines that actually receive the pad (empty lines skip it
+		// unless blank=true) and fail BEFORE the builder allocates.
+		padded := 1 // lines[0] is always indented
+		for _, ln := range lines[1:] {
+			if ln != "" || blank {
+				padded++
+			}
+		}
+		if len(s)+padded*len(pad) > maxStringBytes {
+			return nil, fmt.Errorf("indent: output exceeds %d bytes", maxStringBytes)
+		}
 		var sb strings.Builder
-		sb.Grow(len(lines[0]) + len(pad) + (len(lines)-1)*(len(pad)+1))
+		sb.Grow(len(s) + padded*len(pad))
 		sb.WriteString(pad)
 		sb.WriteString(lines[0])
 		for _, ln := range lines[1:] {

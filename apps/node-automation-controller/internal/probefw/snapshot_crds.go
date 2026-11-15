@@ -45,7 +45,7 @@ func (d *Deps) AllUnstructured(ctx context.Context,
 	}
 	m, ok := s.unstructReads[gvr]
 	if !ok {
-		m = &memo[[]unstructured.Unstructured]{}
+		m = &memo[[]unstructured.Unstructured]{now: s.nowFn}
 		s.unstructReads[gvr] = m
 	}
 	s.muUnstructs.Unlock()
@@ -72,4 +72,27 @@ func (d *Deps) AllUnstructuredFirst(ctx context.Context,
 	schema.GroupVersionResource, error) {
 
 	return kube.ListFirstGVR(ctx, gvrs, d.AllUnstructured)
+}
+
+// Unstructured resolves one object by (namespace, name) out of the
+// per-GVR census AllUnstructured memoizes — the sweep-scoped
+// replacement for a live Dynamic.Resource(gvr).Namespace(ns).Get:
+// the GVR's LIST is paid once per cycle and every later lookup
+// filters the shared slice client-side. Absent → (nil, nil), the
+// same NotFound convention the typed index lookups use; list errors
+// propagate. The returned object aliases snapshot state — read-only
+// (mid-sweep annotation writes ride the overlay, not this object).
+func (d *Deps) Unstructured(ctx context.Context,
+	gvr schema.GroupVersionResource, ns, name string) (*unstructured.Unstructured, error) {
+
+	items, err := d.AllUnstructured(ctx, gvr)
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if items[i].GetNamespace() == ns && items[i].GetName() == name {
+			return &items[i], nil
+		}
+	}
+	return nil, nil
 }

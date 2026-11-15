@@ -113,10 +113,24 @@ func tcpCensusDump(out *TCPCensus) error {
 			endSeq, ferr := parseDiagCensus(b, out)
 			return endSeq != 0, ferr
 		}); err != nil {
+			if family == unix.AF_INET6 && noInet6Family(err) {
+				continue // kernel has no IPv6 — not an error
+			}
 			return err
 		}
 	}
 	return nil
+}
+
+// noInet6Family reports whether err is the kernel's "no such
+// protocol family" answer for an AF_INET6 dump — ipv6.disable=1 /
+// a kernel without IPv6 returns EAFNOSUPPORT (older kernels
+// EOPNOTSUPP, containers EINVAL-adjacent ENOENT variants). The
+// AF_INET half already succeeded; the census just has no v6 rows.
+func noInet6Family(err error) bool {
+	return errors.Is(err, unix.EAFNOSUPPORT) ||
+		errors.Is(err, unix.EOPNOTSUPP) ||
+		errors.Is(err, unix.ENOENT)
 }
 
 // parseDiagCensus folds every inet_diag_msg in one recv batch into
@@ -211,9 +225,27 @@ func DiagEndpoint(key string) string {
 		return net.IP(key[:4]).String() + ":" + strconv.Itoa(port)
 	case 18:
 		port = int(binary.BigEndian.Uint16([]byte(key[16:18])))
+		// net.IP.String's v4-mapped unpadding is the pinned output
+		// contract here (filefd sockstat consumers match the bare
+		// quad inside brackets) — v6String's preserved ::ffff:
+		// prefix is only for parseListenAddrs, whose output feeds
+		// address parsing that needs the real family marker.
 		return "[" + net.IP(key[:16]).String() + "]:" + strconv.Itoa(port)
 	}
 	return key
+}
+
+// v6String renders a 16-byte IPv6 endpoint preserving the v4-mapped
+// prefix — net.IP.String unmaps ::ffff:a.b.c.d to the bare dotted
+// quad, which inside "[...]" brackets produces the malformed
+// "[127.0.0.53]:53" instead of "[::ffff:127.0.0.53]:53". To4 on a
+// 16-byte IP is non-nil exactly for the mapped form, so the check
+// doubles as the discriminator.
+func v6String(b []byte) string {
+	if ip4 := net.IP(b).To4(); ip4 != nil {
+		return "::ffff:" + ip4.String()
+	}
+	return net.IP(b).String()
 }
 
 // --- SOCK_DESTROY: the `ss -K` replacement --------------------
@@ -286,13 +318,19 @@ func diagSock() (int, error) {
 // ENOENT for an all-zero id) and NLM_F_ACK on destroys.
 func diagRequest(seq uint32, family uint8, states uint32,
 	id *[sockidLen]byte, msgType, flags uint16) []byte {
+	return diagRequestProto(seq, family, unix.IPPROTO_TCP, states,
+		id, msgType, flags)
+}
+
+func diagRequestProto(seq uint32, family uint8, proto uint8, states uint32,
+	id *[sockidLen]byte, msgType, flags uint16) []byte {
 	req := make([]byte, 16+diagReqV2)
 	binary.LittleEndian.PutUint32(req[0:], uint32(16+diagReqV2)) // nlmsg_len
 	binary.LittleEndian.PutUint16(req[4:], msgType)
 	binary.LittleEndian.PutUint16(req[6:], flags)
 	binary.LittleEndian.PutUint32(req[8:], seq)
 	req[16] = family
-	req[17] = unix.IPPROTO_TCP
+	req[17] = proto
 	binary.LittleEndian.PutUint32(req[20:], states) // idiag_states
 	if id != nil {
 		copy(req[24:24+sockidLen], id[:]) // idiag_sockid
@@ -330,6 +368,9 @@ func destroyListeners(port uint16) (int, error) {
 		if err := diagRecvLoop(fd, buf, fmt.Sprintf("sock_diag recv %d", family), func(b []byte) (bool, error) {
 			return collectPortListeners(b, family, port, &matches)
 		}); err != nil {
+			if family == unix.AF_INET6 && noInet6Family(err) {
+				continue // kernel has no IPv6 — nothing v6 to kill
+			}
 			return 0, err
 		}
 	}
@@ -381,10 +422,115 @@ func collectPortListeners(buf []byte, family uint8, port uint16, matches *[]sock
 }
 
 // parseDiagAck reads one destroy-phase reply: NLMSG_ERROR with a
-// negative errno is a real failure; anything else (ACK, DONE) is
-// success — the kernel may also answer DONE for an id that no
-// longer exists, which is the desired idempotent outcome.
+// negative errno is a real failure EXCEPT ENOENT — the kernel
+// answers ENOENT for a sockid that no longer exists, which is the
+// desired idempotent outcome of a destroy (the listener already
+// exited between the dump and the kill). Anything else (ACK,
+// DONE) is success.
 func parseDiagAck(buf []byte) error {
 	_, _, err := walkNLMsgs(buf, true, nil)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
 	return err
+}
+
+// --- listener census: the `ss -lntu` replacement --------------------------
+//
+// ListenAddrs returns the set of local endpoints ("ip:port",
+// "[v6]:port") holding a socket a `ss -l` row would print for pid's
+// netns: TCP sockets in TCP_LISTEN plus every bound UDP socket —
+// UDP has no listen state, and ss -lun's UNCONN rows are exactly
+// the sockets carrying a bound local port, so the UDP half keeps
+// every state and lets the sport!=0 + caller's addr match do the
+// filtering (a connected UDP client's ephemeral local port never
+// collides with a service address). One SOCK_DIAG socket serves
+// the TCP and UDP dumps for both address families, drained
+// sequentially like the census path; a family the kernel lacks
+// (ipv6.disable) is skipped, not an error.
+
+// ListenAddrs is the in-process `ss -lntu` for checks that only
+// need "is this endpoint bound here" — no ss binary, no fork.
+func ListenAddrs(pid int) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+	err := InNetNS(pid, func() error { return listenAddrsDump(out) })
+	return out, err
+}
+
+func listenAddrsDump(out map[string]struct{}) error {
+	fd, err := diagSock()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
+
+	bufp := diagBufPool.Get().(*[]byte)
+	defer diagBufPool.Put(bufp)
+	buf := *bufp
+
+	seq := uint32(30)
+	for _, spec := range []struct {
+		family uint8
+		proto  uint8
+	}{
+		{unix.AF_INET, unix.IPPROTO_TCP},
+		{unix.AF_INET, unix.IPPROTO_UDP},
+		{unix.AF_INET6, unix.IPPROTO_TCP},
+		{unix.AF_INET6, unix.IPPROTO_UDP},
+	} {
+		seq++
+		if err := unix.Sendto(fd, diagRequestProto(seq, spec.family,
+			spec.proto, 0xFFF, nil,
+			unix.SOCK_DIAG_BY_FAMILY, unix.NLM_F_REQUEST|unix.NLM_F_DUMP),
+			0, sa); err != nil {
+			return fmt.Errorf("sock_diag send %d/%d: %w",
+				spec.family, spec.proto, err)
+		}
+		if err := diagRecvLoop(fd, buf,
+			fmt.Sprintf("sock_diag recv %d/%d", spec.family, spec.proto),
+			func(b []byte) (bool, error) {
+				endSeq, ferr := parseListenAddrs(b, spec.proto, out)
+				return endSeq != 0, ferr
+			}); err != nil {
+			if spec.family == unix.AF_INET6 && noInet6Family(err) {
+				continue // kernel has no IPv6 — not an error
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// parseListenAddrs folds one dump batch into out — TCP rows only
+// in TCP_LISTEN, UDP rows any state with a bound local port —
+// and returns the terminating dump seq like parseDiagCensus.
+func parseListenAddrs(buf []byte, proto uint8,
+	out map[string]struct{}) (uint32, error) {
+	seq, _, err := walkNLMsgs(buf, false, func(payload []byte) {
+		if len(payload) < diagMsg {
+			return
+		}
+		family := payload[0]
+		if family != unix.AF_INET && family != unix.AF_INET6 {
+			return
+		}
+		if proto == unix.IPPROTO_TCP && payload[1] != tcpStateListen {
+			return
+		}
+		// idiag_sockid at payload+4: idiag_sport (BE u16) at +0,
+		// idiag_src at +4 — 4 bytes AF_INET, 16 AF_INET6.
+		sport := binary.BigEndian.Uint16(payload[4:6])
+		if sport == 0 {
+			return
+		}
+		port := strconv.Itoa(int(sport))
+		switch family {
+		case unix.AF_INET:
+			out[net.IP(payload[8:12]).String()+":"+port] = struct{}{}
+		case unix.AF_INET6:
+			out["["+v6String(payload[8:24])+"]:"+port] = struct{}{}
+		}
+	})
+	return seq, err
 }

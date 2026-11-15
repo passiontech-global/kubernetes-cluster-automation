@@ -210,6 +210,14 @@ func (j *Janitor) sweepIPMonitors() {
 		return
 	}
 	for _, pid := range pids {
+		// Comm pre-filter: only `ip` (or a busybox-ip applet)
+		// procs can be monitors — every other pid skips the
+		// cmdline read. An unreadable stat falls through to the
+		// old path.
+		if st, ok := j.proc.Stat(pid); ok && st.HasComm &&
+			st.Comm != "ip" && st.Comm != "busybox" {
+			continue
+		}
 		argv := j.proc.Cmdline(pid)
 		if !isIPMonitorArgv(argv) {
 			continue

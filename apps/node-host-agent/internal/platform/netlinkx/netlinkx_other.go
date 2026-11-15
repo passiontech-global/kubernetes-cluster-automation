@@ -39,3 +39,6 @@ func TCPTables(int) (TCPCensus, error) { return TCPCensus{}, errNotLinux }
 
 // DestroyListenersOnPort refuses off Linux.
 func DestroyListenersOnPort(int, uint16) (int, error) { return 0, errNotLinux }
+
+// ListenAddrs refuses off Linux.
+func ListenAddrs(int) (map[string]struct{}, error) { return nil, errNotLinux }

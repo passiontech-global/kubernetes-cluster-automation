@@ -569,15 +569,17 @@ func TestPostgresWALPromQueryStrings(t *testing.T) {
 		t.Fatalf("no series — sweep must pass quietly: %+v", res)
 	}
 	const wantPG = `(increase(pg_stat_archiver_failed_count[30m]) > 0) or ` +
-		`(pg_replication_slots_retained_bytes{active="false"} > 5368709120) or ` +
+		`((pg_replication_slots_retained_bytes{active="false"} > 5368709120) ` +
+		`or on(namespace, pod, slot_name) ` +
 		`(pg_replication_slots_active == 0 and on(namespace, pod, slot_name) ` +
 		`(pg_replication_slots_pg_wal_lsn_diff > 5368709120 or ` +
-		`pg_replication_slots_confirmed_flush_lsn_wal_lsn_diff > 5368709120))`
+		`pg_replication_slots_confirmed_flush_lsn_wal_lsn_diff > 5368709120)))`
 	const wantCNPG = `(increase(cnpg_pg_stat_archiver_failed_count[30m]) > 0) or ` +
-		`(cnpg_pg_replication_slots_retained_bytes{active="false"} > 5368709120) or ` +
+		`((cnpg_pg_replication_slots_retained_bytes{active="false"} > 5368709120) ` +
+		`or on(namespace, pod, slot_name) ` +
 		`(cnpg_pg_replication_slots_active == 0 and on(namespace, pod, slot_name) ` +
 		`(cnpg_pg_replication_slots_retained_bytes > 5368709120 or ` +
-		`cnpg_pg_replication_slots_pg_wal_lsn_diff > 5368709120))`
+		`cnpg_pg_replication_slots_pg_wal_lsn_diff > 5368709120)))`
 	if len(queries) != 3 {
 		t.Fatalf("prom queries = %d (%v), want 3 (pg family, cnpg family, volume)",
 			len(queries), queries)

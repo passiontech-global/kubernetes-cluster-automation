@@ -18,7 +18,11 @@ import (
 func binOp(op string, l, r any) (any, error) {
 	switch op {
 	case "~":
-		return Stringify(l) + Stringify(r), nil
+		ls, rs := Stringify(l), Stringify(r)
+		if len(ls)+len(rs) > maxStringBytes {
+			return nil, fmt.Errorf("~: concatenated string exceeds %d bytes", maxStringBytes)
+		}
+		return ls + rs, nil
 	case "+":
 		// seq+seq concatenates across BOTH list representations:
 		// DecodeYAML yields []any while list literals and filters
@@ -26,6 +30,9 @@ func binOp(op string, l, r any) (any, error) {
 		// the unsupported-operands error.
 		if ls, ok := seqElems(l); ok {
 			if rs, ok := seqElems(r); ok {
+				if len(ls)+len(rs) > maxSeqElems {
+					return nil, fmt.Errorf("+: concatenated sequence exceeds %d elements", maxSeqElems)
+				}
 				out := append(append([]any{}, ls...), rs...)
 				if _, isList := l.(*List); isList {
 					return &List{out}, nil
@@ -43,6 +50,9 @@ func binOp(op string, l, r any) (any, error) {
 			ls, lok := l.(string)
 			rs, rok := r.(string)
 			if lok && rok {
+				if len(ls)+len(rs) > maxStringBytes {
+					return nil, fmt.Errorf("+: concatenated string exceeds %d bytes", maxStringBytes)
+				}
 				return ls + rs, nil
 			}
 			// Name the NON-string operand — reporting r's type
@@ -261,6 +271,13 @@ func binOp(op string, l, r any) (any, error) {
 			}
 			return binOp("in", l, rv)
 		case []any:
+			for _, it := range rt {
+				if deepEq(it, l) {
+					return true, nil
+				}
+			}
+			return false, nil
+		case []string:
 			for _, it := range rt {
 				if deepEq(it, l) {
 					return true, nil

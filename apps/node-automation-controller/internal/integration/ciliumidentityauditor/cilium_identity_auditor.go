@@ -73,6 +73,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -122,6 +123,7 @@ var (
 
 type ciliumIdentityAuditor struct {
 	cs         kubernetes.Interface
+	meta       metadata.Interface
 	nodeReader kube.CachedNodeReader
 	dyn        dynamic.Interface
 	// gcEnabled arms the v2 delete path (CILIUM_IDENTITY_GC_ENABLED
@@ -150,6 +152,7 @@ func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, gcEnabledFromEnv, func(gcEnabled bool) error {
 		a := &ciliumIdentityAuditor{
 			cs:         d.CS,
+			meta:       d.Meta,
 			nodeReader: d.CachedClient(),
 			dyn:        d.Dyn,
 			gcEnabled:  gcEnabled,
@@ -227,33 +230,30 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// new pod's endpoint exists in neither snapshot and its live
 	// identity reads orphaned.
 	//
-	// Server-side phase filter + continue-token pagination:
-	// terminal pods hold no live endpoints, and the all-namespaces
-	// pod read is the biggest this module makes — page it at the
-	// shared bound so no single response dominates. The in-code
-	// phase check stays — fake clientsets ignore field selectors
-	// and the belt costs nothing.
+	// Metadata-only pod read: the audit consumes ONE annotation per
+	// pod, so ListPartialOrFallback serves PartialObjectMetadata —
+	// the full Pod objects (status, spec, managedFields) never
+	// cross the wire. The phase filter stays server-side: metadata
+	// items carry no Status to re-check client-side, and counting a
+	// terminal pod's annotation as "used" is the conservative
+	// direction anyway (it can only delay a delete, never cause
+	// one). Fake clientsets ignore the field selector — harmless:
+	// fixtures carry no terminal pods with the annotation.
 	podOpts := metav1.ListOptions{
 		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
 		Limit:         kube.DefaultListPageSize,
 	}
-	err = kube.ListEach(ctx, podOpts, kube.Pods(a.cs, metav1.NamespaceAll),
-		func(items []corev1.Pod) error {
-			for i := range items {
-				p := &items[i]
-				if p.Status.Phase == corev1.PodSucceeded ||
-					p.Status.Phase == corev1.PodFailed {
-					continue
-				}
-				if v := strings.TrimSpace(
-					p.Annotations[ciliumIDAnnotation]); v != "" {
-					used[v] = struct{}{}
-				}
-			}
-			return nil
-		})
+	pods, err := kube.ListPartialOrFallback(ctx, a.meta, a.cs, a.dyn,
+		corev1.SchemeGroupVersion.WithResource("pods"),
+		metav1.NamespaceAll, podOpts)
 	if err != nil {
 		return fmt.Errorf("list pods: %w", err) // wrapper IncErrors — a returned error must not count itself
+	}
+	for i := range pods {
+		if v := strings.TrimSpace(
+			pods[i].Annotations[ciliumIDAnnotation]); v != "" {
+			used[v] = struct{}{}
+		}
 	}
 
 	// CiliumEndpoints are the FIRST API-side usage source. Streamed

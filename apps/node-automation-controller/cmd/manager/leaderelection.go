@@ -42,6 +42,8 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/flowcontrol"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // leaderElectionID is the Lease object name — shared by the resource
@@ -77,7 +79,13 @@ func leaderClientConfig(cfg *rest.Config,
 	if renewDeadline <= 0 {
 		renewDeadline = 10 * time.Second
 	}
-	elCfg.Timeout = max(renewDeadline/2, time.Second)
+	// max(RenewDeadline/2, 1s) bounded ABOVE by 15s: the deployment's
+	// 120s renew deadline would otherwise license a 60s client
+	// timeout — one hung apiserver request could then sit inside
+	// the renew window long enough to matter. 15s still covers
+	// legitimate slow writes while keeping the worst-case stall a
+	// fraction of the smallest sane renew deadline.
+	elCfg.Timeout = min(max(renewDeadline/2, time.Second), 15*time.Second)
 	elCfg.ContentType = "application/vnd.kubernetes.protobuf"
 	// Same accept-fallback posture as the manager/typed configs:
 	// protobuf is sent AND preferred, JSON is the negotiated
@@ -99,13 +107,18 @@ const (
 
 // buildLeaderLock constructs the Lease resource lock controller-
 // runtime would have built internally (same leases type, same
-// hostname_uuid identity convention, same RenewDeadline-derived
-// client timeout), wrapped in releaseGuardedLock. Only called when
-// leader election is on — the returned interface is ignored by
-// ctrl.Options otherwise. stolen is the LeaseLossWatchdog's flag:
-// once it observes a foreign holder it sets the flag and the guard
-// refuses release writes unconditionally (the live-Get check stays
-// as the fallback for the window before the watchdog's first pass).
+// identity convention, same RenewDeadline-derived client timeout),
+// wrapped in releaseGuardedLock. Only called when leader election
+// is on — the returned interface is ignored by ctrl.Options
+// otherwise. stolen is the LeaseLossWatchdog's flag: once it
+// observes a foreign holder it sets the flag and the guard refuses
+// release writes unconditionally (the live-Get check stays as the
+// fallback for the window before the watchdog's first pass).
+// done is closed by main AFTER mgr.Start returns — the election
+// broadcaster's Shutdown rides it so the sink writer is never
+// drained while the manager is still shutting leader-gated work
+// down (the watchdog's workCancel fires mid-drain; tying Shutdown
+// to that channel would kill the event sink early).
 func buildLeaderLock(cfg *rest.Config, scheme *runtime.Scheme,
 	namespace string, renewDeadline time.Duration,
 	stolen *atomic.Bool, done <-chan struct{}) (resourcelock.Interface, error) {
@@ -124,11 +137,22 @@ func buildLeaderLock(cfg *rest.Config, scheme *runtime.Scheme,
 		return nil, fmt.Errorf("leader-election clientset: %w", err)
 	}
 
-	hostname, err := os.Hostname()
-	if err != nil {
-		return nil, fmt.Errorf("leader-election identity: %w", err)
+	// The identity's pod-name half prefers POD_NAME (the
+	// downward-API env) over os.Hostname(): spec.hostname can
+	// differ from metadata.name, and the Preemptor's holderDead
+	// parses the pod name back out of HolderIdentity — a hostname
+	// that is not the pod name makes every holder check 404 and a
+	// LIVE leader reads as pod_missing → false preemption →
+	// split-brain flap.
+	identityBase := envx.String("POD_NAME", "")
+	if identityBase == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return nil, fmt.Errorf("leader-election identity: %w", err)
+		}
+		identityBase = hostname
 	}
-	identity := hostname + "_" + string(uuid.NewUUID())
+	identity := identityBase + "_" + string(uuid.NewUUID())
 
 	// LeaderElection events on the Lease object stay live: the
 	// broadcaster sink writes through the same clientset, bound per

@@ -9,6 +9,7 @@
 package netlinkx
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -25,6 +26,18 @@ func Sockstat(pid int) (SockstatV4, SockstatV6, error) {
 	}
 	v6raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/net/sockstat6", pid))
 	if err != nil {
+		// sockstat6 is absent on kernels with IPv6 disabled
+		// (ipv6.disable=1, no IPv6 stack in the container's
+		// userns view) — that is a legitimate "zero v6 sockets"
+		// answer, not a probe failure: return the v4 half with
+		// an empty v6 table.
+		if errors.Is(err, os.ErrNotExist) {
+			v4, perr := parseSockstatV4(string(v4raw))
+			if perr != nil {
+				return SockstatV4{}, SockstatV6{}, perr
+			}
+			return v4, SockstatV6{}, nil
+		}
 		return SockstatV4{}, SockstatV6{}, fmt.Errorf("read sockstat6: %w", err)
 	}
 	v4, err := parseSockstatV4(string(v4raw))

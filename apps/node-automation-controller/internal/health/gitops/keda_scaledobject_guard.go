@@ -231,7 +231,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		}
 		if dep != nil {
 			kind = "Deployment"
-			annotations = dep.Annotations
+			annotations = kube.EffectiveAnnos(ctx, dep)
 			replicas = dep.Spec.Replicas
 			rv = dep.ResourceVersion
 		}
@@ -243,7 +243,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		}
 		if sts != nil {
 			kind = "StatefulSet"
-			annotations = sts.Annotations
+			annotations = kube.EffectiveAnnos(ctx, sts)
 			replicas = sts.Spec.Replicas
 			rv = sts.ResourceVersion
 		}
@@ -261,7 +261,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 			r := &ros[i]
 			if r.GetNamespace() == ns && r.GetName() == target {
 				kind = "Rollout"
-				annotations = r.GetAnnotations()
+				annotations = kube.EffectiveAnnos(ctx, r)
 				rv = r.GetResourceVersion()
 				if reps, found := kube.NestedInt64(r.Object, "spec", "replicas"); found {
 					v := int32(reps)
@@ -318,6 +318,17 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		log.Error(err, "keda zero-rescue scale patch failed",
 			"target", kind+" "+ns+"/"+target, "replicas", rescue)
 		return
+	}
+	// The spec patch landed — drop the workload census memo so later
+	// checks this sweep see the rescued replica count, not the
+	// pre-patch zero.
+	switch kind {
+	case "Deployment":
+		p.InvalidateDeployments(ctx)
+	case "StatefulSet":
+		p.InvalidateStatefulSets(ctx)
+	case "Rollout":
+		p.InvalidateUnstructured(ctx)
 	}
 	p.Heals.Stamp(ck, now)
 	log.Info("SCALE: keda cold-start rescue — target wedged at 0 while the scaler is unhealthy",

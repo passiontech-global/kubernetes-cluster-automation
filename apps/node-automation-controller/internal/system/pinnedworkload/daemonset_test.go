@@ -83,7 +83,7 @@ func TestDaemonSetSpecNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -120,7 +120,7 @@ func TestDaemonSetSpecNoDrift(t *testing.T) {
 	if patched {
 		t.Fatal("patched a drift-free DaemonSet")
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -144,7 +144,7 @@ func TestDaemonSetSpecMissingContainerSkips(t *testing.T) {
 		t.Fatal("patched a DaemonSet whose pinned container is absent — " +
 			"the name-only merge entry has no image and is rejected forever")
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -166,7 +166,7 @@ func TestDaemonSetSpecUnsettledSkips(t *testing.T) {
 	if patched {
 		t.Fatal("patched during an unsettled rollout — should have skipped")
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -185,7 +185,7 @@ func TestDaemonSetSpecAppliesPatch(t *testing.T) {
 		"system-node-critical" {
 		t.Fatalf("priorityClassName = %q, want system-node-critical", got)
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 }
@@ -246,7 +246,7 @@ func TestDaemonSetSpecCachedReadConfirmSkipsSettled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter != 15*time.Minute {
+	if res.RequeueAfter < 13*time.Minute+30*time.Second || res.RequeueAfter >= 16*time.Minute+30*time.Second {
 		t.Fatalf("expected 15m requeue, got %s", res.RequeueAfter)
 	}
 	if patched {

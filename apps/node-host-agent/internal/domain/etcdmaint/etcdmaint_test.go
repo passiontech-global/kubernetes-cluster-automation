@@ -363,8 +363,11 @@ func TestRunOfflineOnBloat(t *testing.T) {
 	for _, want := range []string{
 		"--data-dir=/fake/k0s/etcd",
 		"--quota-backend-bytes=8589934592",
-		"--listen-client-urls=",
-		"--advertise-client-urls=",
+		"--listen-client-urls=http://127.0.0.1:22379",
+		"--advertise-client-urls=http://127.0.0.1:22379",
+		"--listen-peer-urls=http://127.0.0.1:22380",
+		"--initial-advertise-peer-urls=http://127.0.0.1:22380",
+		"--force-new-cluster=true",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("standalone args missing %q: %s", want, joined)
@@ -374,6 +377,51 @@ func TestRunOfflineOnBloat(t *testing.T) {
 		if a == "/fake/k0s/bin/etcd" {
 			t.Fatalf("argv[0] leaked into standalone flags: %v", starter.args)
 		}
+	}
+	// Isolation contract: NOTHING from the live member's network
+	// shape may leak into the standalone argv — no real :2379/:2380
+	// URL, no cert flags, no inherited --initial-cluster.
+	for _, banned := range []string{
+		"10.0.0.1:2379", ":2380", "--cert-file", "--key-file",
+		"--cacert", "--initial-cluster=default=https",
+	} {
+		if strings.Contains(joined, banned) {
+			t.Fatalf("standalone args leak live member flag %q: %s",
+				banned, joined)
+		}
+	}
+	// The temp-phase etcdctl calls (health + the 180s defrag) must
+	// hit the loopback temp endpoint WITHOUT the live certArgs —
+	// while the post-restart health wait keeps the real endpoint.
+	// Every endpoint-health/defrag call BEFORE systemctl start is a
+	// temp-phase call; assert its endpoint prefix.
+	startIdx := callIndex(f.calls, "systemctl start")
+	for i, c := range f.calls {
+		if i > startIdx {
+			break
+		}
+		if strings.Contains(c.args, "endpoint health") ||
+			strings.Contains(c.args, "--command-timeout=180s") {
+			if !strings.Contains(c.args, "--endpoints=http://127.0.0.1:22379") {
+				t.Fatalf("temp-phase call missing loopback endpoint: %s", c.args)
+			}
+			if strings.Contains(c.args, "--cacert") {
+				t.Fatalf("temp-phase call carries live certs: %s", c.args)
+			}
+		}
+	}
+	// Post-restart health probes keep the live cert endpoint.
+	postRestartHealth := false
+	for _, c := range f.calls[startIdx:] {
+		if strings.Contains(c.args, "endpoint health") {
+			postRestartHealth = true
+			if !strings.Contains(c.args, "--endpoints=https://127.0.0.1:2379") {
+				t.Fatalf("post-restart health lost live endpoint: %s", c.args)
+			}
+		}
+	}
+	if !postRestartHealth {
+		t.Fatal("no post-restart health probe recorded")
 	}
 	if !starter.killed {
 		t.Fatal("standalone etcd was not killed")

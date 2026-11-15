@@ -229,7 +229,7 @@ func Setup(d shared.Deps) error {
 // descheduler_storm_act.go.
 func (r *deschedulerStormGate) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	res := ctrl.Result{RequeueAfter: 5 * time.Minute}
+	res := ctrl.Result{RequeueAfter: shared.RequeueAfter(5 * time.Minute)}
 	now := r.now.Now()
 
 	ev, err := r.nodeStormSignals(ctx, now)

@@ -133,9 +133,16 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 		}
 		// The patch landed — the stale-annotation drops are durable,
 		// so their series are released only here (a failed patch
-		// keeps the annotation, the SSOT, listing those names).
+		// keeps the annotation, the SSOT, listing those names). The
+		// recover-confirm streaks clear here too: evalRecover ran
+		// BEFORE the write, and clearing inside it would let a
+		// failed patch reset confirmation progress the sweep had
+		// already earned.
 		for _, name := range dropped {
 			metrics.WebhookCircuitBroken.DeleteLabelValues(job.Kind, job.Name, name)
+		}
+		for _, name := range recovered {
+			s.b.clearHealthyStreak(job.Kind + "/" + job.Name + "/" + name)
 		}
 		circuitMetrics(&s.b.brokenEmitted, job.Kind, job.Name, trips, recovered, stillBroken)
 	}

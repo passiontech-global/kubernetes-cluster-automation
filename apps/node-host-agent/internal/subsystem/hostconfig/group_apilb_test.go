@@ -4,14 +4,18 @@
 package hostconfig
 
 import (
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
 // ---------- #1: vendored haproxy template renders for...if ----------
@@ -27,18 +31,22 @@ api_lb_backends:
     backup: true
 `
 	vars := writeVarsDir(t, cluster)
-	sr := newScripted(nil, map[string]bool{
-		// probe for api_far fails -> name NOT in api_lb_probe_reachable
-		"/dev/tcp/10.0.2.99/6443": true,
-	})
+	// api_far's probe fails until reachable flips — the LB gate
+	// addr stays up so only the backend filter is exercised.
+	reachable := map[string]bool{"127.0.0.1:6443": true}
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
-		Runner: sr}, nil)
+		Runner: sr, TCPProbe: tcpProbeFake(reachable)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	c := loadCyc(t, r, vars, "node-b")
-	cfg, err := r.render("api-local-lb.haproxy.cfg.j2", c.tplCtx())
+	// tplCtx leaves api_lb_probe_reachable empty — groupAPILB fills
+	// it lazily at T12; mirror that here.
+	tctx := c.tplCtx()
+	tctx["api_lb_probe_reachable"] = &jinja.List{V: strSliceToAny(c.probeReachable())}
+	cfg, err := r.render("api-local-lb.haproxy.cfg.j2", tctx)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -50,8 +58,13 @@ api_lb_backends:
 		t.Fatalf("unreachable probe backend rendered:\n%s", s)
 	}
 	// and with the probe succeeding the backend shows up with ` backup`
-	sr.ClearFails()
-	cfg2, err := r.render("api-local-lb.haproxy.cfg.j2", c.tplCtx())
+	// — a fresh cyc: tplCtx is memoized per converge, so the second
+	// render simulates the next cycle's probe.
+	reachable["10.0.2.99:6443"] = true
+	c = loadCyc(t, r, vars, "node-b")
+	tctx = c.tplCtx()
+	tctx["api_lb_probe_reachable"] = &jinja.List{V: strSliceToAny(c.probeReachable())}
+	cfg2, err := r.render("api-local-lb.haproxy.cfg.j2", tctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +99,8 @@ func newLBHost(t *testing.T, vars string, sr *testutil.FakeRunner) *Reconciler {
 	t.Helper()
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
-		DownloadDir: t.TempDir(), Runner: sr}, nil)
+		DownloadDir: t.TempDir(), Runner: sr,
+		TCPProbe: tcpProbeAllOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,8 +144,9 @@ func TestAPILBPinHostsHappyPath(t *testing.T) {
 func TestAPILBNoPinWhenProbeFails(t *testing.T) {
 	vars := lbVars(t)
 	sr := lbRunner()
-	sr.FailOn("/dev/tcp/127.0.0.1/6443", nil) // LB never listens
 	r := newLBHost(t, vars, sr)
+	// LB never listens on 127.0.0.1:6443; the backend probe stays up.
+	r.cfg.TCPProbe = tcpProbeFake(map[string]bool{"10.0.2.99:6443": true})
 	c := loadCyc(t, r, vars, "node-b")
 	c.groupAPILB()
 
@@ -206,9 +221,9 @@ func TestAPILBExtraLanesNftAndCfg(t *testing.T) {
 func TestAPILBExtraLanesProbeFiltered(t *testing.T) {
 	vars := laneVars(t)
 	sr := lbRunner()
-	// api_far probe fails -> filtered out of EVERY lane backend too.
-	sr.FailOn("/dev/tcp/10.0.2.99/6443", nil)
 	r := newLBHost(t, vars, sr)
+	// api_far probe fails -> filtered out of EVERY lane backend too.
+	r.cfg.TCPProbe = tcpProbeFake(map[string]bool{"127.0.0.1:6443": true})
 	c := loadCyc(t, r, vars, "node-b")
 	cfg, err := r.render("api-local-lb.haproxy.cfg.j2", c.tplCtx())
 	if err != nil {
@@ -318,11 +333,17 @@ func TestProbeReachableRejectsBadAddr(t *testing.T) {
   - {name: api_evil, addr: "10.0.0.1';id:6443", probe: true}
   - {name: api_ok, addr: "10.0.1.10:6443", probe: true}
 `)
-	sr := newScripted(map[string]string{
-		"/dev/tcp/10.0.1.10/6443": "",
-	}, nil)
+	var dialed []string
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr,
+		TCPProbe: func(_ context.Context, addr string, _ time.Duration) error {
+			dialed = append(dialed, addr)
+			if addr == "10.0.1.10:6443" {
+				return nil
+			}
+			return errors.New("refused")
+		}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,8 +352,10 @@ func TestProbeReachableRejectsBadAddr(t *testing.T) {
 	if len(got) != 1 || got[0] != "api_ok" {
 		t.Fatalf("probeReachable = %v", got)
 	}
-	if len(sr.CallsMatching("/dev/tcp/10.0.0.1")) > 0 {
-		t.Fatalf("injected addr reached the shell: %v", sr.CallsMatching("/dev/tcp"))
+	for _, a := range dialed {
+		if strings.HasPrefix(a, "10.0.0.1") {
+			t.Fatalf("injected addr reached the dialer: %v", dialed)
+		}
 	}
 	if c.errs == 0 {
 		t.Fatal("injected backend addr not counted")
@@ -424,11 +447,14 @@ func TestProbeReachableIPv6SplitHostPort(t *testing.T) {
 	vars := writeVarsDir(t, `api_lb_backends:
   - {name: api_v6, addr: "[::1]:6443", probe: true}
 `)
-	sr := newScripted(map[string]string{
-		"/dev/tcp/::1/6443": "",
-	}, nil)
+	var dialed []string
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr,
+		TCPProbe: func(_ context.Context, addr string, _ time.Duration) error {
+			dialed = append(dialed, addr)
+			return nil
+		}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,8 +463,8 @@ func TestProbeReachableIPv6SplitHostPort(t *testing.T) {
 	if len(got) != 1 || got[0] != "api_v6" {
 		t.Fatalf("probeReachable = %v — bracketed IPv6 must parse", got)
 	}
-	if len(sr.CallsMatching("/dev/tcp/::1/6443")) == 0 {
-		t.Fatalf("v6 probe not issued: %v", sr.CallsMatching("/dev/tcp"))
+	if len(dialed) != 1 || dialed[0] != "[::1]:6443" {
+		t.Fatalf("v6 probe not issued on the bracketed addr: %v", dialed)
 	}
 }
 
@@ -449,7 +475,7 @@ func apilbFixture(t *testing.T, cluster string) (*Reconciler, *testutil.FakeRunn
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), WatchdogScriptsDir: t.TempDir(),
-		Runner: sr}, nil)
+		Runner: sr, TCPProbe: tcpProbeAllOK()}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +623,7 @@ api_lb_extra_lanes:
 func TestAPILBProbeAbortKeepsHostsUnpinned(t *testing.T) {
 	r, sr, c := apilbFixture(t, "")
 	sr.On("dpkg-query -W -f=${Status} ${Version} haproxy", "install ok installed 2.8.30-0ubuntu0.24.04.2")
-	sr.FailOn("/dev/tcp/127.0.0.1/6443", nil)
+	r.cfg.TCPProbe = tcpProbeFake(map[string]bool{})
 	c.groupAPILB()
 	if c.errs == 0 {
 		t.Fatal("dead-LB probe did not count a cycle error")
@@ -647,11 +673,17 @@ func TestAPILBProbeReachableSkips(t *testing.T) {
     addr: "10.0.9.9"
     probe: true
 `)
-	sr := newScripted(map[string]string{
-		"timeout 5 bash -c 'cat < /dev/null > /dev/tcp/10.0.9.9/6443'": "ok",
-	}, nil)
+	var dialed []string
+	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
-		VarsDir: vars, Runner: sr}, nil)
+		VarsDir: vars, Runner: sr,
+		TCPProbe: func(_ context.Context, addr string, _ time.Duration) error {
+			dialed = append(dialed, addr)
+			if addr == "10.0.9.9:6443" {
+				return nil
+			}
+			return errors.New("refused")
+		}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,8 +695,8 @@ func TestAPILBProbeReachableSkips(t *testing.T) {
 	if c.errs != 1 {
 		t.Fatalf("errs = %d, want the refused host counted", c.errs)
 	}
-	if len(sr.CallsMatching("/dev/tcp/10.0.9.9/6443")) == 0 {
-		t.Fatal("bare host not probed on the default :6443")
+	if len(dialed) != 1 || dialed[0] != "10.0.9.9:6443" {
+		t.Fatalf("bare host not probed on the default :6443: %v", dialed)
 	}
 }
 

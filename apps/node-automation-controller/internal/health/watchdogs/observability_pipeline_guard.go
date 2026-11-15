@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -30,6 +31,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 // observabilityPipelineCheck is the monitoring-the-monitor watchdog.
@@ -131,8 +133,37 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 	degraded := map[string]bool{}
 	inconclusive := false
 
+	// Phase 1 — issue all eight queries concurrently (bounded 8 =
+	// the whole roster): they are independent instant queries and
+	// the serial loop used to pay 8×Prometheus round-trip latency
+	// inside one PerCheck budget. Evaluation stays serial below so
+	// metric series, log lines and Warning Events keep their
+	// declared order regardless of which query answered first.
+	type qres struct {
+		series []promq.Sample
+		err    error
+	}
+	results := make([]qres, 1+len(obsPipelineCounters))
+	var g errgroup.Group
+	g.SetLimit(8)
+	fire := func(i int, query string) {
+		g.Go(func() error {
+			series, err := p.PromQuery(ctx, query)
+			results[i] = qres{series: series, err: err}
+			return nil
+		})
+	}
+	fire(0, obsWatchdogQuery)
+	for i, q := range obsPipelineCounters {
+		fire(1+i, q.query)
+	}
+	_ = g.Wait()
+
+	// Phase 2 — evaluate in declared order.
+
 	// Dead-Man's-Switch — the always-firing Watchdog alert.
-	series, err := p.PromQuery(ctx, obsWatchdogQuery)
+	wd := results[0]
+	series, err := wd.series, wd.err
 	switch {
 	case err != nil:
 		inconclusive = true
@@ -148,8 +179,8 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 			"always-firing Watchdog alert absent — alert evaluation or routing is wedged")
 	}
 
-	for _, q := range obsPipelineCounters {
-		series, err := p.PromQuery(ctx, q.query)
+	for i, q := range obsPipelineCounters {
+		series, err := results[1+i].series, results[1+i].err
 		if err != nil {
 			inconclusive = true
 			log.Info("WARN: pipeline counter query failed — stage inconclusive",
@@ -185,8 +216,12 @@ func (p *observabilityPipelineCheck) degrade(ctx context.Context,
 	rep.Emit(obsPipelineDegradedGauge, component,
 		[]string{component},
 		fmt.Sprintf("%s (%s)", component, desc))
-	if p.evented.Add(component) {
-		p.emitDegradedEvent(ctx, log, component, desc)
+	// Mark evented ONLY after the Event lands — a failed send must
+	// retry next sweep, not dedupe against an episode marker that
+	// never produced an event.
+	if !p.evented.Has(component) &&
+		p.emitDegradedEvent(ctx, log, component, desc) == nil {
+		p.evented.Add(component)
 	}
 }
 
@@ -196,7 +231,7 @@ func (p *observabilityPipelineCheck) degrade(ctx context.Context,
 // anchors on the monitoring namespace so it surfaces where the
 // on-call actually watches.
 func (p *observabilityPipelineCheck) emitDegradedEvent(
-	ctx context.Context, log logr.Logger, component, desc string) {
+	ctx context.Context, log logr.Logger, component, desc string) error {
 
 	now := p.Now()
 	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
@@ -222,8 +257,9 @@ func (p *observabilityPipelineCheck) emitDegradedEvent(
 	}); err != nil {
 		log.Info("WARN: ObservabilityPipelineDegraded event create failed (RBAC?)",
 			"component", component, "error", err)
-		return
+		return err
 	}
 	log.Info("EVENT: ObservabilityPipelineDegraded — monitoring pipeline stage failing",
 		"component", component)
+	return nil
 }

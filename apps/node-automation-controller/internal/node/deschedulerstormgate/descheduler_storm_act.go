@@ -11,6 +11,7 @@ package deschedulerstormgate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -21,10 +22,17 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
+
+// errStormGateDeferred is the RetryOnConflict sentinel for "the hold
+// annotation appeared between the census Get and the scale patch" —
+// the retry stops without erroring and applyVerdict defers the
+// verdict to the next sweep.
+var errStormGateDeferred = errors.New("storm-gate hold set mid-sweep")
 
 // applyVerdict computes the scale verdict from the collected
 // evidence and acts on it: storm → replicas 0, clear → replicas 1.
@@ -104,31 +112,67 @@ func (r *deschedulerStormGate) applyVerdict(ctx context.Context,
 		// that RV, and three cluster-wide scans run between the Get
 		// and this patch. An operator setting the hold mid-sweep
 		// (or any other concurrent edit) bumps the RV, the apiserver
-		// rejects with 409, and the patch can never silently
-		// overwrite the hold.
-		patch, err := json.Marshal(map[string]any{
-			"spec": map[string]any{"replicas": want},
-			"metadata": map[string]any{
-				"resourceVersion": deploy.ResourceVersion,
-				"annotations": map[string]string{
-					stormGateDecisionAnno: decision,
-				},
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("marshal replicas patch: %w", err)
+		// rejects with 409 — RetryOnConflict re-reads and re-checks
+		// the hold before re-pinning, so the retry can never scale
+		// over a hold that landed mid-sweep.
+		decisionFor := func(d *appsv1.Deployment) string {
+			fcur := int32(1)
+			if d.Spec.Replicas != nil {
+				fcur = *d.Spec.Replicas
+			}
+			return fmt.Sprintf("%s verdict=%s want=%d cur=%d not_ready=[%s] bad=[%s] tainted=[%s] cordoned=[%s] maintenance=[%s] preempted=[%s] imagepull=[%s]",
+				r.now.Now().UTC().Format(time.RFC3339), verdict, want, fcur,
+				strings.Join(ev.notReady, "\n"), strings.Join(ev.bad, "\n"),
+				strings.Join(ev.tainted, "\n"), strings.Join(ev.cordoned, "\n"),
+				strings.Join(ev.maintenance, "\n"), strings.Join(ev.preempted, "\n"),
+				strings.Join(ev.imagePull, "\n"))
 		}
-		if _, err := r.cs.AppsV1().Deployments("kube-system").
-			Patch(ctx, "descheduler", types.MergePatchType, patch,
-				metav1.PatchOptions{}); err != nil {
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh, err := r.cs.AppsV1().Deployments("kube-system").
+				Get(ctx, "descheduler", metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			if fresh.Annotations[stormGateHoldAnno] == "true" {
+				// The hold landed between the census Get and this
+				// patch — defer the whole verdict, never scale
+				// over it. Sentinel: not an actuation failure.
+				return errStormGateDeferred
+			}
+			fcur := int32(1)
+			if fresh.Spec.Replicas != nil {
+				fcur = *fresh.Spec.Replicas
+			}
+			if fcur == want {
+				return nil // a concurrent writer already landed the verdict
+			}
+			patch, err := json.Marshal(map[string]any{
+				"spec": map[string]any{"replicas": want},
+				"metadata": map[string]any{
+					"resourceVersion": fresh.ResourceVersion,
+					"annotations": map[string]string{
+						stormGateDecisionAnno: decisionFor(fresh),
+					},
+				},
+			})
+			if err != nil {
+				return fmt.Errorf("marshal replicas patch: %w", err)
+			}
+			_, err = r.cs.AppsV1().Deployments("kube-system").
+				Patch(ctx, "descheduler", types.MergePatchType, patch,
+					metav1.PatchOptions{})
+			return err
+		})
+		switch {
+		case errors.Is(err, errStormGateDeferred):
+			log.Info("DEFER: storm-gate hold set mid-sweep — re-reading next sweep")
+			return nil
+		case err != nil:
 			if apierrors.IsConflict(err) {
-				// The deployment changed since the Get — a hold set
-				// mid-sweep is exactly the dangerous case. Defer the
-				// whole verdict: no scale, no annotation, the regular
-				// cadence re-reads everything next sweep. A conflict
-				// is a lost race, not an actuation failure.
-				log.Info("DEFER: descheduler deployment changed mid-sweep — re-reading next sweep",
-					"observedResourceVersion", deploy.ResourceVersion)
+				// Retries exhausted — the deployment kept changing
+				// under the verdict. Defer: no scale, no annotation,
+				// the regular cadence re-reads everything next sweep.
+				log.Info("DEFER: descheduler deployment kept changing mid-sweep — re-reading next sweep")
 				return nil
 			}
 			return fmt.Errorf(

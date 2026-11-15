@@ -29,9 +29,7 @@ func TestPartitionEvictor(t *testing.T) {
 		testutil.Node("h2", corev1.ConditionTrue, nil),
 		testutil.Node("h3", corev1.ConditionTrue, nil),
 	}
-	podOnP1 := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name: "src-ctrl", Namespace: "flux-system"},
-		Spec: corev1.PodSpec{NodeName: "p1"}}
+	podOnP1 := pePod("flux-system", "p1", "src-ctrl")
 
 	objs := []runtime.Object{partitioned, healthy, podOnP1}
 	for _, n := range others {

@@ -347,6 +347,48 @@ func TestKonnectivityCmdlineFallback(t *testing.T) {
 	}
 }
 
+// TestKonnectivityNonIPv4NodeIP: --node-ip accepts IPv6 literals and
+// hostnames — the old [0-9.]+ class read them as "no node-ip" and the
+// check stayed inconclusive forever.
+func TestKonnectivityNonIPv4NodeIP(t *testing.T) {
+	for _, nodeIP := range []string{"fd00:abcd::1", "worker-a.dc1.example.com"} {
+		t.Run(nodeIP, func(t *testing.T) {
+			e := fixture(t)
+			wdepstest.WriteFile(t, e.UnitFile,
+				"[Service]\nExecStart=/usr/bin/k0s worker --node-ip="+nodeIP+"\n")
+			e.MkProc(t, 7001, "S",
+				fmt.Sprintf(proxyCmdline, nodeIP), "NODE_IP="+nodeIP+"\x00")
+			e.H.Cycle(context.Background())
+			if _, err := os.Stat(filepath.Join(e.StateDir, "state-konnectivity-ip-mismatch")); !os.IsNotExist(err) {
+				t.Fatal("mismatch latch on agent baked with the node-ip")
+			}
+			if len(e.Kills) != 0 || len(wdepstest.DeleteActions(e.CS)) != 0 {
+				t.Fatal("action taken on healthy agent")
+			}
+		})
+	}
+}
+
+// TestKonnectivityFallbackKillHeldOnAPIFailure: a failed pod LIST
+// leaves e.Pods empty — indistinguishable from "no agent pod". The
+// fallback SIGKILL must NOT fire while the API is unwell.
+func TestKonnectivityFallbackKillHeldOnAPIFailure(t *testing.T) {
+	e := fixture(t)
+	e.MkProc(t, 7001, "S",
+		fmt.Sprintf(proxyCmdline, "10.9.9.9"), "NODE_IP=10.9.9.9\x00")
+	e.CS.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver flake")
+	})
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 0 {
+		t.Fatalf("kills=%v want none — fallback must hold on API failure", e.Kills)
+	}
+	if !strings.Contains(e.LogLines(t), "apiserver unhealthy, proxy-agent kept") {
+		t.Fatalf("missing hold log:\n%s", e.LogLines(t))
+	}
+}
+
 func TestDNSResolvDriftKillPause(t *testing.T) {
 	e := fixture(t)
 	wdepstest.WriteFile(t, e.ResolvConf, "nameserver 10.96.0.10\nnameserver 8.8.8.8\n")

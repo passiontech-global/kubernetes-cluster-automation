@@ -321,6 +321,11 @@ func (f *Fixture) MkProc(t *testing.T, pid int, comm string, args []string, age 
 	fields[19] = strconv.FormatInt(start, 10)
 	testutil.WriteFile(t, filepath.Join(d, "stat"),
 		fmt.Sprintf("%d (%s) %s", pid, comm, strings.Join(fields, " ")))
+	// Every MkProc caller fabricates a k0scontroller child (kine,
+	// kube-apiserver, konnectivity-server) — the comm→pid lookups
+	// scope on this cgroup substr before signalling.
+	testutil.WriteFile(t, filepath.Join(d, "cgroup"),
+		"0::/system.slice/k0scontroller.service\n")
 }
 
 // MkSock links one fd to a socket inode and appends a net/tcp row

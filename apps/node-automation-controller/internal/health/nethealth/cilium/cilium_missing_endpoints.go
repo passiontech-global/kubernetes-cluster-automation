@@ -197,7 +197,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		// denied, cooled-down or failed heal leaves the wedge
 		// live, and marking the node healed would suppress the
 		// per-pod deletes that are the remaining remedy.
-		if p.DeletePodHeal(ctx, log, CheckNameCiliumMissingEndpoints,
+		if p.DeletePodHealOnNode(ctx, log, CheckNameCiliumMissingEndpoints,
 			"agent/"+node, agent, ciliumCEPHealCool, now) {
 			agentHealed[node] = true
 		}
@@ -217,7 +217,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		// The cooldown keys on the pod's controller — the recreated
 		// pod carries a fresh suffix, so a "<ns>/<pod>" key lets the
 		// same workload's re-heal fire every sweep.
-		p.DeletePodHeal(ctx, log, CheckNameCiliumMissingEndpoints,
+		p.DeletePodHealScoped(ctx, log, CheckNameCiliumMissingEndpoints,
 			kube.PodControllerKey(pod), pod, ciliumCEPHealCool, now)
 	}
 	for _, pod := range confirmed {

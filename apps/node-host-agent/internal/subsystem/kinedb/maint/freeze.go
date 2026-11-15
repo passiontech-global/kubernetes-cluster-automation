@@ -90,7 +90,7 @@ func repackBinPath(ctx context.Context, d *kdeps.Deps, pg string) (string, error
 // (the locked session then carries the VACUUM (FREEZE, ANALYZE)).
 func (m *Maint) readXidAge(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string)) bool {
-	age, err := m.d.QueryXidAge(ctx, pg, user, pass)
+	age, err := m.d.QueryXidAge(ctx, pg, user, pass, kdeps.AppNameMaint)
 	if err != nil {
 		note(err.Error())
 		return false
@@ -118,7 +118,7 @@ func (m *Maint) repackHeadroom(ctx context.Context, pg, user, pass string,
 	if dataDir == "" {
 		dataDir = kdeps.DefaultPGDataDir
 	}
-	out, err := m.d.PsqlQuery(ctx, pg, user, pass,
+	out, err := m.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameMaint,
 		"SELECT COALESCE((SELECT SUM(size) FROM pg_ls_waldir()),0)")
 	if err != nil {
 		note(fmt.Sprintf("wal-size-fail: %v", err))

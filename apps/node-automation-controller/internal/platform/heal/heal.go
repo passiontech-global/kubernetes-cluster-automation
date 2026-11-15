@@ -95,6 +95,70 @@ func AllowedV(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
 	return true, false
 }
 
+// AllowedOnNode is AllowedV's node-scoped sibling for heals that
+// touch ONE node's DaemonSet pods (per-node agent bounces): it
+// defers while the maintenance Scope covers THAT node — a
+// cluster-wide hold or a hold naming nodeName blocks, but a drain
+// scoped to a DIFFERENT node does not. The per-key cooldown and
+// heal-budget gates are unchanged (nil heals = no cooldown, same
+// as AllowedV).
+func AllowedOnNode(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
+	cs kubernetes.Interface, dyn dynamic.Interface,
+	heals *state.CooldownSet, key, nodeName string,
+	cooldown time.Duration, now time.Time) (proceed bool, unverifiable bool) {
+
+	if heals != nil && heals.CooledDown(key, cooldown, now) {
+		log.Info("skip heal: inside cooldown", "target", key)
+		return false, false
+	}
+	if v == nil {
+		v = &maintenance.Verdict{}
+	}
+	scope, err := v.Scope(ctx, cs, dyn, now)
+	if err != nil {
+		log.Info("WARN: maintenance check unverifiable — "+
+			"heal deferred (fail closed)", "target", key, "error", err)
+		return false, true
+	}
+	if scope.ClusterWide || scope.Nodes[nodeName] {
+		log.Info("maintenance in progress — heal deferred",
+			"target", key, "node", nodeName, "why", scope.Why)
+		return false, false
+	}
+	if !budgetGate(now) {
+		log.Info("heal budget exhausted — heal deferred",
+			"target", key)
+		return false, false
+	}
+	return true, false
+}
+
+// AllowedUpgradeOnly gates the annotation-only nudges (Flux
+// source/kustomization stamps): a metadata write disrupts no pod,
+// so it defers ONLY on a cluster-wide hold — a node-scoped drain
+// does not block it, and it consumes no heal-budget grant (the
+// budget bounds destructive pod action, not annotation writes).
+func AllowedUpgradeOnly(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
+	cs kubernetes.Interface, dyn dynamic.Interface,
+	key string, now time.Time) (proceed bool, unverifiable bool) {
+
+	if v == nil {
+		v = &maintenance.Verdict{}
+	}
+	scope, err := v.Scope(ctx, cs, dyn, now)
+	if err != nil {
+		log.Info("WARN: maintenance check unverifiable — "+
+			"heal deferred (fail closed)", "target", key, "error", err)
+		return false, true
+	}
+	if scope.ClusterWide {
+		log.Info("cluster-wide maintenance in progress — heal deferred",
+			"target", key, "why", scope.Why)
+		return false, false
+	}
+	return true, false
+}
+
 // preparePodDisruption runs the shared preflight for DeletePod and EvictPod:
 // L1↔L3 local-remediation yield followed by the sweep overlay's workload
 // disruption slot reservation. deferHeal=true means another actor holds the
@@ -166,8 +230,22 @@ func DeletePod(ctx context.Context, cs kubernetes.Interface,
 	if err != nil || deferred {
 		return false, err
 	}
-	if err := cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
-		kube.UIDDeleteOptions(pod.UID, "")); err != nil {
+	err = cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+		kube.UIDDeleteOptions(pod.UID, ""))
+	switch {
+	case apierrors.IsNotFound(err):
+		// The pod is already gone — tombstone the UID so later
+		// sweep readers hide it and return (false, nil): no heal
+		// was delivered but none was needed, so the gate owner
+		// refunds its grant instead of IncErroring a phantom.
+		kube.MarkPodDeleted(ctx, pod.UID)
+		return false, nil
+	case apierrors.IsConflict(err):
+		// UID precondition lost — the pod was recreated under a
+		// new UID mid-sweep; deleting it now would hit the wrong
+		// incarnation. Clean deferral, same as a PDB refusal.
+		return false, nil
+	case err != nil:
 		return false, err
 	}
 	recordPodKilled(ctx, heals, key, pod, now)
@@ -225,8 +303,15 @@ func EvictPod(ctx context.Context, cs kubernetes.Interface,
 		},
 		DeleteOptions: &deleteOpts,
 	})
-	if apierrors.IsTooManyRequests(err) {
-		// PDB refusal — a deferral, never an error.
+	if apierrors.IsTooManyRequests(err) ||
+		apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		// PDB refusal, already-gone pod, or UID-precondition loss —
+		// all clean deferrals: no heal delivered, no mutation
+		// executed, the caller refunds its grant and retries next
+		// sweep. A 404 also tombstones the UID like DeletePod's.
+		if apierrors.IsNotFound(err) {
+			kube.MarkPodDeleted(ctx, pod.UID)
+		}
 		return false, true, nil
 	}
 	if err != nil {

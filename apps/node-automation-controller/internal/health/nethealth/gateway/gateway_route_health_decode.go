@@ -114,7 +114,9 @@ func (g routeGrant) permits(routeKind, routeNS, svcName string) bool {
 		return false
 	}
 	for _, t := range g.to {
-		if t.group == "" && t.kind == "Service" &&
+		// Core-group Services spell the group "" or "core" —
+		// both are the same reference target.
+		if (t.group == "" || t.group == "core") && t.kind == "Service" &&
 			(t.name == "" || t.name == svcName) {
 			return true
 		}

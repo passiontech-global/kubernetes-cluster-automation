@@ -31,6 +31,37 @@ func (d *Deps) AllNodes(ctx context.Context) ([]corev1.Node, error) {
 	})
 }
 
+// nodeIndex is the O(1) name → *Node join over the shared node
+// census — built lazily on first lookup, memoized for the sweep.
+// The map values point into the census slice (read-only contract).
+func (d *Deps) nodeIndex(ctx context.Context) (map[string]*corev1.Node, error) {
+	s := sweepSnap(ctx)
+	return s.nodeByName.get(func(bool) (map[string]*corev1.Node, error) {
+		nodes, err := d.AllNodes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		m := make(map[string]*corev1.Node, len(nodes))
+		for i := range nodes {
+			m[nodes[i].Name] = &nodes[i]
+		}
+		return m, nil
+	})
+}
+
+// Node resolves one node by name against the shared census — the
+// O(1) replacement for a live Nodes().Get inside a sweep. Absent →
+// (nil, nil), matching the nodeIndex NotFound convention callers
+// already handle; the returned node aliases snapshot state —
+// read-only.
+func (d *Deps) Node(ctx context.Context, name string) (*corev1.Node, error) {
+	idx, err := d.nodeIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return idx[name], nil
+}
+
 // NodeZones is the memoized node → topology-zone join the
 // zone-aware checks used to each rebuild inline from AllNodes —
 // the stateful site-skew signatures place endpoints and STS

@@ -18,7 +18,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -219,14 +218,17 @@ func (p *operatorWorkqueueCheck) leaderPods(ctx context.Context, op operatorTarg
 	}
 	if candidates := kube.LeaseHolderPodCandidates(lease); len(candidates) > 0 {
 		for _, name := range candidates {
-			pod, err := p.CS.CoreV1().Pods(podNS).
-				Get(ctx, name, metav1.GetOptions{})
+			// Census lookup, not a live GET — the shared pod
+			// snapshot already paid the LIST this sweep, and a
+			// mid-sweep MarkPodDeleted hides the pod here exactly
+			// like the census does (nil = absent = NotFound).
+			pod, err := p.Pod(ctx, podNS, name)
 			switch {
-			case apierrors.IsNotFound(err):
-				continue
 			case err != nil:
 				return nil, fmt.Errorf("get leader pod %s/%s: %w",
 					podNS, name, err)
+			case pod == nil:
+				continue
 			}
 			// Only a live candidate is deletable: a pod already
 			// terminating (someone else is re-rolling it) or not

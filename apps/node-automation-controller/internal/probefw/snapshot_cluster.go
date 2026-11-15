@@ -10,6 +10,7 @@ import (
 	"slices"
 	"time"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -185,4 +186,32 @@ func (d *Deps) Service(ctx context.Context, ns, name string) (*corev1.Service, e
 		return nil, err
 	}
 	return idx[types.NamespacedName{Namespace: ns, Name: name}], nil
+}
+
+// AllValidatingWebhookConfigurations / AllMutatingWebhookConfigurations
+// are the admissionregistration twins — the cluster-scoped webhook
+// census the apiserver-reachability heal maps webhook backends onto
+// dark nodes through. Cluster-scoped (NamespaceAll-equivalent LIST),
+// memoized like every census; elements alias snapshot state —
+// read-only.
+func (d *Deps) AllValidatingWebhookConfigurations(ctx context.Context) ([]admissionv1.ValidatingWebhookConfiguration, error) {
+	s := sweepSnap(ctx)
+	return s.validatingWebhooks.get(func(bool) ([]admissionv1.ValidatingWebhookConfiguration, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.ValidatingWebhookConfigurations(d.CS))
+	})
+}
+
+func (d *Deps) AllMutatingWebhookConfigurations(ctx context.Context) ([]admissionv1.MutatingWebhookConfiguration, error) {
+	s := sweepSnap(ctx)
+	return s.mutatingWebhooks.get(func(bool) ([]admissionv1.MutatingWebhookConfiguration, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.MutatingWebhookConfigurations(d.CS))
+	})
 }

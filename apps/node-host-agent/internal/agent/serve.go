@@ -21,10 +21,15 @@ import (
 
 func (a *Agent) metricsMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", http.TimeoutHandler(
-		promhttp.HandlerFor(a.reg,
-			promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}),
-		metricsHandlerTimeout, "metrics collection timed out"))
+	// promhttp's own Timeout option replaces the outer
+	// http.TimeoutHandler — the 10s bound covers one metric
+	// collection without the extra handler wrapper (and its
+	// trailing-garbage edge cases).
+	mux.Handle("/metrics", promhttp.HandlerFor(a.reg,
+		promhttp.HandlerOpts{
+			ErrorHandling: promhttp.ContinueOnError,
+			Timeout:       10 * time.Second,
+		}))
 	// /debug/pprof deliberately does NOT live here: it moved to the
 	// loopback-only pprofMux served as "pprof-loopback" —
 	// profile endpoints on the hostPort 9115 exposed the root
@@ -80,21 +85,13 @@ const (
 	// before Run returns — a subsystem wedged mid-check must not
 	// pin the agent's own shutdown forever.
 	subsystemShutdownTimeout = 10 * time.Second
-	// metricsHandlerTimeout bounds ONE /metrics collection — the
-	// handler can block on a hung filesystem, so the scrape gets a
-	// deadline instead of relying on the server WriteTimeout. The
-	// server itself now carries 30s (> this bound, so the timed-out
-	// response flushes); pprof.Profile/Trace no longer constrain it
-	// — they live on the loopback pprof-loopback server, whose
-	// WriteTimeout stays 0 for exactly that reason.
-	metricsHandlerTimeout = 25 * time.Second
 )
 
 // serverTimeouts are the per-server httpx.Opts the three listeners
 // carried as hand-rolled http.Server fields: ReadHeaderTimeout 5s,
 // ReadTimeout 15s, IdleTimeout 60s everywhere; WriteTimeout 30s on
-// metrics+probe (the /metrics TimeoutHandler bounds one collection
-// at metricsHandlerTimeout=25s — 30s leaves the timed-out body room
+// metrics+probe (the /metrics promhttp Timeout bounds one collection
+// at 10s — 30s leaves the timed-out body room
 // to flush) and 0 ONLY on the loopback profile listener, where
 // pprof.Profile/Trace legitimately outlive their sampling windows.
 // The shutdown drain budget stays httpx.DefaultShutdownBudget (5s).

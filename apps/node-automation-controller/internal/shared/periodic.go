@@ -80,8 +80,15 @@ func (p *Periodic) Start(ctx context.Context) error {
 	// waiting out a full extra ticker interval (which used to push
 	// the first scan to [interval, 2*interval) and double the blind
 	// window a fresh pod rollout sits in). ctx is honored so
-	// shutdown is never delayed.
-	timer := time.NewTimer(rand.N(p.Interval))
+	// shutdown is never delayed. The phase offset is capped at
+	// 45s: a 60m interval would otherwise park the first run up
+	// to an hour out, and the ±5% per-tick jitter below keeps the
+	// modules de-phased after that first run anyway.
+	initialJitter := p.Interval
+	if cap := 45 * time.Second; initialJitter > cap {
+		initialJitter = cap
+	}
+	timer := time.NewTimer(rand.N(initialJitter))
 	select {
 	case <-ctx.Done():
 		timer.Stop()
@@ -112,17 +119,29 @@ func (p *Periodic) Start(ctx context.Context) error {
 			}
 		}
 	}
-	t := time.NewTicker(p.Interval)
-	defer t.Stop()
+	// ±5% per-tick jitter: modules sharing an interval (the 5/10/
+	// 15/30/60m sweep family) would otherwise re-align on every
+	// common multiple forever — the initial phase offset only
+	// spreads the FIRST firing. A random wait in [0.95,1.05)
+	// times the interval walks each module's phase independently
+	// so the herd never re-forms.
 	for {
+		jitter := time.Duration(rand.Int64N(int64(p.Interval)/10)) -
+			p.Interval/20
+		wait := p.Interval + jitter
+		if wait < time.Second {
+			wait = time.Second
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return nil
-		case <-t.C:
-			if err := p.runOnce(runCtx); err != nil {
-				metrics.IncError(p.Name)
-				log.Error(err, "periodic run failed")
-			}
+		case <-timer.C:
+		}
+		if err := p.runOnce(runCtx); err != nil {
+			metrics.IncError(p.Name)
+			log.Error(err, "periodic run failed")
 		}
 	}
 }
@@ -141,9 +160,17 @@ func (p *Periodic) Start(ctx context.Context) error {
 // queue counter already attribute the failure to the module, which
 // is all the run-level contract needs.
 func (p *Periodic) runOnce(ctx context.Context) (err error) {
-	if p.RunTimeout > 0 {
+	// Default run budget for modules that declare none:
+	// max(2*Interval, 3m) — a wedged sweep must not park its
+	// goroutine forever, and a run legitimately longer than its
+	// own period is already a bug the timeout should surface.
+	timeout := p.RunTimeout
+	if timeout <= 0 {
+		timeout = max(2*p.Interval, 3*time.Minute)
+	}
+	if timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, p.RunTimeout)
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 	defer func() {
@@ -216,4 +243,21 @@ func NodeUpdatePredicate(fallbackOnMissing bool, changed func(oldNode, newNode *
 			return changed(oldN, newN)
 		},
 	}
+}
+
+// RequeueAfter returns d jittered by ±10% — the watch-reconciler
+// twin of Periodic's per-tick jitter: reconcilers sharing a requeue
+// cadence (the pinned-workload/taint-reaper family) would otherwise
+// re-align their safety-net sweeps on every common multiple and
+// re-form the same API burst the jitter exists to break up. The
+// result stays inside [0.9d, 1.1d) — callers keep their declared
+// cadence as the mean.
+func RequeueAfter(d time.Duration) time.Duration {
+	if d <= 0 {
+		// Int64N panics on a non-positive bound — a zero/negative
+		// cadence has no jitter to add anyway.
+		return d
+	}
+	jitter := time.Duration(rand.Int64N(int64(d)/5)) - d/10
+	return d + jitter
 }

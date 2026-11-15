@@ -20,6 +20,7 @@ package cdeps
 
 import (
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -59,6 +60,15 @@ type Deps struct {
 	// parse.
 	WdApplied *watchdogconf.Config
 
+	// hubMu serializes Cfg.Hub access across goroutines:
+	// RefreshWatchdogConf rewrites the conf-derived Hub knobs on the
+	// cycle goroutine while the feeder goroutine reads them inside
+	// RunRemediate/StreakCycles. Cycle-goroutine checks read
+	// Cfg.Hub directly (same goroutine as the refresh — no lock
+	// needed); cross-goroutine readers go through HubConf and
+	// SingleController takes the read side itself.
+	hubMu sync.RWMutex
+
 	Cycles    *prometheus.CounterVec // check, result
 	Actions   *prometheus.CounterVec // check, action
 	RVGap     prometheus.Gauge
@@ -94,6 +104,17 @@ type Deps struct {
 	KonnReadyBackends prometheus.Gauge
 }
 
+// HubConf returns a copy of the Hub knobs safe for the feeder
+// goroutine — RefreshWatchdogConf mutates Cfg.Hub on the cycle
+// goroutine, so cross-goroutine readers must snapshot under the
+// read lock or they can observe a torn SelfAPI/PeerAPI/KineDBProbe
+// triple mid-refresh.
+func (d *Deps) HubConf() HubConfig {
+	d.hubMu.RLock()
+	defer d.hubMu.RUnlock()
+	return d.Cfg.Hub
+}
+
 // SingleController reports whether this node's control plane is a
 // single-controller topology (spof-streak): TotalControllers is the
 // explicit override (0 = auto — an unset Hub.PeerAPI means no peer
@@ -102,6 +123,8 @@ func (d *Deps) SingleController() bool {
 	if d.Cfg.TotalControllers > 0 {
 		return d.Cfg.TotalControllers == 1
 	}
+	d.hubMu.RLock()
+	defer d.hubMu.RUnlock()
 	return d.Cfg.Hub.PeerAPI == ""
 }
 

@@ -294,7 +294,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		// a deleted agent pod is recreated by the DaemonSet under a
 		// fresh suffix, so a pod-name stamp never suppressed the
 		// re-heal of the same wedge.
-		p.DeletePodHeal(ctx, log, CheckNameKonnectivityTunnelHealth,
+		p.DeletePodHealOnNode(ctx, log, CheckNameKonnectivityTunnelHealth,
 			kube.PodControllerKey(pod), pod, konnHealCool, now)
 	}
 	p.seen.Prune(func(k string) bool { return halfOpen[k] })

@@ -198,12 +198,13 @@ func (e *circuitEval) evalRecover(h guardstate.WebhookView, key, svc string) {
 	streak := e.b.markHealthyStreak(key)
 	if streak < RecoverConfirmSweeps {
 		e.recoverSeen[key] = true
-		// Not confirmed yet — the entry stays broken:
-		// re-assert Ignore if the policy was flipped back
-		// externally, and re-assert the series.
-		if h.FailurePolicy == nil || *h.FailurePolicy != admissionv1.Ignore {
-			e.flip(h, admissionv1.Ignore)
-		}
+		// Not confirmed yet — the entry stays broken. The live
+		// policy is NEVER downgraded Fail -> Ignore in this window:
+		// a webhook already serving Fail (externally restored, or
+		// never flipped) would lose admission enforcement for a
+		// cosmetic annotation catch-up. An already-Ignore entry
+		// needs no write either — only the annotation lags, and it
+		// is the SSOT cleared by the confirmed branch below.
 		e.stillBroken = append(e.stillBroken, h.Name)
 		e.log.Info("CIRCUIT-RECOVER-DEFER: healthy again — confirming next sweep",
 			"kind", e.kind, "config", e.cfgName, "webhook", h.Name,
@@ -215,8 +216,10 @@ func (e *circuitEval) evalRecover(h guardstate.WebhookView, key, svc string) {
 	// NOT count toward the streak (they still fail every
 	// apiserver call), and neither did endpoints whose pods
 	// are still failing the handshake (circuit-breaker-bounce): "Ready" in
-	// the EndpointSlice is not "serving".
-	e.b.clearHealthyStreak(key)
+	// the EndpointSlice is not "serving". The healthy streak is
+	// NOT cleared here — the caller clears it only after the
+	// patch lands, so a failed write does not reset the
+	// confirmation progress it already earned.
 	e.flip(h, admissionv1.Fail)
 	delete(e.broken, h.Name)
 	e.recovered = append(e.recovered, h.Name)

@@ -387,17 +387,29 @@ func newCmd(ctx context.Context, argv []string) *exec.Cmd {
 // Wait returns ErrWaitDelay instead of blocking forever). Run waits
 // for the copy goroutines, so partial output is returned complete
 // alongside an error. Callers keep any deadline on ctx themselves.
+//
+// The child inherits the agent environ MINUS the sd_notify
+// variables (ScrubSystemdEnv): on a standalone host a spawned
+// helper that keeps NOTIFY_SOCKET sd_notifies straight back into
+// OUR unit (systemd>=255 auto-sends EXIT_STATUS on exec) — the same
+// hazard RunEnv and the Config.ScrubSystemdEnv runners exist for.
 func RunCombined(ctx context.Context, argv ...string) (string, error) {
-	return runCombined(ctx, nil, argv)
+	return runCombined(ctx, ScrubSystemdEnv(os.Environ()), argv)
 }
 
 // RunCombinedEnv is RunCombined with the child's environment
-// REPLACED by env (nil → inherit the agent's environ) — for the
-// container-side exec that must scrub inherited daemon variables
-// (controllerhygiene's NOTIFY_SOCKET/WATCHDOG_* drop) where the
-// argv-level `env -u` trick cannot be assumed: it would resolve
-// `env` against the pod image's own PATH.
+// REPLACED by env — for the container-side exec that must scrub
+// inherited daemon variables (controllerhygiene's
+// NOTIFY_SOCKET/WATCHDOG_* drop) where the argv-level `env -u`
+// trick cannot be assumed: it would resolve `env` against the pod
+// image's own PATH. A nil env inherits the agent environ minus the
+// sd_notify variables, exactly like RunCombined — the scrub is the
+// default, never opt-in, because no legitimate child needs OUR
+// NOTIFY_SOCKET.
 func RunCombinedEnv(ctx context.Context, env []string, argv ...string) (string, error) {
+	if env == nil {
+		env = ScrubSystemdEnv(os.Environ())
+	}
 	return runCombined(ctx, env, argv)
 }
 

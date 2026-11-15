@@ -224,14 +224,24 @@ func TestUnmeshedAuditSkipsNonRunning(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // Healthy injector + remediation on: unmeshed, owned, old pods are
-// evicted — capped at 2 per cycle — and counted.
+// evicted — capped at 2 per cycle — and counted. Each pod gets its
+// own ReplicaSet owner: the per-workload cooldown shares one stamp
+// across a controller's pods, so same-owner pods would pace to a
+// single eviction per window.
 func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 	testutil.CleanupMetric(t, metrics.UnmeshedPodsRecreatedTotal, "meshed")
 
+	ownedPod := func(name, rs string) *corev1.Pod {
+		p := upPod("meshed", name)
+		p.OwnerReferences = []metav1.OwnerReference{{
+			Kind: "ReplicaSet", Name: rs, Controller: ptr.To(true)}}
+		return p
+	}
 	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
-		upPod("meshed", "web-a"), upPod("meshed", "web-b"), upPod("meshed", "web-c"))
+		ownedPod("web-a", "rs-a"), ownedPod("web-b", "rs-b"),
+		ownedPod("web-c", "rs-c"))
 	testutil.EmulateEviction(cs)
 	a, g := upGuard(cs)
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
@@ -249,6 +259,32 @@ func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 	if got := ptestutil.ToFloat64(
 		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues("meshed")); got != 2 {
 		t.Fatalf("recreated counter = %v, want 2", got)
+	}
+}
+
+// The per-workload cooldown: two unmeshed pods sharing one
+// controller get ONE eviction per window — the sibling stays for
+// the next sweep instead of the workload being drained pod-by-pod.
+func TestUnmeshedRemediationWorkloadCooldown(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.UnmeshedPodsRecreatedTotal, "meshed")
+
+	cs := upSeed(
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"), upPod("meshed", "web-b")) // same rs-x owner
+	testutil.EmulateEviction(cs)
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	deleted := 0
+	for _, n := range []string{"web-a", "web-b"} {
+		if !testutil.PodExists(t, cs, "meshed", n) {
+			deleted++
+		}
+	}
+	if deleted != 1 {
+		t.Fatalf("same-workload pods deleted = %d, want 1 (cooldown)", deleted)
 	}
 }
 

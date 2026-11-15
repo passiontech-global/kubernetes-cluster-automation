@@ -9,11 +9,13 @@ package guardstate
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
@@ -183,12 +185,36 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 				return nil
 			})
 	}
-	// Services — paged cluster census shared by the probe-port
-	// resolver (was one Get per webhook backend) and any duty that
-	// needs Service spec data.
-	s.Services, s.ServicesErr = kube.ListAll(ctx,
-		metav1.ListOptions{Limit: ListPageSize},
-		kube.Services(g.CS, metav1.NamespaceAll))
+	// Services — targeted GETs for exactly the backends the webhook
+	// configs + CRD conversion webhooks reference (the same key set
+	// webhookBackendServices resolves ports through), NOT a
+	// cluster-wide census: a fleet of thousands of Services used to
+	// cross the wire every run for a resolver that only ever reads
+	// the ~tens of webhook backends. MWC/VWC/CRDs are already
+	// populated above, so the key set is complete here. Per-service
+	// misses degrade exactly like the old absent-from-census path
+	// (name matching alone); the first GET error is recorded on
+	// ServicesErr for observability while the rest still resolve.
+	for key := range webhookBackendServices(s) {
+		ns, name, ok := strings.Cut(key, "/")
+		if !ok {
+			continue
+		}
+		svc, err := g.CS.CoreV1().Services(ns).Get(ctx, name,
+			metav1.GetOptions{})
+		if err != nil {
+			// A 404 is the NORMAL case orphansweep exists to
+			// catch — a webhook pointing at a not-yet-created or
+			// deleted Service. Recording it on ServicesErr would
+			// IncError every sweep and blind the missing-Service
+			// warning for every other backend.
+			if !apierrors.IsNotFound(err) && s.ServicesErr == nil {
+				s.ServicesErr = err
+			}
+			continue
+		}
+		s.Services = append(s.Services, *svc)
+	}
 	return s
 }
 

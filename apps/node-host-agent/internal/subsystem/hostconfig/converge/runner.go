@@ -47,15 +47,17 @@ var (
 	// itself is otherwise unused (the exec is container-side through
 	// RunCombined, no chroot is involved).
 	nsenterAdapt = hostexec.New(hostexec.Config{
-		HostRoot: hostexec.DefaultHostRoot,
-		Timeout:  noStackTimeout,
+		HostRoot:        hostexec.DefaultHostRoot,
+		Timeout:         noStackTimeout,
+		ScrubSystemdEnv: true,
 	})
 	// directAdapt never wraps: HostRoot "/" lands in hostexec's
 	// skip-wrap branch — the standalone systemd deployment is already
 	// inside the host namespaces.
 	directAdapt = hostexec.New(hostexec.Config{
-		HostRoot: "/",
-		Timeout:  noStackTimeout,
+		HostRoot:        "/",
+		Timeout:         noStackTimeout,
+		ScrubSystemdEnv: true,
 	})
 )
 

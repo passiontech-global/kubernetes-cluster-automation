@@ -13,6 +13,7 @@
 package kube
 
 import (
+	"context"
 	"strconv"
 	"strings"
 
@@ -76,7 +77,7 @@ func IsIntentionallyDownscaled(annotations map[string]string, replicas *int32) b
 // absent CRD (NotFound/NoMatch) still reads as "none parked", any
 // other failure returns (nil, err) — the calling check warns and
 // keeps its pod-first posture without downscaler awareness.
-func DownscaledClusterCRs(items []unstructured.Unstructured,
+func DownscaledClusterCRs(ctx context.Context, items []unstructured.Unstructured,
 	listErr error) (map[string]bool, error) {
 	switch {
 	case listErr == nil, apierrors.IsNotFound(listErr),
@@ -92,7 +93,7 @@ func DownscaledClusterCRs(items []unstructured.Unstructured,
 			r := int32(n)
 			reps = &r
 		}
-		if IsIntentionallyDownscaled(cr.GetAnnotations(), reps) {
+		if IsIntentionallyDownscaled(EffectiveAnnos(ctx, cr), reps) {
 			out[cr.GetNamespace()+"/"+cr.GetName()] = true
 		}
 	}

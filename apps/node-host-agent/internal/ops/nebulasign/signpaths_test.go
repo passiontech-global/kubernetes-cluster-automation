@@ -191,7 +191,7 @@ func TestNebulaSignFetchesMissingPubOverSSH(t *testing.T) {
 			jump + "\"\n",
 	})
 	cfg := signConfig{VarsDir: varsDir, CaDir: caFixture(t),
-		Duration: "8760h", SSHKey: fetchKey(t)}
+		Duration: "8760h", SSHKey: fetchKey(t), InsecureIgnoreHostKey: true}
 	if err := nebulaSign(context.Background(), cfg); err != nil {
 		t.Fatalf("nebulaSign: %v", err)
 	}

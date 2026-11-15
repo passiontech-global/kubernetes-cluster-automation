@@ -25,7 +25,7 @@ func (p *Probe) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// in-container port 5432 with credentials in pgbouncer.ini +
 	// userlist.txt (edoburu/pgbouncer compose stack), fall back to
 	// querying 127.0.0.1:5432 inside the pgbouncer container.
-	out, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass), []string{p.d.Cfg.Runtime, "exec",
+	out, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass, kdeps.AppNameProbe), []string{p.d.Cfg.Runtime, "exec",
 		"-e", "PGPASSWORD", pg,
 		"psql", "-h", pgb, "-p", p.d.Cfg.PoolerPort,
 		"-U", user, "-d", "postgres", "-tAc", "select 1"}, "")
@@ -54,7 +54,7 @@ func (p *Probe) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// depth (client spiral leading indicator). Falls back to
 	// in-container :5432 with stats_users from pgbouncer.ini when
 	// the direct .env credential/port path is unavailable.
-	pools, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass), []string{p.d.Cfg.Runtime, "exec",
+	pools, err := p.d.ExecEnv(ctx, kdeps.PsqlPassEnv(pass, kdeps.AppNameProbe), []string{p.d.Cfg.Runtime, "exec",
 		"-e", "PGPASSWORD", pg,
 		"psql", "-h", pgb, "-p", p.d.Cfg.PoolerPort,
 		"-U", user, "-d", pgbAdminDB, "-Aqc", "SHOW POOLS"}, "")
@@ -93,7 +93,7 @@ func (p *Probe) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 
 	// (d) backend env drift — the .env credentials must still log
 	// into the backend postgres role (initdb-skip trap).
-	out, err = p.d.PsqlQuery(ctx, pg, user, pass, "select 1")
+	out, err = p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, "select 1")
 	if err == nil && strings.TrimSpace(out) == "1" {
 		res.Checks[CheckBackendEnv] = 1
 	} else {
@@ -105,7 +105,7 @@ func (p *Probe) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 	// bloat this probe monitors — the bash only counted rows in the
 	// 10-min guard, which owns the kine_db_rows series. A query
 	// failure only zeroes this check, never the probe.
-	out, err = p.d.PsqlQuery(ctx, pg, user, pass, fmt.Sprintf(
+	out, err = p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
 		"SELECT COALESCE((SELECT MAX(id) FROM %[1]s),0), "+
 			"COALESCE((SELECT MAX(prev_revision) FROM %[1]s WHERE name='%s'),0), "+
 			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%s),0)",

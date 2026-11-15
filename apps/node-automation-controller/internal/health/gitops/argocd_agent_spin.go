@@ -54,6 +54,12 @@ type argoCDAgentSpinCheck struct {
 	// emitted is the emitted-gauge ledger — a tuple that stops being
 	// reported gets DeleteLabelValues'd rather than leaking a stale 1.
 	emitted state.GaugeLedger[string]
+	// logScanAt is the per-pod last-log-scan clock — the freshness
+	// gate requires at least one error line whose kubelet timestamp
+	// post-dates the pod's previous scan, so a SinceSeconds window
+	// overlapping across sweeps cannot re-flag an error that already
+	// stopped (and possibly self-healed) minutes ago.
+	logScanAt map[string]time.Time
 }
 
 // NewArgoCDAgentSpinCheck builds the argocd-agent-spin check — its state is the
@@ -84,10 +90,10 @@ const (
 // the dead-stream loop stamps per Recv round; the count is the
 // spin's log-side signal.
 var argocdAgentSpinErrMarkers = []string{
-	"stream.Recv",
-	"Error receiving event from stream",
-	"Error receiving from stream",
-	"codes.Unknown",
+	"stream.recv",
+	"error receiving event from stream",
+	"error receiving from stream",
+	"codes.unknown",
 	"transport is closing",
 }
 
@@ -152,6 +158,13 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 	}
 	var rep probefw.SweepReport
 	live := map[string]bool{}
+	// scanLive tracks every pod that passed the candidacy filters —
+	// NOT just the ones the log channel read. A pod whose CPU
+	// channel answered never paid a log fetch this sweep, but it is
+	// still a live candidate: dropping its scan boundary would make
+	// the NEXT log read bootstrap fresh and re-flag error lines the
+	// overlapping 15m tail already counted.
+	scanLive := map[string]bool{}
 	for i := range pods {
 		pod := pods[i]
 		if !strings.HasPrefix(pod.Name, argocdAgentPrefix) ||
@@ -162,11 +175,12 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 			continue // a fresh pod has no spin history worth reading
 		}
 		key := pod.Namespace + "/" + pod.Name
+		scanLive[key] = true
 		reason := ""
 		logOK := true
 		if p.cpuSpin(series, pod) {
 			reason = "cpu"
-		} else if spin, lerr := p.logSpin(ctx, log, pod); lerr != nil {
+		} else if spin, lerr := p.logSpin(ctx, log, pod, key, now); lerr != nil {
 			logOK = false // fetch failed — inconclusive, not clean
 		} else if spin {
 			reason = "logs"
@@ -216,6 +230,16 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 			"agent/"+kube.PodControllerKey(pod), pod, argocdAgentCool, now)
 	}
 	p.seen.Prune(func(k string) bool { return live[k] })
+	// The log-scan clock only tracks pods still in the candidate
+	// set — a pod whose CPU channel answered keeps its boundary at
+	// the last real log read, and entries for pods that left
+	// candidacy entirely (renamed, deleted, too fresh) are dropped
+	// so a re-entering pod bootstraps against its own last scan.
+	for k := range p.logScanAt {
+		if !scanLive[k] {
+			delete(p.logScanAt, k)
+		}
+	}
 	return rep.Result(&p.emitted, argocdAgentSpinGauge.DeleteLabelValues,
 		"argocd-agent spin pods: ", ", ")
 }
@@ -245,30 +269,71 @@ func (p *argoCDAgentSpinCheck) cpuSpin(
 // order-sensitive, which the first-match PodLogTail helper cannot
 // express.
 func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
-	log logr.Logger, pod *corev1.Pod) (bool, error) {
+	log logr.Logger, pod *corev1.Pod, key string, now time.Time) (bool, error) {
 
 	text, err := kube.ReadPodLogText(ctx, p.CS, pod, kube.PodLogOpts{
 		TailLines:    argocdAgentTail,
 		SinceSeconds: 900,
 		MaxBytes:     argocdAgentLogCap,
 		Timeout:      30 * time.Second,
+		Timestamps:   true,
 	})
 	if err != nil {
 		log.Info("WARN: argocd-agent spin — log channel unavailable",
 			"pod", pod.Namespace+"/"+pod.Name, "error", err)
 		return false, err
 	}
-	errs, recovered := scanAgentSpinLines(strings.NewReader(text))
-	if errs >= argocdAgentMinErrs && !recovered {
-		return true, nil
+	// The scan boundary advances on every SUCCESSFUL fetch — a
+	// failed read must not push it forward (the next good scan
+	// would then skip lines written during the outage).
+	if p.logScanAt == nil {
+		p.logScanAt = map[string]time.Time{}
 	}
-	return false, nil
+	prevScan, scanned := p.logScanAt[key]
+	// freshOnly makes the scanner count ONLY error lines newer than
+	// this pod's previous scan — the 15m tail overlaps across
+	// sweeps, so counting the whole window would double-count an
+	// incident that already stopped. The boundary itself advances
+	// in the KUBELET's clock domain: streamNewest is the newest
+	// stamp on any line read; `now` (controller clock) is only the
+	// fallback for a stream with no parseable timestamp at all.
+	errs, recovered, newestErr, streamNewest := scanAgentSpinLines(
+		strings.NewReader(text), prevScan, scanned)
+	if streamNewest.IsZero() {
+		p.logScanAt[key] = now
+	} else {
+		p.logScanAt[key] = streamNewest
+	}
+	if errs < argocdAgentMinErrs || recovered {
+		return false, nil
+	}
+	// Freshness gate: newestErr is the newest stamp among the
+	// COUNTED (fresh) error lines — zero means the counted errors
+	// carried no parseable stamp, which counts as fresh (fail
+	// toward alerting, never toward silence).
+	if scanned && !newestErr.IsZero() && !newestErr.After(prevScan) {
+		return false, nil
+	}
+	return true, nil
 }
 
-// scanAgentSpinLines counts stream-error lines and reports whether a
-// successful-reconnect line appears AFTER the last error line — the
-// pure predicate unit tests pin directly.
-func scanAgentSpinLines(lines io.Reader) (errs int, recoveredAfter bool) {
+// scanAgentSpinLines counts stream-error lines, reports whether a
+// successful-reconnect line appears AFTER the last error line, and
+// returns two clocks: newestErrTS is the newest kubelet timestamp
+// among the COUNTED error lines (zero when none carried a stamp —
+// the caller's freshness gate counts that as fresh), and
+// streamNewestTS is the newest stamp on ANY line read — the scan
+// boundary the caller stores, kept in the kubelet's clock domain.
+// When freshOnly is set (a previous scan boundary exists), only
+// error lines stamped AFTER freshAfter count toward errs and
+// newestErrTS — the bounded tail overlaps across sweeps, so
+// counting the whole window would double-count an incident that
+// already stopped. Error lines with no parseable stamp count as
+// fresh (fail toward alerting). The reconnect check still scans
+// the whole window: a recovery anywhere after the last error —
+// stale or fresh — ends the spin.
+func scanAgentSpinLines(lines io.Reader, freshAfter time.Time,
+	freshOnly bool) (errs int, recoveredAfter bool, newestErrTS, streamNewestTS time.Time) {
 	lastErr, lastOK := -1, -1
 	// bufio.Scanner's default 64KiB token cap would silently end the
 	// scan on one oversized log line and undercount the spin
@@ -277,10 +342,23 @@ func scanAgentSpinLines(lines io.Reader) (errs int, recoveredAfter bool) {
 	sc.Buffer(make([]byte, 0, 64*1024), argocdAgentLogCap)
 	i := 0
 	for sc.Scan() {
-		line := sc.Text()
+		raw := sc.Text()
+		ts, hasTS := kube.PodLogLineTS(raw)
+		if hasTS && ts.After(streamNewestTS) {
+			streamNewestTS = ts
+		}
+		// Case-fold once per line: marker casing in agent logs varies
+		// across versions, and a missed reconnect marker reads a
+		// recovered agent as still spinning.
+		line := strings.ToLower(raw)
 		for _, m := range argocdAgentSpinErrMarkers {
 			if strings.Contains(line, m) {
-				errs++
+				if !freshOnly || !hasTS || ts.After(freshAfter) {
+					errs++
+					if hasTS && ts.After(newestErrTS) {
+						newestErrTS = ts
+					}
+				}
 				lastErr = i
 				break
 			}
@@ -300,5 +378,5 @@ func scanAgentSpinLines(lines io.Reader) (errs int, recoveredAfter bool) {
 		}
 		i++
 	}
-	return errs, lastOK > lastErr
+	return errs, lastOK > lastErr, newestErrTS, streamNewestTS
 }

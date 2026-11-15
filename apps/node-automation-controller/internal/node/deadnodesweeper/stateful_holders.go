@@ -199,27 +199,35 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 // RWOP landed in the access-mode enum after the original RWO-only
 // check and a not-really-dead node breaks it just as loudly):
 // inline CSI specs resolve off their own spec, PV-referenced ones
-// off the pvModes census. A volume with no modes anywhere
-// (attachment still in flight, PV since deleted) cannot prove
-// multi-writer safety either way and reads as NOT single-writer —
-// logVolumeAttachments still names it for forensics.
+// off the pvModes census. FAIL CLOSED: a volume whose PV is missing
+// from the census, whose AccessModes are empty, or whose source
+// carries neither shape cannot prove multi-writer safety — treating
+// it as NOT single-writer would let the sweeper force-detach an
+// RWO volume off a node that is not really dead (split-brain write
+// corruption), so unknown reads as single-writer and vetoes.
 func volumeAttachmentRWO(va *storagev1.VolumeAttachment,
 	pvModes map[string][]corev1.PersistentVolumeAccessMode) bool {
-	if va.Spec.Source.InlineVolumeSpec != nil {
-		for _, mode := range va.Spec.Source.InlineVolumeSpec.AccessModes {
+	singleWriter := func(modes []corev1.PersistentVolumeAccessMode) bool {
+		for _, mode := range modes {
 			if mode == corev1.ReadWriteOnce || mode == corev1.ReadWriteOncePod {
 				return true
 			}
 		}
+		return false
+	}
+	if va.Spec.Source.InlineVolumeSpec != nil {
+		modes := va.Spec.Source.InlineVolumeSpec.AccessModes
+		// Empty AccessModes is no evidence either way — fail closed.
+		return len(modes) == 0 || singleWriter(modes)
 	}
 	if name := va.Spec.Source.PersistentVolumeName; name != nil {
-		for _, mode := range pvModes[*name] {
-			if mode == corev1.ReadWriteOnce || mode == corev1.ReadWriteOncePod {
-				return true
-			}
+		modes, ok := pvModes[*name]
+		if !ok || len(modes) == 0 {
+			return true // PV absent from the census or mode-less
 		}
+		return singleWriter(modes)
 	}
-	return false
+	return true // no resolvable volume source — fail closed
 }
 
 // logVolumeAttachments reads the sweep's VolumeAttachment census (the

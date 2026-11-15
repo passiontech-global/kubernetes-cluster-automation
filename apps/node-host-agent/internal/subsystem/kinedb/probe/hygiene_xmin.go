@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
 // hygieneBackendXmin reads MAX(age(backend_xmin)) from both views —
@@ -31,7 +33,7 @@ import (
 // fabricating a zero over a real horizon (the seen-gating contract).
 func (p *Probe) hygieneBackendXmin(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass,
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
 		"SELECT 'activity', COALESCE(MAX(age(backend_xmin)), 0) FROM pg_stat_activity "+
 			"UNION ALL SELECT 'replication', COALESCE(MAX(age(backend_xmin)), 0) "+
 			"FROM pg_stat_replication")
