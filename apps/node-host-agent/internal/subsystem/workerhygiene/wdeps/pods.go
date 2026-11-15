@@ -8,6 +8,8 @@ package wdeps
 import (
 	"context"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +18,27 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
+
+// podUIDCgroupRe matches the pod<uid> component inside a
+// /proc/<pid>/cgroup path — kubepods slices embed the uid with
+// underscores; both spellings normalize to the dashed form.
+var podUIDCgroupRe = regexp.MustCompile(`pod([0-9a-fA-F_-]{36})`)
+
+// PodUIDForPID extracts the pod UID owning pid via
+// /proc/<pid>/cgroup — the same parse the process guards run.
+// ok=false when the cgroup file or the pod<uid> component is absent
+// (v1 hierarchy lines differ, non-pod cgroup, raced exit).
+func PodUIDForPID(d *Deps, pid int) (string, bool) {
+	data, err := os.ReadFile(d.Proc.File(pid, "cgroup"))
+	if err != nil {
+		return "", false
+	}
+	m := podUIDCgroupRe.FindSubmatch(data)
+	if m == nil {
+		return "", false
+	}
+	return strings.ReplaceAll(string(m[1]), "_", "-"), true
+}
 
 // PodHasPVC reports whether the pod mounts a persistentVolumeClaim —
 // force-deleting a PVC consumer on a wrong "dead" verdict risks a

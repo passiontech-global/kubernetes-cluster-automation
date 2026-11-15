@@ -77,5 +77,17 @@ func (c *Collector) kernelFailDeps() kernelfail.Deps {
 		KmsgDevicePaths: func(hostRoot string) []string {
 			return c.cfg.kmsgDevicePaths(hostRoot)
 		},
+		// Self-healing wave — the neighbor/NIC threshold knobs cross
+		// verbatim (kernelfail.New defaults any <=0); RouteFile
+		// reuses the collector's HOST_ROUTE_FILE knob so one override
+		// moves both readers. The remaining path seams stay empty so
+		// New() applies its HostRoot/ProcRoot joins.
+		RouteFile:               c.cfg.RouteFile,
+		NeighGCThresh1Ceiling:   c.cfg.NeighGCThresh1Ceiling,
+		NeighGCThresh2Ceiling:   c.cfg.NeighGCThresh2Ceiling,
+		NeighGCThresh3Ceiling:   c.cfg.NeighGCThresh3Ceiling,
+		NICCarrierFlapThreshold: c.cfg.NICCarrierFlapThreshold,
+		NICTxTimeoutThreshold:   c.cfg.NICTxTimeoutThreshold,
+		NICCRErrorThreshold:     c.cfg.NICCRErrorThreshold,
 	}
 }

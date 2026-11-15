@@ -121,8 +121,15 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	// argocd-agent-spin — argocd-agent spin healer.
 	{"argocd-agent-spin", "health"},
 	// apiserver-node-reachability — apiserver-dark node detector +
-	// webhook-backend evacuee, last row.
+	// webhook-backend evacuee.
 	{"apiserver-node-reachability", "health"},
+	// apf-selfheal-shield — APF PriorityLevelConfiguration/FlowSchema
+	// converge check.
+	{"apf-selfheal-shield", "health"},
+	// The three L3 workload/drain unstickers — appended last.
+	{"statefulset-rollout-unstick", "health"},
+	{"daemonset-rollout-wedge", "health"},
+	{"cronjob-forbid-zombie", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -275,8 +282,15 @@ var goldenMetricFamilies = []string{
 	"node_automation_zombie_sidecar_pods_reaped_total",
 	// argocd-agent-spin — argocd-agent spin gauge.
 	"node_automation_argocd_agent_spin",
-	// apiserver-node-reachability — apiserver-dark node gauge (new row).
+	// apiserver-node-reachability — apiserver-dark node gauge.
 	"node_automation_apiserver_node_dark",
+	// apf-selfheal-shield — APF shield degraded gauge.
+	"node_automation_apf_shield_degraded",
+	// L3 unstickers — rollout-wedge gauges + PDB relief counter.
+	"node_automation_statefulset_rollout_wedged",
+	"node_automation_daemonset_rollout_wedged",
+	"node_automation_cronjob_forbid_stalled",
+	"node_automation_pdb_unhealthy_policy_patched_total",
 	"shell_operator_hook_run_errors_total",
 }
 
@@ -305,6 +319,7 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"AnnoLastCoreDNSRestart", "passiontech.dev/last-coredns-restart"},
 	{"AnnoCatchup", "passiontech.dev/catchup"},
 	{"LabelMissedCatchup", "passiontech.dev/missed-catchup"},
+	{"AnnoCronJobMaxActiveDuration", "passiontech.dev/max-active-duration"},
 	{"AnnoConcourseBaselineNodeFSGiB", "passiontech.dev/baseline-nodefs-gib"},
 	{"AnnoWatchdogForceResync", "passiontech.dev/force-resync"},
 	{"AnnoStormGateHold", "passiontech.dev/storm-gate-hold"},
@@ -537,6 +552,8 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.AnnoCatchup
 	case "LabelMissedCatchup":
 		return kube.LabelMissedCatchup
+	case "AnnoCronJobMaxActiveDuration":
+		return kube.AnnoCronJobMaxActiveDuration
 	case "AnnoConcourseBaselineNodeFSGiB":
 		return kube.AnnoConcourseBaselineNodeFSGiB
 	case "AnnoWatchdogForceResync":

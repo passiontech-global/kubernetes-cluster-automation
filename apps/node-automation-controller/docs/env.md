@@ -49,6 +49,7 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 | `COREDNS_PATCHER_ZONE_MIN_DOMAINS` | coredns-patcher | `2` | `minDomains` for the zone topology-spread constraint. |
 | `COREDNS_MIN_REPLICAS` | coredns-patcher | `4` | Floor of the CPA-linear replica pin; `<=0` disables the pin and leaves `.spec.replicas` untouched (standalone CPA can be re-enabled). |
 | `COREDNS_NODES_PER_REPLICA` | coredns-patcher | `1` | Nodes-per-replica ratio for the proportional pin (counts every Node, incl. unschedulable). |
+| `COREDNS_SERVE_STALE_DURATION` | coredns-patcher | `1h` | `serve_stale <dur> immediate` window injected into every Corefile `cache` block that lacks it — stale answers keep resolving through a CoreDNS/apiserver backend outage. `"0"`/`"off"` disables the directive (the `denial 9984 5` cap still applies); unparseable values warn and fall back to `1h`. |
 | `METRICS_SERVER_PATCHER_ENABLED` | metrics-server-patcher | on unless `"false"` | Registration gate — reconciles kube-system/metrics-server. |
 | `METRICS_SERVER_MIN_REPLICAS` | metrics-server-patcher | `3` | Replica-pin floor; `<=0` disables the pin. |
 | `METRICS_SERVER_NODES_PER_REPLICA` | metrics-server-patcher | `1` | Nodes-per-replica ratio for the proportional pin. |
@@ -63,6 +64,8 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 |---|---|---|---|
 | `CILIUM_TAINT_REAPER_ENABLED` | cilium-taint-reaper | opt-in (`"true"`) | Registration gate — removes cilium agent-not-ready taints (`kube-system` pods informer for `k8s-app in (cilium,kube-dns)` stays configured in the manager cache for `coredns-stale-watchdog` regardless). |
 | `PDB_WATCHDOG_ENABLED` | pdb-deadlock-watchdog | on unless `"false"` | Registration gate — detects PDBs deadlocking drains/evictions. |
+| `PDB_UNHEALTHY_EVICTION_PATCH_ENABLED` | pdb-deadlock-watchdog | on unless `"false"` | Sub-feature gate — cordoned-block relief: `"false"` disables patching `unhealthyPodEvictionPolicy=AlwaysAllow` on drain-blocked PDBs (report-only). Resolved at Setup. |
+| `PDB_CORDONED_UNHEALTHY_RELIEF_ENABLED` | pdb-deadlock-watchdog | on unless `"false"` | Sub-feature gate — cordoned-block relief: `"false"` disables the wedged-pod delete fallback that reschedules an unhealthy pod off a cordoned node. Resolved at Setup. |
 | `CSR_APPROVER_ENABLED` | csr-watcher | off unless `"true"` | Sub-feature gate — approve mode. Off = detect/report pending CSRs only (module always registers). |
 | `NODE_LABELER_CONFIG_PATH` | node-labeler | `/etc/node-labeler/labels.txt` | Path to the labels.txt file the reconciler applies to nodes. |
 | `PARTITION_EVICT_NAMESPACES` | partition-pod-evictor | `flux-system` | Comma-separated namespace allow-list for partition eviction; unset/empty falls back to `flux-system`. Pods in any ns can opt in via `passiontech.dev/evict-on-partition`. |
@@ -133,6 +136,16 @@ knobs (always-on, no gates).
 | `NODE_AUTOMATION_WORKLOAD_SCALE_FLAPPING_ENABLED` | workload-scale-flapping | on unless `"false"` | Registration gate — scale-flap check row. Registers the ScalingReplicaSet direction-flip detector (>=6 flips/hour → `node_automation_workload_scale_flapping`) into the sweep roster; requires cluster-health-probes. |
 | `NODE_AUTOMATION_IMAGEPULL_SECRET_AUDITOR_ENABLED` | imagepull-secret-auditor | on unless `"false"` | Registration gate — pullsecret-audit check row. Registers the imagePullSecrets dockerconfigjson auditor (missing/malformed/wrong-type/JWT <7d → `node_automation_imagepull_secret_unhealthy`) into the sweep roster; requires cluster-health-probes. |
 | `NODE_AUTOMATION_APISERVER_NODE_REACHABILITY_ENABLED` | apiserver-node-reachability | on unless `"false"` | Registration gate — apiserver-dark check row. Registers the check that probes `/api/v1/nodes/<node>/proxy/healthz` per Ready worker; a probe failure persisting >=10m with a fresh `kube-node-lease` fences the node with `passiontech.dev/apiserver-unreachable` and deletes its `failurePolicy: Fail` webhook backend pods (capped 4/sweep, 30m cooldown, maintenance-mutex gated); >=half the fleet dark reports mesh-wide and fences nothing (2026-11-12 nonprod lanit-04 Linkerd webhook EOF incident). Requires cluster-health-probes. |
+| `NODE_AUTOMATION_APF_SHIELD_ENABLED` | apf-selfheal-shield | on unless `"false"` | Registration gate — apf-shield check row. Registers the check that keeps the APF `PriorityLevelConfiguration/selfheal-critical` + `FlowSchema/selfheal-controllers` pair converged so self-heal traffic keeps priority during API storms; requires cluster-health-probes. |
+| `NODE_AUTOMATION_APF_SHIELD_ENFORCE` | cluster-health-probes (watchdogs) | on unless `"false"` | Sub-feature gate — apf-selfheal-shield writes: `"false"` makes the check report-only (degraded gauge + FAIL on missing/drifted objects, zero creates/updates). Resolved at check construction. |
+| `NODE_AUTOMATION_APF_SHIELD_NAMESPACE` | cluster-health-probes (watchdogs) | `node-ops` | apf-selfheal-shield — namespace of the `node-automation-controller` ServiceAccount subject in the FlowSchema rule. |
+| `NODE_AUTOMATION_APF_SHIELD_EXTRA_SAS` | cluster-health-probes (watchdogs) | `""` | apf-selfheal-shield — comma-separated `namespace/name` ServiceAccounts appended to the `selfheal-controllers` FlowSchema subjects; malformed entries warn and are skipped. |
+| `NODE_AUTOMATION_STATEFULSET_ROLLOUT_UNSTICK_ENABLED` | statefulset-rollout-unstick | on unless `"false"` | Registration gate — statefulset-rollout-unstick check row. Requires cluster-health-probes. |
+| `NODE_AUTOMATION_STATEFULSET_ROLLOUT_HEAL_ENABLED` | cluster-health-probes (watchdogs) | on unless `"false"` | Sub-feature gate — statefulset-rollout-unstick pod delete: `"false"` leaves the check detect+gauge only. Resolved at check construction. |
+| `NODE_AUTOMATION_DAEMONSET_ROLLOUT_WEDGE_ENABLED` | daemonset-rollout-wedge | on unless `"false"` | Registration gate — daemonset-rollout-wedge check row. Requires cluster-health-probes. |
+| `NODE_AUTOMATION_DAEMONSET_ROLLOUT_HEAL_ENABLED` | cluster-health-probes (watchdogs) | on unless `"false"` | Sub-feature gate — daemonset-rollout-wedge pod delete: `"false"` leaves the check detect+gauge only. Resolved at check construction. |
+| `NODE_AUTOMATION_CRONJOB_FORBID_ZOMBIE_ENABLED` | cronjob-forbid-zombie | on unless `"false"` | Registration gate — cronjob-forbid-zombie check row. Requires cluster-health-probes. |
+| `NODE_AUTOMATION_CRONJOB_FORBID_KILL_RUNAWAY` | cluster-health-probes (watchdogs) | off unless `"true"` | Sub-feature gate — cronjob-forbid-zombie runaway-Job kill without the per-CronJob `passiontech.dev/max-active-duration` annotation; zombie-ref deletes are always on. Resolved at check construction. |
 
 ## CLI flags (`cmd/manager/main.go`)
 

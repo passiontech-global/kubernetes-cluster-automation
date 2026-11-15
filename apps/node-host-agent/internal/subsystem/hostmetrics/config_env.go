@@ -5,6 +5,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics/kernelfail"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
@@ -93,6 +94,22 @@ func ConfigFromEnv(d EnvDeps) Config {
 				}
 			}
 		}},
+		// Self-healing wave — neighbor gc_thresh ceilings + physical-
+		// NIC flap thresholds, all consumed by the kernelfail engine.
+		// The defs are kernelfail's exported compiled defaults so the
+		// env surface and the bare-New fallback can never drift.
+		envx.IntKnob(envnames.EnvNeighGCThresh1Ceiling,
+			&cfg.NeighGCThresh1Ceiling, kernelfail.DefaultNeighGCThresh1Ceiling),
+		envx.IntKnob(envnames.EnvNeighGCThresh2Ceiling,
+			&cfg.NeighGCThresh2Ceiling, kernelfail.DefaultNeighGCThresh2Ceiling),
+		envx.IntKnob(envnames.EnvNeighGCThresh3Ceiling,
+			&cfg.NeighGCThresh3Ceiling, kernelfail.DefaultNeighGCThresh3Ceiling),
+		envx.IntKnob(envnames.EnvNICCarrierFlapThreshold,
+			&cfg.NICCarrierFlapThreshold, kernelfail.DefaultNICCarrierFlapThreshold),
+		envx.IntKnob(envnames.EnvNICTxTimeoutThreshold,
+			&cfg.NICTxTimeoutThreshold, kernelfail.DefaultNICTxTimeoutThreshold),
+		envx.IntKnob(envnames.EnvNICCRErrorThreshold,
+			&cfg.NICCRErrorThreshold, kernelfail.DefaultNICCRErrorThreshold),
 	})
 	return cfg
 }

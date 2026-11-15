@@ -86,3 +86,9 @@ func NewSATokenTTL(d *wdeps.Deps) *SATokenTTLCheck {
 func NewKernelNetShim(d *wdeps.Deps) *KernelNetShimCheck {
 	return &KernelNetShimCheck{d: d}
 }
+
+// NewInotifyPressure returns the inotify-pressure-hygiene
+// sysctl-bump + runaway-pod evictor.
+func NewInotifyPressure(d *wdeps.Deps) *InotifyPressureCheck {
+	return &InotifyPressureCheck{d: d}
+}

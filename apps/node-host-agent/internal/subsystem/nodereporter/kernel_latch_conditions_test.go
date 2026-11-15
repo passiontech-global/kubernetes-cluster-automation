@@ -172,8 +172,8 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 // latch keys, a present latch flips the condition True with the
 // problem reason, and a removed latch flips it back to False.
 func TestCiliumLatchConditions(t *testing.T) {
-	if len(conditionDefs) != 50 {
-		t.Fatalf("conditionDefs has %d defs, want 50 (41 prior + 7 W21 latch→condition surface + ApiserverWatchCacheWedged + SystemdUnresponsive)",
+	if len(conditionDefs) != 55 {
+		t.Fatalf("conditionDefs has %d defs, want 55 (50 prior + 5 self-healing wave latch→condition surface)",
 			len(conditionDefs))
 	}
 	// The cilium pair sits before the inode-pressure + W21 tail —

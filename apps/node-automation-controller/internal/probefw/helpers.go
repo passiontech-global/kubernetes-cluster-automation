@@ -234,6 +234,23 @@ func (d *Deps) HealAllowedOnNode(ctx context.Context, log logr.Logger,
 		heals, key, nodeName, cooldown, now)
 }
 
+// HealAllowedClusterWideOnly is HealAllowed's cluster-wide-only
+// sibling for drain-unblock heals (pod deletes that exist to finish
+// a cordon drain — rollout unstickers, zombie cleanup): the
+// maintenance Scope defers ONLY on a cluster-wide hold, so an
+// actively-cordoned node — itself a node-scoped hold under
+// AllowedV — cannot deadlock the heal that exists to unblock it.
+// Cooldown/budget gates are unchanged; pair the actuation with
+// heal.RefundGrant on a clean (false, nil) deferral exactly like
+// DeletePodHeal does.
+func (d *Deps) HealAllowedClusterWideOnly(ctx context.Context, log logr.Logger,
+	heals *state.CooldownSet, key string, cooldown time.Duration,
+	now time.Time) (proceed, unverifiable bool) {
+	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
+	return heal.AllowedClusterWideOnly(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+		heals, key, cooldown, now)
+}
+
 // HealAllowedUpgradeOnly gates the annotation-only nudges: it
 // defers ONLY on a cluster-wide maintenance hold — a node-scoped
 // drain does not block a metadata write, and no heal-budget grant

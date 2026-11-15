@@ -9,9 +9,9 @@ import (
 // allConditionNames enumerates every exported condition constant BY
 // IDENTIFIER — a renamed or deleted constant breaks this file's
 // compilation instead of silently drifting out of the test's reach.
-// 49 latch-backed + 7 monitor/kubelet-owned = 56.
+// 53 latch-backed + 7 monitor/kubelet-owned = 60.
 var allConditionNames = []string{
-	// Latch-backed (49).
+	// Latch-backed (53).
 	NodeOverloaded, WatchdogStale,
 	CiliumAgentDown, CiliumInitStuck,
 	KubeletRuntimeStall, DNSFallbackActive, DNSResolvStale,
@@ -32,7 +32,10 @@ var allConditionNames = []string{
 	KonnectivityIPMismatch, CiliumEnvoyXDSReject, DiskBloatRunaway,
 	NebulaMTUBlackhole, NebulaSlowpath, NebulaSiteedge,
 	KernelPageAllocFailure, ApiserverWatchCacheWedged,
-	// Monitor- and kubelet-owned (7).
+	DiskPreFail, HardwareCorrupted, GPUHardwareError, InotifyPressure,
+	// Monitor- and kubelet-owned (7) — HostNetworkProblems sits here
+	// by declaration block but IS heartbeat-managed now that the
+	// kernelfail NIC-health guard latches it (see notHeartbeatManaged).
 	KernelDeadlock, ReadonlyFilesystem, InodePressure,
 	HostNetworkProblems, ClusterNetworkProblems,
 	HostNetworkProblem, ClusterNetworkProblem,
@@ -40,9 +43,11 @@ var allConditionNames = []string{
 
 // notHeartbeatManaged is the complement inside allConditionNames —
 // the names a frozen LastHeartbeatTime says nothing about.
+// HostNetworkProblems left this set when the NIC-health guard began
+// latching it: the agent now owns the heartbeat for that spelling.
 var notHeartbeatManaged = []string{
 	KernelDeadlock, // permanent latch, never reconciles False
-	HostNetworkProblems, ClusterNetworkProblems,
+	ClusterNetworkProblems,
 	HostNetworkProblem, ClusterNetworkProblem,
 }
 
@@ -63,8 +68,8 @@ var legacyControllerSpellings = []string{
 }
 
 func TestConstantsNonEmptyAndUnique(t *testing.T) {
-	if len(allConditionNames) != 56 {
-		t.Fatalf("allConditionNames = %d entries, want 56 (49 latch-backed + 7 monitor/kubelet)",
+	if len(allConditionNames) != 60 {
+		t.Fatalf("allConditionNames = %d entries, want 60 (53 latch-backed + 7 monitor/kubelet)",
 			len(allConditionNames))
 	}
 	seen := make(map[string]bool, len(allConditionNames))
@@ -88,8 +93,9 @@ func TestConstantsNonEmptyAndUnique(t *testing.T) {
 type conditionClass struct {
 	partition     bool // PartitionNames — evict pods off a partitioned node
 	stormGate     bool // StormGateNames — suppress descheduler storms
-	hangPreCordon bool // HangPreCordonNames — sustained True cordons the node
+	hangPreCordon bool // HangPreCordonNames — sustained True cordons the node (2m fuse)
 	clockSkew     bool // ClockSkewPreCordonNames — the longer clock fuse
+	diskPreFail   bool // DiskPreFailPreCordonNames — the 15m pre-fail disk fuse
 }
 
 // conditionClasses is the exhaustive {Partition, StormGate,
@@ -148,6 +154,16 @@ var conditionClasses = map[string]conditionClass{
 	NebulaSiteedge:              {stormGate: true},
 	KernelPageAllocFailure:      {stormGate: true, hangPreCordon: true},
 	ApiserverWatchCacheWedged:   {},
+	// Self-healing wave classifications: DiskPreFail rides its own
+	// 15m fuse (never the 2m hang fuse); the hardware/GPU/inotify
+	// conditions take the standard hang fuse; HostNetworkProblems
+	// keeps its partition+storm roles and deliberately stays OFF the
+	// precordon lists (the partition-pod-evictor owns the reaction).
+	DiskPreFail:         {stormGate: true, diskPreFail: true},
+	HardwareCorrupted:   {stormGate: true, hangPreCordon: true},
+	GPUHardwareError:    {stormGate: true, hangPreCordon: true},
+	InotifyPressure:     {stormGate: true, hangPreCordon: true},
+	HostNetworkProblems: {stormGate: true, partition: true},
 }
 
 // TestAllConditionsExplicitlyClassified replaces the old
@@ -181,6 +197,7 @@ func TestAllConditionsExplicitlyClassified(t *testing.T) {
 		{"StormGateNames", StormGateNames, func(c conditionClass) bool { return c.stormGate }},
 		{"HangPreCordonNames", HangPreCordonNames, func(c conditionClass) bool { return c.hangPreCordon }},
 		{"ClockSkewPreCordonNames", ClockSkewPreCordonNames, func(c conditionClass) bool { return c.clockSkew }},
+		{"DiskPreFailPreCordonNames", DiskPreFailPreCordonNames, func(c conditionClass) bool { return c.diskPreFail }},
 	}
 	for _, l := range lists {
 		inList := make(map[string]bool, len(l.list))
@@ -199,11 +216,12 @@ func TestAllConditionsExplicitlyClassified(t *testing.T) {
 
 func TestListsHaveNoDuplicateEntries(t *testing.T) {
 	lists := map[string][]string{
-		"HeartbeatSweptNames":     HeartbeatSweptNames,
-		"HangPreCordonNames":      HangPreCordonNames,
-		"ClockSkewPreCordonNames": ClockSkewPreCordonNames,
-		"StormGateNames":          StormGateNames,
-		"PartitionNames":          PartitionNames,
+		"HeartbeatSweptNames":       HeartbeatSweptNames,
+		"HangPreCordonNames":        HangPreCordonNames,
+		"ClockSkewPreCordonNames":   ClockSkewPreCordonNames,
+		"DiskPreFailPreCordonNames": DiskPreFailPreCordonNames,
+		"StormGateNames":            StormGateNames,
+		"PartitionNames":            PartitionNames,
 	}
 	for name, list := range lists {
 		seen := make(map[string]bool, len(list))
@@ -226,11 +244,12 @@ func TestListEntriesAreDeclaredConstantsOrPinnedForeign(t *testing.T) {
 		foreign[name] = true
 	}
 	lists := map[string][]string{
-		"HeartbeatSweptNames":     HeartbeatSweptNames,
-		"HangPreCordonNames":      HangPreCordonNames,
-		"ClockSkewPreCordonNames": ClockSkewPreCordonNames,
-		"StormGateNames":          StormGateNames,
-		"PartitionNames":          PartitionNames,
+		"HeartbeatSweptNames":       HeartbeatSweptNames,
+		"HangPreCordonNames":        HangPreCordonNames,
+		"ClockSkewPreCordonNames":   ClockSkewPreCordonNames,
+		"DiskPreFailPreCordonNames": DiskPreFailPreCordonNames,
+		"StormGateNames":            StormGateNames,
+		"PartitionNames":            PartitionNames,
 	}
 	for listName, list := range lists {
 		for _, entry := range list {
@@ -261,7 +280,7 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 	if !swept[InodePressure] {
 		t.Error("HeartbeatSweptNames must contain InodePressure (agent inode latch, inode-pressure)")
 	}
-	// Every remaining constant — exactly the 50 latch-backed — in.
+	// Every remaining constant — exactly the 55 latch-backed — in.
 	latchBacked := 0
 	for _, name := range allConditionNames {
 		if name == ReadonlyFilesystem {
@@ -282,8 +301,8 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 			t.Errorf("HeartbeatSweptNames must contain latch-backed condition %q", name)
 		}
 	}
-	if latchBacked != 50 {
-		t.Fatalf("latch-backed constants enumerated = %d, want 50", latchBacked)
+	if latchBacked != 55 {
+		t.Fatalf("latch-backed constants enumerated = %d, want 55", latchBacked)
 	}
 }
 
@@ -317,11 +336,12 @@ func TestAgentHeartbeatManaged(t *testing.T) {
 
 func TestLegacyControllerSpellingsAbsent(t *testing.T) {
 	lists := map[string][]string{
-		"HeartbeatSweptNames":     HeartbeatSweptNames,
-		"HangPreCordonNames":      HangPreCordonNames,
-		"ClockSkewPreCordonNames": ClockSkewPreCordonNames,
-		"StormGateNames":          StormGateNames,
-		"PartitionNames":          PartitionNames,
+		"HeartbeatSweptNames":       HeartbeatSweptNames,
+		"HangPreCordonNames":        HangPreCordonNames,
+		"ClockSkewPreCordonNames":   ClockSkewPreCordonNames,
+		"DiskPreFailPreCordonNames": DiskPreFailPreCordonNames,
+		"StormGateNames":            StormGateNames,
+		"PartitionNames":            PartitionNames,
 	}
 	for listName, list := range lists {
 		for _, entry := range list {
@@ -352,7 +372,7 @@ func TestAllPreCordonConditionsInStormGate(t *testing.T) {
 	for _, name := range StormGateNames {
 		gate[name] = true
 	}
-	for _, list := range [][]string{HangPreCordonNames, ClockSkewPreCordonNames} {
+	for _, list := range [][]string{HangPreCordonNames, ClockSkewPreCordonNames, DiskPreFailPreCordonNames} {
 		for _, name := range list {
 			if !gate[name] {
 				t.Errorf("StormGateNames must contain pre-cordon condition %q", name)

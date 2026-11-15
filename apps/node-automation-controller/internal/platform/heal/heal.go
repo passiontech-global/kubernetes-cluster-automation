@@ -133,6 +133,56 @@ func AllowedOnNode(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
 	return true, false
 }
 
+// AllowedClusterWideOnly is AllowedV's cluster-wide-only sibling for
+// drain-unblock heals — the pod deletes that exist to FINISH a cordon
+// drain (PDB deadlock relief, DaemonSet/StatefulSet rollout unstick,
+// CronJob Forbid zombie cleanup). AllowedV's mutex defers on ANY
+// held signal, and an actively-cordoned node (< NodeCordonActiveMaxAge)
+// is itself a held signal — so under the classic mutex these heals
+// are dead code for exactly the 45-minute window they exist to fix:
+// the cordon creates the wedge, the wedge needs the heal inside the
+// cordon's own active window.
+//
+// This gate inverts that: the maintenance Scope defers ONLY on a
+// cluster-wide hold (autopilot Plan, unscoped kured lock, unresolvable
+// medik8s CR) — node-scoped holds, including the cordoned node the
+// heal targets, do NOT block. A node drain is not a reason to leave a
+// wedged pod pinning maxUnavailable; the heal IS the drain's unblock
+// path, bounded by the same per-key cooldown, UID precondition, L1
+// hold, quorum reservation and heal-budget grant as AllowedV (the
+// RefundGrant contract is identical: the gate owner hands the grant
+// back exactly once when no mutation executed).
+func AllowedClusterWideOnly(ctx context.Context, log logr.Logger, v *maintenance.Verdict,
+	cs kubernetes.Interface, dyn dynamic.Interface,
+	heals *state.CooldownSet, key string, cooldown time.Duration,
+	now time.Time) (proceed bool, unverifiable bool) {
+
+	if heals != nil && heals.CooledDown(key, cooldown, now) {
+		log.Info("skip heal: inside cooldown", "target", key)
+		return false, false
+	}
+	if v == nil {
+		v = &maintenance.Verdict{}
+	}
+	scope, err := v.Scope(ctx, cs, dyn, now)
+	if err != nil {
+		log.Info("WARN: maintenance check unverifiable — "+
+			"heal deferred (fail closed)", "target", key, "error", err)
+		return false, true
+	}
+	if scope.ClusterWide {
+		log.Info("cluster-wide maintenance in progress — heal deferred",
+			"target", key, "why", scope.Why)
+		return false, false
+	}
+	if !budgetGate(now) {
+		log.Info("heal budget exhausted — heal deferred",
+			"target", key)
+		return false, false
+	}
+	return true, false
+}
+
 // AllowedUpgradeOnly gates the annotation-only nudges (Flux
 // source/kustomization stamps): a metadata write disrupts no pod,
 // so it defers ONLY on a cluster-wide hold — a node-scoped drain
@@ -244,6 +294,56 @@ func DeletePod(ctx context.Context, cs kubernetes.Interface,
 		// UID precondition lost — the pod was recreated under a
 		// new UID mid-sweep; deleting it now would hit the wrong
 		// incarnation. Clean deferral, same as a PDB refusal.
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	recordPodKilled(ctx, heals, key, pod, now)
+	return true, nil
+}
+
+// ForceDeletePod is DeletePod's grace-0 sibling for pods already
+// Terminating whose node is unreachable — the DaemonSet wedge case
+// where the kubelet is gone so the graceful delete never completes
+// and the rollout controller keeps counting the pod against
+// maxUnavailable forever. A plain delete on a pod with
+// deletionTimestamp set is an apiserver no-op (the grace period was
+// already consumed), so unblocking the controller requires
+// GracePeriodSeconds=0 — the force delete that drops the API object
+// immediately.
+//
+// Safety rail beyond DeletePod: refuses (false, nil — a clean
+// deferral, the gate owner refunds its grant) when the pod claims
+// any PVC. A grace-0 delete on a partitioned-but-alive node can
+// double-mount an RWO volume when the replacement schedules before
+// the old kubelet releases it; a PVC-holding pod on a truly dead
+// node needs a human, not a force delete.
+//
+// Same contract as DeletePod otherwise: preparePodDisruption
+// preflight, (deleted, err) returns, tombstone + ledger stamp on
+// delivery only, and this helper NEVER refunds a budget grant.
+func ForceDeletePod(ctx context.Context, cs kubernetes.Interface,
+	heals *state.CooldownSet, key string, pod *corev1.Pod,
+	now time.Time) (bool, error) {
+
+	deferred, err := preparePodDisruption(ctx, cs, pod, now)
+	if err != nil || deferred {
+		return false, err
+	}
+	if len(kube.PodClaimedPVCs(pod)) > 0 {
+		return false, nil
+	}
+	grace := int64(0)
+	opts := metav1.DeleteOptions{
+		GracePeriodSeconds: &grace,
+		Preconditions:      &metav1.Preconditions{UID: &pod.UID},
+	}
+	err = cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, opts)
+	switch {
+	case apierrors.IsNotFound(err):
+		kube.MarkPodDeleted(ctx, pod.UID)
+		return false, nil
+	case apierrors.IsConflict(err):
 		return false, nil
 	case err != nil:
 		return false, err

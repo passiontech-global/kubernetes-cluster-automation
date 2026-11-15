@@ -116,4 +116,13 @@ var healthRows = []shared.Module{
 	// apiserver-node-reachability — the apiserver-dark node detector +
 	// webhook-backend evacuee (2026-11-12 lanit-04 webhook EOF incident).
 	{Name: "apiserver-node-reachability", Group: groupHealth, GateEnv: "NODE_AUTOMATION_APISERVER_NODE_REACHABILITY_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameApiserverNodeReachability, New: nethealth.NewApiserverNodeReachabilityCheck}},
+	// apf-selfheal-shield — keeps the APF PriorityLevelConfiguration/
+	// FlowSchema shield for self-heal traffic converged (appended per
+	// the self-healing wave's roster order).
+	{Name: "apf-selfheal-shield", Group: groupHealth, GateEnv: "NODE_AUTOMATION_APF_SHIELD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameAPFSelfHealShield, New: watchdogs.NewAPFSelfHealShieldCheck}},
+	// The three L3 workload/drain unstickers — appended after the APF
+	// row per the self-healing wave's roster order.
+	{Name: "statefulset-rollout-unstick", Group: groupHealth, GateEnv: "NODE_AUTOMATION_STATEFULSET_ROLLOUT_UNSTICK_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameStatefulSetRolloutUnstick, New: watchdogs.NewStatefulSetRolloutUnstickCheck}},
+	{Name: "daemonset-rollout-wedge", Group: groupHealth, GateEnv: "NODE_AUTOMATION_DAEMONSET_ROLLOUT_WEDGE_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameDaemonSetRolloutWedge, New: watchdogs.NewDaemonSetRolloutWedgeCheck}},
+	{Name: "cronjob-forbid-zombie", Group: groupHealth, GateEnv: "NODE_AUTOMATION_CRONJOB_FORBID_ZOMBIE_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameCronJobForbidZombie, New: watchdogs.NewCronJobForbidZombieCheck}},
 }

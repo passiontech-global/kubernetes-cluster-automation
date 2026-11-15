@@ -26,6 +26,10 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewObservabilityPipelineGuardCheck,
 	NewOnePasswordConnectSyncCheck,
 	NewAPIServerRelistStormCheck,
+	NewAPFSelfHealShieldCheck,
+	NewStatefulSetRolloutUnstickCheck,
+	NewDaemonSetRolloutWedgeCheck,
+	NewCronJobForbidZombieCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

@@ -143,6 +143,17 @@ const (
 	// refresh, so a Running pod with <10m left means rotation has
 	// already stalled.
 	defaultSATokenMinTTLSec = int64(600)
+
+	// inotify-pressure-hygiene: the hard sysctl ceilings the
+	// auto-bump respects (fs/inotify/max_user_instances /
+	// max_user_watches) — watches additionally cap at the ~1KiB/
+	// watch RAM budget (2% of MemTotal) computed per cycle.
+	defaultInotifyMaxInstancesCeiling = int64(8192)
+	defaultInotifyMaxWatchesCeiling   = int64(524288)
+	// orphan-pod-volumes: the two-phase confirm age — a kubelet pod
+	// dir must be this old (mtime AND opv-seen marker) before its
+	// volumes tree is reaped.
+	defaultOrphanPodVolsMinAge = 60 * time.Minute
 )
 
 // CtrImageRmInterval is the shared last-ctr-image-rm budget — the

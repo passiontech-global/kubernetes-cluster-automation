@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -586,3 +587,264 @@ func TestPDBWatchdogPDBListError(t *testing.T) {
 
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()
+
+// ---------------------------------------------------------------------------
+// cordoned-block relief (P2-#10)
+// ---------------------------------------------------------------------------
+
+// pdwReliefWatchdog builds a watchdog wired for the relief paths:
+// dyn stub for the maintenance verdict, both knobs on.
+func pdwReliefWatchdog(cs *fake.Clientset, clock *time.Time) *pdbDeadlockWatchdog {
+	return &pdbDeadlockWatchdog{
+		cs:  cs,
+		dyn: testutil.NewDynamicClientWithCRDs(),
+		cfg: pdbConfig{unhealthyEvictionPolicyPatch: true, cordonedUnhealthyRelief: true},
+		now: func() time.Time { return *clock },
+	}
+}
+
+// pdwUnreadyPod builds a pod matching the pdw=protected selector,
+// pinned to nodeName, Ready=False for unreadyFor with a container
+// waiting in waitReason.
+func pdwUnreadyPod(ns, name, nodeName string, unreadyFor time.Duration,
+	waitReason string) *corev1.Pod {
+
+	pod := pdwPod(ns, name, nodeName)
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type:               corev1.PodReady,
+		Status:             corev1.ConditionFalse,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-unreadyFor)),
+	}}
+	if waitReason != "" {
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "c",
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+				Reason: waitReason,
+			}},
+		}}
+	}
+	return pod
+}
+
+// pdwStaticCordonedNode is a node whose cordon is older than the
+// 45m active window — NodeActivelyCordoned reads false so the
+// maintenance mutex stays clear while the test drives the relief
+// with an artificial cordoned set.
+func pdwStaticCordonedNode(name string) *corev1.Node {
+	n := testutil.Node(name, corev1.ConditionTrue, nil)
+	n.Spec.Unschedulable = true
+	ta := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+	n.Spec.Taints = []corev1.Taint{{
+		Key:       "node.kubernetes.io/unschedulable",
+		Effect:    corev1.TaintEffectNoSchedule,
+		TimeAdded: &ta,
+	}}
+	return n
+}
+
+// The patch path: a blocked PDB with unset unhealthyPodEvictionPolicy
+// plus a wedged pod on a cordoned node gets the AlwaysAllow merge
+// patch, the counter increments, and the cooldown stamps.
+func TestPDBReliefPatchesUnhealthyEvictionPolicy(t *testing.T) {
+	clock := time.Now()
+	pdb := pdwBlockedPDB("app", "web-pdb", 3, 2, 1)
+	pod := pdwUnreadyPod("app", "web-0", "node-cordoned", 10*time.Minute, "CrashLoopBackOff")
+	cs := fake.NewSimpleClientset(pdb, pod, pdwStaticCordonedNode("node-cordoned"))
+	w := pdwReliefWatchdog(cs, &clock)
+
+	w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+		pdb, map[string]bool{"node-cordoned": true})
+
+	got, err := cs.PolicyV1().PodDisruptionBudgets("app").Get(context.Background(), "web-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pdb: %v", err)
+	}
+	if got.Spec.UnhealthyPodEvictionPolicy == nil ||
+		*got.Spec.UnhealthyPodEvictionPolicy != policyv1.AlwaysAllow {
+		t.Fatalf("unhealthyPodEvictionPolicy = %v, want AlwaysAllow",
+			got.Spec.UnhealthyPodEvictionPolicy)
+	}
+	if _, err := cs.CoreV1().Pods("app").Get(context.Background(), "web-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("patch path must not delete the pod: %v", err)
+	}
+	// Cooldown stamped — an immediate second call is a no-op.
+	before := pdbUnhealthyPolicyPatchedTotalValue(t)
+	w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+		pdb, map[string]bool{"node-cordoned": true})
+	if after := pdbUnhealthyPolicyPatchedTotalValue(t); after != before {
+		t.Fatalf("cooldown violated: counter moved %v → %v", before, after)
+	}
+}
+
+// The delete fallback: policy already AlwaysAllow (patch path moot)
+// and the pod unready >30m with no DB quorum label → the pod is
+// deleted so it reschedules onto a schedulable node.
+func TestPDBReliefDeletesWedgedPodFallback(t *testing.T) {
+	clock := time.Now()
+	pdb := pdwBlockedPDB("app", "web-pdb", 3, 2, 1)
+	always := policyv1.AlwaysAllow
+	pdb.Spec.UnhealthyPodEvictionPolicy = &always
+	pod := pdwUnreadyPod("app", "web-0", "node-cordoned", 45*time.Minute, "ImagePullBackOff")
+	cs := fake.NewSimpleClientset(pdb, pod, pdwStaticCordonedNode("node-cordoned"))
+	w := pdwReliefWatchdog(cs, &clock)
+
+	w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+		pdb, map[string]bool{"node-cordoned": true})
+
+	if _, err := cs.CoreV1().Pods("app").Get(context.Background(), "web-0", metav1.GetOptions{}); err == nil {
+		t.Fatal("wedged pod was not deleted by the fallback")
+	}
+}
+
+// The production bug this fix targets: the relief exists to finish
+// an ACTIVE cordon drain (<45m), but the classic maintenance mutex
+// holds on exactly that signal — under AllowedV the patch AND the
+// pod-delete fallback were dead code for the whole cordon window.
+// With the cluster-wide-only / upgrade-only gates both paths must
+// proceed while the cordon is fresh.
+func TestPDBReliefProceedsDuringActiveCordon(t *testing.T) {
+	clock := time.Now()
+	// Fresh cordon taint (5m) — NodeActivelyCordoned=true, so the
+	// maintenance verdict carries a NODE-scoped hold. That hold must
+	// NOT defer either relief path.
+	activeNode := testutil.Node("node-cordoned", corev1.ConditionTrue, nil)
+	activeNode.Spec.Unschedulable = true
+	ta := metav1.NewTime(clock.Add(-5 * time.Minute))
+	activeNode.Spec.Taints = []corev1.Taint{{
+		Key:       "node.kubernetes.io/unschedulable",
+		Effect:    corev1.TaintEffectNoSchedule,
+		TimeAdded: &ta,
+	}}
+
+	// Patch path under the active cordon.
+	pdb := pdwBlockedPDB("app", "web-pdb", 3, 2, 1)
+	pod := pdwUnreadyPod("app", "web-0", "node-cordoned", 10*time.Minute, "CrashLoopBackOff")
+	cs := fake.NewSimpleClientset(pdb, pod, activeNode)
+	w := pdwReliefWatchdog(cs, &clock)
+
+	w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+		pdb, map[string]bool{"node-cordoned": true})
+
+	got, err := cs.PolicyV1().PodDisruptionBudgets("app").Get(context.Background(), "web-pdb", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pdb: %v", err)
+	}
+	if got.Spec.UnhealthyPodEvictionPolicy == nil ||
+		*got.Spec.UnhealthyPodEvictionPolicy != policyv1.AlwaysAllow {
+		t.Fatalf("patch deferred by active cordon: policy=%v",
+			got.Spec.UnhealthyPodEvictionPolicy)
+	}
+
+	// Delete fallback under the active cordon — AlwaysAllow policy
+	// makes the patch path moot, the wedged pod must still die.
+	pdb2 := pdwBlockedPDB("app", "web-pdb2", 3, 2, 1)
+	always := policyv1.AlwaysAllow
+	pdb2.Spec.UnhealthyPodEvictionPolicy = &always
+	pod2 := pdwUnreadyPod("app", "web-1", "node-cordoned", 45*time.Minute, "ImagePullBackOff")
+	cs2 := fake.NewSimpleClientset(pdb2, pod2, activeNode)
+	w2 := pdwReliefWatchdog(cs2, &clock)
+
+	w2.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+		pdb2, map[string]bool{"node-cordoned": true})
+
+	if _, err := cs2.CoreV1().Pods("app").Get(context.Background(), "web-1", metav1.GetOptions{}); err == nil {
+		t.Fatal("pod-delete fallback deferred by active cordon")
+	}
+}
+
+// A DB quorum member is never deleted — deleting it trades a drain
+// stall for a data-store outage.
+func TestPDBReliefSkipsDBQuorumPod(t *testing.T) {
+	clock := time.Now()
+	pdb := pdwBlockedPDB("app", "db-pdb", 3, 2, 1)
+	always := policyv1.AlwaysAllow
+	pdb.Spec.UnhealthyPodEvictionPolicy = &always
+	pod := pdwUnreadyPod("app", "pg-0", "node-cordoned", 45*time.Minute, "CrashLoopBackOff")
+	pod.Labels["cnpg.io/cluster"] = "pg"
+	cs := fake.NewSimpleClientset(pdb, pod, pdwStaticCordonedNode("node-cordoned"))
+	w := pdwReliefWatchdog(cs, &clock)
+
+	w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+		pdb, map[string]bool{"node-cordoned": true})
+
+	if _, err := cs.CoreV1().Pods("app").Get(context.Background(), "pg-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("DB quorum pod deleted: %v", err)
+	}
+}
+
+// Negative: a pod unready only 10m does not reach the 30m delete
+// fuse, and a pod without a container-error state is not wedge
+// evidence at all.
+func TestPDBReliefRespectsFuses(t *testing.T) {
+	clock := time.Now()
+	pdb := pdwBlockedPDB("app", "web-pdb", 3, 2, 1)
+	always := policyv1.AlwaysAllow
+	pdb.Spec.UnhealthyPodEvictionPolicy = &always
+	// 10m unready — under the 30m delete fuse (but over the 5m
+	// patch-evidence fuse; the patch path is moot here since the
+	// policy is already AlwaysAllow).
+	pod := pdwUnreadyPod("app", "web-0", "node-cordoned", 10*time.Minute, "CrashLoopBackOff")
+	// A Ready pod on the same cordoned node — not wedge evidence.
+	ready := pdwPod("app", "web-1", "node-cordoned")
+	ready.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionTrue,
+	}}
+	cs := fake.NewSimpleClientset(pdb, pod, ready, pdwStaticCordonedNode("node-cordoned"))
+	w := pdwReliefWatchdog(cs, &clock)
+
+	w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+		pdb, map[string]bool{"node-cordoned": true})
+
+	for _, n := range []string{"web-0", "web-1"} {
+		if _, err := cs.CoreV1().Pods("app").Get(context.Background(), n, metav1.GetOptions{}); err != nil {
+			t.Fatalf("pod %s deleted inside fuse: %v", n, err)
+		}
+	}
+}
+
+// Knobs off: both relief paths disabled → nothing happens even with
+// a perfect wedge fixture.
+func TestPDBReliefKnobsOff(t *testing.T) {
+	clock := time.Now()
+	pdb := pdwBlockedPDB("app", "web-pdb", 3, 2, 1)
+	pod := pdwUnreadyPod("app", "web-0", "node-cordoned", 45*time.Minute, "CrashLoopBackOff")
+	cs := fake.NewSimpleClientset(pdb, pod, pdwStaticCordonedNode("node-cordoned"))
+	w := &pdbDeadlockWatchdog{
+		cs:  cs,
+		dyn: testutil.NewDynamicClientWithCRDs(),
+		cfg: pdbConfig{}, // both knobs false
+		now: func() time.Time { return clock },
+	}
+
+	w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+		pdb, map[string]bool{"node-cordoned": true})
+
+	got, _ := cs.PolicyV1().PodDisruptionBudgets("app").Get(context.Background(), "web-pdb", metav1.GetOptions{})
+	if got.Spec.UnhealthyPodEvictionPolicy != nil {
+		t.Fatal("patch landed with knob off")
+	}
+	if _, err := cs.CoreV1().Pods("app").Get(context.Background(), "web-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod deleted with knob off: %v", err)
+	}
+}
+
+// pdbUnhealthyPolicyPatchedTotalValue reads the relief counter for
+// cooldown assertions.
+func pdbUnhealthyPolicyPatchedTotalValue(t *testing.T) float64 {
+	t.Helper()
+	mfs, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "node_automation_pdb_unhealthy_policy_patched_total" {
+			continue
+		}
+		var v float64
+		for _, m := range mf.GetMetric() {
+			v += m.GetCounter().GetValue()
+		}
+		return v
+	}
+	return 0
+}

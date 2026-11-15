@@ -61,4 +61,12 @@ const (
 	EnvWLayerSnapshotsDir        = "NODE_HOST_AGENT_WLAYER_SNAPSHOTS_DIR"
 	EnvCoredumpDir               = "NODE_HOST_AGENT_COREDUMP_DIR"
 	EnvWLayerBloatThresholdBytes = "NODE_HOST_AGENT_WLAYER_BLOAT_THRESHOLD_BYTES"
+
+	// Inotify pressure + orphan pod-volume reaper knobs — the
+	// inotify-pressure-hygiene sysctl ceilings/evict switch and the
+	// orphan-pod-volumes two-phase confirm age.
+	EnvInotifyMaxInstancesCeiling = "NODE_HOST_AGENT_INOTIFY_MAX_INSTANCES_CEILING"
+	EnvInotifyMaxWatchesCeiling   = "NODE_HOST_AGENT_INOTIFY_MAX_WATCHES_CEILING"
+	EnvInotifyEvictRunawayPod     = "NODE_HOST_AGENT_INOTIFY_EVICT_RUNAWAY_POD"
+	EnvOrphanPodVolsMinAge        = "NODE_HOST_AGENT_ORPHAN_POD_VOLS_MIN_AGE"
 )

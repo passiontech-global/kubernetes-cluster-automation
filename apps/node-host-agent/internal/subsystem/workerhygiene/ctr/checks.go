@@ -26,3 +26,9 @@ func NewIngestGC(d *wdeps.Deps) *IngestGCCheck {
 func NewCtrMeta(d *wdeps.Deps) *CtrMetaCheck {
 	return &CtrMetaCheck{d: d}
 }
+
+// NewOrphanPodVols returns the orphan-pod-volumes kubelet pod dir
+// reaper.
+func NewOrphanPodVols(d *wdeps.Deps) *OrphanPodVolsCheck {
+	return &OrphanPodVolsCheck{d: d}
+}

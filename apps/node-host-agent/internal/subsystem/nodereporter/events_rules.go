@@ -193,6 +193,16 @@ var logRules = []logRule{
 	// per STATE-ENTER (the apiserver serving stale watch-cache data
 	// is exactly when cluster-side heals must defer pod churn).
 	{nodecond.ApiserverWatchCacheWedged, latchdefs.StateEnterRe(latchdefs.LatchAPIServerCacheWedged)},
+	// --- self-healing wave latch→event surface ---
+	// One Event per STATE-ENTER for the five new condition latches.
+	// disk-pre-fail previously had no rule (evidence-only latch);
+	// host-network-problems now owns the NPD host-network spelling
+	// from the physical-NIC guard.
+	{nodecond.DiskPreFail, latchdefs.StateEnterRe(latchdefs.LatchDiskPreFail)},
+	{nodecond.HardwareCorrupted, latchdefs.StateEnterRe(latchdefs.LatchHardwareCorrupted)},
+	{nodecond.GPUHardwareError, latchdefs.StateEnterRe(latchdefs.LatchGPUHardwareError)},
+	{nodecond.HostNetworkProblems, latchdefs.StateEnterRe(latchdefs.LatchHostNetworkProblems)},
+	{nodecond.InotifyPressure, latchdefs.StateEnterRe(latchdefs.LatchInotifyPressure)},
 }
 
 // exitLogRules — STATE-EXIT lines that earn an informational (Normal)
@@ -204,4 +214,9 @@ var exitLogRules = []logRule{
 	// inode-pressure: inode-pressure cleared — every monitored mount back to
 	// <=90% inode usage.
 	{"FilesystemInodesHealthy", latchdefs.StateExitRe(latchdefs.LatchInodePressure)},
+	// host-network-problems / inotify-pressure: the episode's clean
+	// end earns an informational Event (reasons are the CondDefs
+	// DefaultReason spellings).
+	{"HostNetworkHealthy", latchdefs.StateExitRe(latchdefs.LatchHostNetworkProblems)},
+	{"InotifyNormal", latchdefs.StateExitRe(latchdefs.LatchInotifyPressure)},
 }

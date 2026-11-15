@@ -9,6 +9,9 @@ package wdeps
 import (
 	"context"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // CtrConfig groups the containerd knobs: the 31-ctr-tasks per-cycle
@@ -25,6 +28,10 @@ type CtrConfig struct {
 	IngestStaleAge time.Duration
 	MaxTaskClean   int // wedged ctr task dir cap per cycle (31)
 	MaxShimKill    int // orphan shim kill cap per cycle (31)
+	// OrphanPodVolsMinAge is the orphan-pod-volumes confirm age —
+	// a kubelet pod dir must be this old (dir mtime AND the
+	// opv-seen-<uid> marker) before its volumes tree is reaped.
+	OrphanPodVolsMinAge time.Duration
 	// MetaJournalFn is the KR3 journal probe — the cycle-shared
 	// journal snapshot (`journalctl -u k0sworker -u containerd`,
 	// fetched once per cycle through e.JournalOnce). nil → the
@@ -52,8 +59,15 @@ func (g *CtrConfig) applyDefaults() {
 	if g.MaxShimKill <= 0 {
 		g.MaxShimKill = defaultMaxShimKill
 	}
+	if g.OrphanPodVolsMinAge <= 0 {
+		g.OrphanPodVolsMinAge = defaultOrphanPodVolsMinAge
+	}
 }
 
-// The containerd domain has no env rows of its own — the socket row
-// (NODE_HOST_AGENT_CONTAINERD_SOCKET) moved to wiringEnvKnobs when
-// CtrSocket promoted to the top-level Config.
+// envKnobs returns the ctr domain's env rows — the orphan-pod-
+// volumes confirm age (the socket row lives in wiringEnvKnobs).
+func (g *CtrConfig) envKnobs() []envx.Knob {
+	return []envx.Knob{
+		envx.DurationKnob(envnames.EnvOrphanPodVolsMinAge, &g.OrphanPodVolsMinAge, defaultOrphanPodVolsMinAge),
+	}
+}

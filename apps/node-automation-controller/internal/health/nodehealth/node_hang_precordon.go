@@ -111,6 +111,14 @@ const (
 	// lands on the node, same blast radius.
 	nodeClockSkewCordonAge = 10 * time.Minute
 
+	// disk-pre-fail-precordon — the DiskPreFail condition (ext4
+	// metadata error / NVMe SMART pre-fail) gets its own longer
+	// fuse: the disk may still be serving, so the node earns 15
+	// minutes of corroboration before new pods are kept off it —
+	// longer than the clock fuse because a pre-fail disk often
+	// recovers (remount, controller reset) inside that window.
+	nodeDiskPreFailCordonAge = 15 * time.Minute
+
 	// nodeHangCondHeartbeatMaxAge is how old a condition's
 	// lastHeartbeatTime may be before the value stops being cordon
 	// evidence: the writer (nodereporter refreshes it every ~2m on
@@ -158,6 +166,12 @@ var nodeHangConds = kube.CondTypes(nodecond.HangPreCordonNames)
 // offset, node-hang-extra-conds).
 var nodeClockSkewConds = kube.CondTypes(nodecond.ClockSkewPreCordonNames)
 
+// nodeDiskPreFailConds is the pre-fail disk latch on its own
+// 15-minute fuse (nodecond.DiskPreFailPreCordonNames) — kept out of
+// nodeHangConds for the same reason the clock conditions are: the
+// fuse differs.
+var nodeDiskPreFailConds = kube.CondTypes(nodecond.DiskPreFailPreCordonNames)
+
 var (
 	// node-hang-precordon — worker nodes patched spec.unschedulable after a
 	// sustained hang condition (delivered cordons only).
@@ -189,10 +203,13 @@ func init() {
 // qualifies. Every nodeHangConds entry fuses at nodeHangCondMinAge;
 // the nodeClockSkewConds latches (clock-skew-precordon) get
 // nodeClockSkewCordonAge so an NTP daemon restart has time to
-// resync before the node counts as hanging. stale returns the first
-// fused latch the heartbeat-freshness gate rejected — a frozen or
-// absent heartbeat means the writer may be dead and the True value
-// a zombie, so it warns instead of cordoning.
+// resync before the node counts as hanging, and the
+// nodeDiskPreFailConds latch (disk-pre-fail-precordon) gets
+// nodeDiskPreFailCordonAge so a recoverable pre-fail disk earns 15
+// minutes of corroboration. stale returns the first fused latch the
+// heartbeat-freshness gate rejected — a frozen or absent heartbeat
+// means the writer may be dead and the True value a zombie, so it
+// warns instead of cordoning.
 func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 	fused := func(t corev1.NodeConditionType, fuse time.Duration) *corev1.NodeCondition {
 		c := kube.NodeCondition(n, t)
@@ -215,6 +232,16 @@ func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 	}
 	for _, t := range nodeClockSkewConds {
 		if c := fused(t, nodeClockSkewCordonAge); c != nil {
+			if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
+				return string(t), stale
+			}
+			if stale == "" {
+				stale = string(t)
+			}
+		}
+	}
+	for _, t := range nodeDiskPreFailConds {
+		if c := fused(t, nodeDiskPreFailCordonAge); c != nil {
 			if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
 				return string(t), stale
 			}
@@ -247,12 +274,20 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 			return true
 		}
 	}
+	for _, t := range nodeDiskPreFailConds {
+		if c := kube.NodeCondition(n, t); c != nil &&
+			c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
 	return false
 }
 
 // checkNodeHangPreCordon patches spec.unschedulable=true onto worker
 // nodes carrying a sustained hang latch (any nodeHangConds entry
-// >=2m, a nodeClockSkewConds latch >=10m, and a lastHeartbeatTime
+// >=2m — which includes the HardwareCorrupted/GPUHardwareError/
+// InotifyPressure wave conditions — a nodeClockSkewConds latch
+// >=10m, a nodeDiskPreFailConds latch >=15m, and a lastHeartbeatTime
 // fresh enough that the condition's writer is provably alive —
 // a frozen heartbeat warns instead of cordoning) — NHC/SNR will
 // reboot the node, but pods keep scheduling onto it until then. The

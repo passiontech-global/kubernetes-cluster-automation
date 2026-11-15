@@ -55,6 +55,51 @@ var (
 	// vDSO clock read degrades.
 	clocksourceUnstableRe = regexp.MustCompile(
 		`Marking clocksource '.*' as unstable|clocksource:.*unstable`)
+	// --- self-healing wave: hardware / neighbor / NIC signatures ---
+	// hwCorruptRe is the fatal-memory-error family — uncorrected or
+	// fatal MCE, an EDAC uncorrectable-error report, or a memory-
+	// failure SIGBUS/recovery-failure line. Corrected errors stay
+	// out: they are noise, not corruption evidence. Same spelling
+	// as nodereporter's NPD HardwareMemoryError rule.
+	hwCorruptRe = regexp.MustCompile(
+		`mce: \[Hardware Error\].*(?:Uncorrected|Fatal|PCC=1)|` +
+			`EDAC MC\d+: [1-9]\d* UE|` +
+			`Memory failure: 0x[0-9a-f]+: (?:Sending SIGBUS|recovery action .* Failed)`)
+	// pcieNVMeResetRe covers the PCIe AER fatal family and the NVMe
+	// controller-reset loop — PCIeBusError parity with the NPD rule.
+	pcieNVMeResetRe = regexp.MustCompile(
+		`PCIe Bus Error: severity=Uncorrected|AER: (?:Uncorrected|Fatal)|` +
+			`nvme nvme\d+: I/O \d+ .* timeout, resetting controller`)
+	// pcieAERFatalRe / nvmeResetRe split pcieNVMeResetRe's arms so
+	// the handler can tell an acute AER event (evidence stamp) from
+	// a controller reset (streak counter).
+	pcieAERFatalRe = regexp.MustCompile(
+		`PCIe Bus Error: severity=Uncorrected|AER: (?:Uncorrected|Fatal)`)
+	nvmeResetRe = regexp.MustCompile(
+		`nvme nvme\d+: I/O \d+ .* timeout, resetting controller`)
+	// gpuFatalXidRe captures the fatal NVIDIA Xid code — the same
+	// fatal set the NPD GPUXidError rule fires on. Non-fatal Xids
+	// (31 MMU fault, 43 channel error) stay OUT: they are warning
+	// events for NPD, not latch-grade hardware faults.
+	gpuFatalXidRe = regexp.MustCompile(
+		`NVRM: Xid \(PCI:[^)]+\): (48|74|79|94|95|119|120),`)
+	// gpuUVHangRe is the nvidia-uvm driver-hang signature — UVM
+	// channel errors and global fatal errors precede the same
+	// GPUHardwareError latch the fatal Xids feed (the latchdefs
+	// contract names "nvidia-uvm driver hang" explicitly). Real
+	// kmsg spellings: "uvm encountered global fatal error 0x..",
+	// "uvm_channel.c:.. Detected a channel error", "Encountered a
+	// global fatal error".
+	gpuUVHangRe = regexp.MustCompile(
+		`uvm[^\n]*(?:global fatal error|channel error)`)
+	// neighOverflowRe is the kernel's neighbor-table-full record —
+	// (arp|ndisc) names the family neighbor.go bumps.
+	neighOverflowRe = regexp.MustCompile(
+		`neighbour: (arp|ndisc)_cache: neighbor table overflow`)
+	// netdevTxTimeoutRe captures the iface from a NETDEV WATCHDOG
+	// transmit-queue timeout — nic_health counts them per uplink.
+	netdevTxTimeoutRe = regexp.MustCompile(
+		`NETDEV WATCHDOG: ([^\s(:]+).*transmit queue \d+ timed out`)
 )
 
 // oomKillCtx is the pending constraint-line state — the kernel prints
@@ -82,6 +127,18 @@ func (r *Runner) classifyKernelLine(msg string, st *kernelScanState) {
 		r.notePageAllocFailure(msg)
 	case clocksourceUnstableRe.MatchString(msg):
 		r.noteClocksourceUnstable(msg)
+	case hwCorruptRe.MatchString(msg):
+		r.noteHardwareCorrupt(msg)
+	case gpuFatalXidRe.MatchString(msg):
+		r.noteGPUXid(msg)
+	case gpuUVHangRe.MatchString(msg):
+		r.noteGPUUVHang(msg)
+	case pcieNVMeResetRe.MatchString(msg):
+		r.notePCIeNVMeReset(msg)
+	case neighOverflowRe.MatchString(msg):
+		r.noteNeighborOverflow(msg)
+	case netdevTxTimeoutRe.MatchString(msg):
+		r.noteNetdevTxTimeout(msg)
 	}
 }
 

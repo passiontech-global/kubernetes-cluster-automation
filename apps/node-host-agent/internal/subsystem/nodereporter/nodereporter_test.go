@@ -226,6 +226,12 @@ func TestAllConditionDefaults(t *testing.T) {
 		"ApiserverWatchCacheWedged": {"APIServerWatchCacheOk", "apiserver watch-cache tracks etcd revision"},
 		// workerhygiene PID1-frozen latch→condition surface.
 		"SystemdUnresponsive": {"SystemdResponsive", "systemd PID1 answering manager probes"},
+		// self-healing wave latch→condition surface.
+		"DiskPreFail":         {"DiskHealthy", "no ext4 metadata errors or NVMe SMART pre-fail indicators"},
+		"HardwareCorrupted":   {"HardwareHealthy", "no ECC/EDAC uncorrectable errors, fatal MCE, or PCIe/NVMe reset loop"},
+		"GPUHardwareError":    {"GPUHealthy", "no NVIDIA GPU fatal Xid or nvidia-uvm driver hang"},
+		"HostNetworkProblems": {"HostNetworkHealthy", "primary physical NIC stable (no carrier flap, CRC/frame errors, or TX timeouts)"},
+		"InotifyPressure":     {"InotifyNormal", "inotify instances and watches below the sysctl ceiling"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/pinnedworkload"
@@ -633,7 +634,7 @@ func TestCoreDNSPatcherCorefileBracedNoDenial(t *testing.T) {
 // The zone-qualified bare form `cache 30 cluster.local` keeps its
 // zone args through the expansion.
 func TestCoreDNSPatcherCorefileZoneCache(t *testing.T) {
-	got, changed := corefileDenialCap("x {\n    cache 30 cluster.local\n}\n")
+	got, changed := corefileCacheHeal("x {\n    cache 30 cluster.local\n}\n", "")
 	if !changed {
 		t.Fatal("bare zone-qualified cache not rewritten")
 	}
@@ -696,7 +697,7 @@ func TestCorefileDenialCapParser(t *testing.T) {
 			true, "} # tuned"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, changed := corefileDenialCap(tc.in)
+			got, changed := corefileCacheHeal(tc.in, "")
 			if changed != tc.changed {
 				t.Fatalf("changed=%v, want %v (out:\n%s)", changed, tc.changed, got)
 			}
@@ -707,7 +708,7 @@ func TestCorefileDenialCapParser(t *testing.T) {
 				t.Fatal("unchanged corefile mutated")
 			}
 			// Every rewrite must itself be stable — second pass no-ops.
-			again, againChanged := corefileDenialCap(got)
+			again, againChanged := corefileCacheHeal(got, "")
 			if againChanged || again != got {
 				t.Fatalf("rewrite not idempotent: pass 2 changed=%v\n%s", againChanged, again)
 			}
@@ -814,5 +815,173 @@ func TestSetupCoreDNSPatcherNodeWatch(t *testing.T) {
 	}
 	if p.Generic(event.GenericEvent{Object: n1}) {
 		t.Fatal("generic event fired")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// serve-stale — Corefile serve_stale <dur> immediate injection
+// ---------------------------------------------------------------------------
+
+// corefileCacheHealServeStale exercises the serve_stale knob across
+// all three cache-block shapes: a bare directive expands with the
+// window, an inline block gains only the missing directive, a
+// multi-line block gains it on its own line — and every rewrite is
+// idempotent on the second pass.
+func TestCorefileCacheHealServeStale(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      string
+		changed bool
+		want    []string // substrings the rewrite must contain
+		absent  []string // substrings it must NOT contain
+	}{
+		{"bare cache gains serve_stale",
+			".:53 {\n    cache 30\n}\n", true,
+			[]string{"cache 30 {", "success 9984 30", "denial 9984 5",
+				"serve_stale 1h immediate"}, nil},
+		{"bare cache keeps zone args",
+			".:53 {\n    cache 30 cluster.local\n}\n", true,
+			[]string{"cache 30 cluster.local {", "serve_stale 1h immediate"}, nil},
+		{"inline block gains only serve_stale",
+			".:53 {\n    cache 30 { success 9984 30 denial 9984 5 }\n}\n", true,
+			[]string{"serve_stale 1h immediate"}, nil},
+		{"inline block gains denial and serve_stale",
+			".:53 {\n    cache 30 { success 9984 30 }\n}\n", true,
+			[]string{"denial 9984 5", "serve_stale 1h immediate"}, nil},
+		{"multi-line block gains serve_stale on own line",
+			".:53 {\n    cache 30 {\n        success 9984 30\n        denial 9984 5\n    }\n}\n", true,
+			[]string{"serve_stale 1h immediate"}, nil},
+		{"existing serve_stale untouched — custom duration kept",
+			".:53 {\n    cache 30 {\n        success 9984 30\n        denial 9984 5\n        serve_stale 30m\n    }\n}\n", false,
+			nil, []string{"serve_stale 1h"}},
+		{"commented serve_stale counts as missing",
+			".:53 {\n    cache 30 {\n        # serve_stale 1h immediate\n        denial 9984 5\n    }\n}\n", true,
+			[]string{"serve_stale 1h immediate"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := corefileCacheHeal(tc.in, "1h")
+			if changed != tc.changed {
+				t.Fatalf("changed=%v, want %v:\n%s", changed, tc.changed, tc.in)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Fatalf("rewrite missing %q:\n%s", w, got)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(got, a) {
+					t.Fatalf("rewrite unexpectedly contains %q:\n%s", a, got)
+				}
+			}
+			if !changed && got != tc.in {
+				t.Fatal("unchanged corefile mutated")
+			}
+			again, againChanged := corefileCacheHeal(got, "1h")
+			if againChanged || again != got {
+				t.Fatalf("serve_stale rewrite not idempotent: pass2 changed=%v\n%s",
+					againChanged, again)
+			}
+		})
+	}
+}
+
+// With the knob off ("" after corednsServeStale normalization) the
+// heal still caps denial but never emits serve_stale — the
+// COREDNS_SERVE_STALE_DURATION=off contract.
+func TestCorefileCacheHealServeStaleDisabled(t *testing.T) {
+	got, changed := corefileCacheHeal(".:53 {\n    cache 30\n}\n", "")
+	if !changed {
+		t.Fatal("denial heal did not fire with serve_stale disabled")
+	}
+	if strings.Contains(got, "serve_stale") {
+		t.Fatalf("serve_stale emitted while disabled:\n%s", got)
+	}
+	if !strings.Contains(got, "denial 9984 5") {
+		t.Fatalf("denial cap missing:\n%s", got)
+	}
+}
+
+// corednsServeStale normalizes the knob: "0"/"off"/false-y spellings
+// disable, real durations pass through, garbage warns and falls back
+// to the 1h default rather than breaking the Corefile reload.
+func TestCoreDNSServeStaleKnob(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"1h", "1h"},
+		{"30m", "30m"},
+		{" 2h ", "2h"},
+		{"0", ""},
+		{"off", ""},
+		{"OFF", ""},
+		{"false", ""},
+		{"", ""},
+		{"banana", "1h"},
+	} {
+		if got := corednsServeStale(tc.in); got != tc.want {
+			t.Fatalf("corednsServeStale(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Reconcile-level: a patcher carrying serveStale="1h" lands the
+// serve_stale directive in the ConfigMap patch, and the healed
+// Corefile is stable on the next reconcile.
+func TestCoreDNSPatcherCorefileServeStale(t *testing.T) {
+	cs := fake.NewSimpleClientset(corednsDeploy("DoNotSchedule", 2),
+		corefileConfigMap(k0sCorefile))
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		serveStale: "1h"}
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getCorefile(t, cs)
+	if !strings.Contains(got, "serve_stale 1h immediate") {
+		t.Fatalf("corefile missing serve_stale:\n%s", got)
+	}
+	if !strings.Contains(got, "denial 9984 5") {
+		t.Fatalf("corefile missing denial cap:\n%s", got)
+	}
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if getCorefile(t, cs) != got {
+		t.Fatal("serve_stale corefile rewritten again — not idempotent")
+	}
+}
+
+// A Flux-owned ConfigMap that keeps getting reverted trips the
+// heal.FluxPatchGate after fluxConflictLoopMax repeats — the
+// reconcile must SKIP the patch (no write storm) rather than fight
+// Git field-for-field.
+func TestCoreDNSPatcherCorefileFluxLoopGate(t *testing.T) {
+	heal.ConfigureFluxConflictLoop(3, 30*time.Minute)
+	defer heal.ConfigureFluxConflictLoop(0, 0)
+
+	fluxCM := corefileConfigMap(k0sCorefile)
+	fluxCM.ManagedFields = []metav1.ManagedFieldsEntry{{
+		Manager:    "helm-controller",
+		Operation:  metav1.ManagedFieldsOperationApply,
+		APIVersion: "v1",
+		FieldsType: "FieldsV1",
+	}}
+	cs := fake.NewSimpleClientset(corednsDeploy("DoNotSchedule", 2), fluxCM)
+
+	// Two allowed sightings on the same object key — the reconcile's
+	// patch would be sighting #3 and must be denied.
+	now := time.Now()
+	for i := 0; i < 2; i++ {
+		if !heal.FluxPatchGate("configmap", fluxCM, "kube-system/coredns", now) {
+			t.Fatalf("sighting %d unexpectedly denied", i+1)
+		}
+	}
+
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		serveStale: "1h"}
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := getCorefile(t, cs); got != k0sCorefile {
+		t.Fatalf("flux-loop gate did not skip the corefile patch:\n%s", got)
 	}
 }

@@ -807,3 +807,131 @@ func TestCheckNodeHangSkipsAlreadyCordoned(t *testing.T) {
 		t.Fatal("pre-cordon stamp stacked onto a foreign cordon")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// disk-pre-fail-precordon — DiskPreFail's own 15m fuse
+// ---------------------------------------------------------------------------
+
+// DiskPreFail rides its own 15-minute fuse — longer than the 2m hang
+// fuse because a pre-fail disk often recovers (remount, controller
+// reset). At 10m the node is still inside the corroboration window;
+// at 20m it cordons with the same stamp.
+func TestCheckNodeHangDiskPreFailCordon(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-disk", "DiskPreFail", 20*time.Minute, false),
+		probetest.ReadyWorkerNode("w-disk-fresh", "DiskPreFail", 10*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+		t.Fatal("sustained DiskPreFail did not fail the check")
+	}
+	old, _ := cs.CoreV1().Nodes().Get(ctx, "w-disk", metav1.GetOptions{})
+	if !old.Spec.Unschedulable ||
+		old.Annotations[nodeHangPreCordonAnno] != nodeHangPreCordonValue {
+		t.Fatal("sustained DiskPreFail not cordoned+stamped")
+	}
+	fresh, _ := cs.CoreV1().Nodes().Get(ctx, "w-disk-fresh", metav1.GetOptions{})
+	if fresh.Spec.Unschedulable {
+		t.Fatal("DiskPreFail cordoned inside the 15m corroboration window")
+	}
+}
+
+// DiskPreFail must NOT sit in nodeHangConds — its fuse differs, and
+// a 2m hang-fuse membership would cordon a recoverable disk far too
+// early.
+func TestNodeHangDiskPreFailNotInHangSet(t *testing.T) {
+	for _, c := range nodeHangConds {
+		if c == "DiskPreFail" {
+			t.Fatal("DiskPreFail leaked into the 2m hang fuse set")
+		}
+	}
+	found := false
+	for _, c := range nodeDiskPreFailConds {
+		if c == "DiskPreFail" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("DiskPreFail missing from nodeDiskPreFailConds")
+	}
+}
+
+// A fused DiskPreFail with a frozen heartbeat is the same zombie
+// shape — warn, don't cordon.
+func TestCheckNodeHangDiskPreFailStaleHeartbeat(t *testing.T) {
+	disk := probetest.ReadyWorkerNode("w-dzombie", "DiskPreFail", 30*time.Minute, false)
+	disk.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+	cs := fake.NewSimpleClientset(disk, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+		t.Fatalf("stale-heartbeat DiskPreFail must not fail the check: %+v", res)
+	}
+	n, _ := cs.CoreV1().Nodes().Get(ctx, "w-dzombie", metav1.GetOptions{})
+	if n.Spec.Unschedulable {
+		t.Fatal("zombie DiskPreFail cordoned the node")
+	}
+}
+
+// A stamped cordon stays while DiskPreFail is still True — the
+// auto-uncordon guard scans the disk-pre-fail set too, so a
+// recovering-then-relapsing disk cannot lose its cordon early.
+func TestCheckNodeHangDiskPreFailHoldsPreCordon(t *testing.T) {
+	n := precordonedWorkerNode("w-diskheld", true)
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:               "DiskPreFail",
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-30 * time.Second)),
+		LastHeartbeatTime:  metav1.NewTime(time.Now()),
+	})
+	cs := fake.NewSimpleClientset(n, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+		t.Fatalf("fresh DiskPreFail must not fail the check: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-diskheld", metav1.GetOptions{})
+	if !got.Spec.Unschedulable {
+		t.Fatal("uncordoned while DiskPreFail is still True")
+	}
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; !ok {
+		t.Fatal("pre-cordon stamp removed while DiskPreFail active")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// wave self-healing conditions — HardwareCorrupted / GPUHardwareError /
+// InotifyPressure ride the standard 2m hang fuse
+// ---------------------------------------------------------------------------
+
+// The three wave conditions are members of nodeHangConds and fuse at
+// nodeHangCondMinAge like every other hang latch — at 5m each
+// cordons; the set-membership assertion keeps a future refactor from
+// silently dropping them onto a different fuse.
+func TestCheckNodeHangWaveConditions(t *testing.T) {
+	for _, cond := range []string{
+		"HardwareCorrupted", "GPUHardwareError", "InotifyPressure",
+	} {
+		found := false
+		for _, c := range nodeHangConds {
+			if c == corev1.NodeConditionType(cond) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s missing from nodeHangConds", cond)
+		}
+		name := "w-" + strings.ToLower(cond)
+		cs := fake.NewSimpleClientset(
+			probetest.ReadyWorkerNode(name, corev1.NodeConditionType(cond), 5*time.Minute, false),
+			probetest.ReadyWorkerNode(name+"-ok", "", 0, false))
+		p := testProberDyn(cs, probetest.OpDyn())
+		if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+			t.Fatalf("%s latch did not fail the check", cond)
+		}
+		n, _ := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if !n.Spec.Unschedulable {
+			t.Fatalf("%s node not cordoned", cond)
+		}
+		testutil.CleanupMetric(t, nodeHangCordonsTotal, name)
+	}
+}

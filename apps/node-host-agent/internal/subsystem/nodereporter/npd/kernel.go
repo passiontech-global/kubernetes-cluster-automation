@@ -70,6 +70,25 @@ var kernelTempRules = []rule{
 	{"NeighborTableOverflow", regexp.MustCompile(`neighbour: (?:arp|ndisc)_cache: neighbor table overflow`)},
 	{"NetdevTxTimeout", regexp.MustCompile(`NETDEV WATCHDOG: .* transmit queue [0-9]+ timed out`)},
 	{"TCPMemoryPressure", regexp.MustCompile(`TCP: out of memory -- consider tuning tcp_mem`)},
+	// Self-healing wave: the hardware-error signatures the kernelfail
+	// hardware guard also classifies into state latches — here they
+	// are temporary rules (counter + Event) like the upstream set.
+	{"HardwareMemoryError", regexp.MustCompile(
+		`mce: \[Hardware Error\].*(?:Uncorrected|Fatal|PCC=1)|` +
+			`EDAC MC\d+: [1-9]\d* UE|` +
+			`Memory failure: 0x[0-9a-f]+: (?:Sending SIGBUS|recovery action .* Failed)`)},
+	{"PCIeBusError", regexp.MustCompile(
+		`PCIe Bus Error: severity=Uncorrected|AER: (?:Uncorrected|Fatal)|` +
+			`nvme nvme\d+: I/O \d+ .* timeout, resetting controller`)},
+	{"GPUXidError", regexp.MustCompile(
+		`NVRM: Xid \(PCI:[^)]+\): (?:31|43|48|74|79|94|95|119|120),`)},
+	// Non-fatal Xids 31/43 stay in GPUXidError per the plan's code
+	// set — they surface as warning Events without latching
+	// GPUHardwareError (kernelfail's gpuFatalXidRe keeps the fatal
+	// subset only). The uvm hang is the driver-side signature of the
+	// same condition class.
+	{"GPUUVHang", regexp.MustCompile(
+		`uvm[^\n]*(?:global fatal error|channel error)`)},
 }
 
 // kernelDeadlockRe is the permanent KernelDeadlock rule — the

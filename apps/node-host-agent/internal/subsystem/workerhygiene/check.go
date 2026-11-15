@@ -103,6 +103,10 @@ func (h *Hygiene) initChecks() {
 	// containerd shim RSS; last in the runtime-resource group (it
 	// reads the shared per-cycle pid snapshot).
 	add(runtime.NewKernelNetShim(d)) // wdeps.CheckKernelNetShim
+	// Self-healing wave — appended AFTER every pre-existing check:
+	// the inotify pressure healer, then the orphan pod-volume reaper.
+	add(runtime.NewInotifyPressure(d)) // wdeps.CheckInotifyHygiene
+	add(ctr.NewOrphanPodVols(d))       // wdeps.CheckOrphanPodVols
 	// A single UNGATED group: the unit-file and uptime gates return
 	// early in Cycle and workerActive gates inside each check
 	// (per-check cycles{check,"gated"}) — none map onto

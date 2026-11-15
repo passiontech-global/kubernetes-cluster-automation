@@ -24,4 +24,17 @@ const (
 	EnvNebulaCert               = "NODE_HOST_AGENT_NEBULA_CERT"
 	EnvWatchdogLogFile          = "NODE_HOST_AGENT_WATCHDOG_LOG_FILE"
 	EnvCPUDeliveredInterval     = "NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL"
+
+	// Neighbor-table self-heal ceilings (kernelfail neighbor.go): the
+	// gc_thresh{1,2,3} triplet doubles per 30m spend up to these caps.
+	EnvNeighGCThresh1Ceiling = "NODE_HOST_AGENT_NEIGH_GC_THRESH1_CEILING"
+	EnvNeighGCThresh2Ceiling = "NODE_HOST_AGENT_NEIGH_GC_THRESH2_CEILING"
+	EnvNeighGCThresh3Ceiling = "NODE_HOST_AGENT_NEIGH_GC_THRESH3_CEILING"
+	// Physical-NIC flap thresholds (kernelfail nic_health.go):
+	// carrier_changes delta per 5m window, NETDEV WATCHDOG TX
+	// timeouts per 10m, and the rx_crc+rx_frame delta required in
+	// EACH of two consecutive 5m windows.
+	EnvNICCarrierFlapThreshold = "NODE_HOST_AGENT_NIC_CARRIER_FLAP_THRESHOLD"
+	EnvNICTxTimeoutThreshold   = "NODE_HOST_AGENT_NIC_TX_TIMEOUT_THRESHOLD"
+	EnvNICCRErrorThreshold     = "NODE_HOST_AGENT_NIC_CRC_ERROR_THRESHOLD"
 )

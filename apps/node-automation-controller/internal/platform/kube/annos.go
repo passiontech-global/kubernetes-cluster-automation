@@ -81,6 +81,11 @@ const (
 	// LabelMissedCatchup is cronjob-catchup's LABEL marking a Job it
 	// spawned for a missed CronJob schedule.
 	LabelMissedCatchup = "passiontech.dev/missed-catchup"
+	// AnnoCronJobMaxActiveDuration opts a concurrencyPolicy=Forbid
+	// CronJob into terminating active Jobs that run past the parsed
+	// time.Duration (e.g. "4h"), preventing missing-
+	// activeDeadlineSeconds permanent stalls.
+	AnnoCronJobMaxActiveDuration = "passiontech.dev/max-active-duration"
 	// AnnoConcourseBaselineNodeFSGiB is concourse-janitor's recorded
 	// baseline node filesystem size on the node.
 	AnnoConcourseBaselineNodeFSGiB = "passiontech.dev/baseline-nodefs-gib"

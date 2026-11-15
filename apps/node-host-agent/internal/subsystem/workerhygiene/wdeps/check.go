@@ -69,6 +69,10 @@ const (
 	CheckSATokenTTL        = "sa-token-ttl"                // sa-token-ttl projected SA token expiry guard
 	CheckKernelNetShim     = "kernel-net-shim-hygiene"     // kernel drops + containerd shim RSS guard
 	CheckMountinfo         = "mountinfo-hygiene"           // mountinfo bloat + orphan mount reaper
+	// Self-healing wave (appended after the pre-existing checks —
+	// order is load-bearing).
+	CheckInotifyHygiene = "inotify-pressure-hygiene" // inotify instance/watch pressure + runaway-pod evictor
+	CheckOrphanPodVols  = "orphan-pod-volumes"       // orphaned kubelet pod volume dirs
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every

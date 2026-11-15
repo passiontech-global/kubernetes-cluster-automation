@@ -82,6 +82,11 @@ const (
 	LatchSystemdUnresponsive  = "systemd-unresponsive"   // systemd-session-hygiene
 	LatchKubeletPLEGUnhealthy = "kubelet-pleg-unhealthy" // kubelet-syncloop PLEG metrics
 	LatchDiskSlowIO           = "disk-slow-io"           // disk-slow-io io-pressure gray failure
+	// LatchInotifyPressure is the inotify-pressure-hygiene latch —
+	// inotify instances/watches pinned past the (already
+	// auto-raised) sysctl ceiling for two consecutive cycles, the
+	// point where only evicting the runaway holder frees fds.
+	LatchInotifyPressure = "inotify-pressure" // inotify-pressure-hygiene
 	// LatchKernelNetShim is the kernel-net-shim-hygiene degradation
 	// latch — sustained kernel socket/softnet drop growth or a
 	// containerd-shim RSS breach (individual 200MiB / total 1.5GiB).
@@ -153,11 +158,28 @@ const (
 	// indicator (critical_warning != 0, media_errors > 0,
 	// percentage_used > 90) — the death-bed warning days before
 	// FilesystemReadOnly, while the LocalPV data can still be
-	// evacuated. Deliberately no NodeCondition surface yet
-	// (evidence-only latch, conditions.go precedent): the
-	// STATE-ENTER line + the node_agent_*_prefail textfile gauges
-	// are the consumption surface.
+	// evacuated. Surfaces as the DiskPreFail NodeCondition
+	// (conditions.go) so node-hang-precordon's 15m fuse can cordon
+	// the node ahead of the read-only transition.
 	LatchDiskPreFail = "disk-pre-fail" // updateDiskPreFailEvidence
+	// LatchHardwareCorrupted is the kernelfail hardware-corruption
+	// latch: ECC/EDAC uncorrectable errors, fatal/uncorrected MCE,
+	// PCIe AER fatal or a repeated NVMe controller reset — memory
+	// the kernel already poisoned or a bus that keeps resetting.
+	// Surfaces as HardwareCorrupted (2m precordon fuse).
+	LatchHardwareCorrupted = "hardware-corrupted" // updateHardwareHealth
+	// LatchGPUHardwareError is the kernelfail GPU latch: a fatal
+	// NVIDIA Xid (48/74/79/94/95/119/120) or an nvidia-uvm driver
+	// hang — dormant on hosts with no NVIDIA device. Surfaces as
+	// GPUHardwareError (2m precordon fuse).
+	LatchGPUHardwareError = "gpu-hardware-error" // updateHardwareHealth
+	// LatchHostNetworkProblems is the kernelfail physical-NIC latch:
+	// carrier flapping, CRC/frame errors or NETDEV WATCHDOG TX
+	// timeouts on the primary uplink — the hardware half of the
+	// NPD host-network spelling (the agent now owns it, so the
+	// condition rides the heartbeat sweep). Surfaces as
+	// HostNetworkProblems.
+	LatchHostNetworkProblems = "host-network-problems" // updateNICHealth
 	// LatchClocksourceUnstable is the clocksource evidence latch — the
 	// kernel marked its clocksource unstable (kmsg signature) or
 	// hostmetrics found the current clocksource drifted off tsc/
@@ -254,6 +276,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchKubeletPLEGUnhealthy, Owner: "workerhygiene"},
 	{Name: LatchDiskSlowIO, Owner: "workerhygiene"},
 	{Name: LatchKernelNetShim, Owner: "workerhygiene"},
+	{Name: LatchInotifyPressure, Owner: "workerhygiene"},
 	// workerhygiene + controllerhygiene drive the SAME blindness
 	// episode through Store.EnterFrom/ExitFrom: each failing journal
 	// read registers its subsystem's hold, so one hygiene's healthy
@@ -306,6 +329,9 @@ var LatchDefs = []LatchDef{
 	{Name: LatchInodePressure, Owner: "hostmetrics"},
 	{Name: LatchPageAllocFailure, Owner: "hostmetrics"},
 	{Name: LatchDiskPreFail, Owner: "hostmetrics"},
+	{Name: LatchHardwareCorrupted, Owner: "hostmetrics"},
+	{Name: LatchGPUHardwareError, Owner: "hostmetrics"},
+	{Name: LatchHostNetworkProblems, Owner: "hostmetrics"},
 	{Name: LatchClocksourceUnstable, Owner: "hostmetrics"},
 
 	// apiprober

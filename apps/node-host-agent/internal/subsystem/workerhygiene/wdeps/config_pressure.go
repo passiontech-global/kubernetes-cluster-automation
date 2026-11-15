@@ -20,6 +20,16 @@ type PressureConfig struct {
 	ZombieStormThreshold int     // defunct children of one parent → storm
 	PSIFullAvg60         float64 // PSI memory full avg60 percent (25)
 	MemFreeMinRatio      float64 // free-mem ratio floor (0.08)
+	// Inotify* knobs for the inotify-pressure-hygiene check: the
+	// hard sysctl ceilings the auto-bump respects (watches
+	// additionally cap at the ~1KiB/watch RAM budget the check
+	// computes from MemTotal) and the runaway-pod evict switch.
+	// InotifyEvictRunawayPod is NOT defaulted in applyDefaults —
+	// the env knob owns the true default (the Feeder.Enabled
+	// precedent); a direct-New caller leaves it false.
+	InotifyMaxInstancesCeiling int64
+	InotifyMaxWatchesCeiling   int64
+	InotifyEvictRunawayPod     bool
 }
 
 func (p *PressureConfig) applyDefaults() {
@@ -35,12 +45,22 @@ func (p *PressureConfig) applyDefaults() {
 	if p.MemFreeMinRatio <= 0 {
 		p.MemFreeMinRatio = defaultMemFreeMinRatio
 	}
+	if p.InotifyMaxInstancesCeiling <= 0 {
+		p.InotifyMaxInstancesCeiling = defaultInotifyMaxInstancesCeiling
+	}
+	if p.InotifyMaxWatchesCeiling <= 0 {
+		p.InotifyMaxWatchesCeiling = defaultInotifyMaxWatchesCeiling
+	}
 }
 
-// envKnobs returns the pressure domain's env row — the D-state
-// storm threshold (empty env → in-package default).
+// envKnobs returns the pressure domain's env rows — the D-state
+// storm threshold (empty env → in-package default) plus the
+// inotify-pressure-hygiene ceilings and evict switch.
 func (p *PressureConfig) envKnobs() []envx.Knob {
 	return []envx.Knob{
 		envx.IntKnob(envnames.EnvDstateStormThreshold, &p.DStateStormThreshold, defaultDStateStormThreshold),
+		envx.Int64Knob(envnames.EnvInotifyMaxInstancesCeiling, &p.InotifyMaxInstancesCeiling, defaultInotifyMaxInstancesCeiling),
+		envx.Int64Knob(envnames.EnvInotifyMaxWatchesCeiling, &p.InotifyMaxWatchesCeiling, defaultInotifyMaxWatchesCeiling),
+		envx.BoolKnob(envnames.EnvInotifyEvictRunawayPod, &p.InotifyEvictRunawayPod, true),
 	}
 }

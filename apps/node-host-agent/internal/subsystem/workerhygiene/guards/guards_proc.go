@@ -5,19 +5,10 @@ package guards
 
 import (
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
-)
-
-var (
-	// Pod UID inside a /proc/<pid>/cgroup path — kubepods slices
-	// embed it with underscores
-	// (kubepods-burstable-pod<8_4_4_4_12>.slice), some runtimes keep
-	// dashes; both normalize to the dashed form.
-	podUIDCgroupRe = regexp.MustCompile(`pod([0-9a-fA-F_-]{36})`)
 )
 
 // podUIDForPID extracts the pod UID owning a pid via
@@ -25,14 +16,12 @@ var (
 // underscores; normalized to the dashed form. The parse assumes
 // the cgroup-v2 unified hierarchy (the `0::/kubepods...` line and
 // kubepods*.slice naming — k0s hosts are v2; on v1 the per-
-// hierarchy lines differ and pod_uid resolves "unknown").
+// hierarchy lines differ and pod_uid resolves "unknown"). The
+// canonical parse lives in wdeps.PodUIDForPID — the inotify
+// pressure check attributes the same way.
 func podUIDForPID(d *wdeps.Deps, pid int) string {
-	data, err := os.ReadFile(d.Proc.File(pid, "cgroup"))
-	if err != nil {
-		return "unknown"
-	}
-	if m := podUIDCgroupRe.FindSubmatch(data); m != nil {
-		return strings.ReplaceAll(string(m[1]), "_", "-")
+	if uid, ok := wdeps.PodUIDForPID(d, pid); ok {
+		return uid
 	}
 	return "unknown"
 }

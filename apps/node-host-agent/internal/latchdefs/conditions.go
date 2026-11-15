@@ -361,4 +361,35 @@ var CondDefs = map[string]CondDef{
 		DefaultMessage: "apiserver watch-cache tracks etcd revision",
 		ProblemReason:  "APIServerWatchCacheWedged",
 	},
+	// --- self-healing wave: hardware/disk/NIC/inotify surfaces ---
+	LatchDiskPreFail: {
+		Type:           "DiskPreFail",
+		DefaultReason:  "DiskHealthy",
+		DefaultMessage: "no ext4 metadata errors or NVMe SMART pre-fail indicators",
+		ProblemReason:  "DiskPreFailDetected",
+	},
+	LatchHardwareCorrupted: {
+		Type:           "HardwareCorrupted",
+		DefaultReason:  "HardwareHealthy",
+		DefaultMessage: "no ECC/EDAC uncorrectable errors, fatal MCE, or PCIe/NVMe reset loop",
+		ProblemReason:  "HardwareCorruptedDetected",
+	},
+	LatchGPUHardwareError: {
+		Type:           "GPUHardwareError",
+		DefaultReason:  "GPUHealthy",
+		DefaultMessage: "no NVIDIA GPU fatal Xid or nvidia-uvm driver hang",
+		ProblemReason:  "GPUHardwareErrorDetected",
+	},
+	LatchHostNetworkProblems: {
+		Type:           "HostNetworkProblems",
+		DefaultReason:  "HostNetworkHealthy",
+		DefaultMessage: "primary physical NIC stable (no carrier flap, CRC/frame errors, or TX timeouts)",
+		ProblemReason:  "HostNetworkProblemsDetected",
+	},
+	LatchInotifyPressure: {
+		Type:           "InotifyPressure",
+		DefaultReason:  "InotifyNormal",
+		DefaultMessage: "inotify instances and watches below the sysctl ceiling",
+		ProblemReason:  "InotifyPressureDetected",
+	},
 }

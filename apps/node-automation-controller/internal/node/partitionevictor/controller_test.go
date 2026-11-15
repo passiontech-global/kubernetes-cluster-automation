@@ -23,6 +23,10 @@ func TestPartitionEvictor(t *testing.T) {
 			Type:               "HostNetworkProblems",
 			Status:             corev1.ConditionTrue,
 			LastTransitionTime: old,
+			// HostNetworkProblems is agent-managed (the NIC-health
+			// latch projects it), so the zombie-heartbeat gate needs
+			// a live stamp to flag.
+			LastHeartbeatTime: metav1.NewTime(time.Now()),
 		})
 	healthy := testutil.Node("h1", corev1.ConditionTrue, nil)
 	others := []*corev1.Node{

@@ -31,14 +31,19 @@
 // disables the pin (the Deployment keeps its own .spec.replicas) so
 // a cluster can re-enable the standalone CPA without being fought.
 //
-// Corefile negative-cache guard (negative-cache-guard): the kube-system/coredns
-// ConfigMap is k0s-managed and drifts back to a bare `cache 30`,
-// which negative-caches NXDOMAIN for the full SOA TTL — a Job pod
-// that outraces endpointslice-controller at deploy time eats a
-// 30s-cached NXDOMAIN and dies on backoffLimit. The reconciler
+// Corefile cache-block heal (negative-cache-guard/serve-stale): the
+// kube-system/coredns ConfigMap is k0s-managed and drifts back to a
+// bare `cache 30`, which negative-caches NXDOMAIN for the full SOA
+// TTL — a Job pod that outraces endpointslice-controller at deploy
+// time eats a 30s-cached NXDOMAIN and dies on backoffLimit — and
+// carries no serve_stale window, so an apiserver/CoreDNS backend
+// blip expires every cached answer cluster-wide. The reconciler
 // rewrites a denial-less cache directive to `cache 30 { success
-// 9984 30; denial 9984 5 }`, capping negative caching at 5s while
-// keeping the 30s positive cache.
+// 9984 30; denial 9984 5; serve_stale <dur> immediate }`, capping
+// negative caching at 5s, keeping the 30s positive cache, and
+// serving stale answers through a backend outage for
+// COREDNS_SERVE_STALE_DURATION ("1h" default; "0"/"off" disables
+// the serve_stale half only).
 //
 // File layout: this file holds the module contract, the watch/setup wiring
 // (Setup) and the Reconcile pipeline; coredns_patch.go the drift check and
@@ -49,6 +54,8 @@ package corednspatcher
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -85,6 +92,7 @@ type corednsPatcher struct {
 	minDomains      int
 	minReplicas     int
 	nodesPerReplica int
+	serveStale      string
 }
 
 // The watch wiring below installs this package-level predicate
@@ -140,7 +148,7 @@ func Setup(d shared.Deps) error {
 		}.WatchNodes(b, "coredns-patcher-sweep")
 		r := &corednsPatcher{cs: d.CS, nodeReader: d.CachedClient(), zoneWhen: cfg.zoneWhen,
 			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica,
-			reader: d.CachedClient()}
+			serveStale: cfg.serveStale, reader: d.CachedClient()}
 		// CountReconcile owns the returned-error accounting — one
 		// IncError per non-nil Reconcile return; the reconcile body
 		// never IncErrors an error it returns.
@@ -156,6 +164,10 @@ type corednsPatcherConfig struct {
 	zoneMinDomains  int
 	minReplicas     int
 	nodesPerReplica int
+	// serveStale is the normalized serve_stale window injected into
+	// the Corefile cache blocks — "" disables the directive
+	// (COREDNS_SERVE_STALE_DURATION "0"/"off").
+	serveStale string
 }
 
 // configFromEnv resolves the COREDNS_* knobs. SetupWithConfig runs it
@@ -168,7 +180,27 @@ func configFromEnv() corednsPatcherConfig {
 		zoneMinDomains:  envx.GetenvInt("COREDNS_PATCHER_ZONE_MIN_DOMAINS", 2),
 		minReplicas:     envx.GetenvInt("COREDNS_MIN_REPLICAS", 4),
 		nodesPerReplica: envx.GetenvInt("COREDNS_NODES_PER_REPLICA", 1),
+		serveStale:      corednsServeStale(envx.Getenv("COREDNS_SERVE_STALE_DURATION", "1h")),
 	}
+}
+
+// corednsServeStale normalizes the COREDNS_SERVE_STALE_DURATION knob:
+// "0"/"off" (any case, plus the usual false-y spellings) disables
+// the serve_stale directive entirely; an unparseable duration warns
+// and falls back to the 1h default — a typo must not silently drop
+// stale-serving protection, and an invalid value would break the
+// Corefile reload it lands in.
+func corednsServeStale(raw string) string {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "", "0", "off", "false", "no", "disabled":
+		return ""
+	}
+	if _, err := time.ParseDuration(v); err != nil {
+		envx.Warnf("COREDNS_SERVE_STALE_DURATION=%q is not a duration — using 1h", raw)
+		return "1h"
+	}
+	return v
 }
 
 // Reconcile delegates to the shared pinned-Deployment skeleton —

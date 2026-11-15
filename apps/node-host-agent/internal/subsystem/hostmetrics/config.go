@@ -165,6 +165,17 @@ type Config struct {
 	// 30s. Seamed so tests don't wait real seconds.
 	LatchInterval time.Duration
 
+	// Self-healing wave knobs — all consumed by the kernelfail
+	// engine (kernelFailDeps): the neighbor-table gc_thresh bump
+	// ceilings and the physical-NIC flap thresholds. <=0 → the
+	// kernelfail defaults (1024/4096/8192 and 4/2/50).
+	NeighGCThresh1Ceiling   int
+	NeighGCThresh2Ceiling   int
+	NeighGCThresh3Ceiling   int
+	NICCarrierFlapThreshold int
+	NICTxTimeoutThreshold   int
+	NICCRErrorThreshold     int
+
 	// collectCacheTTL overrides the Collect snapshot TTL — 0 →
 	// collectSnapshotTTL (10s); a NEGATIVE value disables the cache
 	// (the test fixture pins -1: its scrapes mutate host state

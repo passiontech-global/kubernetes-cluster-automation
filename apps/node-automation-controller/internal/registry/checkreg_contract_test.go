@@ -125,6 +125,14 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		// apiserver-node-reachability — the apiserver-dark detector is
 		// the newest row; appended last so existing order is stable.
 		"apiserver-node-reachability",
+		// apf-selfheal-shield — the APF shield converge check;
+		// appended after apiserver-node-reachability per the
+		// self-healing wave's roster order.
+		"apf-selfheal-shield",
+		// The three L3 workload/drain unstickers close the roster.
+		"statefulset-rollout-unstick",
+		"daemonset-rollout-wedge",
+		"cronjob-forbid-zombie",
 	}
 	var got []string
 	for _, m := range Modules {

@@ -104,6 +104,13 @@ var conditionOrder = []string{
 	latchdefs.LatchPageAllocFailure,
 	latchdefs.LatchAPIServerCacheWedged,
 	latchdefs.LatchSystemdUnresponsive,
+	// Self-healing wave — appended at the tail so the 49 existing
+	// conditions keep their rendered order.
+	latchdefs.LatchDiskPreFail,
+	latchdefs.LatchHardwareCorrupted,
+	latchdefs.LatchGPUHardwareError,
+	latchdefs.LatchHostNetworkProblems,
+	latchdefs.LatchInotifyPressure,
 }
 
 // staleConditionDef is WatchdogStale's def — the one condition whose

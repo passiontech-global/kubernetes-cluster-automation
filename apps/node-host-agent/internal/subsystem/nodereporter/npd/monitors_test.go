@@ -282,6 +282,19 @@ func TestKernelRulePatterns(t *testing.T) {
 		{"INFO: rcu_preempt self-detected stall on CPU { 3 }", "KernelRCUStall", true},
 		{"INFO: rcu_bh detected stall on CPU 0 (t=12345 jiffies)", "KernelRCUStall", true},
 		{"INFO: rcu_sched kthread starved for 100 jiffies", "KernelRCUStall", false},
+		// GPU rules — the plan's Xid set includes the non-fatal 31/43
+		// warning codes alongside the fatal latch set; a code outside
+		// the set must not fire.
+		{"NVRM: Xid (PCI:0000:01:00): 31, pid=1234, channel 0x00000002", "GPUXidError", true},
+		{"NVRM: Xid (PCI:0000:01:00): 43, pid=1234, ...", "GPUXidError", true},
+		{"NVRM: Xid (PCI:0000:01:00): 79, GPU has fallen off the bus.", "GPUXidError", true},
+		{"NVRM: Xid (PCI:0000:01:00): 13, Graphics Engine Exception on GPC 0", "GPUXidError", false},
+		{"NVRM: Xid (PCI:0000:01:00) 79: GPU has fallen off the bus", "GPUXidError", false},
+		// nvidia-uvm driver-hang signatures — channel errors and
+		// global fatal errors.
+		{"NVRM: uvm: ... Detected a channel error on GPC 0", "GPUUVHang", true},
+		{"uvm encountered global fatal error 0x00000001", "GPUUVHang", true},
+		{"NVRM: Xid (PCI:0000:01:00): 31, pid=1", "GPUUVHang", false},
 	}
 	for _, c := range cases {
 		for _, rule := range kernelTempRules {

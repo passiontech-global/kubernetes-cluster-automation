@@ -42,6 +42,9 @@ const (
 	MemoryPSIThrashing       = "MemoryPSIThrashing"       // memory PSI full avg60 thrash
 	KernelResourceExhaustion = "KernelResourceExhaustion" // pid/fd table exhaustion (pid-fd-pressure latch)
 	KernelPageAllocFailure   = "KernelPageAllocFailure"   // kernel page-allocation failure records (page-alloc-failure latch)
+	DiskPreFail              = "DiskPreFail"              // ext4 metadata errors or NVMe SMART pre-fail indicators (disk-prefail latch)
+	HardwareCorrupted        = "HardwareCorrupted"        // ECC/EDAC memory poison, fatal MCE, or PCIe/NVMe reset loop (hardware-corrupted latch)
+	GPUHardwareError         = "GPUHardwareError"         // NVIDIA GPU fatal Xid or nvidia-uvm driver hang (gpu-hardware-error latch)
 
 	// workerhygiene — container/CNI/runtime hygiene checks.
 	CiliumAgentDown        = "CiliumAgentDown"        // cilium-agent healthz down
@@ -70,6 +73,7 @@ const (
 	KonnectivityIPMismatch = "KonnectivityIPMismatch" // konnectivity-agent stale-identifier guard (pod-teardown)
 	CiliumEnvoyXDSReject   = "CiliumEnvoyXDSReject"   // cilium-envoy xDS update_rejected streak
 	DiskBloatRunaway       = "DiskBloatRunaway"       // disk-bloat runaway detector
+	InotifyPressure        = "InotifyPressure"        // inotify instances/watches exhausted past sysctl ceiling (inotify-pressure latch)
 
 	// nethealth — DNS/overlay/nebula/fail2ban/clock guards.
 	DNSFallbackActive   = "DnsFallbackActive"   // /etc/hosts pin fallback engaged
@@ -140,10 +144,14 @@ const CondLocalRemediation = "LocalRemediationInProgress"
 // emitter in this repo; both singular and plural upstream
 // spellings are live in the cluster).
 const (
-	KernelDeadlock         = "KernelDeadlock"         // PERMANENT: hung-task/soft-lockup/RCU-stall, latches True for the agent lifetime
-	ReadonlyFilesystem     = "ReadonlyFilesystem"     // watched mountpoints mounted read-only
-	InodePressure          = "InodePressure"          // kubelet-native inode exhaustion + agent inode-pressure latch (inode-pressure)
-	HostNetworkProblems    = "HostNetworkProblems"    // NPD host network monitor
+	KernelDeadlock     = "KernelDeadlock"     // PERMANENT: hung-task/soft-lockup/RCU-stall, latches True for the agent lifetime
+	ReadonlyFilesystem = "ReadonlyFilesystem" // watched mountpoints mounted read-only
+	InodePressure      = "InodePressure"      // kubelet-native inode exhaustion + agent inode-pressure latch (inode-pressure)
+	// HostNetworkProblems is BOTH the NPD host-network monitor spelling
+	// AND — since the kernelfail NIC-health guard — an agent-latched
+	// condition (host-network-problems latch off physical carrier flap /
+	// CRC / TX-timeout evidence), so it sits in HeartbeatSweptNames.
+	HostNetworkProblems    = "HostNetworkProblems"    // NPD host network monitor + agent NIC-health latch
 	ClusterNetworkProblems = "ClusterNetworkProblems" // NPD cluster network monitor
 	HostNetworkProblem     = "HostNetworkProblem"     // singular upstream spelling, still live
 	ClusterNetworkProblem  = "ClusterNetworkProblem"  // singular upstream spelling, still live
@@ -185,6 +193,14 @@ var HeartbeatSweptNames = []string{
 	NebulaMTUBlackhole, NebulaSlowpath, NebulaSiteedge,
 	KernelPageAllocFailure,
 	ApiserverWatchCacheWedged,
+	// Wave self-healing additions: the kernelfail hardware/neighbor/NIC
+	// guards and the workerhygiene inotify healer all project latches
+	// through nodereporter, so their conditions ride the same heartbeat
+	// — HostNetworkProblems joins because the NIC-health guard now owns
+	// the host-network spelling too (NPD no longer has a separate
+	// emitter for it).
+	DiskPreFail, HardwareCorrupted, GPUHardwareError,
+	InotifyPressure, HostNetworkProblems,
 }
 
 // HangPreCordonNames are the hang-class conditions node-hang-
@@ -211,6 +227,13 @@ var HangPreCordonNames = []string{
 	// SystemdUnresponsive joins too: a frozen PID1 cannot manage
 	// the node's services — cordon ahead of the NHC reboot.
 	KernelPageAllocFailure, DiskBloatRunaway, SystemdUnresponsive,
+	// HardwareCorrupted (ECC/EDAC poison, fatal MCE, PCIe/NVMe reset
+	// loop), GPUHardwareError (fatal NVIDIA Xid), and InotifyPressure
+	// (inotify instances/watches exhausted) join the 2-minute hang
+	// fuse: each is proof the node is actively degrading and new pods
+	// must stay off it. DiskPreFail deliberately does NOT live here —
+	// it gets its own longer fuse in DiskPreFailPreCordonNames.
+	HardwareCorrupted, GPUHardwareError, InotifyPressure,
 }
 
 // ClockSkewPreCordonNames are the clock-health conditions on the
@@ -222,6 +245,16 @@ var HangPreCordonNames = []string{
 // longer fuse).
 var ClockSkewPreCordonNames = []string{
 	ClockUnsynchronized, ClockSkewDetected, ClocksourceUnstable,
+}
+
+// DiskPreFailPreCordonNames is the pre-fail disk condition on its
+// own longer fuse — an ext4 metadata error or NVMe SMART pre-fail
+// indicator means the disk may still be serving, so the node gets
+// 15 minutes of corroboration (vs the 2m hang fuse) before the
+// precordon acts. Separate list for the same reason
+// ClockSkewPreCordonNames exists: the fuse differs.
+var DiskPreFailPreCordonNames = []string{
+	DiskPreFail,
 }
 
 // StormGateNames are the node-unhealthy conditions the
@@ -263,6 +296,10 @@ var StormGateNames = []string{
 	KernelPageAllocFailure, DiskBloatRunaway,
 	CiliumEnvoyXDSReject, NebulaSlowpath, NebulaSiteedge,
 	NebulaMTUBlackhole,
+	// Self-healing wave: hardware corruption, GPU fatal Xid, disk
+	// pre-fail, and inotify exhaustion are all "node is degrading —
+	// do not rebalance more pods onto it" signals.
+	DiskPreFail, HardwareCorrupted, GPUHardwareError, InotifyPressure,
 }
 
 // PartitionNames are the network-partition conditions the

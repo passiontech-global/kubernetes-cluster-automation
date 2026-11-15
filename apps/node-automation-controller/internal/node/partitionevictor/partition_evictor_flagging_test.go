@@ -199,8 +199,11 @@ func TestPartitionEvictorNebulaPMTUBlackhole(t *testing.T) {
 // A NebulaIsolated latch whose heartbeat froze is a zombie — the
 // wedged nodereporter cannot vouch for the partition anymore, so the
 // node is neither tainted nor its pods evicted. The NWPD monitor
-// spellings are not agent-managed: a frozen heartbeat on
-// HostNetworkProblems still flags the node.
+// spellings are not agent-managed: a frozen heartbeat on the
+// singular HostNetworkProblem still flags the node.
+// (Plural HostNetworkProblems joined HeartbeatSweptNames when the
+// NIC-health latch started owning that spelling — it is agent-managed
+// now, so a missing heartbeat makes it a zombie like NebulaIsolated.)
 func TestPartitionEvictorZombieHeartbeatNotFlagged(t *testing.T) {
 	t.Setenv(partitionNSsEnv, "flux-system")
 	stale := pePartitionedNode("p1", "NebulaIsolated", 20*time.Minute)
@@ -210,8 +213,9 @@ func TestPartitionEvictorZombieHeartbeatNotFlagged(t *testing.T) {
 				metav1.NewTime(time.Now().Add(-2 * partitionCondHeartbeatMaxAge))
 		}
 	}
-	// Same fleet, NWPD spelling with NO heartbeat at all — still flags.
-	nwpd := pePartitionedNode("p2", "HostNetworkProblems", 20*time.Minute)
+	// Same fleet, NWPD singular spelling with NO heartbeat at all —
+	// still flags (it is not in HeartbeatSweptNames).
+	nwpd := pePartitionedNode("p2", "HostNetworkProblem", 20*time.Minute)
 	nwpd.Status.Conditions[1].LastHeartbeatTime = metav1.Time{}
 	objs := append([]runtime.Object{
 		stale, nwpd,
