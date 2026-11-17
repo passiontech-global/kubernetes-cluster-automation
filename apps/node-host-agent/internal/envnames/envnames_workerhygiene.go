@@ -69,4 +69,43 @@ const (
 	EnvInotifyMaxWatchesCeiling   = "NODE_HOST_AGENT_INOTIFY_MAX_WATCHES_CEILING"
 	EnvInotifyEvictRunawayPod     = "NODE_HOST_AGENT_INOTIFY_EVICT_RUNAWAY_POD"
 	EnvOrphanPodVolsMinAge        = "NODE_HOST_AGENT_ORPHAN_POD_VOLS_MIN_AGE"
+
+	// Wave-2 self-healing guards (P0.3–P2.12) — ephemeral-port
+	// exhaustion, hung OCI runtimes, CSI registration, GPU PCIe
+	// desync, and the netfilter lock wedge. The P0.3/P1.5/P2.11
+	// names below are the plan's contract names; the *_GUARD_*
+	// extras are implementation knobs layered on top.
+	EnvPortTupleRatioThreshold     = "NODE_HOST_AGENT_PORT_TUPLE_RATIO"
+	EnvPortCloseWaitMax            = "NODE_HOST_AGENT_PORT_CLOSE_WAIT_MAX"
+	EnvPortDestroySynSent          = "NODE_HOST_AGENT_PORT_DESTROY_SYN_SENT"
+	EnvPortSynSentMinRetrans       = "NODE_HOST_AGENT_PORT_SYN_SENT_MIN_RETRANS"
+	EnvPortEvictRunawayPod         = "NODE_HOST_AGENT_PORT_EVICT_RUNAWAY_POD"
+	EnvMaxConcurrent               = "NODE_HOST_AGENT_MAX_CONCURRENT"
+	EnvPortLeakWindowSec           = "NODE_HOST_AGENT_PORT_LEAK_WINDOW_SECONDS"
+	EnvPortLeakMinPct              = "NODE_HOST_AGENT_PORT_LEAK_MIN_PCT"
+	EnvPortLeakEvictCooldownMin    = "NODE_HOST_AGENT_PORT_LEAK_EVICT_COOLDOWN_MIN"
+	EnvCtrRuncMaxAge               = "NODE_HOST_AGENT_CTR_RUNC_MAX_AGE"
+	EnvCtrKillHungRunc             = "NODE_HOST_AGENT_CTR_KILL_HUNG_RUNC"
+	EnvHungRuncConfirmCycles       = "NODE_HOST_AGENT_RUNC_HANG_CONFIRM_CYCLES"
+	EnvHungRuncMaxKillsPerCycle    = "NODE_HOST_AGENT_RUNC_HANG_MAX_KILLS_PER_CYCLE"
+	EnvCSIGuardMode                = "NODE_HOST_AGENT_CSI_GUARD_MODE"
+	EnvCSIHealEnabled              = "NODE_HOST_AGENT_CSI_HEAL_ENABLED"
+	EnvCSIGuardProbeSec            = "NODE_HOST_AGENT_CSI_GUARD_PROBE_SECONDS"
+	EnvCSIGuardECONNRefusedCycles  = "NODE_HOST_AGENT_CSI_GUARD_ECONNREFUSED_CYCLES"
+	EnvCSIGuardMissingMin          = "NODE_HOST_AGENT_CSI_GUARD_MISSING_MINUTES"
+	EnvCSIGuardBounceCooldownMin   = "NODE_HOST_AGENT_CSI_GUARD_BOUNCE_COOLDOWN_MIN"
+	EnvGPUGuardMode                = "NODE_HOST_AGENT_GPU_GUARD_MODE"
+	EnvGPUHealEnabled              = "NODE_HOST_AGENT_GPU_HEAL_ENABLED"
+	EnvGPUGuardProbeSec            = "NODE_HOST_AGENT_GPU_GUARD_PROBE_SECONDS"
+	EnvGPUGuardDesyncMin           = "NODE_HOST_AGENT_GPU_GUARD_DESYNC_MINUTES"
+	EnvGPUGuardBounceCooldownMin   = "NODE_HOST_AGENT_GPU_GUARD_BOUNCE_COOLDOWN_MIN"
+	EnvNetfilterMaxAge             = "NODE_HOST_AGENT_NETFILTER_MAX_AGE"
+	EnvNetfilterKillHung           = "NODE_HOST_AGENT_NETFILTER_KILL_HUNG"
+	EnvNetfilterGuardMode          = "NODE_HOST_AGENT_NETFILTER_GUARD_MODE"
+	EnvNetfilterGuardIntervalSec   = "NODE_HOST_AGENT_NETFILTER_GUARD_INTERVAL_SECONDS"
+	EnvNetfilterGuardCmdTimeoutSec = "NODE_HOST_AGENT_NETFILTER_GUARD_CMD_TIMEOUT_SECONDS"
+	EnvNetfilterGuardLockPath      = "NODE_HOST_AGENT_NETFILTER_GUARD_LOCK_PATH"
+	EnvNetfilterGuardStuckCycles   = "NODE_HOST_AGENT_NETFILTER_GUARD_STUCK_CONFIRM_CYCLES"
+	EnvNetfilterGuardMaxKillsCycle = "NODE_HOST_AGENT_NETFILTER_GUARD_MAX_KILLS_PER_CYCLE"
+	EnvNetfilterGuardLegacyProbe   = "NODE_HOST_AGENT_NETFILTER_GUARD_LEGACY_TABLE_PROBE"
 )

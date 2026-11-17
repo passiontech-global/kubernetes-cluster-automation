@@ -122,6 +122,12 @@ type Series struct {
 	// while the app is frozen. Surfaced as
 	// node_agent_container_pipe_blocked.
 	PipeBlockedProcs int64
+	// IPTablesLegacyLeakedRules is the netfilter-guard's count of
+	// real "-A " rules in iptables-legacy-save — nonzero on an
+	// iptables-nft host means legacy rules leaked into the kernel
+	// (the split-brain the guard exists to surface). Surfaced as
+	// node_agent_iptables_legacy_leaked_rules.
+	IPTablesLegacyLeakedRules int64
 }
 
 // Deps is the shared state every Check consumes — the split's

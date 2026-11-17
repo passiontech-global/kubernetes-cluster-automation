@@ -265,15 +265,19 @@ func v6String(b []byte) string {
 // inet_diag_destroy walks the matching sockets and drops them.
 
 const (
-	tcpStateListen = 10 // TCP_LISTEN in include/net/tcp_states.h
-	sockidLen      = 48 // sizeof(struct inet_diag_sockid)
+	tcpStateListen  = 10 // TCP_LISTEN in include/net/tcp_states.h
+	tcpStateSynSent = 2  // TCP_SYN_SENT — the stuck-connect state P0.3 reaps
+	sockidLen       = 48 // sizeof(struct inet_diag_sockid)
 )
 
 // sockMatch is one socket the destroy phase will kill: the address
-// family plus the 48-byte idiag_sockid copied out of the dump.
+// family, the idiag_retrans counter (SYN_SENT retransmit count —
+// the wedge evidence), and the 48-byte idiag_sockid copied out of
+// the dump.
 type sockMatch struct {
-	family uint8
-	id     [sockidLen]byte
+	family  uint8
+	retrans uint8
+	id      [sockidLen]byte
 }
 
 // DestroyListenersOnPort kills every TCP LISTEN socket bound to
@@ -289,6 +293,121 @@ func DestroyListenersOnPort(pid int, port uint16) (int, error) {
 		return err
 	})
 	return killed, err
+}
+
+// DestroyStuckSynSent kills TCP sockets wedged in SYN_SENT in pid's
+// netns — the ephemeral-port guard's half of P0.3. Only sockets
+// whose idiag_retrans (byte offset 3 of inet_diag_msg) reaches
+// minRetrans count as wedged: a fresh SYN_SENT is a normal
+// in-flight connect the kernel's own retransmit timer will resolve,
+// while retrans >= 4 means the peer is unreachable and the socket
+// pins an ephemeral port for minutes. maxKills bounds the destroy
+// storm per call. Same dump→sockid→SOCK_DESTROY sequence as
+// destroyListeners, filtered to TCP_SYN_SENT on both families.
+// Returns the number of sockets destroyed.
+func DestroyStuckSynSent(pid int, minRetrans uint8, maxKills int) (int, error) {
+	var killed int
+	err := InNetNS(pid, func() error {
+		var err error
+		killed, err = destroyByState(pid, tcpStateSynSent, minRetrans, maxKills)
+		return err
+	})
+	return killed, err
+}
+
+// destroyByState dumps the TCP table filtered to one idiag state
+// and SOCK_DESTROYs every sockid it finds whose idiag_retrans
+// reaches minRetrans — the generalized form of destroyListeners
+// (which is the LISTEN special case with a port filter). Runs
+// inside the caller's (already-scoped) netns.
+func destroyByState(pid int, state uint8, minRetrans uint8,
+	maxKills int) (int, error) {
+	fd, err := diagSock()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
+
+	bufp := diagBufPool.Get().(*[]byte)
+	defer diagBufPool.Put(bufp)
+	buf := *bufp
+
+	var matches []sockMatch
+	stateMask := uint32(1) << state
+	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
+		if err := unix.Sendto(fd, diagRequest(1, family, stateMask, nil,
+			unix.SOCK_DIAG_BY_FAMILY, unix.NLM_F_REQUEST|unix.NLM_F_DUMP),
+			0, sa); err != nil {
+			return 0, fmt.Errorf("sock_diag send %d: %w", family, err)
+		}
+		if err := diagRecvLoop(fd, buf, fmt.Sprintf("sock_diag recv %d", family), func(b []byte) (bool, error) {
+			return collectStateSockets(b, family, state, &matches)
+		}); err != nil {
+			if family == unix.AF_INET6 && noInet6Family(err) {
+				continue
+			}
+			return 0, err
+		}
+	}
+
+	// Only wedged sockets die: idiag_retrans >= minRetrans, capped
+	// at maxKills per call so one cycle cannot storm the kernel.
+	killed := 0
+	for i, m := range wedgedSynSent(matches, minRetrans, maxKills) {
+		req := diagRequest(uint32(100+i), m.family, 0xFFF, &m.id,
+			unix.SOCK_DESTROY, unix.NLM_F_REQUEST|unix.NLM_F_ACK)
+		if err := unix.Sendto(fd, req, 0, sa); err != nil {
+			return killed, fmt.Errorf("sock_diag destroy send: %w", err)
+		}
+		if err := diagRecvLoop(fd, buf, "sock_diag destroy recv", func(b []byte) (bool, error) {
+			return true, parseDiagAck(b)
+		}); err != nil {
+			return killed, err
+		}
+		killed++
+	}
+	return killed, nil
+}
+
+// wedgedSynSent selects the sockids eligible for SOCK_DESTROY:
+// idiag_retrans >= minRetrans (fresh in-flight connects stay
+// alive — the kernel's own retransmit timer resolves them) and at
+// most maxKills picks so one cycle cannot storm the kernel.
+func wedgedSynSent(matches []sockMatch, minRetrans uint8,
+	maxKills int) []sockMatch {
+	var out []sockMatch
+	for _, m := range matches {
+		if m.retrans < minRetrans || len(out) >= maxKills {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// collectStateSockets folds one dump batch into matches — every
+// socket whose idiag_state equals state (the kernel-side
+// idiag_states filter already narrowed the reply, so this is a
+// belt-and-suspenders recheck). done=true on NLMSG_DONE.
+func collectStateSockets(buf []byte, family uint8, state uint8,
+	matches *[]sockMatch) (bool, error) {
+	_, done, err := walkNLMsgs(buf, false, func(payload []byte) {
+		if len(payload) < 4+sockidLen {
+			return
+		}
+		if payload[0] == family && payload[1] == state {
+			var m sockMatch
+			m.family = payload[0]
+			// idiag_retrans sits at inet_diag_msg offset 3 —
+			// the SYN_SENT retransmit counter the wedge filter
+			// keys on.
+			m.retrans = payload[3]
+			copy(m.id[:], payload[4:4+sockidLen])
+			*matches = append(*matches, m)
+		}
+	})
+	return done, err
 }
 
 // diagSock opens a bound NETLINK_SOCK_DIAG socket with the same

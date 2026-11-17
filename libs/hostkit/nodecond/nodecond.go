@@ -46,6 +46,13 @@ const (
 	HardwareCorrupted        = "HardwareCorrupted"        // ECC/EDAC memory poison, fatal MCE, or PCIe/NVMe reset loop (hardware-corrupted latch)
 	GPUHardwareError         = "GPUHardwareError"         // NVIDIA GPU fatal Xid or nvidia-uvm driver hang (gpu-hardware-error latch)
 
+	// workerhygiene/kernelfail — the self-healing wave-2 pressure
+	// and wedge latches.
+	EphemeralPortPressure = "EphemeralPortPressure" // P0.3: 4-tuple ephemeral port or CLOSE_WAIT socket exhaustion
+	NeighborTablePressure = "NeighborTablePressure" // P0.4: ARP/NDISC neighbor table pinned past ceiling after flush
+	NetfilterLockWedged   = "NetfilterLockWedged"   // P2.11: /run/xtables.lock held across cycles
+	CSIRegistrationWedged = "CSIRegistrationWedged" // P1.6: kubelet plugins_registry / CSINode desynced from live CSI node pod
+
 	// workerhygiene — container/CNI/runtime hygiene checks.
 	CiliumAgentDown        = "CiliumAgentDown"        // cilium-agent healthz down
 	CiliumInitStuck        = "CiliumInitStuck"        // cilium endpoints stuck in init
@@ -201,6 +208,11 @@ var HeartbeatSweptNames = []string{
 	// emitter for it).
 	DiskPreFail, HardwareCorrupted, GPUHardwareError,
 	InotifyPressure, HostNetworkProblems,
+	// Wave-2 self-healing additions: the four new latch-backed
+	// conditions (ephemeral-port/neighbor pressure, netfilter lock
+	// wedge, CSI registration wedge) ride the same heartbeat.
+	EphemeralPortPressure, NeighborTablePressure,
+	NetfilterLockWedged, CSIRegistrationWedged,
 }
 
 // HangPreCordonNames are the hang-class conditions node-hang-
@@ -234,6 +246,13 @@ var HangPreCordonNames = []string{
 	// must stay off it. DiskPreFail deliberately does NOT live here —
 	// it gets its own longer fuse in DiskPreFailPreCordonNames.
 	HardwareCorrupted, GPUHardwareError, InotifyPressure,
+	// Wave-2 self-healing additions: all four new conditions take
+	// the standard 2m hang fuse — a node whose ephemeral-port or
+	// neighbor table is pinned past ceiling, whose netfilter lock
+	// is wedged, or whose CSI registration desynced is actively
+	// degrading and new pods must stay off it.
+	EphemeralPortPressure, NeighborTablePressure,
+	NetfilterLockWedged, CSIRegistrationWedged,
 }
 
 // ClockSkewPreCordonNames are the clock-health conditions on the
@@ -300,6 +319,12 @@ var StormGateNames = []string{
 	// pre-fail, and inotify exhaustion are all "node is degrading —
 	// do not rebalance more pods onto it" signals.
 	DiskPreFail, HardwareCorrupted, GPUHardwareError, InotifyPressure,
+	// Wave-2 self-healing additions: port/neighbor exhaustion and
+	// the two wedge conditions are all "node is degrading — do not
+	// rebalance more pods onto it" signals (the precordon members
+	// must also appear here per TestAllPreCordonConditionsInStormGate).
+	EphemeralPortPressure, NeighborTablePressure,
+	NetfilterLockWedged, CSIRegistrationWedged,
 }
 
 // PartitionNames are the network-partition conditions the

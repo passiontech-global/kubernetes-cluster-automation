@@ -66,6 +66,16 @@ func (r *corednsPatcher) reconcileCorefile(ctx context.Context) error {
 		return nil
 	}
 	rewritten, changed := corefileCacheHeal(corefile, r.serveStale)
+	// forwardMaxConcurrent is always populated by configFromEnv;
+	// a literal-constructed patcher (tests) falls back to the same
+	// 2000 default rather than injecting an empty `max_concurrent`.
+	maxConc := r.forwardMaxConcurrent
+	if maxConc == "" {
+		maxConc = "2000"
+	}
+	if fwd, fchanged := corefileForwardHeal(rewritten, maxConc); fchanged {
+		rewritten, changed = fwd, true
+	}
 	if !changed {
 		return nil
 	}
@@ -255,6 +265,119 @@ func serveStaleLines(indent, serveStale string) string {
 		return ""
 	}
 	return indent + "    serve_stale " + serveStale + " immediate\n"
+}
+
+// corefileForwardHeal ensures every `forward` directive carries a
+// `max_concurrent <N>` option (P1.7a) — the forward plugin's
+// concurrency cap whose overflow shows up as
+// coredns_forward_max_concurrent_rejects_total, the metric
+// coredns-forward-saturation watches. A forward line without an
+// options block gains an inline `{ max_concurrent N }`; an
+// existing block (inline or multi-line) gains the directive only
+// when no `max_concurrent` token is already present — a declared
+// value is never fought (same idempotence rule as the cache heal;
+// a GitOps-pinned different value is respected and the Flux patch
+// gate stops any ping-pong). maxConcurrent is the validated
+// COREDNS_FORWARD_MAX_CONCURRENT value — always a positive integer
+// string, so the injected Corefile can never be malformed by this
+// path.
+func corefileForwardHeal(corefile, maxConcurrent string) (string, bool) {
+	directive := "max_concurrent " + maxConcurrent
+	lines := strings.Split(corefile, "\n")
+	changed := false
+	for i := 0; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		fields := strings.Fields(trimmed)
+		if len(fields) == 0 || fields[0] != "forward" {
+			continue
+		}
+		indent := lines[i][:len(lines[i])-len(strings.TrimLeft(lines[i], " \t"))]
+		code := strings.TrimSpace(stripCorefileComment(trimmed))
+		open := strings.Index(code, "{")
+		switch {
+		case open < 0:
+			// No options block: `forward . 8.8.8.8` gains an inline
+			// block. A trailing comment stays at end-of-line,
+			// outside the braces.
+			comment := ""
+			if hash := strings.Index(lines[i], "#"); hash >= 0 {
+				if c := strings.TrimSpace(lines[i][hash:]); c != "" {
+					comment = " " + c
+				}
+			}
+			lines[i] = indent + code + " { " + directive + " }" + comment
+			changed = true
+		case strings.LastIndex(code, "}") > open:
+			// Inline single-line block — inject before the closing
+			// brace unless max_concurrent already appears inside.
+			inner := code[open+1 : strings.LastIndex(code, "}")]
+			if fieldsHave(inner, "max_concurrent") {
+				continue
+			}
+			// Locate the `}` in the ORIGINAL line: it is the last
+			// `}` before any `#` comment.
+			codeEnd := len(lines[i])
+			if hash := strings.Index(lines[i], "#"); hash >= 0 {
+				codeEnd = hash
+			}
+			closeIdx := strings.LastIndex(lines[i][:codeEnd], "}")
+			if closeIdx < 0 {
+				continue // defensive — code promised a `}`
+			}
+			before := lines[i][:closeIdx]
+			sep := ""
+			if before != "" && !strings.HasSuffix(before, " ") &&
+				!strings.HasSuffix(before, "\t") {
+				sep = " "
+			}
+			lines[i] = before + sep + directive + " " + lines[i][closeIdx:]
+			changed = true
+		default:
+			// Multi-line block: the option may already sit on the
+			// open line after `{`; otherwise scan the body for the
+			// directive and the matching close (comment-stripped
+			// brace depth, same rule as the cache heal).
+			headHas := fieldsHave(code[open+1:], "max_concurrent")
+			depth := strings.Count(code, "{") - strings.Count(code, "}")
+			found := headHas
+			closeIdx := -1
+			for j := i + 1; j < len(lines) && depth > 0; j++ {
+				t := strings.TrimSpace(stripCorefileComment(lines[j]))
+				depth += strings.Count(t, "{") - strings.Count(t, "}")
+				if !found && len(t) > 0 &&
+					strings.Fields(t)[0] == "max_concurrent" {
+					found = true
+				}
+				if depth == 0 {
+					closeIdx = j
+				}
+			}
+			if closeIdx >= 0 && !found {
+				lines[closeIdx] = indent + "    " + directive + "\n" +
+					lines[closeIdx]
+				changed = true
+			}
+			if closeIdx >= 0 {
+				i = closeIdx
+			}
+		}
+	}
+	if !changed {
+		return corefile, false
+	}
+	return strings.Join(lines, "\n"), true
+}
+
+// fieldsHave reports whether any whitespace-separated field of s
+// equals want — the directive-presence check for forward-block
+// options (max_concurrent appears as a bare token).
+func fieldsHave(s, want string) bool {
+	for f := range strings.FieldsSeq(s) {
+		if f == want {
+			return true
+		}
+	}
+	return false
 }
 
 // stripCorefileComment cuts a Corefile line at its first `#` —

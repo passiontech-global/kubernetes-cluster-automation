@@ -133,6 +133,14 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"statefulset-rollout-unstick",
 		"daemonset-rollout-wedge",
 		"cronjob-forbid-zombie",
+		// The six self-healing wave-2 checks — appended after the
+		// existing roster per the plan.
+		"apiserver-write-storm-breaker",
+		"critical-daemonset-starvation",
+		"coredns-forward-saturation",
+		"hpa-scaling-guard",
+		"deployment-rollout-wedge",
+		"subpath-config-drift",
 	}
 	var got []string
 	for _, m := range Modules {

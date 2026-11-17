@@ -207,6 +207,15 @@ const (
 	// ActionEgressHeal heads overlay_egress.go's rule-repair line —
 	// the TincEgressHeal rule matches it.
 	ActionEgressHeal = ActionPrefix + "heal egress"
+
+	// --- wave-2 self-healing ACTION entry names ---
+	// Each is the <name> half of "ACTION <name>: ..." the emitting
+	// check writes once per latch entry (ActionEntryPrefix), shared
+	// by the nodereporter filelog rule that fires the Event.
+	ActionHungRuncKill      = "hung-runc-kill"      // runc_hang.go P1.5
+	ActionNetfilterHungKill = "netfilter-hung-kill" // netfilter_guard.go P2.11
+	ActionPortLeakEvict     = "port-leak-evict"     // runtime_ephemeral_ports.go P0.3
+	ActionCSIRegBounce      = "csi-reg-bounce"      // csi_gpu_reg.go P1.6
 )
 
 // --- suspect/evidence keyword tokens ---

@@ -277,6 +277,9 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	b.Gauge("node_agent_container_pipe_blocked",
 		"Pod processes stuck in pipe_write (state S) past the persist window — container stdout pipe freeze, pipe-write-freeze.",
 		float64(d.Series.PipeBlockedProcs))
+	b.Gauge("node_agent_iptables_legacy_leaked_rules",
+		"Real \"-A \" rules counted by iptables-legacy-save while /proc/1/net/ip_tables_names is non-empty — iptables-nft/legacy split-brain leakage, netfilter-guard.",
+		float64(d.Series.IPTablesLegacyLeakedRules))
 	if err := promfile.Write(dir, "node-agent-hygiene.prom",
 		[]byte(b.String())); err != nil {
 		fail(err)

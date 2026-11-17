@@ -107,6 +107,14 @@ func (h *Hygiene) initChecks() {
 	// the inotify pressure healer, then the orphan pod-volume reaper.
 	add(runtime.NewInotifyPressure(d)) // wdeps.CheckInotifyHygiene
 	add(ctr.NewOrphanPodVols(d))       // wdeps.CheckOrphanPodVols
+	// Wave-2 self-healing guards — appended at the tail in the
+	// declared check order (P0.3 ports → P1.5 runc → P1.6 CSI →
+	// P2.12 GPU → P2.11 netfilter); order is load-bearing.
+	add(runtime.NewEphemeralPorts(d)) // wdeps.CheckEphemeralPorts
+	add(ctr.NewHungRunc(d))           // wdeps.CheckHungRunc
+	add(runtime.NewCSIGuard(d))       // wdeps.CheckCSIGuard
+	add(runtime.NewGPUGuard(d))       // wdeps.CheckGPUGuard
+	add(guards.NewNetfilterGuard(d))  // wdeps.CheckNetfilterGuard
 	// A single UNGATED group: the unit-file and uptime gates return
 	// early in Cycle and workerActive gates inside each check
 	// (per-check cycles{check,"gated"}) — none map onto

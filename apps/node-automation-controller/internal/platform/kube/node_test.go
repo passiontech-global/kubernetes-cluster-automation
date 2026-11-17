@@ -364,3 +364,57 @@ func TestCountNotReadyNodesCached(t *testing.T) {
 		t.Fatalf("expected 2 NotReady from cache, got %d", n)
 	}
 }
+
+// CompatNodeLabels is the shared one-way GA→deprecated node-label
+// sync (P0.2b/P0.2a): GA key present + deprecated twin missing →
+// fill it; existing deprecated labels are never overwritten;
+// control-plane nodes additionally gain the master role labels.
+func TestCompatNodeLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   map[string]string
+	}{
+		{"empty labels — nothing to sync", nil, map[string]string{}},
+		{"ga labels fill deprecated twins",
+			map[string]string{
+				"kubernetes.io/os":              "linux",
+				"kubernetes.io/arch":            "amd64",
+				"topology.kubernetes.io/zone":   "z1",
+				"topology.kubernetes.io/region": "r1",
+			},
+			map[string]string{
+				"beta.kubernetes.io/os":                    "linux",
+				"beta.kubernetes.io/arch":                  "amd64",
+				"failure-domain.beta.kubernetes.io/zone":   "z1",
+				"failure-domain.beta.kubernetes.io/region": "r1",
+			}},
+		{"existing deprecated label never overwritten",
+			map[string]string{
+				"kubernetes.io/os":      "linux",
+				"beta.kubernetes.io/os": "windows",
+			},
+			map[string]string{}},
+		{"control-plane gains master role labels",
+			map[string]string{"node-role.kubernetes.io/control-plane": ""},
+			map[string]string{
+				"node-role.kubernetes.io/master": "",
+				"master":                         "",
+			}},
+		{"worker node gains no master labels",
+			map[string]string{"node-role.kubernetes.io/worker": ""},
+			map[string]string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CompatNodeLabels(tc.labels)
+			if len(got) != len(tc.want) {
+				t.Fatalf("CompatNodeLabels = %v, want %v", got, tc.want)
+			}
+			for k, v := range tc.want {
+				if got[k] != v {
+					t.Fatalf("CompatNodeLabels[%q] = %q, want %q (all: %v)", k, got[k], v, got)
+				}
+			}
+		})
+	}
+}

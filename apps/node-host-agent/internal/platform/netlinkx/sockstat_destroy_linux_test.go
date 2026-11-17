@@ -197,6 +197,74 @@ func TestCollectPortListenersDoneAndError(t *testing.T) {
 	}
 }
 
+// synSentMsg is inetDiagMsg plus the idiag_retrans byte (inet_diag_msg
+// offset 3 = msg[19]) the SYN_SENT wedge filter keys on.
+func synSentMsg(family uint8, retrans uint8, sport uint16) []byte {
+	msg := inetDiagMsg(family, tcpStateSynSent, sport, 0)
+	msg[19] = retrans
+	return msg
+}
+
+func TestCollectStateSocketsReadsRetrans(t *testing.T) {
+	var matches []sockMatch
+	batch := append(
+		append(synSentMsg(unix.AF_INET, 2, 40001),
+			synSentMsg(unix.AF_INET, 7, 40002)...),
+		synSentMsg(unix.AF_INET6, 9, 40003)...)
+	done, err := collectStateSockets(batch, unix.AF_INET, tcpStateSynSent, &matches)
+	if err != nil || done {
+		t.Fatalf("collectStateSockets: done=%v err=%v", done, err)
+	}
+	// The family recheck: AF_INET filter collects only the two v4
+	// sockets; the v6 message is skipped.
+	if len(matches) != 2 || matches[0].retrans != 2 || matches[1].retrans != 7 {
+		t.Fatalf("matches=%+v want two v4 sockets retrans 2/7",
+			matches)
+	}
+	matches = nil
+	if _, err := collectStateSockets(batch, unix.AF_INET6, tcpStateSynSent, &matches); err != nil {
+		t.Fatalf("collectStateSockets v6: %v", err)
+	}
+	if len(matches) != 1 || matches[0].retrans != 9 {
+		t.Fatalf("v6 matches=%+v want one socket retrans 9", matches)
+	}
+}
+
+func TestWedgedSynSentFilterAndCap(t *testing.T) {
+	var matches []sockMatch
+	// 5 wedged (retrans 9) + 2 fresh (retrans 1) SYN_SENT sockets.
+	batch := make([]byte, 0)
+	for i := 0; i < 5; i++ {
+		batch = append(batch, synSentMsg(unix.AF_INET, 9, uint16(41000+i))...)
+	}
+	for i := 0; i < 2; i++ {
+		batch = append(batch, synSentMsg(unix.AF_INET, 1, uint16(42000+i))...)
+	}
+	if _, err := collectStateSockets(batch, unix.AF_INET, tcpStateSynSent, &matches); err != nil {
+		t.Fatalf("collectStateSockets: %v", err)
+	}
+	if len(matches) != 7 {
+		t.Fatalf("collected %d want 7", len(matches))
+	}
+
+	got := wedgedSynSent(matches, 4, 128)
+	if len(got) != 5 {
+		t.Fatalf("wedgedSynSent(minRetrans=4)=%d want 5 — fresh "+
+			"in-flight SYN_SENT sockets must stay alive", len(got))
+	}
+	// minRetrans above every counter → nothing is wedged.
+	if got := wedgedSynSent(matches, 10, 128); len(got) != 0 {
+		t.Fatalf("wedgedSynSent(minRetrans=10)=%d want 0", len(got))
+	}
+	// maxKills bounds the per-cycle destroy storm.
+	if got := wedgedSynSent(matches, 4, 2); len(got) != 2 {
+		t.Fatalf("wedgedSynSent(maxKills=2)=%d want 2", len(got))
+	}
+	if got := wedgedSynSent(matches, 4, 0); len(got) != 0 {
+		t.Fatalf("wedgedSynSent(maxKills=0)=%d want 0", len(got))
+	}
+}
+
 func TestParseDiagAck(t *testing.T) {
 	// Empty / trailing short bytes return nil.
 	if err := parseDiagAck(nil); err != nil {

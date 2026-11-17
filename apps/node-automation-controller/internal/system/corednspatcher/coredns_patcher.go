@@ -54,6 +54,7 @@ package corednspatcher
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,6 +94,15 @@ type corednsPatcher struct {
 	minReplicas     int
 	nodesPerReplica int
 	serveStale      string
+	// forwardMaxConcurrent is the validated
+	// COREDNS_FORWARD_MAX_CONCURRENT value injected into every
+	// Corefile forward block (P1.7a).
+	forwardMaxConcurrent string
+	// boostReplicas is COREDNS_SATURATION_BOOST_REPLICAS — the
+	// temporary replica surge the proportional pin adds while the
+	// coredns-forward-saturation check's AnnoCoreDNSBoostUntil stamp
+	// is fresh (P1.7b).
+	boostReplicas int
 }
 
 // The watch wiring below installs this package-level predicate
@@ -148,7 +158,8 @@ func Setup(d shared.Deps) error {
 		}.WatchNodes(b, "coredns-patcher-sweep")
 		r := &corednsPatcher{cs: d.CS, nodeReader: d.CachedClient(), zoneWhen: cfg.zoneWhen,
 			minDomains: cfg.zoneMinDomains, minReplicas: cfg.minReplicas, nodesPerReplica: cfg.nodesPerReplica,
-			serveStale: cfg.serveStale, reader: d.CachedClient()}
+			serveStale: cfg.serveStale, forwardMaxConcurrent: cfg.forwardMaxConcurrent,
+			boostReplicas: cfg.boostReplicas, reader: d.CachedClient()}
 		// CountReconcile owns the returned-error accounting — one
 		// IncError per non-nil Reconcile return; the reconcile body
 		// never IncErrors an error it returns.
@@ -168,6 +179,14 @@ type corednsPatcherConfig struct {
 	// the Corefile cache blocks — "" disables the directive
 	// (COREDNS_SERVE_STALE_DURATION "0"/"off").
 	serveStale string
+	// forwardMaxConcurrent is the validated
+	// COREDNS_FORWARD_MAX_CONCURRENT value (always a positive
+	// integer string) injected as `max_concurrent` into every
+	// Corefile forward block.
+	forwardMaxConcurrent string
+	// boostReplicas is COREDNS_SATURATION_BOOST_REPLICAS — the
+	// replica surge honored while AnnoCoreDNSBoostUntil is fresh.
+	boostReplicas int
 }
 
 // configFromEnv resolves the COREDNS_* knobs. SetupWithConfig runs it
@@ -181,7 +200,46 @@ func configFromEnv() corednsPatcherConfig {
 		minReplicas:     envx.GetenvInt("COREDNS_MIN_REPLICAS", 4),
 		nodesPerReplica: envx.GetenvInt("COREDNS_NODES_PER_REPLICA", 1),
 		serveStale:      corednsServeStale(envx.Getenv("COREDNS_SERVE_STALE_DURATION", "1h")),
+		forwardMaxConcurrent: corednsMaxConcurrent(
+			envx.Getenv("COREDNS_FORWARD_MAX_CONCURRENT", "2000")),
+		boostReplicas: envx.GetenvIntMin("COREDNS_SATURATION_BOOST_REPLICAS", 2, 0),
 	}
+}
+
+// corednsMaxConcurrent validates COREDNS_FORWARD_MAX_CONCURRENT:
+// the value lands verbatim in the Corefile, so a typo must never
+// reach the apiserver — an unparseable or non-positive value warns
+// and falls back to the 2000 default (a broken forward block would
+// take cluster DNS down, the exact failure this knob exists to
+// prevent).
+func corednsMaxConcurrent(raw string) string {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n <= 0 {
+		envx.Warnf("COREDNS_FORWARD_MAX_CONCURRENT=%q is not a positive integer — using 2000", raw)
+		return "2000"
+	}
+	return strconv.Itoa(n)
+}
+
+// corednsEffectiveReplicas applies the P1.7b saturation boost: while
+// the coredns-forward-saturation check's AnnoCoreDNSBoostUntil stamp
+// on the Deployment is still in the future, the proportional pin
+// adds boostReplicas on top of wantReplicas — so the patcher keeps
+// the surge the check stamped instead of reverting it on the next
+// reconcile, and releases it automatically when the window lapses.
+// A disabled pin (wantReplicas<=0) is never boosted: the patcher
+// does not manage .spec.replicas at all in that mode.
+func corednsEffectiveReplicas(wantReplicas, boostReplicas int32,
+	d *appsv1.Deployment, now time.Time) int32 {
+
+	if wantReplicas <= 0 || boostReplicas <= 0 {
+		return wantReplicas
+	}
+	if until, ok := kube.AnnoTime(d, kube.AnnoCoreDNSBoostUntil); ok &&
+		now.Before(until) {
+		return wantReplicas + boostReplicas
+	}
+	return wantReplicas
 }
 
 // corednsServeStale normalizes the COREDNS_SERVE_STALE_DURATION knob:
@@ -210,6 +268,13 @@ func corednsServeStale(raw string) string {
 // not watched; the 15m requeue plus every Deployment reconcile is
 // fresh enough for a drift k0s only re-applies on stack changes).
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
+	// boostedReplicas carries the saturation boost from Drifted
+	// (which sees the Deployment and its AnnoCoreDNSBoostUntil
+	// stamp) into PatchBody (which only receives wantReplicas).
+	// Drifted always runs before PatchBody in the skeleton, and
+	// the closures are rebuilt per Reconcile call, so the capture
+	// is per-reconcile state — never shared across keys.
+	var boostedReplicas int32
 	res, err := pinnedworkload.DeploymentSpec{
 		CS:         r.cs,
 		Reader:     r.reader,
@@ -223,10 +288,15 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 		},
 		NoDriftLog: "probes/resources/topology/replicas already pinned - nothing to do",
 		Drifted: func(d *appsv1.Deployment, wantReplicas int32) bool {
-			return corednsNeedsPatch(d, r.zoneWhen, r.minDomains, wantReplicas)
+			boostedReplicas = corednsEffectiveReplicas(wantReplicas,
+				int32(r.boostReplicas), d, time.Now())
+			return corednsNeedsPatch(d, r.zoneWhen, r.minDomains, boostedReplicas)
 		},
 		PatchBody: func(wantReplicas int32) ([]byte, error) {
-			return corednsPatchBody(r.zoneWhen, r.minDomains, wantReplicas)
+			if boostedReplicas <= 0 {
+				boostedReplicas = wantReplicas
+			}
+			return corednsPatchBody(r.zoneWhen, r.minDomains, boostedReplicas)
 		},
 	}.Reconcile(ctx)
 	if err != nil {

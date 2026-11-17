@@ -127,6 +127,7 @@ type Config struct {
 	Journal  JournalConfig  // journald blindness-detector inputs
 	Host     HostConfig     // hostmetrics markers + node events (KR1/ST2)
 	Runtime  RuntimeConfig  // cgroup/session/io-pressure guard paths
+	Wave2    Wave2Config    // wave-2 self-healing guards (ports/runc/CSI/GPU/netfilter)
 
 	// Seams are the unexported test seams — every check reads them
 	// through h.cfg.Seams so tests re-stub a live Hygiene after New.
@@ -150,6 +151,7 @@ func (c *Config) ApplyDefaults() {
 	c.Journal.applyDefaults()
 	c.Host.applyDefaults(c.WatchdogStateDir)
 	c.Runtime.applyDefaults()
+	c.Wave2.applyDefaults()
 	c.Seams.applyDefaults(c)
 }
 

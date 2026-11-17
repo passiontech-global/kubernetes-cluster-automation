@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them, listing the
-source location of every reference in that package (149 knobs
+source location of every reference in that package (191 knobs
 referenced across 17 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -137,30 +137,40 @@ subsystem has no env gate.
 
 ### `internal/subsystem/hostmetrics`
 
-- `NODE_HOST_AGENT_ARP_TABLE_FILE` — `config_env.go:72`
-- `NODE_HOST_AGENT_CGROUP_MEM_UNITS` — `config_env.go:83`
-- `NODE_HOST_AGENT_CLOCKSOURCE_AVAILABLE_FILE` — `config_env.go:80`
-- `NODE_HOST_AGENT_CLOCKSOURCE_CURRENT_FILE` — `config_env.go:77`
-- `NODE_HOST_AGENT_CONNTRACK_STAT_FILE` — `config_env.go:70`
-- `NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL` — `config_env.go:67`
-- `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:88`
-- `NODE_HOST_AGENT_HOST_ROUTE_FILE` — `config_env.go:57`
-- `NODE_HOST_AGENT_K0S_CONFIG` — `config_env.go:58`
-- `NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS` — `config_env.go:65`
-- `NODE_HOST_AGENT_K0S_UNIT` — `config_env.go:60`
-- `NODE_HOST_AGENT_KEY_USERS_FILE` — `config_env.go:51`
-- `NODE_HOST_AGENT_LATCH_INTERVAL` — `config_env.go:53`
-- `NODE_HOST_AGENT_NEBULA_CERT` — `config_env.go:62`
-- `NODE_HOST_AGENT_NEBULA_IFACE` — `config_env.go:56`
-- `NODE_HOST_AGENT_NEIGH_GC_THRESH1_CEILING` — `config_env.go:101`
-- `NODE_HOST_AGENT_NEIGH_GC_THRESH2_CEILING` — `config_env.go:103`
-- `NODE_HOST_AGENT_NEIGH_GC_THRESH3_CEILING` — `config_env.go:105`
-- `NODE_HOST_AGENT_NIC_CARRIER_FLAP_THRESHOLD` — `config_env.go:107`
-- `NODE_HOST_AGENT_NIC_CRC_ERROR_THRESHOLD` — `config_env.go:111`
-- `NODE_HOST_AGENT_NIC_TX_TIMEOUT_THRESHOLD` — `config_env.go:109`
-- `NODE_HOST_AGENT_PSI_FILE` — `config_env.go:66`
-- `NODE_HOST_AGENT_SYS_CLASS_NET` — `config_env.go:55`
-- `NODE_HOST_AGENT_WATCHDOG_LOG_FILE` — `config_env.go:49`
+- `NODE_HOST_AGENT_ARP_TABLE_FILE` — `config_env.go:75`
+- `NODE_HOST_AGENT_CGROUP_MEM_UNITS` — `config_env.go:86`
+- `NODE_HOST_AGENT_CLOCKSOURCE_AVAILABLE_FILE` — `config_env.go:83`
+- `NODE_HOST_AGENT_CLOCKSOURCE_CURRENT_FILE` — `config_env.go:80`
+- `NODE_HOST_AGENT_CONNTRACK_STAT_FILE` — `config_env.go:73`
+- `NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL` — `config_env.go:70`
+- `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:91`
+- `NODE_HOST_AGENT_GPU_EXPECTED_COUNT` — `config_env.go:149`
+- `NODE_HOST_AGENT_GPU_GUARD_MODE` — `config_env.go:146`
+- `NODE_HOST_AGENT_HOST_ROUTE_FILE` — `config_env.go:60`
+- `NODE_HOST_AGENT_K0S_CONFIG` — `config_env.go:61`
+- `NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS` — `config_env.go:68`
+- `NODE_HOST_AGENT_K0S_UNIT` — `config_env.go:63`
+- `NODE_HOST_AGENT_KEY_USERS_FILE` — `config_env.go:54`
+- `NODE_HOST_AGENT_LATCH_INTERVAL` — `config_env.go:56`
+- `NODE_HOST_AGENT_NEBULA_CERT` — `config_env.go:65`
+- `NODE_HOST_AGENT_NEBULA_IFACE` — `config_env.go:59`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_ARP_CEILING` — `config_env.go:131`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_COOLDOWN_MIN` — `config_env.go:122`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_NUD_FAILED` — `config_env.go:118`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_REACHABLE` — `config_env.go:120`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_STALE` — `config_env.go:116`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_GUARD_ENABLED` — `config_env.go:114`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_NDISC_CEILING` — `config_env.go:133`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_TABLE_FULLS` — `config_env.go:135`
+- `NODE_HOST_AGENT_NEIGH_GC_THRESH1_CEILING` — `config_env.go:104`
+- `NODE_HOST_AGENT_NEIGH_GC_THRESH2_CEILING` — `config_env.go:106`
+- `NODE_HOST_AGENT_NEIGH_GC_THRESH3_CEILING` — `config_env.go:108`
+- `NODE_HOST_AGENT_NIC_CARRIER_FLAP_THRESHOLD` — `config_env.go:137`
+- `NODE_HOST_AGENT_NIC_CRC_ERROR_THRESHOLD` — `config_env.go:141`
+- `NODE_HOST_AGENT_NIC_TX_TIMEOUT_THRESHOLD` — `config_env.go:139`
+- `NODE_HOST_AGENT_PSI_FILE` — `config_env.go:69`
+- `NODE_HOST_AGENT_SYS_CLASS_NET` — `config_env.go:58`
+- `NODE_HOST_AGENT_WATCHDOG_LOG_FILE` — `config_env.go:52`
 
 ### `internal/subsystem/hubsync`
 
@@ -217,35 +227,68 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CGROUP_ROOT` — `config_runtime.go:53`
 - `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:60`
 - `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:57`
-- `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:235`
+- `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:237`
 - `NODE_HOST_AGENT_COREDUMP_DIR` — `config_disk.go:140`
-- `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:227`
+- `NODE_HOST_AGENT_CSI_GUARD_BOUNCE_COOLDOWN_MIN` — `config_wave2.go:108`
+- `NODE_HOST_AGENT_CSI_GUARD_ECONNREFUSED_CYCLES` — `config_wave2.go:106`
+- `NODE_HOST_AGENT_CSI_GUARD_MISSING_MINUTES` — `config_wave2.go:107`
+- `NODE_HOST_AGENT_CSI_GUARD_MODE` — `config_wave2.go:101`
+- `NODE_HOST_AGENT_CSI_GUARD_PROBE_SECONDS` — `config_wave2.go:105`
+- `NODE_HOST_AGENT_CSI_HEAL_ENABLED` — `config_wave2.go:104`
+- `NODE_HOST_AGENT_CTR_KILL_HUNG_RUNC` — `config_wave2.go:97`
+- `NODE_HOST_AGENT_CTR_RUNC_MAX_AGE` — `config_wave2.go:98`
+- `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:229`
 - `NODE_HOST_AGENT_DEV_SHM_DIR` — `config_disk.go:136`
 - `NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD` — `config_pressure.go:61`
-- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:239`
+- `NODE_HOST_AGENT_GPU_GUARD_BOUNCE_COOLDOWN_MIN` — `config_wave2.go:115`
+- `NODE_HOST_AGENT_GPU_GUARD_DESYNC_MINUTES` — `config_wave2.go:114`
+- `NODE_HOST_AGENT_GPU_GUARD_MODE` — `config_wave2.go:109`
+- `NODE_HOST_AGENT_GPU_GUARD_PROBE_SECONDS` — `config_wave2.go:113`
+- `NODE_HOST_AGENT_GPU_HEAL_ENABLED` — `config_wave2.go:112`
+- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:241`
 - `NODE_HOST_AGENT_HOST_RUN_DIR` — `config_disk.go:134`
-- `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:249`
-- `NODE_HOST_AGENT_HYGIENE_CYCLE_TIMEOUT` — `config.go:225`
-- `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:224`
+- `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:251`
+- `NODE_HOST_AGENT_HYGIENE_CYCLE_TIMEOUT` — `config.go:227`
+- `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:226`
 - `NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE` — `config_teardown.go:38`
-- `NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL` — `config.go:250`
+- `NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL` — `config.go:252`
 - `NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE` — `config_teardown.go:36`
 - `NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE` — `config_teardown.go:37`
 - `NODE_HOST_AGENT_INOTIFY_EVICT_RUNAWAY_POD` — `config_pressure.go:64`
 - `NODE_HOST_AGENT_INOTIFY_MAX_INSTANCES_CEILING` — `config_pressure.go:62`
 - `NODE_HOST_AGENT_INOTIFY_MAX_WATCHES_CEILING` — `config_pressure.go:63`
-- `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:231`
-- `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:237`
+- `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:233`
+- `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:239`
 - `NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL` — `config_kubelet.go:93`
 - `NODE_HOST_AGENT_KUBELET_TOKEN_FILE` — `config_kubelet.go:94`
-- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101, env.go:104`
+- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101, env.go:105`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR` — `config_net.go:38`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_NAME` — `config_net.go:39`
 - `NODE_HOST_AGENT_LOCALPV_QUOTA_DIR` — `config_disk.go:133`
-- `NODE_HOST_AGENT_MOUNTINFO_FILE` — `config.go:233`
+- `NODE_HOST_AGENT_MAX_CONCURRENT` — `config_wave2.go:85`
+- `NODE_HOST_AGENT_MOUNTINFO_FILE` — `config.go:235`
+- `NODE_HOST_AGENT_NETFILTER_GUARD_CMD_TIMEOUT_SECONDS` — `config_wave2.go:120`
+- `NODE_HOST_AGENT_NETFILTER_GUARD_INTERVAL_SECONDS` — `config_wave2.go:119`
+- `NODE_HOST_AGENT_NETFILTER_GUARD_LEGACY_TABLE_PROBE` — `config_wave2.go:131`
+- `NODE_HOST_AGENT_NETFILTER_GUARD_LOCK_PATH` — `config_wave2.go:124`
+- `NODE_HOST_AGENT_NETFILTER_GUARD_MAX_KILLS_PER_CYCLE` — `config_wave2.go:127`
+- `NODE_HOST_AGENT_NETFILTER_GUARD_MODE` — `config_wave2.go:116`
+- `NODE_HOST_AGENT_NETFILTER_GUARD_STUCK_CONFIRM_CYCLES` — `config_wave2.go:126`
+- `NODE_HOST_AGENT_NETFILTER_KILL_HUNG` — `config_wave2.go:128`
+- `NODE_HOST_AGENT_NETFILTER_MAX_AGE` — `config_wave2.go:125`
 - `NODE_HOST_AGENT_ORPHAN_POD_VOLS_MIN_AGE` — `config_ctr.go:71`
-- `NODE_HOST_AGENT_PROC_ROOT` — `config.go:226`
-- `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:229`
+- `NODE_HOST_AGENT_PORT_CLOSE_WAIT_MAX` — `config_wave2.go:93`
+- `NODE_HOST_AGENT_PORT_DESTROY_SYN_SENT` — `config_wave2.go:83`
+- `NODE_HOST_AGENT_PORT_EVICT_RUNAWAY_POD` — `config_wave2.go:82`
+- `NODE_HOST_AGENT_PORT_LEAK_EVICT_COOLDOWN_MIN` — `config_wave2.go:96`
+- `NODE_HOST_AGENT_PORT_LEAK_MIN_PCT` — `config_wave2.go:95`
+- `NODE_HOST_AGENT_PORT_LEAK_WINDOW_SECONDS` — `config_wave2.go:94`
+- `NODE_HOST_AGENT_PORT_SYN_SENT_MIN_RETRANS` — `config_wave2.go:84`
+- `NODE_HOST_AGENT_PORT_TUPLE_RATIO` — `config_wave2.go:86`
+- `NODE_HOST_AGENT_PROC_ROOT` — `config.go:228`
+- `NODE_HOST_AGENT_RUNC_HANG_CONFIRM_CYCLES` — `config_wave2.go:99`
+- `NODE_HOST_AGENT_RUNC_HANG_MAX_KILLS_PER_CYCLE` — `config_wave2.go:100`
+- `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:231`
 - `NODE_HOST_AGENT_SA_TOKEN_MIN_TTL_S` — `config_runtime.go:57`
 - `NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR` — `config_runtime.go:55`
 - `NODE_HOST_AGENT_WLAYER_BLOAT_THRESHOLD_BYTES` — `config_disk.go:142`

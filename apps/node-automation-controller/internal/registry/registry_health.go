@@ -125,4 +125,13 @@ var healthRows = []shared.Module{
 	{Name: "statefulset-rollout-unstick", Group: groupHealth, GateEnv: "NODE_AUTOMATION_STATEFULSET_ROLLOUT_UNSTICK_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameStatefulSetRolloutUnstick, New: watchdogs.NewStatefulSetRolloutUnstickCheck}},
 	{Name: "daemonset-rollout-wedge", Group: groupHealth, GateEnv: "NODE_AUTOMATION_DAEMONSET_ROLLOUT_WEDGE_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameDaemonSetRolloutWedge, New: watchdogs.NewDaemonSetRolloutWedgeCheck}},
 	{Name: "cronjob-forbid-zombie", Group: groupHealth, GateEnv: "NODE_AUTOMATION_CRONJOB_FORBID_ZOMBIE_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameCronJobForbidZombie, New: watchdogs.NewCronJobForbidZombieCheck}},
+	// The six self-healing wave-2 checks — appended after the
+	// existing roster per the plan; each carries its own
+	// NODE_AUTOMATION_*_ENABLED registration gate.
+	{Name: "apiserver-write-storm-breaker", Group: groupHealth, GateEnv: "NODE_AUTOMATION_WRITE_STORM_BREAKER_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameAPIServerWriteStorm, New: watchdogs.NewAPIServerWriteStormCheck}},
+	{Name: "critical-daemonset-starvation", Group: groupHealth, GateEnv: "NODE_AUTOMATION_CRITICAL_DS_STARVATION_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameCriticalDSStarvation, New: watchdogs.NewCriticalDaemonSetStarvationCheck}},
+	{Name: "coredns-forward-saturation", Group: groupHealth, GateEnv: "NODE_AUTOMATION_COREDNS_FORWARD_SATURATION_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameCoreDNSForwardSaturation, New: nethealth.NewCoreDNSForwardSaturationCheck}},
+	{Name: "hpa-scaling-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_HPA_SCALING_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameHPAScalingGuard, New: gitops.NewHPAScalingGuardCheck}},
+	{Name: "deployment-rollout-wedge", Group: groupHealth, GateEnv: "NODE_AUTOMATION_DEPLOYMENT_ROLLOUT_WEDGE_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameDeploymentRolloutWedge, New: watchdogs.NewDeploymentRolloutWedgeCheck}},
+	{Name: "subpath-config-drift", Group: groupHealth, GateEnv: "NODE_AUTOMATION_SUBPATH_CONFIG_DRIFT_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameSubPathConfigDrift, New: watchdogs.NewSubPathConfigDriftCheck}},
 }

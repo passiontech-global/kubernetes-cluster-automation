@@ -82,12 +82,27 @@ func (c *Collector) kernelFailDeps() kernelfail.Deps {
 		// reuses the collector's HOST_ROUTE_FILE knob so one override
 		// moves both readers. The remaining path seams stay empty so
 		// New() applies its HostRoot/ProcRoot joins.
-		RouteFile:               c.cfg.RouteFile,
-		NeighGCThresh1Ceiling:   c.cfg.NeighGCThresh1Ceiling,
-		NeighGCThresh2Ceiling:   c.cfg.NeighGCThresh2Ceiling,
-		NeighGCThresh3Ceiling:   c.cfg.NeighGCThresh3Ceiling,
-		NICCarrierFlapThreshold: c.cfg.NICCarrierFlapThreshold,
-		NICTxTimeoutThreshold:   c.cfg.NICTxTimeoutThreshold,
-		NICCRErrorThreshold:     c.cfg.NICCRErrorThreshold,
+		RouteFile:             c.cfg.RouteFile,
+		NeighGCThresh1Ceiling: c.cfg.NeighGCThresh1Ceiling,
+		NeighGCThresh2Ceiling: c.cfg.NeighGCThresh2Ceiling,
+		NeighGCThresh3Ceiling: c.cfg.NeighGCThresh3Ceiling,
+		// P0.4 flush guard — the knobs cross verbatim (kernelfail.New
+		// defaults the unset ones).
+		NeighFlushGuard:          c.cfg.NeighFlushGuard,
+		NeighFlushEvictStale:     c.cfg.NeighFlushEvictStale,
+		NeighFlushEvictNudFailed: c.cfg.NeighFlushEvictNudFailed,
+		NeighFlushEvictReachable: c.cfg.NeighFlushEvictReachable,
+		NeighFlushCooldown:       c.cfg.NeighFlushCooldown,
+		NeighFlushArpCeiling:     c.cfg.NeighFlushArpCeiling,
+		NeighFlushNdiscCeiling:   c.cfg.NeighFlushNdiscCeiling,
+		NeighFlushTableFulls:     c.cfg.NeighFlushTableFulls,
+		NICCarrierFlapThreshold:  c.cfg.NICCarrierFlapThreshold,
+		NICTxTimeoutThreshold:    c.cfg.NICTxTimeoutThreshold,
+		NICCRErrorThreshold:      c.cfg.NICCRErrorThreshold,
+		// P2.12 GPU PCIe census — mode + expected count cross
+		// verbatim (ModeAuto is the zero value; <=0 expected count
+		// means learn-from-hardware).
+		GPUGuardMode:     c.cfg.GPUGuardMode,
+		GPUExpectedCount: c.cfg.GPUExpectedCount,
 	}
 }

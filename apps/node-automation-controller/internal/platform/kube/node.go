@@ -206,6 +206,44 @@ func UntaintNode(ctx context.Context, cs kubernetes.Interface, name, key string)
 	})
 }
 
+// compatLabelPairs maps each GA node label to the deprecated twin a
+// legacy nodeSelector/nodeAffinity may still reference — the one-way
+// GA→deprecated sync direction (P0.2b). Presence of the GA key with a
+// MISSING deprecated twin yields a (deprecated → value) entry.
+var compatLabelPairs = []struct{ ga, deprecated string }{
+	{"kubernetes.io/os", "beta.kubernetes.io/os"},
+	{"kubernetes.io/arch", "beta.kubernetes.io/arch"},
+	{"topology.kubernetes.io/zone", "failure-domain.beta.kubernetes.io/zone"},
+	{"topology.kubernetes.io/region", "failure-domain.beta.kubernetes.io/region"},
+}
+
+// CompatNodeLabels returns the deprecated node labels that should be
+// added to a node carrying labels — the shared one-way compat sync
+// behind nodelabeler's deprecated-selector heal (P0.2b) and the
+// critical-daemonset-starvation compat patch (P0.2a). Control-plane
+// nodes additionally gain the deprecated master role labels
+// (node-role.kubernetes.io/master and the bare "master" — both spellings
+// appear in the wild). Existing labels are never overwritten: the sync
+// only fills gaps.
+func CompatNodeLabels(labels map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, p := range compatLabelPairs {
+		if v, ok := labels[p.ga]; ok {
+			if _, have := labels[p.deprecated]; !have {
+				out[p.deprecated] = v
+			}
+		}
+	}
+	if _, isCP := labels["node-role.kubernetes.io/control-plane"]; isCP {
+		for _, k := range []string{"node-role.kubernetes.io/master", "master"} {
+			if _, have := labels[k]; !have {
+				out[k] = ""
+			}
+		}
+	}
+	return out
+}
+
 // PatchNodeLabels merges labels onto a node (kubectl label --overwrite).
 func PatchNodeLabels(ctx context.Context, cs kubernetes.Interface, name string, labels map[string]string) error {
 	payload, err := json.Marshal(map[string]any{

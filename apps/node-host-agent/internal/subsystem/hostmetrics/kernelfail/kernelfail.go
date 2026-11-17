@@ -63,6 +63,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -141,12 +142,36 @@ type Deps struct {
 	// IPv6 neighbor count). Empty → ProcRoot-joined "1/net/...".
 	NeighIPv4Table string
 	NeighIPv6Stats string
+	// NeighIPv4Stats is the IPv4 ARP overflow-counter view —
+	// /proc/1/net/stat/arp_cache carries the same
+	// entries/table_fulls columns as ndisc_cache, giving the v4
+	// family the table_fulls delta evidence v6 already had.
+	// Empty → ProcRoot-joined "1/net/stat/arp_cache".
+	NeighIPv4Stats string
 	// NeighGCThresh{1,2,3}Ceiling cap the neighbor-table bump — the
 	// triplet doubles per 30m spend up to these. <=0 → defaults
-	// 1024/4096/8192.
+	// 16384/65536/131072 (the kernel's 1:4:8 ratio scaled for P0.4
+	// dense-cluster churn).
 	NeighGCThresh1Ceiling int
 	NeighGCThresh2Ceiling int
 	NeighGCThresh3Ceiling int
+	// NeighFlush* are the P0.4 flush-guard knobs (neighbor.go's
+	// maybeFlushNeighbor): NeighFlushGuard enables the per-family
+	// nud-state eviction + NeighborTablePressure latch; the
+	// Evict* trio selects which NUD states `ip neigh flush` drops
+	// (reachable defaults OFF — it evicts live neighbors);
+	// NeighFlushCooldown rate-limits the flush per family;
+	// NeighFlush{Arp,Ndisc}Ceiling override the family's gc_thresh3
+	// cap (<=0 → NeighGCThresh3Ceiling); NeighFlushTableFulls gates
+	// the ndisc_cache table_fulls delta as overflow evidence.
+	NeighFlushGuard          bool
+	NeighFlushEvictStale     bool
+	NeighFlushEvictNudFailed bool
+	NeighFlushEvictReachable bool
+	NeighFlushCooldown       time.Duration
+	NeighFlushArpCeiling     int
+	NeighFlushNdiscCeiling   int
+	NeighFlushTableFulls     bool
 	// NICCarrierFlapThreshold is the carrier_changes delta per 5m
 	// window that arms HostNetworkProblems; NICTxTimeoutThreshold
 	// the NETDEV WATCHDOG TX-timeout count per 10m; NICCRErrorThreshold
@@ -155,6 +180,15 @@ type Deps struct {
 	NICCarrierFlapThreshold int
 	NICTxTimeoutThreshold   int
 	NICCRErrorThreshold     int
+
+	// GPUGuardMode gates the gpu_pcie.go sysfs census — ModeOff
+	// makes it fully dormant; ModeAuto (the zero value) and
+	// ModeOn run the same cheap scan. GPUExpectedCount is the
+	// operator-declared NVIDIA device total (0 = learn from the
+	// max-seen baseline only); the pcie-loss verdict fires when
+	// live < max(GPUExpectedCount, baseline).
+	GPUGuardMode     envx.Mode
+	GPUExpectedCount int
 
 	// TickInterval is the latch ticker's expected cadence — carried
 	// into the warp ACTION line's "tick=" evidence text. <=0 →
@@ -225,7 +259,17 @@ type Runner struct {
 	// sample ring + TX-timeout stamps. All three are touched only by
 	// the latch-ticker goroutine, like every other Runner field.
 	neigh map[string]time.Time
-	nic   nicState
+	// neighFulls is neighbor.go's per-family table_fulls baseline —
+	// the last-seen cumulative counter so only a positive DELTA
+	// counts as fresh overflow evidence.
+	neighFulls map[string]uint64
+	// neighPinned counts each family's consecutive post-flush ticks
+	// still >= neighLatchEnterRatio of gc_thresh3 — the latch arms
+	// at neighLatchTicks and clears only when every readable family
+	// sits below neighLatchExitRatio (P0.4 hysteresis; the per-tick
+	// fills ride updateNeighborTable's local map, not Runner state).
+	neighPinned map[string]int
+	nic         nicState
 }
 
 // defaultTickInterval is the latch ticker cadence the warp detector
@@ -294,6 +338,9 @@ func New(d Deps) *Runner {
 	if d.NeighIPv6Stats == "" {
 		d.NeighIPv6Stats = filepath.Join(procRoot, "1", "net", "stat", "ndisc_cache")
 	}
+	if d.NeighIPv4Stats == "" {
+		d.NeighIPv4Stats = filepath.Join(procRoot, "1", "net", "stat", "arp_cache")
+	}
 	// Threshold defaults — the env knobs land through Config; these
 	// cover bare-New tests and unset knobs.
 	if d.NeighGCThresh1Ceiling <= 0 {
@@ -305,6 +352,22 @@ func New(d Deps) *Runner {
 	if d.NeighGCThresh3Ceiling <= 0 {
 		d.NeighGCThresh3Ceiling = DefaultNeighGCThresh3Ceiling
 	}
+	// P0.4 flush-guard defaults — the guard itself stays opt-in;
+	// the evict defaults mirror the env contract (failed+stale on,
+	// reachable off, table_fulls evidence on).
+	if d.NeighFlushCooldown <= 0 {
+		d.NeighFlushCooldown = DefaultNeighFlushCooldown
+	}
+	if d.NeighFlushArpCeiling <= 0 {
+		d.NeighFlushArpCeiling = DefaultNeighFlushCeiling
+	}
+	if d.NeighFlushNdiscCeiling <= 0 {
+		d.NeighFlushNdiscCeiling = DefaultNeighFlushCeiling
+	}
+	// NeighFlushTableFulls needs no default pass — the env layer
+	// resolves the bool explicitly (default on); bare-New callers
+	// get false, which only disables the extra overflow evidence,
+	// never a wrong verdict.
 	if d.NICCarrierFlapThreshold <= 0 {
 		d.NICCarrierFlapThreshold = DefaultNICCarrierFlapThreshold
 	}
@@ -349,11 +412,15 @@ func (r *Runner) Refresh(ctx context.Context) {
 	//   - hardware.go: ECC/EDAC + MCE/PCIe-AER/NVMe-reset + NVIDIA
 	//     fatal-Xid evidence → state-hardware-corrupted /
 	//     state-gpu-hardware-error (P0-#3, P2-#12).
+	//   - gpu_pcie.go: sysfs 0x10de display-function census →
+	//     gpu:pcie-unbound / gpu:pcie-loss acute evidence on the
+	//     GPUHardwareError latch (P2-#12, no nvidia-smi).
 	//   - neighbor.go: ARP/NDISC table fill ≥ gc_thresh3*80% or a
 	//     kmsg overflow record → bounded gc_thresh{1,2,3} bump +
 	//     `ip neigh flush nud failed` (P1-#6).
 	//   - nic_health.go: physical-uplink carrier/CRC/TX-timeout
 	//     windows → state-host-network-problems (P1-#7).
+	r.updateGPUPCIe()
 	r.updateHardwareHealth()
 	r.updateNeighborTable(ctx)
 	r.updateNICHealth()

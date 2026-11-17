@@ -111,6 +111,12 @@ var conditionOrder = []string{
 	latchdefs.LatchGPUHardwareError,
 	latchdefs.LatchHostNetworkProblems,
 	latchdefs.LatchInotifyPressure,
+	// Wave-2 self-healing wave — appended at the tail so the 54
+	// existing conditions keep their rendered order.
+	latchdefs.LatchEphemeralPortPressure,
+	latchdefs.LatchNeighborPressure,
+	latchdefs.LatchNetfilterLocked,
+	latchdefs.LatchCSIRegistrationWedged,
 }
 
 // staleConditionDef is WatchdogStale's def — the one condition whose

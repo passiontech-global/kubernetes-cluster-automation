@@ -1,6 +1,9 @@
 package hostmetrics
 
 import (
+	"strconv"
+	"time"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
@@ -104,12 +107,47 @@ func ConfigFromEnv(d EnvDeps) Config {
 			&cfg.NeighGCThresh2Ceiling, kernelfail.DefaultNeighGCThresh2Ceiling),
 		envx.IntKnob(envnames.EnvNeighGCThresh3Ceiling,
 			&cfg.NeighGCThresh3Ceiling, kernelfail.DefaultNeighGCThresh3Ceiling),
+		// P0.4 neighbor flush guard — default-on eviction of
+		// nud-failed/stale (reachable stays off unless asked) plus
+		// the table_fulls overflow evidence and per-family
+		// gc_thresh3 overrides.
+		envx.BoolKnob(envnames.EnvNeighborFlushGuardEnabled,
+			&cfg.NeighFlushGuard, true),
+		envx.BoolKnob(envnames.EnvNeighborFlushEvictStale,
+			&cfg.NeighFlushEvictStale, true),
+		envx.BoolKnob(envnames.EnvNeighborFlushEvictNudFailed,
+			&cfg.NeighFlushEvictNudFailed, true),
+		envx.BoolKnob(envnames.EnvNeighborFlushEvictReachable,
+			&cfg.NeighFlushEvictReachable, false),
+		{Name: envnames.EnvNeighborFlushCooldownMin, Resolve: func(name string) {
+			// Minutes knob (the *_MIN naming contract) — bare int
+			// minutes, <=0/unparseable → kernelfail's 30m default.
+			if n, err := strconv.Atoi(envx.String(name, "")); err == nil && n > 0 {
+				cfg.NeighFlushCooldown = time.Duration(n) * time.Minute
+			} else {
+				cfg.NeighFlushCooldown = kernelfail.DefaultNeighFlushCooldown
+			}
+		}},
+		envx.IntKnob(envnames.EnvNeighborFlushArpCeiling,
+			&cfg.NeighFlushArpCeiling, kernelfail.DefaultNeighFlushCeiling),
+		envx.IntKnob(envnames.EnvNeighborFlushNdiscCeiling,
+			&cfg.NeighFlushNdiscCeiling, kernelfail.DefaultNeighFlushCeiling),
+		envx.BoolKnob(envnames.EnvNeighborFlushTableFulls,
+			&cfg.NeighFlushTableFulls, true),
 		envx.IntKnob(envnames.EnvNICCarrierFlapThreshold,
 			&cfg.NICCarrierFlapThreshold, kernelfail.DefaultNICCarrierFlapThreshold),
 		envx.IntKnob(envnames.EnvNICTxTimeoutThreshold,
 			&cfg.NICTxTimeoutThreshold, kernelfail.DefaultNICTxTimeoutThreshold),
 		envx.IntKnob(envnames.EnvNICCRErrorThreshold,
 			&cfg.NICCRErrorThreshold, kernelfail.DefaultNICCRErrorThreshold),
+		// P2.12 GPU PCIe census — the mode knob is shared with
+		// workerhygiene's GPU guard (one env contract); auto is the
+		// zero value so bare Configs stay on the cheap scan.
+		{Name: envnames.EnvGPUGuardMode, Resolve: func(name string) {
+			cfg.GPUGuardMode = envx.ModeEnv(name, envx.ModeAuto)
+		}},
+		envx.IntKnob(envnames.EnvGPUExpectedCount,
+			&cfg.GPUExpectedCount, 0),
 	})
 	return cfg
 }

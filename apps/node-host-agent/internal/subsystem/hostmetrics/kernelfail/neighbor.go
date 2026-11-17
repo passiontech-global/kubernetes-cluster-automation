@@ -18,8 +18,8 @@
 // The bump itself is rate-limited to one spend per family per 30m
 // (Store.RateTrySpend — the conntrack bump parity): it doubles the
 // gc_thresh{1,2,3} triplet capped at the configured ceilings
-// (defaults 1024/4096/8192 — high enough for dense pod churn, low
-// enough that a leaked-neighbor bug still surfaces as table
+// (defaults 16384/65536/131072 — high enough for dense pod churn,
+// low enough that a leaked-neighbor bug still surfaces as table
 // pressure instead of unbounded memory), then flushes FAILED
 // entries via `ip -4/-6 neigh flush nud failed` to hand the GC
 // dead slots immediately.
@@ -40,6 +40,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
@@ -59,15 +61,60 @@ const (
 	// records expire and the fill-ratio path (still live) carries
 	// any real ongoing pressure on its own.
 	neighPendingTTL = 10 * time.Minute
+	// neighFlushRatio arms the P0.4 flush pass once live entries
+	// reach 85% of gc_thresh3 — later than the bump's 80% so the
+	// sysctl raise gets first shot at draining pressure cheaply.
+	neighFlushRatio = 0.85
+	// neighFlushCeilingCooldown is the short budget for the
+	// at-ceiling flush branch: once the table is AT gc_thresh3 the
+	// next pod-IP recycle overflows immediately, so eviction gets a
+	// 5m cadence instead of the normal flush cooldown.
+	neighFlushCeilingCooldown = 5 * time.Minute
+	// neighLatchEnterRatio/neighLatchExitRatio are the
+	// NeighborTablePressure hysteresis band: the latch arms only
+	// after two consecutive post-flush ticks still >= 92% of
+	// gc_thresh3, and clears only when BOTH families read < 80%.
+	neighLatchEnterRatio = 0.92
+	neighLatchExitRatio  = 0.80
+	// neighLatchTicks is the consecutive pinned-tick count the
+	// latch needs before it arms.
+	neighLatchTicks = 2
 )
 
 // Exported so hostmetrics' ConfigFromEnv can bind the env knobs to
 // the same compiled defaults New() falls back to.
 const (
-	DefaultNeighGCThresh1Ceiling = 1024
-	DefaultNeighGCThresh2Ceiling = 4096
-	DefaultNeighGCThresh3Ceiling = 8192
+	// P0.4 raises the whole gc_thresh triplet ceiling to
+	// 16384/65536/131072 — the kernel's 1:4:8 ratio scaled past the
+	// hostconfig sysctl floor (8192/32768/65536). Raising only
+	// thresh3 would leave thresh1/thresh2 as "start GC early"
+	// watermarks far below capacity, making the kernel churn GC on
+	// every pod-IP recycle on a dense cluster.
+	DefaultNeighGCThresh1Ceiling = 16384
+	DefaultNeighGCThresh2Ceiling = 65536
+	// DefaultNeighGCThresh3Ceiling is the P0.4 raise — dense
+	// clusters churn pod IPs faster than the old 8192-entry ceiling
+	// could GC, so the hard cap moves to the kernel's practical
+	// maximum.
+	DefaultNeighGCThresh3Ceiling = 131072
+	// DefaultNeighFlushCeiling is the per-family fallback for the
+	// flush-guard's gc_thresh3 override (Deps.NeighFlush*Ceiling) —
+	// same 131072 the shared thresh3 ceiling now uses.
+	DefaultNeighFlushCeiling = 131072
+	// DefaultNeighFlushCooldown rate-limits the flush pass per
+	// family — evictions are cheap but a flush storm on a genuinely
+	// full table just re-fills on the next pod churn.
+	DefaultNeighFlushCooldown = 30 * time.Minute
 )
+
+// neighTableView is one family's parsed proc-table evidence: the
+// live entry count plus the family's table_fulls overflow counter
+// (0 for families whose proc view carries no such column — IPv4
+// ARP has none; its overflow evidence stays the kmsg record).
+type neighTableView struct {
+	entries    int
+	tableFulls uint64
+}
 
 // neighFamily binds one IP family's sysctl dir, proc-table view,
 // ip(8) flag and gc_thresh ceilings for the bump.
@@ -77,75 +124,72 @@ type neighFamily struct {
 	sysDir string // gc_thresh{1,2,3} files (Deps.NeighIPv*Dir)
 	table  string // proc table view (Deps.NeighIPv*Table/Stats)
 	ceil   [3]int // gc_thresh{1,2,3} ceilings
-	// entries parses the family's proc table view into a live-entry
-	// count (arpTableEntries for IPv4, ndiscCacheEntries for IPv6).
-	entries func(string) (int, bool)
+	// entries parses the family's proc table view into the live
+	// count + table_fulls (arpTableView for IPv4,
+	// ndiscStatsView for IPv6).
+	entries func(string) (neighTableView, bool)
+	// fullsPath, when set, is a second proc view carrying the
+	// family's table_fulls counter — IPv4 needs it because
+	// /proc/net/arp (the NUD-state view the flush consumes)
+	// exposes no overflow column; /proc/net/stat/arp_cache does.
+	// IPv6 leaves it empty: its `table` IS the stat file.
+	fullsPath string
 }
 
 // neighFamilies builds the per-tick family table off Deps — the
-// ceilings were defaulted in New().
+// ceilings were defaulted in New(). The flush-guard's per-family
+// gc_thresh3 override (Deps.NeighFlush*Ceiling) replaces the
+// shared thresh3 cap for that family only; 0 falls back to the
+// shared DefaultNeighGCThresh3Ceiling.
 func (r *Runner) neighFamilies() []neighFamily {
+	v4ceil3, v6ceil3 := r.deps.NeighGCThresh3Ceiling,
+		r.deps.NeighGCThresh3Ceiling
+	if r.deps.NeighFlushArpCeiling > 0 {
+		v4ceil3 = r.deps.NeighFlushArpCeiling
+	}
+	if r.deps.NeighFlushNdiscCeiling > 0 {
+		v6ceil3 = r.deps.NeighFlushNdiscCeiling
+	}
 	return []neighFamily{
 		{name: "ipv4", ipFlag: "-4",
 			sysDir: r.deps.NeighIPv4Dir, table: r.deps.NeighIPv4Table,
+			fullsPath: r.deps.NeighIPv4Stats,
 			ceil: [3]int{r.deps.NeighGCThresh1Ceiling,
-				r.deps.NeighGCThresh2Ceiling, r.deps.NeighGCThresh3Ceiling},
-			entries: arpTableEntries},
+				r.deps.NeighGCThresh2Ceiling, v4ceil3},
+			entries: arpTableView},
 		{name: "ipv6", ipFlag: "-6",
 			sysDir: r.deps.NeighIPv6Dir, table: r.deps.NeighIPv6Stats,
 			ceil: [3]int{r.deps.NeighGCThresh1Ceiling,
-				r.deps.NeighGCThresh2Ceiling, r.deps.NeighGCThresh3Ceiling},
-			entries: ndiscCacheEntries},
+				r.deps.NeighGCThresh2Ceiling, v6ceil3},
+			entries: ndiscStatsView},
 	}
 }
 
-// arpTableEntries counts live IPv4 neighbor entries — every
-// non-header line of /proc/net/arp (INCOMPLETE entries still hold
-// a neighbor slot, so they count too). ok=false when the file is
-// unreadable — inconclusive, never a bump trigger.
-func arpTableEntries(path string) (int, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
+// arpTableView counts live IPv4 neighbor entries — every non-header
+// line of /proc/net/arp decoded through procfs.ReadARPTable (the
+// NUD flags ride along for the flush guard's state-aware reads).
+// INCOMPLETE entries still hold a neighbor slot, so they count too.
+// ok=false when the file is unreadable — inconclusive, never a bump
+// trigger.
+func arpTableView(path string) (neighTableView, bool) {
+	entries, ok := procfs.ReadARPTable(path)
+	if !ok {
+		return neighTableView{}, false
 	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	if len(lines) == 0 {
-		return 0, false
-	}
-	// First line is the column header.
-	return len(lines) - 1, true
+	return neighTableView{entries: len(entries)}, true
 }
 
-// ndiscCacheEntries reads the IPv6 neighbor count from
-// /proc/net/stat/ndisc_cache — a header line then one row of hex
-// counters per CPU/histogram bucket whose FIRST column ("entries")
-// carries the table size. Rows disagree only transiently, so the
-// max is the safe read. ok=false on unreadable/unparseable input.
-func ndiscCacheEntries(path string) (int, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
+// ndiscStatsView reads the IPv6 neighbor count AND the table_fulls
+// overflow counter from /proc/net/stat/ndisc_cache via
+// procfs.ReadNDISCStats — columns are located by name so kernel
+// additions never shift the parse. ok=false on unreadable or
+// headerless input.
+func ndiscStatsView(path string) (neighTableView, bool) {
+	st, ok := procfs.ReadNDISCStats(path)
+	if !ok {
+		return neighTableView{}, false
 	}
-	var maxEntries int
-	seenHeader := false
-	for _, line := range strings.Split(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) == 0 {
-			continue
-		}
-		if !seenHeader {
-			seenHeader = true // the "entries allocs ..." header row
-			continue
-		}
-		v, err := strconv.ParseUint(f[0], 16, 32)
-		if err != nil {
-			continue
-		}
-		if int(v) > maxEntries {
-			maxEntries = int(v)
-		}
-	}
-	return maxEntries, seenHeader
+	return neighTableView{entries: st.Entries, tableFulls: st.TableFulls}, true
 }
 
 // neighGCThresh reads one gc_thresh knob. ok=false on a missing or
@@ -188,18 +232,58 @@ func (r *Runner) noteNeighborOverflow(msg string) {
 // when fill >= 80% of gc_thresh3 or an overflow record is pending,
 // rate-limited per family. Inconclusive reads (missing proc view,
 // unreadable sysctl) skip the family entirely — never bump blind.
+//
+// Wave-2 (P0.4) additions on top of the bump path:
+//
+//   - table_fulls: the family's cumulative overflow counter (IPv6
+//     via /proc/net/stat/ndisc_cache; IPv4 ARP exposes none) — a
+//     positive delta marks the family pending exactly like a kmsg
+//     overflow record, but the evidence persists across ticks.
+//   - flush guard (Deps.NeighFlushGuard): on flush-grade evidence
+//     (fill >= 85% of gc_thresh3, the table AT gc_thresh3, or fresh
+//     overflow evidence), a separate last-neigh-flush-<fam> budget
+//     runs `ip neigh flush nud {failed,stale,reachable}` per the
+//     evict knobs — the at-ceiling branch on a 5m budget, the rest
+//     on NeighFlushCooldown — then re-reads the table for the
+//     latch hysteresis (updateNeighborLatch).
 func (r *Runner) updateNeighborTable(ctx context.Context) {
 	now := r.deps.Clock.Now()
+	fills := map[string]float64{}
 	for _, fam := range r.neighFamilies() {
-		entries, ok := fam.entries(fam.table)
+		view, ok := fam.entries(fam.table)
 		if !ok {
 			continue
 		}
+		// Second-source table_fulls (IPv4's arp_cache stat view):
+		// bonus overflow evidence — an unreadable stats file just
+		// leaves the counter at 0, never blocks the family.
+		if fam.fullsPath != "" {
+			if st, sok := procfs.ReadNDISCStats(fam.fullsPath); sok {
+				view.tableFulls = st.TableFulls
+			}
+		}
+		entries := view.entries
 		thresh3, ok := neighGCThresh(fam.sysDir, "gc_thresh3")
 		if !ok || thresh3 == 0 {
 			continue
 		}
 		fill := float64(entries) / float64(thresh3)
+		fills[fam.name] = fill
+		// table_fulls delta → pending overflow evidence. The first
+		// read seeds the baseline (the counter is cumulative since
+		// boot — a fresh Runner must not treat the whole history
+		// as one giant delta).
+		fullsDelta := false
+		if r.deps.NeighFlushTableFulls && view.tableFulls > 0 {
+			if r.neighFulls == nil {
+				r.neighFulls = map[string]uint64{}
+			}
+			if last, seen := r.neighFulls[fam.name]; seen &&
+				view.tableFulls > last {
+				fullsDelta = true
+			}
+			r.neighFulls[fam.name] = view.tableFulls
+		}
 		// Pending overflow evidence expires after neighPendingTTL —
 		// an overflow logged mid-cooldown must not arm a bump once
 		// the table has had a full window to recover on its own.
@@ -208,17 +292,157 @@ func (r *Runner) updateNeighborTable(ctx context.Context) {
 			delete(r.neigh, fam.name)
 			pending = false
 		}
-		if fill < neighFillRatio && !pending {
-			continue
+		if fullsDelta {
+			// Mark pending like noteNeighborOverflow does — the
+			// delta is fresh evidence, so re-stamp the timestamp.
+			if r.neigh == nil {
+				r.neigh = map[string]time.Time{}
+			}
+			r.neigh[fam.name] = now
+			pending = true
 		}
-		// RateTrySpend not RateOK+RateSpend: check-and-spend must
-		// be one atomic budget decision (the conntrack parity).
-		if !r.deps.Store.RateTrySpend("last-neigh-bump-"+fam.name, neighBumpEvery) {
-			continue
+		pressured := fill >= neighFillRatio || pending
+		if pressured {
+			// RateTrySpend not RateOK+RateSpend: check-and-spend must
+			// be one atomic budget decision (the conntrack parity).
+			if r.deps.Store.RateTrySpend("last-neigh-bump-"+fam.name, neighBumpEvery) {
+				r.bumpNeighborGC(ctx, fam, entries, thresh3)
+				delete(r.neigh, fam.name)
+			}
 		}
-		r.bumpNeighborGC(ctx, fam, entries, thresh3)
-		delete(r.neigh, fam.name)
+		// P0.4 flush guard — returns the post-flush fill (or -1
+		// when no flush ran / the re-read was inconclusive) so the
+		// latch hysteresis below sees post-eviction evidence.
+		if postFill := r.maybeFlushNeighbor(ctx, fam, view, fill,
+			pending, thresh3); postFill >= 0 {
+			fills[fam.name] = postFill
+			fill = postFill
+		}
+		if r.neighPinned == nil {
+			r.neighPinned = map[string]int{}
+		}
+		if fill >= neighLatchEnterRatio {
+			r.neighPinned[fam.name]++
+		} else {
+			r.neighPinned[fam.name] = 0
+		}
 	}
+	r.updateNeighborLatch(fills)
+}
+
+// updateNeighborLatch applies the P0.4 hysteresis to the shared
+// NeighborTablePressure latch: arm after neighLatchTicks
+// consecutive ticks with a family still >= neighLatchEnterRatio
+// of gc_thresh3, clear only when EVERY readable family sits below
+// neighLatchExitRatio — the band between the two ratios keeps the
+// prior state so a borderline table cannot flap the condition.
+// fills only carries families whose proc view AND gc_thresh3 read
+// succeeded this tick; an all-inconclusive sweep keeps state.
+func (r *Runner) updateNeighborLatch(fills map[string]float64) {
+	if !r.deps.NeighFlushGuard {
+		// Guard off → the latch must still clear (an operator who
+		// disables the guard shouldn't inherit a stuck condition).
+		r.deps.Store.Exit(latchdefs.LatchNeighborPressure, nil)
+		return
+	}
+	if len(fills) == 0 {
+		return
+	}
+	pinned := false
+	for _, n := range r.neighPinned {
+		if n >= neighLatchTicks {
+			pinned = true
+			break
+		}
+	}
+	low := true
+	for _, f := range fills {
+		if f >= neighLatchExitRatio {
+			low = false
+			break
+		}
+	}
+	switch {
+	case pinned:
+		r.deps.Store.Enter(latchdefs.LatchNeighborPressure, "pinned")
+	case low:
+		r.deps.Store.Exit(latchdefs.LatchNeighborPressure, nil)
+	}
+}
+
+// maybeFlushNeighbor is the P0.4 flush guard: it spends the
+// last-neigh-flush-<fam> budget and evicts the configured NUD
+// states — `nud failed` and `nud stale` by default, `nud reachable`
+// only on explicit opt-in (it drops live neighbors) — when the
+// family shows flush-grade evidence: fill >= neighFlushRatio (85%
+// of gc_thresh3), the table sitting AT gc_thresh3, or fresh
+// overflow evidence (pending kmsg / table_fulls delta). The
+// at-ceiling branch runs on the short neighFlushCeilingCooldown
+// budget; every other branch uses the configured
+// NeighFlushCooldown. Returns the post-flush fill ratio, or -1
+// when no flush ran or the re-read was inconclusive — the caller
+// feeds it into the latch hysteresis.
+func (r *Runner) maybeFlushNeighbor(ctx context.Context, fam neighFamily,
+	view neighTableView, fill float64, pending bool, thresh3 uint64) float64 {
+
+	if !r.deps.NeighFlushGuard {
+		return -1
+	}
+	atCeiling := float64(view.entries) >= float64(thresh3)
+	if fill < neighFlushRatio && !atCeiling && !pending {
+		return -1 // below flush grade — nothing to evict for
+	}
+	cooldown := r.deps.NeighFlushCooldown
+	if cooldown <= 0 {
+		cooldown = DefaultNeighFlushCooldown
+	}
+	if atCeiling && cooldown > neighFlushCeilingCooldown {
+		cooldown = neighFlushCeilingCooldown
+	}
+	if !r.deps.Store.RateTrySpend("last-neigh-flush-"+fam.name, cooldown) {
+		return -1 // flush on cooldown — caller keeps prior fill
+	}
+	var flushed []string
+	for _, spec := range []struct {
+		on  bool
+		nud string
+	}{
+		{r.deps.NeighFlushEvictNudFailed, "failed"},
+		{r.deps.NeighFlushEvictStale, "stale"},
+		{r.deps.NeighFlushEvictReachable, "reachable"},
+	} {
+		if !spec.on {
+			continue
+		}
+		if _, err := r.deps.RunHostCmd(ctx,
+			"ip", fam.ipFlag, "neigh", "flush", "nud", spec.nud); err != nil {
+			logger().Warn("neighbor: ip neigh flush failed",
+				"family", fam.name, "nud", spec.nud, "error", err)
+			continue
+		}
+		flushed = append(flushed, spec.nud)
+	}
+	if len(flushed) == 0 {
+		return -1
+	}
+	logger().Info("neighbor: flush guard evicted entries",
+		"family", fam.name, "nud", strings.Join(flushed, ","))
+	// Post-flush re-read — the caller's latch hysteresis needs the
+	// post-eviction fill, not the pre-flush one.
+	post, ok := fam.entries(fam.table)
+	if !ok {
+		return -1 // inconclusive — keep prior fill
+	}
+	post3, ok := neighGCThresh(fam.sysDir, "gc_thresh3")
+	if !ok || post3 == 0 {
+		return -1
+	}
+	postFill := float64(post.entries) / float64(post3)
+	if postFill >= neighLatchEnterRatio {
+		logger().Warn("hostmetrics: neighbor table still pinned after flush",
+			"family", fam.name, "entries", post.entries, "thresh3", post3)
+	}
+	return postFill
 }
 
 // neighBumpTriplet computes the doubled gc_thresh{1,2,3} values —

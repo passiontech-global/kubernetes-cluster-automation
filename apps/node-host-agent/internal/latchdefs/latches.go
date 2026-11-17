@@ -190,6 +190,12 @@ const (
 	// backend IP with dots dashed (shell ${beh//./-}), minted per
 	// target at write time.
 	LatchAPIServerBackendStalePrefix = "apiserver-backend-stale-"
+
+	// workerhygiene/kernelfail — wave-2 self-healing latches.
+	LatchEphemeralPortPressure = "ephemeral-port-pressure" // P0.3 workerhygiene
+	LatchCSIRegistrationWedged = "csi-registration-wedged" // P1.6 workerhygiene
+	LatchNetfilterLocked       = "netfilter-locked"        // P2.11 workerhygiene
+	LatchNeighborPressure      = "neighbor-pressure"       // P0.4 hostmetrics
 )
 
 // LatchDef is one registry entry: the latch's <name> suffix, the
@@ -333,6 +339,13 @@ var LatchDefs = []LatchDef{
 	{Name: LatchGPUHardwareError, Owner: "hostmetrics"},
 	{Name: LatchHostNetworkProblems, Owner: "hostmetrics"},
 	{Name: LatchClocksourceUnstable, Owner: "hostmetrics"},
+	// workerhygiene — wave-2 self-healing guards.
+	{Name: LatchEphemeralPortPressure, Owner: "workerhygiene"},
+	{Name: LatchCSIRegistrationWedged, Owner: "workerhygiene"},
+	{Name: LatchNetfilterLocked, Owner: "workerhygiene"},
+	// hostmetrics — the neighbor-table post-flush pressure latch
+	// (kernelfail neighbor.go upgrade).
+	{Name: LatchNeighborPressure, Owner: "hostmetrics"},
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},

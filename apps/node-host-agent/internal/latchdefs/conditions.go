@@ -392,4 +392,29 @@ var CondDefs = map[string]CondDef{
 		DefaultMessage: "inotify instances and watches below the sysctl ceiling",
 		ProblemReason:  "InotifyPressureDetected",
 	},
+	// --- wave-2 self-healing wave ---
+	LatchEphemeralPortPressure: {
+		Type:           "EphemeralPortPressure",
+		DefaultReason:  "EphemeralPortsNormal",
+		DefaultMessage: "ephemeral port tuple ratio and CLOSE_WAIT below pressure thresholds",
+		ProblemReason:  "EphemeralPortPressureDetected",
+	},
+	LatchNeighborPressure: {
+		Type:           "NeighborTablePressure",
+		DefaultReason:  "NeighborTableNormal",
+		DefaultMessage: "ARP/NDISC neighbor tables below pressure ceiling after flush",
+		ProblemReason:  "NeighborTablePressureDetected",
+	},
+	LatchNetfilterLocked: {
+		Type:           "NetfilterLockWedged",
+		DefaultReason:  "NetfilterLockFree",
+		DefaultMessage: "/run/xtables.lock not held across hygiene cycles",
+		ProblemReason:  "NetfilterLockWedgedDetected",
+	},
+	LatchCSIRegistrationWedged: {
+		Type:           "CSIRegistrationWedged",
+		DefaultReason:  "CSIRegistrationOk",
+		DefaultMessage: "CSI node plugin registration matches kubelet plugins_registry / CSINode",
+		ProblemReason:  "CSIRegistrationWedgedDetected",
+	},
 }

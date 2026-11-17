@@ -203,6 +203,12 @@ var logRules = []logRule{
 	{nodecond.GPUHardwareError, latchdefs.StateEnterRe(latchdefs.LatchGPUHardwareError)},
 	{nodecond.HostNetworkProblems, latchdefs.StateEnterRe(latchdefs.LatchHostNetworkProblems)},
 	{nodecond.InotifyPressure, latchdefs.StateEnterRe(latchdefs.LatchInotifyPressure)},
+	// --- wave-2 self-healing latch→event surface ---
+	// One Event per STATE-ENTER for the four new condition latches.
+	{nodecond.EphemeralPortPressure, latchdefs.StateEnterRe(latchdefs.LatchEphemeralPortPressure)},
+	{nodecond.NeighborTablePressure, latchdefs.StateEnterRe(latchdefs.LatchNeighborPressure)},
+	{nodecond.NetfilterLockWedged, latchdefs.StateEnterRe(latchdefs.LatchNetfilterLocked)},
+	{nodecond.CSIRegistrationWedged, latchdefs.StateEnterRe(latchdefs.LatchCSIRegistrationWedged)},
 }
 
 // exitLogRules — STATE-EXIT lines that earn an informational (Normal)

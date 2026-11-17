@@ -232,6 +232,11 @@ func TestAllConditionDefaults(t *testing.T) {
 		"GPUHardwareError":    {"GPUHealthy", "no NVIDIA GPU fatal Xid or nvidia-uvm driver hang"},
 		"HostNetworkProblems": {"HostNetworkHealthy", "primary physical NIC stable (no carrier flap, CRC/frame errors, or TX timeouts)"},
 		"InotifyPressure":     {"InotifyNormal", "inotify instances and watches below the sysctl ceiling"},
+		// wave-2 self-healing latch→condition surface.
+		"EphemeralPortPressure": {"EphemeralPortsNormal", "ephemeral port tuple ratio and CLOSE_WAIT below pressure thresholds"},
+		"NeighborTablePressure": {"NeighborTableNormal", "ARP/NDISC neighbor tables below pressure ceiling after flush"},
+		"NetfilterLockWedged":   {"NetfilterLockFree", "/run/xtables.lock not held across hygiene cycles"},
+		"CSIRegistrationWedged": {"CSIRegistrationOk", "CSI node plugin registration matches kubelet plugins_registry / CSINode"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

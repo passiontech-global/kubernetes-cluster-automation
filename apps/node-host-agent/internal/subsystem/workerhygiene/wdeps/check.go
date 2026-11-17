@@ -73,6 +73,15 @@ const (
 	// order is load-bearing).
 	CheckInotifyHygiene = "inotify-pressure-hygiene" // inotify instance/watch pressure + runaway-pod evictor
 	CheckOrphanPodVols  = "orphan-pod-volumes"       // orphaned kubelet pod volume dirs
+
+	// Wave-2 self-healing guards — appended at the tail so the 50
+	// existing check labels (metric `check` values + WD_SIG keys)
+	// keep their dispatch order.
+	CheckEphemeralPorts = "ephemeral-port-pressure" // P0.3 netlink sock-diag port/ CLOSE_WAIT guard
+	CheckHungRunc       = "hung-runc-reaper"        // P1.5 hung OCI runtime reaper
+	CheckCSIGuard       = "csi-registration-guard"  // P1.6 CSI plugins_registry healer
+	CheckGPUGuard       = "gpu-pcie-guard"          // P2.12 GPU PCIe/device-plugin desync guard
+	CheckNetfilterGuard = "netfilter-guard"         // P2.11 xtables lock + hung cmd guard
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every

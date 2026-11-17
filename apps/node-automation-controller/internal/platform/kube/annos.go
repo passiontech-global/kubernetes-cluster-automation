@@ -78,6 +78,31 @@ const (
 	// AnnoCatchup is cronjob-catchup's annotation marker on a CronJob
 	// it already caught up.
 	AnnoCatchup = "passiontech.dev/catchup"
+	// AnnoWriteStormSuspendedBy is apiserver-write-storm's stamp on a
+	// Flux Kustomization/HelmRelease it suspended — restore touches
+	// ONLY stamped objects, never a hand-suspended one.
+	AnnoWriteStormSuspendedBy = "passiontech.dev/write-storm-suspended-by"
+	// AnnoWriteStormExempt opts a Flux Kustomization/HelmRelease out
+	// of the write-storm breaker's suspend pass.
+	AnnoWriteStormExempt = "passiontech.dev/write-storm-exempt"
+	// AnnoCoreDNSBoostUntil is coredns-forward-saturation's boost
+	// window stamp on the kube-system/coredns Deployment — the
+	// coredns-patcher adds COREDNS_SATURATION_BOOST_REPLICAS while
+	// now < this timestamp.
+	AnnoCoreDNSBoostUntil = "passiontech.dev/coredns-boost-until"
+	// AnnoLastHPAHeal is hpa-scaling-guard's persisted cooldown
+	// stamp — cold-start rescue + metrics-server bounce.
+	AnnoLastHPAHeal = "passiontech.dev/last-hpa-heal"
+	// AnnoLastDeploymentUnstick is deployment-rollout-wedge's
+	// persisted template-nudge cooldown stamp.
+	AnnoLastDeploymentUnstick = "passiontech.dev/last-deployment-unstick"
+	// AnnoSubPathReloadOptOut opts a workload out of
+	// subpath-config-drift's restart-template reload when set to
+	// "false" (the plan's literal exclusion value).
+	AnnoSubPathReloadOptOut = "passiontech.dev/subpath-reload-opt-out"
+	// AnnoLastSubPathReload is subpath-config-drift's persisted
+	// cooldown stamp on the restarted workload.
+	AnnoLastSubPathReload = "passiontech.dev/last-subpath-reload"
 	// LabelMissedCatchup is cronjob-catchup's LABEL marking a Job it
 	// spawned for a missed CronJob schedule.
 	LabelMissedCatchup = "passiontech.dev/missed-catchup"
@@ -119,6 +144,7 @@ const (
 	AnnoFirstSeenOperatorWorkqueue   = "passiontech.dev/first-seen-operator-workqueue"
 	AnnoFirstSeenLinkerdEndpointSync = "passiontech.dev/first-seen-linkerd-endpoint-sync"
 	AnnoFirstSeenArgoCDAppStuck      = "passiontech.dev/first-seen-argocd-app-stuck"
+	AnnoFirstSeenHPA                 = "passiontech.dev/first-seen-hpa-scaling"
 	// AnnoFirstSeenStormGateHold is descheduler-storm-gate's persisted
 	// first-seen stamp for a passiontech.dev/storm-gate-hold="true"
 	// hold — the hold annotation carries no timestamp of its own, so

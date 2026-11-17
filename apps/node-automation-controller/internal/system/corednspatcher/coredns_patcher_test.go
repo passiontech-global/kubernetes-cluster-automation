@@ -525,7 +525,8 @@ const k0sCorefile = `.:53 {
 }
 `
 
-// patchedCorefile is the denial-capped stock Corefile.
+// patchedCorefile is the fully healed stock Corefile — denial-capped
+// cache block AND the forward max_concurrent option (P1.7a).
 const patchedCorefile = `.:53 {
     errors
     health {
@@ -538,7 +539,7 @@ const patchedCorefile = `.:53 {
         ttl 30
     }
     prometheus :9153
-    forward . /etc/resolv.conf
+    forward . /etc/resolv.conf { max_concurrent 2000 }
     cache 30 {
         success 9984 30
         denial 9984 5
@@ -983,5 +984,124 @@ func TestCoreDNSPatcherCorefileFluxLoopGate(t *testing.T) {
 	}
 	if got := getCorefile(t, cs); got != k0sCorefile {
 		t.Fatalf("flux-loop gate did not skip the corefile patch:\n%s", got)
+	}
+}
+
+// corefileForwardHeal exercises the P1.7a forward max_concurrent
+// injection across every Corefile forward shape: bare directive,
+// inline block, multi-line block, declared value, and comments.
+func TestCorefileForwardHeal(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      string
+		changed bool
+		want    []string
+		absent  []string
+	}{
+		{"bare forward gains inline block",
+			".:53 {\n    forward . /etc/resolv.conf\n}\n", true,
+			[]string{"forward . /etc/resolv.conf { max_concurrent 2000 }"}, nil},
+		{"bare forward keeps trailing comment",
+			".:53 {\n    forward . /etc/resolv.conf # upstream\n}\n", true,
+			[]string{"{ max_concurrent 2000 } # upstream"}, nil},
+		{"inline block without option gains it",
+			".:53 {\n    forward . 8.8.8.8 { policy sequential }\n}\n", true,
+			[]string{"max_concurrent 2000"}, nil},
+		{"inline block with option untouched",
+			".:53 {\n    forward . 8.8.8.8 { max_concurrent 500 }\n}\n", false,
+			nil, nil},
+		{"multi-line block gains directive before close",
+			".:53 {\n    forward . 8.8.8.8 {\n        policy sequential\n    }\n}\n", true,
+			[]string{"max_concurrent 2000"}, nil},
+		{"multi-line block with option untouched",
+			".:53 {\n    forward . 8.8.8.8 {\n        max_concurrent 750\n    }\n}\n", false,
+			nil, nil},
+		{"commented max_concurrent counts as missing",
+			".:53 {\n    forward . 8.8.8.8 {\n        # max_concurrent 2000\n    }\n}\n", true,
+			[]string{"max_concurrent 2000"}, nil},
+		{"custom value honored",
+			".:53 {\n    forward . /etc/resolv.conf\n}\n", true,
+			[]string{"max_concurrent 4000"}, nil},
+		{"no forward directive — untouched",
+			".:53 {\n    cache 30\n}\n", false, nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := "2000"
+			if tc.name == "custom value honored" {
+				mc = "4000"
+			}
+			got, changed := corefileForwardHeal(tc.in, mc)
+			if changed != tc.changed {
+				t.Fatalf("changed=%v, want %v:\n%s", changed, tc.changed, tc.in)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Fatalf("rewrite missing %q:\n%s", w, got)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(got, a) {
+					t.Fatalf("rewrite unexpectedly contains %q:\n%s", a, got)
+				}
+			}
+			if !changed && got != tc.in {
+				t.Fatal("unchanged corefile mutated")
+			}
+			again, againChanged := corefileForwardHeal(got, mc)
+			if againChanged || again != got {
+				t.Fatalf("forward heal not idempotent: pass2 changed=%v\n%s",
+					againChanged, again)
+			}
+		})
+	}
+}
+
+// corednsMaxConcurrent validates the knob: positive integers pass
+// through normalized, everything else warns and falls back to 2000 —
+// the value lands verbatim in the Corefile.
+func TestCoreDNSMaxConcurrentKnob(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"2000", "2000"},
+		{" 4000 ", "4000"},
+		{"0", "2000"},
+		{"-5", "2000"},
+		{"banana", "2000"},
+		{"", "2000"},
+	} {
+		if got := corednsMaxConcurrent(tc.in); got != tc.want {
+			t.Fatalf("corednsMaxConcurrent(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// corednsEffectiveReplicas applies the saturation boost only while
+// the boost-until stamp is fresh and the replica pin is enabled.
+func TestCoreDNSEffectiveReplicas(t *testing.T) {
+	now := time.Now()
+	fresh := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{
+			kube.AnnoCoreDNSBoostUntil: now.Add(10 * time.Minute).UTC().Format(time.RFC3339),
+		}}}
+	stale := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{
+			kube.AnnoCoreDNSBoostUntil: now.Add(-time.Minute).UTC().Format(time.RFC3339),
+		}}}
+	for _, tc := range []struct {
+		name         string
+		want, boost  int32
+		d            *appsv1.Deployment
+		wantReplicas int32
+	}{
+		{"boost active adds replicas", 4, 2, fresh, 6},
+		{"expired stamp no boost", 4, 2, stale, 4},
+		{"no stamp no boost", 4, 2, &appsv1.Deployment{}, 4},
+		{"disabled pin never boosted", 0, 2, fresh, 0},
+		{"zero boost replicas no-op", 4, 0, fresh, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := corednsEffectiveReplicas(tc.want, tc.boost, tc.d, now); got != tc.wantReplicas {
+				t.Fatalf("corednsEffectiveReplicas = %d, want %d", got, tc.wantReplicas)
+			}
+		})
 	}
 }

@@ -37,4 +37,24 @@ const (
 	EnvNICCarrierFlapThreshold = "NODE_HOST_AGENT_NIC_CARRIER_FLAP_THRESHOLD"
 	EnvNICTxTimeoutThreshold   = "NODE_HOST_AGENT_NIC_TX_TIMEOUT_THRESHOLD"
 	EnvNICCRErrorThreshold     = "NODE_HOST_AGENT_NIC_CRC_ERROR_THRESHOLD"
+
+	// P0.4 neighbor-table pressure (kernelfail neighbor.go wave-2):
+	// the flush guard that evicts nud-failed/stale entries and latches
+	// NeighborTablePressure when the table stays pinned past the
+	// sysctl ceiling.
+	EnvNeighborFlushGuardEnabled   = "NODE_HOST_AGENT_NEIGHBOR_FLUSH_GUARD_ENABLED"
+	EnvNeighborFlushEvictStale     = "NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_STALE"
+	EnvNeighborFlushEvictNudFailed = "NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_NUD_FAILED"
+	EnvNeighborFlushEvictReachable = "NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_REACHABLE"
+	EnvNeighborFlushCooldownMin    = "NODE_HOST_AGENT_NEIGHBOR_FLUSH_COOLDOWN_MIN"
+	EnvNeighborFlushArpCeiling     = "NODE_HOST_AGENT_NEIGHBOR_FLUSH_ARP_CEILING"
+	EnvNeighborFlushNdiscCeiling   = "NODE_HOST_AGENT_NEIGHBOR_FLUSH_NDISC_CEILING"
+	EnvNeighborFlushTableFulls     = "NODE_HOST_AGENT_NEIGHBOR_FLUSH_TABLE_FULLS"
+
+	// P2.12 GPU PCIe census (kernelfail gpu_pcie.go): the operator-
+	// declared NVIDIA device total the pcie-loss verdict compares
+	// against (0 = learn-from-hardware baseline only). The mode
+	// knob itself is EnvGPUGuardMode in envnames_workerhygiene.go —
+	// one env contract shared by both subsystems.
+	EnvGPUExpectedCount = "NODE_HOST_AGENT_GPU_EXPECTED_COUNT"
 )

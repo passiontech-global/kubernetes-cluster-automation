@@ -356,3 +356,91 @@ func TestNodeLabelerReadFileErrorMetered(t *testing.T) {
 		t.Fatalf("labels.txt read failure not IncError'd, delta %v", got)
 	}
 }
+
+// P0.2b — the one-way GA→deprecated compat sync fills missing
+// beta.kubernetes.io/*, failure-domain.beta.kubernetes.io/* and
+// master role labels so DaemonSets on deprecated selectors schedule
+// again; already-synced nodes are not re-patched, and compatHeal=false
+// disables the pass entirely.
+func TestNodeLabelerCompatHeal(t *testing.T) {
+	newFixture := func() *fake.Clientset {
+		return fake.NewSimpleClientset(
+			// GA labels present, deprecated twins missing.
+			testutil.Node("w1", corev1.ConditionTrue, map[string]string{
+				workerRoleLabel:               "",
+				"kubernetes.io/os":            "linux",
+				"kubernetes.io/arch":          "amd64",
+				"topology.kubernetes.io/zone": "z1",
+			}),
+			// Control-plane: gains the master role labels too.
+			testutil.Node("cp1", corev1.ConditionTrue, map[string]string{
+				"node-role.kubernetes.io/control-plane": "",
+				"kubernetes.io/os":                      "linux",
+			}),
+			// Fully synced — must not be re-patched.
+			testutil.Node("w2", corev1.ConditionTrue, map[string]string{
+				workerRoleLabel:         "",
+				"kubernetes.io/os":      "linux",
+				"beta.kubernetes.io/os": "linux",
+			}),
+		)
+	}
+
+	t.Run("syncs missing deprecated twins", func(t *testing.T) {
+		cs := newFixture()
+		r := &nodeLabeler{cs: cs, queue: "node-labeler",
+			configPath: filepath.Join(t.TempDir(), "labels.txt"), compatHeal: true}
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		w1 := testutil.GetNode(t, cs, "w1").Labels
+		for k, v := range map[string]string{
+			"beta.kubernetes.io/os":                  "linux",
+			"beta.kubernetes.io/arch":                "amd64",
+			"failure-domain.beta.kubernetes.io/zone": "z1",
+		} {
+			if w1[k] != v {
+				t.Fatalf("w1 missing compat label %s=%q: %v", k, v, w1)
+			}
+		}
+		cp1 := testutil.GetNode(t, cs, "cp1").Labels
+		if cp1["beta.kubernetes.io/os"] != "linux" ||
+			cp1["node-role.kubernetes.io/master"] != "" ||
+			cp1["master"] != "" {
+			t.Fatalf("cp1 compat labels wrong: %v", cp1)
+		}
+		// w2 was already synced — exactly 2 compat patches (w1, cp1);
+		// the worker-role sweep patched nothing (all roles present).
+		if n := nodePatchActions(cs); n != 2 {
+			t.Fatalf("expected 2 compat patches, got %d", n)
+		}
+	})
+
+	t.Run("disabled gate patches nothing", func(t *testing.T) {
+		cs := newFixture()
+		r := &nodeLabeler{cs: cs, queue: "node-labeler",
+			configPath: filepath.Join(t.TempDir(), "labels.txt"), compatHeal: false}
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		if n := nodePatchActions(cs); n != 0 {
+			t.Fatalf("compatHeal=false still patched %d nodes", n)
+		}
+	})
+
+	t.Run("idempotent second sweep", func(t *testing.T) {
+		cs := newFixture()
+		r := &nodeLabeler{cs: cs, queue: "node-labeler",
+			configPath: filepath.Join(t.TempDir(), "labels.txt"), compatHeal: true}
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		first := nodePatchActions(cs)
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		if n := nodePatchActions(cs); n != first {
+			t.Fatalf("second sweep issued %d extra patches", n-first)
+		}
+	})
+}

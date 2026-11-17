@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,6 +49,12 @@ type nodeLabeler struct {
 	// every IncError label come from one place.
 	queue      string
 	configPath string
+	// compatHeal gates the P0.2b one-way GA→deprecated label sync
+	// (NODE_AUTOMATION_DEPRECATED_SELECTOR_HEAL_ENABLED, default
+	// on): infra DaemonSets still selecting beta.kubernetes.io/*,
+	// failure-domain.beta.kubernetes.io/* or the master role labels
+	// starve on nodes that only carry the GA keys.
+	compatHeal bool
 }
 
 // The watch wiring below installs these package-level units
@@ -71,7 +78,8 @@ var nodeLabelChanges = shared.NodeUpdatePredicate(false, func(oldN, newN *corev1
 func Setup(d shared.Deps) error {
 	return shared.SetupWithConfig(d, configFromEnv, func(cfg labelerConfig) error {
 		logf.Log.WithName(d.Name).Info("registered", "configPath", cfg.configPath)
-		r := &nodeLabeler{cs: d.CS, nodeReader: d.CachedClient(), queue: d.Name, configPath: cfg.configPath}
+		r := &nodeLabeler{cs: d.CS, nodeReader: d.CachedClient(), queue: d.Name,
+			configPath: cfg.configPath, compatHeal: cfg.compatHeal}
 		return ctrl.NewControllerManagedBy(d.Mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the
@@ -91,15 +99,20 @@ func Setup(d shared.Deps) error {
 // through SetupWithConfig's parse step.
 type labelerConfig struct {
 	configPath string
+	compatHeal bool
 }
 
-// configFromEnv resolves NODE_LABELER_CONFIG_PATH. SetupWithConfig
-// runs it before the Deps.Disabled check — moot today (node-labeler
-// has no GateEnv) but it keeps the parse->gate->register shape
-// uniform with the gated modules.
+// configFromEnv resolves NODE_LABELER_CONFIG_PATH and the P0.2b
+// compat-heal gate. SetupWithConfig runs it before the
+// Deps.Disabled check — moot today (node-labeler has no GateEnv)
+// but it keeps the parse->gate->register shape uniform with the
+// gated modules.
 func configFromEnv() labelerConfig {
-	return labelerConfig{configPath: envx.Getenv("NODE_LABELER_CONFIG_PATH",
-		"/etc/node-labeler/labels.txt")}
+	return labelerConfig{
+		configPath: envx.Getenv("NODE_LABELER_CONFIG_PATH",
+			"/etc/node-labeler/labels.txt"),
+		compatHeal: envx.Bool("NODE_AUTOMATION_DEPRECATED_SELECTOR_HEAL_ENABLED", true),
+	}
 }
 
 func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
@@ -156,10 +169,12 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			log.Info("WARN: cannot read labels file — skipping file labels",
 				"path", r.configPath, "error", err)
 		}
+		labeled += r.syncCompatLabels(ctx, log, byName)
 		log.Info("sweep done", "labeled", labeled)
 		return res, nil
 	}
 	if len(data) == 0 {
+		labeled += r.syncCompatLabels(ctx, log, byName)
 		log.Info("sweep done", "labeled", labeled)
 		return res, nil
 	}
@@ -218,6 +233,43 @@ func (r *nodeLabeler) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.
 			log.Info("labeled", "node", name, "label", label)
 		}
 	}
+	labeled += r.syncCompatLabels(ctx, log, byName)
 	log.Info("sweep done", "labeled", labeled)
 	return res, nil
+}
+
+// syncCompatLabels is the P0.2b one-way GA→deprecated label sync:
+// infra DaemonSets still selecting beta.kubernetes.io/*,
+// failure-domain.beta.kubernetes.io/* or the master role labels
+// starve on nodes carrying only the GA keys; filling the deprecated
+// twins (kube.CompatNodeLabels — the same mapping the
+// critical-daemonset-starvation check patches on demand) restores
+// scheduling without touching the workloads. Same per-node
+// WARN-and-continue tolerance as the labels.txt pass; returns the
+// number of nodes patched.
+func (r *nodeLabeler) syncCompatLabels(ctx context.Context,
+	log logr.Logger, byName map[string]*corev1.Node) int {
+
+	if !r.compatHeal {
+		return 0
+	}
+	patched := 0
+	for _, n := range byName {
+		compat := kube.CompatNodeLabels(n.Labels)
+		if len(compat) == 0 {
+			continue
+		}
+		if err := kube.PatchNodeLabels(ctx, r.cs, n.Name, compat); err != nil {
+			metrics.IncError(r.queue)
+			log.Info("WARN: cannot sync compat labels", "node", n.Name, "error", err)
+			continue
+		}
+		if n.Labels == nil {
+			n.Labels = map[string]string{}
+		}
+		maps.Copy(n.Labels, compat)
+		patched++
+		log.Info("synced compat labels", "node", n.Name, "labels", compat)
+	}
+	return patched
 }

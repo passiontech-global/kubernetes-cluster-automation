@@ -130,6 +130,14 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"statefulset-rollout-unstick", "health"},
 	{"daemonset-rollout-wedge", "health"},
 	{"cronjob-forbid-zombie", "health"},
+	// The six self-healing wave-2 checks — appended after the
+	// existing roster per the plan.
+	{"apiserver-write-storm-breaker", "health"},
+	{"critical-daemonset-starvation", "health"},
+	{"coredns-forward-saturation", "health"},
+	{"hpa-scaling-guard", "health"},
+	{"deployment-rollout-wedge", "health"},
+	{"subpath-config-drift", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -292,6 +300,14 @@ var goldenMetricFamilies = []string{
 	"node_automation_cronjob_forbid_stalled",
 	"node_automation_pdb_unhealthy_policy_patched_total",
 	"shell_operator_hook_run_errors_total",
+	// Self-healing wave-2 — the six new check gauges (appended, not
+	// alphabetical, same convention as the rows above).
+	"node_automation_apiserver_write_storm",
+	"node_automation_critical_daemonset_starvation",
+	"node_automation_coredns_forward_saturation",
+	"node_automation_hpa_scaling_unhealthy",
+	"node_automation_deployment_rollout_wedge",
+	"node_automation_subpath_config_drift",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key
@@ -359,6 +375,15 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"AnnoVolumeSelectedNode", "volume.kubernetes.io/selected-node"},
 	{"AnnoRelistStormSuspend", "passiontech.dev/relist-storm-suspend"},
 	{"AnnoRelistStormSuspendedBy", "passiontech.dev/relist-storm-suspended-by"},
+	// Self-healing wave-2 stamps.
+	{"AnnoWriteStormSuspendedBy", "passiontech.dev/write-storm-suspended-by"},
+	{"AnnoWriteStormExempt", "passiontech.dev/write-storm-exempt"},
+	{"AnnoCoreDNSBoostUntil", "passiontech.dev/coredns-boost-until"},
+	{"AnnoLastHPAHeal", "passiontech.dev/last-hpa-heal"},
+	{"AnnoLastDeploymentUnstick", "passiontech.dev/last-deployment-unstick"},
+	{"AnnoSubPathReloadOptOut", "passiontech.dev/subpath-reload-opt-out"},
+	{"AnnoLastSubPathReload", "passiontech.dev/last-subpath-reload"},
+	{"AnnoFirstSeenHPA", "passiontech.dev/first-seen-hpa-scaling"},
 }
 
 func TestGoldenRegistryRows(t *testing.T) {
@@ -632,6 +657,22 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.AnnoRelistStormSuspend
 	case "AnnoRelistStormSuspendedBy":
 		return kube.AnnoRelistStormSuspendedBy
+	case "AnnoWriteStormSuspendedBy":
+		return kube.AnnoWriteStormSuspendedBy
+	case "AnnoWriteStormExempt":
+		return kube.AnnoWriteStormExempt
+	case "AnnoCoreDNSBoostUntil":
+		return kube.AnnoCoreDNSBoostUntil
+	case "AnnoLastHPAHeal":
+		return kube.AnnoLastHPAHeal
+	case "AnnoLastDeploymentUnstick":
+		return kube.AnnoLastDeploymentUnstick
+	case "AnnoSubPathReloadOptOut":
+		return kube.AnnoSubPathReloadOptOut
+	case "AnnoLastSubPathReload":
+		return kube.AnnoLastSubPathReload
+	case "AnnoFirstSeenHPA":
+		return kube.AnnoFirstSeenHPA
 	default:
 		t.Fatalf("golden key %s no longer exists as an exported const in internal/platform/kube/annos.go — update the golden consciously", name)
 		return ""

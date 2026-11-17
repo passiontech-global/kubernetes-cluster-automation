@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
 
 // neighFixture points the engine's neighbor seams at fixture files
@@ -121,22 +123,23 @@ func TestNeighborIPv4FillBumpsAndFlushes(t *testing.T) {
 func TestNeighborCeilingCapsBump(t *testing.T) {
 	f := kfixture(t)
 	nf := seedNeighborFixture(t, f)
-	// Triplet already at the default ceilings.
+	// Triplet already at the default ceilings — the P0.4-raised
+	// 16384/65536/131072.
 	for i, knob := range []string{"gc_thresh1", "gc_thresh2", "gc_thresh3"} {
-		vals := []string{"1024", "4096", "8192"}
+		vals := []string{"16384", "65536", "131072"}
 		writePrefailFile(t, filepath.Join(nf.v4dir, knob), vals[i]+"\n")
 	}
-	// Fill: 7000 >= 80% of 8192.
+	// Fill: 110000 >= 80% of 131072.
 	var b strings.Builder
 	b.WriteString("IP address       HW type     Flags       HW address            Mask     Device\n")
-	for i := 0; i < 7000; i++ {
+	for i := 0; i < 110000; i++ {
 		fmt.Fprintf(&b, "10.2.%d.%d       0x1         0x2         00:11:22:33:44:%02x     *        eth0\n", i/256, i%256, i%256)
 	}
 	writePrefailFile(t, nf.arp, b.String())
 	f.r.updateNeighborTable(context.Background())
 	// At ceiling → values unchanged but the FAILED flush still ran.
 	for knob, want := range map[string]string{
-		"gc_thresh1": "1024", "gc_thresh2": "4096", "gc_thresh3": "8192"} {
+		"gc_thresh1": "16384", "gc_thresh2": "65536", "gc_thresh3": "131072"} {
 		if got := neighValue(t, nf.v4dir, knob); got != want {
 			t.Fatalf("ceiling %s=%s want %s", knob, got, want)
 		}
@@ -310,37 +313,173 @@ func TestNeighborInconclusiveSkips(t *testing.T) {
 	}
 }
 
-func TestNdiscCacheEntriesParse(t *testing.T) {
-	// Two rows disagree — max wins.
+func TestNdiscStatsViewParse(t *testing.T) {
+	// Two rows disagree on entries — max wins; table_fulls sums.
 	p := filepath.Join(t.TempDir(), "ndisc_cache")
 	writePrefailFile(t, p,
-		"entries  allocs   destroys\n"+
-			"0000000a 00000001 00000000\n"+
-			"00000063 00000002 00000000\n")
-	got, ok := ndiscCacheEntries(p)
-	if !ok || got != 0x63 {
-		t.Fatalf("ndiscCacheEntries=%d ok=%v want 99", got, ok)
+		"entries  allocs   destroys table_fulls\n"+
+			"0000000a 00000001 00000000 00000001\n"+
+			"00000063 00000002 00000000 00000002\n")
+	view, ok := ndiscStatsView(p)
+	if !ok || view.entries != 0x63 || view.tableFulls != 3 {
+		t.Fatalf("ndiscStatsView=%+v ok=%v want entries=99 fulls=3", view, ok)
 	}
-	if _, ok := ndiscCacheEntries(filepath.Join(t.TempDir(), "missing")); ok {
+	// Sectioned format (arp_cache + ndisc_cache name/header rows)
+	// re-bases the column indices per section.
+	p2 := filepath.Join(t.TempDir(), "ndisc_cache2")
+	writePrefailFile(t, p2,
+		"arp_cache\n"+
+			"entries allocs destroys table_fulls\n"+
+			"00000005 00000001 00000000 00000004\n"+
+			"ndisc_cache\n"+
+			"entries allocs destroys table_fulls\n"+
+			"00000009 00000001 00000000 00000006\n")
+	view, ok = ndiscStatsView(p2)
+	if !ok || view.entries != 9 || view.tableFulls != 10 {
+		t.Fatalf("sectioned ndiscStatsView=%+v ok=%v want entries=9 fulls=10", view, ok)
+	}
+	if _, ok := ndiscStatsView(filepath.Join(t.TempDir(), "missing")); ok {
 		t.Fatal("missing file parsed")
+	}
+	// Header without table_fulls is not usable evidence.
+	p3 := filepath.Join(t.TempDir(), "ndisc_cache3")
+	writePrefailFile(t, p3, "entries allocs destroys\n00000001 00000001 00000000\n")
+	if _, ok := ndiscStatsView(p3); ok {
+		t.Fatal("headerless-table_fulls file parsed")
 	}
 }
 
-func TestArpTableEntriesCount(t *testing.T) {
+func TestArpTableViewCount(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "arp")
 	writePrefailFile(t, p,
 		"IP address       HW type     Flags       HW address            Mask     Device\n"+
 			"10.0.0.1        0x1         0x2         00:11:22:33:44:55     *        eth0\n"+
 			"10.0.0.2        0x1         0x0         00:00:00:00:00:00     *        eth0\n")
-	got, ok := arpTableEntries(p)
-	if !ok || got != 2 {
-		t.Fatalf("arpTableEntries=%d ok=%v want 2", got, ok)
+	view, ok := arpTableView(p)
+	if !ok || view.entries != 2 {
+		t.Fatalf("arpTableView=%+v ok=%v want 2", view, ok)
 	}
 	// Header-only table = 0 entries, still readable.
 	writePrefailFile(t, p,
 		"IP address       HW type     Flags       HW address            Mask     Device\n")
-	got, ok = arpTableEntries(p)
-	if !ok || got != 0 {
-		t.Fatalf("empty arp table=%d ok=%v want 0", got, ok)
+	view, ok = arpTableView(p)
+	if !ok || view.entries != 0 {
+		t.Fatalf("empty arp table=%+v ok=%v want 0", view, ok)
+	}
+}
+
+// TestMaybeFlushNeighborGuardAndBudget pins the P0.4 flush guard:
+// flush-grade evidence (fill >= 0.85) spends the family budget and
+// evicts the configured NUD states; a second call inside the
+// cooldown is a no-op; the guard-off path never touches ip(8).
+func TestMaybeFlushNeighborGuardAndBudget(t *testing.T) {
+	f := kfixture(t)
+	nf := seedNeighborFixture(t, f)
+	f.r.deps.NeighFlushGuard = true
+	f.r.deps.NeighFlushEvictNudFailed = true
+	f.r.deps.NeighFlushEvictStale = true
+	fams := f.r.neighFamilies()
+	if len(fams) == 0 {
+		t.Fatal("no neighbor families")
+	}
+	fam := fams[0]
+
+	// Below flush grade → no flush, -1 (caller keeps prior fill).
+	if got := f.r.maybeFlushNeighbor(context.Background(), fam,
+		neighTableView{entries: 100}, 0.5, false, 1024); got != -1 {
+		t.Fatalf("below-grade flush returned %v want -1", got)
+	}
+	if len(nf.argvLog) != 0 {
+		t.Fatalf("below-grade flush ran: %v", nf.argvLog)
+	}
+
+	// Flush grade → failed+stale evictions (reachable stays off).
+	post := f.r.maybeFlushNeighbor(context.Background(), fam,
+		neighTableView{entries: 900}, 0.9, false, 1024)
+	if post < 0 {
+		t.Fatal("flush-grade call returned -1 — flush did not run")
+	}
+	var sawFailed, sawStale, sawReachable bool
+	for _, argv := range nf.argvLog {
+		joined := strings.Join(argv, " ")
+		sawFailed = sawFailed || strings.Contains(joined, "nud failed")
+		sawStale = sawStale || strings.Contains(joined, "nud stale")
+		sawReachable = sawReachable || strings.Contains(joined, "nud reachable")
+	}
+	if !sawFailed || !sawStale {
+		t.Fatalf("flush argv missing failed/stale: %v", nf.argvLog)
+	}
+	if sawReachable {
+		t.Fatalf("reachable evicted without opt-in: %v", nf.argvLog)
+	}
+	// Post-flush re-read: fixture arp has 10 entries / thresh3 1024.
+	if post > 0.02 {
+		t.Fatalf("post-flush fill=%v want ~0.01", post)
+	}
+
+	// Cooldown: an immediate second flush-grade call is a no-op.
+	before := len(nf.argvLog)
+	if got := f.r.maybeFlushNeighbor(context.Background(), fam,
+		neighTableView{entries: 900}, 0.9, false, 1024); got != -1 {
+		t.Fatalf("cooldown flush returned %v want -1", got)
+	}
+	if len(nf.argvLog) != before {
+		t.Fatalf("cooldown flush ran anyway: %v", nf.argvLog[before:])
+	}
+}
+
+// TestMaybeFlushNeighborGuardOff pins the detect-only posture: with
+// the guard disabled the flush never runs regardless of evidence.
+func TestMaybeFlushNeighborGuardOff(t *testing.T) {
+	f := kfixture(t)
+	seedNeighborFixture(t, f)
+	fams := f.r.neighFamilies()
+	if got := f.r.maybeFlushNeighbor(context.Background(), fams[0],
+		neighTableView{entries: 900}, 0.99, true, 1024); got != -1 {
+		t.Fatalf("guard-off flush returned %v want -1", got)
+	}
+}
+
+// TestUpdateNeighborLatchHysteresis pins the P0.4 latch contract:
+// arm needs neighLatchTicks consecutive pinned ticks, clear needs
+// EVERY readable family below the exit ratio — the band keeps state.
+func TestUpdateNeighborLatchHysteresis(t *testing.T) {
+	f := kfixture(t)
+	f.r.deps.NeighFlushGuard = true
+	stateFile := filepath.Join(f.deps.StateDir,
+		"state-"+latchdefs.LatchNeighborPressure)
+	latched := func() bool {
+		_, err := os.Stat(stateFile)
+		return err == nil
+	}
+
+	// One pinned tick is not enough — the latch needs 2.
+	f.r.neighPinned = map[string]int{"ipv4": 1}
+	f.r.updateNeighborLatch(map[string]float64{"ipv4": 0.95})
+	if latched() {
+		t.Fatal("latch armed after a single pinned tick")
+	}
+	f.r.neighPinned = map[string]int{"ipv4": 2}
+	f.r.updateNeighborLatch(map[string]float64{"ipv4": 0.95})
+	if !latched() {
+		t.Fatal("latch did not arm after 2 pinned ticks")
+	}
+	// In the 0.80–0.92 band the prior state HOLDS — no flap.
+	f.r.neighPinned = map[string]int{"ipv4": 0}
+	f.r.updateNeighborLatch(map[string]float64{"ipv4": 0.85})
+	if !latched() {
+		t.Fatal("latch cleared inside the hysteresis band")
+	}
+	// Below exit ratio on every family → clear.
+	f.r.updateNeighborLatch(map[string]float64{"ipv4": 0.5, "ipv6": 0.4})
+	if latched() {
+		t.Fatal("latch did not clear below the exit ratio")
+	}
+	// Guard off → the latch must clear even when evidence says pin.
+	f.r.deps.NeighFlushGuard = false
+	f.r.neighPinned = map[string]int{"ipv4": 5}
+	f.r.updateNeighborLatch(map[string]float64{"ipv4": 0.99})
+	if latched() {
+		t.Fatal("guard-off left the latch stuck")
 	}
 }

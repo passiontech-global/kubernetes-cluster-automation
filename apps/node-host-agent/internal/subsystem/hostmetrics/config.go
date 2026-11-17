@@ -15,6 +15,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -167,14 +168,31 @@ type Config struct {
 
 	// Self-healing wave knobs — all consumed by the kernelfail
 	// engine (kernelFailDeps): the neighbor-table gc_thresh bump
-	// ceilings and the physical-NIC flap thresholds. <=0 → the
-	// kernelfail defaults (1024/4096/8192 and 4/2/50).
-	NeighGCThresh1Ceiling   int
-	NeighGCThresh2Ceiling   int
-	NeighGCThresh3Ceiling   int
-	NICCarrierFlapThreshold int
-	NICTxTimeoutThreshold   int
-	NICCRErrorThreshold     int
+	// ceilings, the P0.4 flush guard (nud-state evictions, flush
+	// cooldown, per-family ceilings, table_fulls evidence) and the
+	// physical-NIC flap thresholds. <=0 → the kernelfail defaults
+	// (1024/4096/131072, 30m, 131072/131072 and 4/2/50).
+	NeighGCThresh1Ceiling    int
+	NeighGCThresh2Ceiling    int
+	NeighGCThresh3Ceiling    int
+	NeighFlushGuard          bool
+	NeighFlushEvictStale     bool
+	NeighFlushEvictNudFailed bool
+	NeighFlushEvictReachable bool
+	NeighFlushCooldown       time.Duration
+	NeighFlushArpCeiling     int
+	NeighFlushNdiscCeiling   int
+	NeighFlushTableFulls     bool
+	NICCarrierFlapThreshold  int
+	NICTxTimeoutThreshold    int
+	NICCRErrorThreshold      int
+
+	// P2.12 GPU PCIe census (kernelfail gpu_pcie.go): the guard
+	// mode (auto default — the sysfs scan IS the zero-cost path;
+	// off = fully dormant) and the operator-declared NVIDIA device
+	// total (0 = learn-from-hardware baseline only).
+	GPUGuardMode     envx.Mode
+	GPUExpectedCount int
 
 	// collectCacheTTL overrides the Collect snapshot TTL — 0 →
 	// collectSnapshotTTL (10s); a NEGATIVE value disables the cache
