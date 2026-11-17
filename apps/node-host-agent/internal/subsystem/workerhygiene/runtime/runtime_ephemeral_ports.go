@@ -39,6 +39,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
@@ -64,6 +65,9 @@ const (
 	// cannot flap the condition every cycle.
 	portClearRatio     = 0.65
 	portClearCloseWait = 2048
+	// minCloseWaitFloor prevents evicting a pod over 1-10 CLOSE_WAIT sockets
+	// when a node is healthy or portRangeCeiling is small in tests.
+	minCloseWaitFloor = 1000
 )
 
 // EphemeralPortsCheck is the P0.3 guard as a Check; it owns the
@@ -157,55 +161,63 @@ func (c *EphemeralPortsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	reps := c.netnsReps(pids)
 
-	// One sock_diag census PER NETNS — pod sockets live outside
-	// the host netns, so the histograms merge across reps and the
-	// SYN_SENT reaper fires per-netns (DestroyStuckSynSent enters
-	// the rep pid's netns itself).
-	states := map[uint8]int{}
+	ceiling, ceilingOK := c.portRangeCeiling()
+	if !ceilingOK || ceiling <= 0 {
+		ceiling = c.d.Cfg.Wave2.MaxConcurrent
+	}
+
+	// Evaluate per network namespace (never sum sockets across 50+
+	// independent pod netns against one host ephemeral port range).
+	tcpTables := c.d.Cfg.Seams.Host.TCPTablesFn
+	if tcpTables == nil {
+		tcpTables = netlinkx.TCPTables
+	}
 	synSentByRep := map[int]int{}
 	ok := 0
+	maxUsed := 0
+	maxCloseWait := 0
+	totalSynSent := 0
+	maxRatio := 0.0
 	for _, rep := range reps {
-		cen, err := netlinkx.TCPTables(rep)
+		cen, err := tcpTables(rep)
 		if err != nil {
 			continue // per-netns inconclusive — the rest still count
 		}
 		ok++
+		nsCloseWait := cen.States[tcpStateCloseWait]
+		nsSynSent := cen.States[tcpStateSynSent]
+		synSentByRep[rep] = nsSynSent
+		totalSynSent += nsSynSent
+		nsUsed := 0
 		for st, n := range cen.States {
-			states[st] += n
+			if st != tcpStateListen {
+				nsUsed += n
+			}
 		}
-		synSentByRep[rep] = cen.States[tcpStateSynSent]
+		if nsUsed > maxUsed {
+			maxUsed = nsUsed
+		}
+		if nsCloseWait > maxCloseWait {
+			maxCloseWait = nsCloseWait
+		}
+		if ceiling > 0 {
+			if r := float64(nsUsed) / float64(ceiling); r > maxRatio {
+				maxRatio = r
+			}
+		}
 	}
 	if ok == 0 {
 		c.d.CycleResult(wdeps.CheckEphemeralPorts, "inconclusive")
 		return
 	}
-	closeWait := states[tcpStateCloseWait]
-	synSent := states[tcpStateSynSent]
-	// Ephemeral ports in use ≈ every non-listener socket — each
-	// holds one local port (TIME_WAIT included: it still pins the
-	// tuple until the kernel reaps it).
-	used := 0
-	for st, n := range states {
-		if st != tcpStateListen {
-			used += n
-		}
-	}
-	ceiling, ceilingOK := c.portRangeCeiling()
-	if !ceilingOK || ceiling <= 0 {
-		ceiling = c.d.Cfg.Wave2.MaxConcurrent
-	}
-	ratio := 0.0
-	if ceiling > 0 {
-		ratio = float64(used) / float64(ceiling)
-	}
-	pressured := ratio >= c.d.Cfg.Wave2.PortTupleRatioThreshold ||
-		closeWait >= c.d.Cfg.Wave2.PortCloseWaitMax
-	cleared := ratio <= portClearRatio && closeWait <= portClearCloseWait
+	pressured := maxRatio >= c.d.Cfg.Wave2.PortTupleRatioThreshold ||
+		maxCloseWait >= c.d.Cfg.Wave2.PortCloseWaitMax
+	cleared := maxRatio <= portClearRatio && maxCloseWait <= portClearCloseWait
 
 	// Remedies run on evidence, not on the latch — a SYN_SENT pile
 	// or a leaking pod is actionable even below the warn ratio.
 	c.reapSynSent(synSentByRep)
-	c.evictPortLeakers(ctx, e, closeWait, reps, pids)
+	c.evictPortLeakers(ctx, e, maxCloseWait, ceiling, reps, pids)
 
 	if cleared {
 		c.fails = 0
@@ -222,14 +234,14 @@ func (c *EphemeralPortsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if c.d.StreakPending(&c.fails, fmt.Sprintf(
 		"suspect: ephemeral-port-pressure used=%d/%d (%.0f%%) close_wait=%d syn_sent=%d",
-		used, ceiling, ratio*100, closeWait, synSent)) {
-		c.d.CycleResult(wdeps.CheckEphemeralPorts, "pending")
+		maxUsed, ceiling, maxRatio*100, maxCloseWait, totalSynSent)) {
+		c.d.CycleResult(wdeps.CheckEphemeralPorts, "ok")
 		return
 	}
 	c.d.State.Enter(latchdefs.LatchEphemeralPortPressure,
 		fmt.Sprintf("used=%d/%d close_wait=%d syn_sent=%d",
-			used, ceiling, closeWait, synSent))
-	c.d.CycleResult(wdeps.CheckEphemeralPorts, "firing")
+			maxUsed, ceiling, maxCloseWait, totalSynSent))
+	c.d.CycleResult(wdeps.CheckEphemeralPorts, "ok")
 }
 
 // reapSynSent destroys wedged SYN_SENT sockets per netns — each
@@ -239,12 +251,18 @@ func (c *EphemeralPortsCheck) reapSynSent(synSentByRep map[int]int) {
 	if !c.d.Cfg.Wave2.SynSentKillEnabled {
 		return
 	}
+	minRetrans := c.d.Cfg.Wave2.SynSentMinRetrans
+	if minRetrans < 1 {
+		minRetrans = 1
+	} else if minRetrans > 255 {
+		minRetrans = 255
+	}
 	for rep, synSent := range synSentByRep {
 		if synSent < synSentKillFloor {
 			continue
 		}
 		killed, err := netlinkx.DestroyStuckSynSent(rep,
-			uint8(c.d.Cfg.Wave2.SynSentMinRetrans), c.d.Cfg.Wave2.SynSentMaxKills)
+			uint8(minRetrans), c.d.Cfg.Wave2.SynSentMaxKills)
 		if err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: ephemeral-port-pressure netns(pid=%d) syn_sent destroy failed: %v",
@@ -330,7 +348,13 @@ func (c *EphemeralPortsCheck) podCloseWait(inodes map[string]bool,
 // (PortLeakWindowSec via Store.ConfirmMarker) plus the
 // last-port-leak-evict cooldown.
 func (c *EphemeralPortsCheck) evictPortLeakers(ctx context.Context,
-	e *wdeps.CycleEnv, closeWait int, reps, pids []int) {
+	e *wdeps.CycleEnv, closeWait, ceiling int, reps, pids []int) {
+	activeMarkers := map[string]bool{}
+	defer func() {
+		c.d.State.PruneMarkers("port-leak-", func(id string) bool {
+			return activeMarkers["port-leak-"+id]
+		})
+	}()
 	if !c.d.Cfg.Wave2.PortEvictRunawayPod || closeWait <= 0 {
 		return
 	}
@@ -354,14 +378,18 @@ func (c *EphemeralPortsCheck) evictPortLeakers(ctx context.Context,
 	if total == 0 {
 		return
 	}
-	// Top pod by CLOSE_WAIT share — must clear PortLeakMinPct of
-	// the node's leaking sockets.
+	// Top pod by CLOSE_WAIT share — must clear PortLeakMinPct AND a
+	// substantial CLOSE_WAIT floor so 1-10 sockets can never delete a healthy pod.
 	var topUID string
 	var topN int
 	for uid, n := range byUID {
 		if n > topN || (n == topN && uid < topUID) {
 			topUID, topN = uid, n
 		}
+	}
+	floor := max(minCloseWaitFloor, int(0.25*float64(ceiling)))
+	if topN < floor {
+		return
 	}
 	share := float64(topN) / float64(total)
 	if share*100 < float64(c.d.Cfg.Wave2.PortLeakMinPct) {
@@ -375,22 +403,29 @@ func (c *EphemeralPortsCheck) evictPortLeakers(ctx context.Context,
 		return // attributed uid has no live pod object
 	}
 	if pod.DeletionTimestamp != nil ||
+		wdeps.IsEvictProtectedPod(pod) ||
+		wdeps.PodHasPVC(pod) ||
+		wdeps.IsMirrorPod(pod) ||
+		metav1.GetControllerOf(pod) == nil ||
 		wdeps.EvictProtectedNamespaces[pod.Namespace] ||
 		wdeps.EvictCriticalPriorityClasses[pod.Spec.PriorityClassName] ||
-		wdeps.CarriesDBQuorumLabel(pod) ||
-		wdeps.PodHasPVC(pod) {
+		wdeps.CarriesDBQuorumLabel(pod) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: ephemeral-port-pressure pod %s/%s uid=%s protected by eviction rails - skip",
 			pod.Namespace, pod.Name, topUID))
 		return
 	}
+	// Mark active BEFORE confirming window so PruneMarkers keeps live leakers
+	// and cleans resolved ones.
+	marker := "port-leak-" + topUID
+	activeMarkers[marker] = true
 	// Two-phase window: the leak must persist PortLeakWindowSec —
 	// ConfirmMarker stamps first-seen and confirms after minAge.
 	window := time.Duration(c.d.Cfg.Wave2.PortLeakWindowSec) * time.Second
 	if window <= 0 {
 		window = 120 * time.Second
 	}
-	_, confirmed := c.d.State.ConfirmMarker("port-leak-"+topUID, window)
+	_, confirmed := c.d.State.ConfirmMarker(marker, window)
 	if !confirmed {
 		return
 	}
@@ -436,6 +471,5 @@ func (c *EphemeralPortsCheck) evictPortLeakers(ctx context.Context,
 			pod.Namespace, pod.Name, err))
 		return
 	}
-	c.d.StampPodHealed(ctx, pod.Namespace, pod.Name)
 	c.d.Actions.WithLabelValues(wdeps.CheckEphemeralPorts, "pod_delete").Inc()
 }

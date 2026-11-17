@@ -67,6 +67,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 const (
@@ -214,6 +215,15 @@ type certDriftAuditor struct {
 	// literal-constructed test fixtures.
 	certMemo   map[string]certSecretMemo
 	secretMemo map[string]secretCAMemo
+
+	// Live-socket TLS drift state (#5):
+	// prober is injectable for unit tests; nil uses defaultLiveCertProber.
+	prober                liveCertProber
+	disableLiveRollout    bool
+	liveDriftStreak       state.StreakLedger
+	seenLiveDrift         state.GaugeLedger[liveDriftMetricKey]
+	liveDriftEventSent    state.CooldownSet
+	liveDriftRolloutHeals state.CooldownSet
 }
 
 // certSecretMemo caches one certSecretName resolution.
@@ -236,13 +246,16 @@ type secretCAMemo struct {
 // certmanager-reaper.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	return shared.SetupNoConfig(d, func() error {
+	return shared.SetupWithConfig(d, func() bool {
+		return envx.Gate("CERT_LIVE_DRIFT_ROLLOUT_ENABLED", true)
+	}, func(liveRolloutEnabled bool) error {
 		a := &certDriftAuditor{
-			verdict: d.Maintenance,
-			cs:      cs,
-			dyn:     dyn,
-			queue:   d.Name,
-			now:     shared.SystemClock,
+			verdict:            d.Maintenance,
+			cs:                 cs,
+			dyn:                dyn,
+			queue:              d.Name,
+			now:                shared.SystemClock,
+			disableLiveRollout: !liveRolloutEnabled,
 		}
 		return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
 	})
@@ -250,18 +263,22 @@ func Setup(d shared.Deps) error {
 
 func (a *certDriftAuditor) run(ctx context.Context) error {
 	// The audits are independent duties: a broken webhook list must
-	// not blind the TLS-expiry gauge (and vice versa), so all three
-	// run and their errors join (nil+nil+nil → nil). The periodic
+	// not blind the TLS-expiry gauge (and vice versa), so all four
+	// run and their errors join (nil+nil+nil+nil → nil). The periodic
 	// wrapper owns run-level IncError, so this run() must not count
 	// the error it returns (double-count).
 	// linkerdIssuerHeals keys on the single linkerd-identity name —
 	// prune before the audits so an early-returning sweep still
 	// bounds the ledger.
-	a.linkerdIssuerHeals.PruneExpired(a.now.Now(), linkerdIssuerCooldown)
+	now := a.now.Now()
+	a.linkerdIssuerHeals.PruneExpired(now, linkerdIssuerCooldown)
+	a.liveDriftEventSent.PruneExpired(now, liveDriftEventCooldown)
+	a.liveDriftRolloutHeals.PruneExpired(now, liveDriftRolloutCooldown)
 	webhookErr := a.auditWebhookCABundles(ctx)
 	tlsErr := a.auditTLSSecrets(ctx)
 	trustErr := a.auditTrustBundles(ctx)
-	return errors.Join(webhookErr, tlsErr, trustErr)
+	liveErr := a.auditLiveSockets(ctx)
+	return errors.Join(webhookErr, tlsErr, trustErr, liveErr)
 }
 
 // ---------------------------------------------------------------------------

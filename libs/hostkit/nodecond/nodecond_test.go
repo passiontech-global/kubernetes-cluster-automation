@@ -9,9 +9,9 @@ import (
 // allConditionNames enumerates every exported condition constant BY
 // IDENTIFIER — a renamed or deleted constant breaks this file's
 // compilation instead of silently drifting out of the test's reach.
-// 57 latch-backed + 7 monitor/kubelet-owned = 64.
+// 60 latch-backed + 7 monitor/kubelet-owned = 67.
 var allConditionNames = []string{
-	// Latch-backed (57).
+	// Latch-backed (60).
 	NodeOverloaded, WatchdogStale,
 	CiliumAgentDown, CiliumInitStuck,
 	KubeletRuntimeStall, DNSFallbackActive, DNSResolvStale,
@@ -35,6 +35,7 @@ var allConditionNames = []string{
 	DiskPreFail, HardwareCorrupted, GPUHardwareError, InotifyPressure,
 	EphemeralPortPressure, NeighborTablePressure,
 	NetfilterLockWedged, CSIRegistrationWedged,
+	MountTablePressure, EBPFResourcePressure, EtcdQuorumDegraded,
 	// Monitor- and kubelet-owned (7) — HostNetworkProblems sits here
 	// by declaration block but IS heartbeat-managed now that the
 	// kernelfail NIC-health guard latches it (see notHeartbeatManaged).
@@ -70,8 +71,8 @@ var legacyControllerSpellings = []string{
 }
 
 func TestConstantsNonEmptyAndUnique(t *testing.T) {
-	if len(allConditionNames) != 64 {
-		t.Fatalf("allConditionNames = %d entries, want 64 (57 latch-backed + 7 monitor/kubelet)",
+	if len(allConditionNames) != 67 {
+		t.Fatalf("allConditionNames = %d entries, want 67 (60 latch-backed + 7 monitor/kubelet)",
 			len(allConditionNames))
 	}
 	seen := make(map[string]bool, len(allConditionNames))
@@ -174,6 +175,10 @@ var conditionClasses = map[string]conditionClass{
 	NeighborTablePressure: {stormGate: true, hangPreCordon: true},
 	NetfilterLockWedged:   {stormGate: true, hangPreCordon: true},
 	CSIRegistrationWedged: {stormGate: true, hangPreCordon: true},
+	// Wave-3 self-healing classifications.
+	MountTablePressure:   {stormGate: true, hangPreCordon: true},
+	EBPFResourcePressure: {stormGate: true, hangPreCordon: true},
+	EtcdQuorumDegraded:   {stormGate: true},
 }
 
 // TestAllConditionsExplicitlyClassified replaces the old
@@ -311,8 +316,8 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 			t.Errorf("HeartbeatSweptNames must contain latch-backed condition %q", name)
 		}
 	}
-	if latchBacked != 59 {
-		t.Fatalf("latch-backed constants enumerated = %d, want 59", latchBacked)
+	if latchBacked != 62 {
+		t.Fatalf("latch-backed constants enumerated = %d, want 62", latchBacked)
 	}
 }
 

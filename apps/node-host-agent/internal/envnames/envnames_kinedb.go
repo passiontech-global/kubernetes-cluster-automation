@@ -11,4 +11,6 @@ const (
 	// backup-health — the physical pg_dump backup verifier.
 	EnvKinedbBackupDir      = "NODE_HOST_AGENT_KINEDB_BACKUP_DIR"
 	EnvKinedbBackupInterval = "NODE_HOST_AGENT_KINEDB_BACKUP_INTERVAL"
+	// Wave-3 #1: int4 sequence auto-widen guard.
+	EnvKineSeqWidenEnabled = "NODE_HOST_AGENT_KINE_SEQ_WIDEN_ENABLED"
 )

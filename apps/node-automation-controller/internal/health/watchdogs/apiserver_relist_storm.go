@@ -119,6 +119,7 @@ const (
 func (p *apiserverRelistStormCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
+	p.eventHealed.PruneExpired(now, relistStormEventCooldown)
 	var rep probefw.SweepReport
 
 	watchers, werr := p.PromQuery(ctx, relistStormWatchersQuery)

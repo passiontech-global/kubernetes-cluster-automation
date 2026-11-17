@@ -202,9 +202,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		ctx, cancel = context.WithTimeout(ctx, s.budget)
 		defer cancel()
 	}
-	err := s.srv.Shutdown(ctx)
 	s.mu.Lock()
 	s.closed = true
+	s.mu.Unlock()
+	err := s.srv.Shutdown(ctx)
+	s.mu.Lock()
 	if s.ln != nil {
 		_ = s.ln.Close()
 		s.ln = nil

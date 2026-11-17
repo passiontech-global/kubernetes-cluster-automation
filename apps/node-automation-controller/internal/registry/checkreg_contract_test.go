@@ -141,6 +141,9 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"hpa-scaling-guard",
 		"deployment-rollout-wedge",
 		"subpath-config-drift",
+		// Self-healing wave-3 checks — appended after the wave-2 roster.
+		"service-selector-blackhole",
+		"topology-spread-zone-deadlock",
 	}
 	var got []string
 	for _, m := range Modules {

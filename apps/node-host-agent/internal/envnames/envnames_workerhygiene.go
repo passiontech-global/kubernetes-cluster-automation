@@ -108,4 +108,18 @@ const (
 	EnvNetfilterGuardStuckCycles   = "NODE_HOST_AGENT_NETFILTER_GUARD_STUCK_CONFIRM_CYCLES"
 	EnvNetfilterGuardMaxKillsCycle = "NODE_HOST_AGENT_NETFILTER_GUARD_MAX_KILLS_PER_CYCLE"
 	EnvNetfilterGuardLegacyProbe   = "NODE_HOST_AGENT_NETFILTER_GUARD_LEGACY_TABLE_PROBE"
+
+	// Wave-3 self-healing guards: #3 connected-UDP dead-backend socket
+	// destroyer, #4 mount-max/shared-storm/loop-GC, and #9 CPU CFS/VMA guards.
+	EnvUDPStaleDestroyEnabled = "NODE_HOST_AGENT_UDP_STALE_DESTROY_ENABLED"
+	EnvUDPStalePodCIDRs       = "NODE_HOST_AGENT_UDP_STALE_POD_CIDRS"
+	EnvUDPStaleMaxKills       = "NODE_HOST_AGENT_UDP_STALE_MAX_KILLS"
+	EnvMountTableEnterRatio   = "NODE_HOST_AGENT_MOUNT_TABLE_ENTER_RATIO"
+	EnvMountSharedStormMax    = "NODE_HOST_AGENT_MOUNT_SHARED_STORM_MAX"
+	EnvMountMaxCeiling        = "NODE_HOST_AGENT_MOUNT_MAX_CEILING"
+	EnvLoopGCEnabled          = "NODE_HOST_AGENT_LOOP_GC_ENABLED"
+	EnvCPUCFSThrottleRatio    = "NODE_HOST_AGENT_CPU_CFS_THROTTLE_RATIO"
+	EnvCPUHostIdleMinRatio    = "NODE_HOST_AGENT_CPU_HOST_IDLE_MIN_RATIO"
+	EnvVMAPressureRatio       = "NODE_HOST_AGENT_VMA_PRESSURE_RATIO"
+	EnvVMAMaxCeiling          = "NODE_HOST_AGENT_VMA_MAX_CEILING"
 )

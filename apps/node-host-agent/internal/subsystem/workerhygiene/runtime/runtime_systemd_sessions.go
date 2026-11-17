@@ -11,10 +11,12 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
@@ -115,7 +117,9 @@ func (c *SystemdSessionCheck) scanSessions() (total int, stale []string) {
 
 // Run executes one systemd-session round.
 func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	if c.d.Gated(e, wdeps.CheckSystemdSessions) {
+	// Never gate SystemdSessionCheck solely because the k0sworker D-Bus probe
+	// failed — that is when PID 1 SIGCONT recovery is needed most.
+	if (e == nil || !e.SystemdProbeErr) && c.d.Gated(e, wdeps.CheckSystemdSessions) {
 		return
 	}
 	total, stale := c.scanSessions()
@@ -143,6 +147,7 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// answers still reads as the PID1-frozen signature.
 		probeCtx, cancel := context.WithTimeout(ctx, systemdInitProbeBudget)
 		_, probeErr := sd.SystemState(probeCtx)
+		timedOutCtx := probeCtx.Err()
 		cancel()
 		elapsed := c.d.Cfg.Seams.Host.Clock.Now().Sub(t0)
 		latency = elapsed.Seconds()
@@ -153,7 +158,9 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// — the latency number already carries the verdict.
 			logger().Debug("workerhygiene: is-system-running probe non-ok",
 				"error", probeErr)
-			probeTimedOut = elapsed >= systemdInitProbeBudget
+			probeTimedOut = errors.Is(probeErr, context.DeadlineExceeded) ||
+				errors.Is(timedOutCtx, context.DeadlineExceeded) ||
+				elapsed >= systemdInitProbeBudget
 		}
 	}
 	// PID1-frozen detector: consecutive probe timeouts Enter
@@ -173,7 +180,7 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			fmt.Sprintf("is-system-running timeout %.0fs", latency))
 		if c.d.State.RateTrySpend("last-systemd-init-cont",
 			systemdInitContInterval) {
-			if _, err := sd.Exec(ctx, "kill", "-CONT", "1"); err != nil {
+			if err := c.d.Cfg.Seams.Host.KillFn(1, syscall.SIGCONT); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: systemd-init-unresponsive SIGCONT pid1 failed: %v",
 					err))
@@ -186,9 +193,11 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	triggered := len(stale) >= systemdSessionAbandonedMin ||
-		latency > systemdDbusSlowSeconds
+		(!probeTimedOut && latency > systemdDbusSlowSeconds)
 	if !triggered {
-		c.d.State.Exit(latchdefs.LatchSystemdSessionBloat, nil)
+		if !probeTimedOut {
+			c.d.State.Exit(latchdefs.LatchSystemdSessionBloat, nil)
+		}
 		c.d.CycleResult(wdeps.CheckSystemdSessions, "ok")
 		return
 	}

@@ -103,6 +103,10 @@ func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
 			rootDev, rootDevOK = rst.Dev, true
 		}
 	}
+	if !rootDevOK {
+		c.d.CycleResult(wdeps.CheckRunTmpfs, "inconclusive")
+		return
+	}
 	// The /proc/*/fd pass is built ONCE per sweep, lazily on the
 	// first stale .tmp — a busy /run can hold dozens of candidates
 	// and the old per-file rescan cost O(candidates × fds) stats.
@@ -115,8 +119,11 @@ func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
 	openFDsDone, openFDsOK := false, true
 	_ = filepath.WalkDir(rootDir,
 		func(path string, de fs.DirEntry, err error) error {
-			if err != nil || removed >= runTmpfsSweepMax {
+			if err != nil {
 				return nil //nolint:nilerr // unreadable entries are skipped, never fatal
+			}
+			if removed >= runTmpfsSweepMax {
+				return fs.SkipAll
 			}
 			if de.IsDir() && path != rootDir {
 				dfi, derr := de.Info()
@@ -133,8 +140,8 @@ func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
 				return nil
 			}
 			fi, ierr := de.Info()
-			if ierr != nil || now.Sub(fi.ModTime()) < runTmpfsMinAge {
-				return nil //nolint:nilerr // stat failures skip the entry, never fatal
+			if ierr != nil || runTmpfsForeignDev(fi, rootDev, rootDevOK) || now.Sub(fi.ModTime()) < runTmpfsMinAge {
+				return nil //nolint:nilerr // stat failures or single-file bind mounts skip the entry, never fatal
 			}
 			if !openFDsDone {
 				openFDs, openFDsOK = c.runTmpfsOpenFDs()

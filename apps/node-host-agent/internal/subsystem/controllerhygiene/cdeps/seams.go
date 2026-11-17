@@ -115,6 +115,9 @@ type Etcd struct {
 		cutoff time.Time, out io.Writer) error
 	EtcdRescueFn func(ctx context.Context, cfg etcdmaint.Config,
 		out io.Writer) error
+	// EtcdMetricsFn fetches the local etcd /metrics body (WAL fsync
+	// histogram buckets & leader changes). nil → HTTPBodyStreamInsecure.
+	EtcdMetricsFn func(ctx context.Context, url string) (string, error)
 }
 
 // Seams groups the injectable test-seam funcs. Every one has a
@@ -227,6 +230,12 @@ func (s *Seams) applyDefaults(c *Config) {
 	if s.EtcdRescueFn == nil {
 		s.EtcdRescueFn = etcdmaint.Run
 	}
+	if s.EtcdMetricsFn == nil {
+		s.EtcdMetricsFn = func(ctx context.Context, url string) (string, error) {
+			return probee.HTTPBodyStreamInsecure(ctx, url, 5*time.Second,
+				keepEtcdMetricsLine, 2<<20)
+		}
+	}
 	if s.CPHealthFn == nil {
 		s.CPHealthFn = func(ctx context.Context, url string) bool {
 			return probee.HTTP2xx(ctx, url, 5*time.Second)
@@ -274,6 +283,21 @@ var kcmMetricsPrefixes = [][]byte{
 func keepKCMetricsLine(ln []byte) bool {
 	trimmed := bytes.TrimLeft(ln, " \t")
 	for _, p := range kcmMetricsPrefixes {
+		if bytes.HasPrefix(trimmed, p) {
+			return true
+		}
+	}
+	return false
+}
+
+var etcdMetricsPrefixes = [][]byte{
+	[]byte("etcd_disk_wal_fsync_duration_seconds_bucket"),
+	[]byte("etcd_server_leader_changes_seen_total"),
+}
+
+func keepEtcdMetricsLine(ln []byte) bool {
+	trimmed := bytes.TrimLeft(ln, " \t")
+	for _, p := range etcdMetricsPrefixes {
 		if bytes.HasPrefix(trimmed, p) {
 			return true
 		}

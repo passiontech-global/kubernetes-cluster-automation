@@ -46,12 +46,13 @@ func Config(t *testing.T, rules []testutil.ExecRule) (kdeps.Config, *testutil.Fa
 	}
 	fr := testutil.NewFakeExec(rules...)
 	return kdeps.Config{
-		EnvFile:       envFile,
-		TextfileDir:   filepath.Join(dir, "textfile"),
-		GuardStateDir: filepath.Join(dir, "guard"),
-		Runtime:       "podman",
-		Clock:         timex.NewCell(func() time.Time { return time.Unix(TestNow, 0) }),
-		Run:           fr.RunStdin,
+		EnvFile:         envFile,
+		TextfileDir:     filepath.Join(dir, "textfile"),
+		GuardStateDir:   filepath.Join(dir, "guard"),
+		Runtime:         "podman",
+		SeqWidenEnabled: true,
+		Clock:           timex.NewCell(func() time.Time { return time.Unix(TestNow, 0) }),
+		Run:             fr.RunStdin,
 		// The combined seam shares the fake: rules match argv either
 		// way, and stderr-folding only differs on the real exec.
 		RunCombined: fr.RunStdin,

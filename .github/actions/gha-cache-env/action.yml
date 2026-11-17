@@ -1,11 +1,11 @@
 name: gha-cache-env
 description: >-
   Export the Actions cache runtime env (ACTIONS_RUNTIME_TOKEN,
-  ACTIONS_CACHE_URL, ACTIONS_RESULTS_URL) into $GITHUB_ENV so later
-  `run:` steps can pass them to `docker buildx --cache-from/--cache-to
-  type=gha`. GitHub injects those vars ONLY into JS actions — never
-  into shell steps — which is why moon's image task checks for them
-  before enabling the gha cache exporter.
+  ACTIONS_CACHE_URL, ACTIONS_RESULTS_URL, ACTIONS_CACHE_SERVICE_V2) into
+  $GITHUB_ENV so later `run:` steps can pass them to `docker buildx
+  --cache-from/--cache-to type=gha`. GitHub injects those vars ONLY into
+  JS actions — never into shell steps — which is why moon's image task
+  checks for them before enabling the gha cache exporter.
 runs:
   using: node20
   main: index.js

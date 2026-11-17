@@ -231,6 +231,19 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		Help: "1 while the embedded etcd carries a NOSPACE alarm " +
 			"(embedded-etcd controllers only).",
 	})
+	d.EtcdCorrupt = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_etcd_corrupt_alarm",
+		Help: "1 while the embedded etcd carries a CORRUPT alarm " +
+			"(embedded-etcd controllers only).",
+	})
+	d.EtcdWALFsyncP99 = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_etcd_wal_fsync_p99_seconds",
+		Help: "Estimated p99 WAL fsync duration from embedded etcd /metrics.",
+	})
+	d.EtcdIsLearner = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_controllerhygiene_etcd_is_learner",
+		Help: "1 while the local embedded etcd member reports isLearner=true.",
+	})
 	// CounterFunc parity with the textfile's TYPE counter — the
 	// mirrored apiserver series is monotonic, and the registry must
 	// report the same type as the node-agent-apiserver-apf.prom
@@ -258,6 +271,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		d.Cycles, d.Actions, d.RVGap, d.KineConns, d.KineStuckConns,
 		d.OOMWindow, d.Feeding,
 		d.EtcdDBSize, d.EtcdDBUse, d.EtcdNospace,
+		d.EtcdCorrupt, d.EtcdWALFsyncP99, d.EtcdIsLearner,
 		d.TerminatedWatchers, d.EtcdSnapAge, d.KonnReadyBackends); err != nil {
 		return nil, fmt.Errorf("register controllerhygiene metrics: %w", err)
 	}

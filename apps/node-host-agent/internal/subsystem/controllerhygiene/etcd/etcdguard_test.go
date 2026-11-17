@@ -83,6 +83,9 @@ func (e *env) wireEtcdGuard(t *testing.T, g *etcdGuardFake) {
 	e.H.Cfg.EtcdBackupDir = filepath.Join(filepath.Dir(e.State), "etcd-backups")
 	e.H.Cfg.StatFSFn = func(string) (int64, int64, error) { return 1 << 30, 2 << 30, nil }
 	e.H.Cfg.EtcdctlFn = g.ctl
+	e.H.Cfg.EtcdMetricsFn = func(context.Context, string) (string, error) {
+		return "", nil
+	}
 	e.H.Cfg.EvpurgeRunFn = func(_ context.Context, _ eventpurge.Config,
 		cutoff time.Time, _ io.Writer) error {
 		g.purges++
@@ -228,19 +231,13 @@ func TestEtcdGuardSizeTriggers(t *testing.T) {
 	if !g.rescues[0].OnlineOnly {
 		t.Fatal("rescue ran without OnlineOnly")
 	}
-	// dbSize already decided the trigger — the alarm-list probe is
-	// skipped (hung-etcd probe halving). The remediation's
-	// pre-maintenance snapshot pair (save + status) is expected on
-	// top of the endpoint-status probe; the alarm probe must not
-	// appear.
-	for _, call := range g.ctlCalls {
-		if strings.Contains(strings.Join(call, " "), "alarm list") {
-			t.Fatalf("alarm probe ran despite decided trigger: %v", g.ctlCalls)
-		}
-	}
-	if len(g.ctlCalls) != 3 ||
-		!strings.Contains(strings.Join(g.ctlCalls[0], " "), "endpoint status") {
-		t.Fatalf("etcdctl calls=%v want status + snapshot save/status", g.ctlCalls)
+	// Wave-3 #8: alarm list always runs BEFORE compact/defrag even when
+	// dbSize >= DBSizeLimit so CORRUPT alarms can block destructive
+	// remediation. Expected calls: endpoint status, alarm list, snapshot save, snapshot status.
+	if len(g.ctlCalls) != 4 ||
+		!strings.Contains(strings.Join(g.ctlCalls[0], " "), "endpoint status") ||
+		!strings.Contains(strings.Join(g.ctlCalls[1], " "), "alarm list") {
+		t.Fatalf("etcdctl calls=%v want status + alarm list + snapshot save/status", g.ctlCalls)
 	}
 }
 
@@ -860,8 +857,9 @@ func TestEtcdGuardSnapshotDirUncreatableAborts(t *testing.T) {
 	}
 	e.H.Cfg.K0sDir = e.MkEtcdHost(t)
 	e.H.Cfg.EtcdctlFn = g.ctl
+	e.H.Cfg.EtcdMetricsFn = func(context.Context, string) (string, error) { return "", nil }
 	e.H.Cycle(context.Background())
-	if len(g.ctlCalls) != 1 { // endpoint status only
+	if len(g.ctlCalls) != 2 { // endpoint status + alarm list before snapshot dir abort
 		t.Fatalf("etcdctl ran past the failed snapshot dir: %v", g.ctlCalls)
 	}
 	if g.purges != 0 || len(g.rescues) != 0 {

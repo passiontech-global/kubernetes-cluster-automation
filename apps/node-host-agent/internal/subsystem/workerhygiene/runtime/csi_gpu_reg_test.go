@@ -121,7 +121,14 @@ func TestCSIGuardHealDisabledKeepsOrphan(t *testing.T) {
 // it latched forever on any node with sockets/pods/drivers).
 func TestCSIGuardMissingRegistrationLatchRecovers(t *testing.T) {
 	cn := csiNode("node-a", "csi.bad.com", "csi.ok.com")
-	e := fixture(t, cn)
+	badPod := csiPluginPod("csi-bad-node-a", "kube-system", "uid-bad")
+	badPod.Spec.Volumes = []corev1.Volume{{
+		Name: "plugin-dir",
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/k0s/kubelet/plugins/csi.bad.com"},
+		},
+	}}
+	e := fixture(t, cn, badPod)
 	e.H.Cfg.Wave2.CSIGuardMode = envx.ModeOn
 	e.H.Cfg.Wave2.CSIHealEnabled = false // latch path, no pod bounce
 	e.H.Cfg.Wave2.CSIGuardMissingMin = 0 // window already open
@@ -131,7 +138,7 @@ func TestCSIGuardMissingRegistrationLatchRecovers(t *testing.T) {
 
 	// ConsecNeeded=2 → two past-window cycles latch the wedge.
 	for i := 0; i < 3; i++ {
-		chk.Run(ctx, cycleWithPods())
+		chk.Run(ctx, cycleWithPods(*badPod))
 	}
 	if !latched(e, latchdefs.LatchCSIRegistrationWedged) {
 		t.Fatal("CSIRegistrationWedged not latched on persistent desync")
@@ -139,7 +146,7 @@ func TestCSIGuardMissingRegistrationLatchRecovers(t *testing.T) {
 
 	// Recovery: the missing driver re-registers (socket appears).
 	mkRegSocket(t, e, "csi.bad.com")
-	chk.Run(ctx, cycleWithPods())
+	chk.Run(ctx, cycleWithPods(*badPod))
 	if latched(e, latchdefs.LatchCSIRegistrationWedged) {
 		t.Fatal("latch stuck after all drivers re-registered")
 	}
@@ -289,6 +296,10 @@ func TestGPUGuardLiveGPUZeroAllocatable(t *testing.T) {
 // API (a CPU-only node must not fabricate a desync).
 func TestGPUGuardZeroGPUNodeDormant(t *testing.T) {
 	e := gpuEnv(t)
+	root := filepath.Dir(e.KubepodsDir)
+	if err := os.MkdirAll(filepath.Join(root, "sys", "bus", "pci", "devices"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	e.H.Cfg.Wave2.GPUGuardMode = envx.ModeAuto
 	chk := wdepstest.Check[*runtime.GPUGuardCheck](e.H, wdeps.CheckGPUGuard)
 	chk.Run(context.Background(), cycleWithPods())

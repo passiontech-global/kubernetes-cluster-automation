@@ -37,19 +37,21 @@ type WebhookView struct {
 	NamespaceSelector *metav1.LabelSelector
 	Rules             []admissionv1.RuleWithOperations
 	Service           *admissionv1.ServiceReference
+	TimeoutSeconds    *int32
 }
 
 // WebhookConfigView projects one MutatingWebhookConfiguration or
 // ValidatingWebhookConfiguration together with a snapshot-updating
 // Patch closure.
 type WebhookConfigView struct {
-	Kind     string
-	Resource string
-	Name     string
-	Anno     string
-	Object   metav1.Object
-	Hooks    []WebhookView
-	Patch    func(ctx context.Context, pt types.PatchType, payload []byte) error
+	Kind        string
+	Resource    string
+	Name        string
+	Anno        string
+	Annotations map[string]string
+	Object      metav1.Object
+	Hooks       []WebhookView
+	Patch       func(ctx context.Context, pt types.PatchType, payload []byte) error
 }
 
 // ForEachWebhookConfig walks all mutating then validating webhook
@@ -69,15 +71,17 @@ func (s *Snapshot) ForEachWebhookConfig(visit func(WebhookConfigView)) {
 					NamespaceSelector: w.NamespaceSelector,
 					Rules:             w.Rules,
 					Service:           w.ClientConfig.Service,
+					TimeoutSeconds:    w.TimeoutSeconds,
 				}
 			}
 			visit(WebhookConfigView{
-				Kind:     KindMutating,
-				Resource: "mutatingwebhookconfigurations",
-				Name:     cfg.Name,
-				Anno:     cfg.Annotations[CircuitBrokenAnno],
-				Object:   cfg,
-				Hooks:    hooks,
+				Kind:        KindMutating,
+				Resource:    "mutatingwebhookconfigurations",
+				Name:        cfg.Name,
+				Anno:        cfg.Annotations[CircuitBrokenAnno],
+				Annotations: cfg.Annotations,
+				Object:      cfg,
+				Hooks:       hooks,
 				Patch: func(ctx context.Context, pt types.PatchType, payload []byte) error {
 					patched, err := s.G.CS.AdmissionregistrationV1().MutatingWebhookConfigurations().
 						Patch(ctx, cfg.Name, pt, payload, metav1.PatchOptions{})
@@ -102,15 +106,17 @@ func (s *Snapshot) ForEachWebhookConfig(visit func(WebhookConfigView)) {
 					NamespaceSelector: w.NamespaceSelector,
 					Rules:             w.Rules,
 					Service:           w.ClientConfig.Service,
+					TimeoutSeconds:    w.TimeoutSeconds,
 				}
 			}
 			visit(WebhookConfigView{
-				Kind:     KindValidating,
-				Resource: "validatingwebhookconfigurations",
-				Name:     cfg.Name,
-				Anno:     cfg.Annotations[CircuitBrokenAnno],
-				Object:   cfg,
-				Hooks:    hooks,
+				Kind:        KindValidating,
+				Resource:    "validatingwebhookconfigurations",
+				Name:        cfg.Name,
+				Anno:        cfg.Annotations[CircuitBrokenAnno],
+				Annotations: cfg.Annotations,
+				Object:      cfg,
+				Hooks:       hooks,
 				Patch: func(ctx context.Context, pt types.PatchType, payload []byte) error {
 					patched, err := s.G.CS.AdmissionregistrationV1().ValidatingWebhookConfigurations().
 						Patch(ctx, cfg.Name, pt, payload, metav1.PatchOptions{})

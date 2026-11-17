@@ -194,6 +194,10 @@ type Config struct {
 	GPUGuardMode     envx.Mode
 	GPUExpectedCount int
 
+	// Wave-3 #10: kernel eBPF prog/map resource leak latch ceilings.
+	EBPFProgsMax int
+	EBPFMapsMax  int
+
 	// collectCacheTTL overrides the Collect snapshot TTL — 0 →
 	// collectSnapshotTTL (10s); a NEGATIVE value disables the cache
 	// (the test fixture pins -1: its scrapes mutate host state
@@ -352,7 +356,11 @@ func (c *Config) applyDefaults() {
 		c.InotifyMaxWatchesFile = defaultInotifyMaxWatchFile
 	}
 	if c.CgroupRoot == "" {
-		c.CgroupRoot = defaultCgroupRoot
+		if c.HostRoot != "" {
+			c.CgroupRoot = filepath.Join(c.HostRoot, defaultCgroupRoot)
+		} else {
+			c.CgroupRoot = defaultCgroupRoot
+		}
 	}
 	if len(c.CgroupPidsSlices) == 0 {
 		c.CgroupPidsSlices = defaultCgroupPidsSlices

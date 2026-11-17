@@ -293,8 +293,11 @@ func (r *Runner) edacCounters() []edacMC {
 // Map iteration order is random — sort the output so the
 // STATE-ENTER evidence string is deterministic.
 func (r *Runner) acuteEvidence(now time.Time) (hw, gpu []string) {
+	pruned := false
 	for class, a := range r.hw.acute {
 		if now.Sub(a.at) >= hwAcuteEvidenceTTL {
+			delete(r.hw.acute, class)
+			pruned = true
 			continue
 		}
 		if strings.HasPrefix(class, gpuAcutePrefix) {
@@ -302,6 +305,9 @@ func (r *Runner) acuteEvidence(now time.Time) (hw, gpu []string) {
 		} else {
 			hw = append(hw, a.detail)
 		}
+	}
+	if pruned {
+		r.saveHwEvidence()
 	}
 	slices.Sort(hw)
 	slices.Sort(gpu)

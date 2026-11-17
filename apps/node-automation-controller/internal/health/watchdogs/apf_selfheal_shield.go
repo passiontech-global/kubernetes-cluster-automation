@@ -164,7 +164,9 @@ func (c apfShieldConfig) plcDesired() *flowcontrolv1.PriorityLevelConfiguration 
 // nodes, leases and cluster-scoped config alike.
 func (c apfShieldConfig) flowSchemaDesired() *flowcontrolv1.FlowSchema {
 	subjects := []flowcontrolv1.Subject{
+		apfShieldSubject(c.namespace, "node-ops-operator"),
 		apfShieldSubject(c.namespace, apfShieldControllerSA),
+		apfShieldSubject(c.namespace, "node-host-agent"),
 		apfShieldSubject("kube-system", "node-host-agent"),
 		apfShieldSubject("kube-system", "coredns"),
 	}
@@ -228,14 +230,18 @@ func (p *apfSelfHealShieldCheck) Run(ctx context.Context) probefw.Result {
 	degraded := false
 
 	plc := p.cfg.plcDesired()
-	if why := p.reconcilePLC(ctx, log, now, plc); why != "" {
+	if why, forbidden := p.reconcilePLC(ctx, log, now, plc); why != "" {
 		degraded = true
-		rep.Find("prioritylevelconfiguration/" + apfShieldPLCName + ": " + why)
+		if !forbidden {
+			rep.Find("prioritylevelconfiguration/" + apfShieldPLCName + ": " + why)
+		}
 	}
 	fs := p.cfg.flowSchemaDesired()
-	if why := p.reconcileFlowSchema(ctx, log, now, fs); why != "" {
+	if why, forbidden := p.reconcileFlowSchema(ctx, log, now, fs); why != "" {
 		degraded = true
-		rep.Find("flowschema/" + apfShieldFlowSchemaName + ": " + why)
+		if !forbidden {
+			rep.Find("flowschema/" + apfShieldFlowSchemaName + ": " + why)
+		}
 	}
 
 	if degraded {
@@ -247,36 +253,41 @@ func (p *apfSelfHealShieldCheck) Run(ctx context.Context) probefw.Result {
 }
 
 // reconcilePLC ensures selfheal-critical exists with the pinned
-// spec. Returns "" when converged, else a short degraded reason.
+// spec. Returns ("", false) when converged; forbidden=true marks RBAC 403
+// where the check warns and sets degraded=1 without failing the sweep.
 func (p *apfSelfHealShieldCheck) reconcilePLC(ctx context.Context,
 	log logr.Logger, now time.Time,
-	want *flowcontrolv1.PriorityLevelConfiguration) string {
+	want *flowcontrolv1.PriorityLevelConfiguration) (string, bool) {
 
 	plcs := p.CS.FlowcontrolV1().PriorityLevelConfigurations()
 	existing, err := plcs.Get(ctx, apfShieldPLCName, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
 		if !p.cfg.enforce {
-			return "missing (enforce off)"
+			return "missing (enforce off)", false
 		}
 		if _, err := plcs.Create(ctx, want, metav1.CreateOptions{}); err != nil {
 			return p.writeFailure(log, "create prioritylevelconfiguration", err)
 		}
 		log.Info("ACTION: created PriorityLevelConfiguration",
 			"name", apfShieldPLCName)
-		return "was missing — created"
+		return "was missing — created", false
+	case apierrors.IsForbidden(err):
+		log.Info("WARN: apf shield read forbidden — grant RBAC for prioritylevelconfigurations",
+			"error", err)
+		return "read forbidden (RBAC)", true
 	case err != nil:
-		return "get failed: " + err.Error()
+		return "get failed: " + err.Error(), false
 	}
 	if apiequality.Semantic.DeepEqual(existing.Spec, want.Spec) {
-		return ""
+		return "", false
 	}
 	if !p.cfg.enforce {
-		return "spec drifted (enforce off)"
+		return "spec drifted (enforce off)", false
 	}
 	if !heal.FluxPatchGate("prioritylevelconfiguration", existing,
 		"prioritylevelconfiguration/"+apfShieldPLCName, now) {
-		return "spec drifted — Flux owns the object (heal-revert loop)"
+		return "spec drifted — Flux owns the object (heal-revert loop)", false
 	}
 	existing.Spec = want.Spec
 	if _, err := plcs.Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
@@ -284,40 +295,44 @@ func (p *apfSelfHealShieldCheck) reconcilePLC(ctx context.Context,
 	}
 	log.Info("ACTION: repaired PriorityLevelConfiguration spec drift",
 		"name", apfShieldPLCName)
-	return "spec drifted — repaired"
+	return "spec drifted — repaired", false
 }
 
 // reconcileFlowSchema ensures selfheal-controllers exists with the
 // pinned spec — same converge contract as reconcilePLC.
 func (p *apfSelfHealShieldCheck) reconcileFlowSchema(ctx context.Context,
 	log logr.Logger, now time.Time,
-	want *flowcontrolv1.FlowSchema) string {
+	want *flowcontrolv1.FlowSchema) (string, bool) {
 
 	fss := p.CS.FlowcontrolV1().FlowSchemas()
 	existing, err := fss.Get(ctx, apfShieldFlowSchemaName, metav1.GetOptions{})
 	switch {
 	case apierrors.IsNotFound(err):
 		if !p.cfg.enforce {
-			return "missing (enforce off)"
+			return "missing (enforce off)", false
 		}
 		if _, err := fss.Create(ctx, want, metav1.CreateOptions{}); err != nil {
 			return p.writeFailure(log, "create flowschema", err)
 		}
 		log.Info("ACTION: created FlowSchema",
 			"name", apfShieldFlowSchemaName)
-		return "was missing — created"
+		return "was missing — created", false
+	case apierrors.IsForbidden(err):
+		log.Info("WARN: apf shield read forbidden — grant RBAC for flowschemas",
+			"error", err)
+		return "read forbidden (RBAC)", true
 	case err != nil:
-		return "get failed: " + err.Error()
+		return "get failed: " + err.Error(), false
 	}
 	if apiequality.Semantic.DeepEqual(existing.Spec, want.Spec) {
-		return ""
+		return "", false
 	}
 	if !p.cfg.enforce {
-		return "spec drifted (enforce off)"
+		return "spec drifted (enforce off)", false
 	}
 	if !heal.FluxPatchGate("flowschema", existing,
 		"flowschema/"+apfShieldFlowSchemaName, now) {
-		return "spec drifted — Flux owns the object (heal-revert loop)"
+		return "spec drifted — Flux owns the object (heal-revert loop)", false
 	}
 	existing.Spec = want.Spec
 	if _, err := fss.Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
@@ -325,19 +340,19 @@ func (p *apfSelfHealShieldCheck) reconcileFlowSchema(ctx context.Context,
 	}
 	log.Info("ACTION: repaired FlowSchema spec drift",
 		"name", apfShieldFlowSchemaName)
-	return "spec drifted — repaired"
+	return "spec drifted — repaired", false
 }
 
 // writeFailure renders a create/update error as the degraded reason:
-// RBAC-403 gets the explicit "forbidden" wording (the common
-// ungranted-cluster steady state), anything else carries the error.
+// RBAC-403 gets forbidden=true so the cluster does not alert FAIL for
+// an ungranted optional protection shield.
 func (p *apfSelfHealShieldCheck) writeFailure(log logr.Logger,
-	op string, err error) string {
+	op string, err error) (string, bool) {
 
 	if apierrors.IsForbidden(err) {
 		log.Info("WARN: apf shield write forbidden — grant RBAC for "+
 			"prioritylevelconfigurations/flowschemas "+op, "error", err)
-		return "write forbidden (RBAC)"
+		return "write forbidden (RBAC)", true
 	}
-	return op + " failed: " + err.Error()
+	return op + " failed: " + err.Error(), false
 }

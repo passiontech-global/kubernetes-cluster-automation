@@ -191,6 +191,29 @@ const (
 	// fluent.io/config-hash was last rolled out. Value must never
 	// change.
 	AnnoRolledConfigHash = "passiontech.dev/rolled-config-hash"
+
+	// AnnoWebhookNeverFailOpen protects a webhook configuration from having its
+	// failurePolicy tripped to Ignore or its timeoutSeconds clamped by
+	// webhookguard.
+	AnnoWebhookNeverFailOpen = "passiontech.dev/webhook-never-fail-open"
+	// AnnoLastCertDriftRollout records the RFC3339 timestamp of the last
+	// live-socket certificate drift rollout triggered on the workload.
+	AnnoLastCertDriftRollout = "passiontech.dev/last-cert-drift-rollout"
+	// AnnoCertDriftReloadOptOut disables automatic rollout on a stateless
+	// Deployment/DaemonSet when live-socket TLS cert drift is detected.
+	AnnoCertDriftReloadOptOut = "passiontech.dev/cert-drift-reload-opt-out"
+	// AnnoCertDriftReloadOptIn opts a StatefulSet into automatic rollout when
+	// live-socket TLS cert drift is detected.
+	AnnoCertDriftReloadOptIn = "passiontech.dev/cert-drift-reload-opt-in"
+	// AnnoTopologyRelaxedBy records that topology-spread-zone-deadlock relaxed
+	// topology.kubernetes.io/zone constraints from DoNotSchedule to ScheduleAnyway.
+	AnnoTopologyRelaxedBy = "passiontech.dev/topology-relaxed-by"
+	// AnnoTopologyRelaxOptOut prevents topology-spread-zone-deadlock from
+	// relaxing DoNotSchedule constraints on a Deployment.
+	AnnoTopologyRelaxOptOut = "passiontech.dev/topology-relax-opt-out"
+	// AnnoTopologyRelaxOptIn opts a StatefulSet into temporary relaxation of
+	// topology.kubernetes.io/zone DoNotSchedule constraints during a dead zone.
+	AnnoTopologyRelaxOptIn = "passiontech.dev/topology-relax-opt-in"
 )
 
 // ---------------------------------------------------------------------------

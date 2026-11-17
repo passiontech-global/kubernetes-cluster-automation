@@ -24,11 +24,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
@@ -49,10 +51,19 @@ const (
 	// mountinfoBloatEventBudget rate-limits the MountinfoTableBloat
 	// event — the table bloats slowly, one event per hour is ample.
 	mountinfoBloatEventBudget = time.Hour
+
+	mountTableClearRatio     = 0.65
+	mountSharedStormClearMax = 2048
+	mountMaxDefaultCeiling   = int64(100000)
+	mountMaxRaiseCooldown    = 30 * time.Minute
+	mountMaxRaiseBudgetFile  = "last-mount-max-raise"
 )
 
 // MountinfoCheck is the mountinfo table hygiene check.
-type MountinfoCheck struct{ d *wdeps.Deps }
+type MountinfoCheck struct {
+	d     *wdeps.Deps
+	fails int
+}
 
 // NewMountinfo builds the mountinfo-hygiene check.
 func NewMountinfo(d *wdeps.Deps) *MountinfoCheck { return &MountinfoCheck{d: d} }
@@ -213,7 +224,95 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if n := countLines(data); n > mountinfoBloatLines {
 		c.emitBloatEvent(ctx, n)
 	}
+	c.checkMountPressure(data)
+	c.reapOrphanLoops(ctx, e, data, hostPodsDir, podLive, tasksOnce)
 	c.d.CycleResult(wdeps.CheckMountinfo, "ok")
+}
+
+func (c *MountinfoCheck) checkMountPressure(data []byte) {
+	totalMounts := countLines(data)
+	maxShared, maxGroup, maxMount := maxSharedPeerGroup(data)
+	c.d.Series.MountMaxSharedPeers = int64(maxShared)
+
+	mountMaxPath := filepath.Join(c.d.Cfg.ProcRoot, "sys", "fs", "mount-max")
+	mountMax := mountMaxDefaultCeiling
+	mountMaxReadable := false
+	if raw, err := os.ReadFile(mountMaxPath); err == nil {
+		if v, perr := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64); perr == nil && v > 0 {
+			mountMax = v
+			mountMaxReadable = true
+		}
+	}
+
+	ratio := float64(totalMounts) / float64(mountMax)
+	enterRatio := c.d.Cfg.Wave3.MountTableEnterRatio
+	ceiling := c.d.Cfg.Wave3.MountMaxCeiling
+	if mountMaxReadable && ratio >= enterRatio && mountMax < ceiling &&
+		c.d.State.RateTrySpend(mountMaxRaiseBudgetFile, mountMaxRaiseCooldown) {
+		newMax := mountMax * 2
+		if newMax > ceiling {
+			newMax = ceiling
+		}
+		if err := os.WriteFile(mountMaxPath, []byte(fmt.Sprintf("%d\n", newMax)), 0o644); err != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: mountinfo-hygiene raise fs.mount-max %d->%d failed: %v",
+				mountMax, newMax, err))
+		} else {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"ACTION: mountinfo-hygiene raised fs.mount-max %d->%d (entries=%d ratio=%.2f)",
+				mountMax, newMax, totalMounts, ratio))
+			c.d.Actions.WithLabelValues(wdeps.CheckMountinfo, "raise_mount_max").Inc()
+			mountMax = newMax
+			ratio = float64(totalMounts) / float64(mountMax)
+		}
+	}
+	c.d.Series.MountTableUtilRatio = ratio
+
+	sharedMax := c.d.Cfg.Wave3.MountSharedStormMax
+	tripped := ratio >= enterRatio || maxShared >= sharedMax
+	clear := ratio <= mountTableClearRatio && maxShared < mountSharedStormClearMax
+	switch {
+	case tripped:
+		c.fails++
+		if c.fails >= c.d.Cfg.ConsecNeeded {
+			c.d.State.Enter(latchdefs.LatchMountTablePressure, fmt.Sprintf(
+				"entries=%d/%d (%.2f) max_shared=%d (group=%s mount=%s)",
+				totalMounts, mountMax, ratio, maxShared, maxGroup, maxMount))
+		}
+	case clear:
+		c.fails = 0
+		c.d.State.Exit(latchdefs.LatchMountTablePressure, nil)
+	}
+}
+
+func maxSharedPeerGroup(data []byte) (maxCount int, maxGroup, maxMount string) {
+	counts := map[string]int{}
+	repMount := map[string]string{}
+	for ln := range strings.SplitSeq(string(data), "\n") {
+		f := strings.Fields(ln)
+		if len(f) < 7 {
+			continue
+		}
+		mount := procfs.UnescapeMountPath(f[4])
+		for _, opt := range f[6:] {
+			if opt == "-" {
+				break
+			}
+			if strings.HasPrefix(opt, "shared:") {
+				grp := strings.TrimPrefix(opt, "shared:")
+				counts[grp]++
+				if _, ok := repMount[grp]; !ok {
+					repMount[grp] = mount
+				}
+				if counts[grp] > maxCount {
+					maxCount = counts[grp]
+					maxGroup = grp
+					maxMount = repMount[grp]
+				}
+			}
+		}
+	}
+	return maxCount, maxGroup, maxMount
 }
 
 // taskDirListed reports whether <root>/<id> still exists — the ctr

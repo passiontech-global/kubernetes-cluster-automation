@@ -157,7 +157,6 @@ func (p *operatorWorkqueueCheck) healOperatorLeader(ctx context.Context, log log
 			// slot this sweep; one leader bounce is the heal.
 			continue
 		}
-		kube.MarkPodDeleted(ctx, pod.UID) // O(1) tombstone — no census reset
 		deleted = true
 		log.Info("DELETE: stuck operator leader pod — forcing re-election",
 			"operator", op.name, "pod", pod.Namespace+"/"+pod.Name,

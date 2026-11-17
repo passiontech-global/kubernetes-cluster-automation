@@ -172,3 +172,41 @@ func TestHungRuncPidReuseResetsStreak(t *testing.T) {
 		t.Fatalf("kills=%v want one SIGKILL on 7500", e.Kills)
 	}
 }
+
+// TestHungRuncExcludesExecAndRunAndDState verifies Wave 1.5:
+// - `runc exec` and `runc run` are never SIGKILLed
+// - D-state runc processes are logged only (never SIGKILLed)
+// - `runc:[2:INIT]` in S state IS SIGKILLed after confirm cycles.
+func TestHungRuncExcludesExecAndRunAndDState(t *testing.T) {
+	e := hungEnv(t, 1)
+	// PID 7601: `runc exec` in S state
+	e.MkStatProc(t, 7601, "runc", "S", "futex_wait")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "7601", "cmdline"),
+		"runc\x00--root\x00/run/runc\x00exec\x00-t\x00cid\x00sh\x00")
+	ageProc(t, e, 7601, 10*time.Minute)
+
+	// PID 7602: `runc run` in S state
+	e.MkStatProc(t, 7602, "runc", "S", "do_wait")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "7602", "cmdline"),
+		"runc\x00run\x00cid\x00")
+	ageProc(t, e, 7602, 10*time.Minute)
+
+	// PID 7603: `runc` lifecycle create in D state (uninterruptible)
+	e.MkStatProc(t, 7603, "runc", "D", "ext4_sync")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "7603", "cmdline"),
+		"runc\x00create\x00cid\x00")
+	ageProc(t, e, 7603, 10*time.Minute)
+
+	// PID 7604: `runc:[2:INIT]` in S state (ppid=1 by MkStatProc)
+	e.MkStatProc(t, 7604, "runc:[2:INIT]", "S", "pipe_read")
+	ageProc(t, e, 7604, 10*time.Minute)
+
+	chk := hungCheck(e)
+	chk.Run(context.Background(), cycleEnv())
+	if len(e.Kills) != 1 || e.Kills[0].PID != 7604 {
+		t.Fatalf("kills=%v want only PID 7604 (runc:[2:INIT] S)", e.Kills)
+	}
+	if !strings.Contains(e.LogLines(t), "uninterruptible D-state") {
+		t.Fatalf("expected D-state log entry:\n%s", e.LogLines(t))
+	}
+}

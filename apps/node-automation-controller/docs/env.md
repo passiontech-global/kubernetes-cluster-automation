@@ -83,6 +83,11 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 | `UNMESHED_POD_REMEDIATION_ENABLED` | admission-webhook-guard | on unless `"false"` | Sub-feature gate — allows deleting unmeshed pods once the injector webhook is provably healthy (the audit gauge is exported regardless); re-read every sweep. |
 | `WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED` | admission-webhook-guard | off unless `"true"` | Sub-feature gate — auto-patch every fail-closed webhook whose namespaceSelector matches a critical self-healing namespace (kube-system, kube-node-lease, node-ops, medik8s) with the `kubernetes.io/metadata.name NotIn [...]` exclusion; allowlisted entries untouched. The audit gauges export regardless; re-read every sweep. |
 | `MEDIK8S_BOOT_FAIL_OPEN_ENABLED` | admission-webhook-guard | on unless `"false"` | Sub-feature gate — one-way `FailurePolicy: Fail→Ignore` enforcement on the medik8s boot-path validating webhook entries (rules referencing only `selfnoderemediationconfigs`/`selfnoderemediationtemplates` of `self-node-remediation.medik8s.io`). The operators' startup default-CR ensure is validated by their own webhook; a stale/wrong endpoint set i/o-times the call and the manager exit-1 crash-loops (incident 2026-11-08). OLM re-asserts Fail from the CSV webhookdefinitions on reconcile/upgrade — the sweep re-heals that drift every 5m. Mutating configs, the remediation-CR entry and non-medik8s webhooks untouched; re-read every sweep. |
+| `WEBHOOK_ERROR_RATE_THRESHOLD` | admission-webhook-guard | `0.5` | Error-rate threshold (`calling_webhook_error`\|`apiserver_internal_error`, excluding `no_error`) over `[5m]` triggering degraded admission webhook signal + stage-1 pod bounce at 10m and circuit trip at 15m. Resolved at Setup. |
+| `WEBHOOK_LATENCY_P99_SECONDS` | admission-webhook-guard | `5.0` | p99 admission duration threshold (seconds) triggering degraded admission webhook signal + stage-1 pod bounce at 10m and circuit trip at 15m. Resolved at Setup. |
+| `WEBHOOK_LATENCY_BREAKER_TRIP_ENABLED` | admission-webhook-guard | on unless `"false"` | Sub-feature gate — allows `admission-webhook-guard` to trip slow/5xx `failurePolicy: Fail` sub-webhooks to `Ignore` after 15m (unless annotated `passiontech.dev/webhook-never-fail-open=true`). Resolved at Setup. |
+| `WEBHOOK_TIMEOUT_CLAMP_ENABLED` | admission-webhook-guard | on unless `"false"` | Sub-feature gate — clamps `failurePolicy: Fail` admission webhooks touching core control-plane resources with `timeoutSeconds > WEBHOOK_MAX_TIMEOUT_SECONDS` down to `5s` via `FluxPatchGate`. Resolved at Setup. |
+| `WEBHOOK_MAX_TIMEOUT_SECONDS` | admission-webhook-guard | `10` | Maximum allowed `timeoutSeconds` before emitting `node_automation_webhook_excessive_timeout` (admission webhooks and CRD conversion audits) and clamping eligible admission webhooks to `5s`. Resolved at Setup. |
 
 ## Janitors
 
@@ -104,6 +109,7 @@ knobs (always-on, no gates).
 | `CILIUM_IDENTITY_AUDITOR_ENABLED` | cilium-identity-auditor | opt-in (`"true"`) | Registration gate — 15m CiliumIdentity audit sweep (off on clusters without the cilium component — CRDs absent). |
 | `CILIUM_IDENTITY_GC_ENABLED` | cilium-identity-auditor | on unless `"false"` | Sub-feature gate — enables identity GC (deletion); off = audit-only. |
 | `CERT_DRIFT_AUDITOR_ENABLED` | cert-drift-auditor | on unless `"false"` | Registration gate — audits cert/secret drift. |
+| `CERT_LIVE_DRIFT_ROLLOUT_ENABLED` | cert-drift-auditor | on unless `"false"` | Sub-feature gate — triggers guarded rollout restarts when a Service's live TLS socket serves an expired or `<7d` expiring cert whose serial differs from the mounted `kubernetes.io/tls` Secret (`Deployment`/`DaemonSet` by default, `StatefulSet` opt-in). Resolved at Setup. |
 | `VELERO_BACKUP_AUDITOR_ENABLED` | velero-backup-auditor | on unless `"false"` | Registration gate — audits Velero backup health. |
 | `VELERO_NAMESPACE` | velero-backup-auditor | `velero` | Namespace Velero is installed in — where the in-flight PVB/PVR wedge audit looks up the node-agent pod that owns the transfer's Kopia thread (PodVolumeBackups themselves live in the workload namespaces). |
 | `HELM_STALL_UNWEDGE_ENABLED` | helmrelease-unlocker | off unless `"true"` | Sub-feature gate — gates ONLY the stalled-rollout unwedge pass; pending-secret unlock and artifact-source healing always run. |
@@ -115,7 +121,7 @@ knobs (always-on, no gates).
 
 | Env var | Module | Default | Notes |
 |---|---|---|---|
-| `CLUSTER_HEALTH_PROBES_ENABLED` | cluster-health-probes | on unless `"false"` | Registration gate — the 56-check cluster-health sweep. |
+| `CLUSTER_HEALTH_PROBES_ENABLED` | cluster-health-probes | on unless `"false"` | Registration gate — the 68-check cluster-health sweep. |
 | `CLUSTER_HEALTH_PROBES_INTERVAL` | cluster-health-probes | `5m` | Sweep interval for the whole check roster. |
 | `HEALTH_CHECK_TIMEOUT` | cluster-health-probes | `30s` | Timeout wrapping each remote call (probe, PromQL query). |
 | `HEALTH_PER_CHECK_TIMEOUT` | cluster-health-probes | `2m` | Bounds one check's share of the serial sweep — past it the check's ctx is cancelled and the sweep moves on. |
@@ -155,7 +161,10 @@ knobs (always-on, no gates).
 | `NODE_AUTOMATION_COREDNS_FORWARD_SATURATION_ENABLED` | coredns-forward-saturation | on unless `"false"` | Registration gate — coredns-forward-saturation check row (P1.7b: `coredns_forward_max_concurrent_rejects_total` rate >0 ≥5m → stamps `passiontech.dev/coredns-boost-until` +30m and bumps `kube-system/coredns` replicas by the boost). Requires cluster-health-probes. |
 | `NODE_AUTOMATION_HPA_SCALING_GUARD_ENABLED` | hpa-scaling-guard | on unless `"false"` | Registration gate — hpa-scaling-guard check row (P1.8: autoscaling/v2 HPA `AbleToScale=False`/`ScalingActive=False` ≥15m → cold-start rescue 0→minReplicas + isolated metrics-server pod bounce). Requires cluster-health-probes. |
 | `NODE_AUTOMATION_DEPLOYMENT_ROLLOUT_WEDGE_ENABLED` | deployment-rollout-wedge | on unless `"false"` | Registration gate — deployment-rollout-wedge check row (P1.9: `ProgressDeadlineExceeded`/`ReplicaFailure` ≥20m → GC terminal pods, scale-0 stale ReplicaSets, persisted-cooldown template nudge). Requires cluster-health-probes. |
-| `NODE_AUTOMATION_SUBPATH_CONFIG_DRIFT_ENABLED` | subpath-config-drift | on unless `"false"` | Registration gate — subpath-config-drift check row (P1.10: 30m SHA-256 census of subPath-mounted ConfigMap/Secret keys → ≥15m drift → `RestartTemplatePatch`; excludes system namespaces, DB-quorum labels, `passiontech.dev/subpath-reload-opt-out=false`). Requires cluster-health-probes. |
+| `NODE_AUTOMATION_SUBPATH_CONFIG_DRIFT_ENABLED` | subpath-config-drift | on unless `"false"` | Registration gate — subpath-config-drift check row (P1.10: 30m SHA-256 census of subPath-mounted ConfigMap/Secret keys → ≥15m drift → `RestartTemplatePatch`; excludes system namespaces, DB-quorum labels, `passiontech.dev/subpath-reload-opt-out=true` (`true`/`1`/`yes`)). Requires cluster-health-probes. |
+| `NODE_AUTOMATION_SERVICE_BLACKHOLE_ENABLED` | service-selector-blackhole | on unless `"false"` | Registration gate — service-selector-blackhole check row (detects ClusterIP/Headless Services with `spec.selector` and 0 Ready endpoints ≥10m due to `selector_zero_match` or `target_port_mismatch`). Requires cluster-health-probes. |
+| `NODE_AUTOMATION_TOPOLOGY_ZONE_DEADLOCK_ENABLED` | topology-spread-zone-deadlock | on unless `"false"` | Registration gate — topology-spread-zone-deadlock check row (detects zones with 0 Ready uncordoned workers ≥10m blocking Pending pods on `topology.kubernetes.io/zone` constraints). Requires cluster-health-probes. |
+| `NODE_AUTOMATION_TOPOLOGY_ZONE_RELAX_ENABLED` | cluster-health-probes (watchdogs) | on unless `"false"` | Sub-feature gate — relaxes `topology.kubernetes.io/zone` `DoNotSchedule` → `ScheduleAnyway` (with `passiontech.dev/topology-relaxed-by` stamp) on eligible Deployments / opted-in StatefulSets during a dead zone and auto-restores after zone recovery. Resolved at check construction. |
 
 ## CLI flags (`cmd/manager/main.go`)
 

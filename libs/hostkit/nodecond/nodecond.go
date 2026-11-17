@@ -110,6 +110,11 @@ const (
 	// workerhygiene D-state/kmsg hang class — D-state storm plus the
 	// kernel soft-lockup/RCU-stall evidence latches.
 	KernelHungTasks = "KernelHungTasks"
+
+	// Wave-3 self-healing additions.
+	MountTablePressure   = "MountTablePressure"   // #4: /proc/1/mountinfo vs fs.mount-max or shared peer-group storm
+	EBPFResourcePressure = "EBPFResourcePressure" // #10: kernel eBPF prog/map/bpffs-pin leak past ceiling
+	EtcdQuorumDegraded   = "EtcdQuorumDegraded"   // #8: embedded etcd CORRUPT alarm, stuck learner, or WAL fsync storm
 )
 
 // Node/Pod annotation keys carrying the L1 ↔ L3 cooperative
@@ -213,6 +218,8 @@ var HeartbeatSweptNames = []string{
 	// wedge, CSI registration wedge) ride the same heartbeat.
 	EphemeralPortPressure, NeighborTablePressure,
 	NetfilterLockWedged, CSIRegistrationWedged,
+	// Wave-3 self-healing additions.
+	MountTablePressure, EBPFResourcePressure, EtcdQuorumDegraded,
 }
 
 // HangPreCordonNames are the hang-class conditions node-hang-
@@ -253,6 +260,12 @@ var HangPreCordonNames = []string{
 	// degrading and new pods must stay off it.
 	EphemeralPortPressure, NeighborTablePressure,
 	NetfilterLockWedged, CSIRegistrationWedged,
+	// Wave-3 self-healing additions: mount-table exhaustion and eBPF
+	// resource exhaustion take the 2m hang fuse so precordon isolates
+	// the worker before kernel ENOSPC/ENOMEM. EtcdQuorumDegraded stays
+	// off HangPreCordonNames (control-plane quorum degradation is handled
+	// via StormGateNames, not worker hang precordon).
+	MountTablePressure, EBPFResourcePressure,
 }
 
 // ClockSkewPreCordonNames are the clock-health conditions on the
@@ -325,6 +338,8 @@ var StormGateNames = []string{
 	// must also appear here per TestAllPreCordonConditionsInStormGate).
 	EphemeralPortPressure, NeighborTablePressure,
 	NetfilterLockWedged, CSIRegistrationWedged,
+	// Wave-3 self-healing additions.
+	MountTablePressure, EBPFResourcePressure, EtcdQuorumDegraded,
 }
 
 // PartitionNames are the network-partition conditions the

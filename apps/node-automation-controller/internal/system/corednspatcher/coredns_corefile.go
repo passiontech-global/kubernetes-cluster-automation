@@ -158,18 +158,31 @@ func corefileCacheHeal(corefile, serveStale string) (string, bool) {
 				indent + "}"
 			changed = true
 		case strings.LastIndex(code, "}") > open:
-			// Inline single-line block `cache 30 { denial 9984 5 }`:
-			// directives inside already satisfy; whatever is missing
-			// is injected before the closing brace. `code` is a
-			// prefix of `lines[i]` minus the indent, so code indices
-			// shift by len(indent) onto the original line — and a `}`
-			// inside a trailing comment is never the injection point.
-			inner := code[open+1 : strings.LastIndex(code, "}")]
+			// Inline single-line block `cache 30 { success 9984 30 }`:
+			// Caddyfile subdirectives must be newline-separated when more
+			// than one directive exists; expand into a multi-line block.
+			closeCode := strings.LastIndex(code, "}")
+			inner := code[open+1 : closeCode]
 			missing := cacheBlockMissing(inner, serveStale)
 			if len(missing) > 0 {
-				last := len(indent) + strings.LastIndex(code, "}")
-				lines[i] = lines[i][:last] + " " + strings.Join(missing, " ") +
-					" }" + lines[i][last+len("}"):]
+				prefix := strings.TrimSpace(code[:open])
+				comment := ""
+				if codeEnd := commentStart(lines[i]); codeEnd < len(lines[i]) {
+					if c := strings.TrimSpace(lines[i][codeEnd:]); c != "" {
+						comment = " " + c
+					}
+				}
+				existing := splitCorefileInlineDirectives(inner, cacheSubdirectives)
+				var sb strings.Builder
+				sb.WriteString(indent + prefix + " {\n")
+				for _, line := range existing {
+					sb.WriteString(indent + "    " + line + "\n")
+				}
+				for _, m := range missing {
+					sb.WriteString(indent + "    " + m + "\n")
+				}
+				sb.WriteString(indent + "}" + comment)
+				lines[i] = sb.String()
 				changed = true
 			}
 		default:
@@ -308,29 +321,30 @@ func corefileForwardHeal(corefile, maxConcurrent string) (string, bool) {
 			lines[i] = indent + code + " { " + directive + " }" + comment
 			changed = true
 		case strings.LastIndex(code, "}") > open:
-			// Inline single-line block — inject before the closing
-			// brace unless max_concurrent already appears inside.
-			inner := code[open+1 : strings.LastIndex(code, "}")]
+			// Inline single-line block — expand into multi-line when
+			// injecting max_concurrent alongside existing directives so
+			// CoreDNS Caddyfile parsing never chokes on single-line siblings.
+			closeCode := strings.LastIndex(code, "}")
+			inner := code[open+1 : closeCode]
 			if fieldsHave(inner, "max_concurrent") {
 				continue
 			}
-			// Locate the `}` in the ORIGINAL line: it is the last
-			// `}` before any `#` comment.
-			codeEnd := len(lines[i])
-			if hash := strings.Index(lines[i], "#"); hash >= 0 {
-				codeEnd = hash
+			prefix := strings.TrimSpace(code[:open])
+			comment := ""
+			if codeEnd := commentStart(lines[i]); codeEnd < len(lines[i]) {
+				if c := strings.TrimSpace(lines[i][codeEnd:]); c != "" {
+					comment = " " + c
+				}
 			}
-			closeIdx := strings.LastIndex(lines[i][:codeEnd], "}")
-			if closeIdx < 0 {
-				continue // defensive — code promised a `}`
+			existing := splitCorefileInlineDirectives(inner, forwardSubdirectives)
+			var sb strings.Builder
+			sb.WriteString(indent + prefix + " {\n")
+			for _, line := range existing {
+				sb.WriteString(indent + "    " + line + "\n")
 			}
-			before := lines[i][:closeIdx]
-			sep := ""
-			if before != "" && !strings.HasSuffix(before, " ") &&
-				!strings.HasSuffix(before, "\t") {
-				sep = " "
-			}
-			lines[i] = before + sep + directive + " " + lines[i][closeIdx:]
+			sb.WriteString(indent + "    " + directive + "\n")
+			sb.WriteString(indent + "}" + comment)
+			lines[i] = sb.String()
 			changed = true
 		default:
 			// Multi-line block: the option may already sit on the
@@ -388,4 +402,47 @@ func stripCorefileComment(line string) string {
 		return line[:i]
 	}
 	return line
+}
+
+func commentStart(line string) int {
+	if i := strings.Index(line, "#"); i >= 0 {
+		return i
+	}
+	return len(line)
+}
+
+var (
+	cacheSubdirectives = map[string]bool{
+		"success": true, "denial": true, "serve_stale": true,
+		"prefetch": true, "keepttl": true, "disable": true,
+	}
+	forwardSubdirectives = map[string]bool{
+		"except": true, "force_tcp": true, "prefer_udp": true,
+		"expire": true, "max_fails": true, "health_check": true,
+		"policy": true, "max_concurrent": true, "tls": true,
+		"tls_servername": true,
+	}
+)
+
+// splitCorefileInlineDirectives splits a single-line `{ ... }` inner body
+// at recognized Corefile subdirective boundaries so multi-directive inline
+// blocks expand into valid multi-line Caddyfile syntax.
+func splitCorefileInlineDirectives(inner string, known map[string]bool) []string {
+	fields := strings.Fields(inner)
+	if len(fields) == 0 {
+		return nil
+	}
+	var out []string
+	var cur []string
+	for _, f := range fields {
+		if len(cur) > 0 && known[f] {
+			out = append(out, strings.Join(cur, " "))
+			cur = cur[:0]
+		}
+		cur = append(cur, f)
+	}
+	if len(cur) > 0 {
+		out = append(out, strings.Join(cur, " "))
+	}
+	return out
 }

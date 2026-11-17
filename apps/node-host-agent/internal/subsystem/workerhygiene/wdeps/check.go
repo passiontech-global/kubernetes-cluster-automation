@@ -82,6 +82,10 @@ const (
 	CheckCSIGuard       = "csi-registration-guard"  // P1.6 CSI plugins_registry healer
 	CheckGPUGuard       = "gpu-pcie-guard"          // P2.12 GPU PCIe/device-plugin desync guard
 	CheckNetfilterGuard = "netfilter-guard"         // P2.11 xtables lock + hung cmd guard
+
+	// Wave-3 self-healing guards — appended at the tail so the existing
+	// check labels keep their dispatch order.
+	CheckUDPStale = "udp-stale-socket" // #3 connected-UDP dead-backend socket destroyer
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every
@@ -94,12 +98,13 @@ const (
 // actually pulls it. All fields are read-only to the checks; the
 // once-funcs are idempotent.
 type CycleEnv struct {
-	Pods         []corev1.Pod
-	APIOK        bool
-	WorkerActive bool
-	TasksOnce    func() (map[string][]CtrTask, bool)
-	PidsOnce     func() []int
-	JournalOnce  func() string
+	Pods            []corev1.Pod
+	APIOK           bool
+	WorkerActive    bool
+	SystemdProbeErr bool
+	TasksOnce       func() (map[string][]CtrTask, bool)
+	PidsOnce        func() []int
+	JournalOnce     func() string
 	// StatsOnce memoizes the per-pid /proc/<pid>/stat parse for the
 	// whole cycle — ZombieStormCheck and DstateCheck each used to
 	// read+parse every pid's stat back-to-back. The map holds only

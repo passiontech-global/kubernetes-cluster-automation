@@ -1,14 +1,16 @@
 // gha-cache-env — re-export the Actions cache runtime env into
 // GITHUB_ENV. JS actions receive ACTIONS_RUNTIME_TOKEN /
-// ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL from the runner; `run:`
-// steps do not, so without this hop `docker buildx type=gha` cache
-// args stay empty and every release rebuilds from scratch.
+// ACTIONS_CACHE_URL / ACTIONS_RESULTS_URL / ACTIONS_CACHE_SERVICE_V2
+// from the runner; `run:` steps do not, so without this hop
+// `docker buildx type=gha` cache args stay empty (or fall back to the
+// sunset v1 cache endpoint when ACTIONS_CACHE_SERVICE_V2 is missing).
 const fs = require('fs');
 
 const VARS = [
   'ACTIONS_RUNTIME_TOKEN',
   'ACTIONS_CACHE_URL',
   'ACTIONS_RESULTS_URL',
+  'ACTIONS_CACHE_SERVICE_V2',
 ];
 
 const lines = VARS.filter((v) => process.env[v])

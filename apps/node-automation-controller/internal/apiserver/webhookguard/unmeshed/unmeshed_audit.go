@@ -98,6 +98,7 @@ func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		return err
 	}
 	now := g.Now.Now()
+	a.evictCooldown.PruneExpired(now, unmeshedWorkloadCooldown)
 	unmeshed, candidates, err := a.censusUnmeshed(ctx, snap, nss, now, log)
 	if err != nil {
 		return err

@@ -209,6 +209,10 @@ var logRules = []logRule{
 	{nodecond.NeighborTablePressure, latchdefs.StateEnterRe(latchdefs.LatchNeighborPressure)},
 	{nodecond.NetfilterLockWedged, latchdefs.StateEnterRe(latchdefs.LatchNetfilterLocked)},
 	{nodecond.CSIRegistrationWedged, latchdefs.StateEnterRe(latchdefs.LatchCSIRegistrationWedged)},
+	// --- wave-3 self-healing latch→event surface ---
+	{nodecond.MountTablePressure, latchdefs.StateEnterRe(latchdefs.LatchMountTablePressure)},
+	{nodecond.EBPFResourcePressure, latchdefs.StateEnterRe(latchdefs.LatchEBPFPressure)},
+	{nodecond.EtcdQuorumDegraded, latchdefs.StateEnterRe(latchdefs.LatchEtcdQuorumDegraded)},
 }
 
 // exitLogRules — STATE-EXIT lines that earn an informational (Normal)
@@ -225,4 +229,8 @@ var exitLogRules = []logRule{
 	// DefaultReason spellings).
 	{"HostNetworkHealthy", latchdefs.StateExitRe(latchdefs.LatchHostNetworkProblems)},
 	{"InotifyNormal", latchdefs.StateExitRe(latchdefs.LatchInotifyPressure)},
+	// Wave-3 self-healing recovery events (DefaultReason spellings).
+	{"MountTableNormal", latchdefs.StateExitRe(latchdefs.LatchMountTablePressure)},
+	{"EBPFResourcesNormal", latchdefs.StateExitRe(latchdefs.LatchEBPFPressure)},
+	{"EtcdQuorumHealthy", latchdefs.StateExitRe(latchdefs.LatchEtcdQuorumDegraded)},
 }

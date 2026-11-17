@@ -262,7 +262,7 @@ func isYAMLMergeKey(kn *yaml3.Node) bool {
 func yamlMergeInto(m *OMap, n *yaml3.Node, explicit map[string]bool, depth int, steps *int) error {
 	switch n.Kind {
 	case yaml3.AliasNode, yaml3.MappingNode:
-		v, err := yamlNodeAt(n, depth, steps)
+		v, err := yamlNodeAt(n, depth+1, steps)
 		if err != nil {
 			return err
 		}
@@ -283,7 +283,7 @@ func yamlMergeInto(m *OMap, n *yaml3.Node, explicit map[string]bool, depth int, 
 		return nil
 	case yaml3.SequenceNode:
 		for _, c := range n.Content {
-			if err := yamlMergeInto(m, c, explicit, depth, steps); err != nil {
+			if err := yamlMergeInto(m, c, explicit, depth+1, steps); err != nil {
 				return err
 			}
 		}

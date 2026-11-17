@@ -46,6 +46,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -202,6 +203,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// cordon-active window is deliberate state, not a drain in
 	// flight, and must not pin cordoned_node_blocked forever.
 	now := w.now.Now()
+	w.heals.PruneExpired(now, pdbReliefCooldown)
 	nodes, err := kube.ListNodesCached(ctx, w.nodeReader, w.cs)
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
@@ -439,10 +441,11 @@ func (w *pdbDeadlockWatchdog) relieveCordonedBlock(ctx context.Context,
 			return
 		case proceed:
 			if heal.FluxPatchGate("pdb", pdb, "pdb/"+key, now) {
-				w.patchUnhealthyEvictionPolicy(ctx, log, now, pdb, key)
-				return
+				if w.patchUnhealthyEvictionPolicy(ctx, log, now, pdb, key) {
+					return
+				}
 			}
-			// Flux owns the PDB — the patch would ping-pong. Fall
+			// Flux owns the PDB or PDB patch RBAC is forbidden — fall
 			// through to the pod-delete fallback below.
 		default:
 			return // cluster-wide hold — deferred
@@ -586,19 +589,25 @@ func podHasDBQuorumLabel(pod *corev1.Pod) bool {
 // passed the heal gate and FluxPatchGate.
 func (w *pdbDeadlockWatchdog) patchUnhealthyEvictionPolicy(ctx context.Context,
 	log logr.Logger, now time.Time, pdb *policyv1.PodDisruptionBudget,
-	key string) {
+	key string) bool {
 
 	patch := []byte(`{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}`)
 	_, err := w.cs.PolicyV1().PodDisruptionBudgets(pdb.Namespace).Patch(
 		ctx, pdb.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
+		if apierrors.IsForbidden(err) {
+			log.Info("WARN: PDB unhealthyPodEvictionPolicy patch forbidden (RBAC) — falling back to pod delete",
+				"pdb", pdb.Namespace+"/"+pdb.Name)
+			return false
+		}
 		metrics.IncError(w.queue)
 		log.Error(err, "PDB unhealthyPodEvictionPolicy patch failed",
 			"pdb", pdb.Namespace+"/"+pdb.Name)
-		return
+		return true
 	}
 	w.heals.Stamp(key, now)
 	pdbUnhealthyPolicyPatchedTotal.Inc()
 	log.Info("ACTION: patched PDB unhealthyPodEvictionPolicy=AlwaysAllow",
 		"pdb", pdb.Namespace+"/"+pdb.Name)
+	return true
 }

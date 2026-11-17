@@ -197,7 +197,8 @@ func (p *stsRolloutUnstickCheck) Run(ctx context.Context) probefw.Result {
 func stsUnstickApplies(sts *appsv1.StatefulSet) bool {
 	return sts.Spec.UpdateStrategy.Type == appsv1.RollingUpdateStatefulSetStrategyType &&
 		sts.Spec.PodManagementPolicy == appsv1.OrderedReadyPodManagement &&
-		sts.Status.UpdateRevision != ""
+		sts.Status.UpdateRevision != "" &&
+		!kube.IsIntentionallyDownscaled(sts.Annotations, sts.Spec.Replicas)
 }
 
 // stsPodOrdinal extracts the StatefulSet ordinal from an owned pod
@@ -225,7 +226,15 @@ func (p *stsRolloutUnstickCheck) stsWedgeCandidates(
 
 	sorted := slices.Clone(pods)
 	slices.SortFunc(sorted, func(a, b *corev1.Pod) int {
-		return strings.Compare(a.Name, b.Name)
+		oa, oka := stsPodOrdinal(sts.Name, a.Name)
+		ob, okb := stsPodOrdinal(sts.Name, b.Name)
+		if oka && okb && oa != ob {
+			if oa > ob {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(b.Name, a.Name)
 	})
 	// Canary partition: pods with ordinal < partition intentionally
 	// keep the old revision — deleting one would break the canary
@@ -327,6 +336,7 @@ func (p *stsRolloutUnstickCheck) maybeHealPod(ctx context.Context,
 		return
 	}
 	healed[stsKey] = true
+	p.InvalidatePods(ctx)
 	rep.Find("healed: deleted wedged pod " + pod.Namespace + "/" +
 		pod.Name + " on " + stsKey)
 	log.Info("ACTION: deleted wedged StatefulSet pod to unstick rollout",

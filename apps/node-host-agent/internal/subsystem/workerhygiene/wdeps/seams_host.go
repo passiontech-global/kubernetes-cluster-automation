@@ -7,8 +7,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
-	"strconv"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -69,15 +67,21 @@ type Host struct {
 	// old systemd Exec ran in). Default the netlink call; tests
 	// record instead of touching real links.
 	LinkDelFn func(name string) error
-	// InotifyFDIno returns the open-file-description inode of one
-	// /proc/<pid>/fd/<fdName> entry — the OFD identity the
-	// inotify-pressure census needs to dedup descriptors forked
-	// workers share (N processes holding ONE inotify instance via
-	// fork is ONE ucounts charge, not N). ok=false when the fd
-	// vanished mid-walk or the kernel won't stat it — the caller
-	// counts that fd un-deduped (conservative: never under-count
-	// pressure evidence). Default os.Stat → Stat_t.Ino.
-	InotifyFDIno func(pid int, fdName string) (ino uint64, ok bool)
+	// InotifyFDIno returns the open-file-description identity of one
+	// /proc/<pid>/fd/<fdName> entry when explicitly stubbed by a test;
+	// on Linux all anon_inode:inotify fds share one kernel inode, so
+	// ApplyDefaults leaves InotifyFDIno nil and uses InotifySameOFDFn
+	// (unix.Kcmp KCMP_FILE) on pressured RUIDs instead.
+	InotifyFDIno     func(pid int, fdName string) (ino uint64, ok bool)
+	InotifySameOFDFn func(pid1, fd1, pid2, fd2 int) bool
+	// TCPTablesFn overrides netlinkx.TCPTables for tests that cannot
+	// read host proc/netlink sockets.
+	TCPTablesFn func(pid int) (netlinkx.TCPCensus, error)
+	// Wave-3 #3: connected-UDP socket dump + SOCK_DESTROY seams.
+	DumpConnectedUDPFn func(pid int) ([]netlinkx.ConnectedUDPSocket, error)
+	DestroyUDPSocketFn func(pid int, family uint8, id [48]byte) error
+	// Wave-3 #4b: orphan /dev/loop* LOOP_CLR_FD ioctl detach seam.
+	DetachLoopFn func(devPath string) error
 }
 
 func (s *Host) applyDefaults(c *Config) {
@@ -139,20 +143,22 @@ func (s *Host) applyDefaults(c *Config) {
 			return netlinkx.LinkDel(1, name)
 		}
 	}
-	if s.InotifyFDIno == nil {
-		procRoot := c.ProcRoot
-		s.InotifyFDIno = func(pid int, fdName string) (uint64, bool) {
-			fi, err := os.Stat(filepath.Join(procRoot,
-				strconv.Itoa(pid), "fd", fdName))
-			if err != nil {
-				return 0, false
-			}
-			st, ok := fi.Sys().(*syscall.Stat_t)
-			if !ok {
-				return 0, false
-			}
-			return st.Ino, true
-		}
+	// Do NOT default InotifyFDIno to os.Stat(st.Ino): all
+	// anon_inode:inotify fds share one kernel singleton inode.
+	if s.InotifySameOFDFn == nil {
+		s.InotifySameOFDFn = inotifySameOFD
+	}
+	if s.TCPTablesFn == nil {
+		s.TCPTablesFn = netlinkx.TCPTables
+	}
+	if s.DumpConnectedUDPFn == nil {
+		s.DumpConnectedUDPFn = netlinkx.DumpConnectedUDP
+	}
+	if s.DestroyUDPSocketFn == nil {
+		s.DestroyUDPSocketFn = netlinkx.DestroyUDPSocket
+	}
+	if s.DetachLoopFn == nil {
+		s.DetachLoopFn = detachLoop
 	}
 }
 

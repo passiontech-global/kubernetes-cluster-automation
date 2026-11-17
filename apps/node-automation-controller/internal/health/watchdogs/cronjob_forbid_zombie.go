@@ -176,7 +176,7 @@ func (p *cjForbidZombieCheck) Run(ctx context.Context) probefw.Result {
 			if ref.Name == "" {
 				continue
 			}
-			p.sweepActiveJob(ctx, log, now, &rep, cj, ref.Name,
+			p.sweepActiveJob(ctx, log, now, &rep, cj, ref,
 				jobsByKey, podsByJob, liveNodes, seen)
 		}
 	}
@@ -191,13 +191,19 @@ func (p *cjForbidZombieCheck) Run(ctx context.Context) probefw.Result {
 // opt-in).
 func (p *cjForbidZombieCheck) sweepActiveJob(ctx context.Context,
 	log logr.Logger, now time.Time, rep *probefw.SweepReport,
-	cj *batchv1.CronJob, jobName string,
+	cj *batchv1.CronJob, ref corev1.ObjectReference,
 	jobsByKey map[string]*batchv1.Job,
 	podsByJob map[string][]*corev1.Pod,
 	liveNodes map[string]bool, seen map[string]bool) {
 
+	jobName := ref.Name
 	jobKey := cj.Namespace + "/" + jobName
 	job := jobsByKey[jobKey]
+	if job != nil && ref.UID != "" && job.UID != ref.UID {
+		// Same-named Job has a different UID: the active ref points to a
+		// deleted prior Job instance, never delete the new live Job.
+		job = nil
+	}
 
 	// --- zombie branch -------------------------------------------------
 	// Evidence: the Job object is gone from the census, already
@@ -223,7 +229,7 @@ func (p *cjForbidZombieCheck) sweepActiveJob(ctx context.Context,
 				[]string{cj.Namespace, cj.Name, cjStallZombie})
 			rep.Find("cronjob " + cj.Namespace + "/" + cj.Name +
 				" active job " + jobName + " is a zombie")
-			p.maybeClearActiveRef(ctx, log, now, rep, cj, jobName, job)
+			p.maybeClearActiveRef(ctx, log, now, rep, cj, ref, job)
 		}
 		return // a zombie ref is not also a runaway — one verdict
 	}
@@ -331,26 +337,20 @@ func cjRunawayLimit(cj *batchv1.CronJob, now time.Time) time.Duration {
 // and the per-CronJob cooldown.
 func (p *cjForbidZombieCheck) maybeClearActiveRef(ctx context.Context,
 	log logr.Logger, now time.Time, rep *probefw.SweepReport,
-	cj *batchv1.CronJob, jobName string, job *batchv1.Job) {
+	cj *batchv1.CronJob, target corev1.ObjectReference, job *batchv1.Job) {
 
 	if job == nil {
-		p.clearGhostActiveRef(ctx, log, now, rep, cj, jobName)
+		p.clearGhostActiveRef(ctx, log, now, rep, cj, target)
 		return
 	}
 	p.deleteStalledJob(ctx, log, now, rep, cj, job)
 }
 
-// clearGhostActiveRef removes one stale entry from cj.Status.Active
-// when the Job object no longer exists — a status write, not a pod
-// kill, so it gates on the same cluster-wide-only scope but consumes
-// no heal-budget grant (the budget bounds destructive pod action).
-// The listed object's ResourceVersion gives optimistic concurrency:
-// a concurrent status update fails the write with Conflict and the
-// next sweep retries.
 func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 	log logr.Logger, now time.Time, rep *probefw.SweepReport,
-	cj *batchv1.CronJob, jobName string) {
+	cj *batchv1.CronJob, target corev1.ObjectReference) {
 
+	jobName := target.Name
 	key := cj.Namespace + "/" + cj.Name
 	if p.Heals.CooledDown(key+"/active-ref", cjForbidHealCooldown, now) {
 		return
@@ -364,22 +364,30 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 	case !proceed:
 		return
 	}
-	// Re-verify the Job is still absent — the census copy may be a
-	// sweep old and a same-named Job could have been recreated since.
-	if _, err := p.CS.BatchV1().Jobs(cj.Namespace).Get(ctx, jobName,
+	// Re-verify the target Job instance (matching UID when set) is still absent.
+	if liveJob, err := p.CS.BatchV1().Jobs(cj.Namespace).Get(ctx, jobName,
 		metav1.GetOptions{}); err == nil {
-		return // not a ghost anymore — a live Job owns this ref
+		if target.UID == "" || liveJob.UID == target.UID {
+			return // not a ghost anymore — same Job instance still lives
+		}
 	} else if !apierrors.IsNotFound(err) {
+		if apierrors.IsForbidden(err) {
+			log.Info("WARN: cronjob forbid zombie job re-check forbidden (RBAC)",
+				"cronjob", key, "job", jobName)
+			return
+		}
 		metrics.IncError(p.Name)
 		log.Error(err, "cronjob forbid zombie: job re-check failed",
 			"cronjob", key, "job", jobName)
 		return
 	}
-	// Re-read the live CronJob — only drop the ref if it is still
-	// listed; a concurrent controller sync may have cleared it.
+	// Re-read the live CronJob — only drop the ref if matching UID/name is still present.
 	live, err := p.CS.BatchV1().CronJobs(cj.Namespace).Get(ctx, cj.Name,
 		metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
+			return
+		}
 		metrics.IncError(p.Name)
 		log.Error(err, "cronjob forbid zombie: get for status clear failed",
 			"cronjob", key)
@@ -388,7 +396,8 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 	kept := live.Status.Active[:0]
 	removed := false
 	for _, ref := range live.Status.Active {
-		if ref.Name == jobName {
+		match := ref.Name == jobName && (target.UID == "" || ref.UID == "" || ref.UID == target.UID)
+		if match {
 			removed = true
 			continue
 		}
@@ -400,6 +409,11 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 	live.Status.Active = kept
 	if _, err := p.CS.BatchV1().CronJobs(cj.Namespace).UpdateStatus(
 		ctx, live, metav1.UpdateOptions{}); err != nil {
+		if apierrors.IsConflict(err) || apierrors.IsForbidden(err) {
+			log.Info("WARN: cronjob forbid zombie status.active clear deferred",
+				"cronjob", key, "job", jobName, "error", err)
+			return
+		}
 		metrics.IncError(p.Name)
 		log.Error(err, "cronjob forbid zombie: status.active clear failed",
 			"cronjob", key, "job", jobName)
@@ -411,10 +425,6 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 		"cronjob", key, "job", jobName)
 }
 
-// deleteStalledJob deletes the zombie/runaway Job through the shared
-// cluster-wide-only heal gate — cooldown + maintenance scope + heal
-// budget — then a UID-preconditioned delete with Background
-// propagation so the cronjob-controller drops it from status.active.
 func (p *cjForbidZombieCheck) deleteStalledJob(ctx context.Context,
 	log logr.Logger, now time.Time, rep *probefw.SweepReport,
 	cj *batchv1.CronJob, job *batchv1.Job) {
@@ -433,8 +443,13 @@ func (p *cjForbidZombieCheck) deleteStalledJob(ctx context.Context,
 	err := p.CS.BatchV1().Jobs(job.Namespace).Delete(ctx, job.Name,
 		kube.UIDDeleteOptions(job.UID, prop))
 	switch {
-	case apierrors.IsNotFound(err):
+	case apierrors.IsNotFound(err) || apierrors.IsConflict(err):
 		heal.RefundGrant(now) // nothing executed — hand the grant back
+		return
+	case apierrors.IsForbidden(err):
+		heal.RefundGrant(now)
+		log.Info("WARN: cronjob forbid zombie job delete forbidden (RBAC)",
+			"cronjob", key, "job", job.Namespace+"/"+job.Name)
 		return
 	case err != nil:
 		metrics.IncError(p.Name)

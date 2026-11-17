@@ -367,13 +367,15 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// fail closed: gate the checks off this cycle rather than risk
 	// hygiene actions on a possibly intentionally-downed worker.
 	workerActive := true
+	systemdProbeErr := false
 	if h.Cfg.Systemd != nil {
 		if active, err := h.Cfg.Systemd.Active(ctx, "k0sworker.service"); err != nil {
 			logger().Warn("workerhygiene: k0sworker is-active probe "+
 				"failed — worker checks gated off this cycle "+
-				"(fail closed)",
+				"(fail closed; SystemdSessionCheck remains active)",
 				"unit", "k0sworker.service", "error", err)
 			workerActive = false
+			systemdProbeErr = true
 		} else {
 			workerActive = active
 		}
@@ -427,14 +429,15 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		return stats
 	}
 	*h.envCell = wdeps.CycleEnv{
-		Pods:         pods,
-		APIOK:        apiOK,
-		WorkerActive: workerActive,
-		TasksOnce:    tasksOnce,
-		PidsOnce:     pidsOnce,
-		JournalOnce:  journalOnce,
-		StatsOnce:    statsOnce,
-		WalkOnce:     walkOnce,
+		Pods:            pods,
+		APIOK:           apiOK,
+		WorkerActive:    workerActive,
+		SystemdProbeErr: systemdProbeErr,
+		TasksOnce:       tasksOnce,
+		PidsOnce:        pidsOnce,
+		JournalOnce:     journalOnce,
+		StatsOnce:       statsOnce,
+		WalkOnce:        walkOnce,
 	}
 	subframe.Dispatch(ctx, sigOn, h.Cycles, h.groups)
 	// node_agent_* gauges — one textfile per cycle carrying the

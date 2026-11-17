@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them, listing the
-source location of every reference in that package (191 knobs
+source location of every reference in that package (208 knobs
 referenced across 17 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -99,35 +99,38 @@ subsystem has no env gate.
 
 ### `internal/subsystem/controllerhygiene/cdeps`
 
-- `NODE_HOST_AGENT_API_PEER` — `env.go:102`
-- `NODE_HOST_AGENT_API_SELF` — `env.go:101`
-- `NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS` — `env.go:136`
-- `NODE_HOST_AGENT_CONTROLLER_INTERVAL` — `env.go:95`
-- `NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT` — `env.go:148`
-- `NODE_HOST_AGENT_ETCD_ENDPOINT` — `env.go:147`
-- `NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR` — `env.go:153`
-- `NODE_HOST_AGENT_FROZEN_CYCLES` — `env.go:111`
-- `NODE_HOST_AGENT_GAP_CYCLES` — `env.go:109`
-- `NODE_HOST_AGENT_GAP_MIN` — `env.go:107`
-- `NODE_HOST_AGENT_K0S_DIR` — `env.go:145`
-- `NODE_HOST_AGENT_KINE_DB_PROBE` — `env.go:103`
-- `NODE_HOST_AGENT_KINE_POOL_AUTOFIX` — `env.go:124`
-- `NODE_HOST_AGENT_KINE_POOL_CYCLES` — `env.go:127`
-- `NODE_HOST_AGENT_KINE_POOL_MAX_CONNS` — `env.go:125`
-- `NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S` — `env.go:129`
-- `NODE_HOST_AGENT_KINE_TTL_AUTOFIX` — `env.go:117`
-- `NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S` — `env.go:120`
-- `NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S` — `env.go:118`
-- `NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES` — `env.go:122`
-- `NODE_HOST_AGENT_OOMLOOP_AUTOFIX` — `env.go:131`
-- `NODE_HOST_AGENT_OOMLOOP_MIN_KILLS` — `env.go:132`
-- `NODE_HOST_AGENT_OOMLOOP_WINDOW_S` — `env.go:134`
-- `NODE_HOST_AGENT_PROC_ROOT` — `env.go:96`
-- `NODE_HOST_AGENT_SIG13_AUTOFIX` — `env.go:104`
-- `NODE_HOST_AGENT_SIG13_MIN_RESTART_S` — `env.go:115`
-- `NODE_HOST_AGENT_SOLO_CYCLES` — `env.go:113`
-- `NODE_HOST_AGENT_STALE_MIN_ERRS` — `env.go:105`
-- `NODE_HOST_AGENT_TOTAL_CONTROLLERS` — `env.go:152`
+- `NODE_HOST_AGENT_API_PEER` — `env.go:103`
+- `NODE_HOST_AGENT_API_SELF` — `env.go:102`
+- `NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS` — `env.go:137`
+- `NODE_HOST_AGENT_CONTROLLER_INTERVAL` — `env.go:96`
+- `NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT` — `env.go:149`
+- `NODE_HOST_AGENT_ETCD_ENDPOINT` — `env.go:148`
+- `NODE_HOST_AGENT_ETCD_FSYNC_P99_MAX_SECONDS` — `env.go:151`
+- `NODE_HOST_AGENT_ETCD_LEARNER_MAX_AGE` — `env.go:150`
+- `NODE_HOST_AGENT_ETCD_METRICS_URL` — `env.go:159`
+- `NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR` — `env.go:164`
+- `NODE_HOST_AGENT_FROZEN_CYCLES` — `env.go:112`
+- `NODE_HOST_AGENT_GAP_CYCLES` — `env.go:110`
+- `NODE_HOST_AGENT_GAP_MIN` — `env.go:108`
+- `NODE_HOST_AGENT_K0S_DIR` — `env.go:146`
+- `NODE_HOST_AGENT_KINE_DB_PROBE` — `env.go:104`
+- `NODE_HOST_AGENT_KINE_POOL_AUTOFIX` — `env.go:125`
+- `NODE_HOST_AGENT_KINE_POOL_CYCLES` — `env.go:128`
+- `NODE_HOST_AGENT_KINE_POOL_MAX_CONNS` — `env.go:126`
+- `NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S` — `env.go:130`
+- `NODE_HOST_AGENT_KINE_TTL_AUTOFIX` — `env.go:118`
+- `NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S` — `env.go:121`
+- `NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S` — `env.go:119`
+- `NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES` — `env.go:123`
+- `NODE_HOST_AGENT_OOMLOOP_AUTOFIX` — `env.go:132`
+- `NODE_HOST_AGENT_OOMLOOP_MIN_KILLS` — `env.go:133`
+- `NODE_HOST_AGENT_OOMLOOP_WINDOW_S` — `env.go:135`
+- `NODE_HOST_AGENT_PROC_ROOT` — `env.go:97`
+- `NODE_HOST_AGENT_SIG13_AUTOFIX` — `env.go:105`
+- `NODE_HOST_AGENT_SIG13_MIN_RESTART_S` — `env.go:116`
+- `NODE_HOST_AGENT_SOLO_CYCLES` — `env.go:114`
+- `NODE_HOST_AGENT_STALE_MIN_ERRS` — `env.go:106`
+- `NODE_HOST_AGENT_TOTAL_CONTROLLERS` — `env.go:163`
 
 ### `internal/subsystem/hostconfig`
 
@@ -143,6 +146,8 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CLOCKSOURCE_CURRENT_FILE` — `config_env.go:80`
 - `NODE_HOST_AGENT_CONNTRACK_STAT_FILE` — `config_env.go:73`
 - `NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL` — `config_env.go:70`
+- `NODE_HOST_AGENT_EBPF_MAPS_MAX` — `config_env.go:154`
+- `NODE_HOST_AGENT_EBPF_PROGS_MAX` — `config_env.go:152`
 - `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:91`
 - `NODE_HOST_AGENT_GPU_EXPECTED_COUNT` — `config_env.go:149`
 - `NODE_HOST_AGENT_GPU_GUARD_MODE` — `config_env.go:146`
@@ -193,6 +198,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_KINEDB_GUARD_MAX_STEP_REVISIONS` — `env.go:51`
 - `NODE_HOST_AGENT_KINEDB_GUARD_STATE_DIR` — `env.go:38`
 - `NODE_HOST_AGENT_KINEDB_PG_DATA_DIR` — `env.go:42`
+- `NODE_HOST_AGENT_KINE_SEQ_WIDEN_ENABLED` — `env.go:54`
 
 ### `internal/subsystem/nethealth`
 
@@ -227,8 +233,10 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CGROUP_ROOT` — `config_runtime.go:53`
 - `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:60`
 - `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:57`
-- `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:237`
+- `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:245`
 - `NODE_HOST_AGENT_COREDUMP_DIR` — `config_disk.go:140`
+- `NODE_HOST_AGENT_CPU_CFS_THROTTLE_RATIO` — `config_wave3.go:59`
+- `NODE_HOST_AGENT_CPU_HOST_IDLE_MIN_RATIO` — `config_wave3.go:60`
 - `NODE_HOST_AGENT_CSI_GUARD_BOUNCE_COOLDOWN_MIN` — `config_wave2.go:108`
 - `NODE_HOST_AGENT_CSI_GUARD_ECONNREFUSED_CYCLES` — `config_wave2.go:106`
 - `NODE_HOST_AGENT_CSI_GUARD_MISSING_MINUTES` — `config_wave2.go:107`
@@ -237,7 +245,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CSI_HEAL_ENABLED` — `config_wave2.go:104`
 - `NODE_HOST_AGENT_CTR_KILL_HUNG_RUNC` — `config_wave2.go:97`
 - `NODE_HOST_AGENT_CTR_RUNC_MAX_AGE` — `config_wave2.go:98`
-- `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:229`
+- `NODE_HOST_AGENT_CTR_TASK_ROOT` — `config.go:231`
 - `NODE_HOST_AGENT_DEV_SHM_DIR` — `config_disk.go:136`
 - `NODE_HOST_AGENT_DSTATE_STORM_THRESHOLD` — `config_pressure.go:61`
 - `NODE_HOST_AGENT_GPU_GUARD_BOUNCE_COOLDOWN_MIN` — `config_wave2.go:115`
@@ -245,28 +253,32 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_GPU_GUARD_MODE` — `config_wave2.go:109`
 - `NODE_HOST_AGENT_GPU_GUARD_PROBE_SECONDS` — `config_wave2.go:113`
 - `NODE_HOST_AGENT_GPU_HEAL_ENABLED` — `config_wave2.go:112`
-- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:241`
+- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config.go:249`
 - `NODE_HOST_AGENT_HOST_RUN_DIR` — `config_disk.go:134`
-- `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:251`
-- `NODE_HOST_AGENT_HYGIENE_CYCLE_TIMEOUT` — `config.go:227`
-- `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:226`
+- `NODE_HOST_AGENT_HYGIENE_CONSEC_NEEDED` — `config.go:261`
+- `NODE_HOST_AGENT_HYGIENE_CYCLE_TIMEOUT` — `config.go:229`
+- `NODE_HOST_AGENT_HYGIENE_INTERVAL` — `config.go:228`
 - `NODE_HOST_AGENT_HYGIENE_MAX_FORCE_DELETE` — `config_teardown.go:38`
-- `NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL` — `config.go:252`
+- `NODE_HOST_AGENT_HYGIENE_MIN_RESTART_INTERVAL` — `config.go:262`
 - `NODE_HOST_AGENT_HYGIENE_STUCK_DELETE_AGE` — `config_teardown.go:36`
 - `NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE` — `config_teardown.go:37`
 - `NODE_HOST_AGENT_INOTIFY_EVICT_RUNAWAY_POD` — `config_pressure.go:64`
 - `NODE_HOST_AGENT_INOTIFY_MAX_INSTANCES_CEILING` — `config_pressure.go:62`
 - `NODE_HOST_AGENT_INOTIFY_MAX_WATCHES_CEILING` — `config_pressure.go:63`
-- `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:233`
-- `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:239`
+- `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:235`
+- `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:247`
 - `NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL` — `config_kubelet.go:93`
 - `NODE_HOST_AGENT_KUBELET_TOKEN_FILE` — `config_kubelet.go:94`
-- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101, env.go:105`
+- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101, env.go:106`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR` — `config_net.go:38`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_NAME` — `config_net.go:39`
 - `NODE_HOST_AGENT_LOCALPV_QUOTA_DIR` — `config_disk.go:133`
+- `NODE_HOST_AGENT_LOOP_GC_ENABLED` — `config_wave3.go:58`
 - `NODE_HOST_AGENT_MAX_CONCURRENT` — `config_wave2.go:85`
-- `NODE_HOST_AGENT_MOUNTINFO_FILE` — `config.go:235`
+- `NODE_HOST_AGENT_MOUNTINFO_FILE` — `config.go:244`
+- `NODE_HOST_AGENT_MOUNT_MAX_CEILING` — `config_wave3.go:57`
+- `NODE_HOST_AGENT_MOUNT_SHARED_STORM_MAX` — `config_wave3.go:56`
+- `NODE_HOST_AGENT_MOUNT_TABLE_ENTER_RATIO` — `config_wave3.go:55`
 - `NODE_HOST_AGENT_NETFILTER_GUARD_CMD_TIMEOUT_SECONDS` — `config_wave2.go:120`
 - `NODE_HOST_AGENT_NETFILTER_GUARD_INTERVAL_SECONDS` — `config_wave2.go:119`
 - `NODE_HOST_AGENT_NETFILTER_GUARD_LEGACY_TABLE_PROBE` — `config_wave2.go:131`
@@ -285,12 +297,18 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_PORT_LEAK_WINDOW_SECONDS` — `config_wave2.go:94`
 - `NODE_HOST_AGENT_PORT_SYN_SENT_MIN_RETRANS` — `config_wave2.go:84`
 - `NODE_HOST_AGENT_PORT_TUPLE_RATIO` — `config_wave2.go:86`
-- `NODE_HOST_AGENT_PROC_ROOT` — `config.go:228`
+- `NODE_HOST_AGENT_PROC_ROOT` — `config.go:230`
 - `NODE_HOST_AGENT_RUNC_HANG_CONFIRM_CYCLES` — `config_wave2.go:99`
 - `NODE_HOST_AGENT_RUNC_HANG_MAX_KILLS_PER_CYCLE` — `config_wave2.go:100`
-- `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:231`
+- `NODE_HOST_AGENT_SANDBOX_CTL_ROOT` — `config.go:233`
 - `NODE_HOST_AGENT_SA_TOKEN_MIN_TTL_S` — `config_runtime.go:57`
 - `NODE_HOST_AGENT_SYSTEMD_SESSIONS_DIR` — `config_runtime.go:55`
+- `NODE_HOST_AGENT_SYS_CLASS_NET` — `config.go:251`
+- `NODE_HOST_AGENT_UDP_STALE_DESTROY_ENABLED` — `config_wave3.go:52`
+- `NODE_HOST_AGENT_UDP_STALE_MAX_KILLS` — `config_wave3.go:54`
+- `NODE_HOST_AGENT_UDP_STALE_POD_CIDRS` — `config_wave3.go:53`
+- `NODE_HOST_AGENT_VMA_MAX_CEILING` — `config_wave3.go:62`
+- `NODE_HOST_AGENT_VMA_PRESSURE_RATIO` — `config_wave3.go:61`
 - `NODE_HOST_AGENT_WLAYER_BLOAT_THRESHOLD_BYTES` — `config_disk.go:142`
 - `NODE_HOST_AGENT_WLAYER_SNAPSHOTS_DIR` — `config_disk.go:138`
 

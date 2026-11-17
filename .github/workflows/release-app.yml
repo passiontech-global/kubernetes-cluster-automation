@@ -340,10 +340,10 @@ jobs:
 
       - name: Export GHA cache env for buildx
         # JS actions are the only step kind GitHub injects
-        # ACTIONS_RUNTIME_TOKEN/ACTIONS_CACHE_URL/ACTIONS_RESULTS_URL
-        # into — this hop lands them in $GITHUB_ENV so the moon
-        # image task's type=gha cache check sees them and the
-        # release build actually hits the layer cache.
+        # ACTIONS_RUNTIME_TOKEN/ACTIONS_CACHE_URL/ACTIONS_RESULTS_URL/
+        # ACTIONS_CACHE_SERVICE_V2 into — this hop lands them in
+        # $GITHUB_ENV so the moon image task's type=gha cache check
+        # sees them and buildx targets the v2 cache service.
         if: inputs.uses_buildx
         uses: ./.github/actions/gha-cache-env
 

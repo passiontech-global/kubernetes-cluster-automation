@@ -128,6 +128,9 @@ func pyFormat(format string, args []any) (string, error) {
 			}
 		}
 		i = j
+		if b.Len() > maxStringBytes {
+			return "", fmt.Errorf("format: output exceeds %d bytes", maxStringBytes)
+		}
 	}
 	if argi < len(args) {
 		return "", fmt.Errorf("format: not all arguments converted (%d given)", len(args))

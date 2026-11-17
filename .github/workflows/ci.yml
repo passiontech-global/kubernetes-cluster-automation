@@ -222,4 +222,4 @@ jobs:
           push: false
           tags: kca-${{ matrix.app }}:ci
           cache-from: type=gha,scope=${{ matrix.app }}
-          cache-to: type=gha,scope=${{ matrix.app }},mode=max
+          cache-to: type=gha,scope=${{ matrix.app }},mode=max,ignore-error=true

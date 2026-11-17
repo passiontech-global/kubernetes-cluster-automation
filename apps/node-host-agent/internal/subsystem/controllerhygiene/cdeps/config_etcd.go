@@ -38,6 +38,11 @@ const (
 	// /host/var/backups/etcd; this literal is the standalone /
 	// programmatic-Config fallback.
 	defaultEtcdBackupDir = "/var/backups/etcd"
+
+	// Wave-3 #8: embedded etcd quorum/learner/wal_fsync guard defaults.
+	DefaultEtcdMetricsURL     = "http://127.0.0.1:2381/metrics"
+	defaultEtcdLearnerMaxAge  = 30 * time.Minute
+	defaultEtcdFsyncP99MaxSec = 0.10
 )
 
 // EtcdGuardConfig is the embedded-etcd quota self-defence (k0s
@@ -51,6 +56,10 @@ type EtcdGuardConfig struct {
 	DBSizeLimit int64  // dbSize trigger bytes; <=0 → 1.5 GiB
 	// MinRun is the eventpurge+rescue rate budget; <=0 → 1h.
 	MinRun time.Duration
+	// Wave-3 #8: stuck learner, WAL fsync p99, and etcd /metrics URL.
+	LearnerMaxAge      time.Duration // <=0 → 30m
+	FsyncP99MaxSeconds float64       // <=0 → 0.10s
+	MetricsURL         string        // "" → http://127.0.0.1:2381/metrics
 }
 
 func (c *Config) applyEtcdGuardDefaults() {
@@ -62,6 +71,15 @@ func (c *Config) applyEtcdGuardDefaults() {
 	}
 	if c.EtcdGuard.MinRun <= 0 {
 		c.EtcdGuard.MinRun = defaultEtcdGuardMinRun
+	}
+	if c.EtcdGuard.LearnerMaxAge <= 0 {
+		c.EtcdGuard.LearnerMaxAge = defaultEtcdLearnerMaxAge
+	}
+	if c.EtcdGuard.FsyncP99MaxSeconds <= 0 {
+		c.EtcdGuard.FsyncP99MaxSeconds = defaultEtcdFsyncP99MaxSec
+	}
+	if c.EtcdGuard.MetricsURL == "" {
+		c.EtcdGuard.MetricsURL = DefaultEtcdMetricsURL
 	}
 	if c.EtcdBackupDir == "" {
 		c.EtcdBackupDir = defaultEtcdBackupDir

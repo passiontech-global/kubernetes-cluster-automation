@@ -190,6 +190,10 @@ type hygieneResult struct {
 	xminActivity    int64
 	xminReplication int64
 	xminSeen        bool
+	// Wave-3 #1: Kine PostgreSQL int4 sequence cliff guard.
+	seqUtilRatio float64
+	idInt4Hazard float64
+	seqCliffSeen bool
 }
 
 // largeKeyRow is one census hit: the kine key path (name column —

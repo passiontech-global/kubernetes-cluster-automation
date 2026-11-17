@@ -110,8 +110,7 @@ func tcpCensusDump(out *TCPCensus) error {
 			return fmt.Errorf("sock_diag send %d: %w", family, err)
 		}
 		if err := diagRecvLoop(fd, buf, fmt.Sprintf("sock_diag recv %d", family), func(b []byte) (bool, error) {
-			endSeq, ferr := parseDiagCensus(b, out)
-			return endSeq != 0, ferr
+			return parseDiagCensus(b, out)
 		}); err != nil {
 			if family == unix.AF_INET6 && noInet6Family(err) {
 				continue // kernel has no IPv6 — not an error
@@ -182,8 +181,8 @@ func walkNLMsgs(buf []byte, destroyCtx bool, onPayload func(payload []byte)) (se
 	return 0, false, nil
 }
 
-func parseDiagCensus(buf []byte, out *TCPCensus) (uint32, error) {
-	seq, _, err := walkNLMsgs(buf, false, func(payload []byte) {
+func parseDiagCensus(buf []byte, out *TCPCensus) (bool, error) {
+	_, done, err := walkNLMsgs(buf, false, func(payload []byte) {
 		// inet_diag_msg: family@0, state@1, sockid@4 —
 		// dport (BE) at sockid+2, daddr at sockid+20 (4 bytes
 		// for AF_INET, the full 16 for AF_INET6; the kernel
@@ -206,7 +205,7 @@ func parseDiagCensus(buf []byte, out *TCPCensus) (uint32, error) {
 			out.PerTuple[string(k)]++
 		}
 	})
-	return seq, err
+	return done, err
 }
 
 // DiagEndpoint renders a census PerTuple key (raw daddr bytes +
@@ -609,8 +608,7 @@ func listenAddrsDump(out map[string]struct{}) error {
 		if err := diagRecvLoop(fd, buf,
 			fmt.Sprintf("sock_diag recv %d/%d", spec.family, spec.proto),
 			func(b []byte) (bool, error) {
-				endSeq, ferr := parseListenAddrs(b, spec.proto, out)
-				return endSeq != 0, ferr
+				return parseListenAddrs(b, spec.proto, out)
 			}); err != nil {
 			if spec.family == unix.AF_INET6 && noInet6Family(err) {
 				continue // kernel has no IPv6 — not an error
@@ -625,8 +623,8 @@ func listenAddrsDump(out map[string]struct{}) error {
 // in TCP_LISTEN, UDP rows any state with a bound local port —
 // and returns the terminating dump seq like parseDiagCensus.
 func parseListenAddrs(buf []byte, proto uint8,
-	out map[string]struct{}) (uint32, error) {
-	seq, _, err := walkNLMsgs(buf, false, func(payload []byte) {
+	out map[string]struct{}) (bool, error) {
+	_, done, err := walkNLMsgs(buf, false, func(payload []byte) {
 		if len(payload) < diagMsg {
 			return
 		}
@@ -651,5 +649,5 @@ func parseListenAddrs(buf []byte, proto uint8,
 			out["["+v6String(payload[8:24])+"]:"+port] = struct{}{}
 		}
 	})
-	return seq, err
+	return done, err
 }

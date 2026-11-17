@@ -280,6 +280,98 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	return nil
 }
 
+// recoverLoopCrashPods deletes CrashLoopBackOff CoreDNS pods stuck in
+// plugin/loop so kubelet recreates both the Pod and its pause sandbox with a
+// clean /etc/resolv.conf. Unlike recover(), it does NOT block when
+// ReadyReplicas < Replicas (CrashLoopBackOff always drops ReadyReplicas below
+// desired Replicas); instead it requires Generation == ObservedGeneration,
+// UpdatedReplicas == Replicas, and >=1 Ready replica (unless ALL pods are stuck
+// in plugin/loop), plus the shared NotReady, watch-cache wedge, and heal.Gate
+// checks.
+func (w *coreDNSWatchdog) recoverLoopCrashPods(ctx context.Context, loopPods []string,
+	podUID map[string]types.UID, totalPods int) error {
+	log := logf.FromContext(ctx)
+	deploy, err := w.cs.AppsV1().Deployments(corednsNS).Get(ctx, "coredns", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get deployment %s/coredns: %w", corednsNS, err)
+	}
+	desired := int32(1)
+	if deploy.Spec.Replicas != nil {
+		desired = *deploy.Spec.Replicas
+	}
+	if deploy.Generation != deploy.Status.ObservedGeneration ||
+		deploy.Status.UpdatedReplicas != desired {
+		log.Info("SKIP loop recovery: coredns rollout in progress",
+			"pods", loopPods,
+			"generation", deploy.Generation, "observed", deploy.Status.ObservedGeneration,
+			"updated", deploy.Status.UpdatedReplicas, "desired", desired)
+		return nil
+	}
+	if deploy.Status.ReadyReplicas < 1 && len(loopPods) < totalPods {
+		log.Info("SKIP loop recovery: no Ready CoreDNS replica serving DNS and not all pods are in plugin/loop",
+			"pods", loopPods, "ready", deploy.Status.ReadyReplicas, "total", totalPods)
+		return nil
+	}
+	notReady, err := kube.CountNotReadyNodesCached(ctx, w.nodeReader, w.cs)
+	if err != nil {
+		return fmt.Errorf("count not-ready nodes (storm gate): %w", err)
+	}
+	if notReady > 0 {
+		log.Info("SKIP loop recovery: nodes NotReady — cluster storm",
+			"pods", loopPods, "notReady", notReady)
+		return nil
+	}
+	wedged, err := w.watchCacheWedgedNode(ctx)
+	if err != nil {
+		return fmt.Errorf("check apiserver watch-cache wedge: %w", err)
+	}
+	if wedged != "" {
+		log.Info("SKIP loop recovery: apiserver watch-cache wedged",
+			"pods", loopPods, "node", wedged)
+		return nil
+	}
+
+	gateNow := w.now.Now()
+	proceed, unverifiable := heal.Gate(ctx, log, w.verdict, w.cs, w.dyn, "coredns", gateNow)
+	if unverifiable {
+		metrics.IncError(w.queue)
+		return nil
+	}
+	if !proceed {
+		return nil
+	}
+
+	deleted := 0
+	var delErr error
+	for _, name := range loopPods {
+		coolKey := string(podUID[name])
+		if coolKey == "" {
+			coolKey = name
+		}
+		if w.podHeals.CooledDown(coolKey, corednsCooldownS*time.Second, gateNow) {
+			continue
+		}
+		err := w.cs.CoreV1().Pods(corednsNS).Delete(ctx, name, kube.UIDDeleteOptions(podUID[name], metav1.DeletePropagationBackground))
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			delErr = fmt.Errorf("delete loop-crashing coredns pod %s/%s: %w", corednsNS, name, err)
+			break
+		}
+		deleted++
+		w.podHeals.Stamp(coolKey, gateNow)
+		log.Info("ACTION: deleted CrashLoopBackOff plugin/loop coredns pod", "pod", corednsNS+"/"+name)
+	}
+	if deleted == 0 {
+		if delErr != nil {
+			return delErr
+		}
+		heal.RefundGrant(gateNow)
+	}
+	return delErr
+}
+
 // watchCacheWedgedHeartbeatMax bounds the LastHeartbeatTime age that
 // still counts as live evidence for the watch-cache-wedge gate — the
 // same 10m freshness window the other heartbeat-gated condition

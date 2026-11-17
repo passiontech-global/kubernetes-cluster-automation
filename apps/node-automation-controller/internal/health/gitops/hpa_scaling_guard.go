@@ -25,12 +25,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -100,6 +102,7 @@ func init() {
 func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
+	p.eventHealed.PruneExpired(now, hpaUnhealthyMinAge)
 	var rep probefw.SweepReport
 
 	hpas, err := p.AllUnstructured(ctx, hpaGVR)
@@ -252,6 +255,12 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 			types.MergePatchType, payload, metav1.PatchOptions{})
 	}
 	if patchErr != nil {
+		if apierrors.IsConflict(patchErr) || apierrors.IsNotFound(patchErr) {
+			heal.RefundGrant(now)
+			log.Info("SKIP: hpa cold-start rescue raced (target changed or gone)",
+				"target", kind+" "+ns+"/"+target)
+			return
+		}
 		metrics.IncError(p.Name)
 		log.Error(patchErr, "hpa cold-start rescue scale patch failed",
 			"target", kind+" "+ns+"/"+target, "replicas", rescue)
@@ -303,20 +312,12 @@ func (p *hpaScalingGuardCheck) maybeBounceMetricsServer(ctx context.Context,
 	if !ready || len(unready) == 0 {
 		return
 	}
-	ck := probefw.SelfHealKey(CheckNameHPAScalingGuard, "metrics-server")
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.Heals, ck, hpaMSBounceCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return
-	}
-	if !proceed {
-		return
-	}
-	for _, pod := range unready {
-		p.DeletePodHeal(ctx, log, CheckNameHPAScalingGuard,
-			"metrics-server/"+pod.Name, pod, hpaMSBounceCooldown, now)
-	}
+	slices.SortFunc(unready, func(a, b *corev1.Pod) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	target := unready[0]
+	p.DeletePodHeal(ctx, log, CheckNameHPAScalingGuard,
+		kube.PodControllerKey(target), target, hpaMSBounceCooldown, now)
 }
 
 // emitHPAEvent fires ONE deduped Warning event per window naming

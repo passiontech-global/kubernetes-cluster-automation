@@ -9,6 +9,8 @@ package rabbitmq
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -154,7 +156,11 @@ func (h *rabbitHealPass) scanUnready(ctx context.Context) {
 // shared cooldown key dedupes pods already healed via the unready
 // path.
 func (h *rabbitHealPass) healPromFindings(ctx context.Context) {
-	for key := range h.findings {
+	for _, key := range slices.Sorted(maps.Keys(h.findings)) {
+		reasons := h.findings[key]
+		if len(reasons) == 1 && reasons["stuck_unready"] {
+			continue // scanUnready already handles stuck_unready
+		}
 		pod, ok := h.census.byName[key]
 		if !ok || pod.DeletionTimestamp != nil {
 			continue

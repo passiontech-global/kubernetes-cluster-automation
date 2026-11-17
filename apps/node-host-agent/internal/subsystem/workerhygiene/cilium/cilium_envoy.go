@@ -102,7 +102,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Trigger 1: the agent was SIGKILLed this cycle — envoy may hold
 	// the stale socket, restart it alongside (B1).
 	if c.d.CiliumAgentKilled {
-		c.killCiliumEnvoy(tasks, "cilium-agent restarted this cycle")
+		c.killCiliumEnvoy(ctx, tasks, "cilium-agent restarted this cycle")
 		c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 		return
 	}
@@ -136,7 +136,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				fmt.Sprintf("update_rejected=%d fails=%d",
 					c.xdsLast, c.xdsFails))
 		}
-		c.killCiliumEnvoy(tasks,
+		c.killCiliumEnvoy(ctx, tasks,
 			fmt.Sprintf("xDS update_rejected deltas %d consecutive cycles",
 				c.xdsFails))
 		// The kill just SIGKILLed envoy — fall through to the /ready
@@ -163,7 +163,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	c.d.State.Enter(latchdefs.LatchCiliumEnvoyDown,
 		fmt.Sprintf("ready_probe_fails=%d", c.fails))
-	c.killCiliumEnvoy(tasks,
+	c.killCiliumEnvoy(ctx, tasks,
 		fmt.Sprintf("unready %d consecutive cycles", c.fails))
 	c.d.CycleResult(wdeps.CheckCiliumEnvoy, "ok")
 }
@@ -174,12 +174,18 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // The xDS bookkeeping resets on a successful kill: the replacement
 // envoy starts its update_rejected counters from zero, so the old
 // baseline sum and streak must not leak into its first reads.
-func (c *CiliumEnvoyCheck) killCiliumEnvoy(tasks []wdeps.CtrTask, why string) {
+func (c *CiliumEnvoyCheck) killCiliumEnvoy(ctx context.Context, tasks []wdeps.CtrTask, why string) {
+	if c.d.HoldEmergencyHeal(ctx) {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cilium-envoy kill held (%s) — maintenance window", why))
+		return
+	}
 	if !c.d.State.RateTrySpend("last-cilium-envoy-restart", c.d.Cfg.MinRestartInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-envoy kill skipped (%s) — restart cooldown (<30m)", why))
 		return
 	}
+	c.d.StampLocalRemediation(ctx)
 	if killNamedTasks(c.d, tasks, "cilium-envoy") {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION: killed cilium-envoy container - %s (kubelet will restart -> xDS resync)", why))

@@ -254,8 +254,8 @@ func corednsServeStale(raw string) string {
 	case "", "0", "off", "false", "no", "disabled":
 		return ""
 	}
-	if _, err := time.ParseDuration(v); err != nil {
-		envx.Warnf("COREDNS_SERVE_STALE_DURATION=%q is not a duration — using 1h", raw)
+	if d, err := time.ParseDuration(v); err != nil || d <= 0 {
+		envx.Warnf("COREDNS_SERVE_STALE_DURATION=%q is not a positive duration — using 1h", raw)
 		return "1h"
 	}
 	return v

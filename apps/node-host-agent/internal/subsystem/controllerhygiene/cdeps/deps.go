@@ -82,9 +82,12 @@ type Deps struct {
 	Feeding        prometheus.Gauge
 	// Etcdguard gauges — only set when <K0sDir>/bin/etcdctl +
 	// pki/etcd/ca.crt exist (embedded-etcd controllers).
-	EtcdDBSize  prometheus.Gauge
-	EtcdDBUse   prometheus.Gauge
-	EtcdNospace prometheus.Gauge
+	EtcdDBSize      prometheus.Gauge
+	EtcdDBUse       prometheus.Gauge
+	EtcdNospace     prometheus.Gauge
+	EtcdCorrupt     prometheus.Gauge
+	EtcdWALFsyncP99 prometheus.Gauge
+	EtcdIsLearner   prometheus.Gauge
 	// TerminatedWatchers is the relist-storm 410-Gone relist-storm
 	// series — the local apiserver's
 	// apiserver_terminated_watchers_total mirrored each cycle. It is

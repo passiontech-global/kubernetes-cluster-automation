@@ -35,9 +35,13 @@ func convergeNLDWithVars(t *testing.T, cluster string) (nldNFT, portsNFT string)
 // kubelet and the exporters) and must NOT inherit the RFC1918
 // private allow list that only nodelocaldns :53 needs.
 func TestPortsGuardInetTableTightened(t *testing.T) {
-	_, portsNFT := convergeNLDWithVars(t, "")
+	nldNFT, portsNFT := convergeNLDWithVars(t, "")
+	if !strings.Contains(nldNFT, "destroy table ip nodelocaldns_guard") ||
+		!strings.Contains(portsNFT, "destroy table ip host_internal_ports_guard") {
+		t.Fatalf("missing legacy table ip destroy lines:\nnld:\n%s\nports:\n%s", nldNFT, portsNFT)
+	}
 	if !strings.Contains(portsNFT, "table inet host_internal_ports_guard") ||
-		strings.Contains(portsNFT, "table ip ") {
+		strings.Contains(portsNFT, "\ntable ip ") {
 		t.Fatalf("ports guard not on the inet table:\n%s", portsNFT)
 	}
 	// The blanket pod/VLAN accepts must stay gone — the ONLY pod-iface

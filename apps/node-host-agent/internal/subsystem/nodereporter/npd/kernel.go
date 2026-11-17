@@ -82,7 +82,7 @@ var kernelTempRules = []rule{
 		// "Uncorrected"); kernel >=5.18 prints NVMe resets as
 		// "I/O tag <n> ... timeout, reset controller" — both
 		// spellings must match or the rule goes blind upstream.
-		`PCIe Bus Error: severity=Uncorrect(?:ed|able)|AER: (?:Uncorrect(?:ed|able)|Fatal)|` +
+		`PCIe Bus Error: severity=Uncorrect(?:ed|able)(?:\s*\(Fatal\)|,\s*type=Fatal)|AER: (?:Uncorrect(?:ed|able)\s*\(Fatal\)|Fatal)|` +
 			`nvme nvme\d+: I/O (?:tag )?\d+.* timeout, reset(?:ting)? controller`)},
 	{"GPUXidError", regexp.MustCompile(
 		`NVRM: Xid \(PCI:[^)]+\): (?:31|43|48|74|79|94|95|119|120),`)},

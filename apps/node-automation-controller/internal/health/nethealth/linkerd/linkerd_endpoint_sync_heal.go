@@ -195,7 +195,6 @@ func (p *linkerdEndpointSyncCheck) healLinkerdDestination(ctx context.Context,
 				"pod", target.Namespace+"/"+target.Name)
 		} else {
 			healed = true
-			kube.MarkPodDeleted(ctx, target.UID) // O(1) tombstone — no census reset
 			metrics.ControlPlanePodHealsTotal.WithLabelValues(kube.LinkerdDestinationName).Inc()
 			log.Info("DELETE: linkerd-destination bounce for endpoint desync — forcing endpoint-table resync",
 				"pod", target.Namespace+"/"+target.Name, "service", svcKey)

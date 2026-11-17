@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -193,8 +194,8 @@ func (p *apiObjectSprawlReportGCCheck) auditKineCRDSize(ctx context.Context,
 		kube.GVRCustomResourceDefinition, metav1.NamespaceAll,
 		metav1.ListOptions{Limit: 25})
 	switch {
-	case kube.IsCRDAbsent(err):
-		return nil // CRD API absent on this cluster — skip silently
+	case kube.IsCRDAbsent(err) || apierrors.IsForbidden(err):
+		return nil // CRD API absent or ungranted on this cluster — skip silently
 	case err != nil:
 		return fmt.Errorf("list %s: %w",
 			kube.GVRCustomResourceDefinition.Resource, err)

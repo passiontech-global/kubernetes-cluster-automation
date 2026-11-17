@@ -144,7 +144,6 @@ func (p *statefulMasterlessCheck) healDragonflyOperator(ctx context.Context, log
 			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
-	kube.MarkPodDeleted(ctx, target.UID) // O(1) tombstone — no census reset
 	p.drOpHealed.Stamp(stsKey, now)
 	log.Info("DELETE: dragonfly operator pod — masterless service, forcing re-election",
 		"pod", target.Namespace+"/"+target.Name, "service", sig.ns+"/"+sig.svc,
@@ -355,7 +354,6 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
-	kube.MarkPodDeleted(ctx, target.UID) // O(1) tombstone — no census reset
 	dragonflyMasterlessPodHealsTotal.
 		WithLabelValues(sig.sts.Namespace, sig.sts.Name).Inc()
 	log.Info("DELETE: dragonfly dual-replica deadlock — lowest-ordinal pod deleted to force master re-election",

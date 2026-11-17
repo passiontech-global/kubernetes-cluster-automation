@@ -35,6 +35,8 @@ package watchdogs
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -205,6 +207,9 @@ func dsRolloutWedged(ds *appsv1.DaemonSet, now time.Time) bool {
 			maxUnavail = int32(v)
 		}
 	}
+	if maxUnavail <= 0 {
+		maxUnavail = 1
+	}
 	return ds.Status.NumberUnavailable >= maxUnavail
 }
 
@@ -217,8 +222,15 @@ func dsRolloutWedged(ds *appsv1.DaemonSet, now time.Time) bool {
 func (p *dsRolloutWedgeCheck) blockingPod(ds *appsv1.DaemonSet,
 	pods []*corev1.Pod, nodes map[string]nodeRolloutState) *corev1.Pod {
 
+	sorted := slices.Clone(pods)
+	slices.SortFunc(sorted, func(a, b *corev1.Pod) int {
+		if c := strings.Compare(a.Namespace, b.Namespace); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
 	var cordonedErr *corev1.Pod
-	for _, pod := range pods {
+	for _, pod := range sorted {
 		if pod.DeletionTimestamp != nil {
 			st, ok := nodes[pod.Spec.NodeName]
 			if !ok || st.notReady {
@@ -295,6 +307,7 @@ func (p *dsRolloutWedgeCheck) maybeHealPod(ctx context.Context,
 		return
 	}
 	healed[dsKey] = true
+	p.InvalidatePods(ctx)
 	rep.Find("healed: deleted wedging pod " + pod.Namespace + "/" +
 		pod.Name + " on " + dsKey)
 	log.Info("ACTION: deleted wedging DaemonSet pod to unstick rollout",

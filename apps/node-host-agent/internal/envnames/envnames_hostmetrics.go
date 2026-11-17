@@ -57,4 +57,8 @@ const (
 	// knob itself is EnvGPUGuardMode in envnames_workerhygiene.go —
 	// one env contract shared by both subsystems.
 	EnvGPUExpectedCount = "NODE_HOST_AGENT_GPU_EXPECTED_COUNT"
+
+	// Wave-3 #10: kernel eBPF prog/map resource leak latch ceilings.
+	EnvEBPFProgsMax = "NODE_HOST_AGENT_EBPF_PROGS_MAX"
+	EnvEBPFMapsMax  = "NODE_HOST_AGENT_EBPF_MAPS_MAX"
 )

@@ -7,6 +7,7 @@ package nethealth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
@@ -350,5 +352,60 @@ func TestApiserverNodeReachabilityProbe(t *testing.T) {
 	}
 	if chk.probe(ctx, "bad-node") {
 		t.Fatal("expected bad-node probe to return false")
+	}
+}
+
+func TestApiserverDarkSingleWorkerFencesNormally(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		anrNodeLease("w1", base),
+	)
+	p := testProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+	check := anrCheck(t, p, map[string]bool{"w1": true})
+
+	check.Run(probetest.SweepCtx(ctx))
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	anrRefreshLeases(t, cs, []string{"w1"}, base.Add(11*time.Minute))
+	res := check.Run(probetest.SweepCtx(ctx))
+	if res.Pass {
+		t.Fatal("single dark worker must fail the sweep")
+	}
+	if !kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints, kube.TaintApiserverUnreachable) {
+		t.Fatal("single-worker cluster must still fence its dark worker")
+	}
+}
+
+func TestApiserverDarkSkipsPodEvictionWhenFenceDeferred(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		probetest.ReadyWorkerNode("w2", "", 0, false),
+		probetest.ReadyWorkerNode("w3", "", 0, false),
+		probetest.ReadyWorkerNode("w4", "", 0, false),
+		anrNodeLease("w1", base), anrNodeLease("w2", base),
+		anrNodeLease("w3", base), anrNodeLease("w4", base),
+		anrWebhookConfig("wh-test", "ns", "svc", admissionv1.Fail),
+		anrSlice("ns", "svc", "ns", "backend-1"),
+		anrBackendPod("ns", "backend-1", "w1"),
+	)
+	cs.PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("taint rejected")
+	})
+	p := testProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+	check := anrCheck(t, p, map[string]bool{"w1": true})
+
+	check.Run(probetest.SweepCtx(ctx))
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	anrRefreshLeases(t, cs, []string{"w1", "w2", "w3", "w4"}, base.Add(11*time.Minute))
+	check.Run(probetest.SweepCtx(ctx))
+
+	if kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints, kube.TaintApiserverUnreachable) {
+		t.Fatal("unexpected fence taint on w1")
+	}
+	if _, err := cs.CoreV1().Pods("ns").Get(ctx, "backend-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("webhook backend pod on unfenced node must not be deleted: %v", err)
 	}
 }

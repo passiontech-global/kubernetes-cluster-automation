@@ -57,6 +57,13 @@ var TLSSecretDaysToExpiry = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Days until the tls.crt certificate in the Secret expires; only Secrets within the 30d alert window emit a series.",
 }, []string{"namespace", "secret"})
 
+// TLSLiveSocketDrift tracks Services whose live TLS socket serves a different
+// X.509 serial number than the corresponding Secret's tls.crt.
+var TLSLiveSocketDrift = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_tls_live_socket_drift",
+	Help: "1 while a Service's live TLS endpoint serves a different certificate serial than its TLS Secret.",
+}, []string{"namespace", "service", "secret"})
+
 // ---------------------------------------------------------------------------
 // Operations metrics — cluster-health check series.
 // ---------------------------------------------------------------------------
@@ -263,7 +270,7 @@ var VeleroDataMovementWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 var integrationCollectors = []prometheus.Collector{
 	CiliumIdentitiesCollectedTotal, CiliumActiveIdentities,
 	HelmHookJobsCleanedTotal,
-	WebhookCABundleMismatch, TLSSecretDaysToExpiry,
+	WebhookCABundleMismatch, TLSSecretDaysToExpiry, TLSLiveSocketDrift,
 	WebhookCABundleDaysToExpiry, TrustBundleDaysToExpiry,
 	LinkerdTrustAnchorSkew,
 	FluxSourceReconcilesTriggeredTotal, HelmStallUnwedgesTotal,

@@ -190,6 +190,12 @@ type Deps struct {
 	GPUGuardMode     envx.Mode
 	GPUExpectedCount int
 
+	// Wave-3 #10: eBPF resource leak latch. EBPFSnapshot reuses the
+	// collector's cached fd-link sweep at zero extra I/O cost.
+	EBPFSnapshot func() (progs, maps int, scanned bool)
+	EBPFProgsMax int
+	EBPFMapsMax  int
+
 	// TickInterval is the latch ticker's expected cadence — carried
 	// into the warp ACTION line's "tick=" evidence text. <=0 →
 	// defaultTickInterval.
@@ -273,6 +279,7 @@ type Runner struct {
 	// fills ride updateNeighborTable's local map, not Runner state).
 	neighPinned map[string]int
 	nic         nicState
+	ebpfStreak  int // Wave-3 #10 consecutive ticks >= EBPFProgsMax / EBPFMapsMax
 }
 
 // defaultTickInterval is the latch ticker cadence the warp detector
@@ -380,6 +387,12 @@ func New(d Deps) *Runner {
 	if d.NICCRErrorThreshold <= 0 {
 		d.NICCRErrorThreshold = DefaultNICCRErrorThreshold
 	}
+	if d.EBPFProgsMax <= 0 {
+		d.EBPFProgsMax = DefaultEBPFProgsMax
+	}
+	if d.EBPFMapsMax <= 0 {
+		d.EBPFMapsMax = DefaultEBPFMapsMax
+	}
 	if d.Clock == nil {
 		d.Clock = timex.NewCell(nil)
 	}
@@ -433,6 +446,7 @@ func (r *Runner) Refresh(ctx context.Context) {
 	r.updateHardwareHealth()
 	r.updateNeighborTable(ctx)
 	r.updateNICHealth()
+	r.updateEBPFPressure()
 }
 
 // Close releases the /dev/kmsg fd the session holds — the

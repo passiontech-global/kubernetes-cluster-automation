@@ -50,6 +50,9 @@ func ConfigFromEnv(d EnvDeps) Config {
 		// the same rule for a directly-constructed Config.
 		envx.Int64Knob(envnames.EnvKinedbGuardMaxStepRevisions,
 			&cfg.MaxStepRevisions, 0),
+		// Wave-3 #1: auto-widen narrow sequence when kine.id is already bigint.
+		envx.BoolKnob(envnames.EnvKineSeqWidenEnabled,
+			&cfg.SeqWidenEnabled, true),
 	})
 	return cfg
 }

@@ -128,6 +128,7 @@ type Config struct {
 	Host     HostConfig     // hostmetrics markers + node events (KR1/ST2)
 	Runtime  RuntimeConfig  // cgroup/session/io-pressure guard paths
 	Wave2    Wave2Config    // wave-2 self-healing guards (ports/runc/CSI/GPU/netfilter)
+	Wave3    Wave3Config    // wave-3 self-healing guards (UDP stale/mount-max/loop/CFS/VMA)
 
 	// Seams are the unexported test seams — every check reads them
 	// through h.cfg.Seams so tests re-stub a live Hygiene after New.
@@ -152,6 +153,7 @@ func (c *Config) ApplyDefaults() {
 	c.Host.applyDefaults(c.WatchdogStateDir)
 	c.Runtime.applyDefaults()
 	c.Wave2.applyDefaults()
+	c.Wave3.applyDefaults()
 	c.Seams.applyDefaults(c)
 }
 
@@ -246,6 +248,8 @@ func (c *Config) wiringEnvKnobs(hostPath func(string) string) []envx.Knob {
 			hostPath("/var/lib/k0s/kubelet/pods")),
 		envx.StringKnob(envnames.EnvHostResolvConf, &c.HostResolvConf,
 			hostPath("/etc/resolv.conf")),
+		envx.StringKnob(envnames.EnvSysClassNet, &c.SysClassNet,
+			hostPath("/sys/class/net")),
 	}
 }
 

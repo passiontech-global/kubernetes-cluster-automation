@@ -87,6 +87,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 	knobs = append(knobs, cfg.Runtime.envKnobs(hostPath)...)
 	knobs = append(knobs, cfg.Ctr.envKnobs()...)
 	knobs = append(knobs, cfg.Wave2.envKnobs()...)
+	knobs = append(knobs, cfg.Wave3.envKnobs(hostPath)...)
 	envx.Apply(knobs)
 	if d.Watchdog != nil {
 		// API_BACKENDS → the watch-wedge check's upstream-stale gate

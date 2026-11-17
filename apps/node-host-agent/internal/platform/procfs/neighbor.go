@@ -24,21 +24,27 @@ import (
 	"strings"
 )
 
-// NUDState is the kernel neighbor-entry state the ARP flags byte
-// encodes (include/net/neighbour.h NUD_* values, bit positions
-// match the ATF_* flags /proc/net/arp prints).
+// NUDState is the flags bitmask decoded from /proc/net/arp's Flags column
+// (include/uapi/linux/if_arp.h ATF_* values: 0x02=ATF_COM complete,
+// 0x04=ATF_PERM permanent, 0x08=ATF_PUBL published — note /proc/net/arp does
+// not distinguish REACHABLE vs STALE, so netlink or `ip neigh` owns NUD_*).
 type NUDState uint8
 
 const (
-	NUDNone       NUDState = 0x00 // NUD_NONE — no state yet
-	NUDIncomplete NUDState = 0x01 // NUD_INCOMPLETE — resolution in flight
-	NUDReachable  NUDState = 0x02 // NUD_REACHABLE — confirmed alive
-	NUDStale      NUDState = 0x04 // NUD_STALE — reachable_time expired, revalidate on use
-	NUDDelay      NUDState = 0x08 // NUD_DELAY — probe scheduled
-	NUDProbe      NUDState = 0x10 // NUD_PROBE — reachability probe in flight
-	NUDFailed     NUDState = 0x20 // NUD_FAILED — resolution failed, entry dead
-	NUDNoARP      NUDState = 0x40 // NUD_NOARP — no ARP needed (point-to-point)
-	NUDPermanent  NUDState = 0x80 // NUD_PERMANENT — never expires
+	NUDNone       NUDState = 0x00 // incomplete / no ATF_COM flag
+	NUDIncomplete NUDState = 0x01
+	NUDReachable  NUDState = 0x02 // ATF_COM (0x02): resolved ARP entry
+	NUDStale      NUDState = 0x04 // ATF_PERM alias kept for caller compat
+	NUDDelay      NUDState = 0x08 // ATF_PUBL alias kept for caller compat
+	NUDProbe      NUDState = 0x10
+	NUDFailed     NUDState = 0x20
+	NUDNoARP      NUDState = 0x40
+	NUDPermanent  NUDState = 0x80
+
+	// Accurate /proc/net/arp ATF_* flag constants (if_arp.h).
+	ATFComplete  NUDState = 0x02 // ATF_COM
+	ATFPermanent NUDState = 0x04 // ATF_PERM
+	ATFPublished NUDState = 0x08 // ATF_PUBL
 )
 
 // ARPEntry is one /proc/net/arp row decoded far enough for the

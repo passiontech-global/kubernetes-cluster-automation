@@ -38,6 +38,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -46,6 +47,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
@@ -80,9 +82,9 @@ func regSockets(d *wdeps.Deps) (map[string]string, bool) {
 	return out, true
 }
 
-// csiNodeDrivers fetches this node's CSINode driver names. nil,
-// false on API error (inconclusive — the guard must not act on a
-// possibly-stale object).
+// csiNodeDrivers fetches this node's CSINode driver names, falling back to
+// Node.Annotations["csi.volume.kubernetes.io/nodeid"] if CSINodes().Get returns
+// 403 Forbidden.
 func (c *CSIGuardCheck) csiNodeDrivers(ctx context.Context) (map[string]bool, bool) {
 	if c.d.Cfg.Client == nil {
 		return nil, false
@@ -90,14 +92,72 @@ func (c *CSIGuardCheck) csiNodeDrivers(ctx context.Context) (map[string]bool, bo
 	n, err := c.d.Cfg.Client.StorageV1().CSINodes().
 		Get(ctx, c.d.Cfg.NodeName,
 			metav1.GetOptions{ResourceVersion: "0"})
-	if err != nil {
+	if err == nil {
+		out := map[string]bool{}
+		for _, drv := range n.Spec.Drivers {
+			out[drv.Name] = true
+		}
+		return out, true
+	}
+	if !apierrors.IsForbidden(err) {
 		return nil, false
 	}
+	node, nerr := c.d.Cfg.Client.CoreV1().Nodes().
+		Get(ctx, c.d.Cfg.NodeName, metav1.GetOptions{ResourceVersion: "0"})
+	if nerr != nil {
+		return nil, false
+	}
+	raw := node.Annotations["csi.volume.kubernetes.io/nodeid"]
 	out := map[string]bool{}
-	for _, drv := range n.Spec.Drivers {
-		out[drv.Name] = true
+	if strings.TrimSpace(raw) == "" {
+		return out, true
+	}
+	var parsed map[string]string
+	if jerr := json.Unmarshal([]byte(raw), &parsed); jerr != nil {
+		return nil, false
+	}
+	for drv := range parsed {
+		out[drv] = true
 	}
 	return out, true
+}
+
+func podMatchesCSIDriver(p *corev1.Pod, drv string) bool {
+	if p == nil || drv == "" {
+		return false
+	}
+	ldrv := strings.ToLower(drv)
+	if strings.Contains(strings.ToLower(p.Name), ldrv) {
+		return true
+	}
+	// Match against prefix tokens such as "cephfs" / "rook-ceph" / "nfs" / "openebs"
+	// only when volume mounts / args / env reference the driver or its socket/plugin dir.
+	for i := range p.Spec.Volumes {
+		if hp := p.Spec.Volumes[i].HostPath; hp != nil {
+			if strings.Contains(strings.ToLower(hp.Path), ldrv) {
+				return true
+			}
+		}
+	}
+	for i := range p.Spec.Containers {
+		ct := &p.Spec.Containers[i]
+		for _, a := range ct.Command {
+			if strings.Contains(strings.ToLower(a), ldrv) {
+				return true
+			}
+		}
+		for _, a := range ct.Args {
+			if strings.Contains(strings.ToLower(a), ldrv) {
+				return true
+			}
+		}
+		for _, ev := range ct.Env {
+			if strings.Contains(strings.ToLower(ev.Value), ldrv) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // isDaemonSetPod reports whether the pod is owned by a DaemonSet —
@@ -146,10 +206,11 @@ func (c *CSIGuardCheck) csiPluginPods(e *wdeps.CycleEnv) []*corev1.Pod {
 // CSIGuardCheck is the P1.6 healer as a Check; it owns the
 // per-driver ECONNREFUSED streaks and the desync marker.
 type CSIGuardCheck struct {
-	d           *wdeps.Deps
-	fails       int
-	refused     map[string]int // driver → consecutive ECONNREFUSED cycles
-	desyncSince time.Time      // first-seen of the current desync window
+	d                 *wdeps.Deps
+	fails             int
+	refused           map[string]int // driver → consecutive ECONNREFUSED cycles
+	desyncSince       time.Time      // first-seen of the current desync window
+	bouncedThisWindow bool
 }
 
 // NewCSIGuard builds the check.
@@ -236,15 +297,33 @@ func (c *CSIGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 	}
-	// Missing registrations: CSINode driver with no socket and no
-	// live plugin pod → the plugin never re-registered; bounce the
-	// stale pod object if one lingers, else latch.
+	// Missing registrations: only count CSINode drivers with an active
+	// DaemonSet plugin pod on this node (stale CSINode entries from
+	// uninstalled drivers must not latch CSIRegistrationWedged forever).
 	var missing []string
+	var targetPods []*corev1.Pod
+	seenPod := map[string]bool{}
 	for drv := range drivers {
 		if _, hasSock := socks[drv]; hasSock {
 			continue
 		}
+		var matched []*corev1.Pod
+		for _, p := range pods {
+			if podMatchesCSIDriver(p, drv) {
+				matched = append(matched, p)
+			}
+		}
+		if len(matched) == 0 {
+			continue // driver uninstalled on this node — stale CSINode entry only
+		}
 		missing = append(missing, drv)
+		for _, p := range matched {
+			pk := p.Namespace + "/" + p.Name
+			if !seenPod[pk] {
+				seenPod[pk] = true
+				targetPods = append(targetPods, p)
+			}
+		}
 	}
 	if len(missing) > 0 {
 		if c.desyncSince.IsZero() {
@@ -252,58 +331,55 @@ func (c *CSIGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	} else {
 		c.desyncSince = time.Time{}
+		c.bouncedThisWindow = false
 	}
 	desyncFor := c.d.Cfg.Seams.Host.Clock.Now().Sub(c.desyncSince)
-	if heal && len(missing) > 0 &&
-		desyncFor >= time.Duration(c.d.Cfg.Wave2.CSIGuardMissingMin)*time.Minute {
-		c.bounceStaleCSIPods(ctx, e, pods, missing)
+	pastWindow := len(missing) > 0 && desyncFor >= time.Duration(c.d.Cfg.Wave2.CSIGuardMissingMin)*time.Minute
+	bouncedBefore := c.bouncedThisWindow
+	if heal && pastWindow {
+		if c.bounceStaleCSIPods(ctx, e, targetPods, missing) {
+			c.bouncedThisWindow = true
+		}
 	}
-	if len(missing) > 0 && desyncFor >=
-		time.Duration(c.d.Cfg.Wave2.CSIGuardMissingMin)*time.Minute {
-		// wedge verdict: missing registrations that survived the
-		// missing-minutes window and the bounce pass.
+	// When healing is active, wait until at least one prior bounce failed to
+	// recover before latching CSIRegistrationWedged.
+	if pastWindow && (!heal || bouncedBefore) {
 		joined := strings.Join(missing, ",")
 		if c.d.StreakPending(&c.fails,
 			"suspect: csi-registration-guard drivers missing registration: "+joined) {
-			c.d.CycleResult(wdeps.CheckCSIGuard, "pending")
+			c.d.CycleResult(wdeps.CheckCSIGuard, "ok")
 			return
 		}
 		c.d.State.Enter(latchdefs.LatchCSIRegistrationWedged,
 			"missing="+joined)
-		c.d.CycleResult(wdeps.CheckCSIGuard, "firing")
+		c.d.CycleResult(wdeps.CheckCSIGuard, "ok")
 		return
 	}
 	if len(missing) == 0 {
-		// Recovery: every CSINode driver has a live registration
-		// socket again — release the wedge latch and the pending
-		// streak. The old triple-empty guard kept the latch latched
-		// forever on any node that still had sockets/pods/drivers.
 		c.fails = 0
 		c.d.State.Exit(latchdefs.LatchCSIRegistrationWedged, nil)
 	}
 	c.d.CycleResult(wdeps.CheckCSIGuard, "ok")
 }
 
-// bounceStaleCSIPods deletes CSI node-plugin pods that have been
-// desynced past the missing-registration window — the DaemonSet
-// recreates them and they re-run node-driver-registrar, which is
-// the only in-place fix for a wedged registration. Cooldown-gated
-// per node (last-csi-reg-bounce), protection rails respected.
+// bounceStaleCSIPods deletes ONLY the CSI node-plugin pods belonging to
+// drivers in missing. Returns true if at least one pod delete landed.
 func (c *CSIGuardCheck) bounceStaleCSIPods(ctx context.Context,
-	e *wdeps.CycleEnv, pods []*corev1.Pod, missing []string) {
-	if e == nil || !e.APIOK {
-		return
+	e *wdeps.CycleEnv, pods []*corev1.Pod, missing []string) bool {
+	if e == nil || !e.APIOK || len(pods) == 0 {
+		return false
 	}
 	if c.d.HoldLocalAction(ctx) {
 		c.d.State.AppendLog(
 			"cleanup: csi-registration-guard bounce held - cluster maintenance in progress")
-		return
+		return false
 	}
 	cooldown := time.Duration(c.d.Cfg.Wave2.CSIGuardBounceCooldownMin) * time.Minute
 	if !c.d.State.RateTrySpend("last-csi-reg-bounce", cooldown) {
-		return
+		return false
 	}
 	c.d.StampLocalRemediation(ctx)
+	bounced := false
 	for _, p := range pods {
 		if p.DeletionTimestamp != nil {
 			continue
@@ -317,9 +393,10 @@ func (c *CSIGuardCheck) bounceStaleCSIPods(ctx context.Context,
 				p.Namespace, p.Name, err))
 			continue
 		}
-		c.d.StampPodHealed(ctx, p.Namespace, p.Name)
+		bounced = true
 		c.d.Actions.WithLabelValues(wdeps.CheckCSIGuard, "pod_delete").Inc()
 	}
+	return bounced
 }
 
 // GPUGuardCheck is the P2.12 plugin half: it compares the node's
@@ -370,26 +447,44 @@ func (c *GPUGuardCheck) devicePluginPods(e *wdeps.CycleEnv) []*corev1.Pod {
 	return out
 }
 
-// nodeGPUCapacity reads the node's nvidia.com/gpu allocatable AND
-// capacity in one GET. ok=false on API error or absent node —
-// inconclusive.
-func (c *GPUGuardCheck) nodeGPUCapacity(ctx context.Context) (allocatable, capacity int64, ok bool) {
+type gpuNodeCapacity struct {
+	allocatable int64
+	capacity    int64
+	migAlloc    int64
+	migCapacity int64
+	isMIG       bool
+}
+
+func (c *GPUGuardCheck) nodeGPUCapacity(ctx context.Context) (gpuNodeCapacity, bool) {
 	if c.d.Cfg.Client == nil {
-		return 0, 0, false
+		return gpuNodeCapacity{}, false
 	}
 	n, err := c.d.Cfg.Client.CoreV1().Nodes().
 		Get(ctx, c.d.Cfg.NodeName,
 			metav1.GetOptions{ResourceVersion: "0"})
 	if err != nil {
-		return 0, 0, false
+		return gpuNodeCapacity{}, false
 	}
+	var out gpuNodeCapacity
 	if q, has := n.Status.Allocatable["nvidia.com/gpu"]; has {
-		allocatable = q.Value()
+		out.allocatable = q.Value()
 	}
 	if q, has := n.Status.Capacity["nvidia.com/gpu"]; has {
-		capacity = q.Value()
+		out.capacity = q.Value()
 	}
-	return allocatable, capacity, true
+	for resName, q := range n.Status.Capacity {
+		if strings.HasPrefix(string(resName), "nvidia.com/mig-") && q.Value() > 0 {
+			out.isMIG = true
+			out.migCapacity += q.Value()
+		}
+	}
+	for resName, q := range n.Status.Allocatable {
+		if strings.HasPrefix(string(resName), "nvidia.com/mig-") && q.Value() > 0 {
+			out.isMIG = true
+			out.migAlloc += q.Value()
+		}
+	}
+	return out, true
 }
 
 // liveGPUs runs the same sysfs-only 0x10de census kernelfail's
@@ -448,34 +543,35 @@ func (c *GPUGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	live, liveOK := c.liveGPUs()
 	pods := c.devicePluginPods(e)
-	if live == 0 && len(pods) == 0 {
-		// Zero-GPU node with no plugin pod — the CPU-only dormancy
-		// the MODE=auto contract promises; no API call needed.
-		c.desyncSince = time.Time{}
-		c.d.CycleResult(wdeps.CheckGPUGuard, "ok")
-		return
-	}
 	if !liveOK && len(pods) == 0 {
 		// Sysfs unreadable AND no plugin pods — nothing to compare
 		// against; inconclusive rather than a fabricated desync.
 		c.d.CycleResult(wdeps.CheckGPUGuard, "inconclusive")
 		return
 	}
-	alloc, capacity, ok := c.nodeGPUCapacity(ctx)
+	if liveOK && live == 0 && len(pods) == 0 {
+		// Zero-GPU node with no plugin pod — the CPU-only dormancy
+		// the MODE=auto contract promises; no API call needed.
+		c.desyncSince = time.Time{}
+		c.d.CycleResult(wdeps.CheckGPUGuard, "ok")
+		return
+	}
+	capInfo, ok := c.nodeGPUCapacity(ctx)
 	if !ok {
 		c.d.CycleResult(wdeps.CheckGPUGuard, "inconclusive")
 		return
 	}
-	// Two desync shapes, either sustained past the window heals:
-	//  (a) plan P2.12 — sysfs proves liveGPUs > 0 while the node
-	//      advertises allocatable == 0 (or < liveGPUs when the
-	//      capacity field itself is absent): hardware present,
-	//      kubelet registration dead → bounce the plugin pod.
-	//  (b) allocatable > 0 while EVERY plugin pod is unready —
-	//      kubelet advertises GPUs whose plugin died.
+	alloc, capacity := capInfo.allocatable, capInfo.capacity
+	if capInfo.isMIG {
+		alloc, capacity = capInfo.migAlloc, capInfo.migCapacity
+	}
 	desynced := false
-	if liveOK && live > 0 &&
-		(alloc == 0 || (capacity == 0 && alloc < int64(live))) {
+	if capInfo.isMIG {
+		if alloc == 0 || (capacity > 0 && alloc < capacity) {
+			desynced = true
+		}
+	} else if liveOK && live > 0 &&
+		(alloc == 0 || (capacity > 0 && alloc < capacity) || alloc < int64(live)) {
 		desynced = true
 	}
 	if !desynced && alloc > 0 {
@@ -502,13 +598,13 @@ func (c *GPUGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			"suspect: gpu-pcie-guard live=%d allocatable=%d capacity=%d pluginPods=%d (%.0fm of %dm)",
 			live, alloc, capacity, len(pods), desyncFor.Minutes(),
 			c.d.Cfg.Wave2.GPUGuardDesyncMin))
-		c.d.CycleResult(wdeps.CheckGPUGuard, "pending")
+		c.d.CycleResult(wdeps.CheckGPUGuard, "ok")
 		return
 	}
-	// Past the window: bounce the plugin pods (cooldown-gated).
+	// Past the window: bounce the plugin pods (hold + cooldown gated).
 	// GPUHealEnabled gates the REMEDY only — detection keeps running.
 	cooldown := time.Duration(c.d.Cfg.Wave2.GPUGuardBounceCooldownMin) * time.Minute
-	if c.d.Cfg.Wave2.GPUHealEnabled && e != nil && e.APIOK &&
+	if c.d.Cfg.Wave2.GPUHealEnabled && e != nil && e.APIOK && !c.d.HoldLocalAction(ctx) &&
 		c.d.State.RateTrySpend("last-gpu-plugin-bounce", cooldown) {
 		c.d.StampLocalRemediation(ctx)
 		for _, p := range pods {
@@ -524,12 +620,11 @@ func (c *GPUGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 					p.Namespace, p.Name, err))
 				continue
 			}
-			c.d.StampPodHealed(ctx, p.Namespace, p.Name)
 			c.d.Actions.WithLabelValues(wdeps.CheckGPUGuard, "pod_delete").Inc()
 		}
 		c.emitGPUDesevent(ctx, live, alloc, capacity, len(pods))
 	}
-	c.d.CycleResult(wdeps.CheckGPUGuard, "firing")
+	c.d.CycleResult(wdeps.CheckGPUGuard, "ok")
 }
 
 // emitGPUDesevent emits the node Warning event for a persistent

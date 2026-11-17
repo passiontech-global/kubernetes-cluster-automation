@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -244,6 +245,9 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 		Pressure: wdeps.PressureConfig{
 			ZombieStormThreshold: 500,
 		},
+		Disk: wdeps.DiskConfig{
+			HostRunDir: filepath.Join(root, "run"),
+		},
 		// Cgroup-v2 root under the fixture — pod memory.current
 		// fixtures plant here; the real /sys/fs/cgroup is never
 		// touched by a unit test.
@@ -252,6 +256,12 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 		},
 		Journal: wdeps.JournalConfig{
 			Dirs: []string{f.JDir},
+		},
+		Wave3: wdeps.Wave3Config{
+			UDPStaleDestroyEnabled: true,
+			LoopGCEnabled:          true,
+			HostDevDir:             filepath.Join(root, "dev"),
+			SysBlockDir:            filepath.Join(root, "sys", "block"),
 		},
 	}
 	return f
@@ -277,6 +287,18 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 	d.Cfg.Seams.Host.LinkDelFn = func(name string) error {
 		f.LinkDels = append(f.LinkDels, name)
 		return f.LinkDelErrs[name]
+	}
+	d.Cfg.Seams.Host.DumpConnectedUDPFn = func(int) ([]netlinkx.ConnectedUDPSocket, error) {
+		return nil, nil
+	}
+	d.Cfg.Seams.Host.DestroyUDPSocketFn = func(int, uint8, [48]byte) error {
+		return nil
+	}
+	d.Cfg.Seams.Host.DetachLoopFn = func(string) error {
+		return nil
+	}
+	d.Cfg.Seams.Host.TCPTablesFn = func(int) (netlinkx.TCPCensus, error) {
+		return netlinkx.TCPCensus{}, nil
 	}
 	d.Cfg.Seams.Host.Clock.Set(func() time.Time { return f.Now })
 	// Zombie-peer seams: the wg dump exec is canned as an error (tests

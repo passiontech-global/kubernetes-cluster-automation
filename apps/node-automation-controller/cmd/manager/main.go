@@ -56,9 +56,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
+	authv1 "k8s.io/api/authorization/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -233,18 +237,20 @@ func run(sigCtx context.Context, args []string) error {
 			return err
 		}
 	}
-	crdSize := kube.NewCRDSizeTable(1024)
-	mgr, err := ctrl.NewManager(managerConfig(cfg),
-		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
-			leaseDuration, renewDeadline, retryPeriod, leaderNS, leaderLock, crdSize))
-	if err != nil {
-		log.Error(err, "unable to create manager")
-		return err
-	}
-
 	clients, err := buildKubeClients(cfg)
 	if err != nil {
 		log.Error(err, "unable to create kube clients")
+		return err
+	}
+	watchCRDs := canWatchCRDs(sigCtx, clients.cs, log)
+	kube.SetCRDInformerEnabled(watchCRDs)
+
+	crdSize := kube.NewCRDSizeTable(1024)
+	mgr, err := ctrl.NewManager(managerConfig(cfg),
+		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
+			leaseDuration, renewDeadline, retryPeriod, leaderNS, leaderLock, crdSize, watchCRDs))
+	if err != nil {
+		log.Error(err, "unable to create manager")
 		return err
 	}
 	cs, dyn, meta := clients.cs, clients.dyn, clients.meta
@@ -378,4 +384,28 @@ func run(sigCtx context.Context, args []string) error {
 		return err
 	}
 	return nil
+}
+
+func canWatchCRDs(ctx context.Context, cs kubernetes.Interface, log logr.Logger) bool {
+	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for _, verb := range []string{"list", "watch"} {
+		sar := &authv1.SelfSubjectAccessReview{
+			Spec: authv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authv1.ResourceAttributes{
+					Group:    "apiextensions.k8s.io",
+					Resource: "customresourcedefinitions",
+					Verb:     verb,
+				},
+			},
+		}
+		res, err := cs.AuthorizationV1().SelfSubjectAccessReviews().Create(
+			sctx, sar, metav1.CreateOptions{})
+		if err != nil || !res.Status.Allowed {
+			log.Info("SSAR denied or failed for CRD informer — falling back to targeted dynamic reads",
+				"verb", verb, "allowed", res != nil && res.Status.Allowed, "error", err)
+			return false
+		}
+	}
+	return true
 }

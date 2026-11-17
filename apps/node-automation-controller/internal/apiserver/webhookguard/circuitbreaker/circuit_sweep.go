@@ -39,10 +39,14 @@ type circuitSweep struct {
 	// recoverSeen marks the recover-confirmation streaks Hit this
 	// sweep — the prune's keep set (Hit and defer land together, so
 	// every live streak key appears here each sweep).
-	recoverSeen map[string]bool
-	allowTrips  bool
-	failed      []string
-	jobs        []guardstate.WebhookConfigView
+	recoverSeen       map[string]bool
+	latency           latencySignals
+	latencySeen       map[string]bool
+	latencyBounce     []string
+	latencyBounceSeen map[string]bool
+	allowTrips        bool
+	failed            []string
+	jobs              []guardstate.WebhookConfigView
 }
 
 // loadInputs runs the sweep's census half: the shared
@@ -82,10 +86,15 @@ func (s *circuitSweep) buildJobs() {
 // sweep's error; the stale-annotation drops release their series
 // only after the patch lands — the annotation is the SSOT.
 func (s *circuitSweep) runJobs(ctx context.Context) {
+	if s.latencyBounceSeen == nil {
+		s.latencyBounceSeen = map[string]bool{}
+	}
 	for _, job := range s.jobs {
-		payload, trips, recovered, stillBroken, dropped := s.b.circuitPatch(s.log, s.g.Queue,
+		lv := s.evaluateLatency(job)
+		s.latencyBounce = appendUniqueServices(s.latencyBounce, s.latencyBounceSeen, lv.bounceServices)
+		payload, trips, recovered, stillBroken, dropped := s.b.circuitPatchWithLatency(s.log, s.g.Queue,
 			job.Kind, job.Name, job.Anno, job.Hooks, s.ready, s.now, s.seen, s.recoverSeen,
-			s.allowTrips)
+			s.allowTrips, lv)
 		if payload == nil {
 			circuitMetrics(&s.b.brokenEmitted, job.Kind, job.Name, nil, nil, stillBroken)
 			continue

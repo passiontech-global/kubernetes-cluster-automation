@@ -188,6 +188,11 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "GRPCRoute"},
 	{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"},
 	{Group: "gateway.networking.k8s.io", Version: "v1alpha2", Kind: "ReferenceGrant"},
+
+	// apiregistration + CSI snapshotter
+	{Group: "apiregistration.k8s.io", Version: "v1", Kind: "APIService"},
+	{Group: "snapshot.storage.kubernetes.io", Version: "v1", Kind: "VolumeSnapshot"},
+	{Group: "snapshot.storage.kubernetes.io", Version: "v1", Kind: "VolumeSnapshotContent"},
 }
 
 // buildDynScheme assembles the scheme NewDynamicClient and DynScheme

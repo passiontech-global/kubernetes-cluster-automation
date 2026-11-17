@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -183,21 +184,32 @@ func TestSystemdInitUnresponsive(t *testing.T) {
 	}
 	e.SDReply["kill -CONT 1"] = ""
 
+	hasSigCont := func() bool {
+		for _, k := range e.Kills {
+			if k.PID == 1 && k.Sig == syscall.SIGCONT {
+				return true
+			}
+		}
+		return false
+	}
 	chk := wdepstest.Check[*runtime.SystemdSessionCheck](h, wdeps.CheckSystemdSessions)
-	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: false, SystemdProbeErr: true})
 	if _, err := os.Stat(filepath.Join(e.StateDir, "state-systemd-unresponsive")); !os.IsNotExist(err) {
 		t.Fatal("unresponsive latch set after a single probe timeout")
 	}
-	if e.SDRan("kill -CONT 1") {
+	if hasSigCont() {
 		t.Fatal("SIGCONT sent before the streak confirmed")
 	}
 
-	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: false, SystemdProbeErr: true})
 	if _, err := os.Stat(filepath.Join(e.StateDir, "state-systemd-unresponsive")); err != nil {
 		t.Fatal("unresponsive latch missing after confirmed timeouts")
 	}
-	if !e.SDRan("kill -CONT 1") {
+	if !hasSigCont() {
 		t.Fatal("SIGCONT pid1 not attempted on latch confirmation")
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "state-systemd-session-bloat")); !os.IsNotExist(err) {
+		t.Fatal("probeTimedOut should not enter systemd-session-bloat")
 	}
 
 	// A prompt answer is a live manager — streak and latch clear.

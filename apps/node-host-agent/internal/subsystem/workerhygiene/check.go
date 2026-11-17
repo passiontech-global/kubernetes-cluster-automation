@@ -115,6 +115,8 @@ func (h *Hygiene) initChecks() {
 	add(runtime.NewCSIGuard(d))       // wdeps.CheckCSIGuard
 	add(runtime.NewGPUGuard(d))       // wdeps.CheckGPUGuard
 	add(guards.NewNetfilterGuard(d))  // wdeps.CheckNetfilterGuard
+	// Wave-3 self-healing guards — appended at the tail.
+	add(runtime.NewUDPStale(d)) // wdeps.CheckUDPStale
 	// A single UNGATED group: the unit-file and uptime gates return
 	// early in Cycle and workerActive gates inside each check
 	// (per-check cycles{check,"gated"}) — none map onto

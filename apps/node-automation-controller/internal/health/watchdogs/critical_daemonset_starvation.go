@@ -176,6 +176,7 @@ func compatLabelsForNode(n *corev1.Node) map[string]string {
 func (p *criticalDaemonSetStarvationCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
+	p.eventHealed.PruneExpired(now, criticalDSEventCooldown)
 	var rep probefw.SweepReport
 
 	dss, err := p.AllDaemonSets(ctx)
@@ -271,6 +272,7 @@ func (p *criticalDaemonSetStarvationCheck) healCompatLabels(ctx context.Context,
 		log.Info("WARN: critical DS starvation node census failed", "error", err)
 		return
 	}
+	overlay := map[string]map[string]string{}
 	for key, depKeys := range candidates {
 		// Pre-compute WHICH nodes actually miss a needed label —
 		// spending the HealAllowed grant before this check burned
@@ -294,10 +296,11 @@ func (p *criticalDaemonSetStarvationCheck) healCompatLabels(ctx context.Context,
 				if !ok {
 					continue
 				}
-				// Already labelled — a post-heal steady state must
-				// queue NOTHING, or the HealAllowed grant below
-				// still burns on every sweep.
+				// Already labelled (on shared node snapshot or this sweep's overlay).
 				if cur, has := n.Labels[dk]; has && cur == v {
+					continue
+				}
+				if cur, has := overlay[n.Name][dk]; has && cur == v {
 					continue
 				}
 				needed[dk] = v
@@ -322,7 +325,6 @@ func (p *criticalDaemonSetStarvationCheck) healCompatLabels(ctx context.Context,
 		}
 		patched := 0
 		for _, np := range queue {
-			n := nodeByName(nodes, np.name)
 			patch := []byte(fmt.Sprintf(
 				`{"metadata":{"labels":%s}}`, mustJSONMap(np.need)))
 			if _, err := p.CS.CoreV1().Nodes().Patch(ctx, np.name,
@@ -333,13 +335,11 @@ func (p *criticalDaemonSetStarvationCheck) healCompatLabels(ctx context.Context,
 				continue
 			}
 			patched++
-			if n != nil {
-				for k, v := range np.need {
-					if n.Labels == nil {
-						n.Labels = map[string]string{}
-					}
-					n.Labels[k] = v
-				}
+			if overlay[np.name] == nil {
+				overlay[np.name] = map[string]string{}
+			}
+			for k, v := range np.need {
+				overlay[np.name][k] = v
 			}
 		}
 		if patched > 0 {
@@ -349,18 +349,6 @@ func (p *criticalDaemonSetStarvationCheck) healCompatLabels(ctx context.Context,
 				"daemonset", key, "deprecatedKeys", depKeys, "nodesPatched", patched)
 		}
 	}
-}
-
-// nodeByName finds the node object in the census slice — the
-// overlay update after a successful patch needs the live object,
-// not just its name.
-func nodeByName(nodes []corev1.Node, name string) *corev1.Node {
-	for i := range nodes {
-		if nodes[i].Name == name {
-			return &nodes[i]
-		}
-	}
-	return nil
 }
 
 // mustJSONMap renders a string map as a JSON object literal for

@@ -96,44 +96,92 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/criticalns"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/orphansweep"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/timeoutclamp"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/unmeshed"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
+
+const (
+	defaultPromFallbackURL    = "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"
+	defaultPromQueryTimeout   = 10 * time.Second
+	defaultErrorRateThreshold = 0.5
+	defaultLatencyP99Seconds  = 5.0
+	defaultMaxTimeoutSeconds  = 10
+)
+
+type guardConfig struct {
+	promEndpoint       string
+	errRateThreshold   float64
+	latP99Threshold    float64
+	latencyTripEnabled bool
+	timeoutClampOn     bool
+	maxTimeoutSeconds  int32
+}
+
+func configFromEnv() guardConfig {
+	endpoint, err := promq.ResolveEndpoint(
+		envx.Getenv("HEALTH_PROMETHEUS_QUERY_URL", ""),
+		envx.Getenv("HEALTH_HTTP_CONTENT_URL", defaultPromFallbackURL),
+	)
+	if err != nil {
+		endpoint = ""
+	}
+	return guardConfig{
+		promEndpoint:       endpoint,
+		errRateThreshold:   envx.GetenvFloatPositive("WEBHOOK_ERROR_RATE_THRESHOLD", defaultErrorRateThreshold),
+		latP99Threshold:    envx.GetenvFloatPositive("WEBHOOK_LATENCY_P99_SECONDS", defaultLatencyP99Seconds),
+		latencyTripEnabled: envx.Gate("WEBHOOK_LATENCY_BREAKER_TRIP_ENABLED", true),
+		timeoutClampOn:     envx.Gate("WEBHOOK_TIMEOUT_CLAMP_ENABLED", true),
+		maxTimeoutSeconds:  int32(envx.GetenvIntMin("WEBHOOK_MAX_TIMEOUT_SECONDS", defaultMaxTimeoutSeconds, 1)),
+	}
+}
 
 // webhookGuard is the facade behind the single
 // "admission-webhook-guard" periodic: it embeds the shared
 // guardstate.Guard dep bundle (clients, queue name, clock, probe
-// seam, maintenance verdict) and holds the two stateful duties —
-// circuitbreaker.Breaker and unmeshed.Auditor (orphansweep is
-// stateless, so it needs no struct). run() takes the shared
-// snapshot once and invokes the duties in a fixed order, so the
-// externally visible contract (queue name, interval, metric series,
-// errors.Join error accounting) is unchanged by the split.
+// seam, maintenance verdict) and holds the stateful duties —
+// circuitbreaker.Breaker, timeoutclamp.Sweeper, criticalns.Sweeper,
+// and unmeshed.Auditor (orphansweep is stateless, so it needs no
+// struct). run() takes the shared snapshot once and invokes the
+// duties in a fixed order, so the externally visible contract (queue
+// name, interval, metric series, errors.Join error accounting) is
+// unchanged by the split.
 type webhookGuard struct {
 	guardstate.Guard
-	breaker  circuitbreaker.Breaker
-	critical criticalns.Sweeper
-	auditor  unmeshed.Auditor
+	breaker      circuitbreaker.Breaker
+	timeoutClamp timeoutclamp.Sweeper
+	critical     criticalns.Sweeper
+	auditor      unmeshed.Auditor
 }
 
 // Setup registers the 5-minute sweep (was crontab */5). dyn feeds
 // the autopilot-Plan signal of the maintenance mutex consulted by
-// the unmeshed-pod healer (unmeshed-pod-auditor). Gated through shared.SetupNoConfig:
-// a disabled module registers nothing — no runnable, no periodic
-// cluster LIST against the apiserver.
+// the unmeshed-pod healer (unmeshed-pod-auditor). Gated through
+// shared.SetupWithConfig: knobs parse before the Disabled gate, and a
+// disabled module registers nothing.
 func Setup(d shared.Deps) error {
-	return shared.SetupNoConfig(d, func() error {
+	return shared.SetupWithConfig(d, configFromEnv, func(cfg guardConfig) error {
 		logf.Log.WithName(d.Name).Info("registered",
 			"interval", 5*time.Minute, "circuitBreaker", circuitbreaker.Enabled(),
 			"bootFailOpen", bootwebhooks.Enabled(),
-			"unmeshedRemediation", unmeshed.RemediationEnabled())
-		// The bookkeeping ledgers inside the duty structs (deadSince,
-		// brokenEmitted, bounceAt, crdUnhealthyEmitted, unmeshedEmitted,
-		// criticalns' exclusionEmitted/heartbeatEmitted) are shared.*
-		// zero-value types — nothing to initialize here.
+			"unmeshedRemediation", unmeshed.RemediationEnabled(),
+			"latencyTrip", cfg.latencyTripEnabled,
+			"timeoutClamp", cfg.timeoutClampOn,
+			"maxTimeoutSeconds", cfg.maxTimeoutSeconds,
+			"promEndpoint", cfg.promEndpoint)
 		g := &webhookGuard{Guard: guardstate.Guard{
 			CS: d.CS, Dyn: d.Dyn, Queue: d.Name, Now: shared.SystemClock,
-			NodeReader: d.CachedClient(), Verdict: d.Maintenance}}
+			NodeReader: d.CachedClient(), Verdict: d.Maintenance,
+			PromEndpoint:              cfg.promEndpoint,
+			PromClient:                promq.Client{Timeout: defaultPromQueryTimeout},
+			WebhookErrorRateThreshold: cfg.errRateThreshold,
+			WebhookLatencyP99Seconds:  cfg.latP99Threshold,
+			LatencyBreakerTripEnabled: cfg.latencyTripEnabled,
+			TimeoutClampEnabled:       cfg.timeoutClampOn,
+			MaxWebhookTimeoutSeconds:  cfg.maxTimeoutSeconds,
+		}}
 		return shared.AddPeriodic(d.Mgr, g.Queue, 5*time.Minute, g.run)
 	})
 }
@@ -169,10 +217,13 @@ func (g *webhookGuard) run(ctx context.Context) error {
 	// snapshot — it only reads the validating list the census already
 	// fetched.
 	bootErr := bootwebhooks.Sweep(ctx, snap)
+	// Enforce safe admission webhook timeouts and audit excessive CRD
+	// conversion timeouts on the post-breaker snapshot.
+	timeoutErr := g.timeoutClamp.Sweep(ctx, snap)
 	// The critical-ns audits run here — where they sat at the top of
 	// the unmeshed sweep before the duty moved to its own leaf
 	// subpackage — so they read post-breaker webhook state.
 	g.critical.Sweep(snap)
 	unmeshedErr := g.auditor.Sweep(ctx, snap)
-	return errors.Join(orphanErr, breakerErr, conversionErr, bootErr, unmeshedErr)
+	return errors.Join(orphanErr, breakerErr, conversionErr, bootErr, timeoutErr, unmeshedErr)
 }

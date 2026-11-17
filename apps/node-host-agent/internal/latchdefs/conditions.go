@@ -417,4 +417,23 @@ var CondDefs = map[string]CondDef{
 		DefaultMessage: "CSI node plugin registration matches kubelet plugins_registry / CSINode",
 		ProblemReason:  "CSIRegistrationWedgedDetected",
 	},
+	// --- wave-3 self-healing wave ---
+	LatchMountTablePressure: {
+		Type:           "MountTablePressure",
+		DefaultReason:  "MountTableNormal",
+		DefaultMessage: "mount table utilization and shared peer-group fan-out within bounds",
+		ProblemReason:  "MountTablePressureDetected",
+	},
+	LatchEBPFPressure: {
+		Type:           "EBPFResourcePressure",
+		DefaultReason:  "EBPFResourcesNormal",
+		DefaultMessage: "kernel eBPF prog and map counts below ceiling",
+		ProblemReason:  "EBPFResourcePressureDetected",
+	},
+	LatchEtcdQuorumDegraded: {
+		Type:           "EtcdQuorumDegraded",
+		DefaultReason:  "EtcdQuorumHealthy",
+		DefaultMessage: "embedded etcd healthy (no CORRUPT alarm, stuck learner, or WAL fsync storm)",
+		ProblemReason:  "EtcdQuorumDegradedDetected",
+	},
 }

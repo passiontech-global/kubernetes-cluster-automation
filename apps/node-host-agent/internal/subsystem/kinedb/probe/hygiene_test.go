@@ -895,3 +895,54 @@ func TestProbeLargeKeysParseSkipsGarbage(t *testing.T) {
 		t.Fatalf("pipe-key label wrong:\n%s", content)
 	}
 }
+
+func TestProbeSequenceCliffScalarSubquery(t *testing.T) {
+	// 1. int4 column (atttypid=23) past 50% of 2.1B cliff -> hazard=1, util ~0.50, note warning.
+	k, fr, dir := fixture(t, hygieneRules)
+	fr.On("pg_sequences", "9\n0\n120|100000\n23\n1073741824|2147483647|integer\n")
+	res := k.Cycle(context.Background())
+	if !res.succeeded {
+		t.Fatalf("probe failed: %v", res.notes)
+	}
+	if !res.hyg.seqCliffSeen || res.hyg.idInt4Hazard != 1 {
+		t.Fatalf("seqCliff=%+v", res.hyg)
+	}
+	if res.hyg.seqUtilRatio < 0.499 || res.hyg.seqUtilRatio > 0.501 {
+		t.Fatalf("seqUtilRatio=%v want ~0.5", res.hyg.seqUtilRatio)
+	}
+	content := kdepstest.ReadText(t, dir, xactPromFile)
+	if !strings.Contains(content, "kine_db_id_int4_hazard 1") ||
+		!strings.Contains(content, "kine_db_sequence_utilization_ratio ") {
+		t.Fatalf("xact prom missing seq cliff metrics:\n%s", content)
+	}
+	// Verify scalar-subquery wrapping in SQL batch.
+	if !strings.Contains(fr.Joined(), "SELECT COALESCE((SELECT a.atttypid::bigint FROM pg_attribute") ||
+		!strings.Contains(fr.Joined(), "pg_get_serial_sequence('kine', 'id')") {
+		t.Fatalf("catalog query missing scalar subqueries:\n%s", fr.Joined())
+	}
+
+	// 2. int8 column (atttypid=20) + bigint sequence -> hazard=0.
+	fr.On("pg_sequences", "9\n0\n120|100000\n20\n5000000|9223372036854775807|bigint\n")
+	res = k.Cycle(context.Background())
+	if !res.hyg.seqCliffSeen || res.hyg.idInt4Hazard != 0 {
+		t.Fatalf("bigint seqCliff=%+v", res.hyg)
+	}
+	content = kdepstest.ReadText(t, dir, xactPromFile)
+	if !strings.Contains(content, "kine_db_id_int4_hazard 0") {
+		t.Fatalf("xact prom expected hazard=0:\n%s", content)
+	}
+
+	// 3. Missing table / unowned sequence returning 0|0|'' -> unseen, no fabricated 0.
+	k2, fr2, dir2 := fixture(t, hygieneRules)
+	fr2.On("pg_sequences", "9\n0\n120|100000\n0\n0|0|\n")
+	res = k2.Cycle(context.Background())
+	if res.hyg.seqCliffSeen {
+		t.Fatalf("absent table must stay unseen: %+v", res.hyg)
+	}
+	content2 := kdepstest.ReadText(t, dir2, xactPromFile)
+	for line := range strings.SplitSeq(content2, "\n") {
+		if strings.HasPrefix(line, "kine_db_id_int4_hazard ") || strings.HasPrefix(line, "kine_db_sequence_utilization_ratio ") {
+			t.Fatalf("fabricated metric for absent table:\n%s", content2)
+		}
+	}
+}

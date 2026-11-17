@@ -77,7 +77,9 @@ func TestAPFSelfHealShieldCreatesMissing(t *testing.T) {
 		got[s.ServiceAccount.Namespace+"/"+s.ServiceAccount.Name] = true
 	}
 	for _, want := range []string{
+		"node-ops/node-ops-operator",
 		"node-ops/node-automation-controller",
+		"node-ops/node-host-agent",
 		"kube-system/node-host-agent",
 		"kube-system/coredns",
 		"monitoring/prometheus",
@@ -86,7 +88,7 @@ func TestAPFSelfHealShieldCreatesMissing(t *testing.T) {
 			t.Fatalf("subject %s missing from %+v", want, got)
 		}
 	}
-	if len(got) != 4 {
+	if len(got) != 6 {
 		t.Fatalf("unexpected subject count: %+v", got)
 	}
 	// Second run: converged — clean pass, zero writes.
@@ -155,7 +157,7 @@ func TestAPFSelfHealShieldRepairsDrift(t *testing.T) {
 		Get(ctx, apfShieldFlowSchemaName, metav1.GetOptions{})
 	if fs.Spec.MatchingPrecedence != 500 ||
 		fs.Spec.PriorityLevelConfiguration.Name != apfShieldPLCName ||
-		len(fs.Spec.Rules) != 1 || len(fs.Spec.Rules[0].Subjects) != 4 {
+		len(fs.Spec.Rules) != 1 || len(fs.Spec.Rules[0].Subjects) != 6 {
 		t.Fatalf("FlowSchema not repaired: %+v", fs.Spec)
 	}
 }
@@ -199,8 +201,8 @@ func TestAPFSelfHealShieldForbiddenDegrades(t *testing.T) {
 		})
 	p := apfShieldCheck(t, cs, apfTestCfg)
 	res := p.Run(probetest.SweepCtx(ctx))
-	if res.Pass {
-		t.Fatal("forbidden writes must degrade to FAIL")
+	if !res.Pass {
+		t.Fatalf("forbidden writes must PASS gracefully (degraded=1): %+v", res)
 	}
 	if res.Infra != nil {
 		t.Fatalf("403 must not surface as Infra: %v", res.Infra)

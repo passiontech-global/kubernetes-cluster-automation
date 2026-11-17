@@ -75,7 +75,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProb
 }
 
 // fleetCheckRegs mirrors the health section of registry.Modules —
-// the full 52-check roster in sweep order, which is what
+// the full 68-check roster in sweep order, which is what
 // SetupModules collects into Deps.CheckRegs on a default boot.
 // clusterhealthprobes may not import internal/registry (depguard:
 // domains never import the wiring layer — and a test-internal
@@ -144,6 +144,18 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: gitops.CheckNameImagePullSecretAuditor, New: gitops.NewImagePullSecretAuditorCheck},
 		{Name: gitops.CheckNameArgoCDAgentSpin, New: gitops.NewArgoCDAgentSpinCheck},
 		{Name: nethealth.CheckNameApiserverNodeReachability, New: nethealth.NewApiserverNodeReachabilityCheck},
+		{Name: watchdogs.CheckNameAPFSelfHealShield, New: watchdogs.NewAPFSelfHealShieldCheck},
+		{Name: watchdogs.CheckNameStatefulSetRolloutUnstick, New: watchdogs.NewStatefulSetRolloutUnstickCheck},
+		{Name: watchdogs.CheckNameDaemonSetRolloutWedge, New: watchdogs.NewDaemonSetRolloutWedgeCheck},
+		{Name: watchdogs.CheckNameCronJobForbidZombie, New: watchdogs.NewCronJobForbidZombieCheck},
+		{Name: watchdogs.CheckNameAPIServerWriteStorm, New: watchdogs.NewAPIServerWriteStormCheck},
+		{Name: watchdogs.CheckNameCriticalDSStarvation, New: watchdogs.NewCriticalDaemonSetStarvationCheck},
+		{Name: nethealth.CheckNameCoreDNSForwardSaturation, New: nethealth.NewCoreDNSForwardSaturationCheck},
+		{Name: gitops.CheckNameHPAScalingGuard, New: gitops.NewHPAScalingGuardCheck},
+		{Name: watchdogs.CheckNameDeploymentRolloutWedge, New: watchdogs.NewDeploymentRolloutWedgeCheck},
+		{Name: watchdogs.CheckNameSubPathConfigDrift, New: watchdogs.NewSubPathConfigDriftCheck},
+		{Name: nethealth.CheckNameServiceSelectorBlackhole, New: nethealth.NewServiceSelectorBlackholeCheck},
+		{Name: watchdogs.CheckNameTopologyZoneDeadlock, New: watchdogs.NewTopologySpreadZoneDeadlockCheck},
 	}
 }
 
@@ -282,8 +294,10 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// fleetCheckRegs to parity with the 56-check registry -> twenty-nine total.
 	// cilium-bpf-map-pressure now reports Infra (not silent pass) on
 	// the Prometheus outage this fake produces -> thirty total.
-	if got := errCount() - before; got != 30 {
-		t.Fatalf("run errors delta = %v, want 30", got)
+	// Bringing fleetCheckRegs to full 68-check parity adds the 8 newly
+	// registered checks that census pods or query Prometheus -> thirty-eight total.
+	if got := errCount() - before; got != 38 {
+		t.Fatalf("run errors delta = %v, want 38", got)
 	}
 }
 

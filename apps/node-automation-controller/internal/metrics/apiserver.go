@@ -100,6 +100,20 @@ var CRDConversionWebhookUnhealthy = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while the CRD's spec.conversion webhook backend is unhealthy (missing_service|zero_endpoints|tls_probe_failed).",
 }, []string{"crd", "service", "reason"})
 
+// WebhookAdmissionDegraded tracks admission sub-webhooks breaching error-rate
+// or latency thresholds continuously for >= 10m.
+var WebhookAdmissionDegraded = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_webhook_admission_degraded",
+	Help: "1 while an admission sub-webhook with failurePolicy=Fail is breaching error-rate or latency p99 thresholds.",
+}, []string{"kind", "config", "webhook", "reason"})
+
+// WebhookExcessiveTimeout tracks admission webhooks and CRD conversion webhooks
+// configured with failurePolicy=Fail and timeoutSeconds above the safe bound.
+var WebhookExcessiveTimeout = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_webhook_excessive_timeout",
+	Help: "1 while an admission or CRD conversion webhook with failurePolicy=Fail exceeds max timeoutSeconds.",
+}, []string{"kind", "config", "webhook"})
+
 // ---------------------------------------------------------------------------
 // Operations metrics — cluster-health check series.
 // ---------------------------------------------------------------------------
@@ -154,6 +168,8 @@ var apiserverCollectors = []prometheus.Collector{
 	UnmeshedPods, UnmeshedPodsRecreatedTotal,
 	APIServiceUnblockHealsTotal,
 	CRDConversionWebhookUnhealthy,
+	WebhookAdmissionDegraded,
+	WebhookExcessiveTimeout,
 }
 
 func init() {

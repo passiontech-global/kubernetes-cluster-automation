@@ -308,6 +308,18 @@ func (r *Runner) updateNeighborTable(ctx context.Context) {
 			if r.deps.Store.RateTrySpend("last-neigh-bump-"+fam.name, neighBumpEvery) {
 				r.bumpNeighborGC(ctx, fam, entries, thresh3)
 				delete(r.neigh, fam.name)
+				// Re-read fill against the newly raised gc_thresh3 so
+				// maybeFlushNeighbor and neighPinned never evaluate a
+				// pre-bump fill against the stale ceiling.
+				if rv, rok := fam.entries(fam.table); rok {
+					if rt3, tok := neighGCThresh(fam.sysDir, "gc_thresh3"); tok && rt3 > 0 {
+						view = rv
+						entries = rv.entries
+						thresh3 = rt3
+						fill = float64(entries) / float64(thresh3)
+						fills[fam.name] = fill
+					}
+				}
 			}
 		}
 		// P0.4 flush guard — returns the post-flush fill (or -1

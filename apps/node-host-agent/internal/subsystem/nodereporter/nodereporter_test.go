@@ -237,6 +237,10 @@ func TestAllConditionDefaults(t *testing.T) {
 		"NeighborTablePressure": {"NeighborTableNormal", "ARP/NDISC neighbor tables below pressure ceiling after flush"},
 		"NetfilterLockWedged":   {"NetfilterLockFree", "/run/xtables.lock not held across hygiene cycles"},
 		"CSIRegistrationWedged": {"CSIRegistrationOk", "CSI node plugin registration matches kubelet plugins_registry / CSINode"},
+		// wave-3 self-healing latch→condition surface.
+		"MountTablePressure":   {"MountTableNormal", "mount table utilization and shared peer-group fan-out within bounds"},
+		"EBPFResourcePressure": {"EBPFResourcesNormal", "kernel eBPF prog and map counts below ceiling"},
+		"EtcdQuorumDegraded":   {"EtcdQuorumHealthy", "embedded etcd healthy (no CORRUPT alarm, stuck learner, or WAL fsync storm)"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

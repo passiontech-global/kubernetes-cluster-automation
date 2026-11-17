@@ -145,6 +145,14 @@ type Breaker struct {
 	// confirmation from one sweep — acceptable, the annotation
 	// still holds the entry broken meanwhile.
 	recoverStreak state.StreakLedger
+
+	// degradedSince / degradedEmitted track Prometheus-observed
+	// admission error-rate and latency breaches (>=10m degraded/bounce,
+	// >=15m trip). degradedThreshold / latencyTripThreshold are test seams.
+	degradedSince        state.FirstSeenLedger
+	degradedEmitted      state.GaugeLedger[latencyKey]
+	degradedThreshold    time.Duration
+	latencyTripThreshold time.Duration
 }
 
 // Sweep trips fail-closed sub-webhooks whose backend
@@ -175,6 +183,7 @@ func (b *Breaker) RestoreOnly(ctx context.Context, snap *guardstate.Snapshot) er
 func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	allowTrips bool) error {
 	b.brokenEmitted.Begin() // drop any aborted sweep's leftover emissions
+	b.degradedEmitted.Begin()
 	g := snap.G
 	s := &circuitSweep{
 		b: b, g: g, snap: snap,
@@ -182,6 +191,7 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 		now:         g.Now.Now(),
 		seen:        map[string]bool{},
 		recoverSeen: map[string]bool{},
+		latencySeen: map[string]bool{},
 		allowTrips:  allowTrips,
 	}
 	// bounceAt keys on backend Service names that die with the
@@ -200,9 +210,18 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	// off during an API outage.
 	defer b.deadSince.Prune(func(k string) bool { return s.seen[k] })
 	defer b.recoverStreak.Prune(func(k string) bool { return s.recoverSeen[k] })
+	defer func() {
+		if !s.latency.queryError {
+			b.degradedSince.Prune(func(k string) bool { return s.latencySeen[k] })
+		}
+	}()
 
 	if err := s.loadInputs(); err != nil {
 		return err
+	}
+	s.latency = b.queryLatencySignals(ctx, g)
+	if s.latency.queryError {
+		b.carryDegradedForward()
 	}
 	s.buildJobs()
 	s.runJobs(ctx)
@@ -216,12 +235,16 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	// mode (kill-switch on) is deliberately passive — no pod kills.
 	if allowTrips {
 		b.bounceHungWebhookPods(ctx, snap, s.ready)
+		if len(s.latencyBounce) > 0 {
+			b.bounceServiceKeys(ctx, snap, s.ready, s.latencyBounce, "degraded admission latency/5xx")
+		}
 	}
 
 	// Prune broken series whose label tuple was not re-seen — a config
 	// deleted while broken, recreated without the annotation, or an
 	// entry removed must not pin circuit_broken=1 forever.
 	b.brokenEmitted.Prune(metrics.WebhookCircuitBroken.DeleteLabelValues)
+	b.degradedEmitted.Prune(metrics.WebhookAdmissionDegraded.DeleteLabelValues)
 
 	// The deadSince and recoverStreak prunes run via defer (declared
 	// beside their keep-sets above) so they fire on every cycle,

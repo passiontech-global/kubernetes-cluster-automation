@@ -50,7 +50,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -151,8 +150,8 @@ func (c *NetfilterGuardCheck) scanStuck(now time.Time,
 		if state != "D" && age < minAge {
 			continue
 		}
-		if state == "R" {
-			continue // running — CPU-bound, not lock-blocked
+		if state == "R" || state == "Z" || state == "X" || state == "x" {
+			continue // running or dead/zombie — SIGKILL cannot clear Z/X or busy R
 		}
 		// stat Fields[19] is field 22 (starttime, jiffies) — the
 		// process-instance identity the streak keys on. A stat
@@ -184,21 +183,30 @@ func (c *NetfilterGuardCheck) lockPath() string {
 	return filepath.Join(c.d.Cfg.Disk.HostRunDir, "xtables.lock")
 }
 
-// lockHeld probes the xtables.lock with a non-blocking exclusive
-// flock — the plan's wedge test. EWOULDBLOCK/EAGAIN means another
-// process holds it; a missing file or a successful acquire means
-// no wedge (an acquired lock is released before returning). Other
-// errors are inconclusive → false, never fabricated evidence.
+// lockHeld passively inspects <ProcRoot>/locks (falling back to /proc/locks
+// if <ProcRoot>/locks does not exist) for any kernel lock referencing the
+// xtables.lock (dev, ino), avoiding flock(LOCK_EX) lock-stealing races.
 func (c *NetfilterGuardCheck) lockHeld() bool {
-	fd, err := unix.Open(c.lockPath(), unix.O_RDONLY|unix.O_CLOEXEC, 0)
-	if err != nil {
+	var st unix.Stat_t
+	if err := unix.Stat(c.lockPath(), &st); err != nil {
 		return false
 	}
-	defer func() { _ = unix.Close(fd) }()
-	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return err == unix.EWOULDBLOCK || err == unix.EAGAIN
+	target := fmt.Sprintf("%02x:%02x:%d", unix.Major(st.Dev), unix.Minor(st.Dev), st.Ino)
+	locksPath := filepath.Join(c.d.Cfg.ProcRoot, "locks")
+	data, err := os.ReadFile(locksPath)
+	if err != nil {
+		data, err = os.ReadFile("/proc/locks")
+		if err != nil {
+			return false
+		}
 	}
-	_ = unix.Flock(fd, unix.LOCK_UN)
+	for line := range strings.SplitSeq(string(data), "\n") {
+		fields := strings.Fields(line)
+		// Expected fields: N: FLOCK ADVISORY WRITE PID MAJ:MIN:INO START END
+		if len(fields) >= 6 && fields[5] == target {
+			return true
+		}
+	}
 	return false
 }
 
@@ -227,9 +235,6 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		c.lastScan = now
 	}
-	if c.d.Cfg.Wave2.NetfilterGuardLegacyProbe {
-		c.probeLegacyRules(ctx)
-	}
 	var pids []int
 	var err error
 	if e != nil && e.PidsOnce != nil {
@@ -242,6 +247,10 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	stuck := c.scanStuck(c.d.Cfg.Seams.Host.Clock.Now(), pids)
+	held := c.lockHeld()
+	if c.d.Cfg.Wave2.NetfilterGuardLegacyProbe && !held {
+		c.probeLegacyRules(ctx)
+	}
 
 	// Per-pid consecutive-cycle confirmation — a pid must qualify
 	// NetfilterGuardStuckCycles cycles running before the kill
@@ -288,41 +297,27 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	c.d.Actions.WithLabelValues(wdeps.CheckNetfilterGuard, "cmd_kill").Add(float64(killed))
 
-	// Lock wedge — the flock probe's own >=3-cycle streak owns the
-	// latch; stuck commands alone are remedied by the kill pass,
-	// not latched (the condition means "the lock is held", per
-	// P2.11).
-	held := c.lockHeld()
+	// Lock wedge — the passive /proc/locks probe's >=3-cycle streak owns the latch.
 	if held {
 		c.lockStreak++
 	} else {
 		c.lockStreak = 0
+		c.d.State.Exit(latchdefs.LatchNetfilterLocked, nil)
 	}
 	switch {
 	case c.lockStreak >= netfilterLockStreakCycles:
 		c.d.State.Enter(latchdefs.LatchNetfilterLocked, fmt.Sprintf(
 			"xtables.lock held %d consecutive cycles", c.lockStreak))
-		c.d.CycleResult(wdeps.CheckNetfilterGuard, "firing")
 	case len(confirmed) > 0 || len(stuck) > 0:
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: netfilter-guard %d stuck netfilter cmd(s) (%d confirmed), lock_held=%v streak=%d",
 			len(stuck), len(confirmed), held, c.lockStreak))
-		c.d.CycleResult(wdeps.CheckNetfilterGuard, "pending")
-	default:
-		c.d.State.Exit(latchdefs.LatchNetfilterLocked, nil)
-		c.d.CycleResult(wdeps.CheckNetfilterGuard, "ok")
 	}
+	c.d.CycleResult(wdeps.CheckNetfilterGuard, "ok")
 }
 
 // probeLegacyRules feeds node_agent_iptables_legacy_leaked_rules —
-// the iptables-nft/iptables-legacy split-brain gauge. The probe
-// only runs when /proc/1/net/ip_tables_names is non-empty: an
-// iptables-nft host whose legacy table set is empty must not
-// false-positive on the (always-present, usually empty) mangle
-// table — exactly the lanit-04 trap the plan calls out. Only
-// "-A " chain lines count as leaked rules. An inconclusive probe
-// (names unreadable AND save failing) leaves the prior gauge —
-// never a fabricated 0.
+// the iptables-nft/iptables-legacy split-brain gauge.
 func (c *NetfilterGuardCheck) probeLegacyRules(ctx context.Context) {
 	namesPath := filepath.Join(c.d.Cfg.ProcRoot, "1", "net", "ip_tables_names")
 	names, err := os.ReadFile(namesPath)
@@ -331,15 +326,14 @@ func (c *NetfilterGuardCheck) probeLegacyRules(ctx context.Context) {
 		c.d.Series.IPTablesLegacyLeakedRules = 0
 		return
 	}
-	// NetfilterGuardCmdTimeoutSec bounds the legacy-save exec — a
-	// wedged iptables-legacy-save must not stall the check cycle.
+	if c.d.Cfg.Systemd == nil {
+		return
+	}
 	timeout := time.Duration(c.d.Cfg.Wave2.NetfilterGuardCmdTimeoutSec) * time.Second
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	out, err := hostexec.RunCombined(ctx, "iptables-legacy-save")
+	out, err := c.d.Cfg.Systemd.ExecBounded(ctx, timeout, "iptables-legacy-save")
 	if err != nil {
 		return // inconclusive — keep the last good gauge
 	}

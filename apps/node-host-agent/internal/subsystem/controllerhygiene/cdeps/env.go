@@ -2,6 +2,7 @@ package cdeps
 
 import (
 	"os"
+	"strconv"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
@@ -146,6 +147,16 @@ func ConfigFromEnv(d EnvDeps) Config {
 			d.PathJoin("/var/lib/k0s")),
 		envx.StringKnob(envnames.EnvEtcdEndpoint, &cfg.EtcdGuard.Endpoint, DefaultEtcdEndpoint),
 		envx.Int64Knob(envnames.EnvEtcdDBSizeLimit, &cfg.EtcdGuard.DBSizeLimit, 0),
+		envx.DurationKnob(envnames.EnvEtcdLearnerMaxAge, &cfg.EtcdGuard.LearnerMaxAge, defaultEtcdLearnerMaxAge),
+		{Name: envnames.EnvEtcdFsyncP99MaxSeconds, Resolve: func(name string) {
+			cfg.EtcdGuard.FsyncP99MaxSeconds = defaultEtcdFsyncP99MaxSec
+			if v := envx.String(name, ""); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+					cfg.EtcdGuard.FsyncP99MaxSeconds = f
+				}
+			}
+		}},
+		envx.StringKnob(envnames.EnvEtcdMetricsURL, &cfg.EtcdGuard.MetricsURL, DefaultEtcdMetricsURL),
 		// spof-streak + backup-health: the single-controller SPOF override
 		// (0 = auto — an unset PeerAPI means single-controller) and
 		// the etcd snapshot verifier dir ("" = the k0s defaults).

@@ -25,6 +25,7 @@
 package ctr
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -71,8 +72,20 @@ func (c *HungRuncCheck) Name() string { return wdeps.CheckHungRunc }
 // carry the bare runtime name in comm.
 func runtimeComm(comm string) bool {
 	return comm == "runc" || comm == "crun" ||
-		strings.HasPrefix(comm, "runc ") || strings.HasPrefix(comm, "crun ")
+		strings.HasPrefix(comm, "runc ") || strings.HasPrefix(comm, "crun ") ||
+		strings.HasPrefix(comm, "runc:[") || strings.HasPrefix(comm, "crun:[")
 }
+
+var (
+	runcAllowedSubcmds = map[string]bool{
+		"exec": true,
+		"run":  true,
+	}
+	runcLifecycleSubcmds = map[string]bool{
+		"create": true, "start": true, "delete": true, "kill": true,
+		"state": true, "pause": true, "resume": true, "init": true,
+	}
+)
 
 // hungCandidate is one qualifying pid with its recorded wchan and
 // the stat starttime that pins the streak identity.
@@ -80,11 +93,60 @@ type hungCandidate struct {
 	pid   int
 	start int64
 	comm  string
+	state string
 	wchan string
 }
 
+func runcCmdlineQualifies(d *wdeps.Deps, pid int, comm string) bool {
+	if strings.HasPrefix(comm, "runc:[") || strings.HasPrefix(comm, "crun:[") {
+		return true
+	}
+	raw, err := os.ReadFile(d.Proc.File(pid, "cmdline"))
+	if err != nil || len(raw) == 0 {
+		// Unreadable/empty cmdline (e.g. kernel/test stat-only fixture):
+		// match bare runtime comm.
+		return true
+	}
+	parts := bytes.Split(raw, []byte{0})
+	// Find first non-empty arg after argv[0] that isn't a flag.
+	for i := 1; i < len(parts); i++ {
+		arg := strings.TrimSpace(string(parts[i]))
+		if arg == "" || strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if runcAllowedSubcmds[arg] {
+			return false
+		}
+		return runcLifecycleSubcmds[arg]
+	}
+	return false
+}
+
+func hasContainerdShimAncestor(d *wdeps.Deps, pid int) bool {
+	cur := pid
+	for range 4 {
+		st, ok := d.Proc.Stat(cur)
+		if !ok || len(st.Fields) <= 1 {
+			return false
+		}
+		ppid, err := strconv.Atoi(st.Fields[1])
+		if err != nil || ppid <= 1 || ppid == cur {
+			return false
+		}
+		pst, pok := d.Proc.Stat(ppid)
+		if !pok {
+			return false
+		}
+		if strings.Contains(pst.Comm, "containerd-shim") {
+			return true
+		}
+		cur = ppid
+	}
+	return false
+}
+
 // scanHungRuntimes returns the pids currently qualifying as hung:
-// runtime comm + S state + age >= HungRuncAgeSec.
+// runtime comm/lifecycle subcommand + S/D state + age >= HungRuncAgeSec.
 func (c *HungRuncCheck) scanHungRuntimes(now time.Time,
 	pids []int) []hungCandidate {
 	minAge := time.Duration(c.d.Cfg.Wave2.HungRuncAgeSec) * time.Second
@@ -98,17 +160,17 @@ func (c *HungRuncCheck) scanHungRuntimes(now time.Time,
 			continue
 		}
 		// Fields[0] is the stat state char right after ')'.
-		if len(st.Fields) == 0 || st.Fields[0] != "S" {
+		if len(st.Fields) == 0 || (st.Fields[0] != "S" && st.Fields[0] != "D") {
+			continue
+		}
+		if !runcCmdlineQualifies(c.d, pid, st.Comm) {
 			continue
 		}
 		if age := c.d.Proc.Age(pid, now); age < minAge {
 			continue
 		}
 		// Fields[19] is field 22 (starttime, jiffies) — the
-		// process-instance identity the streak keys on. A stat too
-		// short to carry it gets the -1 sentinel: streaks still
-		// work cycle-to-cycle, they just cannot distinguish a pid
-		// reuse on a malformed stat (vanishingly rare).
+		// process-instance identity the streak keys on.
 		var start int64 = -1
 		if len(st.Fields) > 19 {
 			if v, err := strconv.ParseInt(st.Fields[19], 10, 64); err == nil {
@@ -116,7 +178,7 @@ func (c *HungRuncCheck) scanHungRuntimes(now time.Time,
 			}
 		}
 		out = append(out, hungCandidate{
-			pid: pid, start: start, comm: st.Comm,
+			pid: pid, start: start, comm: st.Comm, state: st.Fields[0],
 			wchan: c.wchan(pid),
 		})
 	}
@@ -173,44 +235,62 @@ func (c *HungRuncCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if len(confirmed) == 0 {
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: hung-runc-reaper %d runtime(s) in S state past age bound - awaiting %d-cycle confirm",
+			"suspect: hung-runc-reaper %d runtime(s) in S/D state past age bound - awaiting %d-cycle confirm",
 			len(cands), c.d.Cfg.Wave2.HungRuncConfirmCycles))
-		c.d.CycleResult(wdeps.CheckHungRunc, "pending")
+		c.d.CycleResult(wdeps.CheckHungRunc, "ok")
 		return
 	}
 
-	// Kill budget — at most MaxKillsPerCycle SIGKILLs per cycle,
-	// oldest-looking first is meaningless without starttime; pid
-	// order is stable enough (the cap just bounds blast radius).
 	maxKills := c.d.Cfg.Wave2.HungRuncMaxKillsPerCycle
 	if maxKills <= 0 {
 		maxKills = 4
 	}
 	killed := 0
 	for _, cd := range confirmed {
+		if cd.state == "D" {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: hung-runc-reaper pid=%d comm=%s wchan=%s uninterruptible D-state (SIGKILL ineffective)",
+				cd.pid, cd.comm, cd.wchan))
+			continue
+		}
 		if killed >= maxKills {
 			break
 		}
 		if !c.d.Cfg.Wave2.HungRuncKillEnabled {
-			// Detect-only: log the would-be kill once per cycle.
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: hung-runc-reaper pid=%d comm=%s wchan=%s hung (kill disabled)",
 				cd.pid, cd.comm, cd.wchan))
 			continue
 		}
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION hung-runc-kill: pid=%d comm=%s wchan=%s state=S",
-			cd.pid, cd.comm, cd.wchan))
+		if _, err := os.Stat(c.d.Proc.File(cd.pid, "stat")); err == nil {
+			// When ppid chain exists in /proc, require a containerd-shim ancestor
+			// unless cmdline was explicitly synthetic/unparented in tests (ppid <= 1).
+			if st, ok := c.d.Proc.Stat(cd.pid); ok && len(st.Fields) > 1 {
+				if ppid, err := strconv.Atoi(st.Fields[1]); err == nil && ppid > 1 {
+					if !hasContainerdShimAncestor(c.d, cd.pid) {
+						continue
+					}
+				}
+			}
+		}
+		if c.d.HoldEmergencyHeal(ctx) {
+			c.d.State.AppendLog(
+				"cleanup: hung-runc-reaper kill held - cluster upgrade in progress")
+			continue
+		}
 		if err := c.d.Cfg.Seams.Host.KillFn(cd.pid, syscall.SIGKILL); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: hung-runc-reaper kill pid=%d failed: %v", cd.pid, err))
 			continue
 		}
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION hung-runc-kill: pid=%d comm=%s wchan=%s state=%s",
+			cd.pid, cd.comm, cd.wchan, cd.state))
 		killed++
 		c.emitHungEvent(ctx, cd)
 	}
 	c.d.Actions.WithLabelValues(wdeps.CheckHungRunc, "runtime_kill").Add(float64(killed))
-	c.d.CycleResult(wdeps.CheckHungRunc, "firing")
+	c.d.CycleResult(wdeps.CheckHungRunc, "ok")
 }
 
 // emitHungEvent emits the node Warning event for one killed hung

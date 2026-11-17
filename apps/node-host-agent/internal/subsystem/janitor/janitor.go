@@ -181,6 +181,8 @@ func (j *Janitor) Run(ctx context.Context) {
 // unit is stopped first — its `ip monitor` child then shows up
 // reparented to init on a later sweep and gets killed cleanly.
 func (j *Janitor) Sweep(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	j.sweepLatches()
 	j.sweepLegacyUnits(ctx)
 	j.sweepIPMonitors()

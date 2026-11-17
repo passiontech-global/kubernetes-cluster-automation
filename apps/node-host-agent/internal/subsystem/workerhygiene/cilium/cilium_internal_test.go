@@ -236,7 +236,7 @@ func TestCiliumEnvoyXDSBookkeepingResets(t *testing.T) {
 
 	// A successful kill resets the same fields.
 	c.fails, c.xdsFails, c.xdsInit, c.xdsLast = 3, 2, true, 42
-	c.killCiliumEnvoy([]wdeps.CtrTask{
+	c.killCiliumEnvoy(context.Background(), []wdeps.CtrTask{
 		{Name: "cilium-envoy", Live: true, PID: 555},
 	}, "test")
 	if c.fails != 0 || c.xdsFails != 0 || c.xdsInit {

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -109,6 +111,7 @@ type rsCensusRow struct {
 	failedSince  time.Time // ReplicaFailure condition's LastTransitionTime
 	replicas     int32
 	ready        int32
+	revision     int64
 	creationTime time.Time
 }
 
@@ -117,6 +120,8 @@ type rsCensusRow struct {
 func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
+	p.eventHealed.PruneExpired(now, rolloutWedgeEventCooldown)
+	p.nudgeHeals.PruneExpired(now, max(rolloutWedgeNudgeCooldown, rolloutWedgeRSZeroCooldown))
 	var rep probefw.SweepReport
 
 	deps, err := p.AllDeployments(ctx)
@@ -150,6 +155,9 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 			uid:          rs.UID,
 			creationTime: rs.CreationTimestamp.Time,
 		}
+		if rev, err := strconv.ParseInt(rs.Annotations["deployment.kubernetes.io/revision"], 10, 64); err == nil {
+			row.revision = rev
+		}
 		if rs.Spec.Replicas != nil {
 			row.replicas = *rs.Spec.Replicas
 		}
@@ -167,6 +175,9 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 	var findings []string
 	for i := range deps {
 		d := &deps[i]
+		if d.Spec.Paused || kube.IsIntentionallyDownscaled(d.Annotations, d.Spec.Replicas) {
+			continue
+		}
 		rsList := rsByDep[d.UID]
 		var reasons []string
 		for _, c := range d.Status.Conditions {
@@ -221,6 +232,7 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 	for _, rs := range rsList {
 		rsUIDs[rs.uid] = true
 	}
+	deletedPods := 0
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Namespace != ns {
@@ -239,56 +251,75 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 			metav1.DeleteOptions{
 				Preconditions: metav1.NewUIDPreconditions(string(pod.UID)),
 			}); err != nil {
+			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+				continue
+			}
 			metrics.IncError(p.Name)
 			log.Error(err, "rollout wedge terminal pod delete failed",
 				"pod", ns+"/"+pod.Name)
 			continue
 		}
+		deletedPods++
 		log.Info("GC: deleted terminal pod blocking rollout",
 			"pod", ns+"/"+pod.Name, "deployment", ns+"/"+name)
 	}
+	if deletedPods > 0 {
+		p.InvalidatePods(ctx)
+	}
 	// Stage 2 — stale ReplicaSet zeroing: old revisions with
 	// spec.replicas>0 but readyReplicas==0 hold ResourceQuota
-	// slots the new rollout needs. The NEWEST RS (by creation
-	// time) is never touched — it is the rollout's own target.
-	// Spec writes on live ReplicaSets go through the shared
-	// maintenance mutex + heal budget like every other heal.
+	// slots the new rollout needs. Sort ascending by (revision, creationTime, name)
+	// so the NEWEST RS stays untouched at the end. Pre-filter candidates
+	// before requesting HealAllowed so no grant is spent when nothing qualifies.
 	if len(rsList) > 1 {
-		ck2 := probefw.SelfHealKey(CheckNameDeploymentRolloutWedge,
-			ns+"/"+name+"/rs-zero")
-		proceed2, unverifiable2 := p.HealAllowed(ctx, log, &p.nudgeHeals,
-			ck2, rolloutWedgeRSZeroCooldown, now)
-		if unverifiable2 {
-			metrics.IncError(p.Name)
-			return
-		}
-		if proceed2 {
-			sorted := append([]rsCensusRow{}, rsList...)
-			sort.Slice(sorted, func(i, j int) bool {
-				return sorted[i].creationTime.Before(sorted[j].creationTime)
-			})
-			zeroed := 0
-			for i := 0; i < len(sorted)-1 && zeroed < rolloutWedgeMaxRSZero; i++ {
-				rs := sorted[i]
-				if rs.replicas == 0 || rs.ready > 0 {
-					continue
-				}
-				payload, _ := json.Marshal(map[string]any{
-					"spec": map[string]any{"replicas": int32(0)},
-				})
-				if _, err := p.CS.AppsV1().ReplicaSets(ns).Patch(ctx, rs.name,
-					types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-					metrics.IncError(p.Name)
-					log.Error(err, "rollout wedge stale RS zero failed",
-						"replicaset", ns+"/"+rs.name)
-					continue
-				}
-				zeroed++
-				log.Info("ACTION: scaled stale ReplicaSet to 0 (quota release)",
-					"replicaset", ns+"/"+rs.name, "deployment", ns+"/"+name)
+		sorted := append([]rsCensusRow{}, rsList...)
+		sort.Slice(sorted, func(i, j int) bool {
+			if sorted[i].revision != sorted[j].revision {
+				return sorted[i].revision < sorted[j].revision
 			}
-			if zeroed > 0 {
-				p.nudgeHeals.Stamp(ck2, now)
+			if !sorted[i].creationTime.Equal(sorted[j].creationTime) {
+				return sorted[i].creationTime.Before(sorted[j].creationTime)
+			}
+			return sorted[i].name < sorted[j].name
+		})
+		var toZero []rsCensusRow
+		for i := 0; i < len(sorted)-1 && len(toZero) < rolloutWedgeMaxRSZero; i++ {
+			rs := sorted[i]
+			if rs.replicas > 0 && rs.ready == 0 {
+				toZero = append(toZero, rs)
+			}
+		}
+		if len(toZero) > 0 {
+			ck2 := probefw.SelfHealKey(CheckNameDeploymentRolloutWedge,
+				ns+"/"+name+"/rs-zero")
+			proceed2, unverifiable2 := p.HealAllowed(ctx, log, &p.nudgeHeals,
+				ck2, rolloutWedgeRSZeroCooldown, now)
+			if unverifiable2 {
+				metrics.IncError(p.Name)
+				return
+			}
+			if proceed2 {
+				zeroed := 0
+				for _, rs := range toZero {
+					payload, _ := json.Marshal(map[string]any{
+						"spec": map[string]any{"replicas": int32(0)},
+					})
+					if _, err := p.CS.AppsV1().ReplicaSets(ns).Patch(ctx, rs.name,
+						types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+						metrics.IncError(p.Name)
+						log.Error(err, "rollout wedge stale RS zero failed",
+							"replicaset", ns+"/"+rs.name)
+						continue
+					}
+					zeroed++
+					log.Info("ACTION: scaled stale ReplicaSet to 0 (quota release)",
+						"replicaset", ns+"/"+rs.name, "deployment", ns+"/"+name)
+				}
+				if zeroed > 0 {
+					p.nudgeHeals.Stamp(ck2, now)
+				} else {
+					heal.RefundGrant(now)
+				}
 			}
 		}
 	}

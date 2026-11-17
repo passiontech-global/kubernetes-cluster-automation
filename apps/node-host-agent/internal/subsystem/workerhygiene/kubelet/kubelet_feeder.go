@@ -276,9 +276,9 @@ func (f *Feeder) remediate(ctx context.Context) {
 	// restart never burns the shared last-restart cooldown (the
 	// Cycle checks gate identically). During a drain the
 	// systemd-watchdog trip is usually the drain's own symptom.
-	if d.HoldLocalAction(ctx) {
+	if d.HoldEmergencyHeal(ctx) {
 		d.State.AppendLog("kubelet-remediate: SKIP(maintenance) cluster maintenance in progress — " +
-			"k0sworker restart held")
+			"emergency k0sworker restart held")
 		return
 	}
 

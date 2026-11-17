@@ -274,7 +274,6 @@ func (p *rabbitMQSuspendedCheck) Run(ctx context.Context) probefw.Result {
 			heal.RefundGrant(now)
 			continue
 		}
-		kube.MarkPodDeleted(ctx, pod.UID) // O(1) tombstone — no census reset
 		rabbitMQSuspendedHealsTotal.
 			WithLabelValues(pod.Namespace, pod.Name).Inc()
 		log.Info("DELETE: suspended-listener rabbitmq pod — quorum verified",

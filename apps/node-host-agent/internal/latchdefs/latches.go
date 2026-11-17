@@ -196,6 +196,11 @@ const (
 	LatchCSIRegistrationWedged = "csi-registration-wedged" // P1.6 workerhygiene
 	LatchNetfilterLocked       = "netfilter-locked"        // P2.11 workerhygiene
 	LatchNeighborPressure      = "neighbor-pressure"       // P0.4 hostmetrics
+
+	// Wave-3 self-healing latches.
+	LatchMountTablePressure = "mount-table-pressure"   // #4 workerhygiene mount-max & shared peer-group storm
+	LatchEBPFPressure       = "ebpf-resource-pressure" // #10 hostmetrics eBPF prog/map leak
+	LatchEtcdQuorumDegraded = "etcd-quorum-degraded"   // #8 controllerhygiene embedded etcd quorum/learner/fsync
 )
 
 // LatchDef is one registry entry: the latch's <name> suffix, the
@@ -346,6 +351,11 @@ var LatchDefs = []LatchDef{
 	// hostmetrics — the neighbor-table post-flush pressure latch
 	// (kernelfail neighbor.go upgrade).
 	{Name: LatchNeighborPressure, Owner: "hostmetrics"},
+
+	// Wave-3 self-healing latches.
+	{Name: LatchMountTablePressure, Owner: "workerhygiene"},
+	{Name: LatchEBPFPressure, Owner: "hostmetrics"},
+	{Name: LatchEtcdQuorumDegraded, Owner: "controllerhygiene"},
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},

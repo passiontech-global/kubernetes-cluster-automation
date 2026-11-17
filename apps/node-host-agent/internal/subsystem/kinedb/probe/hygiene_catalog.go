@@ -45,16 +45,26 @@ import (
 // (probe_test.go) airtight.
 func (p *Probe) hygieneCatalog(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
-		"SELECT COALESCE(MAX(age(datminmxid)),0) FROM pg_database; "+
-			"SELECT COUNT(indexrelid) FROM pg_index WHERE NOT indisvalid; "+
-			"SELECT COALESCE(seq_scan,0), COALESCE(seq_tup_read,0) "+
-			"FROM pg_stat_user_tables WHERE relname="+
-			kdeps.SQLQuote(p.d.Cfg.Table))
+	tblQ := kdeps.SQLQuote(p.d.Cfg.Table)
+	seqFallbackQ := kdeps.SQLQuote(p.d.Cfg.Table + "_id_seq")
+	sql := "SELECT COALESCE(MAX(age(datminmxid)),0) FROM pg_database; " +
+		"SELECT COUNT(indexrelid) FROM pg_index WHERE NOT indisvalid; " +
+		"SELECT COALESCE(seq_scan,0), COALESCE(seq_tup_read,0) " +
+		"FROM pg_stat_user_tables WHERE relname=" + tblQ + "; " +
+		"SELECT COALESCE((SELECT a.atttypid::bigint FROM pg_attribute a " +
+		"JOIN pg_class c ON c.oid = a.attrelid " +
+		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
+		"WHERE n.nspname = current_schema() AND c.relname = " + tblQ +
+		" AND a.attname = 'id' AND NOT a.attisdropped), 0); " +
+		"SELECT COALESCE((SELECT last_value FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), 0), " +
+		"COALESCE((SELECT max_value FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), 0), " +
+		"COALESCE((SELECT data_type::text FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), '')"
+	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, sql)
 	if err != nil {
 		note(fmt.Sprintf("mxid-age-fail: %v", err))
 		note(fmt.Sprintf("invalid-indexes-fail: %v", err))
 		note(fmt.Sprintf("seq-scan-fail: %v", err))
+		note(fmt.Sprintf("seq-cliff-fail: %v", err))
 		return
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
@@ -79,7 +89,68 @@ func (p *Probe) hygieneCatalog(ctx context.Context, pg, user, pass string,
 		// An empty result means the stats view has no row for the
 		// table yet — inconclusive, like a parse failure.
 		note(fmt.Sprintf("seq-scan-unparsed: %v", perr))
+	} else {
+		h.seqScans, h.seqTupRead, h.seqSeen = scans, tupRead, true
+	}
+	p.parseSeqCliffLines(line(3), line(4), h, note)
+}
+
+const (
+	pgTypeInt8 int64 = 20
+	pgTypeInt4 int64 = 23
+	int4MaxVal int64 = 2147483647
+)
+
+func (p *Probe) parseSeqCliffLines(typeLine, seqLine string, h *hygieneResult, note func(string)) {
+	typeLine = strings.TrimSpace(typeLine)
+	seqLine = strings.TrimSpace(seqLine)
+	if typeLine == "" || seqLine == "" {
 		return
 	}
-	h.seqScans, h.seqTupRead, h.seqSeen = scans, tupRead, true
+	attType, err := strconv.ParseInt(typeLine, 10, 64)
+	if err != nil {
+		note(fmt.Sprintf("seq-cliff-type-unparsed: %v", err))
+		return
+	}
+	parts := strings.Split(seqLine, "|")
+	if len(parts) != 3 {
+		note(fmt.Sprintf("seq-cliff-seq-unparsed: want 3 fields, got %d", len(parts)))
+		return
+	}
+	lastVal, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+	if err != nil {
+		note(fmt.Sprintf("seq-cliff-last-unparsed: %v", err))
+		return
+	}
+	maxVal, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	if err != nil {
+		note(fmt.Sprintf("seq-cliff-max-unparsed: %v", err))
+		return
+	}
+	dataType := strings.TrimSpace(parts[2])
+	if attType == 0 || maxVal <= 0 {
+		// Table or sequence absent — keep unseen rather than emitting 0.
+		return
+	}
+	effectiveCeiling := maxVal
+	if attType == pgTypeInt4 && effectiveCeiling > int4MaxVal {
+		effectiveCeiling = int4MaxVal
+	}
+	ratio := float64(lastVal) / float64(effectiveCeiling)
+	if ratio < 0 {
+		ratio = 0
+	}
+	hazard := 0.0
+	if attType == pgTypeInt4 || dataType != "bigint" || maxVal <= int4MaxVal {
+		hazard = 1.0
+	}
+	h.seqUtilRatio = ratio
+	h.idInt4Hazard = hazard
+	h.seqCliffSeen = true
+	p.d.M.SeqUtilRatio.Set(ratio)
+	p.d.M.IDInt4Hazard.Set(hazard)
+	if hazard == 1 && ratio >= 0.50 {
+		note(fmt.Sprintf("kine-id-int4-cliff-warning: atttypid=%d seq_type=%s util=%.3f",
+			attType, dataType, ratio))
+	}
 }

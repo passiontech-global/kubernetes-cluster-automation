@@ -207,8 +207,13 @@ func TestInotifyLatchEvictsRunawayPod(t *testing.T) {
 	e.H.Cfg.Pressure.InotifyEvictRunawayPod = true
 	writeInotifySysctls(t, e, 100, 8192)
 	uid := "123e4567-e89b-12d3-a456-426614174000"
+	isCtrl := true
 	leaky := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "app", Name: "leaky", UID: types.UID(uid)}}
+		Namespace: "app", Name: "leaky", UID: types.UID(uid),
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "leaky-rs", UID: "rs-uid-1", Controller: &isCtrl,
+		}},
+	}}
 	// leaky pod pid: 96 instances + 96×5=480 watches; a host pid
 	// holds the remaining 4 instances — leaky share ≈ 99%.
 	mkInotifyPID(t, e, 100, 96, 5, uid)
@@ -354,10 +359,14 @@ func TestInotifyEvictPicksPressuredAxisVictim(t *testing.T) {
 	writeInotifySysctls(t, e, 100, 8192)
 	uidA := "123e4567-e89b-12d3-a456-426614174010"
 	uidB := "123e4567-e89b-12d3-a456-426614174011"
+	isCtrl := true
+	owners := []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs", UID: "rs-uid-2", Controller: &isCtrl,
+	}}
 	podA := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "app", Name: "watcher-a", UID: types.UID(uidA)}}
+		Namespace: "app", Name: "watcher-a", UID: types.UID(uidA), OwnerReferences: owners}}
 	podB := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "app", Name: "leaky-b", UID: types.UID(uidB)}}
+		Namespace: "app", Name: "leaky-b", UID: types.UID(uidB), OwnerReferences: owners}}
 	// B: 90 instances, 0 watches — the instance-axis leaker.
 	// A: 1 instance, 4000 watches — aggregate 4001, instances share ~1%.
 	// Host pid: 6 instances. Node: 97 inst (97% of ceiling), 4000 watches (49%).
@@ -501,5 +510,85 @@ func TestInotifyFrozenSysctlArmsLatch(t *testing.T) {
 	inotifyRun(e, 100) // cycle 2 — latch arms on frozen axis
 	if !inotifyLatched(e) {
 		t.Fatal("read-only sysctl pinned the latch false forever")
+	}
+}
+
+func TestInotifySameOFDKcmpDedupAndSingletonAnonInode(t *testing.T) {
+	e := fixture(t)
+	writeInotifySysctls(t, e, 3, 8192)
+	mkInotifyPID(t, e, 100, 2, 0, "")
+	mkInotifyPID(t, e, 101, 2, 0, "")
+	mkProcStatus(t, e, 100, 0)
+	mkProcStatus(t, e, 101, 0)
+	// Same OFD across forked children proved by InotifySameOFDFn (kcmp seam).
+	e.H.Cfg.Seams.Host.InotifySameOFDFn = func(pidA, fdA, pidB, fdB int) bool {
+		return fdA == fdB
+	}
+	inotifyRun(e, 100, 101)
+	if got := readSysctl(t, e, "max_user_instances"); got != "3" {
+		t.Fatalf("kcmp-deduped 2 OFDs bumped sysctl: %s", got)
+	}
+}
+
+func TestInotifyEvictRailsNakedPVCAndMirror(t *testing.T) {
+	isCtrl := true
+	owners := []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs", UID: "rs-uid-rails", Controller: &isCtrl,
+	}}
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+	}{
+		{
+			name: "naked_pod",
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "app", Name: "naked", UID: "123e4567-e89b-12d3-a456-426614174020",
+			}},
+		},
+		{
+			name: "pvc_pod",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "app", Name: "db", UID: "123e4567-e89b-12d3-a456-426614174021",
+					OwnerReferences: owners,
+				},
+				Spec: corev1.PodSpec{Volumes: []corev1.Volume{{
+					Name:         "data",
+					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "db-pvc"}},
+				}}},
+			},
+		},
+		{
+			name: "mirror_pod",
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "app", Name: "mirror", UID: "123e4567-e89b-12d3-a456-426614174022",
+				OwnerReferences: owners,
+				Annotations:     map[string]string{"kubernetes.io/config.mirror": "abc"},
+			}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			e.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 100
+			e.H.Cfg.Pressure.InotifyEvictRunawayPod = true
+			writeInotifySysctls(t, e, 100, 8192)
+			mkInotifyPID(t, e, 100, 96, 0, string(tc.pod.UID))
+			if _, err := e.CS.CoreV1().Pods(tc.pod.Namespace).Create(context.Background(), tc.pod, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				e.H.Check(wdeps.CheckInotifyHygiene).Run(context.Background(), &wdeps.CycleEnv{
+					WorkerActive: true, APIOK: true,
+					Pods: []corev1.Pod{*tc.pod}, PidsOnce: wdepstest.PidsOf(100),
+				})
+			}
+			if n := len(wdepstest.DeleteActions(e.CS)); n != 0 {
+				t.Fatalf("%s deleted despite eviction rail", tc.name)
+			}
+			if !strings.Contains(e.LogLines(t), "protected by eviction rails") {
+				t.Fatalf("%s missing protection suspect log:\n%s", tc.name, e.LogLines(t))
+			}
+		})
 	}
 }

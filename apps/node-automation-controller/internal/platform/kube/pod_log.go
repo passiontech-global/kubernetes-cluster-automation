@@ -86,6 +86,9 @@ type PodLogOpts struct {
 	// line timestamps an old error reads as a live one for
 	// window/sweep-interval extra cycles).
 	Timestamps bool
+	// Previous reads the previous terminated container's logs (for
+	// CrashLoopBackOff diagnostics).
+	Previous bool
 }
 
 // ReadPodLogText fetches the bounded pod-log read for one pod container
@@ -111,6 +114,9 @@ func ReadPodLogText(ctx context.Context, cs kubernetes.Interface,
 	}
 	if o.Timestamps {
 		logOpts.Timestamps = true
+	}
+	if o.Previous {
+		logOpts.Previous = true
 	}
 	stream, err := cs.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, logOpts).Stream(lctx)
 	if err != nil {

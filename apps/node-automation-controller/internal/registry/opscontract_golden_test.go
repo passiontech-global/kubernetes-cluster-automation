@@ -138,6 +138,9 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"hpa-scaling-guard", "health"},
 	{"deployment-rollout-wedge", "health"},
 	{"subpath-config-drift", "health"},
+	// Self-healing wave-3 checks — appended at end.
+	{"service-selector-blackhole", "health"},
+	{"topology-spread-zone-deadlock", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -308,6 +311,12 @@ var goldenMetricFamilies = []string{
 	"node_automation_hpa_scaling_unhealthy",
 	"node_automation_deployment_rollout_wedge",
 	"node_automation_subpath_config_drift",
+	// Self-healing wave-3 metrics.
+	"node_automation_webhook_admission_degraded",
+	"node_automation_webhook_excessive_timeout",
+	"node_automation_tls_live_socket_drift",
+	"node_automation_service_blackhole",
+	"node_automation_topology_zone_deadlock",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key
@@ -384,6 +393,14 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"AnnoSubPathReloadOptOut", "passiontech.dev/subpath-reload-opt-out"},
 	{"AnnoLastSubPathReload", "passiontech.dev/last-subpath-reload"},
 	{"AnnoFirstSeenHPA", "passiontech.dev/first-seen-hpa-scaling"},
+	// Self-healing wave-3 stamps.
+	{"AnnoWebhookNeverFailOpen", "passiontech.dev/webhook-never-fail-open"},
+	{"AnnoLastCertDriftRollout", "passiontech.dev/last-cert-drift-rollout"},
+	{"AnnoCertDriftReloadOptOut", "passiontech.dev/cert-drift-reload-opt-out"},
+	{"AnnoCertDriftReloadOptIn", "passiontech.dev/cert-drift-reload-opt-in"},
+	{"AnnoTopologyRelaxedBy", "passiontech.dev/topology-relaxed-by"},
+	{"AnnoTopologyRelaxOptOut", "passiontech.dev/topology-relax-opt-out"},
+	{"AnnoTopologyRelaxOptIn", "passiontech.dev/topology-relax-opt-in"},
 }
 
 func TestGoldenRegistryRows(t *testing.T) {
@@ -673,6 +690,20 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.AnnoLastSubPathReload
 	case "AnnoFirstSeenHPA":
 		return kube.AnnoFirstSeenHPA
+	case "AnnoWebhookNeverFailOpen":
+		return kube.AnnoWebhookNeverFailOpen
+	case "AnnoLastCertDriftRollout":
+		return kube.AnnoLastCertDriftRollout
+	case "AnnoCertDriftReloadOptOut":
+		return kube.AnnoCertDriftReloadOptOut
+	case "AnnoCertDriftReloadOptIn":
+		return kube.AnnoCertDriftReloadOptIn
+	case "AnnoTopologyRelaxedBy":
+		return kube.AnnoTopologyRelaxedBy
+	case "AnnoTopologyRelaxOptOut":
+		return kube.AnnoTopologyRelaxOptOut
+	case "AnnoTopologyRelaxOptIn":
+		return kube.AnnoTopologyRelaxOptIn
 	default:
 		t.Fatalf("golden key %s no longer exists as an exported const in internal/platform/kube/annos.go — update the golden consciously", name)
 		return ""

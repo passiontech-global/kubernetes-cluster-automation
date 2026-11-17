@@ -24,6 +24,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 )
 
@@ -60,6 +61,20 @@ type Guard struct {
 	// informer-backed client. A nil reader (literally-built test
 	// fixtures) falls back to the direct clientset read.
 	NodeReader kube.CachedNodeReader
+	// PromEndpoint and PromClient feed Prometheus-backed admission
+	// latency/5xx queries; empty PromEndpoint disables the queries.
+	PromEndpoint string
+	PromClient   promq.Client
+	// WebhookErrorRateThreshold, WebhookLatencyP99Seconds, and
+	// LatencyBreakerTripEnabled tune slow/5xx admission degradation and
+	// circuit tripping.
+	WebhookErrorRateThreshold float64
+	WebhookLatencyP99Seconds  float64
+	LatencyBreakerTripEnabled bool
+	// TimeoutClampEnabled and MaxWebhookTimeoutSeconds control the
+	// admission timeoutSeconds clamp.
+	TimeoutClampEnabled      bool
+	MaxWebhookTimeoutSeconds int32
 }
 
 // Snapshot carries the cluster state one run shares across its
@@ -225,7 +240,7 @@ func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 func (g *Guard) cachedCRDs(ctx context.Context) (
 	[]unstructured.Unstructured, bool) {
 
-	if g.NodeReader == nil {
+	if g.NodeReader == nil || !kube.CRDInformerEnabled() {
 		return nil, false
 	}
 	var list apiextensionsv1.CustomResourceDefinitionList

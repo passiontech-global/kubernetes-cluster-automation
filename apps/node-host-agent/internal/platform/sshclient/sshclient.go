@@ -203,8 +203,12 @@ func (c Config) clientConfigFor(user string, signer ssh.Signer, pin string) *ssh
 	case c.Log != nil:
 		log := c.Log
 		cb = func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			remoteAddr := "<nil>"
+			if remote != nil {
+				remoteAddr = remote.String()
+			}
 			log.Info("sshclient: ssh host key accepted (no strict check)",
-				"addr", hostname, "remote", remote.String(),
+				"addr", hostname, "remote", remoteAddr,
 				"fingerprint", ssh.FingerprintSHA256(key))
 			return nil
 		}

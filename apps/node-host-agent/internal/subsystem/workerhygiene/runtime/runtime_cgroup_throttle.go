@@ -48,7 +48,15 @@ const (
 	// throttling — every task in the pod stalls on memory reclaim
 	// this share of wall time.
 	podCgroupPSIFullHigh = 40.0
+
+	cpuCFSMinPeriodDelta = 20
+	cpuCFSConfirmCycles  = 3
 )
+
+type cpuStatSample struct {
+	periods   int64
+	throttled int64
+}
 
 // CgroupThrottleCheck is the cgroup-pod-throttle pod-cgroup throttle guard as
 // a Check. prevHigh / prevPidsDenials keep last cycle's
@@ -64,6 +72,17 @@ type CgroupThrottleCheck struct {
 	// the dir's disappearance (a recycled slice name must not
 	// inherit the old pod's marker).
 	evented map[string]bool
+
+	// Wave-3 #9a: CPU CFS bandwidth throttling state.
+	prevHostCPUTotal int64
+	prevHostCPUIdle  int64
+	hasPrevHostCPU   bool
+	prevCPUStat      map[string]cpuStatSample
+	cpuStreak        map[string]int
+	cpuEvented       map[string]bool
+
+	// Wave-3 #9b: per-PID VMA max_map_count event dedup.
+	vmaEvented map[string]bool
 }
 
 // Name returns the check label / WD_SIG key.
@@ -188,6 +207,16 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.evented == nil {
 		c.evented = map[string]bool{}
 	}
+	if c.prevCPUStat == nil {
+		c.prevCPUStat = map[string]cpuStatSample{}
+	}
+	if c.cpuStreak == nil {
+		c.cpuStreak = map[string]int{}
+	}
+	if c.cpuEvented == nil {
+		c.cpuEvented = map[string]bool{}
+	}
+	hostIdleRatio, hostIdleOK := c.readHostCPUIdleRatio()
 	podByUID := e.PodByUID()
 	dirs := podSliceDirs(kubepods)
 	seen := map[string]bool{}
@@ -240,6 +269,8 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 			c.prevPidsDenial[dir] = denied
 		}
+		// --- CPU CFS bandwidth throttling half (Wave-3 #9a) ---
+		c.evalCPUCFSThrottle(ctx, dir, hostIdleRatio, hostIdleOK, podByUID)
 	}
 	// Drop delta ledgers for vanished pod slices — a deleted pod's
 	// counter must not carry into a recycled slice name.
@@ -258,8 +289,144 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			delete(c.evented, dir)
 		}
 	}
+	for dir := range c.prevCPUStat {
+		if !seen[dir] {
+			delete(c.prevCPUStat, dir)
+		}
+	}
+	for dir := range c.cpuStreak {
+		if !seen[dir] {
+			delete(c.cpuStreak, dir)
+		}
+	}
+	for dir := range c.cpuEvented {
+		if !seen[dir] {
+			delete(c.cpuEvented, dir)
+		}
+	}
 	c.d.PodCgroupPIDsMaxUtilRatio = maxRatio
+	c.checkVMAPressure(ctx, e, podByUID)
 	c.d.CycleResult(wdeps.CheckCgroupThrottle, "ok")
+}
+
+func (c *CgroupThrottleCheck) readHostCPUIdleRatio() (float64, bool) {
+	data, err := os.ReadFile(filepath.Join(c.d.Cfg.ProcRoot, "stat"))
+	if err != nil {
+		return 0, false
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if !strings.HasPrefix(line, "cpu ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			return 0, false
+		}
+		var total, idle int64
+		for i, raw := range fields[1:] {
+			v, perr := strconv.ParseInt(raw, 10, 64)
+			if perr != nil {
+				return 0, false
+			}
+			total += v
+			if i == 3 { // idle column (0=user,1=nice,2=system,3=idle)
+				idle = v
+			}
+		}
+		if total <= 0 {
+			return 0, false
+		}
+		var ratio float64
+		if c.hasPrevHostCPU && total > c.prevHostCPUTotal && idle >= c.prevHostCPUIdle {
+			ratio = float64(idle-c.prevHostCPUIdle) / float64(total-c.prevHostCPUTotal)
+		} else {
+			ratio = float64(idle) / float64(total)
+		}
+		c.prevHostCPUTotal = total
+		c.prevHostCPUIdle = idle
+		c.hasPrevHostCPU = true
+		return ratio, true
+	}
+	return 0, false
+}
+
+func readCPUStat(path string) (cpuStatSample, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cpuStatSample{}, false
+	}
+	var s cpuStatSample
+	var gotPeriods, gotThrottled bool
+	for line := range strings.SplitSeq(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		v, perr := strconv.ParseInt(f[1], 10, 64)
+		if perr != nil {
+			continue
+		}
+		switch f[0] {
+		case "nr_periods":
+			s.periods = v
+			gotPeriods = true
+		case "nr_throttled":
+			s.throttled = v
+			gotThrottled = true
+		}
+	}
+	return s, gotPeriods && gotThrottled
+}
+
+func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, dir string,
+	hostIdleRatio float64, hostIdleOK bool, podByUID map[string]*corev1.Pod) {
+	cur, ok := readCPUStat(filepath.Join(dir, "cpu.stat"))
+	if !ok {
+		return
+	}
+	prev, hadPrev := c.prevCPUStat[dir]
+	c.prevCPUStat[dir] = cur
+	if !hadPrev || cur.periods < prev.periods || cur.throttled < prev.throttled {
+		c.cpuStreak[dir] = 0
+		return
+	}
+	dPeriods := cur.periods - prev.periods
+	dThrottled := cur.throttled - prev.throttled
+	if dPeriods < cpuCFSMinPeriodDelta {
+		c.cpuStreak[dir] = 0
+		delete(c.cpuEvented, dir)
+		return
+	}
+	throttleRatio := float64(dThrottled) / float64(dPeriods)
+	throttled := throttleRatio > c.d.Cfg.Wave3.CPUCFSThrottleRatio &&
+		hostIdleOK && hostIdleRatio >= c.d.Cfg.Wave3.CPUHostIdleMinRatio
+	if !throttled {
+		c.cpuStreak[dir] = 0
+		delete(c.cpuEvented, dir)
+		return
+	}
+	c.cpuStreak[dir]++
+	if c.cpuStreak[dir] < cpuCFSConfirmCycles {
+		return
+	}
+	c.d.Series.PodCgroupCPUThrottled++
+	uid := podUIDFromSlice(dir)
+	c.d.State.AppendLog(fmt.Sprintf(
+		"suspect: cgroup-pod-throttle pod uid=%s cpu.stat throttled=%d/%d (%.1f%%) host_idle=%.1f%% (%dx)",
+		uid, dThrottled, dPeriods, throttleRatio*100, hostIdleRatio*100, c.cpuStreak[dir]))
+	if !c.cpuEvented[dir] {
+		pod := podByUID[uid]
+		if pod == nil || c.d.Cfg.Client == nil {
+			c.cpuEvented[dir] = true
+			return
+		}
+		if err := c.d.EmitPodEvent(ctx, pod, "cpu-cfs", "PodCPUCFSThrottled",
+			fmt.Sprintf("pod cgroup CPU CFS throttled %d/%d periods (%.1f%%) while host CPU idle=%.1f%% — CPU limit is starving pod despite ample host capacity",
+				dThrottled, dPeriods, throttleRatio*100, hostIdleRatio*100)); err == nil {
+			c.cpuEvented[dir] = true
+			c.d.Actions.WithLabelValues(wdeps.CheckCgroupThrottle, "cpu_event").Inc()
+		}
+	}
 }
 
 // throttledEvent creates the PodMemoryHighThrottled Warning Event on

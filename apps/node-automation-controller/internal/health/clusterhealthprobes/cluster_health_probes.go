@@ -1,8 +1,8 @@
 // cluster_health_probes.go — the sweep module root: Setup and the
-// prober. The 56 checks it drives live in per-domain subpackages
+// prober. The 68 checks it drives live in per-domain subpackages
 // under internal/health on top of the shared probefw framework; the
 // roster itself is a registry concern — every check is a CheckReg
-// row in internal/registry (52 always-on rows plus 4 gated rows),
+// row in internal/registry (52 always-on rows plus 16 gated rows),
 // collected into Deps.CheckRegs in registry order, which IS the
 // sweep order:
 //

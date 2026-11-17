@@ -58,7 +58,7 @@ type OrphanPodVolsCheck struct{ d *wdeps.Deps }
 func (c *OrphanPodVolsCheck) Name() string { return wdeps.CheckOrphanPodVols }
 
 // Run executes one orphan-pod-volumes round.
-func (c *OrphanPodVolsCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
+func (c *OrphanPodVolsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckOrphanPodVols) {
 		return
 	}
@@ -185,6 +185,10 @@ func (c *OrphanPodVolsCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 					"suspect: orphan-pod-volumes reap cap %d reached — remaining orphans drain next cycle",
 					orphanPodVolsMaxReapPerCycle))
 			}
+			continue
+		}
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog("suspect: orphan-pod-volumes reap held — cluster maintenance in progress")
 			continue
 		}
 		if err := os.RemoveAll(podDir); err != nil {

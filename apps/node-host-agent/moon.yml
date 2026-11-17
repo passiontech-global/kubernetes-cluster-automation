@@ -151,8 +151,10 @@ tasks:
          { [ -n "${ACTIONS_CACHE_URL:-}" ] || [ -n "${ACTIONS_RESULTS_URL:-}" ]; }; then
         # GHA BuildKit cache, scoped per app — release legs never
         # poison each other's layer cache (ci.yml docker-build
-        # parity).
-        cache_args="--cache-from type=gha,scope=node-host-agent --cache-to type=gha,scope=node-host-agent,mode=max"
+        # parity). ignore-error=true on --cache-to keeps a transient
+        # GHA cache/edge 400/5xx error from failing an already-built
+        # release image.
+        cache_args="--cache-from type=gha,scope=node-host-agent --cache-to type=gha,scope=node-host-agent,mode=max,ignore-error=true"
       fi
       # --load: buildx's container driver (release-app.yml sets up
       # buildx) does not auto-load; the local docker driver ignores

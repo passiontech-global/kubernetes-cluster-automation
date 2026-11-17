@@ -36,7 +36,8 @@ import (
 // Check — stateless: the eventpurge+rescue cadence lives in the
 // last-etcd-guard budget.
 type GuardCheck struct {
-	d *cdeps.Deps
+	d  *cdeps.Deps
+	qt quorumTracker
 }
 
 // Name returns the check label / log context.
@@ -58,7 +59,7 @@ func (c *GuardCheck) Run(ctx context.Context) {
 	// dirs to verify.
 	c.VerifySnapshots()
 
-	dbSize, dbUse, err := c.etcdStatus(ctx)
+	st, err := c.etcdStatus(ctx)
 	if err != nil {
 		// etcd unreachable — nothing measurable; the wedge/feeder
 		// guards own the control-plane-down story.
@@ -68,39 +69,51 @@ func (c *GuardCheck) Run(ctx context.Context) {
 		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "status_error").Inc()
 		return
 	}
-	c.d.EtcdDBSize.Set(float64(dbSize))
-	c.d.EtcdDBUse.Set(float64(dbUse))
+	c.d.EtcdDBSize.Set(float64(st.dbSize))
+	c.d.EtcdDBUse.Set(float64(st.dbUse))
+	if st.isLearner {
+		c.d.EtcdIsLearner.Set(1)
+	} else {
+		c.d.EtcdIsLearner.Set(0)
+	}
 
-	// The alarm-list probe only runs while dbSize is below the
-	// trigger: over-limit the action decision is already made, so a
-	// second etcdctl would only double the routine probe cost —
-	// against a hung etcd each call can burn its whole command
-	// timeout. A skipped probe leaves the nospace gauge at its last
-	// value, the same "keep last, never force-clear a
-	// possibly-armed alarm" semantics as a probe error.
-	var nospace bool
-	if dbSize < c.d.Cfg.EtcdGuard.DBSizeLimit {
-		ns, aerr := c.etcdNospaceArmed(ctx)
-		if aerr != nil {
-			// A failed alarm read must not hide a real alarm —
-			// treat the size signal as authoritative this cycle,
-			// surface the error once in the log, and LEAVE the
-			// gauge at its last value.
-			c.d.State.AppendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", aerr))
-		} else if ns {
-			nospace = true
+	// Wave-3 #8: read `alarm list` BEFORE any compact/defrag decision (even
+	// when dbSize >= DBSizeLimit) so a CORRUPT alarm absolutely blocks
+	// eventpurge + etcdmaint and preserves BoltDB/WAL evidence.
+	nospace, corrupt, aerr := c.etcdAlarms(ctx)
+	if aerr != nil {
+		// A failed alarm read must not hide a real alarm —
+		// treat the size signal as authoritative this cycle,
+		// surface the error once in the log, and LEAVE the
+		// gauge at its last value.
+		c.d.State.AppendLogWarn(fmt.Sprintf("etcdguard: alarm list failed: %v", aerr))
+	} else {
+		if nospace {
 			c.d.EtcdNospace.Set(1)
 		} else {
 			c.d.EtcdNospace.Set(0)
 		}
+		if corrupt {
+			c.d.EtcdCorrupt.Set(1)
+		} else {
+			c.d.EtcdCorrupt.Set(0)
+		}
+	}
+
+	c.evalQuorumAndMetrics(ctx, st, corrupt, aerr == nil)
+	if corrupt {
+		c.d.State.AppendLog(
+			"ACTION: etcdguard CORRUPT alarm armed — blocking eventpurge + etcdmaint to preserve BoltDB/WAL evidence")
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "corrupt_alarm").Inc()
+		return
 	}
 
 	var reason string
 	switch {
 	case nospace:
 		reason = "nospace-alarm"
-	case dbSize >= c.d.Cfg.EtcdGuard.DBSizeLimit:
-		reason = fmt.Sprintf("dbSize=%d>=%d", dbSize, c.d.Cfg.EtcdGuard.DBSizeLimit)
+	case st.dbSize >= c.d.Cfg.EtcdGuard.DBSizeLimit:
+		reason = fmt.Sprintf("dbSize=%d>=%d", st.dbSize, c.d.Cfg.EtcdGuard.DBSizeLimit)
 	default:
 		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "ok").Inc()
 		return
@@ -262,37 +275,51 @@ func (c *GuardCheck) VerifySnapshots() {
 	}
 }
 
+type etcdStatusInfo struct {
+	dbSize    int64
+	dbUse     int64
+	leader    *uint64
+	isLearner bool
+}
+
 // etcdStatus fetches `endpoint status -w json` and returns the db
-// file size + in-use size of element[0] (same JSON shape
+// file size + in-use size + leader + isLearner of element[0] (same JSON shape
 // etcdmaint.parseStatusJSON consumes).
-func (c *GuardCheck) etcdStatus(ctx context.Context) (dbSize, dbUse int64, err error) {
+func (c *GuardCheck) etcdStatus(ctx context.Context) (etcdStatusInfo, error) {
 	b, err := c.d.Cfg.EtcdctlFn(ctx, "endpoint", "status", "-w", "json")
 	if err != nil {
-		return 0, 0, err
+		return etcdStatusInfo{}, err
 	}
 	var arr []struct {
 		Status struct {
-			DBSize      int64 `json:"dbSize"`
-			DBSizeInUse int64 `json:"dbSizeInUse"`
+			DBSize      int64   `json:"dbSize"`
+			DBSizeInUse int64   `json:"dbSizeInUse"`
+			Leader      *uint64 `json:"leader"`
+			IsLearner   bool    `json:"isLearner"`
 		} `json:"Status"`
 	}
 	if err := json.Unmarshal(b, &arr); err != nil {
-		return 0, 0, fmt.Errorf("parse endpoint status: %w", err)
+		return etcdStatusInfo{}, fmt.Errorf("parse endpoint status: %w", err)
 	}
 	if len(arr) == 0 {
-		return 0, 0, errors.New("parse endpoint status: empty endpoint list")
+		return etcdStatusInfo{}, errors.New("parse endpoint status: empty endpoint list")
 	}
-	return arr[0].Status.DBSize, arr[0].Status.DBSizeInUse, nil
+	return etcdStatusInfo{
+		dbSize:    arr[0].Status.DBSize,
+		dbUse:     arr[0].Status.DBSizeInUse,
+		leader:    arr[0].Status.Leader,
+		isLearner: arr[0].Status.IsLearner,
+	}, nil
 }
 
-// etcdNospaceArmed reports whether `alarm list` carries a NOSPACE
-// entry — the memberID:xxx alarm:NOSPACE grep the manual flow used.
-func (c *GuardCheck) etcdNospaceArmed(ctx context.Context) (bool, error) {
+// etcdAlarms reports whether `alarm list` carries NOSPACE or CORRUPT entries.
+func (c *GuardCheck) etcdAlarms(ctx context.Context) (nospace, corrupt bool, err error) {
 	b, err := c.d.Cfg.EtcdctlFn(ctx, "alarm", "list")
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	return strings.Contains(string(b), "NOSPACE"), nil
+	s := string(b)
+	return strings.Contains(s, "NOSPACE"), strings.Contains(s, "CORRUPT"), nil
 }
 
 // guardLogWriter adapts the eventpurge/etcdmaint io.Writer output to

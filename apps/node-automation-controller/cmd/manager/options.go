@@ -60,42 +60,41 @@ var podCacheLabelSelector = func() labels.Selector {
 	return sel
 }()
 
-func buildCacheOptions(crdSize *kube.CRDSizeTable) cache.Options {
+func buildCacheOptions(crdSize *kube.CRDSizeTable, watchCRDs bool) cache.Options {
+	byObj := map[client.Object]cache.ByObject{
+		&appsv1.DaemonSet{}: {
+			Namespaces: map[string]cache.Config{"kube-system": {}},
+			Field: fields.SelectorFromSet(
+				fields.Set{"metadata.name": "konnectivity-agent"}),
+		},
+		&appsv1.Deployment{}: {
+			Namespaces: map[string]cache.Config{"kube-system": {}},
+		},
+		&corev1.Secret{}: {
+			// fluent-system only — the sole consumer is
+			// fluentbitroller's passiontech-pipeline watch; a
+			// cluster-wide Secret informer would cache every
+			// TLS key and image-pull credential in the fleet.
+			Namespaces: map[string]cache.Config{"fluent-system": {}},
+			Field: fields.SelectorFromSet(
+				fields.Set{"metadata.name": "passiontech-pipeline"}),
+		},
+		&corev1.Pod{}: {
+			Namespaces: map[string]cache.Config{"kube-system": {}},
+			Label:      podCacheLabelSelector,
+		},
+	}
+	// Register the CRD informer only when startup SSAR proved list+watch
+	// permissions on apiextensions.k8s.io/customresourcedefinitions;
+	// otherwise controller-runtime's reflector would wedge cache sync.
+	if watchCRDs {
+		byObj[&apiextensionsv1.CustomResourceDefinition{}] = cache.ByObject{
+			Transform: makeCRDCacheTransform(crdSize),
+		}
+	}
 	return cache.Options{
 		DefaultTransform: defaultCacheTransform,
-		ByObject: map[client.Object]cache.ByObject{
-			&appsv1.DaemonSet{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-				Field: fields.SelectorFromSet(
-					fields.Set{"metadata.name": "konnectivity-agent"}),
-			},
-			&appsv1.Deployment{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-			},
-			&corev1.Secret{}: {
-				// fluent-system only — the sole consumer is
-				// fluentbitroller's passiontech-pipeline watch; a
-				// cluster-wide Secret informer would cache every
-				// TLS key and image-pull credential in the fleet.
-				Namespaces: map[string]cache.Config{"fluent-system": {}},
-				Field: fields.SelectorFromSet(
-					fields.Set{"metadata.name": "passiontech-pipeline"}),
-			},
-			&corev1.Pod{}: {
-				Namespaces: map[string]cache.Config{"kube-system": {}},
-				Label:      podCacheLabelSelector,
-			},
-			// The CRD informer backs two consumers: webhookguard's
-			// conversion-webhook census (reads .spec.conversion off the
-			// cached objects) and the sprawl kine census's size table
-			// (see makeCRDCacheTransform). Cluster-wide by need — CRDs are
-			// cluster-scoped. RBAC note: this informer needs LIST+WATCH
-			// on apiextensions.k8s.io/customresourcedefinitions (the
-			// legacy dyn LIST grant already existed; WATCH is new).
-			&apiextensionsv1.CustomResourceDefinition{}: {
-				Transform: makeCRDCacheTransform(crdSize),
-			},
-		},
+		ByObject:         byObj,
 	}
 }
 
@@ -168,7 +167,7 @@ func resolveLeaderNamespace() string {
 
 func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 	leaderElect bool, leaseDuration, renewDeadline, retryPeriod time.Duration,
-	leaderNS string, leaderLock resourcelock.Interface, crdSize *kube.CRDSizeTable) ctrl.Options {
+	leaderNS string, leaderLock resourcelock.Interface, crdSize *kube.CRDSizeTable, watchCRDs bool) ctrl.Options {
 	mgrOptions := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -181,7 +180,7 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 		LeaderElectionID:                    leaderElectionID,
 		LeaderElectionReleaseOnCancel:       true,
 		LeaderElectionResourceLockInterface: leaderLock,
-		Cache:                               buildCacheOptions(crdSize),
+		Cache:                               buildCacheOptions(crdSize, watchCRDs),
 		// RecoverPanic: a panicking reconcile must not take the
 		// whole manager down — controller-runtime recovers per
 		// invocation and surfaces the panic as a reconcile error.

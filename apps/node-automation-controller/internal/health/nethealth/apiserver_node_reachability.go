@@ -227,7 +227,7 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 	// fresh-lease candidates: a mass dead-kubelet event is the
 	// reaper's incident, not a reason to suppress a real dark node
 	// sharing the sweep.
-	if len(darkCandidates)*2 >= len(candidates) {
+	if len(candidates) > 1 && len(darkCandidates)*2 >= len(candidates) {
 		rep.Find(fmt.Sprintf("apiserver-dark on %d/%d workers (fresh lease) — "+
 			"mesh-wide fault, no fencing", len(darkCandidates), len(candidates)))
 		return rep.Result(&c.emitted, apiserverNodeDarkGauge.DeleteLabelValues,
@@ -239,6 +239,7 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 	// result, not the ledger — one healthy answer is reachability
 	// proof, and holding the fence on a recovered node only extends
 	// the outage's scheduling damage.
+	fencedDark := map[string]bool{}
 	for i := range nodes {
 		n := &nodes[i]
 		if kube.IsControlPlane(n) || !kube.NodeReady(n) {
@@ -246,6 +247,9 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 		}
 		hasTaint := kube.HasTaint(n.Spec.Taints, kube.TaintApiserverUnreachable)
 		_, wasDark := dark[n.Name]
+		if persistedDark[n.Name] && hasTaint {
+			fencedDark[n.Name] = true
+		}
 		if persistedDark[n.Name] && !hasTaint {
 			// Taint/untaint are scheduling mutations — same heal
 			// contract as the pod deletes below. HealAllowedOnNode
@@ -282,6 +286,7 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 				rep.InfraErr(fmt.Errorf("taint %s: %w", n.Name, err))
 				continue
 			}
+			fencedDark[n.Name] = true
 			// The mutation landed — stamp the fence cooldown so a
 			// restart (or the next sweep's HealAllowed) honors the
 			// window this grant already spent.
@@ -318,8 +323,8 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 	// Webhook-backend evacuation — only worth the census when at
 	// least one node is fenced-dark; a dark node hosting no Fail-
 	// policy webhook backend needs no pod churn.
-	if len(persistedDark) > 0 {
-		c.evictWebhookBackends(ctx, &rep, persistedDark, now, log)
+	if len(fencedDark) > 0 {
+		c.evictWebhookBackends(ctx, &rep, fencedDark, now, log)
 	}
 
 	return rep.Result(&c.emitted, apiserverNodeDarkGauge.DeleteLabelValues,

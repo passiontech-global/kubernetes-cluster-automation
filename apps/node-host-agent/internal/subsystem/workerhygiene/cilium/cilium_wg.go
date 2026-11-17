@@ -310,11 +310,16 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx but node overloaded — skip kill",
 			actual, expected, c.Fails))
+	case c.d.HoldEmergencyHeal(ctx):
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx — emergency restart held by maintenance window, skip",
+			actual, expected, c.Fails))
 	case !c.d.State.RateTrySpend("last-cilium-restart", c.d.Cfg.MinRestartInterval):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-wg-peers allowed_ips=%d expected=%d %dx but restart cooldown — skip kill",
 			actual, expected, c.Fails))
 	default:
+		c.d.StampLocalRemediation(ctx)
 		// Budget already spent atomically by the rateTrySpend case.
 		if killCiliumAgent(c.d, tasks) {
 			// NPD contract: the cilium_wg0 line feeds

@@ -84,17 +84,74 @@ func pausePIDOf(tasks []wdeps.CtrTask) int {
 }
 
 // DNSResolvCheck is the 33-dns-resolv-drift guard as a Check; it
-// owns the stale-pause streak (ex-Hygiene.dnsFails).
+// owns the stale-pause streak (ex-Hygiene.dnsFails), per-UID resolv.conf
+// overflow cache (Wave-3 #12a), and loopback DNS event dedup.
 type DNSResolvCheck struct {
-	d     *wdeps.Deps
-	fails int
+	d               *wdeps.Deps
+	fails           int
+	resolvCache     map[string]resolvInspect
+	loopbackEvented map[string]bool
+}
+
+type resolvInspect struct {
+	overflow bool
+	detail   string
+	evented  bool
+}
+
+func isLoopbackNS(ip string) bool {
+	return ip == "127.0.0.53" || ip == "127.0.0.1" || ip == "::1"
+}
+
+func checkResolvOverflow(path string) (overflow bool, detail string, ok bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, "", false
+	}
+	var nsCount, searchDomains, maxSearchLine int
+	for rawLine := range strings.SplitSeq(string(data), "\n") {
+		line := strings.TrimRight(rawLine, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		f := strings.Fields(trimmed)
+		if len(f) == 0 {
+			continue
+		}
+		switch f[0] {
+		case "nameserver":
+			if len(f) >= 2 {
+				nsCount++
+			}
+		case "search":
+			if len(line) > maxSearchLine {
+				maxSearchLine = len(line)
+			}
+			searchDomains += len(f) - 1
+		}
+	}
+	var reasons []string
+	if nsCount > 3 {
+		reasons = append(reasons, fmt.Sprintf("nameservers=%d>3", nsCount))
+	}
+	if searchDomains > 6 {
+		reasons = append(reasons, fmt.Sprintf("search_domains=%d>6", searchDomains))
+	}
+	if maxSearchLine > 256 {
+		reasons = append(reasons, fmt.Sprintf("search_line_bytes=%d>256", maxSearchLine))
+	}
+	if len(reasons) > 0 {
+		return true, strings.Join(reasons, ", "), true
+	}
+	return false, "", true
 }
 
 // Name returns the check label / WD_SIG key.
 func (c *DNSResolvCheck) Name() string { return wdeps.CheckDNS }
 
 // Run executes one dns-resolv round.
-func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
+func (c *DNSResolvCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckDNS) {
 		return
 	}
@@ -104,44 +161,127 @@ func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckDNS, "abort")
 		return
 	}
-	hostNS, _ := nameserverSet(c.d.Cfg.HostResolvConf)
+	if c.resolvCache == nil {
+		c.resolvCache = map[string]resolvInspect{}
+	}
+	if c.loopbackEvented == nil {
+		c.loopbackEvented = map[string]bool{}
+	}
 
-	var stale []dnsStale
-	if len(hostNS) > 0 { // empty host set → nothing to compare (shell parity)
-		// Task map is built only when a Running dns-pod actually
-		// needs its pause pid looked up.
-		var tasks map[string][]wdeps.CtrTask
-		for i := range e.Pods {
-			p := &e.Pods[i]
-			// Namespace pin like deleteKonnectivityPod: the name
-			// regex alone would match a user pod named coredns-*/
-			// node-local-dns-* in ANY namespace — the pause SIGKILL
-			// is only for the kube-system DaemonSets.
-			if p.Status.Phase != corev1.PodRunning ||
-				p.Namespace != "kube-system" ||
-				!dnsPodRe.MatchString(p.Name) {
-				continue
-			}
-			if tasks == nil {
+	hostNS, _ := nameserverSet(c.d.Cfg.HostResolvConf)
+	hostHasLoopback := slices.ContainsFunc(hostNS, isLoopbackNS)
+	hostHasExternal := false
+	for _, ns := range hostNS {
+		if !isLoopbackNS(ns) {
+			hostHasExternal = true
+			break
+		}
+	}
+
+	var tasks map[string][]wdeps.CtrTask
+	tasksLoaded := false
+	loadTasks := func() map[string][]wdeps.CtrTask {
+		if !tasksLoaded {
+			tasksLoaded = true
+			if e.TasksOnce != nil {
 				tasks, _ = e.TasksOnce()
-				// An incomplete map is fail-closed here already:
-				// an unseen pause pid reads as pid==0 → the pod
-				// is skipped, never killed.
 			}
-			pid := pausePIDOf(tasks[string(p.UID)])
-			if pid == 0 {
-				continue // no live pause task — can't see the pod's resolv.conf
+		}
+		return tasks
+	}
+
+	liveUIDs := make(map[string]bool, len(e.Pods))
+	var overflowCount int64
+	var stale []dnsStale
+
+	for i := range e.Pods {
+		p := &e.Pods[i]
+		uid := string(p.UID)
+		liveUIDs[uid] = true
+
+		// 1. Wave-3 #12a: inspect resolv.conf limits for every Running pod (cached by UID).
+		if p.Status.Phase == corev1.PodRunning {
+			entry, cached := c.resolvCache[uid]
+			if !cached {
+				pid := pausePIDOf(loadTasks()[uid])
+				if pid != 0 {
+					if ov, det, ok := checkResolvOverflow(c.d.Proc.File(pid, "root/etc/resolv.conf")); ok {
+						entry = resolvInspect{overflow: ov, detail: det}
+						c.resolvCache[uid] = entry
+						cached = true
+					}
+				}
 			}
-			// Read the POD's resolv.conf through the pause mount ns —
-			// ProcRoot/<pid>/root is the task's filesystem view.
-			podNS, clusterLocal := nameserverSet(
-				c.d.Proc.File(pid, "root/etc/resolv.conf"))
-			if clusterLocal || len(podNS) == 0 {
-				continue
+			if cached && entry.overflow {
+				overflowCount++
+				if !entry.evented {
+					if c.d.Cfg.Client == nil {
+						entry.evented = true
+						c.resolvCache[uid] = entry
+					} else if err := c.d.EmitPodEvent(ctx, p, "resolv-overflow", "PodDNSResolvOverflow",
+						fmt.Sprintf("pod /etc/resolv.conf exceeds glibc limits (%s)", entry.detail)); err == nil {
+						entry.evented = true
+						c.resolvCache[uid] = entry
+						c.d.Actions.WithLabelValues(wdeps.CheckDNS, "resolv_overflow_event").Inc()
+					}
+				}
 			}
-			if !equalNS(podNS, hostNS) {
-				stale = append(stale, dnsStale{pod: p.Name, pid: pid})
+		}
+
+		// 2. DNS DaemonSet pod drift + loopback guard (covers Running & CrashLoopBackOff).
+		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed ||
+			p.Namespace != "kube-system" || !dnsPodRe.MatchString(p.Name) {
+			continue
+		}
+		pid := pausePIDOf(loadTasks()[uid])
+		if pid == 0 {
+			continue // no live pause task — can't see the pod's resolv.conf
+		}
+		// Read the POD's resolv.conf through the pause mount ns —
+		// ProcRoot/<pid>/root is the task's filesystem view.
+		podNS, clusterLocal := nameserverSet(
+			c.d.Proc.File(pid, "root/etc/resolv.conf"))
+		if clusterLocal || len(podNS) == 0 {
+			continue
+		}
+		podHasLoopback := slices.ContainsFunc(podNS, isLoopbackNS)
+		switch {
+		case podHasLoopback && hostHasLoopback:
+			// Both host and DNS pod point to 127.0.0.53 (systemd-resolved stub not converged):
+			// surface suspect + deduped Warning Event rather than looping on equalNS.
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: dns-resolv loopback nameserver on both host and DNS pod %s (pod_ns=%v host_ns=%v)",
+				p.Name, podNS, hostNS))
+			if !c.loopbackEvented[uid] {
+				if c.d.Cfg.Client == nil {
+					c.loopbackEvented[uid] = true
+				} else if err := c.d.EmitPodEvent(ctx, p, "dns-loopback", "DNSLoopbackNameserver",
+					fmt.Sprintf("DNS pod %s and host /etc/resolv.conf both contain loopback nameserver (%v) — systemd-resolved stub may cause CoreDNS plugin/loop",
+						p.Name, podNS)); err == nil {
+					c.loopbackEvented[uid] = true
+					c.d.Actions.WithLabelValues(wdeps.CheckDNS, "loopback_event").Inc()
+				}
 			}
+		case podHasLoopback && hostHasExternal && !hostHasLoopback:
+			// Host resolv.conf is clean with external upstreams while DNS pod sandbox still
+			// carries loopback (even in CrashLoopBackOff): kill pause so kubelet rebuilds sandbox.
+			stale = append(stale, dnsStale{pod: p.Name, pid: pid})
+		case p.Status.Phase == corev1.PodRunning && len(hostNS) > 0 && !equalNS(podNS, hostNS):
+			stale = append(stale, dnsStale{pod: p.Name, pid: pid})
+		default:
+			delete(c.loopbackEvented, uid)
+		}
+	}
+
+	c.d.Series.PodDNSResolvOverflow = overflowCount
+	for uid := range c.resolvCache {
+		if !liveUIDs[uid] {
+			delete(c.resolvCache, uid)
+		}
+	}
+	for uid := range c.loopbackEvented {
+		if !liveUIDs[uid] {
+			delete(c.loopbackEvented, uid)
 		}
 	}
 
@@ -162,8 +302,12 @@ func (c *DNSResolvCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	c.d.State.Enter(latchdefs.LatchDNSResolvStale, staleStr)
 	c.fails++
 	switch {
+	case c.fails >= c.d.Cfg.ConsecNeeded && c.d.HoldEmergencyHeal(ctx):
+		c.d.State.AppendLog(fmt.Sprintf("suspect: dns-resolv-stale %s — emergency heal held by maintenance window",
+			staleStr))
 	case c.fails >= c.d.Cfg.ConsecNeeded &&
 		c.d.State.RateTrySpend("last-dnsresolv-restart", c.d.Cfg.MinRestartInterval):
+		c.d.StampLocalRemediation(ctx)
 		// budget already spent atomically — spend BEFORE action (lib.sh)
 		for _, s := range stale {
 			// SIGKILL on the PAUSE pid — NOT the app container

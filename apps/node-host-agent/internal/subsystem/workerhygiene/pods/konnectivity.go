@@ -205,46 +205,49 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.Fails++
 	c.d.State.Enter(latchdefs.LatchKonnectivityIPMismatch,
 		fmt.Sprintf("host=%s node-ip=%s", agentHost, nodeIP))
-	if c.Fails >= c.d.Cfg.ConsecNeeded &&
-		c.d.State.RateTrySpend("last-konn-restart", c.d.Cfg.MinRestartInterval) {
-		// Budget spent atomically BEFORE acting — a failed action
-		// still consumed it (conservative, rate_spend parity).
-		c.Fails = 0
-		// NPD contract: "recreating konnectivity-agent ..." fires the
-		// KonnectivityStaleId filelog pattern.
-		c.d.State.AppendLog("KONNECTIVITY-IP-RESTART: " +
-			latchdefs.ReasonKonnectivityAgentRecreate +
-			fmt.Sprintf(" sandbox - stale identifier host=%s != node-ip=%s",
-				agentHost, nodeIP))
-		switch DeleteKonnectivityPod(c.d, ctx, e.Pods) {
-		case KonnDeleted:
-			c.d.Actions.WithLabelValues(wdeps.CheckKonn, "pod_delete").Inc()
-		case KonnNoPod:
-			// The fallback SIGKILL is only safe when the pod LIST
-			// was healthy: !e.APIOK means e.Pods may be empty
-			// because the read failed, not because no agent pod
-			// exists — and killing the agent while the API is
-			// unwell severs the control path the recovery needs.
-			if !e.APIOK {
-				c.d.State.AppendLog("suspect: konnectivity stale-id " +
-					"remediation held — apiserver unhealthy, proxy-agent kept")
-			} else if stalePID > 0 {
-				// No API pod found (list succeeded but pod renamed)
-				// — kill the stale proxy-agent directly. Least-bad:
-				// a container restart alone can't fix env baked at
-				// pod create, but it still clears a hung agent
-				// while humans look.
-				if err := c.d.Cfg.Seams.Host.KillFn(stalePID, syscall.SIGKILL); err != nil {
-					c.d.State.AppendLog(fmt.Sprintf(
-						"suspect: kill stale proxy-agent pid=%d failed: %v", stalePID, err))
-				} else {
-					c.d.State.AppendLog(fmt.Sprintf(
-						"ACTION: killed stale proxy-agent pid=%d — no API pod found",
-						stalePID))
+	if c.Fails >= c.d.Cfg.ConsecNeeded {
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog("suspect: konnectivity pod delete held — cluster maintenance in progress")
+		} else if c.d.State.RateTrySpend("last-konn-restart", c.d.Cfg.MinRestartInterval) {
+			// Budget spent atomically BEFORE acting — a failed action
+			// still consumed it (conservative, rate_spend parity).
+			c.Fails = 0
+			// NPD contract: "recreating konnectivity-agent ..." fires the
+			// KonnectivityStaleId filelog pattern.
+			c.d.State.AppendLog("KONNECTIVITY-IP-RESTART: " +
+				latchdefs.ReasonKonnectivityAgentRecreate +
+				fmt.Sprintf(" sandbox - stale identifier host=%s != node-ip=%s",
+					agentHost, nodeIP))
+			switch DeleteKonnectivityPod(c.d, ctx, e.Pods) {
+			case KonnDeleted:
+				c.d.Actions.WithLabelValues(wdeps.CheckKonn, "pod_delete").Inc()
+			case KonnNoPod:
+				// The fallback SIGKILL is only safe when the pod LIST
+				// was healthy: !e.APIOK means e.Pods may be empty
+				// because the read failed, not because no agent pod
+				// exists — and killing the agent while the API is
+				// unwell severs the control path the recovery needs.
+				if !e.APIOK {
+					c.d.State.AppendLog("suspect: konnectivity stale-id " +
+						"remediation held — apiserver unhealthy, proxy-agent kept")
+				} else if stalePID > 0 {
+					// No API pod found (list succeeded but pod renamed)
+					// — kill the stale proxy-agent directly. Least-bad:
+					// a container restart alone can't fix env baked at
+					// pod create, but it still clears a hung agent
+					// while humans look.
+					if err := c.d.Cfg.Seams.Host.KillFn(stalePID, syscall.SIGKILL); err != nil {
+						c.d.State.AppendLog(fmt.Sprintf(
+							"suspect: kill stale proxy-agent pid=%d failed: %v", stalePID, err))
+					} else {
+						c.d.State.AppendLog(fmt.Sprintf(
+							"ACTION: killed stale proxy-agent pid=%d — no API pod found",
+							stalePID))
+					}
+					c.d.Actions.WithLabelValues(wdeps.CheckKonn, "sigkill").Inc()
 				}
-				c.d.Actions.WithLabelValues(wdeps.CheckKonn, "sigkill").Inc()
+			default: // KonnHeldOrErr — maintenance hold or delete error; keep the agent
 			}
-		default: // KonnHeldOrErr — maintenance hold or delete error; keep the agent
 		}
 	} else {
 		// NPD contract: "konnectivity stale identifier ..." fires the

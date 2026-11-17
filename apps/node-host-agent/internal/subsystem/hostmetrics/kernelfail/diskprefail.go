@@ -212,8 +212,9 @@ func (r *Runner) nvmeSmartPages(ctx context.Context) []nvmeSmart {
 	// for nvmeCLITTL — the 30s latch tick must not pay a fork storm
 	// for a signal that cannot have changed. An empty (but probed)
 	// result caches too: "no nvme-cli installed" is just as stable.
+	now := r.deps.Clock.Now()
 	if !r.nvmeCLIAt.IsZero() &&
-		time.Since(r.nvmeCLIAt) < nvmeCLITTL {
+		now.Sub(r.nvmeCLIAt) < nvmeCLITTL {
 		return r.nvmeCLI
 	}
 	ctrlDirs, _ := filepath.Glob(filepath.Dir(r.deps.NVMeSmartGlob))
@@ -231,7 +232,7 @@ func (r *Runner) nvmeSmartPages(ctx context.Context) []nvmeSmart {
 			out = append(out, s)
 		}
 	}
-	r.nvmeCLI, r.nvmeCLIAt = out, time.Now()
+	r.nvmeCLI, r.nvmeCLIAt = out, r.deps.Clock.Now()
 	return out
 }
 

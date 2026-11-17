@@ -28,6 +28,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -111,6 +112,7 @@ const coreDNSFwdSatRejectsQuery = `sum(rate(coredns_forward_max_concurrent_rejec
 func (p *coreDNSForwardSaturationCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
+	p.eventHealed.PruneExpired(now, coreDNSFwdSatEventCooldown)
 	var rep probefw.SweepReport
 
 	rejects, rerr := p.PromQuery(ctx, coreDNSFwdSatRejectsQuery)
@@ -162,7 +164,7 @@ func (p *coreDNSForwardSaturationCheck) emitSaturationEvent(ctx context.Context,
 		Name:      "coredns-forward-saturation-" + now.Format("20060102-150405"),
 		Namespace: "kube-system",
 		Regarding: corev1.ObjectReference{
-			APIVersion: "v1",
+			APIVersion: "apps/v1",
 			Kind:       "Deployment",
 			Namespace:  "kube-system",
 			Name:       "coredns",
@@ -230,11 +232,20 @@ func (p *coreDNSForwardSaturationCheck) boostCoreDNS(ctx context.Context,
 	if dep.Spec.Replicas != nil {
 		current = *dep.Spec.Replicas
 	}
-	boosted := current + p.boostReplicas
+	// Staircase guard: never compound a previous saturation boost on top of
+	// an already-boosted replica count across consecutive boost windows.
+	base := current
+	if raw, ok := dep.Annotations["passiontech.dev/coredns-boost-base"]; ok {
+		if parsed, err := strconv.ParseInt(raw, 10, 32); err == nil && parsed > 0 {
+			base = int32(parsed)
+		}
+	}
+	boosted := max(current, base+p.boostReplicas)
 	payload, err := json.Marshal(map[string]any{
 		"spec": map[string]any{"replicas": boosted},
 		"metadata": map[string]any{"annotations": map[string]any{
-			kube.AnnoCoreDNSBoostUntil: until,
+			kube.AnnoCoreDNSBoostUntil:           until,
+			"passiontech.dev/coredns-boost-base": strconv.FormatInt(int64(base), 10),
 		}},
 	})
 	if err != nil {
@@ -247,12 +258,11 @@ func (p *coreDNSForwardSaturationCheck) boostCoreDNS(ctx context.Context,
 		log.Error(err, "coredns boost patch failed")
 		return
 	}
+	p.Heals.Stamp(ck, now)
 	log.Info("ACTION: coredns forward saturation boost",
 		"replicas", current, "->", boosted, "boostUntil", until)
-	// Mirror the landed annotation + replica count for later checks
-	// this sweep.
+	// Mirror the landed annotation without mutating shared Deployment.Spec.
 	kube.RecordAnnoPatch(ctx, dep, payload)
-	dep.Spec.Replicas = &boosted
 	p.InvalidateDeployments(ctx)
 }
 

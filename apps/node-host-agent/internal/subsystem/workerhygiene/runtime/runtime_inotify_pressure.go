@@ -38,6 +38,8 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
@@ -90,16 +92,16 @@ type inotifyTotals struct {
 // keeps the degenerate all-unreadable case at the old
 // node-wide behavior instead of going blind.
 type inotifyScan struct {
-	total  inotifyTotals
-	byRUID map[int64]inotifyTotals
-	byUID  map[string]inotifyTotals
+	total        inotifyTotals
+	byRUID       map[int64]inotifyTotals
+	byUID        map[string]inotifyTotals
+	byRUIDAndUID map[int64]map[string]inotifyTotals
 }
 
-// inotifyFD is one deduplicated inotify open file description —
-// key is the OFD identity ("ino:<n>" from the fd's inode, or a
-// per-pid fallback when the stat seam can't resolve it).
+// inotifyFD is one inotify open file description for a pid.
 type inotifyFD struct {
 	key     string
+	fdNum   int
 	watches int64
 }
 
@@ -131,12 +133,7 @@ func (c *InotifyPressureCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckInotifyHygiene, "abort")
 		return
 	}
-	scan := c.scanInotify(e)
-	// ucounts semantics: max_user_instances/watches are PER-REAL-
-	// UID budgets, so the pressure ratio is the WORST uid's
-	// usage/limit — never the node-wide total (a fleet of small
-	// pods each under its own budget is healthy even when the
-	// aggregate dwarfs the per-uid limit).
+	scan := c.scanInotify(e, instCur, watchCur)
 	instRatio := worstUIDRatio(scan.byRUID, instCeilAxis, instCur)
 	watchRatio := worstUIDRatio(scan.byRUID, watchAxis, watchCur)
 	maxRatio := max(instRatio, watchRatio)
@@ -189,7 +186,7 @@ func (c *InotifyPressureCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			"instances=%d/%d watches=%d/%d fails=%d",
 			scan.total.instances, instCur, scan.total.watches, watchCur, c.fails))
 	}
-	c.maybeEvictRunaway(ctx, e, scan, instPressured, watchPressured)
+	c.maybeEvictRunaway(ctx, e, scan, instCur, watchCur, instPressured, watchPressured)
 	c.d.CycleResult(wdeps.CheckInotifyHygiene, "ok")
 }
 
@@ -308,30 +305,55 @@ func (c *InotifyPressureCheck) bumpSysctl(name string, cur, ceil int64) bool {
 // is the only evidence source (the unlinked-open-files guard's
 // sweep shape). pids come from the cycle's shared PidsOnce when
 // wired.
-func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv) inotifyScan {
+type inotifyRUIDEntry struct {
+	pid     int
+	fdNum   int
+	podUID  string
+	watches int64
+}
+
+func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv, instLimit, watchLimit int64) inotifyScan {
 	var pids []int
 	if e != nil && e.PidsOnce != nil {
 		pids = e.PidsOnce()
 	} else {
 		pids, _ = c.d.Proc.PIDs()
 	}
-	scan := inotifyScan{byRUID: map[int64]inotifyTotals{},
-		byUID: map[string]inotifyTotals{}}
-	// OFDs shared across forked workers dedup GLOBALLY — the same
-	// inotify instance reported by N pids is one ucounts charge.
-	// First reporter wins the attribution (its ruid + pod uid).
-	seenOFD := map[string]bool{}
+	scan := inotifyScan{
+		byRUID:       map[int64]inotifyTotals{},
+		byUID:        map[string]inotifyTotals{},
+		byRUIDAndUID: map[int64]map[string]inotifyTotals{},
+	}
+	// When an explicit InotifyFDIno test seam is wired, dedup on its returned
+	// OFD key; otherwise keep each (pid, fd) distinct and run kcmp(KCMP_FILE)
+	// only inside pressured RUIDs so Linux's shared anon_inode_inode never
+	// collapses distinct instances to 1.
+	seenExplicitOFD := map[string]bool{}
+	rawEntriesByRUID := map[int64][]inotifyRUIDEntry{}
+
 	for _, pid := range pids {
 		fds, ok := inotifyProcUsage(c.d, pid)
-		if !ok {
+		if !ok || len(fds) == 0 {
 			continue
 		}
+		ruid, _ := procRealUID(c.d, pid) // -1 bucket on unreadable
+		podUID, hasPodUID := wdeps.PodUIDForPID(c.d, pid)
+
 		var u inotifyTotals
 		for _, f := range fds {
-			if seenOFD[f.key] {
-				continue
+			if strings.HasPrefix(f.key, "ino:") {
+				if seenExplicitOFD[f.key] {
+					continue
+				}
+				seenExplicitOFD[f.key] = true
+			} else {
+				rawEntriesByRUID[ruid] = append(rawEntriesByRUID[ruid], inotifyRUIDEntry{
+					pid:     pid,
+					fdNum:   f.fdNum,
+					podUID:  podUID,
+					watches: f.watches,
+				})
 			}
-			seenOFD[f.key] = true
 			u.instances++
 			u.watches += f.watches
 		}
@@ -340,21 +362,110 @@ func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv) inotifyScan {
 		}
 		scan.total.instances += u.instances
 		scan.total.watches += u.watches
-		// Only pids that actually hold inotify fds pay the status /
-		// cgroup reads — the common pid contributes nothing.
-		ruid, _ := procRealUID(c.d, pid) // -1 bucket on unreadable
 		a := scan.byRUID[ruid]
 		a.instances += u.instances
 		a.watches += u.watches
 		scan.byRUID[ruid] = a
-		if uid, ok := wdeps.PodUIDForPID(c.d, pid); ok {
-			p := scan.byUID[uid]
+		if hasPodUID && podUID != "" {
+			p := scan.byUID[podUID]
 			p.instances += u.instances
 			p.watches += u.watches
-			scan.byUID[uid] = p
+			scan.byUID[podUID] = p
+			if scan.byRUIDAndUID[ruid] == nil {
+				scan.byRUIDAndUID[ruid] = map[string]inotifyTotals{}
+			}
+			rp := scan.byRUIDAndUID[ruid][podUID]
+			rp.instances += u.instances
+			rp.watches += u.watches
+			scan.byRUIDAndUID[ruid][podUID] = rp
+		}
+	}
+
+	sameOFD := c.d.Cfg.Seams.Host.InotifySameOFDFn
+	if sameOFD == nil || c.d.Cfg.Seams.Host.InotifyFDIno != nil {
+		return scan
+	}
+	// Refine only RUIDs near or past the clear threshold using unix.Kcmp(KCMP_FILE).
+	for ruid, entries := range rawEntriesByRUID {
+		tot := scan.byRUID[ruid]
+		if !ruidNeedsKCMP(tot, instLimit, watchLimit) || len(entries) <= 1 {
+			continue
+		}
+		deduped := dedupRUIDEntriesKCMP(entries, sameOFD)
+		if len(deduped) == len(entries) {
+			continue
+		}
+		scan.total.instances -= tot.instances
+		scan.total.watches -= tot.watches
+		var newTot inotifyTotals
+		newPodTotals := map[string]inotifyTotals{}
+		for _, ent := range deduped {
+			newTot.instances++
+			newTot.watches += ent.watches
+			if ent.podUID != "" {
+				pt := newPodTotals[ent.podUID]
+				pt.instances++
+				pt.watches += ent.watches
+				newPodTotals[ent.podUID] = pt
+			}
+		}
+		scan.total.instances += newTot.instances
+		scan.total.watches += newTot.watches
+		scan.byRUID[ruid] = newTot
+		for uid, oldPT := range scan.byRUIDAndUID[ruid] {
+			cur := scan.byUID[uid]
+			cur.instances -= oldPT.instances
+			cur.watches -= oldPT.watches
+			if cur.instances <= 0 && cur.watches <= 0 {
+				delete(scan.byUID, uid)
+			} else {
+				scan.byUID[uid] = cur
+			}
+		}
+		scan.byRUIDAndUID[ruid] = newPodTotals
+		for uid, pt := range newPodTotals {
+			cur := scan.byUID[uid]
+			cur.instances += pt.instances
+			cur.watches += pt.watches
+			scan.byUID[uid] = cur
 		}
 	}
 	return scan
+}
+
+func ruidNeedsKCMP(tot inotifyTotals, instLimit, watchLimit int64) bool {
+	if instLimit > 0 && float64(tot.instances)/float64(instLimit) > inotifyClearRatio {
+		return true
+	}
+	if watchLimit > 0 && float64(tot.watches)/float64(watchLimit) > inotifyClearRatio {
+		return true
+	}
+	return false
+}
+
+const maxKCMPCompareKeepers = 512
+
+func dedupRUIDEntriesKCMP(entries []inotifyRUIDEntry, sameOFD func(int, int, int, int) bool) []inotifyRUIDEntry {
+	var kept []inotifyRUIDEntry
+	for _, ent := range entries {
+		dup := false
+		limit := min(len(kept), maxKCMPCompareKeepers)
+		for i := range limit {
+			k := kept[i]
+			if k.pid == ent.pid && k.fdNum == ent.fdNum {
+				dup = true
+				break
+			}
+			if sameOFD(k.pid, k.fdNum, ent.pid, ent.fdNum) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			kept = append(kept, ent)
+		}
+	}
+	return kept
 }
 
 // procRealUID reads the real uid from /proc/<pid>/status — the
@@ -429,11 +540,15 @@ func inotifyProcUsage(d *wdeps.Deps, pid int) ([]inotifyFD, bool) {
 			continue
 		}
 		key := fmt.Sprintf("pidfd:%d/%s", pid, fd.Name())
-		if ino, ok := d.Cfg.Seams.Host.InotifyFDIno(pid, fd.Name()); ok {
-			key = fmt.Sprintf("ino:%d", ino)
+		if d.Cfg.Seams.Host.InotifyFDIno != nil {
+			if ino, ok := d.Cfg.Seams.Host.InotifyFDIno(pid, fd.Name()); ok {
+				key = fmt.Sprintf("ino:%d", ino)
+			}
 		}
+		fdNum, _ := strconv.Atoi(fd.Name())
 		out = append(out, inotifyFD{
 			key:     key,
+			fdNum:   fdNum,
 			watches: inotifyFDWatches(d.Proc.File(pid, "fdinfo", fd.Name())),
 		})
 	}
@@ -473,7 +588,7 @@ func inotifyFDWatches(path string) int64 {
 // >= 50% of the node's usage ON THAT AXIS. When both axes are
 // pressured the higher-share candidate wins.
 func (c *InotifyPressureCheck) maybeEvictRunaway(ctx context.Context,
-	e *wdeps.CycleEnv, scan inotifyScan,
+	e *wdeps.CycleEnv, scan inotifyScan, instLimit, watchLimit int64,
 	instPressured, watchPressured bool) {
 	if !c.d.Cfg.Pressure.InotifyEvictRunawayPod {
 		return
@@ -487,13 +602,6 @@ func (c *InotifyPressureCheck) maybeEvictRunaway(ctx context.Context,
 		return // latch evidence went stale between arm and evict
 	}
 
-	// Top pod per pressured axis, deterministic uid order for
-	// stable ties.
-	uids := make([]string, 0, len(scan.byUID))
-	for uid := range scan.byUID {
-		uids = append(uids, uid)
-	}
-	slices.Sort(uids)
 	type axisPick struct {
 		uid   string
 		u     inotifyTotals
@@ -501,33 +609,56 @@ func (c *InotifyPressureCheck) maybeEvictRunaway(ctx context.Context,
 		share float64
 	}
 	var best *axisPick
-	consider := func(axis string, total int64, pressured bool,
+	consider := func(axis string, pressured bool, limit int64,
 		val func(inotifyTotals) int64) {
-		if !pressured || total <= 0 {
+		if !pressured || limit <= 0 {
 			return
 		}
+		// Pick the pressured RUID with highest usage on this axis, then score
+		// only pods belonging to THAT RUID against that RUID's total.
+		var worstRUID int64
+		var worstRUIDTotal int64
+		hasWorst := false
+		for ruid, rt := range scan.byRUID {
+			v := val(rt)
+			if float64(v)/float64(limit) < inotifyLatchRatio {
+				continue
+			}
+			if !hasWorst || v > worstRUIDTotal || (v == worstRUIDTotal && ruid < worstRUID) {
+				worstRUID, worstRUIDTotal, hasWorst = ruid, v, true
+			}
+		}
+		if !hasWorst || worstRUIDTotal <= 0 {
+			return
+		}
+		podTotals := scan.byRUIDAndUID[worstRUID]
+		uids := make([]string, 0, len(podTotals))
+		for uid := range podTotals {
+			uids = append(uids, uid)
+		}
+		slices.Sort(uids)
 		var topUID string
 		var topVal int64
 		for _, uid := range uids {
-			if v := val(scan.byUID[uid]); v > topVal {
+			if v := val(podTotals[uid]); v > topVal {
 				topVal, topUID = v, uid
 			}
 		}
 		if topUID == "" {
 			return
 		}
-		share := float64(topVal) / float64(total)
+		share := float64(topVal) / float64(worstRUIDTotal)
 		if share < inotifyEvictShare {
 			return
 		}
 		if best == nil || share > best.share {
-			best = &axisPick{uid: topUID, u: scan.byUID[topUID],
+			best = &axisPick{uid: topUID, u: podTotals[topUID],
 				axis: axis, share: share}
 		}
 	}
-	consider("instances", scan.total.instances, instPressured,
+	consider("instances", instPressured, instLimit,
 		func(u inotifyTotals) int64 { return u.instances })
-	consider("watches", scan.total.watches, watchPressured,
+	consider("watches", watchPressured, watchLimit,
 		func(u inotifyTotals) int64 { return u.watches })
 	if best == nil {
 		c.d.State.AppendLog(
@@ -541,6 +672,10 @@ func (c *InotifyPressureCheck) maybeEvictRunaway(ctx context.Context,
 		return
 	}
 	if pod.DeletionTimestamp != nil ||
+		wdeps.IsEvictProtectedPod(pod) ||
+		wdeps.PodHasPVC(pod) ||
+		wdeps.IsMirrorPod(pod) ||
+		metav1.GetControllerOf(pod) == nil ||
 		wdeps.EvictProtectedNamespaces[pod.Namespace] ||
 		wdeps.EvictCriticalPriorityClasses[pod.Spec.PriorityClassName] ||
 		wdeps.CarriesDBQuorumLabel(pod) {

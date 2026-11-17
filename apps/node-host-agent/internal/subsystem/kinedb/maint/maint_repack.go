@@ -31,6 +31,9 @@ func (m *Maint) maintRun(ctx context.Context, pg, user, pass string,
 	// (a0) invalid-index-reaper — BEFORE the reindex.
 	m.reapInvalidIndexes(ctx, pg, user, pass, res, note)
 
+	// Wave-3 #1: check/auto-widen narrow sequence before heavy maintenance.
+	m.checkAndWidenSequence(ctx, pg, user, pass, res, note)
+
 	// (b) XID wraparound — read MAX(age(datfrozenxid)) first so the
 	// FREEZE vacuum can ride the locked session below.
 	freeze := m.readXidAge(ctx, pg, user, pass, res, note)

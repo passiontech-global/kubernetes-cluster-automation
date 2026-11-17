@@ -2,6 +2,18 @@
 // reader and the !linux stub (netlinkx_other.go).
 package netlinkx
 
+import "net"
+
+// ConnectedUDPSocket is one connected UDP socket returned by DumpConnectedUDP.
+type ConnectedUDPSocket struct {
+	Family  uint8
+	SrcIP   net.IP
+	SrcPort uint16
+	DstIP   net.IP
+	DstPort uint16
+	ID      [48]byte // verbatim idiag_sockid for SOCK_DESTROY
+}
+
 // ProtoCounters is one /proc/net/sockstat protocol row. Absent
 // key/value pairs stay 0 — same convention as procfs.ConntrackStat
 // (the kernel omits fields it does not count).

@@ -29,6 +29,7 @@ package corednswatchdog
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"net/http"
 	"slices"
@@ -110,7 +111,8 @@ type coreDNSWatchdog struct {
 	// Probe seams: the real implementations are the logHit/dnsProbe/
 	// panics methods below — fields so tests can stub log-stream,
 	// UDP+TCP:53 and :9153 access that the fake clientset cannot reach.
-	logHitFn func(ctx context.Context, pod string) string
+	logHitFn  func(ctx context.Context, pod string) string
+	prevLogFn func(ctx context.Context, pod *corev1.Pod) string
 	// dnsFn resolves fqdn through one coredns pod and returns the
 	// A-record IPs it answered — the coredns-probe-fallback fallback verifies them
 	// against the live EndpointSlice/ClusterIP instead of accepting
@@ -304,6 +306,7 @@ func Setup(d shared.Deps) error {
 		}
 		w.nodeReader, w.podReader = d.CachedClient(), d.CachedClient()
 		w.logHitFn = w.logHit
+		w.prevLogFn = w.previousLogLoopHit
 		w.dnsFn = w.dnsProbe
 		w.panicsFn = w.panics
 		return shared.AddPeriodic(d.Mgr, w.queue, time.Minute, w.run)
@@ -329,8 +332,19 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	// recover() deletes with a UID precondition so a same-named pod
 	// recreated mid-sweep is never killed.
 	podUID := map[string]types.UID{}
+	totalPods := 0
+	var crashLoopPods []*corev1.Pod
+	loopUID := map[string]types.UID{}
 	for i := range podItems {
 		p := &podItems[i]
+		if p.DeletionTimestamp == nil {
+			totalPods++
+			if podInCrashLoopBackOff(p) {
+				cp := p
+				crashLoopPods = append(crashLoopPods, cp)
+				loopUID[p.Name] = p.UID
+			}
+		}
 		// Only a pod that can actually answer :53 belongs in the probe
 		// set — a Pending/Terminating/not-yet-Ready pod already has a
 		// CNI-assigned IP but its resolver is not listening, so probing
@@ -344,10 +358,36 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 		podIP[p.Name] = p.Status.PodIP
 		podUID[p.Name] = p.UID
 	}
-	// Only name->IP and name->UID feed the layers below — release
-	// the full PodList before the log streams, EndpointSlice lists
-	// and DNS probes run.
+	// Release the full slice (non-crashloop pods are dropped).
 	podItems = nil
+
+	var loopErr error
+	if len(crashLoopPods) > 0 {
+		prevFn := w.prevLogFn
+		if prevFn == nil {
+			prevFn = w.previousLogLoopHit
+		}
+		crashNames := make([]string, len(crashLoopPods))
+		for i, cp := range crashLoopPods {
+			crashNames[i] = cp.Name
+		}
+		hits := make([]string, len(crashLoopPods))
+		boundedForEach(crashNames, func(i int) {
+			hits[i] = prevFn(ctx, crashLoopPods[i])
+		})
+		var loopSuspects []string
+		for i, cp := range crashLoopPods {
+			if hits[i] != "" {
+				log.Info("log: CrashLoopBackOff plugin/loop detected", "pod", cp.Name, "match", hits[i])
+				loopSuspects = append(loopSuspects, cp.Name)
+			}
+		}
+		if len(loopSuspects) > 0 {
+			slices.Sort(loopSuspects)
+			loopErr = w.recoverLoopCrashPods(ctx, loopSuspects, loopUID, totalPods)
+		}
+	}
+	crashLoopPods = nil
 	// Prune streaks of pods that vanished (recreates change names).
 	w.streak.Prune(func(name string) bool {
 		_, ok := podIP[name]
@@ -488,7 +528,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 
 	if len(stale) == 0 {
 		log.Info("sweep done: coredns fresh", "replicas", len(podIP))
-		return nil
+		return loopErr
 	}
 	suspects := make([]string, 0, len(stale))
 	for name := range stale {
@@ -497,5 +537,17 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	slices.Sort(suspects)
 	log.Info("STALE coredns replicas — dead watch or panic",
 		"stale", len(suspects), "total", len(podIP), "pods", suspects)
-	return w.recover(ctx, suspects, podUID, len(podIP))
+	staleErr := w.recover(ctx, suspects, podUID, len(podIP))
+	return errors.Join(loopErr, staleErr)
+}
+
+func podInCrashLoopBackOff(p *corev1.Pod) bool {
+	for i := range p.Status.ContainerStatuses {
+		cs := &p.Status.ContainerStatuses[i]
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff" &&
+			cs.LastTerminationState.Terminated != nil {
+			return true
+		}
+	}
+	return false
 }

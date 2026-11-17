@@ -178,6 +178,11 @@ type Config struct {
 	// this false — remediation is its job.
 	ReadOnly bool
 
+	// SeqWidenEnabled auto-widens an integer/smallint sequence backing a
+	// bigint kine.id column (ALTER SEQUENCE ... AS bigint) during maint.
+	// Enabled by default via ConfigFromEnv (NODE_HOST_AGENT_KINE_SEQ_WIDEN_ENABLED).
+	SeqWidenEnabled bool
+
 	// --- injectable seams (defaults follow) ---
 	// Clock supplies the current time — the shared timex.Cell seam.
 	Clock *timex.Cell

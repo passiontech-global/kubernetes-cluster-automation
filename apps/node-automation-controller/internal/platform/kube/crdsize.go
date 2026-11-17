@@ -18,7 +18,24 @@
 // (tests and pre-sync windows measure live, byte-identical output).
 package kube
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
+
+var crdInformerDisabled atomic.Bool
+
+// SetCRDInformerEnabled records whether the CRD watch informer was enabled
+// after the startup SSAR check.
+func SetCRDInformerEnabled(enabled bool) {
+	crdInformerDisabled.Store(!enabled)
+}
+
+// CRDInformerEnabled reports whether cached CRD reads are allowed to invoke
+// the manager informer without lazily opening a forbidden CRD watch.
+func CRDInformerEnabled() bool {
+	return !crdInformerDisabled.Load()
+}
 
 // crdSizeTableCap bounds the table. A cluster carries tens of CRDs
 // that update a handful of times a day, so the steady state is a few

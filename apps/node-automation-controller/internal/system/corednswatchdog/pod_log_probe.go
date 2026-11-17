@@ -23,7 +23,9 @@ import (
 // streak it never earned. The watch/list-failure + Unauthorized
 // signatures stay — they only appear when the watch actually died.
 var corednsLogRE = regexp.MustCompile(
-	`Failed to watch|failed to watch|Failed to list|failed to list|Unauthorized`)
+	`Failed to watch|failed to watch|Failed to list|failed to list|Unauthorized|plugin/loop:\s*Loop\b`)
+
+var corednsLoopRE = regexp.MustCompile(`plugin/loop:\s*Loop\b`)
 
 // logHit returns the first last-10m log line matching the informer
 // death signature ("" = clean/unreadable). Bounded to 8s / 256KiB.
@@ -52,6 +54,32 @@ func (w *coreDNSWatchdog) logHit(ctx context.Context, pod string) string {
 		})
 	if err != nil {
 		log.Info("log: cannot stream pod logs — layer 1 inconclusive", "pod", pod, "error", err)
+		return ""
+	}
+	return hit
+}
+
+// previousLogLoopHit inspects the previous terminated container's logs
+// (Previous: true) for a CrashLoopBackOff CoreDNS pod to detect
+// forwarding loops (`plugin/loop: Loop ...`).
+func (w *coreDNSWatchdog) previousLogLoopHit(ctx context.Context, pod *corev1.Pod) string {
+	log := logf.FromContext(ctx)
+	var hit string
+	_, err := kube.ReadPodLogTail(ctx, w.cs, pod, kube.PodLogOpts{
+		Previous:  true,
+		TailLines: 100,
+		MaxBytes:  corednsMaxLogBytes,
+		Timeout:   8 * time.Second,
+	}, func(line string) bool {
+		if corednsLoopRE.MatchString(line) {
+			hit = line
+			return true
+		}
+		return false
+	})
+	if err != nil {
+		log.Info("log: cannot stream previous container logs — loop probe inconclusive",
+			"pod", pod.Name, "error", err)
 		return ""
 	}
 	return hit

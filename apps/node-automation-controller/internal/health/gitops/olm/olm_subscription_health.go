@@ -289,7 +289,6 @@ func (p *olmHealthCheck) healOLMOperator(ctx context.Context,
 			"pod", target.Namespace+"/"+target.Name)
 		return
 	}
-	kube.MarkPodDeleted(ctx, target.UID) // O(1) tombstone — no census reset
 	for _, r := range reasons {
 		olmOperatorHealsTotal.WithLabelValues(r).Inc()
 	}

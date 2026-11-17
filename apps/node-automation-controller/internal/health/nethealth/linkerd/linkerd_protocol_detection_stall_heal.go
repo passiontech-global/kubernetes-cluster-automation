@@ -210,7 +210,6 @@ func (p *linkerdProtocolDetectionStallCheck) bookkeepRestart(ctx context.Context
 	log logr.Logger, pod *corev1.Pod, missing []int, verb string) {
 
 	p.patchLinkerdPodAnno(ctx, log, pod, missing)
-	kube.MarkPodDeleted(ctx, pod.UID) // O(1) tombstone — no census reset
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameLinkerdOpaqueStall).Inc()
 	log.Info("DELETE: linkerd protocol-detection stall — template patched, re-rolling pod",
 		"pod", pod.Namespace+"/"+pod.Name, "ports", missing, "verb", verb)

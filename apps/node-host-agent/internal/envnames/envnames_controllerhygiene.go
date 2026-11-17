@@ -37,4 +37,8 @@ const (
 	// etcd snapshot verifier dir.
 	EnvTotalControllers = "NODE_HOST_AGENT_TOTAL_CONTROLLERS"
 	EnvEtcdSnapshotDir  = "NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR"
+	// Wave-3 #8: embedded etcd quorum/learner/wal_fsync guard.
+	EnvEtcdLearnerMaxAge      = "NODE_HOST_AGENT_ETCD_LEARNER_MAX_AGE"
+	EnvEtcdFsyncP99MaxSeconds = "NODE_HOST_AGENT_ETCD_FSYNC_P99_MAX_SECONDS"
+	EnvEtcdMetricsURL         = "NODE_HOST_AGENT_ETCD_METRICS_URL"
 )

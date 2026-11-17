@@ -167,34 +167,34 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 	var rep probefw.SweepReport
 	for i := range nodes {
 		node := &nodes[i]
-		capacity, ok := podCIDRCapacity(node.Spec.PodCIDR)
-		if !ok {
-			continue
-		}
-		used := float64(podCount[node.Name])
-		free := float64(capacity) - used
-		if free < 0 {
-			free = 0
-		}
-		ratio := free / float64(capacity)
-		// Operator IPAM accounting is authoritative when present —
-		// it counts allocated pod IPs the pod census misses. With
-		// used+available the free ratio comes straight from the
-		// operator's own PodCIDR math.
+		var capacity int
+		var free, ratio float64
 		if promOK {
 			if u, ok := usedProm[node.Name]; ok {
 				if a, aok := availProm[node.Name]; aok && u+a > 0 {
 					ratio = a / (u + a)
 					free = a
-				} else {
-					used = u
-					free = float64(capacity) - used
-					if free < 0 {
-						free = 0
-					}
-					ratio = free / float64(capacity)
+					capacity = int(u + a)
 				}
 			}
+		}
+		if capacity == 0 {
+			var ok bool
+			capacity, ok = podCIDRCapacity(node.Spec.PodCIDR)
+			if !ok {
+				continue
+			}
+			used := float64(podCount[node.Name])
+			if promOK {
+				if u, uok := usedProm[node.Name]; uok {
+					used = u
+				}
+			}
+			free = float64(capacity) - used
+			if free < 0 {
+				free = 0
+			}
+			ratio = free / float64(capacity)
 		}
 		rep.Set(ciliumIPAMFreeRatioGauge, ratio, node.Name, []string{node.Name})
 		if ratio >= minFree {

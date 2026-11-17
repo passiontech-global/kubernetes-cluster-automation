@@ -40,6 +40,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -139,8 +140,28 @@ var subPathDBQuorumLabels = []string{
 	"postgres-operator.crunchydata.com/cluster",
 	"pgv2.percona.com/cluster",
 	"everest.percona.com/cluster",
+	"pxc.percona.com/cluster",
+	"psmdb.percona.com/cluster",
 	"scylla.scylladb.com/cluster",
 	"apps.rabbitmq.com/cluster",
+	"dragonflydb.io/cluster",
+	"nats_cluster",
+}
+
+func isSubPathDBQuorumWorkload(templateLabels map[string]string) bool {
+	for _, k := range subPathDBQuorumLabels {
+		if templateLabels[k] != "" {
+			return true
+		}
+	}
+	for _, k := range []string{"app.kubernetes.io/name", "app.kubernetes.io/part-of", "app.kubernetes.io/managed-by"} {
+		v := strings.ToLower(templateLabels[k])
+		if strings.Contains(v, "dragonfly") || strings.Contains(v, "percona") ||
+			v == "nats" || strings.HasPrefix(v, "nats-") {
+			return true
+		}
+	}
+	return false
 }
 
 // subPathWorkload is one census row the drift scan evaluates.
@@ -153,21 +174,18 @@ type subPathWorkload struct {
 	obj      metav1.Object
 }
 
-// subPathDrifted reports whether the check should even consider
-// this workload: not a system namespace, no quorum label on the
-// pod template, and not opted out via
-// kube.AnnoSubPathReloadOptOut=="false" (the plan's literal
-// exclusion value).
+// subPathDrifted reports whether the check should consider this workload:
+// not a system namespace, no quorum label on the pod template, and not
+// opted out via kube.AnnoSubPathReloadOptOut=="true"|"1"|"yes".
 func subPathDrifted(ns string, templateLabels, annos map[string]string) bool {
-	if subPathSystemNamespaces[ns] {
+	if subPathSystemNamespaces[ns] || isSubPathDBQuorumWorkload(templateLabels) {
 		return false
 	}
-	for _, k := range subPathDBQuorumLabels {
-		if templateLabels[k] != "" {
-			return false
-		}
+	switch strings.ToLower(strings.TrimSpace(annos[kube.AnnoSubPathReloadOptOut])) {
+	case "true", "1", "yes":
+		return false
 	}
-	return !strings.EqualFold(annos[kube.AnnoSubPathReloadOptOut], "false")
+	return true
 }
 
 // allMounts flattens init+regular container mounts — an init
@@ -189,13 +207,16 @@ func allMounts(podSpec *corev1.PodSpec) []corev1.VolumeMount {
 func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
+	p.eventHealed.PruneExpired(now, subPathEventCooldown)
+	p.reloadHeals.PruneExpired(now, subPathReloadCooldown)
 	var rep probefw.SweepReport
 
 	if now.Sub(p.lastScan) < subPathScanInterval && !p.lastScan.IsZero() {
-		// Throttled cycle — carry the held drift tuples forward or
-		// rep.Result reconciles them OFF the gauge for 30 of every
-		// 31 minutes (the gauge would flap to zero between scans).
+		// Throttled cycle — preserve both the FAIL verdict and the
+		// held drift tuples so the check neither flaps to PASS nor
+		// resets Prometheus gauges for 29 of every 30 minutes.
 		for k, lv := range p.emitted.Last() {
+			rep.Find(k)
 			rep.Carry(k, lv)
 		}
 		return rep.Result(&p.emitted, subPathConfigDriftGauge.DeleteLabelValues,
@@ -250,24 +271,40 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 		})
 	}
 
-	// ConfigMap/Secret content index — the hash input. One paged
-	// LIST per kind per scan; only namespaces the workloads live
-	// in matter, but the census is cluster-wide anyway (the sweep
-	// already pays cluster LISTs).
+	// Targeted ConfigMap/Secret fetch — read ONLY the exact ConfigMaps
+	// and Secrets actually mounted via subPath by eligible workloads,
+	// avoiding cluster-wide Secret LISTs that load TLS/token secrets.
+	type objRef struct{ ns, name string }
+	needCMs := map[objRef]bool{}
+	needSecs := map[objRef]bool{}
+	var active []subPathWorkload
+	for _, w := range workloads {
+		if !subPathDrifted(w.ns, w.template, w.annos) {
+			continue
+		}
+		cms, secs := subPathReferencedObjects(w.podSpec)
+		if len(cms) == 0 && len(secs) == 0 {
+			continue
+		}
+		active = append(active, w)
+		for _, n := range cms {
+			needCMs[objRef{w.ns, n}] = true
+		}
+		for _, n := range secs {
+			needSecs[objRef{w.ns, n}] = true
+		}
+	}
+
 	cmData := map[string]map[string]string{} // "ns/name" → key→data
 	secretData := map[string]map[string][]byte{}
-	cms, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.ConfigMaps(p.CS, metav1.NamespaceAll))
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list configmaps: %w", err)}
-	}
-	for i := range cms {
-		cm := &cms[i]
-		// BinaryData holds the same key→content contract as Data
-		// for non-UTF8 payloads — the API keeps the two maps
-		// disjoint per key, so folding bytes into the string view
-		// (string(b) preserves the bytes for hashing) covers both
-		// without a second lookup path.
+	for ref := range needCMs {
+		cm, gerr := p.CS.CoreV1().ConfigMaps(ref.ns).Get(ctx, ref.name, metav1.GetOptions{})
+		if apierrors.IsNotFound(gerr) {
+			continue
+		}
+		if gerr != nil {
+			return probefw.Result{Infra: fmt.Errorf("get configmap %s/%s: %w", ref.ns, ref.name, gerr)}
+		}
 		merged := make(map[string]string, len(cm.Data)+len(cm.BinaryData))
 		for k, v := range cm.Data {
 			merged[k] = v
@@ -275,31 +312,25 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 		for k, v := range cm.BinaryData {
 			merged[k] = string(v)
 		}
-		cmData[cm.Namespace+"/"+cm.Name] = merged
+		cmData[ref.ns+"/"+ref.name] = merged
 	}
-	secs, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Secrets(p.CS, metav1.NamespaceAll))
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list secrets: %w", err)}
-	}
-	for i := range secs {
-		s := &secs[i]
-		// Secret.Data is map[string][]byte — binary content (the
-		// old binaryData field folded into data in this API
-		// version) is already covered; StringData is write-only
-		// and never returned by the API.
-		secretData[s.Namespace+"/"+s.Name] = s.Data
+	for ref := range needSecs {
+		sec, gerr := p.CS.CoreV1().Secrets(ref.ns).Get(ctx, ref.name, metav1.GetOptions{})
+		if apierrors.IsNotFound(gerr) {
+			continue
+		}
+		if gerr != nil {
+			return probefw.Result{Infra: fmt.Errorf("get secret %s/%s: %w", ref.ns, ref.name, gerr)}
+		}
+		secretData[ref.ns+"/"+ref.name] = sec.Data
 	}
 
 	seenKeys := map[string]bool{}
 	reloads := 0
 	var pods []corev1.Pod
 	podsLoaded := false
-	for _, w := range workloads {
+	for _, w := range active {
 		key := w.kind + "/" + w.ns + "/" + w.name
-		if !subPathDrifted(w.ns, w.template, w.annos) {
-			continue
-		}
 		sig := p.subPathContentHash(w.podSpec, w.ns, cmData, secretData)
 		if sig == "" {
 			continue // no subPath mounts — out of scope
@@ -441,6 +472,33 @@ func (p *subpathConfigDriftCheck) subPathContentHash(podSpec *corev1.PodSpec,
 	return hex.EncodeToString(sum[:])
 }
 
+func subPathReferencedObjects(podSpec *corev1.PodSpec) (cms, secs []string) {
+	volKind := map[string]string{}
+	volName := map[string]string{}
+	for _, v := range podSpec.Volumes {
+		switch {
+		case v.ConfigMap != nil && v.ConfigMap.Name != "":
+			volKind[v.Name] = "cm"
+			volName[v.Name] = v.ConfigMap.Name
+		case v.Secret != nil && v.Secret.SecretName != "":
+			volKind[v.Name] = "sec"
+			volName[v.Name] = v.Secret.SecretName
+		}
+	}
+	for _, m := range allMounts(podSpec) {
+		if m.SubPath == "" {
+			continue
+		}
+		switch volKind[m.Name] {
+		case "cm":
+			cms = append(cms, volName[m.Name])
+		case "sec":
+			secs = append(secs, volName[m.Name])
+		}
+	}
+	return cms, secs
+}
+
 // subPathFreshPods reports whether every running pod of the
 // workload started AFTER driftStart — pods mount subPath content
 // at container start, so a pod born post-drift already carries the
@@ -531,12 +589,21 @@ func (p *subpathConfigDriftCheck) reloadWorkload(ctx context.Context,
 	case "Deployment":
 		_, err = p.CS.AppsV1().Deployments(w.ns).Patch(ctx, w.name,
 			types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+		if err == nil {
+			p.InvalidateDeployments(ctx)
+		}
 	case "StatefulSet":
 		_, err = p.CS.AppsV1().StatefulSets(w.ns).Patch(ctx, w.name,
 			types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+		if err == nil {
+			p.InvalidateStatefulSets(ctx)
+		}
 	case "DaemonSet":
 		_, err = p.CS.AppsV1().DaemonSets(w.ns).Patch(ctx, w.name,
 			types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+		if err == nil {
+			p.InvalidateDaemonSets(ctx)
+		}
 	}
 	if err != nil {
 		metrics.IncError(p.Name)

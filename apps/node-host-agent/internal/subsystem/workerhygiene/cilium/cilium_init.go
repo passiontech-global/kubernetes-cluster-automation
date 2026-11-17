@@ -75,11 +75,16 @@ func (c *CiliumInitCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but node overloaded — skip kill",
 			initEps, c.Fails))
+	case c.d.HoldEmergencyHeal(ctx):
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cilium-init-stuck init_eps=%d %dx — emergency restart held by maintenance window, skip",
+			initEps, c.Fails))
 	case !c.d.State.RateTrySpend("last-cilium-restart", c.d.Cfg.MinRestartInterval):
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-init-stuck init_eps=%d %dx but restart cooldown — skip kill",
 			initEps, c.Fails))
 	default:
+		c.d.StampLocalRemediation(ctx)
 		// Budget already spent atomically by the rateTrySpend case —
 		// the feeder goroutine competes for the same file.
 		if killCiliumAgent(c.d, tasks) {

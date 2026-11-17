@@ -280,6 +280,28 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	b.Gauge("node_agent_iptables_legacy_leaked_rules",
 		"Real \"-A \" rules counted by iptables-legacy-save while /proc/1/net/ip_tables_names is non-empty — iptables-nft/legacy split-brain leakage, netfilter-guard.",
 		float64(d.Series.IPTablesLegacyLeakedRules))
+	// Wave-3 self-healing series.
+	counter("node_agent_udp_stale_sockets_destroyed_total",
+		"Connected UDP sockets pointing at dead cluster endpoints destroyed via SOCK_DESTROY.",
+		d.Series.UDPStaleDestroyed)
+	b.Gauge("node_agent_mount_table_utilization_ratio",
+		"Current /proc/1/mountinfo entry count divided by fs.mount-max.",
+		d.Series.MountTableUtilRatio)
+	b.Gauge("node_agent_mount_max_shared_peers",
+		"Largest shared:<group_id> peer count in /proc/1/mountinfo.",
+		float64(d.Series.MountMaxSharedPeers))
+	counter("node_agent_loop_devices_reaped_total",
+		"Orphan /dev/loop* devices with deleted backing files detached via LOOP_CLR_FD.",
+		d.Series.LoopDevicesReaped)
+	counter("node_agent_pod_cgroup_cpu_throttled_total",
+		"Pod cgroup slices experiencing severe CPU CFS throttling while host CPU idle >= 40%.",
+		d.Series.PodCgroupCPUThrottled)
+	b.Gauge("node_agent_vma_max_utilization_ratio",
+		"Worst per-PID VMA count divided by vm.max_map_count across top-5 VmSize processes.",
+		d.Series.VMAMaxUtilRatio)
+	b.Gauge("node_agent_pod_dns_resolv_overflow",
+		"Running pods on this node whose /etc/resolv.conf exceeds glibc MAXNS/MAXDNSRCH limits.",
+		float64(d.Series.PodDNSResolvOverflow))
 	if err := promfile.Write(dir, "node-agent-hygiene.prom",
 		[]byte(b.String())); err != nil {
 		fail(err)

@@ -66,6 +66,10 @@ const (
 	// node_host_agent_watchdog_state{state=...} like every other
 	// state-* latch.
 	StateKubeCertExpiring = latchdefs.LatchKubeconfigCertExpiring
+	// StateEtcdQuorumDegraded latches on embedded etcd CORRUPT alarm,
+	// stuck learner (>EtcdLearnerMaxAge), lost leader, leader-change
+	// storm, or sustained WAL fsync p99 > FsyncP99MaxSeconds.
+	StateEtcdQuorumDegraded = latchdefs.LatchEtcdQuorumDegraded
 )
 
 // On-disk bookkeeping file names under WatchdogStateDir — same names
@@ -116,6 +120,9 @@ const (
 	// FileRateKineCheckpoint is the WAL-checkpoint cooldown file
 	// under WatchdogStateDir.
 	FileRateKineCheckpoint = "last-kine-wal-checkpoint"
+	// FileFirstSeenEtcdLearner tracks when the embedded etcd member
+	// first entered isLearner=true (Wave-3 #8).
+	FileFirstSeenEtcdLearner = "first-seen-etcd-learner"
 	// LogKeyDeadFallbk keys the dead-fallback hold lines —
 	// suspectLog dedupe budget keys are dropped by stateExit when
 	// they match a latch name; the dead-fallback lines have no

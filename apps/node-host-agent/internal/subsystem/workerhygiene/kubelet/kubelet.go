@@ -246,9 +246,9 @@ func restartK0sWorkerGated(d *wdeps.Deps, ctx context.Context,
 		d.State.AppendLog(fmt.Sprintf(
 			"suspect: %s - k0sworker not settled (<180s), skip restart", suspectTag))
 		return false
-	case d.HoldLocalAction(ctx):
+	case d.HoldEmergencyHeal(ctx):
 		d.State.AppendLog(fmt.Sprintf(
-			"suspect: %s - cluster maintenance in progress, skip restart k0sworker", suspectTag))
+			"suspect: %s - emergency k0sworker restart held by maintenance window, skip", suspectTag))
 		return false
 	case !d.State.RateTrySpend("last-restart", d.Cfg.MinRestartInterval):
 		d.State.AppendLog(fmt.Sprintf(

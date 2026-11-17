@@ -157,9 +157,17 @@ func TestSubPathDriftedExclusions(t *testing.T) {
 	if subPathDrifted("apps", quorum, nil) {
 		t.Fatal("quorum-labelled workload not excluded")
 	}
-	optOut := map[string]string{"passiontech.dev/subpath-reload-opt-out": "false"}
-	if subPathDrifted("apps", template, optOut) {
-		t.Fatal("opted-out workload not excluded")
+	for _, val := range []string{"true", "1", "yes", "True"} {
+		optOut := map[string]string{"passiontech.dev/subpath-reload-opt-out": val}
+		if subPathDrifted("apps", template, optOut) {
+			t.Fatalf("opted-out (%q) workload not excluded", val)
+		}
+	}
+	if !subPathDrifted("apps", template, map[string]string{"passiontech.dev/subpath-reload-opt-out": "false"}) {
+		t.Fatal("opt-out=false unexpectedly excluded")
+	}
+	if subPathDrifted("apps", map[string]string{"app.kubernetes.io/part-of": "dragonfly"}, nil) {
+		t.Fatal("dragonfly workload not excluded")
 	}
 }
 

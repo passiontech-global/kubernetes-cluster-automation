@@ -335,7 +335,6 @@ func (p *meshControlPlaneCheck) healNamedPod(ctx context.Context, log logr.Logge
 			"component", component, "pod", key)
 		return
 	}
-	kube.MarkPodDeleted(ctx, pod.UID) // O(1) tombstone — no census reset
 	metrics.ControlPlanePodHealsTotal.WithLabelValues(component).Inc()
 	log.Info("DELETE: wedged control-plane pod — forcing re-roll",
 		"component", component, "pod", key)

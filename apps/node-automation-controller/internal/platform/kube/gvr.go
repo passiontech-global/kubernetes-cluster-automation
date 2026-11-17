@@ -316,4 +316,12 @@ var (
 	// ---------------------------------------------------------------
 	GVRCNPGCluster = schema.GroupVersionResource{
 		Group: "postgresql.cnpg.io", Version: "v1", Resource: "clusters"}
+
+	// ---------------------------------------------------------------
+	// CSI Snapshotter (stuck_terminating_storage bound-protection unstick).
+	// ---------------------------------------------------------------
+	GVRVolumeSnapshot = schema.GroupVersionResource{
+		Group: "snapshot.storage.kubernetes.io", Version: "v1", Resource: "volumesnapshots"}
+	GVRVolumeSnapshotContent = schema.GroupVersionResource{
+		Group: "snapshot.storage.kubernetes.io", Version: "v1", Resource: "volumesnapshotcontents"}
 )

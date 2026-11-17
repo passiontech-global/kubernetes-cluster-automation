@@ -30,6 +30,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewStatefulSetRolloutUnstickCheck,
 	NewDaemonSetRolloutWedgeCheck,
 	NewCronJobForbidZombieCheck,
+	NewTopologySpreadZoneDeadlockCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

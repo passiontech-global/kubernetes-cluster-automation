@@ -36,9 +36,7 @@ import (
 // in this module.
 func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 	snap *guardstate.Snapshot, ready guardstate.EndpointCensus) {
-	g := snap.G
 	log := logf.FromContext(ctx)
-	now := g.Now.Now()
 	if probeBlind(ready) {
 		// Fleet-blind guard: when EVERY probed backend failed the
 		// handshake, this pod's path to webhook pods is the likely
@@ -75,6 +73,17 @@ func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 	if len(keys) == 0 {
 		return
 	}
+	b.bounceServiceKeys(ctx, snap, ready, keys, "hung TCP+TLS handshake")
+}
+
+// bounceServiceKeys bounces the oldest Ready live backing pod for each
+// service in keys, shared between unresponsive TLS handshakes and
+// Prometheus-degraded slow/5xx webhooks under the common BounceCooldown.
+func (b *Breaker) bounceServiceKeys(ctx context.Context, snap *guardstate.Snapshot,
+	ready guardstate.EndpointCensus, keys []string, reason string) {
+	g := snap.G
+	log := logf.FromContext(ctx)
+	now := g.Now.Now()
 	// The bounce target is confirmed LIVE before the heal preamble
 	// runs: a stale census ref must not spend a budget grant or open
 	// the per-service cooldown on nothing. The mutex evaluation is
@@ -86,7 +95,7 @@ func (b *Breaker) bounceHungWebhookPods(ctx context.Context,
 		target := b.oldestLiveBackingPod(ctx, snap, key, ready.BackingPods[key], now)
 		if target == nil {
 			log.Info("webhook bounce: no live Ready backing pod found — endpoint refs are stale",
-				"service", key)
+				"service", key, "reason", reason)
 			continue
 		}
 		b.deleteBouncePod(ctx, snap, key, target, now)

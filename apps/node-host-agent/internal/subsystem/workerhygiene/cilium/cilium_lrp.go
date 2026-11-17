@@ -149,9 +149,9 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Hold BEFORE the budget spend (same rule the spegel/calico
 	// remedies carry): a maintenance-held delete must not consume
 	// the restart cooldown for an action that never ran.
-	if c.d.HoldLocalAction(ctx) {
+	if c.d.HoldEmergencyHeal(ctx) {
 		c.d.State.AppendLog("suspect: cilium-lrp-dns pod delete held — " +
-			"cluster maintenance in progress")
+			"maintenance window in progress")
 		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
@@ -162,6 +162,7 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckCiliumLRP, "ok")
 		return
 	}
+	c.d.StampLocalRemediation(ctx)
 	// Budget spent atomically BEFORE the delete (rate_spend parity).
 	// The heal stamp rides BEFORE the delete so the cluster side sees
 	// the attribution even if this process dies mid-call.
@@ -231,12 +232,19 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 		strings.Join(desynced, " "))) {
 		return true
 	}
+	if c.d.HoldEmergencyHeal(ctx) {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cilium-lrp-dns BPF service-map desync %s (%dx) — emergency restart held by maintenance window, skip",
+			strings.Join(desynced, " "), c.svcFails))
+		return true
+	}
 	if !c.d.State.RateTrySpend("last-cilium-restart", c.d.Cfg.MinRestartInterval) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cilium-lrp-dns BPF service-map desync %s (%dx) but agent restart in cooldown (<30m), skip",
 			strings.Join(desynced, " "), c.svcFails))
 		return true
 	}
+	c.d.StampLocalRemediation(ctx)
 	// Budget spent atomically BEFORE acting (rate_spend parity).
 	if killCiliumAgent(c.d, agentTasks) {
 		c.d.State.AppendLog(fmt.Sprintf(latchdefs.ActionCiliumAgentKill+

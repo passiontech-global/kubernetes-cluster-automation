@@ -41,6 +41,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -126,11 +127,23 @@ func gpuPCIDriverBound(dev gpuPCIDevice) bool {
 // gpuPCIBaseline reads the persisted display-class NVIDIA count —
 // 0 with ok=false when no baseline exists yet (first scan seeds it
 // without alarming).
+func (r *Runner) gpuPCIBaselinePath() string {
+	if r.deps.Store == nil || r.deps.Store.Dir == "" {
+		return ""
+	}
+	return filepath.Join(r.deps.Store.Dir, gpuPCIBaselineName)
+}
+
 func (r *Runner) gpuPCIBaseline() (int, bool) {
-	if r.deps.Store == nil {
+	p := r.gpuPCIBaselinePath()
+	if p == "" {
 		return 0, false
 	}
-	data, err := os.ReadFile(r.deps.Store.Path(gpuPCIBaselineName))
+	// Clean up legacy state-gpu-pcie-baseline left by earlier builds if present.
+	if legacy := r.deps.Store.Path(gpuPCIBaselineName); legacy != "" && legacy != p {
+		_ = os.Remove(legacy)
+	}
+	data, err := os.ReadFile(p)
 	if err != nil {
 		return 0, false
 	}
@@ -141,14 +154,14 @@ func (r *Runner) gpuPCIBaseline() (int, bool) {
 	return n, true
 }
 
-// writeGPUPCI Baseline persists the display-class NVIDIA count —
-// best-effort; a failed write just means the next restart re-seeds.
+// writeGPUPCIbaseline persists the display-class NVIDIA count atomically
+// without the state- prefix so collectWatchdog never surfaces it as a latch.
 func (r *Runner) writeGPUPCIbaseline(n int) {
-	if r.deps.Store == nil {
+	p := r.gpuPCIBaselinePath()
+	if p == "" {
 		return
 	}
-	_ = os.WriteFile(r.deps.Store.Path(gpuPCIBaselineName),
-		[]byte(strconv.Itoa(n)+"\n"), 0o644)
+	_ = fsx.WriteFileAtomicNoSync(p, strconv.Itoa(n)+"\n")
 }
 
 // updateGPUPCIe runs the sysfs census once per latch tick and feeds

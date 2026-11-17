@@ -73,13 +73,14 @@ var (
 	// ... resetting controller") — both spellings must match or the
 	// signatures go blind on newer kernels.
 	pcieNVMeResetRe = regexp.MustCompile(
-		`PCIe Bus Error: severity=Uncorrect(?:ed|able)|AER: (?:Uncorrect(?:ed|able)|Fatal)|` +
+		`PCIe Bus Error: severity=Uncorrect(?:ed|able)(?:\s*\(Fatal\)|,\s*type=Fatal)|AER: (?:Uncorrect(?:ed|able)\s*\(Fatal\)|Fatal)|` +
 			`nvme nvme\d+: I/O (?:tag )?\d+.* timeout, reset(?:ting)? controller`)
 	// pcieAERFatalRe / nvmeResetRe split pcieNVMeResetRe's arms so
 	// the handler can tell an acute AER event (evidence stamp) from
-	// a controller reset (streak counter).
+	// a controller reset (streak counter). Non-Fatal AER lines
+	// recovered by TLP replay stay excluded.
 	pcieAERFatalRe = regexp.MustCompile(
-		`PCIe Bus Error: severity=Uncorrect(?:ed|able)|AER: (?:Uncorrect(?:ed|able)|Fatal)`)
+		`PCIe Bus Error: severity=Uncorrect(?:ed|able)(?:\s*\(Fatal\)|,\s*type=Fatal)|AER: (?:Uncorrect(?:ed|able)\s*\(Fatal\)|Fatal)`)
 	nvmeResetRe = regexp.MustCompile(
 		`nvme nvme\d+: I/O (?:tag )?\d+.* timeout, reset(?:ting)? controller`)
 	// gpuFatalXidRe captures the fatal NVIDIA Xid code — the same

@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -314,6 +315,12 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 			Patch(ctx, target, types.MergePatchType, payload, metav1.PatchOptions{})
 	}
 	if err != nil {
+		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+			heal.RefundGrant(now)
+			log.Info("SKIP: keda zero-rescue raced (target changed or gone)",
+				"target", kind+" "+ns+"/"+target)
+			return
+		}
 		metrics.IncError(p.Name)
 		log.Error(err, "keda zero-rescue scale patch failed",
 			"target", kind+" "+ns+"/"+target, "replicas", rescue)

@@ -27,6 +27,15 @@ func TestConfigFromEnv(t *testing.T) {
 	if cfg.TextfileDir != "/textfile" {
 		t.Fatalf("TextfileDir=%q", cfg.TextfileDir)
 	}
+	if !cfg.SeqWidenEnabled {
+		t.Fatal("SeqWidenEnabled default should be true")
+	}
+
+	t.Setenv(envnames.EnvKineSeqWidenEnabled, "false")
+	cfg2 := ConfigFromEnv(EnvDeps{HostPath: func(p string) string { return "/host" + p }})
+	if cfg2.SeqWidenEnabled {
+		t.Fatal("SeqWidenEnabled=false override ignored")
+	}
 }
 
 func TestConfigFromEnvHostPathDefaults(t *testing.T) {

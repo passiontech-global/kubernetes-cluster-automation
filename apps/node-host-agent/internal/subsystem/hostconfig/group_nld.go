@@ -104,6 +104,7 @@ DNSStubListener=no
 	// IPv6 — a dual-stack listener (:53 wildcard bind) let every v6
 	// source through the v4-only firewall.
 	nft := fmt.Sprintf(`# Managed by node-config-agent - block DNS from non-cluster sources
+destroy table ip nodelocaldns_guard
 destroy table inet nodelocaldns_guard
 table inet nodelocaldns_guard {
     chain input {
@@ -327,7 +328,7 @@ func (c *cyc) convergeHostPortsGuard() {
 		// Drop the LIVE table too — disabling must actually reopen
 		// the ports, not only stop the oneshot.
 		_, _ = r.run(ctx, "sh", "-c",
-			"nft delete table inet host_internal_ports_guard 2>/dev/null; true")
+			"nft delete table inet host_internal_ports_guard 2>/dev/null; nft delete table ip host_internal_ports_guard 2>/dev/null; true")
 		return
 	}
 	var ports strings.Builder
@@ -384,6 +385,7 @@ func (c *cyc) convergeHostPortsGuard() {
 		return
 	}
 	nft := fmt.Sprintf(`# Managed by node-config-agent - drop non-cluster traffic to node-internal ports
+destroy table ip host_internal_ports_guard
 destroy table inet host_internal_ports_guard
 table inet host_internal_ports_guard {
     chain input {

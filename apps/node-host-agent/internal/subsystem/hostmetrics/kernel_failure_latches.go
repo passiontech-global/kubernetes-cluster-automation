@@ -104,5 +104,9 @@ func (c *Collector) kernelFailDeps() kernelfail.Deps {
 		// means learn-from-hardware).
 		GPUGuardMode:     c.cfg.GPUGuardMode,
 		GPUExpectedCount: c.cfg.GPUExpectedCount,
+		// Wave-3 #10: eBPF resource leak latch (zero new I/O — reuses ebpfSnapshot).
+		EBPFSnapshot: c.ebpfSnapshot,
+		EBPFProgsMax: c.cfg.EBPFProgsMax,
+		EBPFMapsMax:  c.cfg.EBPFMapsMax,
 	}
 }

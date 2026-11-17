@@ -471,7 +471,7 @@ func flattenInstanceVar(path string, fields []string, value any) []instanceVarPa
 // are wrapped in Go quoting so the ATC's dot-notation parser keeps
 // them as ONE field.
 func instanceVarSegment(seg string) string {
-	if strings.ContainsAny(seg, ",.:/ ") {
+	if strings.ContainsAny(seg, ",.:/ \"\\") {
 		return fmt.Sprintf("%q", seg)
 	}
 	return seg

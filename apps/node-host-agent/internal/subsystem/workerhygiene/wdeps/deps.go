@@ -128,6 +128,14 @@ type Series struct {
 	// (the split-brain the guard exists to surface). Surfaced as
 	// node_agent_iptables_legacy_leaked_rules.
 	IPTablesLegacyLeakedRules int64
+	// Wave-3 series.
+	UDPStaleDestroyed     int64
+	MountTableUtilRatio   float64
+	MountMaxSharedPeers   int64
+	LoopDevicesReaped     int64
+	PodCgroupCPUThrottled int64
+	VMAMaxUtilRatio       float64
+	PodDNSResolvOverflow  int64
 }
 
 // Deps is the shared state every Check consumes — the split's

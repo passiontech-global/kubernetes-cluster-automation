@@ -80,6 +80,10 @@ type Metrics struct {
 	BackupAge   prometheus.Gauge
 	BackupValid prometheus.Gauge
 
+	// Wave-3 #1: Kine PostgreSQL int4 sequence cliff guard.
+	SeqUtilRatio prometheus.Gauge // kine_db_sequence_utilization_ratio
+	IDInt4Hazard prometheus.Gauge // kine_db_id_int4_hazard
+
 	Cycles *prometheus.CounterVec // loop, result
 }
 
@@ -227,6 +231,14 @@ func NewMetrics() *Metrics {
 			Name: "kine_db_backup_valid",
 			Help: "1 when the newest physical pg_dump passed header verification (PGDMP magic / pg_restore -l) — backup-health.",
 		}),
+		SeqUtilRatio: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_sequence_utilization_ratio",
+			Help: "Ratio of kine.id sequence last_value to effective ceiling (capped at 2147483647 when kine.id is int4).",
+		}),
+		IDInt4Hazard: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kine_db_id_int4_hazard",
+			Help: "1 when kine.id column is int4 (atttypid=23) or its backing sequence is non-bigint (max_value <= 2147483647); 0 when both are bigint.",
+		}),
 		Cycles: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "node_host_agent_kinedb_cycles_total",
 			Help: "kinedb loop cycles by loop and result.",
@@ -262,6 +274,7 @@ func (m *Metrics) Collectors() []prometheus.Collector {
 		m.PgbClientWaiting, m.PgbMaxWait, m.InvalidIndexes,
 		m.SeqScans, m.SeqTupRead,
 		m.TopChurn, m.TopHotkey, m.BackupAge, m.BackupValid,
+		m.SeqUtilRatio, m.IDInt4Hazard,
 		m.Cycles,
 	}
 }

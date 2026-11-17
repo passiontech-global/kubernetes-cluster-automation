@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -104,6 +105,7 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 			"ACTION: killed konnectivity-server pid=%d — uds_ok=%v "+
 				"ready_backends=%v bad_cycles=%d (k0s supervisor restarts it)",
 			pid, sockErr == nil, backends, c.konnBadCycles))
+		c.konnBadCycles = 0
 		d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "konn_server_kill").Inc()
 	case cdeps.ModeDryRun:
 		d.State.AppendLog(fmt.Sprintf(
@@ -198,47 +200,64 @@ func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
 	}
 	endpoint = strings.TrimPrefix(endpoint, "https://")
 	endpoint = strings.TrimPrefix(endpoint, "http://")
-	qctx, cancel := context.WithTimeout(ctx, c.d.Cfg.QueryTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(qctx, http.MethodGet,
-		"https://"+endpoint+"/api/v1/nodes?limit=500", nil)
-	if err != nil {
-		return 0
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var list struct {
-		Items []struct {
-			Metadata struct {
-				Labels map[string]string `json:"labels"`
-			} `json:"metadata"`
-			Status struct {
-				Conditions []struct {
-					Type   string `json:"type"`
-					Status string `json:"status"`
-				} `json:"conditions"`
-			} `json:"status"`
-		} `json:"items"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&list); err != nil {
-		return 0
-	}
 	n := 0
-	for _, item := range list.Items {
-		if _, cp := item.Metadata.Labels["node-role.kubernetes.io/control-plane"]; cp {
-			continue
+	cont := ""
+	for {
+		u := "https://" + endpoint + "/api/v1/nodes?limit=500"
+		if cont != "" {
+			u += "&continue=" + url.QueryEscape(cont)
 		}
-		if _, cp := item.Metadata.Labels["node-role.kubernetes.io/master"]; cp {
-			continue
+		qctx, cancel := context.WithTimeout(ctx, c.d.Cfg.QueryTimeout)
+		req, err := http.NewRequestWithContext(qctx, http.MethodGet, u, nil)
+		if err != nil {
+			cancel()
+			return 0
 		}
-		for _, cond := range item.Status.Conditions {
-			if cond.Type == "Ready" && cond.Status == "True" {
-				n++
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			return 0
+		}
+		var list struct {
+			Metadata struct {
+				Continue string `json:"continue"`
+			} `json:"metadata"`
+			Items []struct {
+				Metadata struct {
+					Labels map[string]string `json:"labels"`
+				} `json:"metadata"`
+				Status struct {
+					Conditions []struct {
+						Type   string `json:"type"`
+						Status string `json:"status"`
+					} `json:"conditions"`
+				} `json:"status"`
+			} `json:"items"`
+		}
+		statusOK := resp.StatusCode/100 == 2
+		decErr := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&list)
+		_ = resp.Body.Close()
+		cancel()
+		if !statusOK || decErr != nil {
+			return 0
+		}
+		for _, item := range list.Items {
+			if _, cp := item.Metadata.Labels["node-role.kubernetes.io/control-plane"]; cp {
+				continue
+			}
+			if _, cp := item.Metadata.Labels["node-role.kubernetes.io/master"]; cp {
+				continue
+			}
+			for _, cond := range item.Status.Conditions {
+				if cond.Type == "Ready" && cond.Status == "True" {
+					n++
+				}
 			}
 		}
+		if list.Metadata.Continue == "" {
+			break
+		}
+		cont = list.Metadata.Continue
 	}
 	return n
 }

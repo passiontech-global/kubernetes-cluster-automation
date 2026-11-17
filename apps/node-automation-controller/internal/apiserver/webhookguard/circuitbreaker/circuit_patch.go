@@ -62,6 +62,8 @@ type circuitEval struct {
 	broken      map[string]bool // annotation set being rebuilt
 	present     map[string]bool // every live sub-webhook name
 	blind       bool            // probe source itself suspect — see probeBlind
+	latencyHold map[string]bool
+	latencyTrip map[string]string
 	hookMerges  []map[string]any
 	changed     bool
 	trips       []string
@@ -99,6 +101,13 @@ type circuitEval struct {
 func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal string,
 	hooks []guardstate.WebhookView, ready guardstate.EndpointCensus, now time.Time,
 	seen, recoverSeen map[string]bool, allowTrips bool) (payload []byte, trips, recovered, stillBroken, dropped []string) {
+	return b.circuitPatchWithLatency(log, queue, kind, cfgName, annoVal, hooks, ready, now,
+		seen, recoverSeen, allowTrips, latencyVerdict{})
+}
+
+func (b *Breaker) circuitPatchWithLatency(log logr.Logger, queue, kind, cfgName, annoVal string,
+	hooks []guardstate.WebhookView, ready guardstate.EndpointCensus, now time.Time,
+	seen, recoverSeen map[string]bool, allowTrips bool, lv latencyVerdict) (payload []byte, trips, recovered, stillBroken, dropped []string) {
 
 	e := &circuitEval{
 		b: b, log: log,
@@ -115,7 +124,9 @@ func (b *Breaker) circuitPatch(log logr.Logger, queue, kind, cfgName, annoVal st
 		// the healthy streak must not advance ("can't tell" holds the
 		// annotation, the SSOT). Apiserver-truth verdicts (0 effective
 		// endpoints) are unaffected.
-		blind: probeBlind(ready),
+		blind:       probeBlind(ready),
+		latencyHold: lv.holdForMetrics,
+		latencyTrip: lv.tripForMetrics,
 	}
 	for _, h := range e.hooks {
 		e.evalHook(h)
@@ -178,13 +189,21 @@ func (e *circuitEval) evalHook(h guardstate.WebhookView) {
 	// malformed Service ref is unmeasurable and must NEVER advance
 	// the streak) and effective must be positive (0 endpoints is a
 	// backend that is still dead, not a recovered one; effective > 0
-	// implies raw > 0, spelled out for symmetry with the freeze).
-	case isBroken && svcEffective > 0 && svcRaw > 0 && !unresponsive && !e.blind:
+	// implies raw > 0, spelled out for symmetry with the freeze),
+	// AND Prometheus latency/5xx metrics must no longer be breached.
+	case isBroken && svcEffective > 0 && svcRaw > 0 && !unresponsive && !e.blind && !e.latencyHold[h.Name]:
 		e.evalRecover(h, key, svc)
 	case isBroken:
 		e.evalStillBroken(h, key)
 	case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.FailurePolicy) && e.allowTrips:
 		e.evalTrip(h, key, svc, svcRaw, unresponsive)
+	case e.latencyTrip[h.Name] != "" && guardstate.FailClosed(h.FailurePolicy) && e.allowTrips:
+		e.flip(h, admissionv1.Ignore)
+		e.broken[h.Name] = true
+		e.trips = append(e.trips, h.Name)
+		e.log.Info("CIRCUIT-TRIP: admission webhook degraded "+joinReason(e.latencyTrip[h.Name])+" — patching failurePolicy=Ignore",
+			"kind", e.kind, "config", e.cfgName, "webhook", h.Name,
+			"service", svcRefString(h.Service), "reason", e.latencyTrip[h.Name])
 	}
 }
 

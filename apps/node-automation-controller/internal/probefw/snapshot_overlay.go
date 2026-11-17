@@ -170,6 +170,14 @@ func (d *Deps) InvalidateStatefulSets(ctx context.Context) {
 	}
 }
 
+// InvalidateDaemonSets is the DaemonSet twin of InvalidateDeployments.
+func (d *Deps) InvalidateDaemonSets(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.daemonSets.reset()
+		s.daemonSetsIdx.reset()
+	}
+}
+
 // InvalidateCronJobs is the CronJob twin — a suspend/spec patch
 // mid-sweep must be visible to later schedule audits.
 func (d *Deps) InvalidateCronJobs(ctx context.Context) {

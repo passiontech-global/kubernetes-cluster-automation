@@ -63,6 +63,11 @@ func (s *crdConversionSweep) carryForward(live map[string]bool) {
 // the kill-switch is on, so re-reporting would double-count).
 func (s *crdConversionSweep) loadInputs() (proceed bool, err error) {
 	if s.snap.CRDErr != nil {
+		if apierrors.IsForbidden(s.snap.CRDErr) {
+			s.carryForward(nil)
+			s.log.Info("WARN: list customresourcedefinitions forbidden (RBAC) — conversion webhook sweep skipped")
+			return false, nil
+		}
 		// API flap — "can't read the surface" fails closed: carry
 		// the series forward and surface the error.
 		s.carryForward(nil)

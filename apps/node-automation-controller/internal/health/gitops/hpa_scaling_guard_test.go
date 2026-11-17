@@ -168,3 +168,35 @@ func TestHPAScalingGuardRescueSkipsIntentionalZero(t *testing.T) {
 			*got.Spec.Replicas)
 	}
 }
+
+func TestHPAScalingGuardBouncesIsolatedUnreadyMetricsServer(t *testing.T) {
+	hpa := hpaObj("apps", "api", "Deployment", "api",
+		map[string]string{"type": "ScalingActive", "status": "False",
+			"reason": "FailedGetResourceMetric"})
+	ctrl := true
+	rsOwner := metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "metrics-server-abc", UID: "rs-ms", Controller: &ctrl,
+	}
+	msReady := probetest.PodWithPhase("kube-system", "metrics-server-ready", corev1.PodRunning, true, time.Hour)
+	msReady.OwnerReferences = []metav1.OwnerReference{rsOwner}
+	msBad1 := probetest.PodWithPhase("kube-system", "metrics-server-bad-1", corev1.PodRunning, false, time.Hour)
+	msBad1.OwnerReferences = []metav1.OwnerReference{rsOwner}
+	msBad2 := probetest.PodWithPhase("kube-system", "metrics-server-bad-2", corev1.PodRunning, false, time.Hour)
+	msBad2.OwnerReferences = []metav1.OwnerReference{rsOwner}
+
+	cs, ch := hpaDeps(hpa, msReady, msBad1, msBad2)
+	base := time.Now()
+	probetest.FreezeNow(ch.Deps, base)
+	ch.Run(probetest.SweepCtx(ctx))
+	probetest.FreezeNow(ch.Deps, base.Add(hpaUnhealthyMinAge+time.Minute))
+	ch.Run(probetest.SweepCtx(ctx))
+
+	// Only one unready metrics-server pod should be deleted per sweep (sorted: bad-1).
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "metrics-server-bad-1", metav1.GetOptions{}); err == nil {
+		t.Fatal("expected first unready metrics-server pod to be bounced")
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "metrics-server-bad-2", metav1.GetOptions{}); err != nil {
+		t.Fatalf("second unready metrics-server pod should wait for cooldown: %v", err)
+	}
+}

@@ -81,7 +81,14 @@ func (c *CiliumCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.fails))
 	case c.fails >= c.d.Cfg.ConsecNeeded &&
 		!c.d.State.Exists(latchdefs.LatchNodeOverloaded) &&
+		c.d.HoldEmergencyHeal(ctx):
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cilium-agent-down healthz fail %dx — emergency restart held by maintenance window, skip",
+			c.fails))
+	case c.fails >= c.d.Cfg.ConsecNeeded &&
+		!c.d.State.Exists(latchdefs.LatchNodeOverloaded) &&
 		c.d.State.RateTrySpend("last-cilium-restart", c.d.Cfg.MinRestartInterval):
+		c.d.StampLocalRemediation(ctx)
 		// Budget spent atomically BEFORE acting (rate_spend
 		// parity): a missed kill still consumed it — the feeder
 		// goroutine competes for the same file.

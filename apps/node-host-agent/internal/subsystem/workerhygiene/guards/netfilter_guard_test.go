@@ -272,3 +272,22 @@ func TestNetfilterGuardLegacyGaugeEmptyNames(t *testing.T) {
 			"ip_tables_names", got)
 	}
 }
+
+func TestNetfilterGuardSkipsZombieAndRunnable(t *testing.T) {
+	d, f := gDeps(t)
+	d.Cfg.Wave2.NetfilterGuardStuckCycles = 1
+	d.Cfg.Wave2.NetfilterGuardHungCmdSec = 1
+	mkNetfilterProc(t, d, 301, "iptables", "Z", nil, 5*time.Minute)
+	mkNetfilterProc(t, d, 302, "iptables", "R", nil, 5*time.Minute)
+	mkNetfilterProc(t, d, 303, "iptables", "S", nil, 5*time.Minute)
+	old := f.Now.Add(-5 * time.Minute)
+	for _, pid := range []int{301, 302, 303} {
+		_ = os.Chtimes(filepath.Join(d.Cfg.ProcRoot, strconv.Itoa(pid)), old, old)
+	}
+	c := nfCheck(t, d)
+	d.Cfg.Wave2.NetfilterGuardStuckCycles = 1
+	c.Run(context.Background(), nfEnv(301, 302, 303))
+	if len(f.Kills) != 1 || f.Kills[0].PID != 303 {
+		t.Fatalf("kills=%+v want only PID 303 (skipped Z/R)", f.Kills)
+	}
+}

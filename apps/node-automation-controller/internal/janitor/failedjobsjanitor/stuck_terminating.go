@@ -100,6 +100,10 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 	if err != nil {
 		return fmt.Errorf("list volumeattachments: %w", err)
 	}
+	storageLists, err := j.listStuckStorageCandidates(ctx)
+	if err != nil {
+		return err
+	}
 
 	stuck := 0 // tuples re-asserted this sweep (for the done log)
 	mark := func(kind, ns, name string, terminatingSince *metav1.Time, finalizers []string) {
@@ -157,6 +161,7 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 		mark("VolumeAttachment", "", v.Name, v.DeletionTimestamp, v.Finalizers)
 	}
 	vas = nil
+	j.processStuckStorage(ctx, storageLists, now, mark)
 
 	// Hygiene: series for resources that finished terminating are
 	// deleted, not zeroed — a Set(0) leaves the label triple in

@@ -148,6 +148,11 @@ func ConfigFromEnv(d EnvDeps) Config {
 		}},
 		envx.IntKnob(envnames.EnvGPUExpectedCount,
 			&cfg.GPUExpectedCount, 0),
+		// Wave-3 #10: kernel eBPF prog/map resource leak latch ceilings.
+		envx.IntKnob(envnames.EnvEBPFProgsMax,
+			&cfg.EBPFProgsMax, kernelfail.DefaultEBPFProgsMax),
+		envx.IntKnob(envnames.EnvEBPFMapsMax,
+			&cfg.EBPFMapsMax, kernelfail.DefaultEBPFMapsMax),
 	})
 	return cfg
 }

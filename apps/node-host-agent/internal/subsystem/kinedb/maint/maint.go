@@ -118,6 +118,7 @@ type Result struct {
 	// okUrgent; skips count as ok like the repack gates).
 	urgentState string
 	okUrgent    bool
+	seqWidened  bool
 	notes       []string
 }
 

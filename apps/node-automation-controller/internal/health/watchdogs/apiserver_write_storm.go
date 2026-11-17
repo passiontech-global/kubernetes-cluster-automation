@@ -27,6 +27,8 @@ package watchdogs
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -146,6 +148,7 @@ const (
 func (p *apiserverWriteStormCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
+	p.eventHealed.PruneExpired(now, writeStormEventCooldown)
 	var rep probefw.SweepReport
 
 	rate, rerr := p.PromQuery(ctx, writeStormRateQuery)
@@ -309,6 +312,15 @@ func (p *apiserverWriteStormCheck) suspendStormFlux(ctx context.Context,
 	case !proceed:
 		return
 	}
+	slices.SortFunc(targets, func(a, b *fluxWriteStormObject) int {
+		if c := strings.Compare(a.ns, b.ns); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.gvr.Resource, b.gvr.Resource); c != 0 {
+			return c
+		}
+		return strings.Compare(a.name, b.name)
+	})
 	patched := 0
 	for _, t := range targets {
 		if patched >= writeStormMaxSuspends {
@@ -335,6 +347,7 @@ func (p *apiserverWriteStormCheck) suspendStormFlux(ctx context.Context,
 	if patched > 0 {
 		p.Heals.Stamp(ck, now)
 		p.suspended = true
+		p.InvalidateUnstructured(ctx)
 	}
 }
 
@@ -353,6 +366,7 @@ func (p *apiserverWriteStormCheck) restoreSuspendedFlux(ctx context.Context,
 		return false // census failed — inconclusive, keep armed
 	}
 	ok := true
+	restored := 0
 	for _, t := range targets {
 		patch := []byte(fmt.Sprintf(
 			`{"spec":{"suspend":false},"metadata":{"annotations":{%q:null}}}`,
@@ -368,6 +382,10 @@ func (p *apiserverWriteStormCheck) restoreSuspendedFlux(ctx context.Context,
 		log.Info("ACTION: restored flux object after write-storm relief",
 			"kind", t.gvr.Resource, "object", t.ns+"/"+t.name)
 		kube.RecordAnnoPatch(ctx, t.obj, patch)
+		restored++
+	}
+	if restored > 0 {
+		p.InvalidateUnstructured(ctx)
 	}
 	return ok
 }

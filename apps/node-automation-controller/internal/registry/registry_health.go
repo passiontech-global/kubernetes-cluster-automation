@@ -134,4 +134,7 @@ var healthRows = []shared.Module{
 	{Name: "hpa-scaling-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_HPA_SCALING_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameHPAScalingGuard, New: gitops.NewHPAScalingGuardCheck}},
 	{Name: "deployment-rollout-wedge", Group: groupHealth, GateEnv: "NODE_AUTOMATION_DEPLOYMENT_ROLLOUT_WEDGE_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameDeploymentRolloutWedge, New: watchdogs.NewDeploymentRolloutWedgeCheck}},
 	{Name: "subpath-config-drift", Group: groupHealth, GateEnv: "NODE_AUTOMATION_SUBPATH_CONFIG_DRIFT_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameSubPathConfigDrift, New: watchdogs.NewSubPathConfigDriftCheck}},
+	// Self-healing wave-3 checks — appended at end of healthRows.
+	{Name: "service-selector-blackhole", Group: groupHealth, GateEnv: "NODE_AUTOMATION_SERVICE_BLACKHOLE_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameServiceSelectorBlackhole, New: nethealth.NewServiceSelectorBlackholeCheck}},
+	{Name: "topology-spread-zone-deadlock", Group: groupHealth, GateEnv: "NODE_AUTOMATION_TOPOLOGY_ZONE_DEADLOCK_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameTopologyZoneDeadlock, New: watchdogs.NewTopologySpreadZoneDeadlockCheck}},
 }

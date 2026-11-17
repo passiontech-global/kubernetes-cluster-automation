@@ -96,7 +96,6 @@ func (p *localPVStrandedCheck) healStrandedEphemeral(ctx context.Context,
 			// to the bookkeeping below — pod already gone counts.)
 			continue
 		}
-		kube.MarkPodDeleted(ctx, h.pod.UID) // O(1) tombstone — no census reset
 		p.localPVHealed.Stamp(pvcKey, now)
 		localPVEphemeralHealsTotal.
 			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
