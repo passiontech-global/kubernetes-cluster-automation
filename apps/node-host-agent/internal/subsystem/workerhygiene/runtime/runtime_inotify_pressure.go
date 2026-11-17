@@ -79,13 +79,28 @@ type inotifyTotals struct {
 	watches   int64
 }
 
-// inotifyScan is one cycle's usage sweep: node totals plus the
-// per-pod-UID aggregate (only pids whose cgroup resolves to a pod
-// land in byUID — host processes count toward the totals but are
-// never eviction candidates).
+// inotifyScan is one cycle's usage sweep: node totals, the
+// per-real-UID aggregate the ucounts-correct ratios compare
+// against (max_user_instances/watches are PER-UID budgets — a
+// node-wide total vs a per-uid limit false-positives on any
+// multi-uid fleet), and the per-pod-UID aggregate (only pids whose
+// cgroup resolves to a pod land in byUID — host processes count
+// toward the totals but are never eviction candidates). pids whose
+// real uid is unreadable share the -1 bucket — merging unknowns
+// keeps the degenerate all-unreadable case at the old
+// node-wide behavior instead of going blind.
 type inotifyScan struct {
-	total inotifyTotals
-	byUID map[string]inotifyTotals
+	total  inotifyTotals
+	byRUID map[int64]inotifyTotals
+	byUID  map[string]inotifyTotals
+}
+
+// inotifyFD is one deduplicated inotify open file description —
+// key is the OFD identity ("ino:<n>" from the fd's inode, or a
+// per-pid fallback when the stat seam can't resolve it).
+type inotifyFD struct {
+	key     string
+	watches int64
 }
 
 // InotifyPressureCheck is the inotify pressure healer as a Check;
@@ -94,6 +109,13 @@ type inotifyScan struct {
 type InotifyPressureCheck struct {
 	d     *wdeps.Deps
 	fails int
+	// instFrozen/watchFrozen mark a sysctl the agent provably
+	// cannot raise (EROFS/EPERM write failure) — the current
+	// value IS the effective ceiling, so tier-2 must not wait
+	// forever for cur to reach the configured cap it can never
+	// hit. Cleared by the next successful bump.
+	instFrozen  bool
+	watchFrozen bool
 }
 
 // Name returns the check label / WD_SIG key.
@@ -110,8 +132,13 @@ func (c *InotifyPressureCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	scan := c.scanInotify(e)
-	instRatio := float64(scan.total.instances) / float64(instCur)
-	watchRatio := float64(scan.total.watches) / float64(watchCur)
+	// ucounts semantics: max_user_instances/watches are PER-REAL-
+	// UID budgets, so the pressure ratio is the WORST uid's
+	// usage/limit — never the node-wide total (a fleet of small
+	// pods each under its own budget is healthy even when the
+	// aggregate dwarfs the per-uid limit).
+	instRatio := worstUIDRatio(scan.byRUID, instCeilAxis, instCur)
+	watchRatio := worstUIDRatio(scan.byRUID, watchAxis, watchCur)
 	maxRatio := max(instRatio, watchRatio)
 
 	if maxRatio <= inotifyClearRatio {
@@ -133,8 +160,13 @@ func (c *InotifyPressureCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// known for the runaway-pod share math below.
 	instCeil := c.d.Cfg.Pressure.InotifyMaxInstancesCeiling
 	watchCeil := c.watchCeiling()
-	instPressured := instRatio >= inotifyLatchRatio && instCur >= instCeil
-	watchPressured := watchRatio >= inotifyLatchRatio && watchCur >= watchCeil
+	// frozen axes count as at-ceiling — a sysctl the agent cannot
+	// write (EROFS/EPERM) will never reach the configured cap, so
+	// waiting for cur >= ceil would pin the latch false forever.
+	instPressured := instRatio >= inotifyLatchRatio &&
+		(instCur >= instCeil || c.instFrozen)
+	watchPressured := watchRatio >= inotifyLatchRatio &&
+		(watchCur >= watchCeil || c.watchFrozen)
 	if !instPressured && !watchPressured {
 		c.fails = 0
 		c.d.CycleResult(wdeps.CheckInotifyHygiene, "ok")
@@ -237,33 +269,37 @@ func (c *InotifyPressureCheck) maybeBumpSysctls(instCur, watchCur int64,
 		return
 	}
 	if needInst {
-		c.bumpSysctl("max_user_instances", instCur, instCeil)
+		c.instFrozen = !c.bumpSysctl("max_user_instances", instCur, instCeil)
 	}
 	if needWatch {
-		c.bumpSysctl("max_user_watches", watchCur, watchCeil)
+		c.watchFrozen = !c.bumpSysctl("max_user_watches", watchCur, watchCeil)
 	}
 }
 
 // bumpSysctl writes min(cur*2, ceil) to one fs/inotify sysctl —
 // the doubling keeps convergence fast while the ceiling keeps the
-// kernel-side footprint bounded.
-func (c *InotifyPressureCheck) bumpSysctl(name string, cur, ceil int64) {
+// kernel-side footprint bounded. Returns false when the write
+// failed: the current value is then the EFFECTIVE ceiling (a
+// read-only /proc/sys can never be raised), which the tier-2 gate
+// honors via the frozen flags.
+func (c *InotifyPressureCheck) bumpSysctl(name string, cur, ceil int64) bool {
 	next := cur * 2
 	if next > ceil {
 		next = ceil
 	}
 	if next <= cur {
-		return
+		return true // already at the cap — nothing to freeze
 	}
 	p := filepath.Join(c.d.Cfg.ProcRoot, "sys", "fs", "inotify", name)
 	if err := os.WriteFile(p, []byte(strconv.FormatInt(next, 10)+"\n"), 0o644); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: inotify-pressure-hygiene write %s=%d failed: %v", p, next, err))
-		return
+		return false
 	}
 	c.d.State.AppendLog(fmt.Sprintf(
 		"ACTION: inotify-pressure-hygiene raised %s %d -> %d", name, cur, next))
 	c.d.Actions.WithLabelValues(wdeps.CheckInotifyHygiene, "sysctl_write").Inc()
+	return true
 }
 
 // scanInotify walks <ProcRoot>/<pid>/fd once per cycle counting
@@ -279,46 +315,129 @@ func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv) inotifyScan {
 	} else {
 		pids, _ = c.d.Proc.PIDs()
 	}
-	scan := inotifyScan{byUID: map[string]inotifyTotals{}}
+	scan := inotifyScan{byRUID: map[int64]inotifyTotals{},
+		byUID: map[string]inotifyTotals{}}
+	// OFDs shared across forked workers dedup GLOBALLY — the same
+	// inotify instance reported by N pids is one ucounts charge.
+	// First reporter wins the attribution (its ruid + pod uid).
+	seenOFD := map[string]bool{}
 	for _, pid := range pids {
-		u, ok := inotifyProcUsage(c.d, pid)
-		if !ok || (u.instances == 0 && u.watches == 0) {
+		fds, ok := inotifyProcUsage(c.d, pid)
+		if !ok {
+			continue
+		}
+		var u inotifyTotals
+		for _, f := range fds {
+			if seenOFD[f.key] {
+				continue
+			}
+			seenOFD[f.key] = true
+			u.instances++
+			u.watches += f.watches
+		}
+		if u.instances == 0 {
 			continue
 		}
 		scan.total.instances += u.instances
 		scan.total.watches += u.watches
-		// Only pids that actually hold inotify fds pay the cgroup
-		// read — the common pid contributes nothing and skips it.
+		// Only pids that actually hold inotify fds pay the status /
+		// cgroup reads — the common pid contributes nothing.
+		ruid, _ := procRealUID(c.d, pid) // -1 bucket on unreadable
+		a := scan.byRUID[ruid]
+		a.instances += u.instances
+		a.watches += u.watches
+		scan.byRUID[ruid] = a
 		if uid, ok := wdeps.PodUIDForPID(c.d, pid); ok {
-			a := scan.byUID[uid]
-			a.instances += u.instances
-			a.watches += u.watches
-			scan.byUID[uid] = a
+			p := scan.byUID[uid]
+			p.instances += u.instances
+			p.watches += u.watches
+			scan.byUID[uid] = p
 		}
 	}
 	return scan
 }
 
-// inotifyProcUsage counts one pid's inotify instances (fd
-// readlinks) and watches (fdinfo wd: lines). ok=false when the fd
-// dir is unreadable — a raced exit or a pid we may not inspect;
-// the caller treats it as zero usage, never an error.
-func inotifyProcUsage(d *wdeps.Deps, pid int) (inotifyTotals, bool) {
-	var u inotifyTotals
+// procRealUID reads the real uid from /proc/<pid>/status — the
+// ucounts charging identity for inotify instances/watches.
+// ok=false on unreadable/malformed status; callers bucket those
+// pids under -1 rather than dropping their usage.
+func procRealUID(d *wdeps.Deps, pid int) (int64, bool) {
+	data, err := os.ReadFile(d.Proc.File(pid, "status"))
+	if err != nil {
+		return -1, false
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if !strings.HasPrefix(line, "Uid:") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			return -1, false
+		}
+		uid, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil {
+			return -1, false
+		}
+		return uid, true
+	}
+	return -1, false
+}
+
+// instCeilAxis/watchAxis pick the pressured field out of one
+// per-uid total for worstUIDRatio.
+func instCeilAxis(u inotifyTotals) int64 { return u.instances }
+func watchAxis(u inotifyTotals) int64    { return u.watches }
+
+// worstUIDRatio returns the maximum usage/limit across every real
+// uid — the ucounts-correct pressure signal. A uid with zero
+// usage on the axis is skipped; an empty map (no inotify pids at
+// all) reads 0.
+func worstUIDRatio(byRUID map[int64]inotifyTotals,
+	pick func(inotifyTotals) int64, limit int64) float64 {
+
+	var worst float64
+	for _, u := range byRUID {
+		v := pick(u)
+		if v <= 0 || limit <= 0 {
+			continue
+		}
+		if r := float64(v) / float64(limit); r > worst {
+			worst = r
+		}
+	}
+	return worst
+}
+
+// inotifyProcUsage lists one pid's inotify open file descriptions
+// — each entry carries its OFD dedup key (the fd inode via the
+// InotifyFDIno seam; a "pidfd:<pid>/<fd>" fallback that never
+// dedups when the stat can't resolve, so fork-shared evidence is
+// only dropped when the kernel proves the sharing) plus the
+// fdinfo watch count. ok=false when the fd dir is unreadable — a
+// raced exit or a pid we may not inspect; the caller treats it as
+// zero usage, never an error.
+func inotifyProcUsage(d *wdeps.Deps, pid int) ([]inotifyFD, bool) {
+	var out []inotifyFD
 	fdDir := d.Proc.File(pid, "fd")
 	fds, err := os.ReadDir(fdDir)
 	if err != nil {
-		return u, false
+		return nil, false
 	}
 	for _, fd := range fds {
 		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
 		if err != nil || target != "anon_inode:inotify" {
 			continue
 		}
-		u.instances++
-		u.watches += inotifyFDWatches(d.Proc.File(pid, "fdinfo", fd.Name()))
+		key := fmt.Sprintf("pidfd:%d/%s", pid, fd.Name())
+		if ino, ok := d.Cfg.Seams.Host.InotifyFDIno(pid, fd.Name()); ok {
+			key = fmt.Sprintf("ino:%d", ino)
+		}
+		out = append(out, inotifyFD{
+			key:     key,
+			watches: inotifyFDWatches(d.Proc.File(pid, "fdinfo", fd.Name())),
+		})
 	}
-	return u, true
+	return out, true
 }
 
 // inotifyFDWatches counts the `inotify wd:` watch lines in one

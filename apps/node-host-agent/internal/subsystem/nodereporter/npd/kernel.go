@@ -78,8 +78,12 @@ var kernelTempRules = []rule{
 			`EDAC MC\d+: [1-9]\d* UE|` +
 			`Memory failure: 0x[0-9a-f]+: (?:Sending SIGBUS|recovery action .* Failed)`)},
 	{"PCIeBusError", regexp.MustCompile(
-		`PCIe Bus Error: severity=Uncorrected|AER: (?:Uncorrected|Fatal)|` +
-			`nvme nvme\d+: I/O \d+ .* timeout, resetting controller`)},
+		// Kernel >=5.7 spells the severity "Uncorrectable" (was
+		// "Uncorrected"); kernel >=5.18 prints NVMe resets as
+		// "I/O tag <n> ... timeout, reset controller" — both
+		// spellings must match or the rule goes blind upstream.
+		`PCIe Bus Error: severity=Uncorrect(?:ed|able)|AER: (?:Uncorrect(?:ed|able)|Fatal)|` +
+			`nvme nvme\d+: I/O (?:tag )?\d+.* timeout, reset(?:ting)? controller`)},
 	{"GPUXidError", regexp.MustCompile(
 		`NVRM: Xid \(PCI:[^)]+\): (?:31|43|48|74|79|94|95|119|120),`)},
 	// Non-fatal Xids 31/43 stay in GPUXidError per the plan's code

@@ -252,7 +252,10 @@ type Runner struct {
 	nvmeCLI   []nvmeSmart
 	nvmeCLIAt time.Time
 	// hw is hardware.go's cross-tick state — the acute kmsg evidence
-	// stamps and the NVMe controller-reset streak.
+	// stamps and the NVMe controller-reset streak. The RAM map is a
+	// cache of the hw-evidence file in the state dir: mutations
+	// persist immediately so an agent restart reloads still-fresh
+	// evidence instead of Exiting armed latches on tick one.
 	hw hwScanState
 	// neigh is neighbor.go's pending-overflow family set — fam name
 	// to the kmsg stamp that armed it; nic is nic_health.go's uplink
@@ -383,7 +386,13 @@ func New(d Deps) *Runner {
 	if d.Store == nil && d.StateDir != "" {
 		d.Store = hoststate.New(d.StateDir, "", nil, nil)
 	}
-	return &Runner{deps: d}
+	r := &Runner{deps: d}
+	// Restore the persisted acute-evidence + NVMe-reset state BEFORE
+	// the ticker starts — otherwise the first updateHardwareHealth
+	// after a restart sees an empty hw map and Exits latches that
+	// were legitimately armed by kmsg evidence pre-restart.
+	r.loadHwEvidence()
+	return r
 }
 
 // Refresh runs the deep-failure latch-maintenance block once — the same

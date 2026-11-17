@@ -377,3 +377,74 @@ func TestOrphanPodVolsMountinfoUnreadableKeepsAll(t *testing.T) {
 		t.Fatal("dir reaped while mountinfo was unreadable")
 	}
 }
+
+// TestOrphanPodVolsSubPathAndDeviceTrees is the P1-#6 regression:
+// the residue gate must inspect volume-subpaths/ and volumeDevices/
+// too — a subPath mirror can hold user data (never reaped) while
+// kubelet's own device symlinks are residue (reaped).
+func TestOrphanPodVolsSubPathAndDeviceTrees(t *testing.T) {
+	// volume-subpaths user data → kept.
+	e := fixture(t)
+	writeMountinfo(t, e, []string{miLine("/mnt/ordinary")})
+	uid := opvUIDs[0]
+	podDir := mkOrphanPodDir(t, e, uid, 61*time.Minute)
+	sub := filepath.Join(podDir, "volume-subpaths", "pvc-abc", "pod",
+		"hash-1", "app", "conf.d")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sub, "extra.conf"), "user\n")
+	// Re-age the pod dir — planting the subPath tree refreshed its
+	// mtime; without this gate 4 (not gate 5) is what keeps it.
+	stale := e.Now.Add(-61 * time.Minute)
+	if err := os.Chtimes(podDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	opvConfirm(e, opvEnv(e, true))
+	if _, err := os.Stat(podDir); err != nil {
+		t.Fatal("dir with volume-subpaths user data was reaped")
+	}
+
+	// volumeDevices kubelet symlinks → residue, dir reaped.
+	e = fixture(t)
+	writeMountinfo(t, e, []string{miLine("/mnt/ordinary")})
+	uid = opvUIDs[0]
+	podDir = mkOrphanPodDir(t, e, uid, 61*time.Minute)
+	vd := filepath.Join(podDir, "volumeDevices")
+	if err := os.MkdirAll(vd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/disk/by-id/ata-SSD_X",
+		filepath.Join(vd, "kubernetes.io~csi~pvc-abc")); err != nil {
+		t.Fatal(err)
+	}
+	// Planting volumeDevices refreshed the pod dir mtime — re-age
+	// it or gate 4 (min-age) stands the reap down.
+	stale = e.Now.Add(-61 * time.Minute)
+	if err := os.Chtimes(podDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	opvConfirm(e, opvEnv(e, true))
+	if _, err := os.Stat(podDir); !os.IsNotExist(err) {
+		t.Fatal("dir with only kubelet device symlinks was not reaped")
+	}
+
+	// volumeDevices regular file → fail closed, kept.
+	e = fixture(t)
+	writeMountinfo(t, e, []string{miLine("/mnt/ordinary")})
+	uid = opvUIDs[0]
+	podDir = mkOrphanPodDir(t, e, uid, 61*time.Minute)
+	vd = filepath.Join(podDir, "volumeDevices")
+	if err := os.MkdirAll(vd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(vd, "stray"), "data")
+	stale = e.Now.Add(-61 * time.Minute)
+	if err := os.Chtimes(podDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	opvConfirm(e, opvEnv(e, true))
+	if _, err := os.Stat(podDir); err != nil {
+		t.Fatal("dir with volumeDevices regular file was reaped")
+	}
+}

@@ -30,6 +30,7 @@
 package kernelfail
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -63,11 +64,13 @@ const (
 	gpuAcutePrefix = "gpu:"
 )
 
-// hwScanState is the Runner-held cross-tick hardware evidence —
-// process-local by design: the durable half (meminfo
-// HardwareCorrupted, EDAC ue_count) lives in sysfs/procfs and
-// survives restarts; the acute kmsg half re-arms only if the
-// signature recurs after an agent restart.
+// hwScanState is the Runner-held cross-tick hardware evidence.
+// The durable half (meminfo HardwareCorrupted, EDAC ue_count)
+// lives in sysfs/procfs and survives restarts on its own; the
+// acute kmsg half persists to the hw-evidence file in the state
+// dir (saveHwEvidence/loadHwEvidence) so a restart inside the
+// evidence TTL keeps the latch armed instead of clearing it on
+// the first clean-looking tick.
 type hwScanState struct {
 	// acute maps an evidence class ("hw", "pcie", "gpu:<xid>") to
 	// the last signature detail + when it fired.
@@ -93,6 +96,7 @@ func (r *Runner) hwNoteAcute(class, detail string) {
 		detail = detail[:200]
 	}
 	r.hw.acute[class] = hwAcute{at: r.deps.Clock.Now(), detail: detail}
+	r.saveHwEvidence()
 }
 
 // noteHardwareCorrupt handles the hwCorruptRe family — uncorrected
@@ -119,6 +123,7 @@ func (r *Runner) notePCIeNVMeReset(msg string) {
 			}
 		}
 		r.hw.nvmeResets = append(kept, now)
+		r.saveHwEvidence()
 	}
 }
 
@@ -140,6 +145,97 @@ func (r *Runner) noteGPUXid(msg string) {
 // "gpu:uvm" so the STATE-ENTER line names the fault family.
 func (r *Runner) noteGPUUVHang(msg string) {
 	r.hwNoteAcute(gpuAcutePrefix+"uvm", "nvidia-uvm driver hang: "+msg)
+}
+
+// hwEvidenceFile is the on-disk half of hwScanState — acute kmsg
+// evidence stamps and the NVMe reset streak persist across agent
+// restarts so a reboot inside the evidence TTL cannot Exit a
+// still-valid hardware latch on the first clean-looking tick.
+// It lives in the watchdog state dir WITHOUT the state- prefix, so
+// the janitor's latch reaper never touches it.
+const hwEvidenceFile = "hw-evidence"
+
+// hwEvidenceDisk is the persisted hwScanState shape — unix-second
+// stamps so the file survives clock-format drift.
+type hwEvidenceDisk struct {
+	Acute      map[string]hwAcuteDisk `json:"acute"`
+	NVMeResets []int64                `json:"nvme_resets"`
+}
+
+// hwAcuteDisk is one persisted hwAcute.
+type hwAcuteDisk struct {
+	At     int64  `json:"at"`
+	Detail string `json:"detail"`
+}
+
+// hwEvidencePath resolves the persistence file — "" when no Store
+// is wired (bare-Deps callers get RAM-only evidence, the pre-fix
+// behavior).
+func (r *Runner) hwEvidencePath() string {
+	if r.deps.Store == nil {
+		return ""
+	}
+	return filepath.Join(r.deps.Store.Dir, hwEvidenceFile)
+}
+
+// saveHwEvidence rewrites the evidence file after every mutation —
+// the file is tiny (a handful of classes + a 10m reset window) and
+// the writers are kmsg-line-rate at worst, so no debounce is worth
+// the lost-durability window.
+func (r *Runner) saveHwEvidence() {
+	p := r.hwEvidencePath()
+	if p == "" {
+		return
+	}
+	d := hwEvidenceDisk{
+		Acute:      map[string]hwAcuteDisk{},
+		NVMeResets: make([]int64, 0, len(r.hw.nvmeResets)),
+	}
+	for class, a := range r.hw.acute {
+		d.Acute[class] = hwAcuteDisk{At: a.at.Unix(), Detail: a.detail}
+	}
+	for _, t := range r.hw.nvmeResets {
+		d.NVMeResets = append(d.NVMeResets, t.Unix())
+	}
+	data, err := json.Marshal(d)
+	if err != nil {
+		return
+	}
+	if err := fsx.WriteFileAtomicNoSync(p, string(data)); err != nil {
+		logger().Debug("hostmetrics: hw-evidence persist failed",
+			"path", p, "error", err)
+	}
+}
+
+// loadHwEvidence restores the persisted evidence into the fresh
+// Runner — called once from New before any goroutine touches hw.
+// An unreadable/corrupt file starts clean (the durable sysfs/procfs
+// half — meminfo, EDAC — still covers the latch); TTL/window
+// filtering downstream expires stale entries naturally.
+func (r *Runner) loadHwEvidence() {
+	p := r.hwEvidencePath()
+	if p == "" {
+		return
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var d hwEvidenceDisk
+	if err := json.Unmarshal(data, &d); err != nil {
+		logger().Warn("hostmetrics: hw-evidence state unreadable — starting clean",
+			"path", p, "error", err)
+		return
+	}
+	if len(d.Acute) > 0 && r.hw.acute == nil {
+		r.hw.acute = map[string]hwAcute{}
+	}
+	for class, a := range d.Acute {
+		r.hw.acute[class] = hwAcute{at: time.Unix(a.At, 0), detail: a.Detail}
+	}
+	for _, ts := range d.NVMeResets {
+		r.hw.nvmeResets = append(r.hw.nvmeResets, time.Unix(ts, 0))
+	}
 }
 
 // meminfoHardwareCorruptedKB reads the "HardwareCorrupted:" field

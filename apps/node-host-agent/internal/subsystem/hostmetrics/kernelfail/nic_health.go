@@ -55,6 +55,10 @@ const (
 	// nicCleanHold is the no-signature dwell before the latch Exits
 	// — two consecutive clean 5m windows.
 	nicCleanHold = 10 * time.Minute
+
+	// rtfUp is the RTF_UP route flag bit (linux fib_semantics.h) —
+	// /proc/net/route prints Flags as hex.
+	rtfUp = 0x1
 )
 
 // Exported so hostmetrics' ConfigFromEnv can bind the env knobs to
@@ -114,9 +118,12 @@ func isVirtualIface(name string) bool {
 
 // physicalUplinkIface picks the physical default-route iface from
 // the host route table — the lowest-metric entry whose Destination
-// is "00000000" (0.0.0.0) and whose name isn't virtual. "" when no
-// physical uplink is visible (unparseable table, virt-only host) —
-// inconclusive, never a latch verdict.
+// AND Mask are both "00000000" (a true 0.0.0.0/0 — split-tunnel
+// VPN/Liqo routes advertise 0.0.0.0/1 = Mask 00000080 and must not
+// steal the uplink pick), whose flags carry RTF_UP, and whose name
+// isn't virtual. "" when no physical uplink is visible
+// (unparseable table, virt-only host) — inconclusive, never a
+// latch verdict.
 func physicalUplinkIface(routeFile string) string {
 	f, err := os.Open(routeFile)
 	if err != nil {
@@ -130,7 +137,12 @@ func physicalUplinkIface(routeFile string) string {
 		// /proc/net/route columns: Iface Destination Gateway Flags
 		// RefCnt Use Metric Mask MTU Window IRTT — hex fields.
 		fields := strings.Fields(sc.Text())
-		if len(fields) < 7 || fields[1] != "00000000" {
+		if len(fields) < 8 ||
+			fields[1] != "00000000" || fields[7] != "00000000" {
+			continue
+		}
+		flags, err := strconv.ParseUint(fields[3], 16, 32)
+		if err != nil || flags&rtfUp == 0 {
 			continue
 		}
 		iface := fields[0]
@@ -242,15 +254,52 @@ func (r *Runner) nicCovered(now time.Time, window time.Duration) bool {
 	return now.Sub(r.nic.samples[0].at) >= window
 }
 
+// netdevTxIface extracts the interface name from a NETDEV WATCHDOG
+// record in either kernel spelling:
+//
+//	legacy (<=6.2): "NETDEV WATCHDOG: eth0 (eth0): transmit queue 0 timed out"
+//	new    (>=6.3): "igb 0000:02:00.0 eno1: NETDEV WATCHDOG: CPU: 5: transmit queue 0 timed out"
+//
+// In the new layout the iface is the last token of the driver/pci
+// prefix BEFORE "NETDEV WATCHDOG:" — grabbing the token after the
+// colon would return "CPU". "" when neither layout resolves.
+func netdevTxIface(msg string) string {
+	idx := strings.Index(msg, "NETDEV WATCHDOG:")
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimLeft(msg[idx+len("NETDEV WATCHDOG:"):], " ")
+	prefixIface := func() string {
+		fields := strings.Fields(msg[:idx])
+		if len(fields) == 0 {
+			return ""
+		}
+		return strings.TrimSuffix(fields[len(fields)-1], ":")
+	}
+	if strings.HasPrefix(rest, "CPU:") {
+		// New format — iface is the last prefix token before the
+		// colon that introduces "NETDEV WATCHDOG".
+		return prefixIface()
+	}
+	// Legacy format — "<iface> (drv): ..." or "<iface>: ...".
+	// A bare "<iface>: NETDEV WATCHDOG: transmit queue..." line has
+	// no post-colon token, so fall back to the prefix when the
+	// first token is the message body itself.
+	if i := strings.IndexAny(rest, " (:"); i >= 0 {
+		rest = rest[:i]
+	}
+	if rest == "transmit" || rest == "" {
+		return prefixIface()
+	}
+	return rest
+}
+
 // noteNetdevTxTimeout records one NETDEV WATCHDOG TX-timeout kmsg
 // record — nicSignature counts them per uplink iface. The record
 // is kept even before the uplink resolves: iface matching happens
 // at evaluation time.
 func (r *Runner) noteNetdevTxTimeout(msg string) {
-	iface := ""
-	if m := netdevTxTimeoutRe.FindStringSubmatch(msg); m != nil {
-		iface = m[1]
-	}
+	iface := netdevTxIface(msg)
 	now := r.deps.Clock.Now()
 	r.nic.tx = append(r.nic.tx, nicTxEvent{iface: iface, at: now})
 	// Bound the ring between ticks — a TX-timeout flood must not

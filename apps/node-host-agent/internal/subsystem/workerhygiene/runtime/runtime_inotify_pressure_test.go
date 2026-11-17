@@ -400,3 +400,106 @@ func TestInotifySysctlsMissingAborts(t *testing.T) {
 		t.Fatal("unreadable sysctls armed the latch")
 	}
 }
+
+// mkProcStatus plants a minimal /proc/<pid>/status carrying the
+// Uid: line procRealUID parses — the ucounts charging identity.
+func mkProcStatus(t *testing.T, e *env, pid int, ruid int64) {
+	t.Helper()
+	wdepstest.WriteFile(t,
+		filepath.Join(e.ProcDir, strconv.Itoa(pid), "status"),
+		fmt.Sprintf("Name:\tfake\nUid:\t%d\t%d\t%d\t%d\n", ruid, ruid, ruid, ruid))
+}
+
+// TestInotifyUcountsPerUID is the P0-13 ucounts regression: the
+// sysctls are PER-REAL-UID budgets, so node-wide usage spread
+// across uids must NOT flag even when the aggregate dwarfs the
+// per-uid limit. Two uids at 60/100 each = 120% of the limit
+// node-wide but 60% per-uid — healthy.
+func TestInotifyUcountsPerUID(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 100
+	writeInotifySysctls(t, e, 100, 8192)
+	mkInotifyPID(t, e, 100, 60, 0, "")
+	mkInotifyPID(t, e, 101, 60, 0, "")
+	mkProcStatus(t, e, 100, 1000)
+	mkProcStatus(t, e, 101, 1001)
+	inotifyRun(e, 100, 101)
+	inotifyRun(e, 100, 101)
+	if inotifyLatched(e) {
+		t.Fatal("multi-uid aggregate false-positived the ucounts latch")
+	}
+	// Same usage concentrated on ONE uid IS pressure — the
+	// per-uid ratio is what the kernel actually enforces.
+	mkProcStatus(t, e, 101, 1000) // both pids now share uid 1000
+	inotifyRun(e, 100, 101)
+	inotifyRun(e, 100, 101)
+	if !inotifyLatched(e) {
+		t.Fatal("single-uid 120/100 usage did not arm the latch")
+	}
+}
+
+// TestInotifyOFDedupForkShared is the P0-13 fork-dedup regression:
+// N processes holding ONE inotify open file description (fork
+// inheritance) is ONE ucounts charge — the census must not
+// multiply it. The InotifyFDIno seam plays the kernel's inode.
+func TestInotifyOFDedupForkShared(t *testing.T) {
+	e := fixture(t)
+	writeInotifySysctls(t, e, 100, 8192)
+	// Parent opened 2 inotify instances; the forked child shares
+	// BOTH (same fd names → same ino via the stub).
+	mkInotifyPID(t, e, 100, 2, 0, "")
+	mkInotifyPID(t, e, 101, 2, 0, "")
+	mkProcStatus(t, e, 100, 0)
+	mkProcStatus(t, e, 101, 0)
+	e.H.Cfg.Seams.Host.InotifyFDIno = func(pid int, fd string) (uint64, bool) {
+		// ino keyed on fd NAME only — pid 100/fd "1" and pid
+		// 101/fd "1" are the same OFD (fork inheritance).
+		n, _ := strconv.Atoi(fd)
+		return uint64(5000 + n), true
+	}
+	inotifyRun(e, 100, 101)
+	// 2 unique OFDs, not 4 — usage reads 2/100 = 2%, nowhere near
+	// the 85% bump line; without dedup it would read 4%… still
+	// under. Use a tighter limit to make the distinction real:
+	writeInotifySysctls(t, e, 3, 8192)
+	inotifyRun(e, 100, 101)
+	if got := readSysctl(t, e, "max_user_instances"); got != "3" {
+		t.Fatalf("deduped 2 OFDs bumped sysctl: %s", got)
+	}
+	// Sanity: without the seam (stat fails → per-pid fallback)
+	// the same fixture counts 4 and DOES bump.
+	e2 := fixture(t)
+	writeInotifySysctls(t, e2, 3, 8192)
+	mkInotifyPID(t, e2, 100, 2, 0, "")
+	mkInotifyPID(t, e2, 101, 2, 0, "")
+	mkProcStatus(t, e2, 100, 0)
+	mkProcStatus(t, e2, 101, 0)
+	inotifyRun(e2, 100, 101)
+	if got := readSysctl(t, e2, "max_user_instances"); got != "6" {
+		t.Fatalf("un-deduped fallback did not count 4 OFDs: %s", got)
+	}
+}
+
+// TestInotifyFrozenSysctlArmsLatch is the P0-13 EROFS regression:
+// a read-only /proc/sys can never reach the configured ceiling —
+// the failed bump must freeze the axis at its current value so
+// tier-2 still arms instead of waiting forever.
+func TestInotifyFrozenSysctlArmsLatch(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 1000
+	writeInotifySysctls(t, e, 100, 8192)
+	// 96/100 = 96% >= 95% latch ratio but cur(100) << ceil(1000) —
+	// only the frozen flag can arm this.
+	mkInotifyPID(t, e, 100, 96, 0, "")
+	mkProcStatus(t, e, 100, 0)
+	// Read-only sysctl: the tier-1 bump write fails EROFS/EACCES.
+	sysctl := filepath.Join(inotifySysctlDir(e), "max_user_instances")
+	if err := os.Chmod(sysctl, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	inotifyRun(e, 100) // cycle 1 — bump fails → frozen
+	inotifyRun(e, 100) // cycle 2 — latch arms on frozen axis
+	if !inotifyLatched(e) {
+		t.Fatal("read-only sysctl pinned the latch false forever")
+	}
+}

@@ -36,3 +36,21 @@ func TestKernelPressureTempRules(t *testing.T) {
 		}
 	}
 }
+
+// TestPCIeBusErrorKernelABICompat pins the >=5.7/5.18 kmsg
+// spellings on the NPD temporary rule — same drift as kernelfail's
+// pcieNVMeResetRe, kept in parity so NPD Events don't go blind on
+// newer kernels.
+func TestPCIeBusErrorKernelABICompat(t *testing.T) {
+	e := fixture(t)
+	for _, msg := range []string{
+		"pcieport 0000:00:1c.0: AER: Uncorrectable (Fatal) error received: 0000:00:1c.0",
+		"pcieport 0000:00:1c.0: PCIe Bus Error: severity=Uncorrectable, type=Fatal",
+		"nvme nvme0: I/O tag 12 on qid 1 timeout, reset controller",
+	} {
+		e.m.processKernelLine(context.Background(), e.sink, msg)
+	}
+	if got := e.sink.counter("PCIeBusError"); got != 3 {
+		t.Fatalf("problem_counter{PCIeBusError}=%v want 3", got)
+	}
+}

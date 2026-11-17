@@ -256,3 +256,32 @@ func TestNICCounterResetDoesNotFabricateDelta(t *testing.T) {
 		t.Fatal("counter reset fabricated a carrier flap")
 	}
 }
+
+// TestPhysicalUplinkIfaceRejectsSplitTunnel is the P0-14 regression:
+// VPN/Liqo split-tunnel routes advertise 0.0.0.0/1 (Destination
+// 00000000, Mask 00000080) — they must never steal the physical
+// uplink pick, and a down route (no RTF_UP) is not an uplink.
+func TestPhysicalUplinkIfaceRejectsSplitTunnel(t *testing.T) {
+	f := kfixture(t)
+	nf := seedNICFixture(t, f)
+	writePrefailFile(t, nf.route,
+		"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"+
+			// Split-tunnel half-routes on a physical-named iface —
+			// lower metric than the real default, wrong mask.
+			"eth9\t00000000\t010011AC\t0003\t0\t0\t10\t00000080\t0\t0\t0\n"+
+			"eth9\t80000000\t010011AC\t0003\t0\t0\t10\t00000080\t0\t0\t0\n"+
+			// A DOWN default route — flags 0000 lacks RTF_UP.
+			"eth8\t00000000\t010011AC\t0000\t0\t0\t5\t00000000\t0\t0\t0\n"+
+			// The real uplink.
+			"eth0\t00000000\t010011AC\t0003\t0\t0\t100\t00000000\t0\t0\t0\n")
+	if got := physicalUplinkIface(nf.route); got != "eth0" {
+		t.Fatalf("uplink=%q want eth0 — split-tunnel mask/down routes must not win", got)
+	}
+	// ONLY split-tunnel routes → inconclusive, never a latch.
+	writePrefailFile(t, nf.route,
+		"Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"+
+			"tun0\t00000000\t010011AC\t0003\t0\t0\t10\t00000080\t0\t0\t0\n")
+	if got := physicalUplinkIface(nf.route); got != "" {
+		t.Fatalf("uplink=%q want empty — no true default route", got)
+	}
+}

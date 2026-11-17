@@ -18,8 +18,9 @@
 //  4. The dir's mtime AND the opv-seen-<uid> confirm marker are both
 //     past Ctr.OrphanPodVolsMinAge (default 60m) — the
 //     ConfirmMarker two-phase confirm (mi-task-seen-* parity).
-//  5. volumes/ holds only the empty CSI/emptyDir/projected dir
-//     skeleton plus vol_data.json / etc-hosts metadata — any other
+//  5. volumes/, volume-subpaths/ and volumeDevices/ hold only the
+//     empty CSI/emptyDir/projected dir skeleton plus vol_data.json
+//     / etc-hosts metadata and kubelet device symlinks — any other
 //     file, symlink or unreadable entry means user data and the
 //     dir is reported, never touched.
 //
@@ -165,9 +166,13 @@ func (c *OrphanPodVolsCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		if !confirmed {
 			continue // inside the confirm window
 		}
-		// Gate 5 — volumes/ must hold only plugin skeleton +
-		// kubelet metadata; anything else is user data.
-		if !orphanPodVolsResidueOnly(filepath.Join(podDir, "volumes")) {
+		// Gate 5 — every kubelet volume tree must hold only plugin
+		// skeleton + kubelet metadata; anything else is user data.
+		// volumes/ and volume-subpaths/ share the residue rule;
+		// volumeDevices/ holds kubelet device symlinks only.
+		if !orphanPodVolsResidueOnly(filepath.Join(podDir, "volumes")) ||
+			!orphanPodVolsResidueOnly(filepath.Join(podDir, "volume-subpaths")) ||
+			!orphanVolDevicesResidueOnly(filepath.Join(podDir, "volumeDevices")) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: orphan pod dir %.8s holds volume data - left in place",
 				uid))
@@ -259,13 +264,37 @@ func mountUnderPodDir(mounts []string, hostPodsDir, uid string) bool {
 	return false
 }
 
-// orphanPodVolsResidueOnly reports whether the pod's volumes/ tree
-// holds nothing but the empty plugin skeleton (CSI/emptyDir/
-// projected dir structure) and kubelet metadata files — any other
-// entry (user file, symlink, unreadable dir) means the dir is
-// reported, never reaped.
+// orphanPodVolsResidueOnly reports whether one pod volume tree
+// (volumes/ or volume-subpaths/) holds nothing but the empty
+// plugin skeleton (CSI/emptyDir/projected dir structure) and
+// kubelet metadata files — any other entry (user file, symlink,
+// unreadable dir) means the dir is reported, never reaped.
 func orphanPodVolsResidueOnly(vols string) bool {
 	return volsResidueOK(vols)
+}
+
+// orphanVolDevicesResidueOnly reports whether volumeDevices/ holds
+// only kubelet's device symlinks (kubernetes.io~* → /dev/...).
+// Pod workloads can never write into this tree — kubelet creates
+// the links — so a symlink carries no payload and counts as
+// residue; regular files, fifos and anything else stay fail-closed.
+func orphanVolDevicesResidueOnly(dir string) bool {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	for _, en := range ents {
+		if en.IsDir() {
+			if !orphanVolDevicesResidueOnly(filepath.Join(dir, en.Name())) {
+				return false
+			}
+			continue
+		}
+		if en.Type()&os.ModeSymlink == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func volsResidueOK(dir string) bool {

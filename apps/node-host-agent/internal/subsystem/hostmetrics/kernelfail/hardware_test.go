@@ -227,3 +227,35 @@ func TestGPUUVHangArmsGPUOnly(t *testing.T) {
 		t.Fatal("GPU uvm hang armed the hardware-corrupted latch")
 	}
 }
+
+// TestHardwareEvidenceSurvivesRestart is the P1-#7 regression: the
+// acute kmsg evidence persists to hw-evidence in the state dir, so
+// a fresh Runner over the same state dir (an agent restart) keeps
+// the armed latch instead of Exiting it on the first clean-looking
+// tick — and still clears once the evidence TTL genuinely expires.
+func TestHardwareEvidenceSurvivesRestart(t *testing.T) {
+	f := kfixture(t)
+	seedHardwareFixture(t, f)
+	f.r.noteGPUXid("NVRM: Xid (PCI:0000:01:00): 79, GPU has fallen off the bus.")
+	f.r.updateHardwareHealth()
+	if !hwLatchSet(f.r, latchdefs.LatchGPUHardwareError) {
+		t.Fatal("fatal Xid did not arm state-gpu-hardware-error")
+	}
+	// Simulate the agent restart — a NEW Runner over the same
+	// state dir must reload the persisted evidence.
+	r2 := New(f.deps)
+	r2.updateHardwareHealth()
+	if !hwLatchSet(r2, latchdefs.LatchGPUHardwareError) {
+		t.Fatal("restart cleared a still-fresh GPU hardware latch")
+	}
+	// Persistence must not pin the latch forever — past the
+	// evidence TTL the reloaded stamp expires and the latch Exits.
+	f.deps.Clock.Set(func() time.Time {
+		return time.Now().Add(hwAcuteEvidenceTTL + time.Minute)
+	})
+	r3 := New(f.deps)
+	r3.updateHardwareHealth()
+	if hwLatchSet(r3, latchdefs.LatchGPUHardwareError) {
+		t.Fatal("expired persisted evidence held the latch past TTL")
+	}
+}

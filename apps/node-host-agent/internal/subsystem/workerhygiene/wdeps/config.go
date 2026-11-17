@@ -232,8 +232,14 @@ func (c *Config) wiringEnvKnobs(hostPath func(string) string) []envx.Knob {
 			hostPath("/run/k0s/containerd/io.containerd.sandbox.controller.v1.shim")),
 		envx.StringKnob(envnames.EnvK0sWorkerUnit, &c.K0sWorkerUnitFile,
 			hostPath("/etc/systemd/system/k0sworker.service")),
-		envx.StringKnob(envnames.EnvMountinfoFile, &c.MountinfoFile,
-			hostPath("/proc/1/mountinfo")),
+		// MountinfoFile defers to applyWiringDefaults — it joins
+		// ProcRoot/"1"/mountinfo AFTER env application, so a custom
+		// NODE_HOST_AGENT_PROC_ROOT propagates. A literal
+		// hostPath("/proc/1/mountinfo") would bake the pod-mode
+		// "/host" prefix onto a path under /proc that the /host
+		// bind does not necessarily carry (ENOENT on non-recursive
+		// binds).
+		envx.StringKnob(envnames.EnvMountinfoFile, &c.MountinfoFile, ""),
 		envx.StringKnob(envnames.EnvContainerdSocket, &c.CtrSocket,
 			hostPath("/run/k0s/containerd.sock")),
 		envx.StringKnob(envnames.EnvKubeletPodsDir, &c.PodsDir,

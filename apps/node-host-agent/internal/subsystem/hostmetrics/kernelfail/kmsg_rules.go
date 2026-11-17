@@ -67,16 +67,21 @@ var (
 			`Memory failure: 0x[0-9a-f]+: (?:Sending SIGBUS|recovery action .* Failed)`)
 	// pcieNVMeResetRe covers the PCIe AER fatal family and the NVMe
 	// controller-reset loop — PCIeBusError parity with the NPD rule.
+	// Kernel >=5.7 spells the severity "Uncorrectable" (was
+	// "Uncorrected"); kernel >=5.18 prints NVMe resets as
+	// "I/O tag <n> ... timeout, reset controller" (was "I/O <n>
+	// ... resetting controller") — both spellings must match or the
+	// signatures go blind on newer kernels.
 	pcieNVMeResetRe = regexp.MustCompile(
-		`PCIe Bus Error: severity=Uncorrected|AER: (?:Uncorrected|Fatal)|` +
-			`nvme nvme\d+: I/O \d+ .* timeout, resetting controller`)
+		`PCIe Bus Error: severity=Uncorrect(?:ed|able)|AER: (?:Uncorrect(?:ed|able)|Fatal)|` +
+			`nvme nvme\d+: I/O (?:tag )?\d+.* timeout, reset(?:ting)? controller`)
 	// pcieAERFatalRe / nvmeResetRe split pcieNVMeResetRe's arms so
 	// the handler can tell an acute AER event (evidence stamp) from
 	// a controller reset (streak counter).
 	pcieAERFatalRe = regexp.MustCompile(
-		`PCIe Bus Error: severity=Uncorrected|AER: (?:Uncorrected|Fatal)`)
+		`PCIe Bus Error: severity=Uncorrect(?:ed|able)|AER: (?:Uncorrect(?:ed|able)|Fatal)`)
 	nvmeResetRe = regexp.MustCompile(
-		`nvme nvme\d+: I/O \d+ .* timeout, resetting controller`)
+		`nvme nvme\d+: I/O (?:tag )?\d+.* timeout, reset(?:ting)? controller`)
 	// gpuFatalXidRe captures the fatal NVIDIA Xid code — the same
 	// fatal set the NPD GPUXidError rule fires on. Non-fatal Xids
 	// (31 MMU fault, 43 channel error) stay OUT: they are warning
@@ -96,10 +101,15 @@ var (
 	// (arp|ndisc) names the family neighbor.go bumps.
 	neighOverflowRe = regexp.MustCompile(
 		`neighbour: (arp|ndisc)_cache: neighbor table overflow`)
-	// netdevTxTimeoutRe captures the iface from a NETDEV WATCHDOG
-	// transmit-queue timeout — nic_health counts them per uplink.
+	// netdevTxTimeoutRe matches a NETDEV WATCHDOG transmit-queue
+	// timeout record — both the legacy "<iface>: NETDEV WATCHDOG:
+	// <iface> (drv): transmit queue N timed out" spelling and the
+	// kernel >=6.3 "<drv> <pci> <iface>: NETDEV WATCHDOG: CPU: <N>:
+	// transmit queue <Q> timed out" layout. The iface itself is
+	// extracted by netdevTxIface, not a capture group — its
+	// position differs between the two formats.
 	netdevTxTimeoutRe = regexp.MustCompile(
-		`NETDEV WATCHDOG: ([^\s(:]+).*transmit queue \d+ timed out`)
+		`NETDEV WATCHDOG:.*transmit queue \d+ timed out`)
 )
 
 // oomKillCtx is the pending constraint-line state — the kernel prints
