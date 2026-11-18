@@ -298,7 +298,11 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 	flagged := map[string]string{}
 	for ns, members := range dnsByNS {
 		for _, pod := range members {
-			if pod.DeletionTimestamp != nil ||
+			// An unscheduled DaemonSet pod (Pending, no node yet)
+			// has no failure domain to key a per-node cooldown on;
+			// its target would end in "/" and the bounce would be
+			// pointless — the scheduler has not even placed it.
+			if pod.Spec.NodeName == "" || pod.DeletionTimestamp != nil ||
 				pod.Status.Phase == corev1.PodSucceeded ||
 				pod.Status.Phase == corev1.PodFailed {
 				continue

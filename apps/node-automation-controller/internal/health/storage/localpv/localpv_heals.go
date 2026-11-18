@@ -140,7 +140,12 @@ func (p *localPVStrandedCheck) healStrandedEphemeral(ctx context.Context,
 		// didDelete=false with no error means the pod was already
 		// gone (or its UID/quorum deferral landed): the claim release
 		// still freed the stranded slot, so stamp and count the heal
-		// rather than silently re-detecting it every sweep.
+		// rather than silently re-detecting it every sweep. No
+		// mutation ran at all, though — hand the budget back before
+		// stamping the cooldown.
+		if !mutated && !didDelete {
+			heal.RefundGrant(now)
+		}
 		p.localPVHealed.Stamp(pvcKey, now)
 		localPVEphemeralHealsTotal.
 			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()

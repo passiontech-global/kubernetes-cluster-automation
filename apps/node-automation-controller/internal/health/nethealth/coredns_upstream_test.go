@@ -161,6 +161,10 @@ func TestCoreDNSFallbackUnreadyPod(t *testing.T) {
 	// Prometheus dead -> readiness fallback: unready >10m + sibling.
 	bad := probetest.PodWithPhase("kube-system", "node-local-dns-x1", corev1.PodPending, false, 15*time.Minute)
 	good := probetest.PodWithPhase("kube-system", "node-local-dns-x2", corev1.PodRunning, true, time.Hour)
+	// A real DaemonSet pod is always scheduled; the check deliberately
+	// skips unscheduled pods (no failure domain to key a cooldown on).
+	bad.Spec.NodeName = "node-1"
+	good.Spec.NodeName = "node-2"
 	cs := fake.NewSimpleClientset(bad, good)
 	p := testProber(cs) // dead httpURL -> both prom queries fail
 
@@ -170,6 +174,20 @@ func TestCoreDNSFallbackUnreadyPod(t *testing.T) {
 	}
 	if !strings.Contains(res.Why, "node-local-dns-x1") {
 		t.Fatalf("why missing pod: %q", res.Why)
+	}
+}
+
+// An unready but UNSCHEDULED DaemonSet pod has no node to key the
+// per-node cooldown on — it must not produce a "/" target or a finding.
+func TestCoreDNSFallbackSkipsUnscheduledPod(t *testing.T) {
+	bad := probetest.PodWithPhase("kube-system", "node-local-dns-pending", corev1.PodPending, false, 15*time.Minute)
+	good := probetest.PodWithPhase("kube-system", "node-local-dns-x2", corev1.PodRunning, true, time.Hour)
+	good.Spec.NodeName = "node-2"
+	cs := fake.NewSimpleClientset(bad, good)
+	p := testProber(cs)
+	res := probetest.MustCheck[*coreDNSUpstreamCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if !res.Pass {
+		t.Fatalf("unscheduled DNS pod must be ignored: %+v", res)
 	}
 }
 

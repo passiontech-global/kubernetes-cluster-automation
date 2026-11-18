@@ -551,7 +551,13 @@ func restoreZoneConstraintsPatch(tscs []corev1.TopologySpreadConstraint,
 		restored++
 	}
 	if restored == 0 {
-		return nil, false // nothing to restore — no useless patch
+		if len(deferred) == 0 {
+			// Every recorded entry is stale (constraint moved back by
+			// its owner, or already restored) — drop the orphan
+			// annotation instead of leaving it pinned forever.
+			return dropTopologyRelaxAnno()
+		}
+		return nil, false // all deferred — nothing to patch this sweep
 	}
 	// Drop the annotation only when EVERY entry was restored. Keeping
 	// the deferred entries (and the zone attribution) lets a later
