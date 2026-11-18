@@ -164,7 +164,7 @@ func (p *stsRolloutUnstickCheck) Run(ctx context.Context) probefw.Result {
 	healed := map[string]bool{} // sts keys already healed this sweep
 	for i := range stsList {
 		sts := &stsList[i]
-		if !stsUnstickApplies(sts) {
+		if !stsUnstickApplies(ctx, sts) {
 			continue
 		}
 		pods := podsBySTS[sts.Namespace+"/"+sts.Name]
@@ -189,16 +189,22 @@ func (p *stsRolloutUnstickCheck) Run(ctx context.Context) probefw.Result {
 // OrderedReady StatefulSet with an update revision to roll toward —
 // the only shape the unstick applies to (OnDelete is the roller
 // module's job, Parallel sets do not serialize on pod health the
-// same way). currentRevision == updateRevision is deliberately NOT
+// same way). An explicit spec.replicas=0 is skipped — no roll can be
+// in flight. currentRevision == updateRevision is deliberately NOT
 // required: the #67250 rollback converges both revisions while a
 // stale-hash pod remains wedged — the per-pod hash check in
 // stsWedgeCandidates is the detector, this gate only proves the set
 // can roll at all.
-func stsUnstickApplies(sts *appsv1.StatefulSet) bool {
+func stsUnstickApplies(ctx context.Context, sts *appsv1.StatefulSet) bool {
+	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
+		return false // nothing to roll — no pod can be a rollout blocker
+	}
+	// Read annotations through the sweep overlay so a downscaler
+	// stamp recorded earlier in this sweep is visible here too.
 	return sts.Spec.UpdateStrategy.Type == appsv1.RollingUpdateStatefulSetStrategyType &&
 		sts.Spec.PodManagementPolicy == appsv1.OrderedReadyPodManagement &&
 		sts.Status.UpdateRevision != "" &&
-		!kube.IsIntentionallyDownscaled(sts.Annotations, sts.Spec.Replicas)
+		!kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, sts), sts.Spec.Replicas)
 }
 
 // stsPodOrdinal extracts the StatefulSet ordinal from an owned pod
@@ -215,6 +221,32 @@ func stsPodOrdinal(stsName, podName string) (int64, bool) {
 	return n, err == nil && n >= 0
 }
 
+// stsPodOrdinalCompare is the strict weak ordering for wedged pods:
+// highest parseable ordinal first, parseable before unparseable,
+// name descending as the final tie-break. The parseable/unparseable
+// split MUST be decided before the name tie-break — falling through
+// when only one side parses breaks transitivity against pairs where
+// both parse (a name can sort between two ordinals). Split out so
+// that property is directly unit-testable.
+func stsPodOrdinalCompare(stsName string, a, b *corev1.Pod) int {
+	oa, oka := stsPodOrdinal(stsName, a.Name)
+	ob, okb := stsPodOrdinal(stsName, b.Name)
+	if oka != okb {
+		if oka {
+			return -1
+		}
+		return 1
+	}
+	if oka && oa != ob {
+		// The controller retires the largest ordinal first.
+		if oa > ob {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(b.Name, a.Name)
+}
+
 // stsWedgeCandidates returns the owned pods whose old-revision
 // container-error signature has held >= stsUnstickMinAge, in name
 // order for a deterministic single-pick heal. Observing into
@@ -226,15 +258,7 @@ func (p *stsRolloutUnstickCheck) stsWedgeCandidates(
 
 	sorted := slices.Clone(pods)
 	slices.SortFunc(sorted, func(a, b *corev1.Pod) int {
-		oa, oka := stsPodOrdinal(sts.Name, a.Name)
-		ob, okb := stsPodOrdinal(sts.Name, b.Name)
-		if oka && okb && oa != ob {
-			if oa > ob {
-				return -1
-			}
-			return 1
-		}
-		return strings.Compare(b.Name, a.Name)
+		return stsPodOrdinalCompare(sts.Name, a, b)
 	})
 	// Canary partition: pods with ordinal < partition intentionally
 	// keep the old revision — deleting one would break the canary

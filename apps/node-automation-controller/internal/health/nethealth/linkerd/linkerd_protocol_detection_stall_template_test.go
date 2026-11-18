@@ -44,7 +44,7 @@ func patchPod(ns, name, ownerKind, ownerName string) *corev1.Pod {
 func patchTemplate(t *testing.T, chk *linkerdProtocolDetectionStallCheck,
 	pod *corev1.Pod, cs *fake.Clientset) (bool, bool) {
 	t.Helper()
-	covered, patched, _ := chk.patchLinkerdTemplate(ctx, logr.Discard(), pod,
+	covered, patched, _, _ := chk.patchLinkerdTemplate(ctx, logr.Discard(), pod,
 		[]int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
 	return covered, patched
 }
@@ -287,6 +287,34 @@ func TestPatchLinkerdTemplatePatchRefused(t *testing.T) {
 	}
 }
 
+// A failed template Patch is an ATTEMPTED mutation: the gate's
+// budget token is spent and must not be refunded. A pre-write
+// deferral (no owner resolved) is a clean refund — attempted=false.
+func TestPatchLinkerdTemplatePatchFailureIsAttempted(t *testing.T) {
+	dep := emptyDeployment("apps", "web", nil, nil)
+	cs := fake.NewSimpleClientset(dep)
+	cs.PrependReactor("patch", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("forbidden")
+		})
+	p := testProber(cs)
+	chk := probetest.MustCheck[*linkerdProtocolDetectionStallCheck](t, p)
+
+	_, _, _, attempted := chk.patchLinkerdTemplate(ctx, logr.Discard(),
+		patchPod("apps", "web-x1", "Deployment", "web"), []int{5432},
+		time.Now(), &probefw.SweepReport{}, map[string][]string{})
+	if !attempted {
+		t.Fatal("a failed Patch call must report attempted=true — no RefundGrant after a failed write")
+	}
+
+	bare := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "bare"}}
+	_, _, _, attempted = chk.patchLinkerdTemplate(ctx, logr.Discard(),
+		bare, []int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
+	if attempted {
+		t.Fatal("an unresolved owner never issued a Patch — clean refund must be allowed")
+	}
+}
+
 // A Job whose GET fails (deleted between census and patch) fails
 // closed the same way.
 func TestPatchLinkerdTemplateJobGetFails(t *testing.T) {
@@ -319,7 +347,7 @@ func TestPatchTemplatePortsSkipInboundAlreadyCovers(t *testing.T) {
 	}
 	target := &linkerdTemplateTarget{obj: dep, kind: "deployment",
 		ns: "apps", name: "web", existing: existing}
-	covered, patched, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
+	covered, patched, _, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
 		[]int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
 	if !covered || patched {
 		t.Fatalf("skip-inbound-covered template: covered=%v patched=%v, want covered only", covered, patched)
@@ -348,7 +376,7 @@ func TestPatchTemplatePortsSkipOutboundAlreadyCovers(t *testing.T) {
 	}
 	target := &linkerdTemplateTarget{obj: dep, kind: "deployment",
 		ns: "apps", name: "web", existing: existing}
-	covered, patched, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
+	covered, patched, _, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
 		[]int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
 	if !covered || patched {
 		t.Fatalf("skip-outbound-covered template: covered=%v patched=%v, want covered only", covered, patched)
@@ -369,7 +397,7 @@ func TestPatchTemplatePortsMergesExistingCoverage(t *testing.T) {
 	}
 	target := &linkerdTemplateTarget{obj: dep, kind: "deployment",
 		ns: "apps", name: "web", existing: existing}
-	covered, patched, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
+	covered, patched, _, _ := chk.patchTemplatePorts(ctx, logr.Discard(), target,
 		[]int{5432}, time.Now(), &probefw.SweepReport{}, map[string][]string{})
 	if !covered || !patched {
 		t.Fatalf("partial cover patch: covered=%v patched=%v, want both", covered, patched)

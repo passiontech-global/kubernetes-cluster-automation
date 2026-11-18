@@ -15,6 +15,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -75,6 +76,29 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 						"secret", s.Namespace+"/"+s.Name)
 					continue
 				}
+				// Reuse this same paged read for the live-socket audit:
+				// it needs serial/SAN/creation metadata, which is free
+				// here but would otherwise cost a second cluster-wide
+				// TLS-Secret list at the end of every sweep.
+				if cert.SerialNumber != nil {
+					if a.liveRunSecretMeta == nil {
+						a.liveRunSecretMeta = map[secretMetricKey]tlsSecretMeta{}
+					}
+					var dnsName string
+					if len(cert.DNSNames) > 0 {
+						dnsName = cert.DNSNames[0]
+					}
+					a.liveRunSecretMeta[secretMetricKey{s.Namespace, s.Name}] = tlsSecretMeta{
+						name:         s.Name,
+						serialHex:    cert.SerialNumber.Text(16),
+						notAfter:     cert.NotAfter,
+						creationTime: s.CreationTimestamp.Time,
+						dnsName:      dnsName,
+						dnsNames:     append([]string(nil), cert.DNSNames...),
+						ipNames:      certIPStrings(cert.IPAddresses),
+						commonName:   cert.Subject.CommonName,
+					}
+				}
 				key := secretMetricKey{s.Namespace, s.Name}
 				// Days, not seconds — the alert budget this feeds ("fires
 				// <30d, pages <7d") thinks in days; negatives mean expired.
@@ -98,6 +122,9 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list tls secrets: %w", err)
 	}
+	// The census is complete (possibly empty) — publish it for the
+	// live-socket duty even when no cert parsed.
+	a.liveRunSecretSet = true
 
 	// Prune series for secrets gone (or no longer parseable) since the
 	// last sweep — otherwise /metrics keeps reporting a dead secret.
@@ -153,6 +180,16 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	deploy, err := a.cs.AppsV1().Deployments(kube.LinkerdNS).
 		Get(ctx, kube.LinkerdIdentityName, metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// No Linkerd (or a mid-reinstall gap): there is no
+			// rollout target to nudge. A benign absence, not a
+			// failed check — no queue error, and the new fingerprint
+			// stays unlatched so the rollout retries when the
+			// Deployment is back (wave3.2/issuer-404).
+			log.Info("skip issuer rollout: linkerd-identity Deployment absent",
+				"namespace", kube.LinkerdNS, "name", kube.LinkerdIdentityName)
+			return
+		}
 		metrics.IncError(a.queue)
 		log.Error(err, "linkerd-identity get failed")
 		return
@@ -209,6 +246,18 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	if _, err := a.cs.AppsV1().Deployments(kube.LinkerdNS).Patch(ctx, kube.LinkerdIdentityName,
 		types.StrategicMergePatchType, kube.RestartTemplatePatch(now),
 		metav1.PatchOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The Deployment vanished between the Get above and this
+			// Patch: no mutation landed, so the maintenance/budget
+			// grant from heal.Gate was bought for nothing. Hand it
+			// back exactly once and leave the fingerprint unlatched
+			// — the next sweep retries once the Deployment is back
+			// (wave3.2/issuer-404-refund).
+			heal.RefundGrant(now)
+			log.Info("skip issuer rollout: linkerd-identity vanished mid-patch — grant refunded",
+				"namespace", kube.LinkerdNS, "name", kube.LinkerdIdentityName)
+			return
+		}
 		metrics.IncError(a.queue)
 		log.Error(err, "linkerd-identity rollout stamp failed")
 		return

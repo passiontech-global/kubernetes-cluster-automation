@@ -388,6 +388,8 @@ var pdbDBQuorumLabels = []string{
 	"postgres-operator.crunchydata.com/cluster",
 	"pgv2.percona.com/cluster",
 	"everest.percona.com/cluster",
+	"pxc.percona.com/cluster",
+	"psmdb.percona.com/cluster",
 	"scylla.scylladb.com/cluster",
 	"apps.rabbitmq.com/cluster",
 }

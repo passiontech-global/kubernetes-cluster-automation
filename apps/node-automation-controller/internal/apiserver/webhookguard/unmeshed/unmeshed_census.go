@@ -36,8 +36,14 @@ type nsAudit struct {
 // cannot be checked must never be classified, so the error aborts
 // the audit before anything is emitted or deleted.
 func nsAudits(snap *guardstate.Snapshot) (map[string]nsAudit, error) {
+	if snap == nil {
+		return nil, errors.New("nil snapshot — unmeshed audit skipped")
+	}
 	if snap.NSErr != nil {
 		return nil, fmt.Errorf("list namespaces — unmeshed audit skipped: %w", snap.NSErr)
+	}
+	if snap.NS == nil {
+		return nil, errors.New("nil namespace census — unmeshed audit skipped")
 	}
 	if len(snap.NS.Items) == 0 {
 		return nil, errors.New("empty namespace list (API flap) — unmeshed audit skipped")
@@ -140,6 +146,12 @@ func (a *Auditor) censusUnmeshed(ctx context.Context, snap *guardstate.Snapshot,
 				p := &items[i]
 				if p.Status.Phase != corev1.PodRunning {
 					continue // mirrors the FieldSelector for fake clients
+				}
+				// A pod on its way out is not an unmeshed incident: it is
+				// already being replaced, and emitting a tuple for it
+				// would hold a false alert until the Prune reconciles.
+				if p.DeletionTimestamp != nil {
+					continue
 				}
 				// A namespace missing from the census keeps the
 				// zero nsAudit — directive "" and nil labels — so a

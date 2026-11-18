@@ -7,6 +7,7 @@ package kube
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -119,12 +120,12 @@ func EmitWarningEvent(ctx context.Context, cs kubernetes.Interface,
 
 	ev := &eventsv1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      we.Name,
+			Name:      clipEventName(we.Name, 253),
 			Namespace: we.Namespace,
 		},
 		EventTime:           metav1.NewMicroTime(we.Now),
 		Reason:              we.Reason,
-		Note:                we.Note,
+		Note:                clipEventField(we.Note, 1024),
 		Type:                corev1.EventTypeWarning,
 		ReportingController: "node-automation-controller",
 		ReportingInstance:   we.ReportingInstance,
@@ -133,4 +134,80 @@ func EmitWarningEvent(ctx context.Context, cs kubernetes.Interface,
 	}
 	_, err := cs.EventsV1().Events(we.Namespace).Create(ctx, ev, metav1.CreateOptions{})
 	return err
+}
+
+// clipEventField bounds an events.k8s.io/v1 Note to the API server's
+// 1024-byte limit. A findings blob copied into a note otherwise makes
+// the whole Create fail 422 — the check's Warning Event silently
+// disappears. ToValidUTF8 drops a partial multi-byte rune at the cut
+// instead of emitting invalid UTF-8; the reason/action are
+// caller-owned contract strings and are never truncated.
+func clipEventField(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
+}
+
+// clipEventName bounds an events.k8s.io/v1 Event.Name to 253 bytes
+// WITHOUT dropping the caller's uniqueness suffix. Emitters compose
+// names as "<object>.<key>.<now.Unix()>" or with a hex UnixNano
+// ("<object>.%x"); a plain prefix cut throws that timestamp away, so
+// two long names emitted in one sweep collapse into one name and the
+// second Create fails 422 AlreadyExists. Shrink the object-name
+// segment instead and keep the trailing ".1752890400" / ".19a2..." intact.
+// A cut can land right after a '.' or '-' — DNS-1123 subdomain names
+// must start and end with an alphanumeric byte, so trim those off the
+// shortened segment before re-attaching the suffix (also when the
+// suffix alone already exhausts the budget).
+func clipEventName(name string, max int) string {
+	if len(name) <= max {
+		return name
+	}
+	suffix := ""
+	if dot := strings.LastIndexByte(name, '.'); dot > 0 {
+		candidate := name[dot+1:]
+		// Hex suffixes are at least 8 chars: shorter runs of a-f are
+		// far more likely to be part of a DNS name than a timestamp.
+		if allDigits(candidate) || (len(candidate) >= 8 && allHex(candidate)) {
+			suffix = name[dot:]
+		}
+	}
+	budget := max - len(suffix)
+	if budget <= 0 {
+		return strings.TrimRight(strings.ToValidUTF8(name[:max], ""), ".-")
+	}
+	base := strings.TrimRight(strings.ToValidUTF8(name[:budget], ""), ".-")
+	if base == "" {
+		base = "event"
+	}
+	return base + suffix
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// allHex recognizes the lowercase "%x" form used for UnixNano suffixes.
+// Callers enforce the minimum length so ordinary DNS labels made of
+// a-f do not get mistaken for a timestamp.
+func allHex(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

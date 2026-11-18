@@ -44,9 +44,9 @@ func runPastSigWindow(t *testing.T, p *probetest.Prober) probefw.Result {
 	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
 	base := time.Now()
 	probetest.FreezeNow(p.Deps, base)
-	chk.Run(probetest.SweepCtx(ctx))
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	probetest.FreezeNow(p.Deps, base.Add(linkerdH2SigMinAge+time.Minute))
-	return chk.Run(probetest.SweepCtx(ctx))
+	return chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 }
 
 func TestLinkerdH2StormDeletesPodWithReadySibling(t *testing.T) {
@@ -97,7 +97,7 @@ func TestLinkerdH2CleanLogsPass(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"linkerd-proxy INFO connection established\n", nil))
 	p := testProber(cs)
-	if res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("clean proxy log must pass: %+v", res)
 	}
 }
@@ -204,9 +204,9 @@ func TestLinkerdIdentityStallGaugeClears(t *testing.T) {
 	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
 	base := time.Now()
 	probetest.FreezeNow(p.Deps, base)
-	chk.Run(probetest.SweepCtx(ctx)) // arms the signature window
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps)) // arms the signature window
 	probetest.FreezeNow(p.Deps, base.Add(linkerdH2SigMinAge+time.Minute))
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatal("identity-stall signature must fail")
 	}
 	if m := probetest.FindMetric(t, "node_automation_linkerd_proxy_identity_stalled",
@@ -218,7 +218,7 @@ func TestLinkerdIdentityStallGaugeClears(t *testing.T) {
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("identity-stalled pod should already be evicted, err=%v", err)
 	}
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("resolved identity stall must pass: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_linkerd_proxy_identity_stalled",
@@ -257,7 +257,7 @@ func TestLinkerdProxyOOMKilledFlagged(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"linkerd-proxy INFO connection established\n", nil))
 	p := testProber(cs)
-	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("OOMKilled linkerd-proxy must fail: %+v", res)
 	}
@@ -291,7 +291,7 @@ func TestLinkerdProxyOOMKilledStaleWindowNotFlagged(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if !res.Pass {
 		t.Fatalf("a 45m-old OOM kill is not a wedge seed: %+v", res)
 	}
@@ -320,7 +320,7 @@ func TestLinkerdProxyInitOOMKilledFlagged(t *testing.T) {
 	}}
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)
-	probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if m := probetest.FindMetric(t, "node_automation_linkerd_proxy_oomkilled",
 		map[string]string{"namespace": "apps", "pod": "web-1"}); m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatal("init-container OOM kill must raise the oomkilled gauge")
@@ -395,14 +395,14 @@ func TestLinkerdBalancerWedgedHeals(t *testing.T) {
 
 	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("first-seen wedge must pass (inside window): %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-1", metav1.GetOptions{}); err != nil {
 		t.Fatalf("pod deleted inside the persistence window: %v", err)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(linkerdBalancerWedgeMinAge+time.Minute))
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Pass {
 		t.Fatal("persisted balancer wedge must fail")
 	}
@@ -450,11 +450,11 @@ func TestLinkerdBalancerRealOutageSkipped(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
 	probetest.FreezeNow(p.Deps, base)
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("real outage must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(linkerdBalancerWedgeMinAge+time.Minute))
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("real outage still must pass past the window: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_linkerd_outbound_balancer_wedged",

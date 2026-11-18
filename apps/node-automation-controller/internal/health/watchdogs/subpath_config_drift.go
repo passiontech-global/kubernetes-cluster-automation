@@ -238,7 +238,7 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 			kind: "Deployment", ns: d.Namespace, name: d.Name,
 			podSpec:  &d.Spec.Template.Spec,
 			template: d.Spec.Template.Labels,
-			annos:    d.Annotations,
+			annos:    kube.EffectiveAnnos(ctx, d),
 			obj:      d,
 		})
 	}
@@ -252,7 +252,7 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 			kind: "StatefulSet", ns: s.Namespace, name: s.Name,
 			podSpec:  &s.Spec.Template.Spec,
 			template: s.Spec.Template.Labels,
-			annos:    s.Annotations,
+			annos:    kube.EffectiveAnnos(ctx, s),
 			obj:      s,
 		})
 	}
@@ -266,7 +266,7 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 			kind: "DaemonSet", ns: d.Namespace, name: d.Name,
 			podSpec:  &d.Spec.Template.Spec,
 			template: d.Spec.Template.Labels,
-			annos:    d.Annotations,
+			annos:    kube.EffectiveAnnos(ctx, d),
 			obj:      d,
 		})
 	}

@@ -47,27 +47,44 @@ type stuckStorageLists struct {
 
 func (j *failedJobsJanitor) listStuckStorageCandidates(ctx context.Context) (stuckStorageLists, error) {
 	opts := metav1.ListOptions{Limit: kube.DefaultListPageSize}
+	log := logf.FromContext(ctx)
 	pvs, err := kube.ListAll(ctx, opts, kube.PersistentVolumes(j.cs))
 	if err != nil {
-		return stuckStorageLists{}, fmt.Errorf("list persistentvolumes: %w", err)
+		if !apierrors.IsForbidden(err) {
+			return stuckStorageLists{}, fmt.Errorf("list persistentvolumes: %w", err)
+		}
+		// Missing PV list RBAC is a tolerated sub-failure: skip ONLY this
+		// half of the audit and keep going to VolumeSnapshot/VSC — an
+		// empty PV list must not drop the snapshot half with it. Do NOT
+		// IncError: the periodic wrapper counts only the error the run
+		// returns. V(1) avoids a per-sweep warn flood.
+		log.V(1).Info("skip persistentvolumes: RBAC forbidden", "error", err)
+		pvs = nil
 	}
 	out := stuckStorageLists{pvs: pvs}
 	if j.dyn == nil {
 		return out, nil
 	}
 	vss, err := kube.ListAllUnstructured(ctx, j.dyn.Resource(kube.GVRVolumeSnapshot).Namespace(metav1.NamespaceAll), opts)
-	if err != nil && !kube.IsCRDAbsent(err) {
+	switch {
+	case err == nil && vss != nil:
+		out.vss = vss.Items
+	case err != nil && apierrors.IsForbidden(err):
+		// RBAC varies per cluster — a missing snapshot CRD permission
+		// must NOT abort the whole stuck-terminating audit (the PVC/PV
+		// half still runs). V(1) keeps the warn from spamming /metrics.
+		log.V(1).Info("skip volumesnapshots: RBAC forbidden", "error", err)
+	case err != nil && !kube.IsCRDAbsent(err):
 		return stuckStorageLists{}, fmt.Errorf("list volumesnapshots: %w", err)
 	}
-	if err == nil && vss != nil {
-		out.vss = vss.Items
-	}
 	vscs, err := kube.ListAllUnstructured(ctx, j.dyn.Resource(kube.GVRVolumeSnapshotContent), opts)
-	if err != nil && !kube.IsCRDAbsent(err) {
-		return stuckStorageLists{}, fmt.Errorf("list volumesnapshotcontents: %w", err)
-	}
-	if err == nil && vscs != nil {
+	switch {
+	case err == nil && vscs != nil:
 		out.vscs = vscs.Items
+	case err != nil && apierrors.IsForbidden(err):
+		log.V(1).Info("skip volumesnapshotcontents: RBAC forbidden", "error", err)
+	case err != nil && !kube.IsCRDAbsent(err):
+		return stuckStorageLists{}, fmt.Errorf("list volumesnapshotcontents: %w", err)
 	}
 	return out, nil
 }
@@ -121,22 +138,28 @@ func (j *failedJobsJanitor) processStuckStorage(
 func (j *failedJobsJanitor) unstickPVProtection(ctx context.Context, pv *corev1.PersistentVolume) bool {
 	log := logf.FromContext(ctx)
 
-	// Gate 3: if ClaimRef points to a PVC, namespace and name must be populated
-	// and live Get MUST confirm IsNotFound (fail closed on partial/empty ref).
-	if pv.Spec.ClaimRef != nil {
-		if pv.Spec.ClaimRef.Namespace == "" || pv.Spec.ClaimRef.Name == "" {
-			return false
-		}
-		_, err := j.cs.CoreV1().PersistentVolumeClaims(pv.Spec.ClaimRef.Namespace).
-			Get(ctx, pv.Spec.ClaimRef.Name, metav1.GetOptions{})
-		if err == nil {
-			return false // bound PVC still exists — protection finalizer valid
-		}
-		if !apierrors.IsNotFound(err) {
-			metrics.IncError(j.queue)
-			log.Error(err, "claimRef PVC lookup failed — keeping pv-protection (fail closed)", "pv", pv.Name)
-			return false
-		}
+	// Gate 3: a PV WITHOUT a fully populated ClaimRef is not an orphan —
+	// it is unbound/released storage that some other controller still
+	// owns. Stripping pv-protection there is a data-loss vector, so
+	// fail closed. A BOUND PV likewise still has a live consumer by
+	// definition; only Released/Failed (or an empty phase with a
+	// confirmed-gone claim) is eligible.
+	ref := pv.Spec.ClaimRef
+	if ref == nil || ref.Namespace == "" || ref.Name == "" {
+		return false
+	}
+	if pv.Status.Phase == corev1.VolumeBound {
+		return false
+	}
+	_, err := j.cs.CoreV1().PersistentVolumeClaims(ref.Namespace).
+		Get(ctx, ref.Name, metav1.GetOptions{})
+	if err == nil {
+		return false // bound PVC still exists — protection finalizer valid
+	}
+	if !apierrors.IsNotFound(err) {
+		metrics.IncError(j.queue)
+		log.Error(err, "claimRef PVC lookup failed — keeping pv-protection (fail closed)", "pv", pv.Name)
+		return false
 	}
 
 	// Gate 4: no VolumeAttachment attached (or unconfirmed detach) for this PV.
@@ -181,6 +204,12 @@ func (j *failedJobsJanitor) unstickPVProtection(ctx context.Context, pv *corev1.
 			log.Info("SKIP: pv-protection target resourceVersion conflicted — retry next sweep", "pv", pv.Name)
 			return false
 		}
+		if apierrors.IsForbidden(err) {
+			// This is a tolerated sub-failure: the audit keeps running
+			// and the periodic wrapper only counts errors it returns.
+			log.V(1).Info("SKIP: persistentvolume patch forbidden — keeping pv-protection", "pv", pv.Name, "error", err)
+			return false
+		}
 		metrics.IncError(j.queue)
 		log.Error(err, "pv-protection finalizer strip failed", "pv", pv.Name)
 		return false
@@ -203,13 +232,13 @@ func (j *failedJobsJanitor) clusterPodUsesClaimRef(ctx context.Context, ref *cor
 	}
 
 	inUse := false
+	// Namespace-scoped read: the claimRef names ONE namespace, so a
+	// cluster-wide Pods("").List pulls every Pod in the cluster into the
+	// controller's heap just to throw almost all of it away.
 	err = kube.ListEach(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Pods(j.cs, metav1.NamespaceAll), func(page []corev1.Pod) error {
+		kube.Pods(j.cs, ref.Namespace), func(page []corev1.Pod) error {
 			for i := range page {
 				p := &page[i]
-				if p.Namespace != ref.Namespace {
-					continue
-				}
 				if p.Status.Phase == corev1.PodSucceeded {
 					continue
 				}
@@ -241,10 +270,20 @@ func (j *failedJobsJanitor) unstickVolumeSnapshot(ctx context.Context, vs *unstr
 		return false, finalizers
 	}
 	_, err := j.dyn.Resource(kube.GVRVolumeSnapshotContent).Get(ctx, vscName, metav1.GetOptions{})
-	if err == nil {
+	switch {
+	case err == nil:
 		return false, finalizers // counterpart still exists
-	}
-	if !apierrors.IsNotFound(err) {
+	case apierrors.IsNotFound(err):
+		// counterpart gone — safe to strip this finalizer below
+	case apierrors.IsForbidden(err):
+		// Tolerated RBAC sub-failure: fail closed (keep the finalizer),
+		// but do NOT IncError — the run absorbs it and only the errors
+		// it returns are counted by the periodic wrapper. V(1) keeps
+		// the log from spamming every sweep.
+		log.V(1).Info("SKIP: counterpart VolumeSnapshotContent lookup forbidden — keeping bound-protection",
+			"volumesnapshot", vs.GetNamespace()+"/"+vs.GetName(), "vsc", vscName, "error", err)
+		return false, finalizers
+	default:
 		metrics.IncError(j.queue)
 		log.Error(err, "counterpart VolumeSnapshotContent lookup failed — fail closed",
 			"volumesnapshot", vs.GetNamespace()+"/"+vs.GetName(), "vsc", vscName)
@@ -263,6 +302,11 @@ func (j *failedJobsJanitor) unstickVolumeSnapshot(ctx context.Context, vs *unstr
 			return true, nil
 		}
 		if apierrors.IsConflict(err) {
+			return false, finalizers
+		}
+		if apierrors.IsForbidden(err) {
+			log.V(1).Info("SKIP: volumesnapshot patch forbidden — keeping bound-protection",
+				"volumesnapshot", vs.GetNamespace()+"/"+vs.GetName(), "error", err)
 			return false, finalizers
 		}
 		metrics.IncError(j.queue)
@@ -286,10 +330,20 @@ func (j *failedJobsJanitor) unstickVolumeSnapshotContent(ctx context.Context, vs
 		return false, finalizers
 	}
 	_, err := j.dyn.Resource(kube.GVRVolumeSnapshot).Namespace(vsNS).Get(ctx, vsName, metav1.GetOptions{})
-	if err == nil {
+	switch {
+	case err == nil:
 		return false, finalizers // counterpart still exists
-	}
-	if !apierrors.IsNotFound(err) {
+	case apierrors.IsNotFound(err):
+		// counterpart gone — safe to strip this finalizer below
+	case apierrors.IsForbidden(err):
+		// Tolerated RBAC sub-failure: fail closed (keep the finalizer),
+		// but do NOT IncError — the run absorbs it and only the errors
+		// it returns are counted by the periodic wrapper. V(1) keeps
+		// the log from spamming every sweep.
+		log.V(1).Info("SKIP: counterpart VolumeSnapshot lookup forbidden — keeping bound-protection",
+			"volumesnapshotcontent", vsc.GetName(), "vs", vsNS+"/"+vsName, "error", err)
+		return false, finalizers
+	default:
 		metrics.IncError(j.queue)
 		log.Error(err, "counterpart VolumeSnapshot lookup failed — fail closed",
 			"volumesnapshotcontent", vsc.GetName(), "vs", vsNS+"/"+vsName)
@@ -308,6 +362,11 @@ func (j *failedJobsJanitor) unstickVolumeSnapshotContent(ctx context.Context, vs
 			return true, nil
 		}
 		if apierrors.IsConflict(err) {
+			return false, finalizers
+		}
+		if apierrors.IsForbidden(err) {
+			log.V(1).Info("SKIP: volumesnapshotcontent patch forbidden — keeping bound-protection",
+				"volumesnapshotcontent", vsc.GetName(), "error", err)
 			return false, finalizers
 		}
 		metrics.IncError(j.queue)

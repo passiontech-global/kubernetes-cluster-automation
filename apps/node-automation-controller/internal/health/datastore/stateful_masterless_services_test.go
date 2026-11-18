@@ -5,6 +5,7 @@
 package datastore
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -111,7 +112,7 @@ func TestDeadlockDeletesLowestOrdinal(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("deadlocked masterless service must FAIL")
 	}
 	if _, err := cs.CoreV1().Pods("db").
@@ -153,7 +154,7 @@ func TestDeadlockWaitsForOperatorSettle(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted while the operator heal is still settling")
@@ -175,7 +176,7 @@ func TestDeadlockRequiresOperatorHeal(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).stsZeroSince.
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted with no operator heal on record")
@@ -199,7 +200,7 @@ func TestDeadlockSkipsWhenMasterPresent(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted while a pod already holds the master role")
@@ -224,7 +225,7 @@ func TestDeadlockHealCooldown(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drPodHealed.
 		Stamp("db/dragonfly", base.Add(-10*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted inside the 30m deadlock cooldown")
@@ -259,7 +260,7 @@ func TestDeadlockOperatorHealLedgerPruned(t *testing.T) {
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).
 		drOpHealed.Stamp("db/other", base.Add(-4*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if _, ok := probetest.MustCheck[*statefulMasterlessCheck](t, p).
 		drOpHealed.Last("db/retired"); ok {
 		t.Fatal("drOpHealed stamp past the 30m heal cooldown must be pruned")
@@ -294,7 +295,7 @@ func TestMasterlessSkipsDownscaledSTS(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("downscaled statefulset must pass: %+v", res)
 	}
 }
@@ -349,10 +350,10 @@ func TestMasterlessMultipleMastersSplitBrain(t *testing.T) {
 		endpointSliceWithZones("db", "dragonfly-master", "", ""))
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("first multi-master sighting must pass: %+v", res)
 	}
-	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("multi-master for 2 sweeps did not fail the check")
 	}
@@ -384,7 +385,7 @@ func TestMasterlessSiteSkewTriggerA(t *testing.T) {
 		endpointSliceWithZones("db", "dragonfly-master", "lanit"))
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("master pinned to lanit with datahub replicas must fail")
 	}
@@ -413,7 +414,7 @@ func TestMasterlessSiteSkewPinRatio(t *testing.T) {
 		endpointSliceWithZones("db", "m2", "lanit"))
 	p := testProberDyn(cs, probetest.OpDyn())
 
-	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("100% masters pinned to lanit must fail")
 	}
@@ -438,7 +439,7 @@ func TestMasterlessSiteSkewSingleZoneSkips(t *testing.T) {
 		zoneNode("ln-worker", "lanit"),
 		endpointSliceWithZones("db", "m1", "lanit"))
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("single-zone cluster must pass: %+v", res)
 	}
 }
@@ -460,7 +461,7 @@ func TestDeadlockMaintenanceDefers(t *testing.T) {
 		Observe("db/dragonfly-master/dragonfly", base.Add(-12*time.Minute))
 	probetest.MustCheck[*statefulMasterlessCheck](t, p).drOpHealed.Stamp("db/dragonfly", base.Add(-4*time.Minute))
 
-	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*statefulMasterlessCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if _, err := cs.CoreV1().Pods("db").
 		Get(ctx, "dragonfly-0", metav1.GetOptions{}); err != nil {
 		t.Fatal("pod deleted during maintenance")
@@ -618,4 +619,79 @@ func TestSmallestOrdinalPodPredicate(t *testing.T) {
 			t.Fatalf("smallestOrdinalPod = %v, want nil", got)
 		}
 	})
+	t.Run("terminating ordinal is never a target", func(t *testing.T) {
+		pods := []*corev1.Pod{mkPod("df-1"), mkPod("df-0"), mkPod("df-2")}
+		now := metav1.Now()
+		pods[1].DeletionTimestamp = &now
+		if got := smallestOrdinalPod(pods, "df"); got == nil || got.Name != "df-1" {
+			t.Fatalf("smallestOrdinalPod = %v, want df-1", got)
+		}
+	})
+}
+
+// A single-replica StatefulSet cannot be "dual-replica deadlocked" —
+// deleting its only pod would take the service fully down.
+func TestDeadlockSkipsSingleReplica(t *testing.T) {
+	base := time.Now()
+	sts := shSTS("db", "dragonfly-solo", 1,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	svc := shMasterSvc("db", "dragonfly-solo-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	cs := fake.NewSimpleClientset(sts, svc,
+		dragonflyRolePod("db", "dragonfly-solo-0", "replica", true))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	chk := probetest.MustCheck[*statefulMasterlessCheck](t, p)
+	chk.stsZeroSince.Observe("db/dragonfly-solo-master/dragonfly-solo", base.Add(-12*time.Minute))
+	chk.drOpHealed.Stamp("db/dragonfly-solo", base.Add(-4*time.Minute))
+
+	_ = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if _, err := cs.CoreV1().Pods("db").
+		Get(ctx, "dragonfly-solo-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("sole replica must not be deleted: %v", err)
+	}
+}
+
+// A terminating replica is already being replaced — it neither
+// counts toward the two-live-replica floor nor becomes the target.
+func TestDeadlockSkipsTerminatingReplica(t *testing.T) {
+	base := time.Now()
+	sts := shSTS("db", "dragonfly-term", 2,
+		map[string]string{"app": "dragonfly", "app.kubernetes.io/part-of": "dragonfly"})
+	svc := shMasterSvc("db", "dragonfly-term-master",
+		map[string]string{"app": "dragonfly", "role": "master"})
+	term := dragonflyRolePod("db", "dragonfly-term-0", "replica", true)
+	now := metav1.Now()
+	term.DeletionTimestamp = &now
+	cs := fake.NewSimpleClientset(sts, svc, term,
+		dragonflyRolePod("db", "dragonfly-term-1", "replica", true))
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Now = func() time.Time { return base }
+	chk := probetest.MustCheck[*statefulMasterlessCheck](t, p)
+	chk.stsZeroSince.Observe("db/dragonfly-term-master/dragonfly-term", base.Add(-12*time.Minute))
+	chk.drOpHealed.Stamp("db/dragonfly-term", base.Add(-4*time.Minute))
+
+	_ = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	for _, name := range []string{"dragonfly-term-0", "dragonfly-term-1"} {
+		if _, err := cs.CoreV1().Pods("db").Get(ctx, name, metav1.GetOptions{}); err != nil {
+			t.Fatalf("%s must not be reaped: %v", name, err)
+		}
+	}
+}
+
+// An Infra-only SweepReport has no findings: Verdict returns
+// Result{Infra: err} with an empty Why. The combined verdict must thread
+// that error through (and stay FAIL) even when nothing was flagged —
+// otherwise a dead census/query reads as a passing check.
+func TestMasterlessVerdictThreadsInfraOnlyReports(t *testing.T) {
+	s := &masterlessSweep{skew: &siteSkewSweep{}}
+	s.skew.rep.InfraErr(errors.New("site-skew census down"))
+	s.multiRep.InfraErr(errors.New("split-brain query down"))
+	res := s.verdict()
+	if res.Infra == nil {
+		t.Fatal("Infra-only report must reach the combined verdict")
+	}
+	if res.Pass {
+		t.Fatal("Infra-only report must not read as PASS")
+	}
 }

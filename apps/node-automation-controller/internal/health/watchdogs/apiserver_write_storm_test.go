@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -89,15 +90,15 @@ func TestWriteStormPersistenceWindow(t *testing.T) {
 	base := time.Now()
 
 	probetest.FreezeNow(d, base)
-	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
 		t.Fatalf("first breaching sweep must pass inside window: %+v", res)
 	}
 	probetest.FreezeNow(d, base.Add(writeStormMinAge-time.Minute))
-	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
 		t.Fatalf("inside window must pass: %+v", res)
 	}
 	probetest.FreezeNow(d, base.Add(writeStormMinAge+time.Minute))
-	res := ch.Run(probetest.SweepCtx(ctx))
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	if res.Pass {
 		t.Fatal("storm past the window must fail the sweep")
 	}
@@ -140,9 +141,9 @@ func TestWriteStormHealDisabledStillDetects(t *testing.T) {
 	// ledger — two sweeps 11m apart.
 	base := time.Now()
 	probetest.FreezeNow(d, base)
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	probetest.FreezeNow(d, base.Add(writeStormMinAge+time.Minute))
-	res := ch.Run(probetest.SweepCtx(ctx))
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	if res.Pass {
 		t.Fatal("storm past window must fail even with heals off")
 	}
@@ -182,9 +183,9 @@ func TestWriteStormSuspendEligibilityAndCap(t *testing.T) {
 
 	base := time.Now()
 	probetest.FreezeNow(d, base)
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	probetest.FreezeNow(d, base.Add(writeStormMinAge+time.Minute))
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 
 	suspended := 0
 	for _, u := range ksList {
@@ -228,6 +229,40 @@ func TestWriteStormSuspendEligibilityAndCap(t *testing.T) {
 	}
 }
 
+// A restore pass with an empty Flux census is a SUCCESSFUL census
+// with nothing to restore — it must disarm reliefDue/suspended, not
+// keep the check re-listing every Flux kind for ever after a restart
+// with no objects this check suspended.
+func TestWriteStormRestoreEmptyCensusDisarms(t *testing.T) {
+	d, _ := stormDeps(t, 0, 0, nil) // no storm; no Flux objects at all
+	ch := stormCheck(d, true)
+	ch.suspended = true
+	ch.reliefDue = true
+
+	if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
+		t.Fatalf("clean sweep must pass: %+v", res)
+	}
+	if ch.reliefDue || ch.suspended {
+		t.Fatalf("empty restore census must disarm relief: reliefDue=%v suspended=%v",
+			ch.reliefDue, ch.suspended)
+	}
+}
+
+// An explicitly false write-storm-exempt annotation opts the object
+// IN — presence alone must not silently disable storm relief.
+func TestWriteStormExemptFalseStillEligible(t *testing.T) {
+	ks := fluxKS("apps", "not-exempt", false,
+		map[string]string{kube.AnnoWriteStormExempt: "false"}, true)
+	d, _ := stormDeps(t, 0, 0, nil)
+	d.Dyn = probetest.OpDyn(ks)
+
+	targets := stormCheck(d, true).stormFluxTargets(
+		probetest.SweepCtx(ctx, d), logr.Discard(), false)
+	if len(targets) != 1 || targets[0].name != "not-exempt" {
+		t.Fatalf("exempt=false object must remain a suspend target, got %+v", targets)
+	}
+}
+
 func TestWriteStormRestoreOnlyStamped(t *testing.T) {
 	// A storm-suspended object (stamp present) restores on
 	// recovery; a hand-suspended object (no stamp) stays down.
@@ -242,7 +277,7 @@ func TestWriteStormRestoreOnlyStamped(t *testing.T) {
 	ch.suspended = true
 	ch.reliefDue = true
 
-	res := ch.Run(probetest.SweepCtx(ctx))
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	if !res.Pass {
 		t.Fatalf("clean sweep must pass: %+v", res)
 	}

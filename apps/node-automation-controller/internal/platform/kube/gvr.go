@@ -320,8 +320,13 @@ var (
 	// ---------------------------------------------------------------
 	// CSI Snapshotter (stuck_terminating_storage bound-protection unstick).
 	// ---------------------------------------------------------------
+	// The discoverable API group is snapshot.storage.k8s.io. The similar
+	// snapshot.storage.kubernetes.io is the bound-protection FINALIZER
+	// prefix used by the snapshot controller, not an API group — using it
+	// here makes every real-cluster List/Get 404 (silently swallowed by
+	// IsCRDAbsent) and disables the unstick feature entirely.
 	GVRVolumeSnapshot = schema.GroupVersionResource{
-		Group: "snapshot.storage.kubernetes.io", Version: "v1", Resource: "volumesnapshots"}
+		Group: "snapshot.storage.k8s.io", Version: "v1", Resource: "volumesnapshots"}
 	GVRVolumeSnapshotContent = schema.GroupVersionResource{
-		Group: "snapshot.storage.kubernetes.io", Version: "v1", Resource: "volumesnapshotcontents"}
+		Group: "snapshot.storage.k8s.io", Version: "v1", Resource: "volumesnapshotcontents"}
 )

@@ -66,6 +66,14 @@ const (
 	konnHealCool       = 30 * time.Minute
 	konnAgentNS        = "kube-system"
 	konnAgentPodPrefix = "konnectivity-agent-"
+	// konnHealCapPerSweep bounds agent deletes per sweep: a
+	// half-open signature can fire on many DaemonSet members at
+	// once (a konnectivity-server rollout), and bouncing every
+	// agent in one pass would drop ALL tunnel paths simultaneously
+	// — the exact outage the heal exists to prevent. The gauge
+	// still fires for every persisted agent; only the heal is
+	// capped, with the remainder retried next sweep.
+	konnHealCapPerSweep = 2
 )
 
 var (
@@ -275,6 +283,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		targets = append(targets, pod)
 	}
 
+	healedThisSweep := 0
 	for _, pod := range targets {
 		key := pod.Namespace + "/" + pod.Name
 		if !probefw.Persisted(&p.seen, key, now, konnHalfOpenMinAge, log) {
@@ -290,12 +299,24 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 				"pod", key)
 			continue
 		}
-		// The cooldown keys on the pod's CONTROLLER, not its name —
-		// a deleted agent pod is recreated by the DaemonSet under a
-		// fresh suffix, so a pod-name stamp never suppressed the
-		// re-heal of the same wedge.
-		p.DeletePodHealOnNode(ctx, log, CheckNameKonnectivityTunnelHealth,
-			kube.PodControllerKey(pod), pod, konnHealCool, now)
+		if healedThisSweep >= konnHealCapPerSweep {
+			log.Info("DEFER: konnectivity heal cap reached this sweep — retry next sweep",
+				"pod", key, "cap", konnHealCapPerSweep)
+			continue
+		}
+		// The cooldown keys on the pod's CONTROLLER AND NODE, not
+		// just its name or controller: this is a DaemonSet, one
+		// agent per node, and keying on the shared DaemonSet alone
+		// would put EVERY node's agent into a 30m cooldown after
+		// bouncing a single node's wedge. Node is also the actual
+		// failure domain — a replacement pod on the same node must
+		// not re-heal inside the window, while a different node's
+		// agent keeps its independent key.
+		targetKey := kube.PodControllerKey(pod) + "/" + pod.Spec.NodeName
+		if p.DeletePodHealOnNode(ctx, log, CheckNameKonnectivityTunnelHealth,
+			targetKey, pod, konnHealCool, now) {
+			healedThisSweep++
+		}
 	}
 	p.seen.Prune(func(k string) bool { return halfOpen[k] })
 	return rep.Result(&p.emitted, konnAgentHalfOpenGauge.DeleteLabelValues,

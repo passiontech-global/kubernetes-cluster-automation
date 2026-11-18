@@ -14,7 +14,6 @@ import (
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -98,26 +97,35 @@ func (s *crdConversionSweep) loadInputs() (proceed bool, err error) {
 }
 
 // svcExists answers whether the conversion backend Service exists,
-// memoized per sweep. Inconclusive gets (flap, timeout) are NOT
-// cached: a transient error must not freeze the verdict for the
-// rest of the sweep.
-func (s *crdConversionSweep) svcExists(ctx context.Context, svcKey, ns, name string) (missing, exists bool, err error) {
+// memoized per sweep. The snapshot's targeted Service census (see
+// guardstate.Snapshot.Services) already GET exactly the backends the
+// webhook configs and CRD conversion webhooks reference — one
+// conversion server commonly backs a whole API group, so re-Getting
+// it once per CRD was pure apiserver churn.
+//
+// A non-NotFound GET failure is recorded on ServicesErr: the census
+// is then incomplete, so existence is UNVERIFIABLE this sweep. Fail
+// closed — return the error and let evalCRDs carry the CRD's last
+// verdict forward rather than reading "missing" from a partial list.
+func (s *crdConversionSweep) svcExists(svcKey, ns, name string) (missing, exists bool, err error) {
 	if s.svcVerdicts[svcKey] {
 		return false, true, nil
 	}
 	if s.svcMissing[svcKey] {
 		return true, false, nil
 	}
-	_, gerr := s.g.CS.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
-	switch {
-	case apierrors.IsNotFound(gerr):
-		s.svcMissing[svcKey] = true
-		return true, false, nil
-	case gerr != nil:
-		return false, false, gerr
+	if s.snap.ServicesErr != nil {
+		return false, false, s.snap.ServicesErr
 	}
-	s.svcVerdicts[svcKey] = true
-	return false, true, nil
+	for i := range s.snap.Services {
+		if s.snap.Services[i].Namespace == ns &&
+			s.snap.Services[i].Name == name {
+			s.svcVerdicts[svcKey] = true
+			return false, true, nil
+		}
+	}
+	s.svcMissing[svcKey] = true
+	return true, false, nil
 }
 
 // evalCRDs walks every CRD with a webhook conversion to an
@@ -126,7 +134,7 @@ func (s *crdConversionSweep) svcExists(ctx context.Context, svcKey, ns, name str
 // zero_endpoints, tls_probe_failed. An unverifiable read (Service
 // get flap, monitor-blind probe source) carries that CRD's last
 // verdict forward instead of flapping.
-func (s *crdConversionSweep) evalCRDs(ctx context.Context) {
+func (s *crdConversionSweep) evalCRDs() {
 	// probeBlind — the same fleet-blind gate as the admission path:
 	// when every probed backend failed the handshake the monitor is
 	// the likely culprit, so the tls_probe_failed verdict must not
@@ -140,7 +148,7 @@ func (s *crdConversionSweep) evalCRDs(ctx context.Context) {
 			continue // no webhook conversion or a URL backend — unmeasurable
 		}
 		reason := ""
-		missing, _, err := s.svcExists(ctx, svcKey, svcNS, svcName)
+		missing, _, err := s.svcExists(svcKey, svcNS, svcName)
 		switch {
 		case missing:
 			reason = CRDReasonMissingService
@@ -217,6 +225,6 @@ func (s *crdConversionSweep) bounceHung(ctx context.Context) {
 				"service", svcKey)
 			continue
 		}
-		s.b.deleteBouncePod(ctx, s.snap, svcKey, target, s.now)
+		s.b.deleteBouncePod(ctx, s.snap, svcKey, target, s.now, "hung TCP+TLS handshake (CRD conversion)")
 	}
 }

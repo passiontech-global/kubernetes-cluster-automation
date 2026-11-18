@@ -111,6 +111,20 @@ type vaTarget struct {
 	reason string
 }
 
+// hasAttacherFinalizer reports whether the VA actually carries a
+// finalizer the cleaner can strip. A stuck-Terminating VA whose
+// attacher finalizer is already gone has nothing to free — turning
+// it into a strip target would emit a bogus "finalizers removed"
+// metric and patch a no-op.
+func hasAttacherFinalizer(va *storagev1.VolumeAttachment) bool {
+	for _, f := range va.Finalizers {
+		if strings.HasPrefix(f, "external-attacher/") {
+			return true
+		}
+	}
+	return false
+}
+
 // buildTargets lists the cluster's VolumeAttachments and runs the
 // sighting pre-pass, classifying every listed VA into a sweep
 // target. The missing-node sightings are recorded for EVERY VA
@@ -142,7 +156,8 @@ func (c *volumeAttachmentCleaner) buildTargets(ctx context.Context,
 			// finalizers are stripped to free the volume. Inside
 			// the grace window it stays the stuck-terminating
 			// audit's surface (C3b), untouched here.
-			if now.Sub(va.DeletionTimestamp.Time) >= vaStuckTerminatingAge {
+			if now.Sub(va.DeletionTimestamp.Time) >= vaStuckTerminatingAge &&
+				hasAttacherFinalizer(va) {
 				targets = append(targets, &vaTarget{va: va, strip: true})
 				// Ready-node unused-volume sighting — recorded for
 				// every stuck VA (including capped ones) so the
@@ -253,6 +268,42 @@ func (c *volumeAttachmentCleaner) confirmTarget(ctx context.Context,
 			"va", t.va.Name, "node", t.va.Spec.NodeName)
 		return false, nil
 	}
+	// The VA itself must be re-confirmed too: the census list is a
+	// snapshot and CSI csi-hash names are DETERMINISTIC — a same-named
+	// VA can be recreated under a new UID between the list and the
+	// write, or finish its detach / flip its DeletionTimestamp. Every
+	// mismatch keeps the object; only the very VA we vetted may be
+	// deleted or stripped. A failed confirm fails closed (metered
+	// once here — the run absorbs it, so no returned-error count).
+	liveVA, err := c.confirmLiveVA(ctx, t, log)
+	if err != nil {
+		metrics.IncError(c.queue)
+		log.Error(err, "live VA confirm failed — keeping VA (fail closed)",
+			"va", t.va.Name)
+		return false, nil
+	}
+	if liveVA == nil {
+		return false, nil // already gone, recreated, or verdict stale
+	}
+	// An ATTACHED VA still claims a live mount. While the live
+	// apiserver still has the node, the external-attacher may be
+	// mid-detach — deleting the VA here would remove the detach
+	// trigger itself and turn a stale status into a split-brain
+	// (the payload this module exists to prevent). Only the
+	// strongest proof — the apiserver itself answering NotFound for
+	// the node — permits detaching an object that still reports
+	// Attached. The finalizer-strip branch is a different shape: it
+	// leaves the attacher's own unpublish path intact and is
+	// gated on the unused-volume proof below.
+	if !t.strip && liveVA.Status.Attached && !gone {
+		log.Info("KEEP: VA still reports Attached on a live node — attacher owns the detach",
+			"va", t.va.Name, "node", t.va.Spec.NodeName)
+		return false, nil
+	}
+	// Act on the LIVE object: its UID confirms the delete's UID
+	// precondition and its resourceVersion makes the finalizer
+	// patch a compare-and-swap against current state.
+	t.va = liveVA
 	if gone {
 		// The apiserver itself answers NotFound — the
 		// strongest shape of every destructive verdict; the
@@ -281,8 +332,16 @@ func (c *volumeAttachmentCleaner) confirmTarget(ctx context.Context,
 		// volume since. Re-run the proof against the LIVE node and a
 		// LIVE pod list so its Status.VolumesInUse/VolumesAttached
 		// (and the pod census) decide, never the stale copy.
-		if kube.NodeReady(live) &&
-			!kube.HasTaint(live.Spec.Taints, kube.TaintNodeOutOfService) {
+		if kube.NodeReady(live) {
+			// A Ready node carrying ANY current remediation/fencing
+			// taint is not a fast-reboot leak — the fence protects a
+			// volume whose attacher may still be live. Fail closed
+			// no matter what the two-cycle census sighting said.
+			if kube.HasRemediationOrOutOfServiceTaint(live) {
+				log.Info("KEEP: live node Ready but fenced — finalizers stay",
+					"va", t.va.Name, "node", live.Name)
+				return false, nil
+			}
 			return c.stuckReadyUnused(ctx, t.va, liveNodes,
 				liveNodePods, cyc.pvcPVs, cyc.pvNames, log), nil
 		}
@@ -306,4 +365,49 @@ func (c *volumeAttachmentCleaner) confirmTarget(ctx context.Context,
 	// the census pass (livePods is confirm-local, not the
 	// cycle cache).
 	return c.nodeFencedDead(ctx, live, livePods, now), nil
+}
+
+// confirmLiveVA re-Gets the VA itself on the direct clientset at the
+// single Confirm point — the node confirm alone cannot tell a
+// recreated same-name VA from the one the census vetted, nor whether
+// the attacher finished the detach since the list. Returns nil
+// (with nil error) when every destructive verdict must be dropped:
+// the object is gone, its UID changed, or its DeletionTimestamp no
+// longer matches the strip/delete classification. A Get failure is
+// returned as an error so the caller fails closed and meters once.
+func (c *volumeAttachmentCleaner) confirmLiveVA(ctx context.Context,
+	t *vaTarget, log logr.Logger) (*storagev1.VolumeAttachment, error) {
+	got, getErr := c.cs.StorageV1().VolumeAttachments().
+		Get(ctx, t.va.Name, metav1.GetOptions{})
+	gone, err := kube.ConfirmAbsent(getErr)
+	if err != nil {
+		return nil, fmt.Errorf("get volumeattachment %s: %w", t.va.Name, err)
+	}
+	if gone {
+		// Another actor (usually the external-attacher) finished
+		// the cleanup between the list and the confirm.
+		log.Info("KEEP: VA already gone at the live confirm", "va", t.va.Name)
+		return nil, nil
+	}
+	// UID confirm: a recreated VA shares the deterministic csi-hash
+	// name but is a NEW attachment with its own sighting window —
+	// it must never inherit the dead object's destructive verdict.
+	if t.va.UID != "" && got.UID != t.va.UID {
+		log.Info("KEEP: VA recreated since the census — UID mismatch",
+			"va", t.va.Name, "listed", t.va.UID, "live", got.UID)
+		return nil, nil
+	}
+	// The strip/delete classification rides on DeletionTimestamp:
+	// if it changed, the verdict no longer describes this object.
+	if t.strip && got.DeletionTimestamp == nil {
+		log.Info("KEEP: VA no longer terminating — finalizer-strip verdict stale",
+			"va", t.va.Name)
+		return nil, nil
+	}
+	if !t.strip && got.DeletionTimestamp != nil {
+		log.Info("KEEP: VA became terminating — delete verdict stale",
+			"va", t.va.Name)
+		return nil, nil
+	}
+	return got, nil
 }

@@ -62,6 +62,11 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list validatingwebhookconfigurations: %w", err)
 	}
+	// Hand the same objects to the live-socket duty — it only needs the
+	// clientConfig service refs/ports, so a second MWC/VWC list is pure
+	// waste. Set only after BOTH lists succeeded (a partial census would
+	// silently drop the references of a failed list).
+	a.liveRunMWC, a.liveRunVWC, a.liveRunWebhooksSet = mutating, validating, true
 
 	for i := range mutating {
 		m := &mutating[i]
@@ -90,12 +95,17 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	// the bulk of a CRD object's heap — are garbage-collected with
 	// the page instead of a cluster-wide census pinning ~80–150 MiB
 	// for the whole sweep.
+	a.liveRunCRDRefs = map[string]int32{}
 	err = kube.ListEach(ctx,
 		metav1.ListOptions{Limit: crdAuditPageSize},
 		kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)),
 		func(page []unstructured.Unstructured) error {
 			for i := range page {
 				crd := &page[i]
+				// Harvest the conversion service ref while the full
+				// CRD schema is already in hand — the live-socket
+				// audit must never trigger a second full-schema list.
+				collectCRDConversionService(crd, a.liveRunCRDRefs)
 				entry, ok := crdConversionEntry(crd)
 				if !ok {
 					continue
@@ -108,6 +118,7 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list customresourcedefinitions: %w", err)
 	}
+	a.liveRunCRDRefsSet = true
 
 	// Prune series for entries no longer covered — a webhook entry
 	// deleted or an annotation removed must not pin drift=1 (or a

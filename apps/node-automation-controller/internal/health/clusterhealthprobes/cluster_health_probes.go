@@ -402,7 +402,11 @@ func runCheckIsolated(entry checkEntry, ctx context.Context,
 	cctx, cancel := context.WithTimeout(ctx, perCheck)
 	defer cancel()
 	res := entry.check.Run(cctx)
-	out.pass = res.Pass
+	// An Infra error is "can't tell", never "healthy": a check that
+	// returns Result{Pass:true, Infra:err} must still report FAIL.
+	// The queue IncError for o.infra happens once in run()'s report
+	// loop — do NOT add one here (the run would double-count it).
+	out.pass = res.Pass && res.Infra == nil
 	out.why = res.Why
 	out.infra = res.Infra
 	out.timedOut = cctx.Err() == context.DeadlineExceeded

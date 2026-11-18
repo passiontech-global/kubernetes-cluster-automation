@@ -56,7 +56,7 @@ func TestCheckMeshLinkerdWedgedHeals(t *testing.T) {
 		"u-dest-ready", "rs-dest")
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod, sibling)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("wedged linkerd pod passed")
 	}
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).
@@ -205,7 +205,7 @@ func TestCheckMeshLinkerdPodListInfraCounted(t *testing.T) {
 		return m.GetCounter().GetValue()
 	}
 	before := runErrors()
-	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Infra == nil {
 		t.Fatalf("a skipped wedge scan must report Infra, got %+v", res)
 	}
@@ -331,7 +331,7 @@ func TestMeshIPAMExhaustedStaleHeartbeatSkipped(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		ipamNode("w1", 20*time.Minute, true), pod)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("stale-heartbeat zombie must not produce a finding: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).
@@ -355,7 +355,7 @@ func TestMeshIPAMExhaustedHealsLeaseHolder(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		ipamNode("w1", 20*time.Minute, false), standby, leader, lease)
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("fresh CiliumIPAMExhausted must FAIL the check")
 	}
@@ -377,7 +377,7 @@ func TestMeshIPAMExhaustedNoLeaseFallsBack(t *testing.T) {
 	cs := fake.NewSimpleClientset(
 		ipamNode("w1", 20*time.Minute, false), first, second)
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("fresh CiliumIPAMExhausted must FAIL the check")
 	}
@@ -406,7 +406,7 @@ func TestCheckMeshLinkerdSoleReplicaWedgedNotDeleted(t *testing.T) {
 		"u-dest", "rs-dest")
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod)
 	p := testProberDyn(cs, probetest.OpDyn())
-	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass || !strings.Contains(res.Why, "destination:wedged") {
 		t.Fatalf("sole-replica wedge must stay detect-only with the finding emitted, got pass=%v why=%q", res.Pass, res.Why)
 	}
@@ -425,7 +425,7 @@ func TestCheckMeshLinkerdWedgedWithReadySiblingDeletes(t *testing.T) {
 		"u-dest-ready", "rs-dest")
 	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false), pod, sibling)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("wedged linkerd pod passed")
 	}
 	if _, err := cs.CoreV1().Pods(kube.LinkerdNS).

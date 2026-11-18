@@ -90,6 +90,13 @@ const (
 	// coredns-patcher adds COREDNS_SATURATION_BOOST_REPLICAS while
 	// now < this timestamp.
 	AnnoCoreDNSBoostUntil = "passiontech.dev/coredns-boost-until"
+	// AnnoCoreDNSBoostBase is coredns-forward-saturation's record of
+	// the pre-boost replica count on the same Deployment — the
+	// staircase guard reads it so consecutive boost windows never
+	// compound a surge on top of a previous one. It shares the
+	// until stamp's lifecycle: both are cleared together when the
+	// boost window lapses.
+	AnnoCoreDNSBoostBase = "passiontech.dev/coredns-boost-base"
 	// AnnoLastHPAHeal is hpa-scaling-guard's persisted cooldown
 	// stamp — cold-start rescue + metrics-server bounce.
 	AnnoLastHPAHeal = "passiontech.dev/last-hpa-heal"

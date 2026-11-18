@@ -388,6 +388,7 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"AnnoWriteStormSuspendedBy", "passiontech.dev/write-storm-suspended-by"},
 	{"AnnoWriteStormExempt", "passiontech.dev/write-storm-exempt"},
 	{"AnnoCoreDNSBoostUntil", "passiontech.dev/coredns-boost-until"},
+	{"AnnoCoreDNSBoostBase", "passiontech.dev/coredns-boost-base"},
 	{"AnnoLastHPAHeal", "passiontech.dev/last-hpa-heal"},
 	{"AnnoLastDeploymentUnstick", "passiontech.dev/last-deployment-unstick"},
 	{"AnnoSubPathReloadOptOut", "passiontech.dev/subpath-reload-opt-out"},
@@ -680,6 +681,8 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.AnnoWriteStormExempt
 	case "AnnoCoreDNSBoostUntil":
 		return kube.AnnoCoreDNSBoostUntil
+	case "AnnoCoreDNSBoostBase":
+		return kube.AnnoCoreDNSBoostBase
 	case "AnnoLastHPAHeal":
 		return kube.AnnoLastHPAHeal
 	case "AnnoLastDeploymentUnstick":

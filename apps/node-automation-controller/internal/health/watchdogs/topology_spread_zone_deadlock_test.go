@@ -105,14 +105,14 @@ func TestTopologySpreadZoneDeadlockRelaxAndAutoRestore(t *testing.T) {
 	chk := probetest.MustCheck[*topologySpreadZoneDeadlockCheck](t, p)
 
 	// Sweep 1 (T=0): zone dead window starts, NOT relaxed yet (<10m).
-	res1 := chk.Run(probetest.SweepCtx(ctx))
+	res1 := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if !res1.Pass {
 		t.Fatalf("expected Pass before 10m dead-zone window, got %+v", res1)
 	}
 
 	// Sweep 2 (T+10m): dead zone >=10m -> metric=1, stateless Deployment api relaxed, DB quorum db-proxy untouched!
 	now = now.Add(10 * time.Minute)
-	res2 := chk.Run(probetest.SweepCtx(ctx))
+	res2 := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res2.Pass {
 		t.Fatalf("expected failure once dead zone + pending pods >=10m")
 	}
@@ -138,7 +138,7 @@ func TestTopologySpreadZoneDeadlockRelaxAndAutoRestore(t *testing.T) {
 	p.InvalidateNodes(ctx)
 	p.InvalidateDeployments(ctx)
 	now = now.Add(5 * time.Minute)
-	_ = chk.Run(probetest.SweepCtx(ctx)) // first healthy sweep starts 10m restore timer
+	_ = chk.Run(probetest.SweepCtx(ctx, chk.Deps)) // first healthy sweep starts 10m restore timer
 
 	// Still ScheduleAnyway before 10m healthy window elapses.
 	gotAPI, _ = cs.AppsV1().Deployments("apps").Get(ctx, "api", metav1.GetOptions{})
@@ -148,7 +148,7 @@ func TestTopologySpreadZoneDeadlockRelaxAndAutoRestore(t *testing.T) {
 
 	now = now.Add(30 * time.Minute) // clear 30m patch cooldown + >=10m healthy zone window
 	p.InvalidateDeployments(ctx)
-	resRestore := chk.Run(probetest.SweepCtx(ctx))
+	resRestore := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if !resRestore.Pass {
 		t.Fatalf("expected Pass after zone recovery, got %+v", resRestore)
 	}

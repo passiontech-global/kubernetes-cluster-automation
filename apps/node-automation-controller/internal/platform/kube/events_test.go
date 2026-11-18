@@ -1,6 +1,8 @@
 package kube
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,5 +98,150 @@ func TestCountRecentEventsSkipsFutureTimestamp(t *testing.T) {
 	}
 	if got != 0 {
 		t.Fatalf("CountRecentEvents = %d, want 0 — future timestamp counted as recent", got)
+	}
+}
+
+// A long workload name or a findings blob must not make the whole
+// Event create fail validation — Name/Note are clipped at the API's
+// byte limits while the reason/action contract strings stay intact.
+func TestEmitWarningEventClipsNameAndNote(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	err := EmitWarningEvent(t.Context(), cs, WarningEvent{
+		Namespace:         "apps",
+		Name:              strings.Repeat("a", 300),
+		Reason:            "ServiceSelectorBlackhole",
+		Note:              strings.Repeat("x", 1200),
+		ReportingInstance: "cluster-health-probes",
+		Now:               now,
+	})
+	if err != nil {
+		t.Fatalf("EmitWarningEvent: %v", err)
+	}
+	evs, err := cs.EventsV1().Events("apps").List(t.Context(), metav1.ListOptions{})
+	if err != nil || len(evs.Items) != 1 {
+		t.Fatalf("events = %d err = %v", len(evs.Items), err)
+	}
+	got := evs.Items[0]
+	if len(got.Name) != 253 {
+		t.Fatalf("event name length = %d, want 253", len(got.Name))
+	}
+	if len(got.Note) != 1024 {
+		t.Fatalf("event note length = %d, want 1024", len(got.Note))
+	}
+	if got.Reason != "ServiceSelectorBlackhole" || got.Action != got.Reason {
+		t.Fatalf("reason/action must stay byte-stable: %q / %q", got.Reason, got.Action)
+	}
+	// Cutting a multi-byte rune must not leave invalid UTF-8 in Note.
+	cs2 := fake.NewSimpleClientset()
+	err = EmitWarningEvent(t.Context(), cs2, WarningEvent{
+		Namespace: "apps", Name: "ev-utf8", Reason: "X",
+		Note: strings.Repeat("é", 600), Now: now,
+	})
+	if err != nil {
+		t.Fatalf("EmitWarningEvent utf8: %v", err)
+	}
+	got2, _ := cs2.EventsV1().Events("apps").List(t.Context(), metav1.ListOptions{})
+	if len(got2.Items) != 1 || len(got2.Items[0].Note) > 1024 {
+		t.Fatalf("utf8 note not clipped: %+v", got2.Items)
+	}
+}
+
+// A long object name must be shortened from the FRONT while keeping
+// the trailing ".unix" uniqueness suffix — otherwise every long name
+// emitted in one sweep collapses to the same prefix and the second
+// Create fails 422 AlreadyExists. The cut must also not leave a '.'
+// or '-' at the end of the shortened segment (DNS-1123).
+func TestEmitWarningEventClipKeepsTimestampSuffix(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	const suffix = ".1752890400"
+	// The '-' sits exactly at byte 242 (the 253-11 name budget), so a
+	// naive prefix cut would leave a DNS-invalid trailing separator.
+	name := strings.Repeat("a", 241) + "-" + strings.Repeat("b", 60) + suffix
+	if err := EmitWarningEvent(t.Context(), cs, WarningEvent{
+		Namespace: "apps", Name: name, Reason: "TopologyZoneDeadlock",
+		Note: "long name", Now: now,
+	}); err != nil {
+		t.Fatalf("EmitWarningEvent: %v", err)
+	}
+	evs, err := cs.EventsV1().Events("apps").List(t.Context(), metav1.ListOptions{})
+	if err != nil || len(evs.Items) != 1 {
+		t.Fatalf("events = %d err = %v", len(evs.Items), err)
+	}
+	got := evs.Items[0].Name
+	if len(got) > 253 {
+		t.Fatalf("event name length = %d, want <=253", len(got))
+	}
+	if !strings.HasSuffix(got, suffix) {
+		t.Fatalf("event name lost its timestamp suffix: %q", got)
+	}
+	segment := strings.TrimSuffix(got, suffix)
+	if strings.HasSuffix(segment, ".") || strings.HasSuffix(segment, "-") {
+		t.Fatalf("shortened segment ends with DNS-invalid separator: %q", segment)
+	}
+	if got == name[:253] {
+		t.Fatal("timestamp suffix was clipped away by a plain prefix cut")
+	}
+}
+
+// The other emitter spelling uses ".%x" of UnixNano: a long name must
+// keep that suffix too, with the same DNS-1123 separator trim.
+func TestEmitWarningEventClipKeepsHexNanoSuffix(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	suffix := fmt.Sprintf(".%x", now.UnixNano())
+	// The '-' sits exactly at the first cut byte of the shortened
+	// segment (253 - len(suffix)), so a naive prefix cut would leave a
+	// DNS-invalid trailing separator.
+	baseLen := 253 - len(suffix) - 1
+	name := strings.Repeat("a", baseLen) + "-" + strings.Repeat("b", 60) + suffix
+	if err := EmitWarningEvent(t.Context(), cs, WarningEvent{
+		Namespace: "apps", Name: name, Reason: "TopologyZoneDeadlock",
+		Note: "long name", Now: now,
+	}); err != nil {
+		t.Fatalf("EmitWarningEvent: %v", err)
+	}
+	evs, err := cs.EventsV1().Events("apps").List(t.Context(), metav1.ListOptions{})
+	if err != nil || len(evs.Items) != 1 {
+		t.Fatalf("events = %d err = %v", len(evs.Items), err)
+	}
+	got := evs.Items[0].Name
+	if len(got) > 253 || !strings.HasSuffix(got, suffix) {
+		t.Fatalf("hex nano suffix lost: %q (suffix %q)", got, suffix)
+	}
+	segment := strings.TrimSuffix(got, suffix)
+	if strings.HasSuffix(segment, ".") || strings.HasSuffix(segment, "-") {
+		t.Fatalf("shortened segment ends with DNS-invalid separator: %q", segment)
+	}
+}
+
+// Short a-f runs are ordinary DNS labels, not timestamps: only hex
+// suffixes of at least 8 chars are preserved as uniqueness suffixes.
+func TestClipEventNameHexSuffixMinimumLength(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		max         int
+		want        string
+	}{
+		{"7-char hex is part of the name", "aaaaaaaaaa.abcdefa", 15, "aaaaaaaaaa.abcd"},
+		{"8-char hex is a suffix", "aaaaaaaaaaaaaaaaaaaa.abcdefab", 15, "aaaaaa.abcdefab"},
+	} {
+		if got := clipEventName(tc.input, tc.max); got != tc.want {
+			t.Errorf("%s: clipEventName = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Even when the suffix alone exhausts the budget (or there is no
+// suffix), the hard cut must not end on a DNS-invalid separator.
+func TestClipEventNameTrimsSeparatorsWhenBudgetExhausted(t *testing.T) {
+	longHexSuffix := strings.Repeat("f", 260)
+	name := strings.Repeat("a", 252) + "-" + longHexSuffix // suffix 261 bytes > max
+	if got := clipEventName(name, 253); strings.HasSuffix(got, ".") || strings.HasSuffix(got, "-") {
+		t.Fatalf("hard cut left a trailing separator: %q", got)
+	}
+	if got := clipEventName("ab-cd-", 5); got != "ab-cd" {
+		t.Fatalf("clipEventName = %q, want ab-cd", got)
 	}
 }

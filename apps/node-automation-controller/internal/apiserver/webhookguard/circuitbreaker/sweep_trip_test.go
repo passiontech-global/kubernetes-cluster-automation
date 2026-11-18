@@ -21,6 +21,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -322,6 +323,47 @@ func TestWebhookCircuitBreakerReadyBackendNeverTrips(t *testing.T) {
 				t.Fatalf("ready backend must not be patched, got %d patch(es)", got)
 			}
 		})
+	}
+}
+
+// An AnnoWebhookNeverFailOpen="true" config must not be tripped even
+// by the census (dead-backend) path: the opt-out is uniform across
+// BOTH trip routes, not just the Prometheus metric route.
+func TestWebhookCircuitBreakerNeverFailOpenBlocksDeadBackendTrip(t *testing.T) {
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "cb-never-fail-open",
+			Annotations: map[string]string{kube.AnnoWebhookNeverFailOpen: "true"},
+		},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "dead.example.com",
+			FailurePolicy: new(admissionv1.Fail),
+			ClientConfig:  admissionv1.WebhookClientConfig{Service: wgSvcRef("backend", "dead-svc")},
+		}},
+	}
+	cs := fake.NewSimpleClientset(
+		wgNamespace("kube-system"), wgNamespace("backend"),
+		wgService("backend", "dead-svc"),
+		wgEndpointSlice("backend", "dead-svc", 0, 1),
+		mwc)
+	patches := wgPatchCounter(cs)
+	now := time.Unix(1_700_000_000, 0)
+	g, b := wgBreakerGuard(cs, &now)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * DeadThreshold)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatal(err)
+	}
+	if got := wgMutatingFP(t, cs, "cb-never-fail-open", "dead.example.com"); got != admissionv1.Fail {
+		t.Fatalf("never-fail-open webhook must not trip on a dead backend, got %q", got)
+	}
+	if _, ok := wgMutatingAnno(t, cs, "cb-never-fail-open"); ok {
+		t.Fatal("never-fail-open webhook must not enter the circuit-broken annotation")
+	}
+	if got := atomic.LoadInt32(patches); got != 0 {
+		t.Fatalf("never-fail-open webhook must not be patched, got %d", got)
 	}
 }
 

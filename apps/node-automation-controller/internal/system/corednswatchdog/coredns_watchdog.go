@@ -332,9 +332,16 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	// recover() deletes with a UID precondition so a same-named pod
 	// recreated mid-sweep is never killed.
 	podUID := map[string]types.UID{}
+	// podNode carries Spec.NodeName off the SAME snapshot: recover()
+	// needs it for heal.EvictPod's L1↔L3 local-remediation yield,
+	// which would otherwise see an unscheduled synthetic pod.
+	podNode := map[string]string{}
 	totalPods := 0
 	var crashLoopPods []*corev1.Pod
 	loopUID := map[string]types.UID{}
+	// The loop-recovery cooldown and target breaker are node-keyed —
+	// capture the node from the SAME census as the UID precondition.
+	loopNode := map[string]string{}
 	for i := range podItems {
 		p := &podItems[i]
 		if p.DeletionTimestamp == nil {
@@ -343,6 +350,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 				cp := p
 				crashLoopPods = append(crashLoopPods, cp)
 				loopUID[p.Name] = p.UID
+				loopNode[p.Name] = p.Spec.NodeName
 			}
 		}
 		// Only a pod that can actually answer :53 belongs in the probe
@@ -357,6 +365,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 		}
 		podIP[p.Name] = p.Status.PodIP
 		podUID[p.Name] = p.UID
+		podNode[p.Name] = p.Spec.NodeName
 	}
 	// Release the full slice (non-crashloop pods are dropped).
 	podItems = nil
@@ -384,7 +393,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 		}
 		if len(loopSuspects) > 0 {
 			slices.Sort(loopSuspects)
-			loopErr = w.recoverLoopCrashPods(ctx, loopSuspects, loopUID, totalPods)
+			loopErr = w.recoverLoopCrashPods(ctx, loopSuspects, loopUID, loopNode, totalPods)
 		}
 	}
 	crashLoopPods = nil
@@ -537,7 +546,7 @@ func (w *coreDNSWatchdog) run(ctx context.Context) error {
 	slices.Sort(suspects)
 	log.Info("STALE coredns replicas — dead watch or panic",
 		"stale", len(suspects), "total", len(podIP), "pods", suspects)
-	staleErr := w.recover(ctx, suspects, podUID, len(podIP))
+	staleErr := w.recover(ctx, suspects, podUID, podNode, len(podIP))
 	return errors.Join(loopErr, staleErr)
 }
 

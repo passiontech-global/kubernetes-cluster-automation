@@ -159,32 +159,34 @@ func corefileCacheHeal(corefile, serveStale string) (string, bool) {
 			changed = true
 		case strings.LastIndex(code, "}") > open:
 			// Inline single-line block `cache 30 { success 9984 30 }`:
-			// Caddyfile subdirectives must be newline-separated when more
-			// than one directive exists; expand into a multi-line block.
+			// Caddyfile subdirectives must be newline-separated, and
+			// Dispenser.NextBlock() requires a `\n` right after `{` —
+			// even a block whose directives are all already present
+			// fails to parse on reload. ALWAYS expand to a multi-line
+			// block, appending any directives it lacks while keeping
+			// the existing tokens verbatim.
 			closeCode := strings.LastIndex(code, "}")
 			inner := code[open+1 : closeCode]
 			missing := cacheBlockMissing(inner, serveStale)
-			if len(missing) > 0 {
-				prefix := strings.TrimSpace(code[:open])
-				comment := ""
-				if codeEnd := commentStart(lines[i]); codeEnd < len(lines[i]) {
-					if c := strings.TrimSpace(lines[i][codeEnd:]); c != "" {
-						comment = " " + c
-					}
+			prefix := strings.TrimSpace(code[:open])
+			comment := ""
+			if codeEnd := commentStart(lines[i]); codeEnd < len(lines[i]) {
+				if c := strings.TrimSpace(lines[i][codeEnd:]); c != "" {
+					comment = " " + c
 				}
-				existing := splitCorefileInlineDirectives(inner, cacheSubdirectives)
-				var sb strings.Builder
-				sb.WriteString(indent + prefix + " {\n")
-				for _, line := range existing {
-					sb.WriteString(indent + "    " + line + "\n")
-				}
-				for _, m := range missing {
-					sb.WriteString(indent + "    " + m + "\n")
-				}
-				sb.WriteString(indent + "}" + comment)
-				lines[i] = sb.String()
-				changed = true
 			}
+			existing := splitCorefileInlineDirectives(inner, cacheSubdirectives)
+			var sb strings.Builder
+			sb.WriteString(indent + prefix + " {\n")
+			for _, line := range existing {
+				sb.WriteString(indent + "    " + line + "\n")
+			}
+			for _, m := range missing {
+				sb.WriteString(indent + "    " + m + "\n")
+			}
+			sb.WriteString(indent + "}" + comment)
+			lines[i] = sb.String()
+			changed = true
 		default:
 			// Braced multi-line block: find the matching close and
 			// inject the missing directives before it. Depth counts
@@ -285,11 +287,14 @@ func serveStaleLines(indent, serveStale string) string {
 // concurrency cap whose overflow shows up as
 // coredns_forward_max_concurrent_rejects_total, the metric
 // coredns-forward-saturation watches. A forward line without an
-// options block gains an inline `{ max_concurrent N }`; an
-// existing block (inline or multi-line) gains the directive only
-// when no `max_concurrent` token is already present — a declared
-// value is never fought (same idempotence rule as the cache heal;
-// a GitOps-pinned different value is respected and the Flux patch
+// options block gains a multi-line `{ ... }` block with the option
+// on its own indented line; an existing one-line `{ ... }` block is
+// always expanded to multi-line (the Caddyfile parser requires a
+// newline after `{`, even when the block is otherwise complete).
+// In either case max_concurrent is added only when no
+// `max_concurrent` token is already present — a declared value is
+// never fought (same idempotence rule as the cache heal; a
+// GitOps-pinned different value is respected and the Flux patch
 // gate stops any ping-pong). maxConcurrent is the validated
 // COREDNS_FORWARD_MAX_CONCURRENT value — always a positive integer
 // string, so the injected Corefile can never be malformed by this
@@ -309,26 +314,31 @@ func corefileForwardHeal(corefile, maxConcurrent string) (string, bool) {
 		open := strings.Index(code, "{")
 		switch {
 		case open < 0:
-			// No options block: `forward . 8.8.8.8` gains an inline
-			// block. A trailing comment stays at end-of-line,
-			// outside the braces.
+			// No options block: `forward . /etc/resolv.conf` gains a
+			// braced block. The option MUST sit on its own line: an
+			// inline `{ max_concurrent N }` has no `\n` after `{`,
+			// which CoreDNS's Caddyfile parser (Dispenser.NextBlock)
+			// rejects on reload. A trailing comment stays on the
+			// closing-brace line, outside the braces.
 			comment := ""
 			if hash := strings.Index(lines[i], "#"); hash >= 0 {
 				if c := strings.TrimSpace(lines[i][hash:]); c != "" {
 					comment = " " + c
 				}
 			}
-			lines[i] = indent + code + " { " + directive + " }" + comment
+			lines[i] = indent + code + " {\n" +
+				indent + "    " + directive + "\n" +
+				indent + "}" + comment
 			changed = true
 		case strings.LastIndex(code, "}") > open:
-			// Inline single-line block — expand into multi-line when
-			// injecting max_concurrent alongside existing directives so
-			// CoreDNS Caddyfile parsing never chokes on single-line siblings.
+			// Inline single-line block — ALWAYS expand to multi-line:
+			// the `\n` after `{` is mandatory for Caddyfile parsing,
+			// even when every option is already present. Preserve
+			// existing tokens verbatim and append max_concurrent only
+			// when it is genuinely absent (a declared value is never
+			// fought — same idempotence rule as the cache heal).
 			closeCode := strings.LastIndex(code, "}")
 			inner := code[open+1 : closeCode]
-			if fieldsHave(inner, "max_concurrent") {
-				continue
-			}
 			prefix := strings.TrimSpace(code[:open])
 			comment := ""
 			if codeEnd := commentStart(lines[i]); codeEnd < len(lines[i]) {
@@ -342,7 +352,9 @@ func corefileForwardHeal(corefile, maxConcurrent string) (string, bool) {
 			for _, line := range existing {
 				sb.WriteString(indent + "    " + line + "\n")
 			}
-			sb.WriteString(indent + "    " + directive + "\n")
+			if !fieldsHave(inner, "max_concurrent") {
+				sb.WriteString(indent + "    " + directive + "\n")
+			}
 			sb.WriteString(indent + "}" + comment)
 			lines[i] = sb.String()
 			changed = true

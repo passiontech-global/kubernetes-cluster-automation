@@ -9,6 +9,7 @@ package probefw
 import (
 	"context"
 	"testing"
+	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -72,6 +73,24 @@ func (c *ctxCaptureNodes) List(ctx context.Context, o metav1.ListOptions) (*core
 	c.cs.nodeListHadCtx = true
 	c.cs.nodeListCtxErr = ctx.Err()
 	return c.NodeInterface.List(ctx, o)
+}
+
+// The snapshot clock must close over the Deps pointer, not copy
+// deps[0].Now at install time: probetest.FreezeNow is routinely
+// called after WithSweepSnapshot and every memo's fetchedAt stamp
+// must then read the new clock.
+func TestWithSweepSnapshotBindsNowDynamically(t *testing.T) {
+	d := &Deps{}
+	ctx := WithSweepSnapshot(t.Context(), d)
+	snap := ctx.Value(sweepCtxKey{}).(*sweepSnapshot)
+	frozen := time.Date(2024, 5, 1, 12, 0, 0, 0, time.UTC)
+	d.Now = func() time.Time { return frozen }
+	if got := snap.nowFn(); !got.Equal(frozen) {
+		t.Fatalf("snapshot clock = %v, want frozen %v", got, frozen)
+	}
+	if got := snap.pods.nowTime(); !got.Equal(frozen) {
+		t.Fatalf("pod memo stamp = %v, want frozen %v", got, frozen)
+	}
 }
 
 // A check running under an already-DEAD per-check ctx must still get

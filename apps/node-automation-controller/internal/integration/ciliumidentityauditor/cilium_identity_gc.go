@@ -1,6 +1,7 @@
 // GC delete path for the cilium identity auditor: the four stacked
 // v2 gates (gcEnabled handled by the caller, grace period, min age,
-// node storm-gate) and the capped, UID-preconditioned deletes.
+// node storm-gate — Ready, remediation/fence taint and explicit
+// NetworkPartitioned) and the capped, UID-preconditioned deletes.
 // split from cilium_identity_auditor.go (see its header for the module contract).
 package ciliumidentityauditor
 
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -61,10 +63,29 @@ func (a *ciliumIdentityAuditor) gcOrphans(ctx context.Context,
 		return nil
 	}
 	for i := range nodes {
-		if !kube.NodeReady(&nodes[i]) {
+		n := &nodes[i]
+		if !kube.NodeReady(n) {
 			log.Info("GC SKIP: node not Ready — identities may still be live on it",
-				"node", nodes[i].Name, "eligible", len(eligible))
+				"node", n.Name, "eligible", len(eligible))
 			return nil
+		}
+		// A fenced/remediating node can still report Ready=True while
+		// its kubelet is wedged and CiliumEndpoints are unsynced —
+		// deleting "orphans" underneath it strips live workloads of
+		// network policy (wave3.2/gc-storm-gate). Same for an explicit
+		// NetworkPartitioned condition: the API view is stale, so
+		// the orphan census cannot be trusted.
+		if kube.HasRemediationOrOutOfServiceTaint(n) {
+			log.Info("GC SKIP: node carries remediation/out-of-service taint — identities may still be live",
+				"node", n.Name, "eligible", len(eligible))
+			return nil
+		}
+		for _, c := range n.Status.Conditions {
+			if c.Type == "NetworkPartitioned" && c.Status == corev1.ConditionTrue {
+				log.Info("GC SKIP: node reports NetworkPartitioned — identities may still be live",
+					"node", n.Name, "eligible", len(eligible))
+				return nil
+			}
 		}
 	}
 

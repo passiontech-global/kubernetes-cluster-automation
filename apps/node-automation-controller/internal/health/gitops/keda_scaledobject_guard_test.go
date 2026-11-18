@@ -19,6 +19,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -61,6 +62,37 @@ func zeroDeploy(ns, name string, annotations map[string]string) *appsv1.Deployme
 	}
 }
 
+// The KEDA zero-rescue consults the same Flux conflict gate as the
+// HPA twin — a Git-owned target parked at zero must not be fought
+// every sweep.
+func TestKedaRescueRespectsFluxConflictGate(t *testing.T) {
+	heal.ConfigureFluxConflictLoop(3, 30*time.Minute)
+	t.Cleanup(func() { heal.ConfigureFluxConflictLoop(0, 0) })
+	so := kedaObj("apps", "flux-scaler", "flux-worker", 1, "False", "")
+	dep := zeroDeploy("apps", "flux-worker", nil)
+	dep.ManagedFields = []metav1.ManagedFieldsEntry{{
+		Manager: "helm-controller", Operation: metav1.ManagedFieldsOperationApply,
+	}}
+	cs := fake.NewSimpleClientset(dep)
+	p := testProberDyn(cs, probetest.OpDyn(so))
+	base := time.Now()
+	p.Now = func() time.Time { return base }
+	heal.FluxPatchGate("deployment", dep, "apps/flux-worker", base)
+	heal.FluxPatchGate("deployment", dep, "apps/flux-worker", base)
+	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	base = base.Add(16 * time.Minute)
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	got, err := cs.AppsV1().Deployments("apps").Get(ctx, "flux-worker", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+		t.Fatalf("flux-gated rescue must not patch replicas, got %v",
+			got.Spec.Replicas)
+	}
+}
+
 func TestKedaGuardFlagsUnhealthyPastWindowAndRescuesZero(t *testing.T) {
 	so := kedaObj("apps", "worker-scaler", "worker", 1, "False", "")
 	dep := zeroDeploy("apps", "worker", nil)
@@ -69,11 +101,11 @@ func TestKedaGuardFlagsUnhealthyPastWindowAndRescuesZero(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("first sighting inside window must pass: %+v", res)
 	}
 	base = base.Add(16 * time.Minute)
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Pass {
 		t.Fatalf("unhealthy scaledobject past window must fail: %+v", res)
 	}
@@ -103,9 +135,9 @@ func TestKedaGuardRescuesZeroRollout(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
-	chk.Run(probetest.SweepCtx(ctx))
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	base = base.Add(16 * time.Minute)
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("unhealthy scaledobject past window must fail: %+v", res)
 	}
 	got, err := dyn.Resource(kube.GVRArgoRollout).Namespace("apps").
@@ -128,9 +160,9 @@ func TestKedaGuardSkipsDownscalerManagedZero(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
-	chk.Run(probetest.SweepCtx(ctx))
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	base = base.Add(16 * time.Minute)
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Pass {
 		t.Fatalf("active_unknown scaledobject past window must fail: %+v", res)
 	}
@@ -156,7 +188,7 @@ func TestKedaGuardRestartResume(t *testing.T) {
 	dep := zeroDeploy("apps", "worker", nil)
 	cs := fake.NewSimpleClientset(dep)
 	p := testProberDyn(cs, probetest.OpDyn(so))
-	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("persisted window did not resume on the first post-restart sweep: %+v", res)
 	}
@@ -173,7 +205,7 @@ func TestKedaGuardPassesOnHealthyObjects(t *testing.T) {
 	so := kedaObj("apps", "worker-scaler", "worker", 1, "True", "True")
 	cs := fake.NewSimpleClientset()
 	p := testProberDyn(cs, probetest.OpDyn(so))
-	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if !res.Pass {
 		t.Fatalf("healthy scaledobject must pass: %+v", res)
 	}

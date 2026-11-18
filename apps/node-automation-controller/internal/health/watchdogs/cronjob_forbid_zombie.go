@@ -199,6 +199,10 @@ func (p *cjForbidZombieCheck) sweepActiveJob(ctx context.Context,
 	jobName := ref.Name
 	jobKey := cj.Namespace + "/" + jobName
 	job := jobsByKey[jobKey]
+	// Annotation opt-ins are sweep-overlay-aware: a stamp landed
+	// earlier in this same sweep must be visible, not the frozen
+	// snapshot copy of the CronJob.
+	annos := kube.EffectiveAnnos(ctx, cj)
 	if job != nil && ref.UID != "" && job.UID != ref.UID {
 		// Same-named Job has a different UID: the active ref points to a
 		// deleted prior Job instance, never delete the new live Job.
@@ -239,7 +243,10 @@ func (p *cjForbidZombieCheck) sweepActiveJob(ctx context.Context,
 		return // nothing to age — the zombie branch covers the gone case
 	}
 	age := jobRuntimeAge(job, now)
-	limit := cjRunawayLimit(cj, now)
+	// The opt-in annotation is read through the sweep overlay — a
+	// cooldown/opt-out stamp landed earlier in this same sweep must
+	// be visible here instead of the frozen snapshot copy.
+	limit := cjRunawayLimit(cj, annos, now)
 	if age < limit {
 		return
 	}
@@ -256,7 +263,7 @@ func (p *cjForbidZombieCheck) sweepActiveJob(ctx context.Context,
 	// same rule for the threshold side).
 	annoKill := false
 	if d, err := time.ParseDuration(
-		cj.Annotations[kube.AnnoCronJobMaxActiveDuration]); err == nil && d > 0 {
+		annos[kube.AnnoCronJobMaxActiveDuration]); err == nil && d > 0 {
 		annoKill = true
 	}
 	if !annoKill && !p.killRunaway {
@@ -309,9 +316,9 @@ func jobRuntimeAge(job *batchv1.Job, now time.Time) time.Duration {
 // otherwise max(6h, 10 × schedule interval). An unparseable
 // annotation or schedule falls back to the 6h floor — the gauge
 // still fires, the opt-in kill simply never engages on a typo.
-func cjRunawayLimit(cj *batchv1.CronJob, now time.Time) time.Duration {
+func cjRunawayLimit(cj *batchv1.CronJob, annos map[string]string, now time.Time) time.Duration {
 	floor := cjRunawayFloor
-	if d, err := time.ParseDuration(cj.Annotations[kube.AnnoCronJobMaxActiveDuration]); err == nil && d > 0 {
+	if d, err := time.ParseDuration(annos[kube.AnnoCronJobMaxActiveDuration]); err == nil && d > 0 {
 		return d
 	}
 	if sched, err := cron.ParseStandard(cj.Spec.Schedule); err == nil {
@@ -409,8 +416,18 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 	live.Status.Active = kept
 	if _, err := p.CS.BatchV1().CronJobs(cj.Namespace).UpdateStatus(
 		ctx, live, metav1.UpdateOptions{}); err != nil {
-		if apierrors.IsConflict(err) || apierrors.IsForbidden(err) {
-			log.Info("WARN: cronjob forbid zombie status.active clear deferred",
+		if apierrors.IsForbidden(err) {
+			// RBAC is a stable condition — stamp the cooldown so we
+			// stop retrying the doomed write every sweep. The audit
+			// finding (gauge + FAIL) was already emitted above; this
+			// is a tolerated sub-failure, never an aborted audit.
+			p.Heals.Stamp(key+"/active-ref", now)
+			log.Info("WARN: cronjob forbid zombie status.active clear forbidden (RBAC) — cooldown stamped",
+				"cronjob", key, "job", jobName, "error", err)
+			return
+		}
+		if apierrors.IsConflict(err) {
+			log.Info("WARN: cronjob forbid zombie status.active clear deferred (conflict)",
 				"cronjob", key, "job", jobName, "error", err)
 			return
 		}
@@ -429,6 +446,18 @@ func (p *cjForbidZombieCheck) deleteStalledJob(ctx context.Context,
 	log logr.Logger, now time.Time, rep *probefw.SweepReport,
 	cj *batchv1.CronJob, job *batchv1.Job) {
 
+	// A status.active ref names a Job by NAME, not by identity. A
+	// same-named Job that is not controlled by THIS CronJob (a later
+	// instance from another owner, or a hand-rolled Job with no
+	// controller at all) must never be deleted just to free the Forbid
+	// slot — that would kill somebody else's workload. Check the
+	// controller UID BEFORE the heal gate so no grant is spent.
+	if owner := metav1.GetControllerOf(job); owner == nil || owner.UID != cj.UID {
+		log.Info("WARN: cronjob forbid zombie job not controlled by this cronjob — skip delete",
+			"cronjob", cj.Namespace+"/"+cj.Name,
+			"job", job.Namespace+"/"+job.Name)
+		return
+	}
 	key := cj.Namespace + "/" + cj.Name
 	proceed, unverifiable := p.HealAllowedClusterWideOnly(ctx, log, &p.Heals,
 		key, cjForbidHealCooldown, now)

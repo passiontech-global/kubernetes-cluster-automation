@@ -75,7 +75,7 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 	if !proceed {
 		return
 	}
-	covered, patched, drift := p.patchLinkerdTemplate(ctx, log, pod, missing, now, rep, driftNow)
+	covered, patched, drift, attempted := p.patchLinkerdTemplate(ctx, log, pod, missing, now, rep, driftNow)
 	switch {
 	case drift:
 		// GitOps drift: the gauge + finding already emitted inside
@@ -96,13 +96,17 @@ func (p *linkerdProtocolDetectionStallCheck) healLinkerdOpaquePorts(ctx context.
 		// linkerd_opaque_port_missing and linkerd_gitops_opaque_drift
 		// while the proxy never got the fix.
 		//
-		// No cooldown stamp either: every !covered cause is a
-		// slow-moving refusal that resolves on its own (an RBAC
-		// rollout lands, an owner re-links), and the grant refund
-		// keeps the retry budget-neutral — an UNSTAMPED refusal no
-		// longer burns the shared heal budget, which was the stamp's
-		// original job.
-		heal.RefundGrant(now)
+		// No cooldown stamp: a refusal is slow-moving and resolves
+		// on its own (an RBAC rollout lands, an owner re-links).
+		// Refund ONLY a clean, pre-write deferral. When a Patch was
+		// actually sent and failed, the token is spent (budget.go:
+		// never refund after a failed K8s API call) — the failure
+		// is absorbed here, so account it as a tolerated sub-error.
+		if attempted {
+			metrics.IncError(p.Name)
+		} else {
+			heal.RefundGrant(now)
+		}
 		log.Info("opaque-ports heal: owning workload template not patched — leaving pod running (annotation alone cannot reach a live proxy)",
 			"pod", pod.Namespace+"/"+pod.Name, "ports", missing)
 		return

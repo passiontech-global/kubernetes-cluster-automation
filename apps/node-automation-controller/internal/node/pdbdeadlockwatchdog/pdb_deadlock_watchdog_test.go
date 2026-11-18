@@ -753,22 +753,27 @@ func TestPDBReliefProceedsDuringActiveCordon(t *testing.T) {
 }
 
 // A DB quorum member is never deleted — deleting it trades a drain
-// stall for a data-store outage.
+// stall for a data-store outage. Every operator label in the quorum
+// set (including the Percona PXC/PSMDB pair) must shield the pod.
 func TestPDBReliefSkipsDBQuorumPod(t *testing.T) {
-	clock := time.Now()
-	pdb := pdwBlockedPDB("app", "db-pdb", 3, 2, 1)
-	always := policyv1.AlwaysAllow
-	pdb.Spec.UnhealthyPodEvictionPolicy = &always
-	pod := pdwUnreadyPod("app", "pg-0", "node-cordoned", 45*time.Minute, "CrashLoopBackOff")
-	pod.Labels["cnpg.io/cluster"] = "pg"
-	cs := fake.NewSimpleClientset(pdb, pod, pdwStaticCordonedNode("node-cordoned"))
-	w := pdwReliefWatchdog(cs, &clock)
+	for _, label := range pdbDBQuorumLabels {
+		t.Run(label, func(t *testing.T) {
+			clock := time.Now()
+			pdb := pdwBlockedPDB("app", "db-pdb", 3, 2, 1)
+			always := policyv1.AlwaysAllow
+			pdb.Spec.UnhealthyPodEvictionPolicy = &always
+			pod := pdwUnreadyPod("app", "pg-0", "node-cordoned", 45*time.Minute, "CrashLoopBackOff")
+			pod.Labels[label] = "cluster"
+			cs := fake.NewSimpleClientset(pdb, pod, pdwStaticCordonedNode("node-cordoned"))
+			w := pdwReliefWatchdog(cs, &clock)
 
-	w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
-		pdb, map[string]bool{"node-cordoned": true})
+			w.relieveCordonedBlock(context.Background(), logr.Discard(), clock,
+				pdb, map[string]bool{"node-cordoned": true})
 
-	if _, err := cs.CoreV1().Pods("app").Get(context.Background(), "pg-0", metav1.GetOptions{}); err != nil {
-		t.Fatalf("DB quorum pod deleted: %v", err)
+			if _, err := cs.CoreV1().Pods("app").Get(context.Background(), "pg-0", metav1.GetOptions{}); err != nil {
+				t.Fatalf("DB quorum pod deleted: %v", err)
+			}
+		})
 	}
 }
 

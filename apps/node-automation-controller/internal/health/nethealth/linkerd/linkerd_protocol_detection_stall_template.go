@@ -154,14 +154,17 @@ func (p *linkerdProtocolDetectionStallCheck) linkerdTemplateDriftProbe(ctx conte
 // (RBAC/not-found) — the caller must not delete the pod then. drift
 // reports the GitOps-revert refusal specifically: the caller treats
 // it as "keep evaluating, never cool down" (the read-only probe
-// already emitted the drift tuple before the gates).
+// already emitted the drift tuple before the gates). attempted=true
+// reports that a template Patch was actually SENT (whether it
+// landed or failed): the gate owner must not refund its budget
+// grant for a mutation it tried and failed to deliver.
 func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Context,
 	log logr.Logger, pod *corev1.Pod, missing []int, now time.Time,
-	rep *probefw.SweepReport, driftNow map[string][]string) (covered, patched, drift bool) {
+	rep *probefw.SweepReport, driftNow map[string][]string) (covered, patched, drift, attempted bool) {
 
 	target, ok := p.resolveLinkerdTemplate(ctx, log, pod, missing)
 	if !ok {
-		return false, false, false
+		return false, false, false, false
 	}
 	return p.patchTemplatePorts(ctx, log, target, missing, now, rep, driftNow)
 }
@@ -178,10 +181,13 @@ func (p *linkerdProtocolDetectionStallCheck) patchLinkerdTemplate(ctx context.Co
 // reverted — re-patching inside the window is a fight with whoever
 // reverted it. drift=true ONLY on the GitOps-managed revert refusal —
 // the caller treats it as "keep evaluating, never cool down".
+// attempted=true only when a Patch call was issued, so a failed
+// write keeps the budget grant (budget.go: no refund after a
+// mutation was attempted).
 func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Context,
 	log logr.Logger, target *linkerdTemplateTarget, missing []int,
 	now time.Time, rep *probefw.SweepReport, driftNow map[string][]string,
-) (covered, patched, drift bool) {
+) (covered, patched, drift, attempted bool) {
 
 	obj, kind, ns, name := target.obj, target.kind, target.ns, target.name
 	existing, cronJob := target.existing, target.cronJob
@@ -202,7 +208,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 	if len(stillMissing) == 0 {
 		log.Info("linkerd heal: template already covers ports — pod restart suffices",
 			"kind", kind, "workload", ns+"/"+name)
-		return true, false, false
+		return true, false, false, false
 	}
 	// template-patch-stamp durable stamp: a workload we already patched that lost
 	// opaque-ports again inside the window was reverted by its owner.
@@ -224,7 +230,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 				"Flux/ArgoCD selfHeal owns it, refusing the revert fight",
 				"kind", kind, "workload", ns+"/"+name,
 				"lastPatch", stamped)
-			return false, false, true
+			return false, false, true, false
 		}
 		// Not GitOps-owned: honor the window silently AND drop
 		// any drift series this workload emitted earlier — a
@@ -233,7 +239,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 		linkerdGitOpsOpaqueDriftGauge.DeleteLabelValues(ns, kind, name)
 		log.Info("linkerd heal: template reverted inside patch cooldown — not re-patching",
 			"kind", kind, "workload", ns+"/"+name, "lastPatch", stamped)
-		return false, false, false
+		return false, false, false, false
 	}
 	for pt := range stillMissing {
 		covers[pt] = true
@@ -276,7 +282,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 		metrics.IncError(p.Name)
 		log.Error(err, "linkerd heal: marshal template patch failed",
 			"kind", kind, "workload", ns+"/"+name)
-		return false, false, false
+		return false, false, false, false // no API call — clean deferral
 	}
 	var patchErr error
 	switch kind {
@@ -304,9 +310,13 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 	if patchErr != nil {
 		// Forbidden until the RBAC rollout lands patch on pods /
 		// daemonsets / jobs — log and fail closed (no pod delete).
+		// attempted=true: the Patch call reached the apiserver, so
+		// the gate's budget grant is SPENT even though the write
+		// failed. The caller must not RefundGrant here — only a
+		// clean, pre-write deferral earns a refund.
 		log.Info("WARN: linkerd heal — template patch failed",
 			"kind", kind, "workload", ns+"/"+name, "error", patchErr)
-		return false, false, false
+		return false, false, false, true
 	}
 	// Mirror the landed patch into the snapshot's in-memory workload
 	// copy — the serial sweep sees no apiserver echo, so a second
@@ -328,7 +338,7 @@ func (p *linkerdProtocolDetectionStallCheck) patchTemplatePorts(ctx context.Cont
 	}
 	log.Info("PATCH: linkerd opaque-ports added to workload template",
 		"kind", kind, "workload", ns+"/"+name, "ports", value)
-	return true, true, false
+	return true, true, false, true
 }
 
 // mergeTemplateAnnos writes anno into obj's pod-template annotation

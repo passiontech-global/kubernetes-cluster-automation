@@ -71,8 +71,14 @@ type siteSkewWatch struct {
 // all scoped to a single Run; only the emitted ledger (back on the
 // watch) crosses sweeps.
 type siteSkewSweep struct {
-	watch     *siteSkewWatch
-	rep       probefw.SweepReport // this signature's flagged tuples
+	watch *siteSkewWatch
+	rep   probefw.SweepReport // this signature's flagged tuples
+	// censusOK is false when begin() could not read the node/pod
+	// placement joins. close() must then CARRY the held gauge series
+	// instead of reconciling against an empty sweep — a transient
+	// LIST failure is "can't tell", never "skew resolved".
+	censusOK  bool
+	infraErr  error
 	multiZone bool
 	nodeZone  map[string]string // node name → topology zone
 	podNode   map[string]string // "ns/pod" → node name
@@ -104,11 +110,19 @@ func (w *siteSkewWatch) begin(ctx context.Context, log logr.Logger,
 	podNode, perr := d.PodNodes(ctx)
 	if nerr != nil || perr != nil {
 		// Tolerated: the skew signatures go dark this sweep, the
-		// masterless/multimaster ones are unaffected.
+		// masterless/multimaster ones are unaffected. The skew
+		// report records an Infra error and close() keeps every
+		// held series — an API flap must not read as skew recovery.
 		log.Info("WARN: node/pod census failed — site-skew evaluation skipped",
 			"nodeErr", fmt.Sprint(nerr), "podErr", fmt.Sprint(perr))
+		if nerr != nil {
+			s.infraErr = fmt.Errorf("site skew node zones: %w", nerr)
+		} else {
+			s.infraErr = fmt.Errorf("site skew pod nodes: %w", perr)
+		}
 		return s
 	}
+	s.censusOK = true
 	s.nodeZone = nodeZone
 	s.podNode = podNode
 	zoneWorkers := map[string]bool{} // zones with >=1 Ready schedulable worker
@@ -119,7 +133,12 @@ func (w *siteSkewWatch) begin(ctx context.Context, log logr.Logger,
 	nodes, _ := d.AllNodes(ctx)
 	for i := range nodes {
 		if kube.NodeReady(&nodes[i]) && !nodes[i].Spec.Unschedulable &&
-			!kube.IsControlPlane(&nodes[i]) {
+			!kube.IsControlPlane(&nodes[i]) &&
+			!kube.HasRemediationOrOutOfServiceTaint(&nodes[i]) {
+			// A node under remediation/out-of-service is not
+			// serving its zone — counting it as a live worker
+			// would keep the multi-zone gate open on a dead site
+			// and let a real skew read as healthy.
 			if z := nodeZone[nodes[i].Name]; z != "" {
 				zoneWorkers[z] = true
 			}
@@ -185,8 +204,19 @@ func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
 }
 
 // close runs trigger B — the cluster-wide pin ratio — then
-// reconciles the emitted-gauge ledger.
+// reconciles the emitted-gauge ledger. On a failed census it carries
+// every held tuple forward instead: nothing was evaluated, so no
+// series may be pruned on this sweep's empty evidence.
 func (s *siteSkewSweep) close() {
+	if !s.censusOK {
+		for k, lv := range s.watch.emitted.Last() {
+			s.rep.Carry(k, lv)
+		}
+		s.rep.InfraErr(s.infraErr)
+		s.rep.Close(&s.watch.emitted,
+			statefulMasterSiteSkewGauge.DeleteLabelValues)
+		return
+	}
 	// stateful-split-brain(ii) trigger B — the pin is cluster-wide when >=80% of
 	// evaluated stateful masters live in the standby zone (every
 	// resolved endpoint lanit, none datahub). Flag every pinned

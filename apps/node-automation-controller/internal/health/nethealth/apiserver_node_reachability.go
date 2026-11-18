@@ -156,15 +156,23 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 		}
 		candidates = append(candidates, *n)
 	}
+	// Probe and untaint BEFORE any early return. Recovery is
+	// bookkeeping against a LIVE probe answer, not a speculative
+	// heal — a fenced node whose proxy path answers again must be
+	// unfenced even on a mesh-wide blip (the old order stranded it
+	// with the taint until the majority cleared) or when the lease
+	// census fails. probeAll on an empty candidate set is a cheap
+	// no-op, so the no-worker early return below stays honest.
+	dark := c.probeAll(ctx, candidates)
+	var rep probefw.SweepReport
+	c.untaintRecovered(ctx, &rep, nodes, dark)
+
 	if len(candidates) == 0 {
 		c.seen.Prune(func(string) bool { return false })
-		var rep probefw.SweepReport
 		return rep.Result(&c.emitted,
 			apiserverNodeDarkGauge.DeleteLabelValues,
 			"apiserver-dark nodes: ", ", ")
 	}
-
-	dark := c.probeAll(ctx, candidates)
 
 	// Lease gate: only a FRESH kube-node-lease proves the kubelet is
 	// alive while its proxy path fails — the apiserver-dark signature.
@@ -209,7 +217,6 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 	// observation.
 	c.seen.Prune(func(k string) bool { return darkCandidates[k] })
 
-	var rep probefw.SweepReport
 	persistedDark := map[string]bool{}
 	for name := range darkCandidates {
 		if !probefw.Persisted(&c.seen, name, now, darkMinAge, log) {
@@ -226,19 +233,34 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 	// partition-pod-evictor majority-abort posture). Counts only
 	// fresh-lease candidates: a mass dead-kubelet event is the
 	// reaper's incident, not a reason to suppress a real dark node
-	// sharing the sweep.
-	if len(candidates) > 1 && len(darkCandidates)*2 >= len(candidates) {
+	// sharing the sweep. A SINGLE worker is also exempted from
+	// fencing: with nothing to compare against, an apiserver-proxy
+	// failure cannot be distinguished from an apiserver/mesh fault,
+	// and fencing the only worker would evacuate its webhook
+	// backends with no reachable node to reschedule onto. Fail
+	// closed — report the finding, take no action.
+	//
+	// The guard is purely a suppression of FENCING, so it must only
+	// fire when there is something to suppress: with zero dark
+	// candidates (e.g. a one-worker cluster whose lone worker is
+	// healthy) an unconditional `len(candidates) <= 1` branch emits a
+	// bogus "apiserver-dark on 0/1 workers" finding and pins the
+	// kuberhealthy_check at FAIL=1 forever. No dark candidate means
+	// no finding and no action — the sweep passes cleanly.
+	if len(darkCandidates) > 0 &&
+		(len(candidates) <= 1 || len(darkCandidates)*2 >= len(candidates)) {
 		rep.Find(fmt.Sprintf("apiserver-dark on %d/%d workers (fresh lease) — "+
-			"mesh-wide fault, no fencing", len(darkCandidates), len(candidates)))
+			"mesh-wide fault or single-worker cluster, no fencing",
+			len(darkCandidates), len(candidates)))
 		return rep.Result(&c.emitted, apiserverNodeDarkGauge.DeleteLabelValues,
 			"apiserver-dark nodes: ", ", ")
 	}
 
-	// Fencing: taint persisted-dark nodes; untaint fenced nodes whose
-	// probe recovered this sweep. Untaint runs off the LIVE probe
-	// result, not the ledger — one healthy answer is reachability
-	// proof, and holding the fence on a recovered node only extends
-	// the outage's scheduling damage.
+	// Fencing: taint persisted-dark nodes. Untaint of recovered
+	// nodes already ran above, before every early return — a tainted
+	// node whose probe answered is gone from the live census view
+	// by the time this loop runs, so the `hasTaint && wasDark`
+	// branch below is the only fence source that survives here.
 	fencedDark := map[string]bool{}
 	for i := range nodes {
 		n := &nodes[i]
@@ -247,77 +269,67 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 		}
 		hasTaint := kube.HasTaint(n.Spec.Taints, kube.TaintApiserverUnreachable)
 		_, wasDark := dark[n.Name]
-		if persistedDark[n.Name] && hasTaint {
-			fencedDark[n.Name] = true
+		if hasTaint {
+			// Keep the fence state for the evacuation pass. The
+			// in-RAM seen ledger is EMPTY after a controller
+			// restart, so persistedDark cannot carry a node that
+			// was fenced before the restart — the taint plus a
+			// still-failing probe is the durable proof. Without
+			// this, webhook backends on a still-dark, still-fenced
+			// node would stop being evacuated for a full
+			// darkMinAge after every restart.
+			if wasDark {
+				fencedDark[n.Name] = true
+			}
+			continue
 		}
-		if persistedDark[n.Name] && !hasTaint {
-			// Taint/untaint are scheduling mutations — same heal
-			// contract as the pod deletes below. HealAllowedOnNode
-			// runs FIRST (cooldown → node-scoped mutex → fleet
-			// budget): a cluster-wide hold or a drain naming THIS
-			// node must defer before the per-target circuit is
-			// consulted, while a drain scoped to a different node
-			// does not — or every held sweep would burn breaker
-			// credit on a fence it could never deliver.
-			proceed, unverifiable := c.HealAllowedOnNode(ctx, log, &c.Heals,
-				CheckNameApiserverNodeReachability+"/fence/"+n.Name,
-				n.Name, darkHealCool, now)
-			if unverifiable {
-				rep.InfraErr(fmt.Errorf(
-					"maintenance verdict unverifiable — fence %s deferred", n.Name))
-				continue
-			}
-			if !proceed {
-				log.Info("heal gate deferred apiserver-dark fence",
-					"node", n.Name)
-				continue
-			}
-			if allowed, reason := heal.TryAcquireTarget(
-				CheckNameApiserverNodeReachability, n.Name, now); !allowed {
-				// The budget grant HealAllowed spent buys a
-				// mutation — the circuit denial means none happens.
-				heal.RefundGrant(now)
-				log.Info("DEFER: heal target circuit open — fence skipped",
-					"node", n.Name, "reason", reason)
-				continue
-			}
-			if err := kube.TaintNode(ctx, c.Deps.CS, n.Name,
-				kube.TaintApiserverUnreachable, "true", corev1.TaintEffectNoSchedule); err != nil {
-				rep.InfraErr(fmt.Errorf("taint %s: %w", n.Name, err))
-				continue
-			}
-			fencedDark[n.Name] = true
-			// The mutation landed — stamp the fence cooldown so a
-			// restart (or the next sweep's HealAllowed) honors the
-			// window this grant already spent.
-			c.Heals.Stamp(CheckNameApiserverNodeReachability+"/fence/"+n.Name, now)
-			c.InvalidateNodes(ctx) // taint census is stale — next sweep must see it
-			rep.Find("ACTION: fenced apiserver-dark node " + n.Name)
-			log.Info("ACTION: fenced apiserver-dark node",
-				"node", n.Name, "taint", kube.TaintApiserverUnreachable)
-		} else if hasTaint && !wasDark {
-			// Recovery is not a mutation budget item: the LIVE probe
-			// just proved reachability, so the untaint is bookkeeping
-			// against evidence, not a speculative heal. Spending
-			// TryAcquireTarget/HealAllowed here burned breaker credit
-			// on healthy nodes — three recoveries inside an hour
-			// locked the target circuit for 2h with the fence still
-			// on. Untaint directly; RecordTargetHealthy then clears
-			// any residual breaker history the dark episode left.
-			if err := kube.UntaintNode(ctx, c.Deps.CS, n.Name,
-				kube.TaintApiserverUnreachable); err != nil {
-				rep.InfraErr(fmt.Errorf("untaint %s: %w", n.Name, err))
-				continue
-			}
-			heal.RecordTargetHealthy(CheckNameApiserverNodeReachability, n.Name)
-			c.InvalidateNodes(ctx) // untaint census is stale too
-			// Recovery is NOT an action finding — rep.Find would
-			// report the sweep as flagged on the very sweep the
-			// node healed. Log only; the gauge already cleared via
-			// the emitted-ledger reconcile.
-			log.Info("unfenced recovered node",
-				"node", n.Name, "taint", kube.TaintApiserverUnreachable)
+		if !persistedDark[n.Name] {
+			continue
 		}
+		// Taint is a scheduling mutation — same heal contract as
+		// the pod deletes below. HealAllowedOnNode runs FIRST
+		// (cooldown → node-scoped mutex → fleet budget): a
+		// cluster-wide hold or a drain naming THIS node must defer
+		// before the per-target circuit is consulted, while a
+		// drain scoped to a different node does not — or every
+		// held sweep would burn breaker credit on a fence it
+		// could never deliver.
+		proceed, unverifiable := c.HealAllowedOnNode(ctx, log, &c.Heals,
+			CheckNameApiserverNodeReachability+"/fence/"+n.Name,
+			n.Name, darkHealCool, now)
+		if unverifiable {
+			rep.InfraErr(fmt.Errorf(
+				"maintenance verdict unverifiable — fence %s deferred", n.Name))
+			continue
+		}
+		if !proceed {
+			log.Info("heal gate deferred apiserver-dark fence",
+				"node", n.Name)
+			continue
+		}
+		if allowed, reason := heal.TryAcquireTarget(
+			CheckNameApiserverNodeReachability, n.Name, now); !allowed {
+			// The budget grant HealAllowed spent buys a
+			// mutation — the circuit denial means none happens.
+			heal.RefundGrant(now)
+			log.Info("DEFER: heal target circuit open — fence skipped",
+				"node", n.Name, "reason", reason)
+			continue
+		}
+		if err := kube.TaintNode(ctx, c.Deps.CS, n.Name,
+			kube.TaintApiserverUnreachable, "true", corev1.TaintEffectNoSchedule); err != nil {
+			rep.InfraErr(fmt.Errorf("taint %s: %w", n.Name, err))
+			continue
+		}
+		fencedDark[n.Name] = true
+		// The mutation landed — stamp the fence cooldown so a
+		// restart (or the next sweep's HealAllowed) honors the
+		// window this grant already spent.
+		c.Heals.Stamp(CheckNameApiserverNodeReachability+"/fence/"+n.Name, now)
+		c.InvalidateNodes(ctx) // taint census is stale — next sweep must see it
+		rep.Find("ACTION: fenced apiserver-dark node " + n.Name)
+		log.Info("ACTION: fenced apiserver-dark node",
+			"node", n.Name, "taint", kube.TaintApiserverUnreachable)
 	}
 
 	// Webhook-backend evacuation — only worth the census when at
@@ -329,6 +341,41 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 
 	return rep.Result(&c.emitted, apiserverNodeDarkGauge.DeleteLabelValues,
 		"apiserver-dark nodes: ", ", ")
+}
+
+// untaintRecovered lifts the apiserver-unreachable taint from every
+// fenced worker whose proxy probe answered THIS sweep. It deliberately
+// runs before the mesh-wide/single-worker early returns: recovery is
+// bookkeeping against live evidence, not a speculative heal, so a
+// recovered node must never stay stranded with a NoSchedule taint
+// until a fleet-wide blip clears (or a Lease LIST failure resolves).
+// It also skips the budget/target circuit — spending either here
+// burned breaker credit on healthy nodes, where three recoveries in
+// an hour locked the target circuit for 2h with the fence still on.
+func (c *apiserverNodeReachabilityCheck) untaintRecovered(ctx context.Context,
+	rep *probefw.SweepReport, nodes []corev1.Node, dark map[string]bool) {
+	for i := range nodes {
+		n := &nodes[i]
+		if kube.IsControlPlane(n) || !kube.NodeReady(n) {
+			continue
+		}
+		if !kube.HasTaint(n.Spec.Taints, kube.TaintApiserverUnreachable) ||
+			dark[n.Name] {
+			continue // no fence, or still dark — fence stands
+		}
+		if err := kube.UntaintNode(ctx, c.Deps.CS, n.Name,
+			kube.TaintApiserverUnreachable); err != nil {
+			rep.InfraErr(fmt.Errorf("untaint %s: %w", n.Name, err))
+			continue
+		}
+		heal.RecordTargetHealthy(CheckNameApiserverNodeReachability, n.Name)
+		c.InvalidateNodes(ctx) // untaint census is stale too
+		// Recovery is NOT an action finding — rep.Find would report
+		// the sweep as flagged on the very sweep the node healed.
+		// Log only; the gauge cleared via the emitted-ledger reconcile.
+		logf.FromContext(ctx).Info("unfenced recovered node",
+			"node", n.Name, "taint", kube.TaintApiserverUnreachable)
+	}
 }
 
 // probeAll runs the per-node healthz probe on a fixed worker pool —

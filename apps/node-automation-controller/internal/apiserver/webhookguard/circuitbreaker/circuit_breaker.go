@@ -211,7 +211,10 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	defer b.deadSince.Prune(func(k string) bool { return s.seen[k] })
 	defer b.recoverStreak.Prune(func(k string) bool { return s.recoverSeen[k] })
 	defer func() {
-		if !s.latency.queryError {
+		// RestoreOnly never queries metrics: an empty keep-set here
+		// would wipe the breach streaks and let a levered-off breaker
+		// trip immediately the moment it is re-enabled.
+		if allowTrips && !s.latency.queryError {
 			b.degradedSince.Prune(func(k string) bool { return s.latencySeen[k] })
 		}
 	}()
@@ -219,9 +222,15 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	if err := s.loadInputs(); err != nil {
 		return err
 	}
-	s.latency = b.queryLatencySignals(ctx, g)
-	if s.latency.queryError {
-		b.carryDegradedForward()
+	// RestoreOnly (kill-switch off) carries recoveries only — no new
+	// trips, no metric-derived holds or bounces. Querying here would
+	// re-arm latency holds on entries we are explicitly trying to
+	// release, so the whole signal stays dark in restore mode.
+	if allowTrips {
+		s.latency = b.queryLatencySignals(ctx, g)
+		if s.latency.queryError {
+			b.carryDegradedForward()
+		}
 	}
 	s.buildJobs()
 	s.runJobs(ctx)

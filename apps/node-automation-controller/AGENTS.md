@@ -95,21 +95,29 @@ byte-stable with the shell-operator alerts).
   whose collection order into `Deps.CheckRegs` IS the sweep order
   (ops contract — the check rows' relative order must not change).
   `apiserver/webhookguard` is the one module with subpackages —
-  `circuitbreaker`, `criticalns`, `guardstate`, `orphansweep`,
-  `unmeshed` are leaf duties the facade's single `Setup`/sweep
-  orchestrates (one registry row, `errors.Join` of the duty
-  errors). Check-side, domain packages split per product once a
-  family's checks are self-contained: `health/datastore/{nats,
-  scylla, percona, postgres, olm, pvc}` and
-  `health/nethealth/{cilium,gateway}` hold their checks + a mini
-  `harness_test.go` (own `harnessChecks` roster) behind the
+  `bootwebhooks`, `circuitbreaker`, `criticalns`, `guardstate`,
+  `orphansweep`, `timeoutclamp`, `unmeshed` are leaf duties the
+  facade's single `Setup`/sweep orchestrates (one registry row,
+  `errors.Join` of the duty errors). Check-side, the `health/`
+  domains split per product once a family is self-contained:
+  `health/datastore/{dragonfly,nats,percona,postgres,rabbitmq,scylla}`,
+  `health/gitops/olm`, `health/nethealth/{cilium,cloudflared,gateway,linkerd,liqo}`,
+  `health/storage/{localpv,pvc}`, `health/watchdogs/{leases,sprawl}`,
+  plus the direct `health/nodehealth` and `health/ported` domains;
+  `health/clusterhealthprobes` is the sweep module itself and
+  `health/probetest` is sanctioned test scaffolding shared across
+  sibling packages. Each product subpackage holds its checks + a
+  mini `harness_test.go` (own `harnessChecks` roster) behind the
   registry rows, while the parent package keeps the shared helpers
   (downscaler/site-skew/db-operator/masterless in datastore;
   config + tunnel/linkerd-guard/coredns/zone-starvation checks in
   nethealth); `health/nethealth/linkerd` is the oldest such
-  subpackage (the three linkerd checks + their shared markers
-  behind one facade with three `NewX` constructors — registry rows
-  point there, duty logic stays out of the nethealth root).
+  subpackage (the linkerd checks + their shared markers behind one
+  facade with `NewX` constructors — registry rows point there, duty
+  logic stays out of the nethealth root). The 32 Setup rows and 68
+  health `CheckReg` rows are pinned by `registry_test.go`,
+  `TestCheckRegSweepOrder` and the 68-row `fleetCheckRegs` roster
+  in `clusterhealthprobes`' tests.
   Cross-TREE topology identifiers (linkerd control-plane names,
   dragonfly operator namespace) live once, in
   `internal/platform/kube/domains.go` — the platform sharing layer
@@ -126,6 +134,10 @@ byte-stable with the shell-operator alerts).
   internal/registry` for GateEnv literals, `AllowRawOS: false` so
   raw `os.Getenv` sites land on RawReads and fail) and fails on
   undocumented knobs.
+- `internal/releaseglob` — test-only guard pinning the release
+  workflow's `paths:` globs to exactly the hostkit/jinja trees
+  `./cmd/...` actually imports (plus go.mod/go.sum) — a stale glob
+  would fire an empty release or skip one that shipped shared code.
 
 ## Layering (enforced by depguard in the root .golangci.yml)
 

@@ -23,9 +23,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -56,7 +57,40 @@ type tlsSecretMeta struct {
 	serialHex    string
 	notAfter     time.Time
 	creationTime time.Time
-	dnsName      string
+	// dnsName is kept for the probe's SNI (first SAN); dnsNames holds the
+	// full set so the port-serving Secret can be picked by SAN/CN match
+	// instead of "whichever Secret happens to be mounted first".
+	dnsName    string
+	dnsNames   []string
+	ipNames    []string
+	commonName string
+}
+
+// certIPStrings renders IP SANs into the same textual form the served
+// certificate's ip.String() match uses. Both TLS-Secret census paths
+// (Check B's reused list and the standalone fallback list) must fill
+// ipNames or an IP-only served cert can never find its Secret.
+func certIPStrings(ips []net.IP) []string {
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.String())
+	}
+	return out
+}
+
+// servesName reports whether this Secret's certificate was issued for
+// the probe's SNI name (or the bare Service name). Used to pick the
+// Secret that actually serves a port when a Pod mounts several.
+func (m tlsSecretMeta) servesName(svcName, serverName string) bool {
+	for _, n := range append([]string{m.commonName}, m.dnsNames...) {
+		if n == "" {
+			continue
+		}
+		if n == serverName || n == svcName || n == svcName+"." || strings.HasPrefix(n, svcName+".") {
+			return true
+		}
+	}
+	return false
 }
 
 type liveProbeTarget struct {
@@ -65,7 +99,19 @@ type liveProbeTarget struct {
 	ip         string
 	port       int32
 	serverName string
+	// isKnownRef proves an in-cluster TLS reference (webhook/CRD
+	// conversion/APIService) pins this Service. Only then may the audit
+	// assume a mounted Secret serves the port without a Subject/SAN match
+	// to the served certificate — a TLS-port-only hit must not fall back to
+	// mounted[0] (a Pod may mount a client mTLS Secret for an unrelated
+	// upstream and would be restarted every 2h).
+	isKnownRef bool
+	// secret is the SAN/CN-matched Secret serving this port (metric label
+	// + expiry comparison). secrets is every TLS Secret mounted into the
+	// Pod: a socket serial matching ANY of them means the workload is
+	// already serving a mounted cert, so no drift/rollout is warranted.
 	secret     tlsSecretMeta
+	secrets    []tlsSecretMeta
 	servedCert *x509.Certificate
 	probeErr   error
 }
@@ -80,6 +126,13 @@ var liveDriftSystemNamespaces = map[string]bool{
 	"linkerd":          true,
 	"linkerd-cni":      true,
 	"external-secrets": true,
+	// Operators/platform tenants whose TLS workloads are shared
+	// infrastructure: an automatic rollout there has a wide blast
+	// radius, so drift is still reported but the restart is skipped.
+	"k0s-system":        true,
+	"gatekeeper-system": true,
+	"metallb-system":    true,
+	"tigera-operator":   true,
 }
 
 var liveDriftDBQuorumLabels = []string{
@@ -89,9 +142,24 @@ var liveDriftDBQuorumLabels = []string{
 	"everest.percona.com/cluster",
 	"scylla.scylladb.com/cluster",
 	"apps.rabbitmq.com/cluster",
+	// Legacy/parallel operator labels seen on stateful DB workloads.
+	"postgresql.cnpg.io/cluster",
+	"operator.crunchydata.com/cluster",
+	// Keep parity with the watchdogs' DB-quorum label sets — restarting a
+	// member of one of these clusters can breach quorum.
+	"pxc.percona.com/cluster",
+	"psmdb.percona.com/cluster",
+	"dragonflydb.io/cluster",
+	"nats_cluster",
 }
 
 func defaultLiveCertProber(ctx context.Context, addr, serverName string) (*x509.Certificate, error) {
+	// NetDialer.Timeout bounds the TCP connect only — a server that
+	// accepts the socket and then stalls the TLS handshake would hold
+	// this goroutine (and a probe worker slot) forever. Bound the
+	// whole handshake, not just the connect.
+	pctx, cancel := context.WithTimeout(ctx, liveProbeTimeout)
+	defer cancel()
 	d := &tls.Dialer{
 		NetDialer: &net.Dialer{Timeout: liveProbeTimeout},
 		Config: &tls.Config{
@@ -99,7 +167,7 @@ func defaultLiveCertProber(ctx context.Context, addr, serverName string) (*x509.
 			InsecureSkipVerify: true, // serial comparison only — endpoint IP may lack SAN
 		},
 	}
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	conn, err := d.DialContext(pctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -125,9 +193,16 @@ func (a *certDriftAuditor) auditLiveSockets(ctx context.Context) error {
 		a.seenLiveDrift.Prune(metrics.TLSLiveSocketDrift.DeleteLabelValues)
 	}()
 
-	secrets, err := a.collectTLSSecretMeta(ctx)
-	if err != nil {
-		return fmt.Errorf("live socket audit secrets: %w", err)
+	var err error
+	secrets := a.cachedTLSSecretMeta()
+	// The census flag, not an empty map, decides whether Check B already
+	// ran this sweep: a cluster with no TLS Secrets is a valid (empty)
+	// census and must not trigger a second full Secret list every 15m.
+	if !a.liveRunSecretSet {
+		secrets, err = a.collectTLSSecretMeta(ctx)
+		if err != nil {
+			return fmt.Errorf("live socket audit secrets: %w", err)
+		}
 	}
 	if len(secrets) == 0 {
 		return nil
@@ -138,19 +213,35 @@ func (a *certDriftAuditor) auditLiveSockets(ctx context.Context) error {
 		return fmt.Errorf("live socket audit references: %w", err)
 	}
 
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Pods(a.cs, metav1.NamespaceAll))
+	// Stream the pod census page-by-page and retain only Ready pods that
+	// mount a TLS Secret. A cluster-wide ListAll here used to pull every
+	// Pod body (with all container/env/detail) into the operator's heap
+	// every 15m — the filtered map is the only thing the target builder
+	// needs.
+	podsByNSName := map[string]*corev1.Pod{}
+	podsByNS := map[string][]*corev1.Pod{}
+	err = kube.ListEach(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		kube.Pods(a.cs, metav1.NamespaceAll), func(page []corev1.Pod) error {
+			for i := range page {
+				// &page[i] would pin the whole ~500-Pod page (with every
+				// container/env payload) for the rest of the sweep. Keep a
+				// lean copy of just the Pod we retain and drop ManagedFields
+				// — the bulky field this audit never reads — so each page is
+				// collectable as soon as the callback returns.
+				cp := page[i]
+				cp.ManagedFields = nil
+				p := &cp
+				if p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning ||
+					!kube.PodReadyCond(p) || !podMountsTLSSecret(p, secrets) {
+					continue
+				}
+				podsByNSName[p.Namespace+"/"+p.Name] = p
+				podsByNS[p.Namespace] = append(podsByNS[p.Namespace], p)
+			}
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("live socket audit pods: %w", err)
-	}
-	podsByNSName := make(map[string]*corev1.Pod, len(pods))
-	podsByNS := map[string][]*corev1.Pod{}
-	for i := range pods {
-		p := &pods[i]
-		podsByNSName[p.Namespace+"/"+p.Name] = p
-		if p.DeletionTimestamp == nil && p.Status.Phase == corev1.PodRunning && kube.PodReadyCond(p) {
-			podsByNS[p.Namespace] = append(podsByNS[p.Namespace], p)
-		}
 	}
 
 	slices, err := kube.ListAll(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
@@ -190,7 +281,25 @@ func (a *certDriftAuditor) auditLiveSockets(ctx context.Context) error {
 			continue
 		}
 		servedSerial := t.servedCert.SerialNumber.Text(16)
-		if servedSerial == t.secret.serialHex {
+		// A Pod may mount several TLS Secrets (webhook + metrics +
+		// management). The socket serving one of them is in sync even
+		// when it is not the SAN-matched Secret for this port — paging
+		// a restart on the SAN match alone would bounce a healthy pod
+		// every 2h. Only an unknown serial is drift.
+		if anyMountedSecretServesSerial(t.secrets, servedSerial) {
+			continue
+		}
+		// The socket serves a serial no mounted Secret holds. Identify the
+		// port's Secret from the served certificate's Subject/SAN rather
+		// than a blind mounted[0]: a same-name cert with a new serial is
+		// real drift (Secret rotated, Pod still serves the old one).
+		if servedSecret, ok := matchServedSecret(t.secrets, t.servedCert); ok {
+			t.secret = servedSecret
+		} else if !t.isKnownRef {
+			// A TLS-port-only Service with no mounted Secret bearing the
+			// served identity gives no proof a mounted Secret serves this
+			// port — e.g. the Pod mounts a client mTLS Secret for an
+			// unrelated upstream. Never page/restart it on a guess.
 			continue
 		}
 		if !t.secret.creationTime.IsZero() && now.Sub(t.secret.creationTime) < liveSecretStableMinAge {
@@ -246,163 +355,184 @@ func (a *certDriftAuditor) collectTLSSecretMeta(ctx context.Context) (map[secret
 				notAfter:     cert.NotAfter,
 				creationTime: s.CreationTimestamp.Time,
 				dnsName:      dnsName,
+				dnsNames:     append([]string(nil), cert.DNSNames...),
+				ipNames:      certIPStrings(cert.IPAddresses),
+				commonName:   cert.Subject.CommonName,
 			}
 		}
 		return nil
 	})
+	if err == nil {
+		a.liveRunSecretMeta = out
+		a.liveRunSecretSet = true
+	}
 	return out, err
 }
 
-func (a *certDriftAuditor) collectReferencedTLSServices(ctx context.Context) (map[string]bool, error) {
-	refs := map[string]bool{}
+// cachedTLSSecretMeta returns the TLS-Secret census Check B built this
+// sweep. run() orders auditTLSSecrets before auditLiveSockets, so the
+// live-socket audit reuses it instead of listing all TLS Secrets a
+// second time. Unit tests that drive auditLiveSockets directly see an
+// empty cache and fall back to their own list.
+func (a *certDriftAuditor) cachedTLSSecretMeta() map[secretMetricKey]tlsSecretMeta {
+	if !a.liveRunSecretSet {
+		return nil
+	}
+	return a.liveRunSecretMeta
+}
+
+// collectReferencedTLSServices returns "namespace/name" → the port the
+// reference pins (0 = unspecified, fall back to the Service's TLS port).
+// Only the in-cluster clientConfig surfaces this operator can actually
+// READ are used: MWC/VWC, CRD conversion and APIService. Ingress and
+// HTTPRoute were deliberately dropped — NAC has no RBAC on ingresses
+// (a guaranteed 403 that tore down the whole 15m audit) and dialing a
+// proxy/L7 backend's Service port does not prove the origin's cert.
+func (a *certDriftAuditor) collectReferencedTLSServices(ctx context.Context) (map[string]int32, error) {
+	refs := map[string]int32{}
 	opts := metav1.ListOptions{Limit: kube.DefaultListPageSize}
+	log := logf.FromContext(ctx)
 
-	mwcs, err := kube.ListAll(ctx, opts, kube.MutatingWebhookConfigurations(a.cs))
-	if err != nil {
-		return nil, err
-	}
-	for i := range mwcs {
-		for j := range mwcs[i].Webhooks {
-			if svc := mwcs[i].Webhooks[j].ClientConfig.Service; svc != nil && svc.Namespace != "" && svc.Name != "" {
-				refs[svc.Namespace+"/"+svc.Name] = true
+	mwcs, vwcs, ok := a.cachedWebhookConfigs()
+	if ok {
+		addWebhookRefs(refs, mwcs, vwcs)
+	} else {
+		var err error
+		mwcs, err = kube.ListAll(ctx, opts, kube.MutatingWebhookConfigurations(a.cs))
+		if err != nil {
+			if apierrors.IsForbidden(err) {
+				log.Info("skip mutatingwebhookconfigurations: RBAC forbidden", "err", err)
+			} else {
+				return nil, err
+			}
+		} else {
+			for i := range mwcs {
+				addMutatingWebhookRefs(refs, mwcs[i].Webhooks)
 			}
 		}
-	}
-
-	vwcs, err := kube.ListAll(ctx, opts, kube.ValidatingWebhookConfigurations(a.cs))
-	if err != nil {
-		return nil, err
-	}
-	for i := range vwcs {
-		for j := range vwcs[i].Webhooks {
-			if svc := vwcs[i].Webhooks[j].ClientConfig.Service; svc != nil && svc.Namespace != "" && svc.Name != "" {
-				refs[svc.Namespace+"/"+svc.Name] = true
+		vwcs, err = kube.ListAll(ctx, opts, kube.ValidatingWebhookConfigurations(a.cs))
+		if err != nil {
+			if apierrors.IsForbidden(err) {
+				log.Info("skip validatingwebhookconfigurations: RBAC forbidden", "err", err)
+			} else {
+				return nil, err
+			}
+		} else {
+			for i := range vwcs {
+				addValidatingWebhookRefs(refs, vwcs[i].Webhooks)
 			}
 		}
-	}
-
-	ings, err := kube.ListAll(ctx, opts, func(c context.Context, lo metav1.ListOptions) ([]networkingv1.Ingress, string, error) {
-		l, listErr := a.cs.NetworkingV1().Ingresses(metav1.NamespaceAll).List(c, lo)
-		if listErr != nil {
-			return nil, "", listErr
-		}
-		return l.Items, l.Continue, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	for i := range ings {
-		collectIngressTLSServices(&ings[i], refs)
 	}
 
 	if a.dyn != nil {
-		for _, src := range []struct {
-			collect func(*unstructured.Unstructured, map[string]bool)
-			fn      kube.PageFunc[unstructured.Unstructured]
-		}{
-			{
-				collect: collectCRDConversionService,
-				fn:      kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)),
-			},
-			{
-				collect: collectAPIServiceRef,
-				fn:      kube.DynamicPage(a.dyn.Resource(kube.GVRAPIService)),
-			},
-			{
-				collect: collectHTTPRouteServices,
-				fn:      kube.DynamicPage(a.dyn.Resource(kube.GVRHTTPRoute)),
-			},
-		} {
-			listErr := kube.ListEach(ctx, opts, src.fn, func(page []unstructured.Unstructured) error {
+		// CRD conversion refs ride the same page read as Check A (which
+		// already scans full CRD schemas every sweep) — no second
+		// full-schema CRD list. The cache is only warm when run() called
+		// auditWebhookCABundles first; standalone unit tests fall back.
+		for key, port := range a.cachedCRDRefs() {
+			ns, name, ok := strings.Cut(key, "/")
+			if !ok {
+				continue
+			}
+			putRef(refs, ns, name, port)
+		}
+		if !a.crdRefsCached() {
+			listErr := kube.ListEach(ctx, opts,
+				kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)),
+				func(page []unstructured.Unstructured) error {
+					for i := range page {
+						collectCRDConversionService(&page[i], refs)
+					}
+					return nil
+				})
+			if listErr != nil && !kube.IsCRDAbsent(listErr) && !apierrors.IsForbidden(listErr) {
+				return nil, listErr
+			}
+		}
+		// APIService objects are tiny — reading them here is cheap.
+		listErr := kube.ListEach(ctx, opts,
+			kube.DynamicPage(a.dyn.Resource(kube.GVRAPIService)),
+			func(page []unstructured.Unstructured) error {
 				for i := range page {
-					src.collect(&page[i], refs)
+					collectAPIServiceRef(&page[i], refs)
 				}
 				return nil
 			})
-			if listErr != nil && !kube.IsCRDAbsent(listErr) {
-				return nil, listErr
-			}
+		if listErr != nil && !kube.IsCRDAbsent(listErr) && !apierrors.IsForbidden(listErr) {
+			return nil, listErr
 		}
 	}
 	return refs, nil
 }
 
-func collectIngressTLSServices(ing *networkingv1.Ingress, refs map[string]bool) {
-	if len(ing.Spec.TLS) == 0 {
+func putRef(refs map[string]int32, ns, name string, port int32) {
+	if ns == "" || name == "" {
 		return
 	}
-	if ing.Spec.DefaultBackend != nil && ing.Spec.DefaultBackend.Service != nil {
-		if name := ing.Spec.DefaultBackend.Service.Name; name != "" {
-			refs[ing.Namespace+"/"+name] = true
-		}
-	}
-	for i := range ing.Spec.Rules {
-		http := ing.Spec.Rules[i].HTTP
-		if http == nil {
-			continue
-		}
-		for j := range http.Paths {
-			if http.Paths[j].Backend.Service != nil && http.Paths[j].Backend.Service.Name != "" {
-				refs[ing.Namespace+"/"+http.Paths[j].Backend.Service.Name] = true
-			}
-		}
+	key := ns + "/" + name
+	if prev, exists := refs[key]; !exists || (prev == 0 && port > 0) {
+		refs[key] = port
 	}
 }
 
-func collectCRDConversionService(u *unstructured.Unstructured, refs map[string]bool) {
+func addWebhookRefs(refs map[string]int32,
+	mwcs []admissionv1.MutatingWebhookConfiguration,
+	vwcs []admissionv1.ValidatingWebhookConfiguration) {
+	for i := range mwcs {
+		addMutatingWebhookRefs(refs, mwcs[i].Webhooks)
+	}
+	for i := range vwcs {
+		addValidatingWebhookRefs(refs, vwcs[i].Webhooks)
+	}
+}
+
+func addMutatingWebhookRefs(refs map[string]int32, ws []admissionv1.MutatingWebhook) {
+	for i := range ws {
+		addWebhookServiceRef(refs, ws[i].ClientConfig.Service)
+	}
+}
+
+func addValidatingWebhookRefs(refs map[string]int32, ws []admissionv1.ValidatingWebhook) {
+	for i := range ws {
+		addWebhookServiceRef(refs, ws[i].ClientConfig.Service)
+	}
+}
+
+func addWebhookServiceRef(refs map[string]int32, svc *admissionv1.ServiceReference) {
+	if svc == nil {
+		return
+	}
+	var port int32
+	if svc.Port != nil {
+		port = *svc.Port
+	}
+	putRef(refs, svc.Namespace, svc.Name, port)
+}
+
+func collectCRDConversionService(u *unstructured.Unstructured, refs map[string]int32) {
 	strategy, _ := kube.NestedString(u.Object, "spec", "conversion", "strategy")
 	if strategy != "Webhook" {
 		return
 	}
 	ns, _ := kube.NestedString(u.Object, "spec", "conversion", "webhook", "clientConfig", "service", "namespace")
 	name, _ := kube.NestedString(u.Object, "spec", "conversion", "webhook", "clientConfig", "service", "name")
-	if ns != "" && name != "" {
-		refs[ns+"/"+name] = true
-	}
+	port, _ := nestedInt32(u.Object, "spec", "conversion", "webhook", "clientConfig", "service", "port")
+	putRef(refs, ns, name, port)
 }
 
-func collectAPIServiceRef(u *unstructured.Unstructured, refs map[string]bool) {
+func collectAPIServiceRef(u *unstructured.Unstructured, refs map[string]int32) {
 	ns, _ := kube.NestedString(u.Object, "spec", "service", "namespace")
 	name, _ := kube.NestedString(u.Object, "spec", "service", "name")
-	if ns != "" && name != "" {
-		refs[ns+"/"+name] = true
-	}
+	port, _ := nestedInt32(u.Object, "spec", "service", "port")
+	putRef(refs, ns, name, port)
 }
 
-func collectHTTPRouteServices(u *unstructured.Unstructured, refs map[string]bool) {
-	rules, found, _ := unstructured.NestedSlice(u.Object, "spec", "rules")
-	if !found {
-		return
+func nestedInt32(obj map[string]any, fields ...string) (int32, bool) {
+	v, found, err := unstructured.NestedInt64(obj, fields...)
+	if err != nil || !found {
+		return 0, false
 	}
-	defaultNS := u.GetNamespace()
-	for _, r := range rules {
-		rm, ok := r.(map[string]any)
-		if !ok {
-			continue
-		}
-		brefs, _ := rm["backendRefs"].([]any)
-		for _, b := range brefs {
-			bm, ok := b.(map[string]any)
-			if !ok {
-				continue
-			}
-			kind, _ := bm["kind"].(string)
-			if kind != "" && kind != "Service" {
-				continue
-			}
-			name, _ := bm["name"].(string)
-			if name == "" {
-				continue
-			}
-			ns, _ := bm["namespace"].(string)
-			if ns == "" {
-				ns = defaultNS
-			}
-			if ns != "" {
-				refs[ns+"/"+name] = true
-			}
-		}
-	}
+	return int32(v), true
 }
 
 type endpointAddr struct {
@@ -437,7 +567,7 @@ func buildReadyEndpointsMap(slices []discoveryv1.EndpointSlice) map[string][]end
 	return out
 }
 
-func buildProbeTarget(svc *corev1.Service, knownTLSSvcs map[string]bool,
+func buildProbeTarget(svc *corev1.Service, knownTLSSvcs map[string]int32,
 	secrets map[secretMetricKey]tlsSecretMeta, podsByNSName map[string]*corev1.Pod,
 	podsByNS map[string][]*corev1.Pod, epBySvc map[string][]endpointAddr) (liveProbeTarget, bool) {
 
@@ -445,7 +575,7 @@ func buildProbeTarget(svc *corev1.Service, knownTLSSvcs map[string]bool,
 		return liveProbeTarget{}, false
 	}
 	svcKey := svc.Namespace + "/" + svc.Name
-	isKnownRef := knownTLSSvcs[svcKey]
+	pinnedPort, isKnownRef := knownTLSSvcs[svcKey]
 
 	var matchedPod *corev1.Pod
 	var ip string
@@ -473,12 +603,19 @@ func buildProbeTarget(svc *corev1.Service, knownTLSSvcs map[string]bool,
 		return liveProbeTarget{}, false
 	}
 
-	secret, hasSecret := firstMountedTLSSecret(matchedPod, secrets)
-	if !hasSecret {
+	mounted := mountedTLSSecrets(matchedPod, secrets)
+	if len(mounted) == 0 {
 		return liveProbeTarget{}, false
 	}
 
 	port, isTLSPort := resolveServiceTLSPort(svc, matchedPod)
+	// A ServiceReference.Port is a SERVICE port; the probe dials the
+	// endpoint (pod IP), so it must be translated through targetPort.
+	if pinnedPort > 0 {
+		if translated, ok := resolvePinnedServicePort(svc, matchedPod, pinnedPort); ok {
+			port, isTLSPort = translated, true
+		}
+	}
 	if !isKnownRef && !isTLSPort {
 		return liveProbeTarget{}, false
 	}
@@ -488,9 +625,17 @@ func buildProbeTarget(svc *corev1.Service, knownTLSSvcs map[string]bool,
 			port = svc.Spec.Ports[0].TargetPort.IntVal
 		}
 	}
-	serverName := secret.dnsName
-	if serverName == "" {
-		serverName = svc.Name + "." + svc.Namespace + ".svc"
+	serverName := svc.Name + "." + svc.Namespace + ".svc"
+	// pickServingSecret reports only a real SAN/CN match. The blind
+	// mounted[0] fallback is confined to known TLS references: for a
+	// TLS-port-only Service we cannot prove a mounted Secret serves the
+	// port, so the audit loop re-resolves it from the served certificate.
+	secret, nameMatched := pickServingSecret(mounted, svc.Name, serverName)
+	if isKnownRef && !nameMatched {
+		secret = mounted[0]
+	}
+	if secret.dnsName != "" {
+		serverName = secret.dnsName
 	}
 	return liveProbeTarget{
 		svc:        *svc,
@@ -498,7 +643,9 @@ func buildProbeTarget(svc *corev1.Service, knownTLSSvcs map[string]bool,
 		ip:         ip,
 		port:       port,
 		serverName: serverName,
+		isKnownRef: isKnownRef,
 		secret:     secret,
+		secrets:    mounted,
 	}, true
 }
 
@@ -511,26 +658,145 @@ func selectorMatches(sel, labels map[string]string) bool {
 	return true
 }
 
-func firstMountedTLSSecret(pod *corev1.Pod, secrets map[secretMetricKey]tlsSecretMeta) (tlsSecretMeta, bool) {
+// resolvePinnedServicePort translates a ServiceReference.Service.Port
+// (the Service-side port) into the container port the endpoint listens
+// on. Without this the audit dials podIP:<servicePort> and reports a
+// false TLS drift for every webhook whose targetPort differs.
+func resolvePinnedServicePort(svc *corev1.Service, pod *corev1.Pod, port int32) (int32, bool) {
+	for i := range svc.Spec.Ports {
+		if svc.Spec.Ports[i].Port == port {
+			return resolveContainerPort(&svc.Spec.Ports[i], pod), true
+		}
+	}
+	return 0, false
+}
+
+// podTLSSecretNames lists every Secret source referenced by the Pod's
+// volumes (direct or projected). Volumes are shared by the app and init
+// containers; the explicit InitContainers pass also resolves a TLS
+// Secret an init sidecar mounts by name, so a cert staged before the main
+// container starts is never missed by the live-socket census.
+func podTLSSecretNames(pod *corev1.Pod) []string {
+	var out []string
+	secretByVolume := map[string]string{}
+	addSecret := func(name string) {
+		if name != "" {
+			out = append(out, name)
+		}
+	}
 	for i := range pod.Spec.Volumes {
 		v := &pod.Spec.Volumes[i]
 		if v.Secret != nil {
-			if meta, ok := secrets[secretMetricKey{pod.Namespace, v.Secret.SecretName}]; ok {
-				return meta, true
-			}
+			addSecret(v.Secret.SecretName)
+			secretByVolume[v.Name] = v.Secret.SecretName
 		}
 		if v.Projected != nil {
 			for j := range v.Projected.Sources {
-				src := &v.Projected.Sources[j]
-				if src.Secret != nil {
-					if meta, ok := secrets[secretMetricKey{pod.Namespace, src.Secret.Name}]; ok {
-						return meta, true
-					}
+				if src := v.Projected.Sources[j].Secret; src != nil {
+					addSecret(src.Name)
+					secretByVolume[v.Name] = src.Name
 				}
 			}
 		}
 	}
+	for i := range pod.Spec.InitContainers {
+		for j := range pod.Spec.InitContainers[i].VolumeMounts {
+			if name, ok := secretByVolume[pod.Spec.InitContainers[i].VolumeMounts[j].Name]; ok {
+				addSecret(name)
+			}
+		}
+	}
+	return out
+}
+
+// mountedTLSSecrets is the multi-Secret successor to
+// firstMountedTLSSecret: it returns every TLS Secret mounted (directly
+// or via a projected volume) into the Pod, not just the first one.
+func mountedTLSSecrets(pod *corev1.Pod, secrets map[secretMetricKey]tlsSecretMeta) []tlsSecretMeta {
+	var out []tlsSecretMeta
+	seen := map[string]bool{}
+	for _, name := range podTLSSecretNames(pod) {
+		if seen[name] {
+			continue
+		}
+		if meta, ok := secrets[secretMetricKey{pod.Namespace, name}]; ok {
+			seen[name] = true
+			out = append(out, meta)
+		}
+	}
+	return out
+}
+
+func podMountsTLSSecret(pod *corev1.Pod, secrets map[secretMetricKey]tlsSecretMeta) bool {
+	for _, name := range podTLSSecretNames(pod) {
+		if _, ok := secrets[secretMetricKey{pod.Namespace, name}]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// pickServingSecret selects the mounted Secret whose Subject/SAN names
+// the Service. It never guesses: a Pod that mounts only a client mTLS
+// Secret for an unrelated upstream must not be assumed to serve it.
+// The bool distinguishes a real match from "no Secret named this port".
+func pickServingSecret(mounted []tlsSecretMeta, svcName, serverName string) (tlsSecretMeta, bool) {
+	for _, m := range mounted {
+		if m.servesName(svcName, serverName) {
+			return m, true
+		}
+	}
 	return tlsSecretMeta{}, false
+}
+
+// matchServedSecret identifies the mounted Secret that actually serves a
+// port by comparing the certificate presented on the socket with each
+// mounted Secret's Subject CN / DNS+IP SANs. A name match with a different
+// serial means the Secret rotated but the Pod still serves the old cert —
+// genuine drift. When no mounted Secret bears the served identity, a
+// TLS-port-only Service is skipped rather than restarted on a guess.
+func matchServedSecret(mounted []tlsSecretMeta, served *x509.Certificate) (tlsSecretMeta, bool) {
+	if served == nil {
+		return tlsSecretMeta{}, false
+	}
+	names := make(map[string]bool, len(served.DNSNames)+len(served.IPAddresses)+1)
+	if served.Subject.CommonName != "" {
+		names[served.Subject.CommonName] = true
+	}
+	for _, n := range served.DNSNames {
+		names[n] = true
+	}
+	for _, ip := range served.IPAddresses {
+		names[ip.String()] = true
+	}
+	for _, m := range mounted {
+		// An empty CN is NOT an identity — without the guard, a served
+		// cert with an empty SAN/CN set would match every mounted Secret
+		// that has no CN and restart the wrong workload.
+		if m.commonName != "" && names[m.commonName] {
+			return m, true
+		}
+		for _, n := range m.dnsNames {
+			if names[n] {
+				return m, true
+			}
+		}
+		for _, ip := range m.ipNames {
+			if names[ip] {
+				return m, true
+			}
+		}
+	}
+	return tlsSecretMeta{}, false
+}
+
+func anyMountedSecretServesSerial(mounted []tlsSecretMeta, serialHex string) bool {
+	for _, m := range mounted {
+		if m.serialHex == serialHex {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveServiceTLSPort(svc *corev1.Service, pod *corev1.Pod) (int32, bool) {
@@ -553,14 +819,33 @@ func resolveContainerPort(sp *corev1.ServicePort, pod *corev1.Pod) int32 {
 	}
 	if sp.TargetPort.Type == intstr.String && sp.TargetPort.StrVal != "" {
 		for i := range pod.Spec.Containers {
-			for j := range pod.Spec.Containers[i].Ports {
-				if pod.Spec.Containers[i].Ports[j].Name == sp.TargetPort.StrVal {
-					return pod.Spec.Containers[i].Ports[j].ContainerPort
-				}
+			if port := namedContainerPort(pod.Spec.Containers[i].Ports, sp.TargetPort.StrVal); port > 0 {
+				return port
+			}
+		}
+		// Native sidecars (restartPolicy: Always on an initContainer)
+		// live for the whole pod and may own the named targetPort —
+		// e.g. a service-mesh proxy terminating the Service traffic.
+		for i := range pod.Spec.InitContainers {
+			ic := &pod.Spec.InitContainers[i]
+			if ic.RestartPolicy == nil || *ic.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+				continue
+			}
+			if port := namedContainerPort(ic.Ports, sp.TargetPort.StrVal); port > 0 {
+				return port
 			}
 		}
 	}
 	return sp.Port
+}
+
+func namedContainerPort(ports []corev1.ContainerPort, name string) int32 {
+	for i := range ports {
+		if ports[i].Name == name {
+			return ports[i].ContainerPort
+		}
+	}
+	return 0
 }
 
 func runProbePool(ctx context.Context, prober liveCertProber, targets []liveProbeTarget) {
@@ -642,7 +927,7 @@ func (a *certDriftAuditor) maybeRolloutWorkload(ctx context.Context, log interfa
 			metrics.IncError(a.queue)
 			return
 		}
-		if dep.Annotations[kube.AnnoCertDriftReloadOptOut] == "true" {
+		if kube.EffectiveAnnos(ctx, dep)[kube.AnnoCertDriftReloadOptOut] == "true" {
 			return
 		}
 		obj = dep
@@ -658,7 +943,7 @@ func (a *certDriftAuditor) maybeRolloutWorkload(ctx context.Context, log interfa
 			metrics.IncError(a.queue)
 			return
 		}
-		if ds.Annotations[kube.AnnoCertDriftReloadOptOut] == "true" {
+		if kube.EffectiveAnnos(ctx, ds)[kube.AnnoCertDriftReloadOptOut] == "true" {
 			return
 		}
 		obj = ds
@@ -674,7 +959,7 @@ func (a *certDriftAuditor) maybeRolloutWorkload(ctx context.Context, log interfa
 			metrics.IncError(a.queue)
 			return
 		}
-		if sts.Annotations[kube.AnnoCertDriftReloadOptIn] != "true" {
+		if kube.EffectiveAnnos(ctx, sts)[kube.AnnoCertDriftReloadOptIn] != "true" {
 			return
 		}
 		obj = sts

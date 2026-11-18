@@ -112,7 +112,9 @@ func (s *deadNodeSweeper) pvClaims(ctx context.Context,
 // spec lost the claim), or ANY pod — whatever its controller —
 // bound to a PVC whose volume is RWO/RWOP (CloudNativePG Cluster
 // pods, bare DB pods, Jobs with claims: none are StatefulSet-owned
-// yet all hold single-writer disks). A list failure is an error —
+// yet all hold single-writer disks). Terminal (Succeeded/Failed) pods
+// are excluded — a completed Job pod has released its disk and must
+// not pin a dead node's fence forever. A list failure is an error —
 // the caller fails closed.
 func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName string,
 	vac *volumeAttachmentCache, pc *pvcCache, pvC *pvCache) (bool, error) {
@@ -161,6 +163,15 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 				if p.Spec.NodeName != nodeName {
 					continue
 				}
+				// Terminal pods are not holders: a completed/failed Job
+				// pod (or any Succeeded/Failed pod) no longer writes to
+				// its volume, so an RWO claim pinned to it on a
+				// confirmed-dead node must not veto fencing forever
+				// (wave3.2/stateful-holders). The VolumeAttachment census
+				// above still vetoes genuinely attached RWO volumes.
+				if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+					continue
+				}
 				for _, ref := range p.OwnerReferences {
 					if ref.Kind == "StatefulSet" {
 						stsPod = true
@@ -169,12 +180,14 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 				if stsPod {
 					continue
 				}
-				for _, vol := range p.Spec.Volumes {
-					claim := vol.PersistentVolumeClaim
-					if claim == nil {
-						continue
-					}
-					pvName, ok := claims[p.Namespace+"/"+claim.ClaimName]
+				// Walk BOTH pre-provisioned PVC volumes and generic
+				// ephemeral ones: an ephemeral volume materializes a
+				// PVC named <pod>-<volume> with the same single-writer
+				// contract, so resolving only vol.PersistentVolumeClaim
+				// would let a node holding an RWO ephemeral disk be
+				// force-detached (split-brain write corruption).
+				for _, claimName := range kube.PodClaimedPVCs(p) {
+					pvName, ok := claims[p.Namespace+"/"+claimName]
 					if !ok {
 						continue // unbound claim — no volume to split yet
 					}

@@ -235,7 +235,11 @@ func (p *coreDNSForwardSaturationCheck) boostCoreDNS(ctx context.Context,
 	// Staircase guard: never compound a previous saturation boost on top of
 	// an already-boosted replica count across consecutive boost windows.
 	base := current
-	if raw, ok := dep.Annotations["passiontech.dev/coredns-boost-base"]; ok {
+	// The patcher may have written a fresh base earlier in this same
+	// sweep — EffectiveAnno reads the overlay before the snapshot's
+	// own map, so a stale dep copy cannot compound a new boost on top
+	// of an already-boosted replica count.
+	if raw := kube.EffectiveAnno(ctx, dep, kube.AnnoCoreDNSBoostBase); raw != "" {
 		if parsed, err := strconv.ParseInt(raw, 10, 32); err == nil && parsed > 0 {
 			base = int32(parsed)
 		}
@@ -244,8 +248,8 @@ func (p *coreDNSForwardSaturationCheck) boostCoreDNS(ctx context.Context,
 	payload, err := json.Marshal(map[string]any{
 		"spec": map[string]any{"replicas": boosted},
 		"metadata": map[string]any{"annotations": map[string]any{
-			kube.AnnoCoreDNSBoostUntil:           until,
-			"passiontech.dev/coredns-boost-base": strconv.FormatInt(int64(base), 10),
+			kube.AnnoCoreDNSBoostUntil: until,
+			kube.AnnoCoreDNSBoostBase:  strconv.FormatInt(int64(base), 10),
 		}},
 	})
 	if err != nil {

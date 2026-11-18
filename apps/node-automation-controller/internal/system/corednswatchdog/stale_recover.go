@@ -23,15 +23,24 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
+// corednsLocalRemediationLease is the protocol's L1 self-heal lease —
+// the same 3m window heal.localRemediationHold uses for the agent's
+// LocalRemediationInProgress heartbeat.
+const corednsLocalRemediationLease = 3 * time.Minute
+
 // recover applies cooldown/storm-gate/watch-cache-wedge/
 // maintenance-mutex/rollout gates, then either rollout-restarts the
 // Deployment (whole fleet stale) or deletes only the stale pods, and
 // stamps the cooldown annotation. podUID maps pod name → the UID
 // the sweep's pod list saw — the deletes carry it as a UID
-// precondition. Hard API failures are returned so the wrapper
+// precondition. podNode carries the SAME census's Spec.NodeName:
+// heal.EvictPod's L1↔L3 local-remediation yield reads
+// pod.Spec.NodeName, so a synthetic pod built without it would
+// silently skip the yield and evict a pod whose node-host-agent is
+// mid self-heal. Hard API failures are returned so the wrapper
 // counts them.
 func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
-	podUID map[string]types.UID, nPods int) error {
+	podUID map[string]types.UID, podNode map[string]string, nPods int) error {
 	log := logf.FromContext(ctx)
 	deploy, err := w.cs.AppsV1().Deployments(corednsNS).Get(ctx, "coredns", metav1.GetOptions{})
 	if err != nil {
@@ -206,9 +215,16 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 				corednsCooldownS*time.Second, gateNow) {
 				continue
 			}
-			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-				Name: name, Namespace: corednsNS, UID: podUID[name],
-			}}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name, Namespace: corednsNS, UID: podUID[name],
+				},
+				// The node from the census makes the local-
+				// remediation hold inside heal.EvictPod effective:
+				// without Spec.NodeName it reads "unscheduled" and
+				// yields to nobody.
+				Spec: corev1.PodSpec{NodeName: podNode[name]},
+			}
 			evicted, refused, err := heal.EvictPod(ctx, w.cs, nil, "",
 				pod, w.now.Now())
 			switch {
@@ -280,6 +296,36 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 	return nil
 }
 
+// loopNodeRemediationHold reports whether the pod's node is inside a
+// node-host-agent L1 self-heal window. recoverLoopCrashPods uses a raw
+// UID-delete (the pause sandbox must go, which an Eviction cannot
+// guarantee), so it must perform the L1↔L3 yield itself — the hold
+// check inside heal.EvictPod is not on this path.
+func (w *coreDNSWatchdog) loopNodeRemediationHold(ctx context.Context, nodeName string) (bool, error) {
+	if nodeName == "" {
+		return false, nil // unscheduled — no agent to race
+	}
+	node, err := w.cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err // "cannot verify" fails closed
+	}
+	now := w.now.Now()
+	if until, ok := kube.ParseAnnoTime(
+		node.Annotations[nodecond.AnnoLocalRemediationUntil]); ok && until.After(now) {
+		return true, nil
+	}
+	if c := kube.NodeCondition(node,
+		corev1.NodeConditionType(nodecond.CondLocalRemediation)); c != nil &&
+		c.Status == corev1.ConditionTrue &&
+		kube.CondHeartbeatLive(c, corednsLocalRemediationLease, now) {
+		return true, nil
+	}
+	return false, nil
+}
+
 // recoverLoopCrashPods deletes CrashLoopBackOff CoreDNS pods stuck in
 // plugin/loop so kubelet recreates both the Pod and its pause sandbox with a
 // clean /etc/resolv.conf. Unlike recover(), it does NOT block when
@@ -287,9 +333,12 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 // desired Replicas); instead it requires Generation == ObservedGeneration,
 // UpdatedReplicas == Replicas, and >=1 Ready replica (unless ALL pods are stuck
 // in plugin/loop), plus the shared NotReady, watch-cache wedge, and heal.Gate
-// checks.
+// checks. The per-target cooldown and the non-convergent target breaker are
+// keyed by NODE ("loop-node/<nodeName>"): a delete gives the pod a fresh UID,
+// so a UID key never matched the replacement and the watchdog re-killed the
+// same node every minute.
 func (w *coreDNSWatchdog) recoverLoopCrashPods(ctx context.Context, loopPods []string,
-	podUID map[string]types.UID, totalPods int) error {
+	podUID map[string]types.UID, loopNode map[string]string, totalPods int) error {
 	log := logf.FromContext(ctx)
 	deploy, err := w.cs.AppsV1().Deployments(corednsNS).Get(ctx, "coredns", metav1.GetOptions{})
 	if err != nil {
@@ -341,23 +390,51 @@ func (w *coreDNSWatchdog) recoverLoopCrashPods(ctx context.Context, loopPods []s
 		return nil
 	}
 
+	// Fleet-wide cap: max(1, half the CoreDNS fleet). Without it a
+	// plugin/loop episode could delete every replica in one pass and
+	// blackhole DNS while the replacement pods are still starting.
+	evictCap := max(1, totalPods/2)
 	deleted := 0
 	var delErr error
+loopPods:
 	for _, name := range loopPods {
-		coolKey := string(podUID[name])
-		if coolKey == "" {
-			coolKey = name
+		if deleted >= evictCap {
+			log.Info("DEFER: per-pass plugin/loop delete cap reached — rest next sweep",
+				"cap", evictCap, "deleted", deleted, "remaining", len(loopPods)-deleted)
+			break
 		}
+		// Node-keyed, NOT UID-keyed: a delete recreates the pod with
+		// a new UID, so a UID stamp could never pace the next crash.
+		nodeName := loopNode[name]
+		coolKey := "loop-node/" + nodeName
 		if w.podHeals.CooledDown(coolKey, corednsCooldownS*time.Second, gateNow) {
 			continue
 		}
-		err := w.cs.CoreV1().Pods(corednsNS).Delete(ctx, name, kube.UIDDeleteOptions(podUID[name], metav1.DeletePropagationBackground))
-		if apierrors.IsNotFound(err) {
+		held, holdErr := w.loopNodeRemediationHold(ctx, nodeName)
+		if holdErr != nil {
+			delErr = fmt.Errorf("check L1 local remediation on node %s: %w", nodeName, holdErr)
+			break
+		}
+		if held {
+			log.Info("YIELD: node-host-agent local remediation in flight — loop pod delete deferred",
+				"pod", corednsNS+"/"+name, "node", nodeName)
 			continue
 		}
-		if err != nil {
+		if allowed, reason := heal.TryAcquireTarget(w.queue, coolKey, gateNow); !allowed {
+			log.Info("DEFER: loop heal target circuit open — pod delete skipped",
+				"pod", corednsNS+"/"+name, "node", nodeName, "reason", reason)
+			continue
+		}
+		err := w.cs.CoreV1().Pods(corednsNS).Delete(ctx, name, kube.UIDDeleteOptions(podUID[name], metav1.DeletePropagationBackground))
+		switch {
+		case apierrors.IsNotFound(err), apierrors.IsConflict(err):
+			// Already gone, or a concurrent controller changed the
+			// object between our census and the preconditioned
+			// delete. Both are benign races, not heal failures.
+			continue
+		case err != nil:
 			delErr = fmt.Errorf("delete loop-crashing coredns pod %s/%s: %w", corednsNS, name, err)
-			break
+			break loopPods
 		}
 		deleted++
 		w.podHeals.Stamp(coolKey, gateNow)

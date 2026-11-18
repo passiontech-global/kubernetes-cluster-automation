@@ -13,19 +13,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -1149,4 +1153,74 @@ func TestLinkerdIssuerRolloutHonorsPersistedCooldown(t *testing.T) {
 			t.Fatalf("persisted stamp stale: %v", stamp)
 		}
 	})
+}
+
+// A cluster without linkerd-identity (not installed, or a reinstall
+// gap) has no rollout target: a rotated issuer is tolerated with no
+// queue error and the new fingerprint stays unlatched for the next
+// sweep (wave3.2/issuer-404).
+func TestLinkerdIssuerRolloutAbsentDeploymentTolerated(t *testing.T) {
+	fixedNow := time.Now()
+	cs := fake.NewSimpleClientset(issuerSecret(t))
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+	a.queue = "cert-drift-issuer-404-test"
+	if err := a.run(ctx); err != nil { // seed the fingerprint
+		t.Fatal(err)
+	}
+	seeded := a.linkerdIssuerSerial
+	rotateIssuer(t, cs)
+	before := testutil.QueueErrorCount(t, a.queue)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.QueueErrorCount(t, a.queue) - before; got != 0 {
+		t.Fatalf("queue errors on absent linkerd-identity = %v, want 0", got)
+	}
+	if a.linkerdIssuerSerial != seeded {
+		t.Fatal("fingerprint latched with no Deployment to roll")
+	}
+}
+
+// A 404 on the rollout Patch (Deployment deleted between Get and
+// Patch) is a clean race: no mutation landed, so the heal grant from
+// heal.Gate must be refunded and the fingerprint left unlatched
+// (wave3.2/issuer-404-refund).
+func TestLinkerdIssuerRolloutPatchNotFoundRefundsGrant(t *testing.T) {
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	fixedNow := time.Now()
+	cs := fake.NewSimpleClientset(issuerSecret(t), linkerdIdentityDeploy(nil))
+	a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+	a.queue = "cert-drift-issuer-refund-test"
+	if err := a.run(ctx); err != nil { // seed the fingerprint
+		t.Fatal(err)
+	}
+	seeded := a.linkerdIssuerSerial
+	rotateIssuer(t, cs)
+	cs.PrependReactor("patch", "deployments",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				schema.GroupResource{Group: "apps", Resource: "deployments"},
+				kube.LinkerdIdentityName)
+		})
+	before := testutil.QueueErrorCount(t, a.queue)
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.QueueErrorCount(t, a.queue) - before; got != 0 {
+		t.Fatalf("queue errors on raced 404 Patch = %v, want 0", got)
+	}
+	if a.linkerdIssuerSerial != seeded {
+		t.Fatal("fingerprint latched on a 404 Patch — the next sweep would skip the rollout")
+	}
+	if got := rolloutAnno(t, cs); got != "" {
+		t.Fatalf("restart stamped on a 404 Patch: %q", got)
+	}
+	proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(),
+		"after-issuer-404", fixedNow)
+	if !proceed || unverifiable {
+		t.Fatalf("Gate after raced 404 Patch = (%v,%v), want (true,false) — grant not refunded",
+			proceed, unverifiable)
+	}
 }

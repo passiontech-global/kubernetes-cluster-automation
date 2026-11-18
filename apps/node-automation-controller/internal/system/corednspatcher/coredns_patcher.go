@@ -60,7 +60,10 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -263,10 +266,13 @@ func corednsServeStale(raw string) string {
 
 // Reconcile delegates to the shared pinned-Deployment skeleton —
 // this module only supplies the kube-system/coredns identity, the
-// drift check and the patch body — then reconciles the Corefile's
-// negative-cache cap on the same requeue cadence (the ConfigMap is
-// not watched; the 15m requeue plus every Deployment reconcile is
-// fresh enough for a drift k0s only re-applies on stack changes).
+// drift check and the patch body — then clears the expired boost
+// stamp pair and reconciles the Corefile's negative-cache cap on
+// the same cadence (the ConfigMap is not watched; the requeue plus
+// every Deployment reconcile is fresh enough for a drift k0s only
+// re-applies on stack changes). While a saturation boost is live
+// the requeue is shortened to the stamp's exact expiry so the
+// surge is released on time.
 func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
 	// boostedReplicas carries the saturation boost from Drifted
 	// (which sees the Deployment and its AnnoCoreDNSBoostUntil
@@ -275,6 +281,11 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 	// the closures are rebuilt per Reconcile call, so the capture
 	// is per-reconcile state — never shared across keys.
 	var boostedReplicas int32
+	// boostUntil is the live deadline the same Drifted read observed;
+	// captured so the final result can requeue exactly at expiry
+	// instead of waiting for the fixed 15m safety net.
+	var boostUntil time.Time
+	now := time.Now()
 	res, err := pinnedworkload.DeploymentSpec{
 		CS:         r.cs,
 		Reader:     r.reader,
@@ -289,7 +300,11 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 		NoDriftLog: "probes/resources/topology/replicas already pinned - nothing to do",
 		Drifted: func(d *appsv1.Deployment, wantReplicas int32) bool {
 			boostedReplicas = corednsEffectiveReplicas(wantReplicas,
-				int32(r.boostReplicas), d, time.Now())
+				int32(r.boostReplicas), d, now)
+			if until, ok := kube.AnnoTime(d, kube.AnnoCoreDNSBoostUntil); ok &&
+				now.Before(until) {
+				boostUntil = until
+			}
 			return corednsNeedsPatch(d, r.zoneWhen, r.minDomains, boostedReplicas)
 		},
 		PatchBody: func(wantReplicas int32) ([]byte, error) {
@@ -302,8 +317,65 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 	if err != nil {
 		return res, err
 	}
+	// The stamp pair outlives the boost window. Clear BOTH keys once
+	// it lapses: the until stamp alone gates the replica surge, while
+	// base is the staircase guard's input for the NEXT window — a
+	// stale base would compound a new boost on top of a manually
+	// resized replica count.
+	if err := r.clearExpiredBoost(ctx, now); err != nil {
+		return res, err
+	}
+	// While a boost is live, requeue at the EARLIER of the stamp's
+	// expiry and the fixed 15m safety net. Replacing a 15m timer with
+	// a 30m expiry kept the cluster over-provisioned for 15m past the
+	// safety net; keeping the shorter value releases the surge at the
+	// right moment in both directions.
+	if !boostUntil.IsZero() {
+		if until := boostUntil.Sub(now); until > 0 &&
+			(res.RequeueAfter <= 0 || until < res.RequeueAfter) {
+			res.RequeueAfter = until
+		}
+	}
 	if err := r.reconcileCorefile(ctx); err != nil {
 		return ctrl.Result{}, err
 	}
 	return res, nil
+}
+
+// clearExpiredBoost deletes the boost-until + boost-base annotation
+// pair once the window has lapsed. Metadata-only merge patch: no spec
+// write, so it rides no maintenance mutex / heal budget (the replica
+// release itself is the skeleton's spec patch above). Both keys go in
+// one patch so a crash between them can never leave a half stamp.
+func (r *corednsPatcher) clearExpiredBoost(ctx context.Context, now time.Time) error {
+	dep, err := r.cs.AppsV1().Deployments("kube-system").
+		Get(ctx, "coredns", metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return nil // cluster without this k0s addon
+	case err != nil:
+		return fmt.Errorf("get coredns for boost stamp cleanup: %w", err)
+	}
+	raw, stamped := kube.EffectiveAnnos(ctx, dep)[kube.AnnoCoreDNSBoostUntil]
+	if !stamped || raw == "" {
+		return nil
+	}
+	until, ok := kube.ParseAnnoTime(raw)
+	if !ok || now.Before(until) {
+		return nil // unreadable stamp is treated as no stamp; live window stays
+	}
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		kube.AnnoCoreDNSBoostUntil: nil,
+		kube.AnnoCoreDNSBoostBase:  nil,
+	})
+	if err != nil {
+		return fmt.Errorf("render boost stamp cleanup patch: %w", err)
+	}
+	if _, err := r.cs.AppsV1().Deployments("kube-system").Patch(ctx,
+		"coredns", types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("clear expired coredns boost stamps: %w", err)
+	}
+	// Mirror the landed deletions without mutating a shared snapshot.
+	kube.RecordAnnoPatch(ctx, dep, payload)
+	return nil
 }

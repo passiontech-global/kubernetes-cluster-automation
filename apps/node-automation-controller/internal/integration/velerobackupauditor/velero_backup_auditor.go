@@ -51,6 +51,7 @@ import (
 	"fmt"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -144,21 +145,44 @@ const veleroRepoNotReadyMinAge = 30 * time.Minute
 // but is not delete-looped.
 const veleroRepoHealedCooldown = 2 * time.Hour
 
-// veleroList pages a full dynamic List through the shared page bound —
-// same contract as a raw .List but bounded per response (Velero and
-// Everest CRDs are cluster-scoped here, so every audit read is
-// cluster-wide). ResourceVersion "0" routes the read to the
-// apiserver's watch cache: these censuses are point-in-time audit
+// veleroListEach pages a full dynamic List through the shared page
+// bound and visits EVERY PAGE in the callback — it never accumulates
+// a whole []unstructured.Unstructured in RAM. Each caller keeps only
+// the derived state it actually audits (a per-schedule "latest" map,
+// a stuck-phase subset, a metric series), and the page's bodies die
+// with the page. Same read contract as a raw .List but bounded per
+// response (Velero and Everest CRDs are cluster-scoped here, so every
+// audit read is cluster-wide). ResourceVersion "0" routes the read to
+// the apiserver's watch cache: these censuses are point-in-time audit
 // snapshots, and under kube-apiserver-on-Kine every paged page was a
 // separate SQL round-trip — one cache-served response replaces them
 // (pageOpts strips the Limit companion on the wire).
-func (a *veleroBackupAuditor) veleroList(ctx context.Context,
-	gvr schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
-	return kube.ListAllUnstructured(ctx, a.dyn.Resource(gvr),
-		metav1.ListOptions{
-			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
-		})
+//
+// The walk is an explicit kube.ListEach rather than the ListAll
+// wrapper so the visit is a streaming callback and the one-shot 410
+// Gone restart (a Kine-compacted continue token) stays local to the
+// read. A restart may re-visit pages the callback already saw; every
+// visitor keys its emissions and stamps by object identity, so a
+// repeat re-asserts the same state rather than duplicating it (only
+// the log-only schedule count can be inflated).
+func (a *veleroBackupAuditor) veleroListEach(ctx context.Context,
+	gvr schema.GroupVersionResource,
+	visit func([]unstructured.Unstructured) error) error {
+	walk := func() error {
+		return kube.ListEach(ctx,
+			metav1.ListOptions{
+				Limit:           kube.DefaultListPageSize,
+				ResourceVersion: "0",
+			},
+			kube.DynamicPage(a.dyn.Resource(gvr)), visit)
+	}
+	err := walk()
+	if apierrors.IsResourceExpired(err) {
+		// The continue token's resourceVersion was compacted away
+		// mid-walk (Kine) — restart once from a fresh first page.
+		err = walk()
+	}
+	return err
 }
 
 // veleroMissingBackupMaxAge is the zero-backup-guard zero-backup threshold:
@@ -315,7 +339,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// Begin EVERY emitted-gauge ledger up front — not just the four
 	// this function prunes itself. The audit helpers Begin their own
 	// ledgers at their start, but an early return BELOW (a failed
-	// veleroObjects list, a BSL/repo audit error) can strand
+	// Backup/Schedule list, a BSL/repo audit error) can strand
 	// "current" emissions an aborted sweep left behind; resetting
 	// here means every ledger's next Prune rolls forward only what
 	// THIS sweep measured. Begin is idempotent — the per-audit
@@ -343,11 +367,18 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	cnpgErr := a.auditCNPGBackups(ctx)
 	dbErr := errors.Join(everestErr, cnpgErr)
 
-	schedules, backups, err := a.veleroObjects(ctx)
+	// Stream the Backup census once, keeping only the newest Backup
+	// per Schedule (for the rot checks) and the in-flight-phase subset
+	// (for the wedge audit) instead of a whole UnstructuredList.
+	latest, stuckBackups, err := a.collectBackups(ctx)
 	if err != nil {
 		return errors.Join(dbErr, err)
 	}
-	if schedules == nil {
+	present, scheduleCount, err := a.auditSchedules(ctx, latest, log)
+	if err != nil {
+		return errors.Join(dbErr, err)
+	}
+	if !present {
 		// Clusters without Velero have no CRDs — quiet skip, same
 		// contract as externalsecret-nudge. Every seen ledger still
 		// gets its prune BEFORE the early return: series emitted
@@ -373,9 +404,6 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		log.Info("skip: velero CRDs not installed")
 		return dbErr
 	}
-	latest := latestBackupsBySchedule(backups)
-
-	a.auditSchedules(ctx, schedules, latest, log)
 
 	// velero-bsl-audit + backup-health — the storage-side audits run
 	// after the schedule checks; a list failure short-circuits the
@@ -396,63 +424,53 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	// cooldown so decommissioned nodes' stamps cannot accumulate.
 	a.pvbHealed.PruneExpired(a.now.Now(), veleroPVBCleanupCooldown)
 	a.repoHealed.PruneExpired(a.now.Now(), veleroRepoHealedCooldown)
-	stuckErr := a.auditInFlightTransfers(ctx, backups)
+	stuckErr := a.auditInFlightTransfers(ctx, stuckBackups)
 	// cnpg-backup-audit — the data-mover half of the in-flight audit: mark-only
 	// scan of DataUpload/DataDownload wedges.
 	dmErr := a.auditDataMovement(ctx)
 
-	log.Info("sweep done", "schedules", len(schedules.Items),
+	log.Info("sweep done", "schedules", scheduleCount,
 		"paused", len(a.seenPaused.Last()), "badBackups", len(a.seenBad.Last()),
 		"bslUnavailable", len(a.seenBSL.Last()))
 	return errors.Join(dbErr, stuckErr, dmErr)
 }
 
-// veleroObjects lists the Velero Schedule and Backup objects the
-// schedule audits and the in-flight audit consume. A missing Velero
-// CRD set (no Velero installed) returns (nil, nil, nil) — the caller
-// logs the quiet skip and returns the already-collected db errors.
-// A missing Backups CRD while Schedules exist is tolerated (the
-// paused-schedule check still runs on an empty backup view); any
-// other list error aborts the sweep.
-func (a *veleroBackupAuditor) veleroObjects(ctx context.Context) (
-	*unstructured.UnstructuredList, *unstructured.UnstructuredList, error) {
-	schedules, err := a.veleroList(ctx, veleroScheduleGVR)
+// collectBackups streams the Backup census once, keeping ONLY the
+// derived state the rest of the sweep needs: the newest Backup per
+// owning Schedule (velero.io/schedule-name label, keyed "ns/name" —
+// manual backups without the label stay out) and the in-flight-phase
+// subset the wedge audit marks. Page bodies are DeepCopied before
+// being kept; everything else dies with its page, so a cluster with
+// thousands of old Backups no longer materializes them all in RAM.
+// A missing Backups CRD is tolerated — the paused-schedule check
+// still runs on an empty backup view; any other list error aborts.
+func (a *veleroBackupAuditor) collectBackups(ctx context.Context) (
+	map[string]*unstructured.Unstructured, []*unstructured.Unstructured, error) {
+	latest := map[string]*unstructured.Unstructured{}
+	stuck := []*unstructured.Unstructured{}
+	err := a.veleroListEach(ctx, veleroBackupGVR,
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				b := &page[i]
+				if sched := b.GetLabels()[veleroScheduleLabel]; sched != "" {
+					key := b.GetNamespace() + "/" + sched
+					cur, ok := latest[key]
+					if !ok ||
+						b.GetCreationTimestamp().After(cur.GetCreationTimestamp().Time) {
+						latest[key] = b.DeepCopy()
+					}
+				}
+				if phase, _ := kube.NestedString(b.Object, "status", "phase"); phase == "InProgress" || phase == "Deleting" {
+					stuck = append(stuck, b.DeepCopy())
+				}
+			}
+			return nil
+		})
+	if kube.IsCRDAbsent(err) {
+		return latest, stuck, nil
+	}
 	if err != nil {
-		if kube.IsCRDAbsent(err) {
-			return nil, nil, nil
-		}
-		return nil, nil, fmt.Errorf("list velero schedules: %w", err)
+		return nil, nil, fmt.Errorf("list velero backups: %w", err)
 	}
-	backups, err := a.veleroList(ctx, veleroBackupGVR)
-	if err != nil {
-		if kube.IsCRDAbsent(err) {
-			backups = nil // schedules exist but backups CRD absent — check 1 still runs
-		} else {
-			return nil, nil, fmt.Errorf("list velero backups: %w", err)
-		}
-	}
-	return schedules, backups, nil
-}
-
-// latestBackupsBySchedule indexes the newest Backup per owning
-// Schedule (velero.io/schedule-name label, keyed "ns/name") —
-// manual backups without the label stay out.
-func latestBackupsBySchedule(backups *unstructured.UnstructuredList) map[string]*unstructured.Unstructured {
-	out := map[string]*unstructured.Unstructured{}
-	if backups == nil {
-		return out
-	}
-	for i := range backups.Items {
-		b := &backups.Items[i]
-		sched := b.GetLabels()[veleroScheduleLabel]
-		if sched == "" {
-			continue
-		}
-		key := b.GetNamespace() + "/" + sched
-		cur, ok := out[key]
-		if !ok || b.GetCreationTimestamp().After(cur.GetCreationTimestamp().Time) {
-			out[key] = b
-		}
-	}
-	return out
+	return latest, stuck, nil
 }

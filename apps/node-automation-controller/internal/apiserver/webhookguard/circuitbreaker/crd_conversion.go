@@ -92,7 +92,7 @@ func (b *Breaker) SweepCRDConversionBackends(ctx context.Context,
 		return err
 	}
 
-	s.evalCRDs(ctx)
+	s.evalCRDs()
 
 	if !Enabled() {
 		// The shared ops lever silences pod kills module-wide —

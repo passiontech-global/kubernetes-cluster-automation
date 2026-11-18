@@ -84,11 +84,11 @@ func TestKonnectivityHalfOpenHealsPastWindow(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
-	if res := check.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx, check.Deps)); !res.Pass {
 		t.Fatalf("first sight is inside the window — must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res := check.Run(probetest.SweepCtx(ctx))
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if res.Pass {
 		t.Fatal("half-open tunnel past the window must FAIL")
 	}
@@ -126,9 +126,9 @@ func TestKonnectivityAllHalfOpenNeverHeals(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
-	_ = check.Run(probetest.SweepCtx(ctx))
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res := check.Run(probetest.SweepCtx(ctx))
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if res.Pass {
 		t.Fatal("all-agents half-open must still FAIL the check")
 	}
@@ -137,6 +137,63 @@ func TestKonnectivityAllHalfOpenNeverHeals(t *testing.T) {
 			Get(ctx, name, metav1.GetOptions{}); err != nil {
 			t.Fatalf("no healthy peer — %s must not be deleted: %v", name, err)
 		}
+	}
+}
+
+// The heal is capped per sweep AND keyed per node: three half-open
+// DaemonSet agents with one healthy peer lose at most two per sweep,
+// and a third agent on its own node is still healable on the next
+// sweep (a shared DaemonSet cooldown key would suppress it for 30m).
+func TestKonnectivityHealCapAndPerNodeCooldown(t *testing.T) {
+	base := time.Now()
+	srv := konnPromServer(t, map[string]float64{
+		"konnectivity-agent-a": 1,
+		"konnectivity-agent-b": 1,
+		"konnectivity-agent-d": 1,
+		"konnectivity-agent-c": 2, // the sole healthy peer
+	})
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		konnCPNode("cp-1"), konnCPNode("cp-2"),
+		konnAgentPod("konnectivity-agent-a", "w1"),
+		konnAgentPod("konnectivity-agent-b", "w2"),
+		konnAgentPod("konnectivity-agent-c", "w3"),
+		konnAgentPod("konnectivity-agent-d", "w4"),
+	}...)
+	p := konnProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
+
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
+
+	candidates := []string{"konnectivity-agent-a", "konnectivity-agent-b", "konnectivity-agent-d"}
+	deleted, leftover := 0, ""
+	for _, name := range candidates {
+		if _, err := cs.CoreV1().Pods("kube-system").
+			Get(ctx, name, metav1.GetOptions{}); err != nil {
+			deleted++
+		} else {
+			leftover = name
+		}
+	}
+	if deleted != konnHealCapPerSweep || leftover == "" {
+		t.Fatalf("first sweep deleted %d agents (leftover %q), want the cap of %d",
+			deleted, leftover, konnHealCapPerSweep)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").
+		Get(ctx, "konnectivity-agent-c", metav1.GetOptions{}); err != nil {
+		t.Fatalf("healthy peer must survive: %v", err)
+	}
+
+	// Next sweep is still inside the 30m cooldown of the two
+	// delivered deletes. The remaining agent is on a DIFFERENT node
+	// and must not inherit their per-node cooldown stamps.
+	probetest.FreezeNow(p.Deps, base.Add(12*time.Minute))
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if _, err := cs.CoreV1().Pods("kube-system").
+		Get(ctx, leftover, metav1.GetOptions{}); err == nil {
+		t.Fatalf("remaining agent %s must heal next sweep — per-node cooldown key", leftover)
 	}
 }
 
@@ -191,11 +248,11 @@ func TestKonnectivityHubSpokePeerMaxHeals(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
-	if res := check.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx, check.Deps)); !res.Pass {
 		t.Fatalf("first sight is inside the window — must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res := check.Run(probetest.SweepCtx(ctx))
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if res.Pass {
 		t.Fatal("hub-spoke half-open tunnel past the window must FAIL")
 	}
@@ -229,9 +286,9 @@ func TestKonnectivityHubSpokeAllZeroFiresGaugeNoHeal(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 
 	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
-	_ = check.Run(probetest.SweepCtx(ctx))
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	res := check.Run(probetest.SweepCtx(ctx))
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if res.Pass {
 		t.Fatal("all-agents-at-zero tunnel loss must FAIL — the gauge is the alerting contract")
 	}

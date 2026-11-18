@@ -189,10 +189,12 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"},
 	{Group: "gateway.networking.k8s.io", Version: "v1alpha2", Kind: "ReferenceGrant"},
 
-	// apiregistration + CSI snapshotter
+	// apiregistration + CSI snapshotter. The snapshot API group is
+	// snapshot.storage.k8s.io — keep in sync with kube.GVRVolumeSnapshot{,Content};
+	// snapshot.storage.kubernetes.io is only a finalizer-name prefix.
 	{Group: "apiregistration.k8s.io", Version: "v1", Kind: "APIService"},
-	{Group: "snapshot.storage.kubernetes.io", Version: "v1", Kind: "VolumeSnapshot"},
-	{Group: "snapshot.storage.kubernetes.io", Version: "v1", Kind: "VolumeSnapshotContent"},
+	{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshot"},
+	{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshotContent"},
 }
 
 // buildDynScheme assembles the scheme NewDynamicClient and DynScheme

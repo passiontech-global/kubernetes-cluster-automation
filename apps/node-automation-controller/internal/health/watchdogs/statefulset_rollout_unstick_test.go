@@ -101,7 +101,7 @@ func TestStatefulSetRolloutUnstickHealsWedgedPod(t *testing.T) {
 	cs, chk := stsUnstickFixture(t, now, sts, wedged)
 
 	// First sighting — inside the window, no verdict yet.
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if !res.Pass {
 		t.Fatalf("first sighting must not flag: %+v", res)
 	}
@@ -111,7 +111,7 @@ func TestStatefulSetRolloutUnstickHealsWedgedPod(t *testing.T) {
 
 	// Age past the 15m fuse.
 	probetest.FreezeNow(chk.Deps, now.Add(16*time.Minute))
-	res = chk.Run(probetest.SweepCtx(ctx))
+	res = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Pass {
 		t.Fatalf("aged wedge must flag: %+v", res)
 	}
@@ -136,7 +136,7 @@ func TestStatefulSetRolloutUnstickLeavesHealthyPods(t *testing.T) {
 	cs, chk := stsUnstickFixture(t, now, sts, pods...)
 	probetest.FreezeNow(chk.Deps, now.Add(time.Hour))
 
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if !res.Pass {
 		t.Fatalf("healthy roll must pass: %+v", res)
 	}
@@ -157,7 +157,7 @@ func TestStatefulSetRolloutUnstickIgnoresSettledSet(t *testing.T) {
 	cs, chk := stsUnstickFixture(t, now, sts, pod)
 	probetest.FreezeNow(chk.Deps, now.Add(time.Hour))
 
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if !res.Pass {
 		t.Fatalf("settled set must pass: %+v", res)
 	}
@@ -179,9 +179,9 @@ func TestStatefulSetRolloutUnstickHealsRollbackShape(t *testing.T) {
 	wedged := stsPod("app", "db", "db-0", "rev-v2", "CrashLoopBackOff", false)
 	cs, chk := stsUnstickFixture(t, now, sts, wedged)
 
-	chk.Run(probetest.SweepCtx(ctx)) // arm the 15m window
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps)) // arm the 15m window
 	probetest.FreezeNow(chk.Deps, now.Add(16*time.Minute))
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Pass {
 		t.Fatalf("rollback-shaped wedge must flag: %+v", res)
 	}
@@ -207,10 +207,10 @@ func TestStatefulSetRolloutUnstickRespectsPartition(t *testing.T) {
 		stsPod("app", "db", "db-2", "rev-old", "CrashLoopBackOff", false),
 	}
 	cs, chk := stsUnstickFixture(t, now, sts, pods...)
-	chk.Run(probetest.SweepCtx(ctx)) // arm the 15m window
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps)) // arm the 15m window
 	probetest.FreezeNow(chk.Deps, now.Add(time.Hour))
 
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Pass {
 		t.Fatalf("above-partition wedge must flag: %+v", res)
 	}
@@ -221,6 +221,55 @@ func TestStatefulSetRolloutUnstickRespectsPartition(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("app").Get(ctx, "db-2", metav1.GetOptions{}); err == nil {
 		t.Fatal("above-partition wedged pod was not deleted")
+	}
+}
+
+// An explicit replicas=0 skips the set entirely — no roll can be in
+// flight, even when a pod still carries a hard-error revision.
+func TestStatefulSetRolloutUnstickSkipsZeroReplicaSet(t *testing.T) {
+	now := time.Now()
+	sts := rollingSTS("app", "db")
+	sts.Spec.Replicas = ptr.To(int32(0))
+	wedged := stsPod("app", "db", "db-0", "rev-old", "CrashLoopBackOff", false)
+	cs, chk := stsUnstickFixture(t, now, sts, wedged)
+	probetest.FreezeNow(chk.Deps, now.Add(time.Hour))
+
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+		t.Fatalf("zero-replica StatefulSet must not flag: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("app").Get(ctx, "db-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("zero-replica StatefulSet pod was deleted: %v", err)
+	}
+}
+
+// The sort comparator must be a strict weak ordering: deciding the
+// parseable/unparseable split BEFORE the name tie-break keeps it
+// transitive even when an unparseable pod's name sorts between two
+// parseable ordinals ("db-0" < "db-aaa" < "db-5").
+func TestStatefulSetRolloutOrdinalComparatorIsStrictWeakOrdering(t *testing.T) {
+	a := stsPod("app", "db", "db-0", "rev-old", "", false)
+	b := stsPod("app", "db", "db-aaa", "rev-old", "", false) // unparseable ordinal
+	c := stsPod("app", "db", "db-5", "rev-old", "", false)
+	pods := []*corev1.Pod{a, b, c}
+	for i := range pods {
+		for j := range pods {
+			ab := stsPodOrdinalCompare("db", pods[i], pods[j])
+			ba := stsPodOrdinalCompare("db", pods[j], pods[i])
+			if (ab < 0) == (ba < 0) && i != j {
+				t.Fatalf("antisymmetry violated for %s vs %s: %d / %d",
+					pods[i].Name, pods[j].Name, ab, ba)
+			}
+			if (ab == 0) != (ba == 0) {
+				t.Fatalf("reflexivity violated for %s vs %s: %d / %d",
+					pods[i].Name, pods[j].Name, ab, ba)
+			}
+		}
+	}
+	// Highest parseable ordinal first; unparseable last.
+	if stsPodOrdinalCompare("db", c, a) >= 0 ||
+		stsPodOrdinalCompare("db", a, b) >= 0 ||
+		stsPodOrdinalCompare("db", c, b) >= 0 {
+		t.Fatal("expected c < a < b (highest ordinal first, unparseable last)")
 	}
 }
 
@@ -235,9 +284,9 @@ func TestStatefulSetRolloutUnstickReportOnly(t *testing.T) {
 	probetest.FreezeNow(d, now)
 	chk := &stsRolloutUnstickCheck{Deps: d, healEnabled: false}
 
-	chk.Run(probetest.SweepCtx(ctx))
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	probetest.FreezeNow(d, now.Add(16*time.Minute))
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Pass {
 		t.Fatalf("report-only wedge must still flag: %+v", res)
 	}

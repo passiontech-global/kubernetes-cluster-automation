@@ -105,10 +105,13 @@ func (p *dragonflyReplicaSyncStormCheck) Run(ctx context.Context) probefw.Result
 		for k, lv := range p.emitted.Last() {
 			rep.Carry(k, lv)
 		}
-		res := rep.Result(&p.emitted,
+		// Record the infra error BEFORE folding the verdict: setting
+		// Result.Infra afterwards left Pass=true (the report saw no
+		// findings and no InfraErr), so a dead Prometheus read as a
+		// healthy fleet downstream.
+		rep.InfraErr(err)
+		return rep.Result(&p.emitted,
 			dragonflyReplicaSyncStormGauge.DeleteLabelValues, "", ", ")
-		res.Infra = err
-		return res
 	}
 
 	// Evidence phase (dragonfly_sync_storm_signals.go): the primary

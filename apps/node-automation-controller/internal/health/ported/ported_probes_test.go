@@ -40,7 +40,7 @@ func chPod(ns, name string, phase corev1.PodPhase, age time.Duration) *corev1.Po
 func TestProbeDNS(t *testing.T) {
 	t.Setenv("HEALTH_DNS_HOSTNAMES", "svc-a.ns.svc,svc-b.ns.svc")
 	p := testProber(fake.NewSimpleClientset())
-	if res := probetest.MustCheck[*dnsStatusCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*dnsStatusCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("expected pass, got %+v", res)
 	}
 
@@ -51,7 +51,7 @@ func TestProbeDNS(t *testing.T) {
 		}
 		return []string{"10.0.0.1"}, nil
 	}
-	res := probetest.MustCheck[*dnsStatusCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*dnsStatusCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass || res.Infra != nil {
 		t.Fatalf("expected clean FAIL, got %+v", res)
 	}
@@ -74,13 +74,13 @@ func TestProbeHTTPContent(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("expected pass on 'Healthy' body, got %+v", res)
 	}
 
 	// Expected substring missing -> FAIL.
 	p.Cfg.HTTPContent.Expected = "Absolutely"
-	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("expected FAIL when body lacks the expected content")
 	}
 }
@@ -94,7 +94,7 @@ func TestProbeHTTPContentNon200(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset())
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
-	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("expected FAIL on non-200")
 	}
 }
@@ -112,7 +112,7 @@ func TestProbeHTTPContentBodyCapInconclusive(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset())
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
-	res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass || res.Why != "" || res.Infra == nil {
 		t.Fatalf("cap-filling body must read inconclusive, got %+v", res)
 	}
@@ -127,7 +127,7 @@ func TestProbeHTTPContentBodyCapInconclusive(t *testing.T) {
 	}))
 	t.Cleanup(srv2.Close)
 	p.Cfg.HTTPContent.URL = srv2.URL
-	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*httpContentCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("match within the capped window must pass, got %+v", res)
 	}
 }
@@ -150,7 +150,7 @@ func TestProbePodRestarts(t *testing.T) {
 			}},
 	}
 	p := testProber(fake.NewSimpleClientset(over))
-	if res := probetest.MustCheck[*podRestartsCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*podRestartsCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("expected FAIL on RestartCount 11 with a recent termination")
 	}
 
@@ -162,7 +162,7 @@ func TestProbePodRestarts(t *testing.T) {
 			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
 				Reason: "CrashLoopBackOff"}}},
 	}
-	if res := probetest.MustCheck[*podRestartsCheck](t, testProber(fake.NewSimpleClientset(waiting))).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*podRestartsCheck](t, testProber(fake.NewSimpleClientset(waiting))).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("expected FAIL on CrashLoopBackOff over threshold")
 	}
 
@@ -178,14 +178,14 @@ func TestProbePodRestarts(t *testing.T) {
 				},
 			}},
 	}
-	if res := probetest.MustCheck[*podRestartsCheck](t, testProber(fake.NewSimpleClientset(stale))).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*podRestartsCheck](t, testProber(fake.NewSimpleClientset(stale))).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatal("stale (>24h) termination must not FAIL the check")
 	}
 
 	// Boundary: exactly at the limit is still a pass.
 	over.Status.ContainerStatuses[0].RestartCount = 10
 	cs := fake.NewSimpleClientset(over)
-	if res := probetest.MustCheck[*podRestartsCheck](t, testProber(cs)).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*podRestartsCheck](t, testProber(cs)).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatal("RestartCount == max must pass")
 	}
 
@@ -200,7 +200,7 @@ func TestProbePodRestarts(t *testing.T) {
 				},
 			}},
 	}
-	if res := probetest.MustCheck[*podRestartsCheck](t, testProber(fake.NewSimpleClientset(init))).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*podRestartsCheck](t, testProber(fake.NewSimpleClientset(init))).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("expected FAIL on init-container restarts")
 	}
 }
@@ -212,21 +212,21 @@ func TestProbePodRestarts(t *testing.T) {
 func TestProbePodStatus(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset(
 		chPod("kube-system", "stuck", corev1.PodPending, 15*time.Minute)))
-	if res := probetest.MustCheck[*podStatusCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*podStatusCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("expected FAIL on old Pending pod")
 	}
 
 	// Younger than SKIP_DURATION -> ignored (image still pulling).
 	p = testProber(fake.NewSimpleClientset(
 		chPod("kube-system", "fresh", corev1.PodPending, 5*time.Minute)))
-	if res := probetest.MustCheck[*podStatusCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*podStatusCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatal("young Pending pod must be skipped")
 	}
 
 	for _, phase := range []corev1.PodPhase{corev1.PodFailed, corev1.PodUnknown} {
 		p = testProber(fake.NewSimpleClientset(
 			chPod("kube-system", "dead", phase, time.Hour)))
-		if res := probetest.MustCheck[*podStatusCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+		if res := probetest.MustCheck[*podStatusCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 			t.Fatalf("expected FAIL on phase %s", phase)
 		}
 	}
@@ -234,7 +234,7 @@ func TestProbePodStatus(t *testing.T) {
 	p = testProber(fake.NewSimpleClientset(
 		chPod("kube-system", "ok", corev1.PodRunning, time.Hour),
 		chPod("kube-system", "done", corev1.PodSucceeded, time.Hour)))
-	if res := probetest.MustCheck[*podStatusCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*podStatusCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatal("Running+Succeeded must pass")
 	}
 }
@@ -259,19 +259,19 @@ func quota(ns, name, used, hard string) *corev1.ResourceQuota {
 func TestProbeResourceQuota(t *testing.T) {
 	// 95% of hard -> FAIL.
 	p := testProber(fake.NewSimpleClientset(quota("a", "q", "950m", "1")))
-	if res := probetest.MustCheck[*resourceQuotaCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*resourceQuotaCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("expected FAIL at 0.95 used/hard")
 	}
 
 	// Boundary: exactly at threshold is a pass (only '>' fails).
 	p = testProber(fake.NewSimpleClientset(quota("a", "q", "900m", "1")))
-	if res := probetest.MustCheck[*resourceQuotaCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*resourceQuotaCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatal("used/hard == threshold must pass")
 	}
 
 	// No usage recorded -> used=0 -> pass.
 	p = testProber(fake.NewSimpleClientset(quota("a", "q", "", "1")))
-	if res := probetest.MustCheck[*resourceQuotaCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*resourceQuotaCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatal("absent Used entry must pass")
 	}
 }

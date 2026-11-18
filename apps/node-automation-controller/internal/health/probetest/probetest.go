@@ -104,8 +104,15 @@ func FreezeNow(d *probefw.Deps, base time.Time) {
 // its memo's last read is invisible until the post-sweep verify
 // re-checks every loaded memo (probefw.VerifySweepSnapshotUnmutated
 // — same panic contract).
-func SweepCtx(ctx context.Context) context.Context {
-	return probefw.WithSweepSnapshot(ctx)
+//
+// Callers pass the check's *probefw.Deps (d/p.Deps/chk.Deps): the
+// snapshot closes over the pointer, so every memo's fetchedAt stamp
+// reads the CURRENT clock — a FreezeNow before OR after install is
+// honored for the whole sweep. Deps is REQUIRED: without it the
+// snapshot would silently fall back to wall time and ignore every
+// frozen-clock fixture.
+func SweepCtx(ctx context.Context, d *probefw.Deps) context.Context {
+	return probefw.WithSweepSnapshot(ctx, d)
 }
 
 // VerifySweep is the post-Run half of the snapshot mutation guard:
@@ -115,7 +122,7 @@ func SweepCtx(ctx context.Context) context.Context {
 // after the memo's last read). Call it with the SAME ctx SweepCtx
 // returned, after the check's Run completes:
 //
-//	sctx := probetest.SweepCtx(ctx)
+//	sctx := probetest.SweepCtx(ctx, d)
 //	res := check.Run(sctx)
 //	probetest.VerifySweep(sctx)
 //

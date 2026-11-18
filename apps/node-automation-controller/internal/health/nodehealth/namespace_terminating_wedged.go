@@ -20,7 +20,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
@@ -60,13 +59,6 @@ const (
 	nsFinalizerSweepCooldown = 30 * time.Minute
 	nsFinalizerMaxStrips     = 20
 )
-
-// errSweepCapped stops a paged ListEach walk once the sweep hits
-// its strip cap — the visit error halts page fetching so the cap
-// lands before the next GVR's list, mirroring the pre-pagination
-// early return. Never surfaced: the capped flag distinguishes it
-// from a real fetch error.
-var errSweepCapped = errors.New("finalizer strip cap reached")
 
 var (
 	// namespace-terminating-wedged — namespace stuck Terminating.
@@ -185,8 +177,7 @@ func finalizerDomain(f string) (string, bool) {
 // pinned that way stays: only the dead owner's own cleanup marker is
 // provably safe to strip, everything else may belong to a different,
 // still-alive controller.
-func finalizerAttributedToOwner(f string,
-	obj *unstructured.Unstructured) bool {
+func finalizerAttributedToOwner(f string, obj metav1.Object) bool {
 
 	ref := metav1.GetControllerOf(obj)
 	if ref == nil || ref.Name == "" {
@@ -251,6 +242,12 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 			"namespace", nsName, "error", err)
 	}
 	stripped := 0
+	// attempted tracks whether a patch was actually SENT, not whether
+	// it landed. heal.RefundGrant's contract (see platform/heal/budget)
+	// is refund only when the pass delivered nothing AND attempted
+	// nothing — an attempted write that 409/404'd or failed is still
+	// a spent token, not a free retry.
+	attempted := false
 	for _, rl := range lists {
 		if rl == nil {
 			continue
@@ -272,71 +269,67 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 			}
 			gvr := schema.GroupVersionResource{
 				Group: gv.Group, Version: gv.Version, Resource: r.Name}
-			// Namespace-scoped PAGED LIST, not the sweep snapshot's
-			// cluster-wide AllUnstructured: the snapshot memoizes per
-			// GVR but the LIST itself still hauls EVERY namespace's
-			// objects of ~100-200 GVRs into memory just to filter one
-			// namespace client-side — the heap spike behind the
-			// 256Mi OOM incident. A namespaced list returns only this
-			// namespace's objects (usually a handful) and stays cheap
-			// even repeated per wedged namespace per cooldown; pages
-			// stream so even a single GVR gone wild cannot spike the
-			// heap the way an unpaginated LIST would.
-			capped := false
-			err := kube.ListEach(ctx,
-				metav1.ListOptions{Limit: kube.DefaultListPageSize},
-				kube.DynamicPage(p.Dyn.Resource(gvr).Namespace(nsName)),
-				func(items []unstructured.Unstructured) error {
-					for i := range items {
-						obj := &items[i]
-						if obj.GetDeletionTimestamp() == nil ||
-							len(obj.GetFinalizers()) == 0 {
-							continue
-						}
-						if p.maybeStripFinalizers(ctx, log, gvr, obj) {
-							stripped++
-							if stripped >= nsFinalizerMaxStrips {
-								capped = true
-								return errSweepCapped
-							}
-						}
-					}
-					return nil
-				})
-			if capped {
-				p.Heals.Stamp(ck, now)
-				log.Info("namespace finalizer sweep — strip cap reached",
-					"namespace", nsName, "stripped", stripped)
-				return
-			}
-			if err != nil {
-				// Forbidden (RBAC pending) and NoMatch (resource
-				// gone mid-sweep) are expected skips — everything
-				// else is a real list failure the sweep must not
-				// swallow into a silent "nothing to strip".
-				if apierrors.IsForbidden(err) || meta.IsNoMatchError(err) {
+			// Namespace-scoped METADATA LIST, not a full-object list:
+			// this sweep only reads ObjectMeta (deletion timestamp,
+			// finalizers, ownerRefs, RV) — the full spec/status of
+			// ~100-200 GVRs across every namespace was the heap spike
+			// behind the 256Mi OOM incident. ListPartialOrFallback
+			// prefers the metadata client and paginates to completion;
+			// nil-client / 406 / unregistered-scheme fall back to the
+			// typed or dynamic client, never on a real API failure.
+			items, lerr := kube.ListPartialOrFallback(ctx,
+				p.Meta, p.CS, p.Dyn, gvr, nsName,
+				metav1.ListOptions{Limit: kube.DefaultListPageSize})
+			if lerr != nil {
+				// Forbidden (RBAC pending), NotFound/NoMatch
+				// (resource gone mid-sweep) are expected skips —
+				// everything else is a real list failure the sweep
+				// must not swallow into a silent "nothing to strip".
+				if apierrors.IsForbidden(lerr) ||
+					apierrors.IsNotFound(lerr) ||
+					meta.IsNoMatchError(lerr) {
 					continue
 				}
 				metrics.IncError(p.Name)
 				log.Info("WARN: namespace finalizer sweep — resource list failed",
-					"namespace", nsName, "gvr", gvr.String(), "error", err)
+					"namespace", nsName, "gvr", gvr.String(), "error", lerr)
 				continue
+			}
+			for i := range items {
+				obj := &items[i]
+				if obj.GetDeletionTimestamp() == nil ||
+					len(obj.GetFinalizers()) == 0 {
+					continue
+				}
+				didStrip, didAttempt := p.maybeStripFinalizers(ctx, log, gvr, obj)
+				if didAttempt {
+					attempted = true
+				}
+				if !didStrip {
+					continue
+				}
+				stripped++
+				if stripped >= nsFinalizerMaxStrips {
+					p.Heals.Stamp(ck, now)
+					log.Info("namespace finalizer sweep — strip cap reached",
+						"namespace", nsName, "stripped", stripped)
+					return
+				}
 			}
 		}
 	}
 	// Cooldown stamps ONLY on delivered strips: a sweep that found
 	// nothing strippable must re-run next cycle — newly-wedged CRs
 	// appearing inside a blind 30m window would otherwise wait out
-	// the whole cooldown before the sweep looks again. The same
-	// split drives the grant: strips>0 means a mutation executed
-	// (grant legitimately spent); stripped==0 — every candidate
-	// clean, owner alive, patch refused or errored before landing —
-	// delivered nothing, so the gate's grant goes back.
+	// the whole cooldown before the sweep looks again. The grant
+	// follows the same split, with the attempted bit distinguishing
+	// "nothing to do" from "tried and failed": only the former gets
+	// a refund; a 409/404 race or a real patch failure spent it.
 	if stripped > 0 {
 		p.Heals.Stamp(ck, now)
 		log.Info("namespace finalizer sweep done",
 			"namespace", nsName, "stripped", stripped)
-	} else {
+	} else if !attempted {
 		heal.RefundGrant(now)
 	}
 }
@@ -347,11 +340,15 @@ func (p *namespaceTerminatingWedgedCheck) nsFinalizerSweep(ctx context.Context,
 // positively attributable to that dead owner: protected families and
 // finalizers whose writer cannot be pinned on the dead owner are
 // kept (their writers are usually different, still-alive controllers
-// whose external cleanup must not be orphaned). Returns true when a
-// patch was applied.
+// whose external cleanup must not be orphaned).
+//
+// Returns (stripped, attempted): attempted becomes true as soon as a
+// patch is sent, so the sweep can refund its gate grant only when
+// nothing was even tried. obj is the metadata-only projection from
+// the sweep's LIST — every field read here lives in ObjectMeta.
 func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Context,
 	log logr.Logger, gvr schema.GroupVersionResource,
-	obj *unstructured.Unstructured) bool {
+	obj metav1.Object) (stripped, attempted bool) {
 
 	var keep []string
 	var strip []string
@@ -367,11 +364,8 @@ func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Conte
 			keep = append(keep, f)
 		}
 	}
-	if len(strip) == 0 {
-		return false
-	}
-	if !p.ownerGone(ctx, obj) {
-		return false
+	if len(strip) == 0 || !p.ownerGone(ctx, obj) {
+		return false, false
 	}
 	var fin any
 	if len(keep) > 0 {
@@ -384,26 +378,40 @@ func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Conte
 		},
 	})
 	if err != nil {
-		return false
+		return false, false
 	}
+	// Past this point a mutation IS attempted — the heal budget's
+	// token is spent whether or not the apiserver accepts the patch.
+	attempted = true
 	if _, err := p.Dyn.Resource(gvr).Namespace(obj.GetNamespace()).Patch(ctx,
 		obj.GetName(), types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
-		if apierrors.IsForbidden(err) {
+		switch {
+		case apierrors.IsNotFound(err):
+			// The object finished deleting between LIST and PATCH:
+			// the wedged finalizer is already gone, nothing to do.
+			log.Info("finalizer strip skipped — object already deleted",
+				"gvr", gvr.String(), "object", obj.GetNamespace()+"/"+obj.GetName())
+		case apierrors.IsConflict(err):
+			// Another controller wrote the object between LIST and
+			// PATCH. Expected race; the next sweep re-reads its RV.
+			log.Info("finalizer strip skipped — object changed mid-sweep",
+				"gvr", gvr.String(), "object", obj.GetNamespace()+"/"+obj.GetName())
+		case apierrors.IsForbidden(err):
 			// Expected until the RBAC rollout grants patch on the CR —
 			// not an apiserver failure, don't count a run error.
 			log.Info("WARN: finalizer strip forbidden (RBAC pending)",
 				"gvr", gvr.String(), "object", obj.GetNamespace()+"/"+obj.GetName())
-			return false
+		default:
+			metrics.IncError(p.Name)
+			log.Error(err, "finalizer strip failed",
+				"gvr", gvr.String(), "object", obj.GetNamespace()+"/"+obj.GetName())
 		}
-		metrics.IncError(p.Name)
-		log.Error(err, "finalizer strip failed",
-			"gvr", gvr.String(), "object", obj.GetNamespace()+"/"+obj.GetName())
-		return false
+		return false, attempted
 	}
 	log.Info("PATCH-FINALIZERS: dead-owner CR in terminating namespace — stripped finalizers",
 		"gvr", gvr.String(), "object", obj.GetNamespace()+"/"+obj.GetName(),
 		"stripped", strip, "kept", keep)
-	return true
+	return true, attempted
 }
 
 // ownerGone reports whether the object's controller ownerRef
@@ -413,7 +421,7 @@ func (p *namespaceTerminatingWedgedCheck) maybeStripFinalizers(ctx context.Conte
 // tells "exists" apart from "unresolvable" so the
 // ReplicaSet→Deployment chain can still run.
 func (p *namespaceTerminatingWedgedCheck) ownerGone(ctx context.Context,
-	obj *unstructured.Unstructured) bool {
+	obj metav1.Object) bool {
 
 	ref := metav1.GetControllerOf(obj)
 	gone, resolved := p.OwnerGone(ctx, obj.GetNamespace(), ref,

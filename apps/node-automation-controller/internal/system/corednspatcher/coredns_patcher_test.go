@@ -539,7 +539,9 @@ const patchedCorefile = `.:53 {
         ttl 30
     }
     prometheus :9153
-    forward . /etc/resolv.conf { max_concurrent 2000 }
+    forward . /etc/resolv.conf {
+        max_concurrent 2000
+    }
     cache 30 {
         success 9984 30
         denial 9984 5
@@ -659,8 +661,12 @@ func TestCorefileDenialCapParser(t *testing.T) {
 		{"comment is not a cache", ".:53 {\n    # cache 30\n    forward . x\n}\n", false, ""},
 		{"denial commented counts as missing",
 			".:53 {\n    cache 30 {\n        # denial 9984 5\n    }\n}\n", true, "denial 9984 5"},
-		{"inline block with denial untouched",
-			".:53 {\n    cache 30 { denial 9984 5 }\n}\n", false, ""},
+		// A complete single-line block is still invalid Caddyfile —
+		// `{` must be followed by a newline — so it is expanded even
+		// though no directive is missing.
+		{"complete inline block still expanded to multi-line",
+			".:53 {\n    cache 30 { denial 9984 5 }\n}\n", true,
+			"cache 30 {\n        denial 9984 5\n    }"},
 		{"inline block without denial injected",
 			".:53 {\n    cache 30 { success 9984 30 }\n}\n", true, "denial 9984 5"},
 		{"two cache directives",
@@ -998,18 +1004,19 @@ func TestCorefileForwardHeal(t *testing.T) {
 		want    []string
 		absent  []string
 	}{
-		{"bare forward gains inline block",
+		{"bare forward gains multi-line block",
 			".:53 {\n    forward . /etc/resolv.conf\n}\n", true,
-			[]string{"forward . /etc/resolv.conf { max_concurrent 2000 }"}, nil},
+			[]string{"forward . /etc/resolv.conf {\n        max_concurrent 2000\n    }"}, nil},
 		{"bare forward keeps trailing comment",
 			".:53 {\n    forward . /etc/resolv.conf # upstream\n}\n", true,
-			[]string{"{ max_concurrent 2000 } # upstream"}, nil},
+			[]string{"forward . /etc/resolv.conf {\n        max_concurrent 2000\n    } # upstream"}, nil},
 		{"inline block without option gains it",
 			".:53 {\n    forward . 8.8.8.8 { policy sequential }\n}\n", true,
 			[]string{"max_concurrent 2000"}, nil},
-		{"inline block with option untouched",
-			".:53 {\n    forward . 8.8.8.8 { max_concurrent 500 }\n}\n", false,
-			nil, nil},
+		{"complete inline block still expanded, value kept",
+			".:53 {\n    forward . 8.8.8.8 { max_concurrent 500 }\n}\n", true,
+			[]string{"forward . 8.8.8.8 {\n        max_concurrent 500\n    }"},
+			[]string{"max_concurrent 2000"}},
 		{"multi-line block gains directive before close",
 			".:53 {\n    forward . 8.8.8.8 {\n        policy sequential\n    }\n}\n", true,
 			[]string{"max_concurrent 2000"}, nil},
@@ -1056,6 +1063,54 @@ func TestCorefileForwardHeal(t *testing.T) {
 	}
 }
 
+// Caddyfile's Dispenser.NextBlock() requires a `\n` immediately after
+// `{`. A bare forward OR any one-line `{ ... }` block (even one that
+// already carries max_concurrent) must come out multi-line. Assert the
+// whole rewritten Corefile, not just substrings, so a stray inline
+// brace can never slip through.
+func TestCorefileForwardHealEmitsMultilineBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{
+			name: "bare forward",
+			in:   ".:53 {\n    forward . /etc/resolv.conf\n}\n",
+			want: ".:53 {\n    forward . /etc/resolv.conf {\n        max_concurrent 2000\n    }\n}\n",
+		},
+		{
+			name: "complete single-line block",
+			in:   ".:53 {\n    forward . /etc/resolv.conf { max_concurrent 2000 }\n}\n",
+			want: ".:53 {\n    forward . /etc/resolv.conf {\n        max_concurrent 2000\n    }\n}\n",
+		},
+		{
+			name: "single-line block with siblings",
+			in:   ".:53 {\n    forward . 8.8.8.8 { policy sequential max_concurrent 2000 }\n}\n",
+			want: ".:53 {\n    forward . 8.8.8.8 {\n        policy sequential\n        max_concurrent 2000\n    }\n}\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := corefileForwardHeal(tc.in, "2000")
+			if !changed {
+				t.Fatal("expected a rewrite")
+			}
+			if got != tc.want {
+				t.Fatalf("rewritten Corefile:\n%q\nwant:\n%q", got, tc.want)
+			}
+			for _, line := range strings.Split(got, "\n") {
+				if i := strings.Index(line, "{"); i >= 0 &&
+					strings.Contains(line[i:], "}") {
+					t.Fatalf("single-line block survived: %q", line)
+				}
+			}
+			again, againChanged := corefileForwardHeal(got, "2000")
+			if againChanged || again != got {
+				t.Fatalf("rewrite not idempotent: pass2 changed=%v\n%s",
+					againChanged, again)
+			}
+		})
+	}
+}
+
 // corednsMaxConcurrent validates the knob: positive integers pass
 // through normalized, everything else warns and falls back to 2000 —
 // the value lands verbatim in the Corefile.
@@ -1071,6 +1126,93 @@ func TestCoreDNSMaxConcurrentKnob(t *testing.T) {
 		if got := corednsMaxConcurrent(tc.in); got != tc.want {
 			t.Fatalf("corednsMaxConcurrent(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// While the saturation boost is live the 15m safety-net requeue is
+// replaced by one timed at the stamp's exact expiry, so the patcher
+// releases the surge the moment the window lapses instead of up to
+// 15m late.
+func TestCoreDNSPatcherRequeuesAtBoostExpiry(t *testing.T) {
+	until := time.Now().Add(10 * time.Minute).UTC()
+	d := corednsDeploy("DoNotSchedule", 2)
+	d.Annotations = map[string]string{
+		kube.AnnoCoreDNSBoostUntil: until.Format(time.RFC3339),
+		kube.AnnoCoreDNSBoostBase:  "4",
+	}
+	cs := fake.NewSimpleClientset(d)
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		minReplicas: 4, nodesPerReplica: 1, boostReplicas: 2}
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	want := time.Until(until)
+	if res.RequeueAfter < want-time.Minute || res.RequeueAfter > want+time.Minute {
+		t.Fatalf("requeue = %s, want boost expiry in ~%s (not the 15m safety net)",
+			res.RequeueAfter, want)
+	}
+	// The surge is still pinned while the stamp is fresh.
+	got := getCorednsDeploy(t, cs)
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 6 {
+		t.Fatalf("replicas = %v, want 6 (4 + boost 2)", got.Spec.Replicas)
+	}
+	if got.Annotations[kube.AnnoCoreDNSBoostUntil] == "" ||
+		got.Annotations[kube.AnnoCoreDNSBoostBase] != "4" {
+		t.Fatal("live boost stamps must survive the reconcile")
+	}
+}
+
+// A boost window LONGER than the 15m safety net must not push the
+// requeue out: keeping the shorter timer releases the surge at the
+// safety-net tick instead of 15m past it.
+func TestCoreDNSPatcherBoostExpiryDoesNotExtendSafetyNet(t *testing.T) {
+	until := time.Now().Add(30 * time.Minute).UTC()
+	d := corednsDeploy("DoNotSchedule", 2)
+	d.Annotations = map[string]string{
+		kube.AnnoCoreDNSBoostUntil: until.Format(time.RFC3339),
+		kube.AnnoCoreDNSBoostBase:  "4",
+	}
+	cs := fake.NewSimpleClientset(d)
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		minReplicas: 4, nodesPerReplica: 1, boostReplicas: 2}
+	res, err := r.Reconcile(t.Context(), reconcile.Request{})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter < 13*time.Minute+30*time.Second ||
+		res.RequeueAfter > 16*time.Minute+30*time.Second {
+		t.Fatalf("requeue = %s, want the 15m safety net (boost expiry is 30m out)",
+			res.RequeueAfter)
+	}
+}
+
+// A lapsed boost window clears BOTH stamps in one metadata patch —
+// leaving the base behind would make the next boost compound on top
+// of a stale pre-boost count.
+func TestCoreDNSPatcherClearsExpiredBoostStamps(t *testing.T) {
+	until := time.Now().Add(-time.Minute).UTC()
+	d := corednsDeploy("DoNotSchedule", 2)
+	d.Spec.Replicas = ptr.To(int32(6)) // the now-expired surge
+	d.Annotations = map[string]string{
+		kube.AnnoCoreDNSBoostUntil: until.Format(time.RFC3339),
+		kube.AnnoCoreDNSBoostBase:  "4",
+	}
+	cs := fake.NewSimpleClientset(d)
+	r := &corednsPatcher{cs: cs, zoneWhen: "DoNotSchedule", minDomains: 2,
+		minReplicas: 4, nodesPerReplica: 1, boostReplicas: 2}
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := getCorednsDeploy(t, cs)
+	if _, ok := got.Annotations[kube.AnnoCoreDNSBoostUntil]; ok {
+		t.Fatal("expired boost-until stamp was not cleared")
+	}
+	if _, ok := got.Annotations[kube.AnnoCoreDNSBoostBase]; ok {
+		t.Fatal("expired boost-base stamp was not cleared")
+	}
+	if got.Spec.Replicas == nil || *got.Spec.Replicas != 4 {
+		t.Fatalf("replicas = %v, want 4 (surge released)", got.Spec.Replicas)
 	}
 }
 

@@ -9,8 +9,16 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
 // driftPodSpec builds a pod spec mounting one ConfigMap key and one
@@ -85,6 +93,90 @@ func TestSubPathContentHashDetectsKeyContentDrift(t *testing.T) {
 	}}}
 	if h := p.subPathContentHash(plain, "apps", cmData, secData); h != "" {
 		t.Fatal("non-subPath mount produced a signature")
+	}
+}
+
+// The opt-out annotation is read through the sweep overlay. An opt-out
+// stamped earlier in the SAME sweep (cooldown/sibling check) must hide
+// the workload from this check even though the snapshot's own
+// annotation map is still empty — the frozen copy must not win.
+func TestSubPathRunHonorsOverlayedOptOut(t *testing.T) {
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "apps", Name: "app",
+		},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "app"}},
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{{
+					Name: "cfg",
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "app-config"},
+						},
+					},
+				}},
+				Containers: []corev1.Container{{
+					Name:         "app",
+					VolumeMounts: []corev1.VolumeMount{{Name: "cfg", MountPath: "/etc/app", SubPath: "flags.yaml"}},
+				}},
+			},
+		}},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "app-config"},
+		Data:       map[string]string{"flags.yaml": "v1"},
+	}
+	cs := fake.NewSimpleClientset(dep, cm)
+	var patches int
+	cs.PrependReactor("patch", "deployments",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			patches++
+			return false, nil, nil
+		})
+	d := probetest.NewDeps(cs, probetest.OpDyn())
+	now := time.Now()
+	probetest.FreezeNow(d, now)
+	chk := &subpathConfigDriftCheck{Deps: d,
+		hashes: map[string]string{}, driftSince: map[string]time.Time{}}
+	sweepCtx := probefw.WithSweepSnapshot(ctx)
+
+	// First sweep seeds the subPath hash baseline.
+	chk.Run(sweepCtx)
+	if len(chk.hashes) != 1 {
+		t.Fatalf("baseline seeds = %d, want 1", len(chk.hashes))
+	}
+	// Drift the source ConfigMap content in the live API.
+	changed := cm.DeepCopy()
+	changed.Data["flags.yaml"] = "v2"
+	if _, err := cs.CoreV1().ConfigMaps("apps").Update(ctx, changed, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Stamp the opt-out onto the SNAPSHOT-cached Deployment via the
+	// overlay — the object's own map stays empty.
+	cached, err := chk.AllDeployments(sweepCtx)
+	if err != nil || len(cached) != 1 {
+		t.Fatalf("cached deployments = %d, err %v", len(cached), err)
+	}
+	payload, err := kube.MergePatchAnnos(map[string]any{
+		kube.AnnoSubPathReloadOptOut: "true",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kube.RecordAnnoPatch(sweepCtx, &cached[0], payload)
+
+	// Two full scans past the 15m settle window: without the overlay
+	// read the second one would nudge the Deployment (patches=1).
+	probetest.FreezeNow(d, now.Add(31*time.Minute))
+	chk.Run(sweepCtx)
+	probetest.FreezeNow(d, now.Add(62*time.Minute))
+	res := chk.Run(sweepCtx)
+	if !res.Pass {
+		t.Fatalf("opted-out workload must not be flagged: %+v", res)
+	}
+	if patches != 0 {
+		t.Fatalf("opted-out workload got %d restart-template patches", patches)
 	}
 }
 

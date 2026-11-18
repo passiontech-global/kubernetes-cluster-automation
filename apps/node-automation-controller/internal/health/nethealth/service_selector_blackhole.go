@@ -7,19 +7,23 @@
 //     a named string targetPort that matches no containerPort.name on those Pods.
 //
 // Skips ExternalName Services, selectorless Services, default/kubernetes, empty
-// namespaces, and intentionally scaled-to-0 / downscaled workloads. Uses only
-// memoized probefw.Deps censuses (0 additional API list calls).
+// namespaces, and intentionally scaled-to-0 / downscaled workloads — including
+// Argo Rollouts parked at zero (their owned ReplicaSet carries
+// rollout.argoproj.io/desired-replicas=0). Uses only memoized probefw.Deps
+// censuses (0 additional API list calls).
 package nethealth
 
 import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -34,6 +38,17 @@ const (
 
 	serviceBlackholeMinAge        = 10 * time.Minute
 	serviceBlackholeEventCooldown = 30 * time.Minute
+
+	// annoRolloutDesiredReplicas is stamped by the Argo Rollouts
+	// controller on the ReplicaSets it owns. A Rollout parked at zero
+	// has no Deployment/StatefulSet/downscaled annotation for the
+	// workload census to see — only a RS with desired-replicas=0.
+	annoRolloutDesiredReplicas = "rollout.argoproj.io/desired-replicas"
+	// annoRolloutRevision is stamped on every RS an Argo Rollout owns.
+	// Only the highest revision reflects the Rollout's current desired
+	// state; older revisions linger in the census with stale
+	// desired-replicas annotations.
+	annoRolloutRevision = "rollout.argoproj.io/revision"
 )
 
 var serviceBlackholeGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -93,6 +108,10 @@ func (c *serviceSelectorBlackholeCheck) Run(ctx context.Context) probefw.Result 
 	if err != nil {
 		return carryBlackholeOnErr(&rep, &c.emitted, err, "list daemonsets")
 	}
+	rss, err := c.AllReplicaSets(ctx)
+	if err != nil {
+		return carryBlackholeOnErr(&rep, &c.emitted, err, "list replicasets")
+	}
 
 	readyBySvc := kube.ReadyEndpointsByService(slices)
 
@@ -109,7 +128,7 @@ func (c *serviceSelectorBlackholeCheck) Run(ctx context.Context) probefw.Result 
 	for i := range deploys {
 		d := &deploys[i]
 		downscaled := (d.Spec.Replicas != nil && *d.Spec.Replicas == 0) ||
-			kube.IsIntentionallyDownscaled(d.Annotations, d.Spec.Replicas)
+			kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, d), d.Spec.Replicas)
 		workloadsByNS[d.Namespace] = append(workloadsByNS[d.Namespace], workloadTemplateInfo{
 			name:       "Deployment/" + d.Name,
 			labels:     d.Spec.Template.Labels,
@@ -119,7 +138,7 @@ func (c *serviceSelectorBlackholeCheck) Run(ctx context.Context) probefw.Result 
 	for i := range stss {
 		s := &stss[i]
 		downscaled := (s.Spec.Replicas != nil && *s.Spec.Replicas == 0) ||
-			kube.IsIntentionallyDownscaled(s.Annotations, s.Spec.Replicas)
+			kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, s), s.Spec.Replicas)
 		workloadsByNS[s.Namespace] = append(workloadsByNS[s.Namespace], workloadTemplateInfo{
 			name:       "StatefulSet/" + s.Name,
 			labels:     s.Spec.Template.Labels,
@@ -131,6 +150,31 @@ func (c *serviceSelectorBlackholeCheck) Run(ctx context.Context) probefw.Result 
 		workloadsByNS[ds.Namespace] = append(workloadsByNS[ds.Namespace], workloadTemplateInfo{
 			name:   "DaemonSet/" + ds.Name,
 			labels: ds.Spec.Template.Labels,
+		})
+	}
+	// Argo Rollouts scale 0 (argo-rollout-gates): a parked Rollout has
+	// no Deployment/StatefulSet to recognize. Its owned ReplicaSet is
+	// metadata-only in the shared census, but the controller's
+	// desired-replicas annotation is enough to tell "intentionally
+	// asleep" from a selector that genuinely matches nothing.
+	// Argo keeps older revision RSes around (often carrying a stale
+	// desired-replicas annotation), so ONLY the highest-revision RS
+	// per Rollout reflects current intent — counting them all made a
+	// parked Rollout look like a live workload, or vice versa.
+	latestRolloutRS := latestRolloutReplicaSets(ctx, rss)
+	for i := range rss {
+		rs := &rss[i]
+		if !latestRolloutRS[rs.Namespace+"/"+rs.Name] {
+			continue
+		}
+		annos := kube.EffectiveAnnos(ctx, rs)
+		zero := int32(0)
+		downscaled := annos[annoRolloutDesiredReplicas] == "0" ||
+			kube.IsIntentionallyDownscaled(annos, &zero)
+		workloadsByNS[rs.Namespace] = append(workloadsByNS[rs.Namespace], workloadTemplateInfo{
+			name:       "ReplicaSet/" + rs.Name,
+			labels:     rs.Labels,
+			downscaled: downscaled,
 		})
 	}
 
@@ -204,6 +248,59 @@ func carryBlackholeOnErr(rep *probefw.SweepReport, ledger *state.GaugeLedger[str
 		"service selector blackhole: ", ", ")
 }
 
+// rolloutOwnerName returns the owning argoproj.io Rollout name for a
+// ReplicaSet, or "" when it is a Deployment-owned RS (already covered
+// by the Deployment census). Only Rollout-owned RSes stand in for a
+// workload the typed censuses cannot see.
+func rolloutOwnerName(refs []metav1.OwnerReference) string {
+	for i := range refs {
+		ref := &refs[i]
+		if ref.Kind == "Rollout" &&
+			strings.Contains(ref.APIVersion, "argoproj.io") {
+			return ref.Name
+		}
+	}
+	return ""
+}
+
+// latestRolloutReplicaSets keeps only the highest-revision RS for each
+// Rollout (namespace + owner name). An unstamped or malformed revision
+// reads as 0, so a single-revision Rollout is still represented and a
+// newer stamped revision wins over an older one. Without this filter
+// a parked Rollout's old revision RS — which Argo leaves behind with
+// a stale desired-replicas value — is ingested as a live workload and
+// suppresses the "intentionally asleep" exemption.
+func latestRolloutReplicaSets(ctx context.Context, rss []metav1.PartialObjectMetadata) map[string]bool {
+	type best struct {
+		idx int
+		rev int64
+	}
+	bestByRollout := map[string]best{}
+	for i := range rss {
+		rs := &rss[i]
+		rollout := rolloutOwnerName(rs.OwnerReferences)
+		if rollout == "" {
+			continue
+		}
+		var rev int64
+		if raw := kube.EffectiveAnnos(ctx, rs)[annoRolloutRevision]; raw != "" {
+			if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+				rev = n
+			}
+		}
+		key := rs.Namespace + "/" + rollout
+		if cur, ok := bestByRollout[key]; !ok || rev > cur.rev {
+			bestByRollout[key] = best{idx: i, rev: rev}
+		}
+	}
+	out := make(map[string]bool, len(bestByRollout))
+	for _, b := range bestByRollout {
+		rs := &rss[b.idx]
+		out[rs.Namespace+"/"+rs.Name] = true
+	}
+	return out
+}
+
 func matchesDownscaledWorkload(sel map[string]string, workloads []workloadTemplateInfo) bool {
 	matchedAny := false
 	for i := range workloads {
@@ -272,12 +369,25 @@ func findMissingNamedTargetPort(svcPorts []corev1.ServicePort, matchingPods []*c
 		return "", false
 	}
 	definedNames := map[string]bool{}
-	for _, p := range readyPods {
-		for i := range p.Spec.Containers {
-			for j := range p.Spec.Containers[i].Ports {
-				if n := p.Spec.Containers[i].Ports[j].Name; n != "" {
+	addPorts := func(cs []corev1.Container) {
+		for i := range cs {
+			for j := range cs[i].Ports {
+				if n := cs[i].Ports[j].Name; n != "" {
 					definedNames[n] = true
 				}
+			}
+		}
+	}
+	for _, p := range readyPods {
+		addPorts(p.Spec.Containers)
+		// Native sidecars (restartPolicy: Always on an initContainer)
+		// run alongside the main container for the pod's whole life
+		// and may own the named targetPort — e.g. an envoy/linkerd
+		// proxy that terminates the Service traffic. Missing them
+		// reported a false target_port_mismatch.
+		for _, ic := range p.Spec.InitContainers {
+			if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+				addPorts([]corev1.Container{ic})
 			}
 		}
 	}

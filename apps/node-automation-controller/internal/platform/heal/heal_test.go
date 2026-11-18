@@ -309,6 +309,48 @@ func TestEvictPodPDBRefusalDefers(t *testing.T) {
 	}
 }
 
+// EvictPodNotFound separates the ordinary 404 race (the pod vanished
+// since the census) from real PDB/L1/quorum deferrals, so a caller can
+// handle it quietly. The wrapper's refused contract is unchanged.
+func TestEvictPodNotFoundSeparates404FromRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		err          error
+		wantNotFound bool
+	}{
+		{"gone since census", apierrors.NewNotFound(
+			corev1.Resource("pods"), "op-abc-1"), true},
+		{"pdb floor", apierrors.NewTooManyRequests(
+			"pdb allows no disruptions", 0), false},
+		{"uid conflict", apierrors.NewConflict(
+			corev1.Resource("pods"), "op-abc-1", errors.New("recreated")), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := pod("ns1", "op-abc-1", "uid-1", corev1.PodRunning, time.Now())
+			cs := fake.NewSimpleClientset(p)
+			cs.PrependReactor("create", "pods",
+				func(a ktesting.Action) (bool, runtime.Object, error) {
+					ca, ok := a.(ktesting.CreateAction)
+					if !ok || ca.GetSubresource() != "eviction" {
+						return false, nil, nil
+					}
+					return true, nil, tc.err
+				})
+			evicted, refused, notFound, err := EvictPodNotFound(
+				ctx, cs, nil, "k", p, time.Now())
+			if err != nil || evicted || !refused || notFound != tc.wantNotFound {
+				t.Fatalf("EvictPodNotFound = (%v,%v,%v,%v), want (false,true,%v,nil)",
+					evicted, refused, notFound, err, tc.wantNotFound)
+			}
+			// The wrapper keeps the old fold: all three are refused.
+			_, refused2, err2 := EvictPod(ctx, cs, nil, "k", p, time.Now())
+			if err2 != nil || !refused2 {
+				t.Fatalf("EvictPod wrapper = (%v,%v), want (true,nil)", refused2, err2)
+			}
+		})
+	}
+}
+
 // Any other API failure is (false, false, err) and does NOT stamp —
 // the caller meters it and the next sweep retries.
 func TestEvictPodFailurePassthrough(t *testing.T) {

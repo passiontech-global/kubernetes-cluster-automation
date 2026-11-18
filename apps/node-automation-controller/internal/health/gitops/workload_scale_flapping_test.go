@@ -77,7 +77,7 @@ func TestScaleFlappingDetected(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("6 flips must FAIL")
 	}
@@ -111,7 +111,7 @@ func TestScaleFlappingUnderThreshold(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("under-threshold flapping must pass: %+v", res)
 	}
 }
@@ -130,7 +130,7 @@ func TestScaleFlappingOldEventsIgnored(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("stale flapping must pass: %+v", res)
 	}
 }
@@ -149,7 +149,7 @@ func TestScaleFlappingStatefulSet(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("StatefulSet flapping must FAIL")
 	}
 }
@@ -157,7 +157,7 @@ func TestScaleFlappingStatefulSet(t *testing.T) {
 // No events at all is a clean pass.
 func TestScaleFlappingQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn())
-	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("empty event stream must pass: %+v", res)
 	}
 }
@@ -205,7 +205,7 @@ func TestScaleFlappingRollout(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("Rollout flapping must FAIL")
 	}
@@ -225,7 +225,7 @@ func TestScaleFlappingRolloutSteadyUp(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("steady one-direction Rollout scaling must pass: %+v", res)
 	}
 }
@@ -282,7 +282,7 @@ func TestScaleFlappingRolloutPairsExcluded(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("a single rolling update must not flag flapping: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_workload_scale_flapping",
@@ -317,7 +317,7 @@ func TestScaleFlappingSameRSFlipsStillFlags(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("same-RS reversal must still flag: %+v", res)
 	}
@@ -378,7 +378,7 @@ func TestScaleFlappingSTSMidRolloutExcluded(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("a mid-rollout StatefulSet must not flag flapping: %+v", res)
 	}
 }
@@ -403,7 +403,7 @@ func TestScaleFlappingSTSSettledChurnPasses(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*workloadScaleFlappingCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("settled-StatefulSet pod churn must not flag: %+v", res)
 	}
 }
@@ -430,7 +430,7 @@ func TestScaleFlappingSTSSpecReplicas(t *testing.T) {
 	chk := probetest.MustCheck[*workloadScaleFlappingCheck](t, p)
 
 	// Baseline observation — the first census arms the tracker.
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("baseline sweep must pass: %+v", res)
 	}
 	// 3→1→3→1→3→1→3→1: seven desired-count moves, six direction
@@ -441,9 +441,9 @@ func TestScaleFlappingSTSSpecReplicas(t *testing.T) {
 			metav1.UpdateOptions{}); err != nil {
 			t.Fatal(err)
 		}
-		chk.Run(probetest.SweepCtx(ctx))
+		chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	}
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatal("six spec.replicas reversals must FAIL")
 	}
 	m := probetest.FindMetric(t, "node_automation_workload_scale_flapping",

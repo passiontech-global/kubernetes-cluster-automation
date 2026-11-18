@@ -41,28 +41,26 @@ import (
 // wedged PVB is deleted AND its node-agent pod bounced so the next
 // scheduled backup is not blocked behind it.
 func (a *veleroBackupAuditor) auditInFlightTransfers(ctx context.Context,
-	backups *unstructured.UnstructuredList) error {
+	stuckBackups []*unstructured.Unstructured) error {
 	a.seenStuckBackup.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 	now := a.now.Now()
 
-	// --- Backups: mark-only gauge over the already-listed set ---
-	if backups != nil {
-		for i := range backups.Items {
-			b := &backups.Items[i]
-			phase, _ := kube.NestedString(b.Object, "status", "phase")
-			if phase != "InProgress" && phase != "Deleting" {
-				continue
-			}
-			since := inFlightSince(b)
-			if now.Sub(since) <= veleroStuckMaxAge {
-				continue
-			}
-			k := pausedKey{b.GetNamespace(), b.GetName()}
-			a.seenStuckBackup.Set(metrics.VeleroBackupStuck, 1, k, k.namespace, k.schedule)
-			log.Info("velero backup wedged in-flight >6h",
-				"backup", k.namespace+"/"+k.schedule, "phase", phase)
+	// --- Backups: mark-only gauge over the in-flight subset the
+	// sweep's single streaming Backup read already collected ---
+	for _, b := range stuckBackups {
+		phase, _ := kube.NestedString(b.Object, "status", "phase")
+		if phase != "InProgress" && phase != "Deleting" {
+			continue
 		}
+		since := inFlightSince(b)
+		if now.Sub(since) <= veleroStuckMaxAge {
+			continue
+		}
+		k := pausedKey{b.GetNamespace(), b.GetName()}
+		a.seenStuckBackup.Set(metrics.VeleroBackupStuck, 1, k, k.namespace, k.schedule)
+		log.Info("velero backup wedged in-flight >6h",
+			"backup", k.namespace+"/"+k.schedule, "phase", phase)
 	}
 	a.seenStuckBackup.Prune(metrics.VeleroBackupStuck.DeleteLabelValues)
 
@@ -103,65 +101,69 @@ func (a *veleroBackupAuditor) auditWedgedTransferKind(ctx context.Context,
 	log := logf.FromContext(ctx)
 	now := a.now.Now()
 
-	items, err := a.veleroList(ctx, gvr)
-	switch {
-	case kube.IsCRDAbsent(err):
+	cleaned := 0
+	// Visit each page in the callback — only the per-object signals
+	// (series emissions, cleanup counter, cooldown stamps) survive
+	// the page; the object bodies die with it.
+	err := a.veleroListEach(ctx, gvr, func(page []unstructured.Unstructured) error {
+		for i := range page {
+			obj := &page[i]
+			phase, _ := kube.NestedString(obj.Object, "status", "phase")
+			if phase != "InProgress" && phase != "Deleting" {
+				continue
+			}
+			since := inFlightSince(obj)
+			if now.Sub(since) <= veleroStuckMaxAge {
+				continue
+			}
+			ns, name := obj.GetNamespace(), obj.GetName()
+			k := pausedKey{ns, name}
+			seen.Set(gauge, 1, k, ns, name)
+			log.Info("velero transfer object wedged in-flight >6h",
+				"kind", kind, "object", ns+"/"+name, "phase", phase)
+
+			// Only an InProgress object is a cleanup candidate — a
+			// Deleting one is already on its way out.
+			if phase != "InProgress" || cleaned >= veleroPVBCleanupMaxPerRun {
+				continue
+			}
+			// A PVB the controller has not assigned a node yet owns no
+			// node-agent to bounce — skipping beats keying the cooldown
+			// (and the heal) on the bogus "node-agent/" target.
+			if pvbNode(obj) == "" {
+				continue
+			}
+			// The cleanup cooldown is keyed on the NODE, not the object:
+			// the destructive half is the node-agent pod bounce, and
+			// several wedged transfers can share one agent — per-object
+			// keys would bounce the same pod once per wedged transfer.
+			coolKey := "node-agent/" + pvbNode(obj)
+			if a.pvbHealed.CooledDown(coolKey, veleroPVBCleanupCooldown, now) {
+				continue
+			}
+			acted, bounced := a.cleanWedgedTransfer(ctx, gvr, obj, since, now, kind)
+			if acted {
+				cleaned++
+				// The cooldown exists to rate-limit the node-agent pod
+				// BOUNCE — stamp it only when a bounce actually landed.
+				// A cleanup that deleted the wedged object but found the
+				// agent already a fresh incarnation must not park the
+				// node's cooldown: the next wedged transfer on it still
+				// needs its agent evaluated.
+				if bounced {
+					a.pvbHealed.Stamp(coolKey, now)
+				}
+			}
+		}
+		return nil
+	})
+	if kube.IsCRDAbsent(err) {
 		// CRD absent — clear any stale wedge series and stop.
 		seen.Prune(gauge.DeleteLabelValues)
 		return nil
-	case err != nil:
-		return fmt.Errorf("list velero %s: %w", gvr.Resource, err)
 	}
-
-	cleaned := 0
-	for i := range items.Items {
-		obj := &items.Items[i]
-		phase, _ := kube.NestedString(obj.Object, "status", "phase")
-		if phase != "InProgress" && phase != "Deleting" {
-			continue
-		}
-		since := inFlightSince(obj)
-		if now.Sub(since) <= veleroStuckMaxAge {
-			continue
-		}
-		ns, name := obj.GetNamespace(), obj.GetName()
-		k := pausedKey{ns, name}
-		seen.Set(gauge, 1, k, ns, name)
-		log.Info("velero transfer object wedged in-flight >6h",
-			"kind", kind, "object", ns+"/"+name, "phase", phase)
-
-		// Only an InProgress object is a cleanup candidate — a
-		// Deleting one is already on its way out.
-		if phase != "InProgress" || cleaned >= veleroPVBCleanupMaxPerRun {
-			continue
-		}
-		// A PVB the controller has not assigned a node yet owns no
-		// node-agent to bounce — skipping beats keying the cooldown
-		// (and the heal) on the bogus "node-agent/" target.
-		if pvbNode(obj) == "" {
-			continue
-		}
-		// The cleanup cooldown is keyed on the NODE, not the object:
-		// the destructive half is the node-agent pod bounce, and
-		// several wedged transfers can share one agent — per-object
-		// keys would bounce the same pod once per wedged transfer.
-		coolKey := "node-agent/" + pvbNode(obj)
-		if a.pvbHealed.CooledDown(coolKey, veleroPVBCleanupCooldown, now) {
-			continue
-		}
-		acted, bounced := a.cleanWedgedTransfer(ctx, gvr, obj, since, now, kind)
-		if acted {
-			cleaned++
-			// The cooldown exists to rate-limit the node-agent pod
-			// BOUNCE — stamp it only when a bounce actually landed.
-			// A cleanup that deleted the wedged object but found the
-			// agent already a fresh incarnation must not park the
-			// node's cooldown: the next wedged transfer on it still
-			// needs its agent evaluated.
-			if bounced {
-				a.pvbHealed.Stamp(coolKey, now)
-			}
-		}
+	if err != nil {
+		return fmt.Errorf("list velero %s: %w", gvr.Resource, err)
 	}
 	seen.Prune(gauge.DeleteLabelValues)
 	return nil
@@ -197,32 +199,34 @@ func (a *veleroBackupAuditor) auditDataMovement(ctx context.Context) error {
 		kube.GVRVeleroDataUpload, kube.GVRVeleroDataDownload,
 	} {
 		kind := gvr.Resource
-		items, err := a.veleroList(ctx, gvr)
-		switch {
-		case kube.IsCRDAbsent(err):
+		err := a.veleroListEach(ctx, gvr, func(page []unstructured.Unstructured) error {
+			for i := range page {
+				u := &page[i]
+				phase, _ := kube.NestedString(u.Object, "status", "phase")
+				if !dataMovementStuckPhases[phase] {
+					continue
+				}
+				if now.Sub(inFlightSince(u)) <= veleroStuckMaxAge {
+					continue
+				}
+				k := kind + "/" + u.GetNamespace() + "/" + u.GetName()
+				a.seenDataMovement.Set(metrics.VeleroDataMovementWedged, 1, k,
+					u.GetNamespace(), u.GetName(), kind)
+				log.Info("velero data movement object wedged in-flight >6h",
+					"kind", kind, "object", u.GetNamespace()+"/"+u.GetName(),
+					"phase", phase)
+			}
+			return nil
+		})
+		if kube.IsCRDAbsent(err) {
 			continue // CRD absent — nothing to scan, stale series still prune below
-		case err != nil:
+		}
+		if err != nil {
 			// List failed — return WITHOUT pruning: the last-emitted
 			// wedge series must stay up (a transient API flap is not
 			// evidence the objects resolved), and the next successful
 			// sweep re-asserts or prunes them itself.
 			return fmt.Errorf("list velero %s: %w", kind, err)
-		}
-		for i := range items.Items {
-			u := &items.Items[i]
-			phase, _ := kube.NestedString(u.Object, "status", "phase")
-			if !dataMovementStuckPhases[phase] {
-				continue
-			}
-			if now.Sub(inFlightSince(u)) <= veleroStuckMaxAge {
-				continue
-			}
-			k := kind + "/" + u.GetNamespace() + "/" + u.GetName()
-			a.seenDataMovement.Set(metrics.VeleroDataMovementWedged, 1, k,
-				u.GetNamespace(), u.GetName(), kind)
-			log.Info("velero data movement object wedged in-flight >6h",
-				"kind", kind, "object", u.GetNamespace()+"/"+u.GetName(),
-				"phase", phase)
 		}
 	}
 	a.seenDataMovement.Prune(metrics.VeleroDataMovementWedged.DeleteLabelValues)

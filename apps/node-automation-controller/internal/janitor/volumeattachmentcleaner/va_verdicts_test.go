@@ -21,6 +21,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -317,6 +318,77 @@ func TestRunPrunesRemovedFinalizerSeriesWhenNodeGone(t *testing.T) {
 	}
 	if _, ok := c.finalizersRemovedEmitted.Last()["n-gone"]; ok {
 		t.Fatal("ledger kept the tuple of a census-gone node")
+	}
+}
+
+// A Terminating VA past the stuck age whose attacher finalizer is
+// ALREADY gone is not a strip target: there is nothing to free and
+// no "finalizer removed" event to emit.
+func TestBuildTargetsSkipsStuckVAWithoutAttacherFinalizer(t *testing.T) {
+	now := time.Now()
+	termAt := metav1.NewTime(now.Add(-time.Hour))
+	va := vacAttachment("va-no-finalizer", "n-gone", now.Add(-2*time.Hour))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"example.com/custom-holder"}
+	cs := fake.NewSimpleClientset(va)
+	c := newVACleaner(cs, func() time.Time { return now })
+
+	targets, err := c.buildTargets(ctx, map[string]*corev1.Node{},
+		newVaCycle(), now, logf.FromContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 0 {
+		t.Fatalf("VA with no external-attacher finalizer became %d targets, want 0",
+			len(targets))
+	}
+}
+
+// A remediation taint (kubelet-unresponsive, network-partitioned,
+// ...) is fencing evidence too. The Ready-node unused-volume branch
+// must refuse it — not just the plain out-of-service fence — or a
+// node fenced by a remediation actor could have its finalizers
+// stripped as if it were healthy.
+func TestStuckReadyUnusedRefusesRemediationTaint(t *testing.T) {
+	now := time.Now()
+	va := vacAttachment("va-taint", "n-remediated", now.Add(-time.Hour))
+	node := vacNode("n-remediated", corev1.ConditionTrue, corev1.Taint{
+		Key: kube.RemediationTaints[0], Effect: corev1.TaintEffectNoSchedule,
+	})
+	c := newVACleaner(fake.NewSimpleClientset(va), func() time.Time { return now })
+	cyc := newVaCycle()
+	if c.stuckReadyUnused(ctx, va,
+		map[string]*corev1.Node{node.Name: node}, cyc.livePods,
+		cyc.pvcPVs, cyc.pvNames, logf.FromContext(ctx)) {
+		t.Fatal("remediation-tainted node read as an unused-volume strip candidate")
+	}
+}
+
+// confirmTarget's LIVE-node branch applies the same fencing test: a
+// node that was Ready in the census but now carries a remediation
+// taint is not a fast-reboot candidate, so the strip verdict drops.
+func TestConfirmTargetRefusesRemediationTaintOnLiveNode(t *testing.T) {
+	now := time.Now()
+	termAt := metav1.NewTime(now.Add(-30 * time.Minute))
+	va := vacAttachment("va-confirm", "w1", now.Add(-time.Hour))
+	va.DeletionTimestamp = &termAt
+	va.Finalizers = []string{"external-attacher/csi-test"}
+	node := vacNode("w1", corev1.ConditionTrue, corev1.Taint{
+		Key: kube.RemediationTaints[0], Effect: corev1.TaintEffectNoSchedule,
+	})
+	cs := fake.NewSimpleClientset(va, node)
+	c := newVACleaner(cs, func() time.Time { return now })
+	cyc := newVaCycle()
+	cyc.stuckReadyPrior[va.Name] = true // two-cycle proof available
+
+	ok, err := c.confirmTarget(ctx, &vaTarget{va: va, strip: true},
+		map[string]*corev1.Node{node.Name: node}, cyc, now,
+		logf.FromContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("remediation-tainted live node was accepted as a strip target")
 	}
 }
 

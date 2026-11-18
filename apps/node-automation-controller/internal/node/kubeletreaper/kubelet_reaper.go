@@ -35,6 +35,7 @@ package kubeletreaper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -166,7 +167,7 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	for range workers {
 		wg.Go(func() {
 			for name := range jobs {
-				results <- result{name, r.probeFn(ctx, name)}
+				results <- result{name, r.probeSafe(ctx, name)}
 			}
 		})
 	}
@@ -238,11 +239,17 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	// count (fail closed, the same posture sweep()'s own
 	// lease-read error path takes).
 	darkFresh := 0
+	leaseAlive := make(map[string]leaseVerdict, len(ok))
 	for name, o := range ok {
 		if o {
 			continue
 		}
-		if alive, err := r.kubeletAlive(ctx, name); err == nil && alive {
+		// One Lease read per failed node — the sweep's per-node
+		// decision below reuses this verdict instead of re-Get'ing
+		// the same Lease a second time.
+		alive, err := r.kubeletAlive(ctx, name)
+		leaseAlive[name] = leaseVerdict{alive: alive, err: err}
+		if err == nil && alive {
 			darkFresh++
 		}
 	}
@@ -251,8 +258,21 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	// fake-ready case this module exists to fence (the dedicated
 	// konnectivityDegraded guard above already covers the tunnel
 	// suspect), so the fleet guard must not engage there.
+	//
+	// On a TWO-worker cluster one dark worker is NOT a mesh outage:
+	// >=half is trivially true at 1-of-2, and suppressing the
+	// healthy sibling's evidence would let a genuinely dead worker
+	// go unfenced forever. Both workers must be dark. On >=3
+	// workers the shared-path >=half posture still applies.
 	wasDark := r.meshDark
-	r.meshDark = len(ok) > 1 && darkFresh > 0 && darkFresh*2 >= len(ok)
+	switch {
+	case len(ok) == 2:
+		r.meshDark = darkFresh == 2
+	case len(ok) >= 3:
+		r.meshDark = darkFresh > 0 && darkFresh*2 >= len(ok)
+	default:
+		r.meshDark = false
+	}
 	if r.meshDark {
 		log.Info("mesh-dark guard: >=half of probed workers fail with fresh leases — fresh-lease taints suppressed",
 			"darkFresh", darkFresh, "probed", len(ok))
@@ -266,13 +286,51 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	}
 	r.probeOutage = false
 
+	// Fleet-capacity guard: on a MULTI-worker cluster this module
+	// must never unnode the fleet. Count both the workers and those
+	// that can actually host a replacement — Ready, schedulable, and
+	// not already fenced by any remediation actor (our own
+	// kubelet-unresponsive taint included). On a 2-worker cluster
+	// that has already lost one worker to fencing, the last remaining
+	// one is the ONLY capacity left: a failed probe there gets a
+	// deferral, never a taint, even with a stale lease and an expired
+	// grace window. This guard covers the "the other worker is
+	// already fenced" shape the probe cross-checks cannot see.
+	//
+	// A GENUINE one-worker cluster is excluded: with no sibling ever
+	// present, the probe-fail+fresh-lease signature is exactly the
+	// fake-ready case this reaper exists to fence (see the one-worker
+	// tunnel guard above and the meshDark len(ok)>1 carve-out).
+	workerNodes := 0
+	schedulable := map[string]bool{}
+	for i := range nodes {
+		n := &nodes[i]
+		if kube.IsControlPlane(n) {
+			continue
+		}
+		workerNodes++
+		if n.Spec.Unschedulable ||
+			kube.HasRemediationOrFenceTaint(n) || !kube.NodeReady(n) {
+			continue
+		}
+		schedulable[n.Name] = true
+	}
 	sweepErrs := 0
 	for i := range nodes {
 		n := &nodes[i]
 		if kube.IsControlPlane(n) {
 			continue
 		}
-		if err := r.sweep(ctx, n, ok[n.Name]); err != nil {
+		// Only a NEW taint on a schedulable worker costs capacity;
+		// untaints (healthy probe) and keep-taints stay allowed.
+		atRisk := !ok[n.Name] && schedulable[n.Name] &&
+			!kube.HasTaint(n.Spec.Taints, kubeletReaperTaint)
+		if atRisk && workerNodes > 1 && len(schedulable) <= 1 {
+			log.Info("DEFER: last schedulable worker — refusing to fence the cluster",
+				"node", n.Name)
+			continue
+		}
+		if err := r.sweep(ctx, n, ok[n.Name], leaseAlive); err != nil {
 			// Best-effort per node — like the bash loop a failure on
 			// one node must not skip the rest of the sweep. The run
 			// absorbs it (returns nil), so it IncErrors here —
@@ -280,6 +338,14 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 			sweepErrs++
 			metrics.IncError(r.queue)
 			log.Error(err, "sweep failed — node skipped", "node", n.Name)
+		}
+		if atRisk {
+			// Conservatively spend the capacity slot even if sweep()
+			// deferred (lease grace, circuit breaker, L1 yield):
+			// under-counting capacity here can only make THIS sweep
+			// more conservative — no sibling may be fenced on the
+			// same pass.
+			delete(schedulable, n.Name)
 		}
 	}
 	// Prune freshFail against the live node list: a deleted (or
@@ -302,4 +368,28 @@ func (r *kubeletReaper) run(ctx context.Context) error {
 	log.Info("sweep done", "probed", len(ok), "healthy", healthy,
 		"sweepErrors", sweepErrs)
 	return nil
+}
+
+// probeSafe runs probeFn under a panic guard — a panic in the probe
+// path is OUR bug, never evidence the kubelet is dead: the node reads
+// ok (inconclusive, feeds no persistence window, earns no taint) and
+// the panic is logged. Without this guard one bad probe kills a
+// worker goroutine mid-sweep — and an unrecovered panic in ANY
+// spawned goroutine takes the whole process down, bypassing
+// Periodic's Run-level recover entirely (same posture as
+// apiserver-node-reachability's probeSafe). A spent sweep budget is
+// inconclusive too: every remaining probe would fail on OUR
+// deadline, not the node's.
+func (r *kubeletReaper) probeSafe(ctx context.Context, node string) (ok bool) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logf.FromContext(ctx).Error(errors.New("kubelet probe panic"),
+				"node", node, "panic", rec)
+			ok = true // inconclusive — never taint on our own bug
+		}
+	}()
+	if ctx.Err() != nil {
+		return true
+	}
+	return r.probeFn(ctx, node)
 }

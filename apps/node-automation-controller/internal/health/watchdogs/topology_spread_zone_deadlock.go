@@ -6,9 +6,12 @@
 // When NODE_AUTOMATION_TOPOLOGY_ZONE_RELAX_ENABLED=true, relaxes
 // topology.kubernetes.io/zone DoNotSchedule -> ScheduleAnyway on eligible stateless
 // Deployments (excluding DB quorum labels and AnnoTopologyRelaxOptOut=="true") and
-// opted-in StatefulSets (AnnoTopologyRelaxOptIn=="true") via HealAllowed + FluxPatchGate,
-// stamping AnnoTopologyRelaxedBy. Auto-restores DoNotSchedule once all zones have >=1
-// Ready uncordoned worker continuously >=10m.
+// opted-in StatefulSets (AnnoTopologyRelaxOptIn=="true") via the cluster-wide-only
+// heal gate + FluxPatchGate (a node-scoped cordon must not deadlock the very relax
+// that unblocks its zone), stamping AnnoTopologyRelaxedBy with the exact changed
+// constraint indices and their original minDomains. MinDomains is cleared on relax
+// (ScheduleAnyway + minDomains is a 422 Invalid) and restored byte-for-byte on
+// auto-restore — a user's own ScheduleAnyway constraint is never overwritten.
 package watchdogs
 
 import (
@@ -58,6 +61,24 @@ func init() {
 	ctrlmetrics.Registry.MustRegister(topologyZoneDeadlockGauge)
 }
 
+// topologyRelaxRecord is the value of AnnoTopologyRelaxedBy. It is
+// deliberately an exact change-list, not a boolean marker: a restore
+// must flip back ONLY the constraints this check relaxed, with their
+// original minDomains, or it silently overwrites a ScheduleAnyway
+// constraint the user wrote themselves. Zones records the dead zones
+// that triggered the relax so a later sweep still knows which zone a
+// pod restart / zone deletion should be attributed to.
+type topologyRelaxRecord struct {
+	By      string               `json:"by"`
+	Zones   []string             `json:"zones,omitempty"`
+	Relaxed []topologyRelaxEntry `json:"relaxed"`
+}
+
+type topologyRelaxEntry struct {
+	Index      int    `json:"i"`
+	MinDomains *int32 `json:"m,omitempty"`
+}
+
 type topologySpreadZoneDeadlockCheck struct {
 	*probefw.Deps
 
@@ -83,9 +104,10 @@ func (c *topologySpreadZoneDeadlockCheck) Run(ctx context.Context) probefw.Resul
 	now := c.Now()
 	c.eventCooldown.PruneExpired(now, topologyEventCooldown)
 	c.healCooldowns.PruneExpired(now, topologyPatchCooldown)
-	if c.knownZones == nil {
-		c.knownZones = map[string]bool{}
-	}
+	// knownZones is REBUILT every sweep. The old sticky map never
+	// forgot a zone, so a zone deleted for maintenance stayed "known"
+	// with zero healthy workers forever and the restore never fired.
+	c.knownZones = map[string]bool{}
 	var rep probefw.SweepReport
 	log := logf.FromContext(ctx)
 
@@ -110,19 +132,33 @@ func (c *topologySpreadZoneDeadlockCheck) Run(ctx context.Context) probefw.Resul
 		return carryTopologyOnErr(&rep, &c.emitted, err, "list statefulsets")
 	}
 
+	// Zones recorded on already-relaxed workloads survive pod
+	// restarts and a controller that briefly drops the annotation.
+	// They are merged into the known set ONLY when a real worker for
+	// that zone still exists: a recorded zone whose nodes are all
+	// gone was deleted, and keeping it known with zero healthy
+	// workers would pin the restore deadlock forever.
+	recordedZones := topologyRecordedZones(ctx, deploys, stss)
 	healthyInZone := map[string]int{}
+	presentWorkerZones := map[string]bool{}
 	for i := range nodes {
 		n := &nodes[i]
-		if kube.IsControlPlane(n) {
+		if kube.IsControlPlane(n) || isVirtualWorkerNode(n) {
 			continue
 		}
 		z := n.Labels[topologyZoneKey]
 		if z == "" {
 			continue
 		}
+		presentWorkerZones[z] = true
 		c.knownZones[z] = true
 		if isWorkerReadyUncordoned(n) {
 			healthyInZone[z]++
+		}
+	}
+	for z := range recordedZones {
+		if presentWorkerZones[z] {
+			c.knownZones[z] = true
 		}
 	}
 
@@ -199,6 +235,12 @@ func (c *topologySpreadZoneDeadlockCheck) Run(ctx context.Context) probefw.Resul
 
 		for i := range pods {
 			p := &pods[i]
+			// Control-plane / GitOps namespaces manage their own
+			// scheduling; relaxing their constraints would fight
+			// the operator that owns them.
+			if subPathSystemNamespaces[p.Namespace] {
+				continue
+			}
 			if p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodPending {
 				continue
 			}
@@ -224,13 +266,15 @@ func (c *topologySpreadZoneDeadlockCheck) Run(ctx context.Context) probefw.Resul
 			switch wKind {
 			case "Deployment":
 				dep := deployMap[p.Namespace+"/"+wName]
-				if dep == nil || !hasZoneDoNotScheduleConstraint(dep.Spec.Template.Spec.TopologySpreadConstraints) {
+				if dep == nil || dep.Spec.Paused ||
+					!hasZoneDoNotScheduleConstraint(dep.Spec.Template.Spec.TopologySpreadConstraints) {
 					continue
 				}
 				blocked[wMapKey] = targetWorkload{kind: "Deployment", ns: p.Namespace, name: wName, dep: dep}
 			case "StatefulSet":
 				sts := stsMap[p.Namespace+"/"+wName]
-				if sts == nil || !hasZoneDoNotScheduleConstraint(sts.Spec.Template.Spec.TopologySpreadConstraints) {
+				if sts == nil ||
+					!hasZoneDoNotScheduleConstraint(sts.Spec.Template.Spec.TopologySpreadConstraints) {
 					continue
 				}
 				blocked[wMapKey] = targetWorkload{kind: "StatefulSet", ns: p.Namespace, name: wName, sts: sts}
@@ -250,21 +294,21 @@ func (c *topologySpreadZoneDeadlockCheck) Run(ctx context.Context) probefw.Resul
 			}
 			switch tw.kind {
 			case "Deployment":
-				if !eligibleDeploymentForRelax(tw.dep) {
+				if !eligibleDeploymentForRelax(ctx, tw.dep) {
 					continue
 				}
-				c.relaxDeployment(ctx, log, tw.dep, now)
+				c.relaxDeployment(ctx, log, &rep, tw.dep, confirmedDeadZones, now)
 			case "StatefulSet":
-				if tw.sts.Annotations[kube.AnnoTopologyRelaxOptIn] != "true" {
+				if kube.EffectiveAnnos(ctx, tw.sts)[kube.AnnoTopologyRelaxOptIn] != "true" {
 					continue
 				}
-				c.relaxStatefulSet(ctx, log, tw.sts, now)
+				c.relaxStatefulSet(ctx, log, &rep, tw.sts, confirmedDeadZones, now)
 			}
 		}
 	}
 
 	if allZonesHealthyPersisted && c.relaxEnabled {
-		c.restoreRelaxedWorkloads(ctx, log, deploys, stss, now)
+		c.restoreRelaxedWorkloads(ctx, log, &rep, deploys, stss, healthyZoneCount, now)
 	}
 
 	return rep.Result(&c.emitted, topologyZoneDeadlockGauge.DeleteLabelValues,
@@ -284,7 +328,71 @@ func isWorkerReadyUncordoned(n *corev1.Node) bool {
 	if !kube.NodeReady(n) || n.Spec.Unschedulable {
 		return false
 	}
-	return !kube.HasTaint(n.Spec.Taints, corev1.TaintNodeUnschedulable)
+	if kube.HasTaint(n.Spec.Taints, corev1.TaintNodeUnschedulable) {
+		return false
+	}
+	// A remediation taint (kubelet-unresponsive, etc.) makes the node
+	// just as unschedulable as a cordon — counting it healthy here is
+	// what let a dead zone look alive while pods stayed Pending.
+	return !kube.HasRemediationTaint(n)
+}
+
+// isVirtualWorkerNode filters liqo / virtual-kubelet shadow nodes out
+// of the zone census: they carry zone labels but run no real workload
+// capacity, so counting one as the zone's last healthy worker hides
+// a genuinely dead zone. Besides the liqo and provider labels, some
+// clusters stamp plain type=virtual-kubelet on the node or give it the
+// stable node.kubernetes.io/instance-type=external label (virtual /
+// out-of-cluster capacity).
+func isVirtualWorkerNode(n *corev1.Node) bool {
+	if n.Labels["liqo.io/type"] == "virtual-node" {
+		return true
+	}
+	if n.Labels["virtual-kubelet.io/provider"] != "" {
+		return true
+	}
+	if n.Labels["type"] == "virtual-kubelet" {
+		return true
+	}
+	return n.Labels[corev1.LabelInstanceTypeStable] == "external"
+}
+
+// topologyRecordedZones collects the dead zones named on workloads
+// already carrying AnnoTopologyRelaxedBy. The value also survives a
+// pod restart / controller rewrite that temporarily drops the
+// annotation's structured payload, keeping the zone attribution
+// stable across such a gap.
+func topologyRecordedZones(ctx context.Context, deploys []appsv1.Deployment, stss []appsv1.StatefulSet) map[string]bool {
+	out := map[string]bool{}
+	add := func(anno string) {
+		rec, ok := parseTopologyRelaxRecord(anno)
+		if !ok {
+			return
+		}
+		for _, z := range rec.Zones {
+			if z != "" {
+				out[z] = true
+			}
+		}
+	}
+	for i := range deploys {
+		add(kube.EffectiveAnnos(ctx, &deploys[i])[kube.AnnoTopologyRelaxedBy])
+	}
+	for i := range stss {
+		add(kube.EffectiveAnnos(ctx, &stss[i])[kube.AnnoTopologyRelaxedBy])
+	}
+	return out
+}
+
+func parseTopologyRelaxRecord(anno string) (topologyRelaxRecord, bool) {
+	var rec topologyRelaxRecord
+	if anno == "" || json.Unmarshal([]byte(anno), &rec) != nil {
+		return rec, false
+	}
+	if rec.By != topologyRelaxedMarkerValue {
+		return rec, false
+	}
+	return rec, true
 }
 
 func findPodCondition(p *corev1.Pod, t corev1.PodConditionType) *corev1.PodCondition {
@@ -334,31 +442,19 @@ func hasZoneScheduleAnywayConstraint(tscs []corev1.TopologySpreadConstraint) boo
 	return false
 }
 
-func eligibleDeploymentForRelax(dep *appsv1.Deployment) bool {
-	if dep.Annotations[kube.AnnoTopologyRelaxOptOut] == "true" {
+func eligibleDeploymentForRelax(ctx context.Context, dep *appsv1.Deployment) bool {
+	if kube.EffectiveAnnos(ctx, dep)[kube.AnnoTopologyRelaxOptOut] == "true" {
 		return false
 	}
-	for _, k := range subPathDBQuorumLabels {
-		if dep.Spec.Template.Labels[k] != "" {
-			return false
-		}
-	}
-	return true
+	// Share the full DB-quorum signature with the other watchdogs —
+	// a partial label list let a Percona/Dragonfly cluster through.
+	return !isSubPathDBQuorumWorkload(dep.Spec.Template.Labels)
 }
 
-func rewriteZoneConstraintsPatch(tscs []corev1.TopologySpreadConstraint, target corev1.UnsatisfiableConstraintAction, annoVal any) ([]byte, bool) {
-	updated := make([]corev1.TopologySpreadConstraint, len(tscs))
-	changed := false
-	for i := range tscs {
-		updated[i] = tscs[i]
-		if updated[i].TopologyKey == topologyZoneKey && updated[i].WhenUnsatisfiable != target {
-			updated[i].WhenUnsatisfiable = target
-			changed = true
-		}
-	}
-	if !changed {
-		return nil, false
-	}
+// zoneConstraintsPatch renders the template-spec + annotation half of
+// a relax or restore in ONE merge patch. annoVal nil deletes the
+// annotation (the restore direction).
+func zoneConstraintsPatch(updated []corev1.TopologySpreadConstraint, annoVal any) ([]byte, bool) {
 	doc := map[string]any{
 		"metadata": map[string]any{
 			"annotations": map[string]any{
@@ -380,15 +476,145 @@ func rewriteZoneConstraintsPatch(tscs []corev1.TopologySpreadConstraint, target 
 	return payload, true
 }
 
+// relaxZoneConstraintsPatch flips ONLY zone DoNotSchedule constraints
+// to ScheduleAnyway and records each changed index with its original
+// minDomains. MinDomains MUST be cleared: the apiserver rejects a
+// ScheduleAnyway constraint carrying minDomains with 422 Invalid.
+func relaxZoneConstraintsPatch(tscs []corev1.TopologySpreadConstraint,
+	deadZones []string) (payload []byte, rec topologyRelaxRecord, ok bool) {
+
+	updated := make([]corev1.TopologySpreadConstraint, len(tscs))
+	rec = topologyRelaxRecord{
+		By:    topologyRelaxedMarkerValue,
+		Zones: slices.Clone(deadZones),
+	}
+	for i := range tscs {
+		updated[i] = tscs[i]
+		if tscs[i].TopologyKey != topologyZoneKey ||
+			tscs[i].WhenUnsatisfiable != corev1.DoNotSchedule {
+			continue
+		}
+		rec.Relaxed = append(rec.Relaxed, topologyRelaxEntry{
+			Index: i, MinDomains: tscs[i].MinDomains,
+		})
+		updated[i].WhenUnsatisfiable = corev1.ScheduleAnyway
+		updated[i].MinDomains = nil
+	}
+	if len(rec.Relaxed) == 0 {
+		return nil, rec, false
+	}
+	anno, err := json.Marshal(rec)
+	if err != nil {
+		return nil, rec, false
+	}
+	payload, ok = zoneConstraintsPatch(updated, string(anno))
+	return payload, rec, ok
+}
+
+// restoreZoneConstraintsPatch reverses ONLY the recorded indices, and
+// only while they are still ScheduleAnyway on the zone key — a
+// ScheduleAnyway constraint the user added afterwards is never
+// overwritten. Each original minDomains is put back so the constraint
+// is byte-for-byte the one the user had before the relax. An exception
+// is a zone that lost ALL its workers between relax and restore: the
+// surviving-zone count makes a previously-valid minDomains a 422
+// Invalid, so that entry stays relaxed AND stays in the annotation for
+// a later sweep with enough healthy zones. Stale entries (index gone
+// or constraint no longer relaxed) are dropped. When no entry can be
+// restored at all, no patch is emitted — rewriting an unchanged spec
+// and annotation would only burn a heal grant.
+func restoreZoneConstraintsPatch(tscs []corev1.TopologySpreadConstraint,
+	anno string, healthyZoneCount int) ([]byte, bool) {
+
+	rec, valid := parseTopologyRelaxRecord(anno)
+	if !valid {
+		return nil, false
+	}
+	updated := make([]corev1.TopologySpreadConstraint, len(tscs))
+	copy(updated, tscs)
+	deferred := make([]topologyRelaxEntry, 0, len(rec.Relaxed))
+	restored := 0
+	for _, e := range rec.Relaxed {
+		if e.Index < 0 || e.Index >= len(updated) {
+			continue // stale index — nothing left to restore
+		}
+		if e.MinDomains != nil && *e.MinDomains > int32(healthyZoneCount) {
+			deferred = append(deferred, e) // keep for a later sweep
+			continue
+		}
+		c := &updated[e.Index]
+		if c.TopologyKey != topologyZoneKey || c.WhenUnsatisfiable != corev1.ScheduleAnyway {
+			continue // stale constraint — someone else moved it
+		}
+		c.WhenUnsatisfiable = corev1.DoNotSchedule
+		c.MinDomains = e.MinDomains
+		restored++
+	}
+	if restored == 0 {
+		return nil, false // nothing to restore — no useless patch
+	}
+	// Drop the annotation only when EVERY entry was restored. Keeping
+	// the deferred entries (and the zone attribution) lets a later
+	// sweep with more healthy zones finish the restore; dropping it
+	// would leave those constraints relaxed forever with no record.
+	var annoVal any
+	if len(deferred) > 0 {
+		rec.Relaxed = deferred
+		kept, err := json.Marshal(rec)
+		if err != nil {
+			return nil, false
+		}
+		annoVal = string(kept)
+	}
+	return zoneConstraintsPatch(updated, annoVal)
+}
+
+// dropTopologyRelaxAnno removes ONLY AnnoTopologyRelaxedBy. It is the
+// patch for an orphan marker: an unparseable record, an empty relaxed
+// list, or a workload whose constraints are no longer relaxed. There
+// is nothing to restore in those cases, but leaving the annotation
+// would keep the zone attribution alive and invite another replay.
+func dropTopologyRelaxAnno() ([]byte, bool) {
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]any{kube.AnnoTopologyRelaxedBy: nil},
+		},
+	})
+	if err != nil {
+		return nil, false
+	}
+	return payload, true
+}
+
+// restorePatchFor picks the merge patch for a workload that still
+// carries AnnoTopologyRelaxedBy: an exact-index restore when the record
+// and a relaxed zone constraint are both present, otherwise the
+// annotation-only cleanup for an orphan.
+func (c *topologySpreadZoneDeadlockCheck) restorePatchFor(tscs []corev1.TopologySpreadConstraint,
+	anno string, healthyZoneCount int) ([]byte, bool) {
+
+	rec, valid := parseTopologyRelaxRecord(anno)
+	if valid && len(rec.Relaxed) > 0 && hasZoneScheduleAnywayConstraint(tscs) {
+		return restoreZoneConstraintsPatch(tscs, anno, healthyZoneCount)
+	}
+	return dropTopologyRelaxAnno()
+}
+
 func (c *topologySpreadZoneDeadlockCheck) relaxDeployment(ctx context.Context, log interface {
 	Info(string, ...any)
 	Error(error, string, ...any)
-}, dep *appsv1.Deployment, now time.Time) {
+}, rep *probefw.SweepReport, dep *appsv1.Deployment, deadZones []string, now time.Time) {
 	wKey := dep.Namespace + "/Deployment/" + dep.Name
-	proceed, unverifiable := c.HealAllowed(ctx, logf.FromContext(ctx), &c.healCooldowns, wKey, topologyPatchCooldown, now)
+	// Cluster-wide-only: a dead zone is usually cordoned (a node-scoped
+	// maintenance hold). HealAllowed would let that very cordon defer
+	// the relax that exists to unblock scheduling in that zone.
+	proceed, unverifiable := c.HealAllowedClusterWideOnly(ctx, logf.FromContext(ctx),
+		&c.healCooldowns, wKey, topologyPatchCooldown, now)
 	if !proceed {
 		if unverifiable {
-			log.Error(errors.New("maintenance mutex unverifiable"), "skip relax deployment", "workload", wKey)
+			infraErr := errors.New("maintenance mutex unverifiable — relax deployment deferred")
+			rep.InfraErr(infraErr)
+			log.Error(infraErr, "skip relax deployment", "workload", wKey)
 		}
 		return
 	}
@@ -397,12 +623,13 @@ func (c *topologySpreadZoneDeadlockCheck) relaxDeployment(ctx context.Context, l
 		heal.RefundGrant(now)
 		return
 	}
-	payload, ok := rewriteZoneConstraintsPatch(dep.Spec.Template.Spec.TopologySpreadConstraints, corev1.ScheduleAnyway, topologyRelaxedMarkerValue)
+	payload, _, ok := relaxZoneConstraintsPatch(dep.Spec.Template.Spec.TopologySpreadConstraints, deadZones)
 	if !ok {
 		heal.RefundGrant(now)
 		return
 	}
 	if _, err := c.CS.AppsV1().Deployments(dep.Namespace).Patch(ctx, dep.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		rep.InfraErr(fmt.Errorf("topology zone relax Deployment %s: %w", wKey, err))
 		log.Error(err, "topology zone relax Deployment patch failed", "workload", wKey)
 		return
 	}
@@ -414,12 +641,15 @@ func (c *topologySpreadZoneDeadlockCheck) relaxDeployment(ctx context.Context, l
 func (c *topologySpreadZoneDeadlockCheck) relaxStatefulSet(ctx context.Context, log interface {
 	Info(string, ...any)
 	Error(error, string, ...any)
-}, sts *appsv1.StatefulSet, now time.Time) {
+}, rep *probefw.SweepReport, sts *appsv1.StatefulSet, deadZones []string, now time.Time) {
 	wKey := sts.Namespace + "/StatefulSet/" + sts.Name
-	proceed, unverifiable := c.HealAllowed(ctx, logf.FromContext(ctx), &c.healCooldowns, wKey, topologyPatchCooldown, now)
+	proceed, unverifiable := c.HealAllowedClusterWideOnly(ctx, logf.FromContext(ctx),
+		&c.healCooldowns, wKey, topologyPatchCooldown, now)
 	if !proceed {
 		if unverifiable {
-			log.Error(errors.New("maintenance mutex unverifiable"), "skip relax statefulset", "workload", wKey)
+			infraErr := errors.New("maintenance mutex unverifiable — relax statefulset deferred")
+			rep.InfraErr(infraErr)
+			log.Error(infraErr, "skip relax statefulset", "workload", wKey)
 		}
 		return
 	}
@@ -428,12 +658,13 @@ func (c *topologySpreadZoneDeadlockCheck) relaxStatefulSet(ctx context.Context, 
 		heal.RefundGrant(now)
 		return
 	}
-	payload, ok := rewriteZoneConstraintsPatch(sts.Spec.Template.Spec.TopologySpreadConstraints, corev1.ScheduleAnyway, topologyRelaxedMarkerValue)
+	payload, _, ok := relaxZoneConstraintsPatch(sts.Spec.Template.Spec.TopologySpreadConstraints, deadZones)
 	if !ok {
 		heal.RefundGrant(now)
 		return
 	}
 	if _, err := c.CS.AppsV1().StatefulSets(sts.Namespace).Patch(ctx, sts.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		rep.InfraErr(fmt.Errorf("topology zone relax StatefulSet %s: %w", wKey, err))
 		log.Error(err, "topology zone relax StatefulSet patch failed", "workload", wKey)
 		return
 	}
@@ -445,16 +676,26 @@ func (c *topologySpreadZoneDeadlockCheck) relaxStatefulSet(ctx context.Context, 
 func (c *topologySpreadZoneDeadlockCheck) restoreRelaxedWorkloads(ctx context.Context, log interface {
 	Info(string, ...any)
 	Error(error, string, ...any)
-}, deploys []appsv1.Deployment, stss []appsv1.StatefulSet, now time.Time) {
+}, rep *probefw.SweepReport, deploys []appsv1.Deployment, stss []appsv1.StatefulSet, healthyZoneCount int, now time.Time) {
 	for i := range deploys {
 		dep := &deploys[i]
-		if dep.Annotations[kube.AnnoTopologyRelaxedBy] == "" ||
-			!hasZoneScheduleAnywayConstraint(dep.Spec.Template.Spec.TopologySpreadConstraints) {
+		anno := kube.EffectiveAnnos(ctx, dep)[kube.AnnoTopologyRelaxedBy]
+		if anno == "" || dep.Spec.Paused {
+			continue
+		}
+		payload, ok := c.restorePatchFor(dep.Spec.Template.Spec.TopologySpreadConstraints, anno, healthyZoneCount)
+		if !ok {
 			continue
 		}
 		wKey := dep.Namespace + "/Deployment/" + dep.Name
-		proceed, _ := c.HealAllowed(ctx, logf.FromContext(ctx), &c.healCooldowns, wKey, topologyPatchCooldown, now)
+		proceed, unverifiable := c.HealAllowedClusterWideOnly(ctx, logf.FromContext(ctx),
+			&c.healCooldowns, wKey, topologyPatchCooldown, now)
 		if !proceed {
+			if unverifiable {
+				infraErr := errors.New("maintenance mutex unverifiable — restore deployment deferred")
+				rep.InfraErr(infraErr)
+				log.Error(infraErr, "skip restore deployment", "workload", wKey)
+			}
 			continue
 		}
 		if !kube.TryReserveWorkloadKey(ctx, wKey) ||
@@ -462,12 +703,8 @@ func (c *topologySpreadZoneDeadlockCheck) restoreRelaxedWorkloads(ctx context.Co
 			heal.RefundGrant(now)
 			continue
 		}
-		payload, ok := rewriteZoneConstraintsPatch(dep.Spec.Template.Spec.TopologySpreadConstraints, corev1.DoNotSchedule, nil)
-		if !ok {
-			heal.RefundGrant(now)
-			continue
-		}
 		if _, err := c.CS.AppsV1().Deployments(dep.Namespace).Patch(ctx, dep.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+			rep.InfraErr(fmt.Errorf("topology zone restore Deployment %s: %w", wKey, err))
 			log.Error(err, "topology zone restore Deployment patch failed", "workload", wKey)
 			continue
 		}
@@ -477,13 +714,23 @@ func (c *topologySpreadZoneDeadlockCheck) restoreRelaxedWorkloads(ctx context.Co
 	}
 	for i := range stss {
 		sts := &stss[i]
-		if sts.Annotations[kube.AnnoTopologyRelaxedBy] == "" ||
-			!hasZoneScheduleAnywayConstraint(sts.Spec.Template.Spec.TopologySpreadConstraints) {
+		anno := kube.EffectiveAnnos(ctx, sts)[kube.AnnoTopologyRelaxedBy]
+		if anno == "" {
+			continue
+		}
+		payload, ok := c.restorePatchFor(sts.Spec.Template.Spec.TopologySpreadConstraints, anno, healthyZoneCount)
+		if !ok {
 			continue
 		}
 		wKey := sts.Namespace + "/StatefulSet/" + sts.Name
-		proceed, _ := c.HealAllowed(ctx, logf.FromContext(ctx), &c.healCooldowns, wKey, topologyPatchCooldown, now)
+		proceed, unverifiable := c.HealAllowedClusterWideOnly(ctx, logf.FromContext(ctx),
+			&c.healCooldowns, wKey, topologyPatchCooldown, now)
 		if !proceed {
+			if unverifiable {
+				infraErr := errors.New("maintenance mutex unverifiable — restore statefulset deferred")
+				rep.InfraErr(infraErr)
+				log.Error(infraErr, "skip restore statefulset", "workload", wKey)
+			}
 			continue
 		}
 		if !kube.TryReserveWorkloadKey(ctx, wKey) ||
@@ -491,12 +738,8 @@ func (c *topologySpreadZoneDeadlockCheck) restoreRelaxedWorkloads(ctx context.Co
 			heal.RefundGrant(now)
 			continue
 		}
-		payload, ok := rewriteZoneConstraintsPatch(sts.Spec.Template.Spec.TopologySpreadConstraints, corev1.DoNotSchedule, nil)
-		if !ok {
-			heal.RefundGrant(now)
-			continue
-		}
 		if _, err := c.CS.AppsV1().StatefulSets(sts.Namespace).Patch(ctx, sts.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+			rep.InfraErr(fmt.Errorf("topology zone restore StatefulSet %s: %w", wKey, err))
 			log.Error(err, "topology zone restore StatefulSet patch failed", "workload", wKey)
 			continue
 		}

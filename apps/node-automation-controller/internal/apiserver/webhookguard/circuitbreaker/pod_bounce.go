@@ -98,7 +98,7 @@ func (b *Breaker) bounceServiceKeys(ctx context.Context, snap *guardstate.Snapsh
 				"service", key, "reason", reason)
 			continue
 		}
-		b.deleteBouncePod(ctx, snap, key, target, now)
+		b.deleteBouncePod(ctx, snap, key, target, now, reason)
 	}
 }
 
@@ -139,7 +139,11 @@ func (b *Breaker) oldestLiveBackingPod(ctx context.Context, snap *guardstate.Sna
 }
 
 // deleteBouncePod runs the whole preamble→actuation pair for a
-// pre-resolved bounce target in ONE call (heal.EvictPodV): the
+// pre-resolved bounce target in ONE call (heal.EvictPodV). reason is
+// the caller's trigger ("hung TCP+TLS handshake" / "degraded admission
+// latency/5xx") and rides the BOUNCE log so an operator can tell which
+// duty killed the pod; the older hardcoded handshake text hid the
+// Prometheus-driven bounces behind a misleading message. The
 // per-service cooldown on the shared bounceAt ledger, the maintenance
 // mutex (memoized through the Guard verdict) and the fleet-wide heal
 // budget grant, then the UID-preconditioned eviction through the
@@ -156,7 +160,7 @@ func (b *Breaker) oldestLiveBackingPod(ctx context.Context, snap *guardstate.Sna
 // bounce only — a failed eviction leaves the pod hung and the next
 // sweep retries.
 func (b *Breaker) deleteBouncePod(ctx context.Context, snap *guardstate.Snapshot,
-	svcKey string, target *corev1.Pod, now time.Time) {
+	svcKey string, target *corev1.Pod, now time.Time, reason string) {
 	g := snap.G
 	log := logf.FromContext(ctx)
 	proceed, unverifiable, _, refused, err := heal.EvictPodV(ctx, log,
@@ -171,8 +175,9 @@ func (b *Breaker) deleteBouncePod(ctx context.Context, snap *guardstate.Snapshot
 		}
 		return
 	}
-	log.Info("BOUNCE: evicting oldest Ready webhook pod — hung TCP+TLS handshake",
+	log.Info("BOUNCE: evicting oldest Ready webhook pod — "+reason,
 		"service", svcKey, "pod", target.Namespace+"/"+target.Name,
+		"reason", reason,
 		"age", now.Sub(target.CreationTimestamp.Time).Truncate(time.Second))
 	switch {
 	case refused:

@@ -80,7 +80,7 @@ func TestServiceSelectorBlackholeZeroMatchAndPortMismatch(t *testing.T) {
 	chk := probetest.MustCheck[*serviceSelectorBlackholeCheck](t, p)
 
 	// Sweep 1 (T=0): first seen -> Pass=true, no metrics yet.
-	res1 := chk.Run(probetest.SweepCtx(ctx))
+	res1 := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if !res1.Pass {
 		t.Fatalf("expected Pass before 10m persistence window, got %+v", res1)
 	}
@@ -88,7 +88,7 @@ func TestServiceSelectorBlackholeZeroMatchAndPortMismatch(t *testing.T) {
 	// Sweep 2 (T+10m): both blackholes persist >=10m -> flagged + Events emitted.
 	now = now.Add(10 * time.Minute)
 	p.InvalidatePods(ctx)
-	res2 := chk.Run(probetest.SweepCtx(ctx))
+	res2 := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res2.Pass {
 		t.Fatalf("expected failure after >=10m blackhole")
 	}
@@ -117,5 +117,122 @@ func TestServiceSelectorBlackholeZeroMatchAndPortMismatch(t *testing.T) {
 	}
 	if !foundHint {
 		t.Fatalf("expected nearest workload hint Deployment/api in Event note, got %+v", evs.Items)
+	}
+}
+
+func TestServiceSelectorBlackholeArgoRolloutScaledZeroAndNativeSidecar(t *testing.T) {
+	serviceBlackholeGauge.Reset()
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	ctrl := true
+
+	// An Argo Rollout parked at zero has no Deployment — its RS is the
+	// only workload the check can see.
+	rolled := clusterIPService("apps", "rollout-svc", map[string]string{"app": "rollout"})
+	zeroRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "rollout-abc123",
+		Labels:      map[string]string{"app": "rollout"},
+		Annotations: map[string]string{annoRolloutDesiredReplicas: "0"},
+		OwnerReferences: []metav1.OwnerReference{{
+			Kind: "Rollout", Name: "rollout", APIVersion: "argoproj.io/v1alpha1", Controller: &ctrl,
+		}},
+	}}
+
+	// A native sidecar owns the named targetPort; a Ready main
+	// container alone must not be read as a port mismatch.
+	sideSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "sidecar-svc", UID: "s3"},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.96.0.30",
+			Selector:  map[string]string{"app": "side"},
+			Ports:     []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromString("grpc")}},
+		},
+	}
+	always := corev1.ContainerRestartPolicyAlways
+	sidePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "side-0", Labels: map[string]string{"app": "side"}},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}}},
+			InitContainers: []corev1.Container{{
+				Name: "proxy", RestartPolicy: &always,
+				Ports: []corev1.ContainerPort{{Name: "grpc", ContainerPort: 9090}},
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cs := fake.NewSimpleClientset(rolled, zeroRS, sideSvc, sidePod)
+	p := testProber(cs)
+	p.Now = func() time.Time { return now }
+	chk := probetest.MustCheck[*serviceSelectorBlackholeCheck](t, p)
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+		t.Fatalf("unexpected finding: %+v", res)
+	}
+	now = now.Add(10 * time.Minute)
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+		t.Fatalf("a parked Rollout / native sidecar must not be flagged: %+v", res)
+	}
+	for _, name := range []string{"rollout-svc", "sidecar-svc"} {
+		if v := ptestutil.ToFloat64(serviceBlackholeGauge.WithLabelValues("apps", name, "selector_zero_match")); v != 0 {
+			t.Errorf("%s selector_zero_match = %v, want 0", name, v)
+		}
+		if v := ptestutil.ToFloat64(serviceBlackholeGauge.WithLabelValues("apps", name, "target_port_mismatch")); v != 0 {
+			t.Errorf("%s target_port_mismatch = %v, want 0", name, v)
+		}
+	}
+}
+
+// Argo leaves old revision ReplicaSets behind. If the parked Rollout's
+// latest revision RS (desired-replicas=0) is outvoted by an older RS
+// still carrying a stale "desired-replicas=1", the Service looks like
+// a genuinely empty selector and fires a false blackhole. Only the
+// highest revision per Rollout may represent current intent.
+func TestServiceSelectorBlackholeOnlyLatestRolloutRevision(t *testing.T) {
+	serviceBlackholeGauge.Reset()
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	ctrl := true
+	owner := []metav1.OwnerReference{{
+		Kind: "Rollout", Name: "rollout", APIVersion: "argoproj.io/v1alpha1", Controller: &ctrl,
+	}}
+	labels := map[string]string{"app": "rollout"}
+
+	svc := clusterIPService("apps", "rollout-svc", labels)
+	oldRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "rollout-old", Labels: labels,
+		Annotations: map[string]string{
+			annoRolloutRevision:        "1",
+			annoRolloutDesiredReplicas: "1", // stale — not actually running
+		},
+		OwnerReferences: owner,
+	}}
+	latestRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "rollout-latest", Labels: labels,
+		Annotations: map[string]string{
+			annoRolloutRevision:        "2",
+			annoRolloutDesiredReplicas: "0", // parked
+		},
+		OwnerReferences: owner,
+	}}
+	// A pod in the namespace keeps the Service in scope; it simply does
+	// not match the selector (no EndpointSlices => 0 ready endpoints).
+	otherPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "apps", Name: "other-0", Labels: map[string]string{"app": "other"},
+	}}
+
+	cs := fake.NewSimpleClientset(svc, oldRS, latestRS, otherPod)
+	p := testProber(cs)
+	p.Now = func() time.Time { return now }
+	chk := probetest.MustCheck[*serviceSelectorBlackholeCheck](t, p)
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+		t.Fatalf("T=0: %+v", res)
+	}
+	now = now.Add(10 * time.Minute)
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+		t.Fatalf("parked Rollout must not be flagged: %+v", res)
+	}
+	if v := ptestutil.ToFloat64(serviceBlackholeGauge.WithLabelValues("apps", "rollout-svc", "selector_zero_match")); v != 0 {
+		t.Fatalf("rollout-svc selector_zero_match = %v, want 0 — older revision RS skewed the verdict", v)
 	}
 }

@@ -304,13 +304,25 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 				continue
 			}
 			fk := "fence/" + ns + "/" + name + "/" + inst
-			fenceLive[fk] = true
-			if !probefw.Persisted(&p.cnpgFenceSeen, fk, now, minAge, log) {
+			// Safety gates FIRST: the 15m first-seen window must
+			// only mature while this instance is a legitimate
+			// unfence candidate. Starting it on a fenced pod that
+			// is mid-failover, or whose node is broken, would let
+			// a single Ready flicker unfence it with zero settle
+			// time.
+			if inst == curPrimary || inst == tgtPrimary || failoverInFlight ||
+				!canUnfence ||
+				!cnpgInstanceOnHealthyNode(ctx, pods, nodeByName, ns, name, inst) {
 				continue
 			}
-			if inst == curPrimary || inst == tgtPrimary || failoverInFlight ||
-				!cnpgInstanceOnHealthyNode(pods, nodeByName, ns, name, inst) ||
-				!canUnfence {
+			// Keep the ledger key alive ONLY for instances whose
+			// window is legitimately maturing. The prune below
+			// drops keys that went unsafe — a node that drops
+			// NotReady, or a failover that starts mid-window,
+			// resets the counter instead of banking elapsed time
+			// that a later single healthy sweep could spend.
+			fenceLive[fk] = true
+			if !probefw.Persisted(&p.cnpgFenceSeen, fk, now, minAge, log) {
 				continue
 			}
 			key := probefw.SelfHealKey(
@@ -360,12 +372,13 @@ func cnpgFencedInstanceList(ctx context.Context, cr *unstructured.Unstructured) 
 }
 
 // cnpgInstanceOnHealthyNode reports whether the fenced instance's
-// pod is Running on a node that is Ready, schedulable and free of
-// every remediation/out-of-service taint — the evidence that the
-// fence is stale rather than protective. A missing pod or node
-// census, a non-Running pod, or an unverifiable node all read false
-// (fail closed — never unfence on partial evidence).
-func cnpgInstanceOnHealthyNode(pods []corev1.Pod,
+// pod is Running and Ready, not terminating or already reaped by a
+// sibling heal this sweep, on a node that is Ready, schedulable and
+// free of every remediation/out-of-service taint — the evidence that
+// the fence is stale rather than protective. A missing pod or node
+// census, a non-Running/unready pod, or an unverifiable node all
+// read false (fail closed — never unfence on partial evidence).
+func cnpgInstanceOnHealthyNode(ctx context.Context, pods []corev1.Pod,
 	nodeByName map[string]*corev1.Node, ns, cluster, inst string) bool {
 
 	var pod *corev1.Pod
@@ -392,7 +405,9 @@ func cnpgInstanceOnHealthyNode(pods []corev1.Pod,
 		}
 	}
 	if pod == nil || pod.Spec.NodeName == "" ||
-		pod.Status.Phase != corev1.PodRunning {
+		pod.Status.Phase != corev1.PodRunning ||
+		pod.DeletionTimestamp != nil || kube.IsPodDeleted(ctx, pod.UID) ||
+		!kube.PodReadyCond(pod) {
 		return false
 	}
 	node := nodeByName[pod.Spec.NodeName]

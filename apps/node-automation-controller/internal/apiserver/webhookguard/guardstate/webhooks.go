@@ -161,7 +161,8 @@ func FailClosed(fp *admissionv1.FailurePolicyType) bool {
 // consumer is the unmeshed-pod remediation, which runs only when
 // unmeshed candidates exist, so the census + config-list inputs are
 // drawn from the shared run snapshot (the census is computed lazily on
-// first use — see Snapshot).
+// first use — see Snapshot). A missing MWC list reads as "not healthy",
+// never a panic and never a false green light for remediation.
 func InjectorHealthy(snap *Snapshot) (bool, error) {
 	ready, err := snap.ReadyCounts()
 	if err != nil {
@@ -171,6 +172,15 @@ func InjectorHealthy(snap *Snapshot) (bool, error) {
 		return false, fmt.Errorf("list mutatingwebhookconfigurations — injector health unknown: %w", snap.MWCErr)
 	}
 	mwcs := snap.MWC
+	if mwcs == nil {
+		// A partial snapshot (or a duty that skipped the MWC census)
+		// must fail closed — never panic and never report "healthy"
+		// when the injector's config could not be inspected
+		// (wave3.2/injector-nil-guard).
+		logf.FromContext(snap.Ctx).Info(
+			"injector health: no mutatingwebhookconfiguration list — not healthy")
+		return false, nil
+	}
 	found := false
 	for i := range mwcs.Items {
 		cfg := &mwcs.Items[i]

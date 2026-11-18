@@ -44,9 +44,9 @@ var cnpgDBBackupAudit = dbBackupAudit{
 	backupGVR:      cnpgBackupGVR,
 	primaryListErr: "list cnpg scheduledbackups",
 	backupListErr:  "list cnpg backups",
-	listBackups: func(primary *unstructured.UnstructuredList) bool {
+	listBackups: func(primaryCount int) bool {
 		// No schedules — skip the Backup read entirely.
-		return len(primary.Items) > 0
+		return primaryCount > 0
 	},
 	ownerPath: []string{"spec", "clusterName"},
 	identity: func(sb *unstructured.Unstructured) (string, string, bool) {

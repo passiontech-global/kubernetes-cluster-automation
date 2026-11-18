@@ -25,6 +25,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -342,6 +343,55 @@ func TestCiliumIdentityAuditorGCAbortsOnNotReadyNode(t *testing.T) {
 	}
 	if !identityExists(t, dyn, "8001") {
 		t.Fatal("identity deleted while a node was NotReady")
+	}
+}
+
+// A remediation/fence taint freezes deletion even when the node still
+// reports Ready=True: a wedged kubelet's endpoint view is stale, so
+// its "orphan" identities may still be live (wave3.2/gc-storm-gate).
+func TestCiliumIdentityAuditorGCAbortsOnRemediationTaint(t *testing.T) {
+	for _, key := range []string{
+		kube.TaintKubeletUnresponsive,
+		kube.TaintNetworkPartitioned,
+		kube.TaintNodeOutOfService,
+	} {
+		t.Run(key, func(t *testing.T) {
+			now := time.Now()
+			dyn := testutil.NewDynamicClient(ciliumIdentityAged("8101", now.Add(-time.Hour)))
+			tainted := readyNode("n1")
+			tainted.Spec.Taints = []corev1.Taint{{Key: key, Effect: corev1.TaintEffectNoSchedule}}
+			cs := fake.NewSimpleClientset(tainted)
+			a := newGCAuditor(cs, dyn, now)
+			a.orphanFirstSeen.Observe("8101", now.Add(-time.Hour))
+
+			if err := a.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if !identityExists(t, dyn, "8101") {
+				t.Fatalf("identity deleted while n1 carried %s", key)
+			}
+		})
+	}
+}
+
+// An explicit NetworkPartitioned condition is the same "API view is
+// stale" signal as a taint — a Ready node reporting it must also
+// freeze the GC (wave3.2/gc-storm-gate).
+func TestCiliumIdentityAuditorGCAbortsOnNetworkPartitionedCondition(t *testing.T) {
+	now := time.Now()
+	dyn := testutil.NewDynamicClient(ciliumIdentityAged("8102", now.Add(-time.Hour)))
+	partitioned := readyNode("n1")
+	partitioned.Status.Conditions = append(partitioned.Status.Conditions,
+		corev1.NodeCondition{Type: "NetworkPartitioned", Status: corev1.ConditionTrue})
+	cs := fake.NewSimpleClientset(partitioned)
+	a := newGCAuditor(cs, dyn, now)
+	a.orphanFirstSeen.Observe("8102", now.Add(-time.Hour))
+
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !identityExists(t, dyn, "8102") {
+		t.Fatal("identity deleted while n1 reported NetworkPartitioned")
 	}
 }
 

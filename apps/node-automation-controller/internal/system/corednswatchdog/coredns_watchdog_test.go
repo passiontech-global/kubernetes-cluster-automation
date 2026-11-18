@@ -436,7 +436,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, cooldown))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		for _, p := range []string{"cdns-a", "cdns-b"} {
@@ -455,7 +455,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"),
 			cdnsDeployment(1, 1, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 1); err != nil {
 			t.Fatal(err)
 		}
 		if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
@@ -475,7 +475,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"),
 			cdnsDeployment(2, 1, nil)) // 2 desired, only 1 ready
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 1); err != nil {
 			t.Fatal(err)
 		}
 		if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
@@ -488,7 +488,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		d := getCDNSDeployment(t, cs)
@@ -511,7 +511,7 @@ func TestCoreDNSRecover(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
@@ -531,7 +531,7 @@ func TestCoreDNSRecover(t *testing.T) {
 
 	t.Run("missing deployment is a hard error", func(t *testing.T) {
 		w := newCDNSWatchdog(fake.NewSimpleClientset())
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err == nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 1); err == nil {
 			t.Fatal("expected error when deploy/coredns is absent")
 		}
 	})
@@ -561,7 +561,7 @@ func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
 		// Whole-fleet stale — the path that would rollout-restart.
-		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		for _, p := range []string{"cdns-a", "cdns-b"} {
@@ -584,7 +584,7 @@ func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		if !testutil.PodExists(t, cs, corednsNS, "cdns-a") {
@@ -598,7 +598,7 @@ func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
@@ -622,7 +622,7 @@ func TestCoreDNSRecoverWatchCacheWedge(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 2); err != nil {
 			t.Fatal(err)
 		}
 		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
@@ -696,7 +696,7 @@ func TestCoreDNSRecoverErrorPaths(t *testing.T) {
 				return true, nil, errors.New("api down")
 			})
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err == nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 1); err == nil {
 			t.Fatal("expected error when the node list fails")
 		}
 	})
@@ -710,7 +710,7 @@ func TestCoreDNSRecoverErrorPaths(t *testing.T) {
 				return true, nil, errors.New("patch rejected")
 			})
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err == nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 1); err == nil {
 			t.Fatal("expected error when the restart patch fails")
 		}
 	})
@@ -730,7 +730,7 @@ func TestCoreDNSRecoverErrorPaths(t *testing.T) {
 				}
 				return false, nil, nil
 			})
-		if err := w.recover(ctx, []string{"cdns-a"}, nil, 2); err == nil {
+		if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 2); err == nil {
 			t.Fatal("expected error when the pod eviction fails")
 		}
 	})
@@ -1118,7 +1118,7 @@ func TestCoreDNSRecoverLegitSkipsNotCounted(t *testing.T) {
 		w := newCDNSWatchdog(cs)
 		w.queue = queue
 		if d := queueErrDelta(t, queue, func() {
-			if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, 2); err != nil {
+			if err := w.recover(ctx, []string{"cdns-a", "cdns-b"}, nil, nil, 2); err != nil {
 				t.Fatal(err)
 			}
 		}); d != 0 {
@@ -1134,7 +1134,7 @@ func TestCoreDNSRecoverLegitSkipsNotCounted(t *testing.T) {
 		w := newCDNSWatchdog(cs)
 		w.queue = queue
 		if d := queueErrDelta(t, queue, func() {
-			if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
+			if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 1); err != nil {
 				t.Fatal(err)
 			}
 		}); d != 0 {
@@ -1149,7 +1149,7 @@ func TestCoreDNSRecoverLegitSkipsNotCounted(t *testing.T) {
 		w := newCDNSWatchdog(cs)
 		w.queue = queue
 		if d := queueErrDelta(t, queue, func() {
-			if err := w.recover(ctx, []string{"cdns-a"}, nil, 1); err != nil {
+			if err := w.recover(ctx, []string{"cdns-a"}, nil, nil, 1); err != nil {
 				t.Fatal(err)
 			}
 		}); d != 0 {
@@ -1173,7 +1173,7 @@ func TestCoreDNSRecoverNotFoundDelete(t *testing.T) {
 		w := newCDNSWatchdog(cs)
 		// "ghost" has no pod in the fake — its delete answers NotFound.
 		// nPods=3 keeps len(suspects)=2 on the surgical-delete path.
-		if err := w.recover(ctx, []string{"cdns-a", "ghost"}, nil, 3); err != nil {
+		if err := w.recover(ctx, []string{"cdns-a", "ghost"}, nil, nil, 3); err != nil {
 			t.Fatalf("NotFound delete must not error: %v", err)
 		}
 		if testutil.PodExists(t, cs, corednsNS, "cdns-a") {
@@ -1196,7 +1196,7 @@ func TestCoreDNSRecoverNotFoundDelete(t *testing.T) {
 			cdnsPod("cdns-a", "10.0.0.1"), cdnsPod("cdns-b", "10.0.0.2"),
 			cdnsDeployment(2, 2, nil))
 		w := newCDNSWatchdog(cs)
-		if err := w.recover(ctx, []string{"ghost-a", "ghost-b"}, nil, 3); err != nil {
+		if err := w.recover(ctx, []string{"ghost-a", "ghost-b"}, nil, nil, 3); err != nil {
 			t.Fatalf("all-NotFound recovery must not error: %v", err)
 		}
 		if a := getCDNSDeployment(t, cs).Annotations[corednsTSAnno]; a != "" {

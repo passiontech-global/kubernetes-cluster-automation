@@ -90,7 +90,7 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 		s.latencyBounceSeen = map[string]bool{}
 	}
 	for _, job := range s.jobs {
-		lv := s.evaluateLatency(job)
+		lv := s.evaluateLatency(ctx, job)
 		s.latencyBounce = appendUniqueServices(s.latencyBounce, s.latencyBounceSeen, lv.bounceServices)
 		payload, trips, recovered, stillBroken, dropped := s.b.circuitPatchWithLatency(s.log, s.g.Queue,
 			job.Kind, job.Name, job.Anno, job.Hooks, s.ready, s.now, s.seen, s.recoverSeen,

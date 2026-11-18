@@ -498,6 +498,18 @@ func TryReserveWorkloadDisruption(ctx context.Context, pod *corev1.Pod) bool {
 		// workload identity to reserve against — same answer.
 		return true
 	}
+	// Terminal pods hold no traffic — deleting a Succeeded/Failed
+	// pod is garbage collection, not a disruption of a live
+	// workload. Consuming the one-per-workload slot here would let
+	// a dead pod suppress a sibling check's heal of a genuinely
+	// wedged Running replica of the same controller all sweep,
+	// and cap a terminal-pod reaper at ONE per controller (the
+	// evicted-pod janitor / IPAM-reap shape). Permissive, no slot
+	// spent — matches the AGENTS.md terminal-cleanup exemption.
+	if pod.Status.Phase == corev1.PodSucceeded ||
+		pod.Status.Phase == corev1.PodFailed {
+		return true
+	}
 	key := disruptionKey(pod)
 	ov.mu.Lock()
 	defer ov.mu.Unlock()

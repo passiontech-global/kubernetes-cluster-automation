@@ -388,12 +388,33 @@ func EvictPod(ctx context.Context, cs kubernetes.Interface,
 	heals *state.CooldownSet, key string, pod *corev1.Pod,
 	now time.Time) (evicted bool, refused bool, err error) {
 
+	evicted, refused, _, err = evictPod(ctx, cs, heals, key, pod, now)
+	return evicted, refused, err
+}
+
+// EvictPodNotFound is EvictPod with the apiserver-404 outcome exposed:
+// notFound=true means the Eviction API answered 404 — the pod vanished
+// between the audit census and the evict, an ordinary race rather than
+// a PDB/L1/quorum deferral. Callers that log refusals can handle that
+// case quietly; every other contract is byte-identical to EvictPod,
+// including the caller's duty to RefundGrant on ANY refused=true.
+func EvictPodNotFound(ctx context.Context, cs kubernetes.Interface,
+	heals *state.CooldownSet, key string, pod *corev1.Pod,
+	now time.Time) (evicted, refused, notFound bool, err error) {
+	return evictPod(ctx, cs, heals, key, pod, now)
+}
+
+// evictPod is the shared body behind EvictPod and EvictPodNotFound.
+func evictPod(ctx context.Context, cs kubernetes.Interface,
+	heals *state.CooldownSet, key string, pod *corev1.Pod,
+	now time.Time) (evicted, refused, notFound bool, err error) {
+
 	deferred, err := preparePodDisruption(ctx, cs, pod, now)
 	if err != nil {
-		return false, false, err
+		return false, false, false, err
 	}
 	if deferred {
-		return false, true, nil
+		return false, true, false, nil
 	}
 	deleteOpts := kube.UIDDeleteOptions(pod.UID, "")
 	err = cs.CoreV1().Pods(pod.Namespace).EvictV1(ctx, &policyv1.Eviction{
@@ -403,22 +424,23 @@ func EvictPod(ctx context.Context, cs kubernetes.Interface,
 		},
 		DeleteOptions: &deleteOpts,
 	})
-	if apierrors.IsTooManyRequests(err) ||
-		apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-		// PDB refusal, already-gone pod, or UID-precondition loss —
-		// all clean deferrals: no heal delivered, no mutation
-		// executed, the caller refunds its grant and retries next
-		// sweep. A 404 also tombstones the UID like DeletePod's.
-		if apierrors.IsNotFound(err) {
-			kube.MarkPodDeleted(ctx, pod.UID)
-		}
-		return false, true, nil
+	if apierrors.IsNotFound(err) {
+		// Already-gone pod: tombstone the UID like DeletePod's and
+		// report the reason so callers need not log a normal census
+		// race as an eviction refusal.
+		kube.MarkPodDeleted(ctx, pod.UID)
+		return false, true, true, nil
+	}
+	if apierrors.IsTooManyRequests(err) || apierrors.IsConflict(err) {
+		// PDB refusal or UID-precondition loss: clean deferrals,
+		// no heal delivered, no mutation executed.
+		return false, true, false, nil
 	}
 	if err != nil {
-		return false, false, err
+		return false, false, false, err
 	}
 	recordPodKilled(ctx, heals, key, pod, now)
-	return true, false, nil
+	return true, false, false, nil
 }
 
 // EvictPodV is the budget-safe EvictPod: the full preamble→actuation

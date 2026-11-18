@@ -7,6 +7,7 @@ package unmeshed
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -114,6 +116,27 @@ func upSeed(thirdNS *corev1.Namespace, extra ...runtime.Object) *fake.Clientset 
 func upGuard(cs *fake.Clientset) (*Auditor, *guardstate.Guard) {
 	return &Auditor{},
 		&guardstate.Guard{CS: cs, Dyn: wgDyn(), Now: time.Now}
+}
+
+// upLogSink captures log MESSAGES so a test can assert the ABSENCE of
+// a misleading line (e.g. a 404 census race logged as an eviction
+// refusal). Values are ignored — the message is the contract here.
+type upLogSink struct{ lines *[]string }
+
+func (*upLogSink) Init(logr.RuntimeInfo)                 {}
+func (*upLogSink) Enabled(int) bool                      { return true }
+func (s *upLogSink) Info(_ int, msg string, _ ...any)    { *s.lines = append(*s.lines, msg) }
+func (s *upLogSink) Error(_ error, msg string, _ ...any) { *s.lines = append(*s.lines, msg) }
+func (s *upLogSink) WithValues(...any) logr.LogSink      { return s }
+func (s *upLogSink) WithName(string) logr.LogSink        { return s }
+
+func upCaptureLogs(t *testing.T) *[]string {
+	t.Helper()
+	lines := &[]string{}
+	old := logf.Log
+	logf.SetLogger(logr.New(&upLogSink{lines: lines}))
+	t.Cleanup(func() { logf.SetLogger(old) })
+	return lines
 }
 
 // ---------------------------------------------------------------------------
@@ -240,8 +263,11 @@ func TestUnmeshedRemediationDeletesUpToTwo(t *testing.T) {
 	cs := upSeed(
 		upNamespace("linkerd", ""),
 		upInjectorCfg(), upReadySlice(),
-		ownedPod("web-a", "rs-a"), ownedPod("web-b", "rs-b"),
-		ownedPod("web-c", "rs-c"))
+		// Distinct Deployment names (RS = <deploy>-<hash>): the
+		// cooldown key normalizes both RSs of a rollout onto one
+		// Deployment slot (wave3.2/rs-cooldown-key).
+		ownedPod("web-a", "web-a-7d9f8"), ownedPod("web-b", "web-b-5c4b1"),
+		ownedPod("web-c", "web-c-2a8e6"))
 	testutil.EmulateEviction(cs)
 	a, g := upGuard(cs)
 	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
@@ -285,6 +311,103 @@ func TestUnmeshedRemediationWorkloadCooldown(t *testing.T) {
 	}
 	if deleted != 1 {
 		t.Fatalf("same-workload pods deleted = %d, want 1 (cooldown)", deleted)
+	}
+}
+
+// The cooldown key folds both ReplicaSets of one Deployment rollout
+// onto one slot; a bare pod has no shared workload key
+// (wave3.2/rs-cooldown-key).
+func TestUnmeshedWorkloadKey(t *testing.T) {
+	owned := func(kind, name string) *corev1.Pod {
+		p := upPod("meshed", "pod")
+		p.OwnerReferences = []metav1.OwnerReference{{
+			Kind: kind, Name: name, Controller: ptr.To(true)}}
+		return p
+	}
+	for _, tc := range []struct {
+		name string
+		pod  *corev1.Pod
+		want string
+	}{
+		{"rs with hash", owned("ReplicaSet", "web-7d9f8c"), "meshed/Deployment/web"},
+		{"second rs same rollout", owned("ReplicaSet", "web-5c4b1a"), "meshed/Deployment/web"},
+		{"statefulset untouched", owned("StatefulSet", "pg"), "meshed/StatefulSet/pg"},
+		{"short rs name", upPod("meshed", "bare"), "meshed/Deployment/rs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unmeshedWorkloadKey(tc.pod); got != tc.want {
+				t.Fatalf("unmeshedWorkloadKey = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	bare := upPod("meshed", "bare")
+	bare.OwnerReferences = nil
+	if got := unmeshedWorkloadKey(bare); got != "" {
+		t.Fatalf("bare pod workload key = %q, want empty", got)
+	}
+}
+
+// Two ReplicaSets of the SAME Deployment mid-rollout share one
+// per-workload cooldown slot — only one pod may be evicted this
+// sweep even though their RS owners differ (wave3.2/rs-cooldown-key).
+func TestUnmeshedRemediationRolloutSharesDeploymentCooldown(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.UnmeshedPodsRecreatedTotal, "meshed")
+
+	owned := func(name, rs string) *corev1.Pod {
+		p := upPod("meshed", name)
+		p.OwnerReferences = []metav1.OwnerReference{{
+			Kind: "ReplicaSet", Name: rs, Controller: ptr.To(true)}}
+		return p
+	}
+	cs := upSeed(
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		owned("web-old", "web-7d9f8c"), owned("web-new", "web-5c4b1a"))
+	testutil.EmulateEviction(cs)
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	deleted := 0
+	for _, n := range []string{"web-old", "web-new"} {
+		if !testutil.PodExists(t, cs, "meshed", n) {
+			deleted++
+		}
+	}
+	if deleted != 1 {
+		t.Fatalf("mid-rollout pods deleted = %d, want 1 (shared Deployment cooldown)", deleted)
+	}
+}
+
+// A sweep whose every candidate is still inside its workload cooldown
+// takes NO heal gate at all (wave3.2/gate-order). Proof: break the
+// maintenance check (fail the node list) — the OLD gate-first shape
+// would call heal.Gate, read "unverifiable" and IncError the queue
+// even though nothing was going to be evicted; the filtered sweep
+// must never touch that gate.
+func TestUnmeshedRemediationAllInCooldownDoesNotTakeGrant(t *testing.T) {
+	now := time.Now()
+	cs := upSeed(
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		upPod("meshed", "web-a"))
+	a, g := upGuard(cs)
+	g.Queue = "unmeshed-cooldown-test"
+	snap := g.TakeSnapshot(ctx)
+	a.evictCooldown.Stamp("meshed/Deployment/rs", now)
+	cs.PrependReactor("list", "nodes",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("node list boom")
+		})
+	before := testutil.QueueErrorCount(t, g.Queue)
+	if err := a.Sweep(ctx, snap); err != nil {
+		t.Fatal(err)
+	}
+	if !testutil.PodExists(t, cs, "meshed", "web-a") {
+		t.Fatal("pod evicted while its workload was inside cooldown")
+	}
+	if got := testutil.QueueErrorCount(t, g.Queue) - before; got != 0 {
+		t.Fatalf("queue errors = %v, want 0 — the heal gate was taken with nothing to do", got)
 	}
 }
 
@@ -438,8 +561,12 @@ func TestUnmeshedRemediationSkipsTerminatingAndMirror(t *testing.T) {
 			t.Fatalf("pod %s deleted — terminating/mirror skip failed", n)
 		}
 	}
-	if len(a.unmeshedEmitted.Last()) != 2 {
-		t.Fatalf("terminating/mirror pods not flagged: %v", a.unmeshedEmitted.Last())
+	// The mirror pod is still flagged (it is Running and opted in), but
+	// a terminating pod is no longer an incident — only 1 tuple.
+	got := a.unmeshedEmitted.Last()
+	_, mirrorFlagged := got["meshed/mirror"]
+	if len(got) != 1 || !mirrorFlagged {
+		t.Fatalf("want only the mirror pod flagged, got %v", got)
 	}
 }
 
@@ -754,5 +881,114 @@ func TestUnmeshedRemediationAllPDBRefusedRefundsBudget(t *testing.T) {
 	if !proceed || unverifiable {
 		t.Fatalf("Gate after all-PDB-refused unmeshed sweep = (%v,%v), want (true,false) — grant not refunded",
 			proceed, unverifiable)
+	}
+}
+
+// The fleet heal grant is taken PER POD, not once for the whole
+// batch: with a one-grant window only the first candidate may be
+// evicted. The batch-gated shape spent one token and evicted both.
+func TestUnmeshedRemediationBudgetGrantPerPod(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.UnmeshedPodsRecreatedTotal, "meshed")
+	heal.ConfigureBudget(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+	owned := func(name, rs string) *corev1.Pod {
+		p := upPod("meshed", name)
+		p.OwnerReferences = []metav1.OwnerReference{{
+			Kind: "ReplicaSet", Name: rs, Controller: ptr.To(true)}}
+		return p
+	}
+	cs := upSeed(
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		owned("web-a", "web-a-7d9f8"), owned("web-b", "web-b-5c4b1"))
+	testutil.EmulateEviction(cs)
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	deleted := 0
+	for _, n := range []string{"web-a", "web-b"} {
+		if !testutil.PodExists(t, cs, "meshed", n) {
+			deleted++
+		}
+	}
+	if deleted != 1 {
+		t.Fatalf("evictions with a 1-grant window = %d, want 1 (per-pod gate)", deleted)
+	}
+	if got := ptestutil.ToFloat64(
+		metrics.UnmeshedPodsRecreatedTotal.WithLabelValues("meshed")); got != 1 {
+		t.Fatalf("recreated counter = %v, want 1", got)
+	}
+}
+
+// A 404 is an ordinary census race (the pod vanished before the
+// evict), not a PDB/L1/quorum refusal — it must not emit a misleading
+// "eviction refused" line, and it must not stop the next candidate.
+func TestUnmeshedRemediationGonePodNotLoggedAsRefused(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.UnmeshedPodsRecreatedTotal, "meshed")
+	lines := upCaptureLogs(t)
+
+	owned := func(name, rs string) *corev1.Pod {
+		p := upPod("meshed", name)
+		p.OwnerReferences = []metav1.OwnerReference{{
+			Kind: "ReplicaSet", Name: rs, Controller: ptr.To(true)}}
+		return p
+	}
+	cs := upSeed(
+		upNamespace("linkerd", ""),
+		upInjectorCfg(), upReadySlice(),
+		owned("web-gone", "web-gone-7d9f8"), owned("web-b", "web-b-5c4b1"))
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			ev := ca.GetObject().(*policyv1.Eviction)
+			if ev.Name == "web-gone" {
+				return true, nil, apierrors.NewNotFound(
+					corev1.Resource("pods"), ev.Name)
+			}
+			return true, ev, cs.Tracker().Delete(
+				corev1.SchemeGroupVersion.WithResource("pods"),
+				ca.GetNamespace(), ev.Name)
+		})
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range *lines {
+		if strings.Contains(line, "eviction refused") {
+			t.Fatalf("404 logged as an eviction refusal: %q\n%v", line, *lines)
+		}
+	}
+	if testutil.PodExists(t, cs, "meshed", "web-b") {
+		t.Fatal("404 on web-gone blocked web-b's eviction")
+	}
+}
+
+// A terminating pod is already being replaced — it must not open an
+// UnmeshedPods tuple (that would hold a false alert until Prune).
+func TestUnmeshedAuditSkipsTerminatingPodInGauge(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.UnmeshedPods, "meshed", "web-term")
+	now := metav1.Now()
+	p := upPod("meshed", "web-term")
+	p.DeletionTimestamp = &now
+	cs := upSeed(nil, p)
+	a, g := upGuard(cs)
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(
+		metrics.UnmeshedPods.WithLabelValues("meshed", "web-term")); got != 0 {
+		t.Fatalf("terminating pod must not be gauged as unmeshed, got %v", got)
+	}
+}
+
+func TestUnmeshedSweepNilSnapshotFailsClosed(t *testing.T) {
+	a := &Auditor{}
+	if err := a.Sweep(ctx, nil); err == nil {
+		t.Fatal("nil snapshot must be a tolerated fail-closed error, not a pass")
 	}
 }

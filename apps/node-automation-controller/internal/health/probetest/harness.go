@@ -60,10 +60,10 @@ func MustCheck[T probefw.Check](t *testing.T, p *Prober) T {
 	return zero
 }
 
-// RunCheck runs chk inside a fresh SweepCtx and verifies no census
-// memo was mutated in place afterwards.
-func RunCheck(ctx context.Context, chk probefw.Check) probefw.Result {
-	sctx := SweepCtx(ctx)
+// RunCheck runs chk inside a fresh SweepCtx bound to d and verifies
+// no census memo was mutated in place afterwards.
+func RunCheck(ctx context.Context, d *probefw.Deps, chk probefw.Check) probefw.Result {
+	sctx := SweepCtx(ctx, d)
 	res := chk.Run(sctx)
 	VerifySweep(sctx)
 	return res

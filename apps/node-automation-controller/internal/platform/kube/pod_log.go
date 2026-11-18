@@ -145,19 +145,55 @@ func ReadPodLogText(ctx context.Context, cs kubernetes.Interface,
 func readPodLogTailBytes(stream io.Reader, maxBytes int64) (string, error) {
 	var buf bytes.Buffer
 	tmp := make([]byte, 32*1024)
+	// headPartial is set while the buffer's first line is a fragment
+	// whose timestamp head was cut by an earlier byte-count trim.
+	// Newlines can arrive in later (small) Read chunks, so the cut
+	// cannot always be finalized in the same iteration.
+	headPartial := false
 	for {
 		n, err := stream.Read(tmp)
 		if n > 0 {
 			buf.Write(tmp[:n])
 			if int64(buf.Len()) > maxBytes {
-				buf.Next(buf.Len() - int(maxBytes))
+				data := buf.Bytes()
+				keepFrom := buf.Len() - int(maxBytes)
+				if keepFrom > 0 && data[keepFrom-1] != '\n' {
+					// The cut lands mid-line: never expose that
+					// fragment as line 0 (its RFC3339 prefix is
+					// gone and PodLogLineTS callers would read a
+					// signature match on it as freshly written).
+					// Prefer the next newline (discard the whole
+					// fragment). When a short Read has not delivered
+					// it yet, keep the bounded tail and mark the
+					// head partial — the cut is finalized at EOF or
+					// on a later read once the newline lands, never
+					// by growing the ring past its byte cap.
+					if nl := bytes.IndexByte(data[keepFrom:], '\n'); nl >= 0 {
+						keepFrom += nl + 1
+						headPartial = false
+					} else {
+						headPartial = true
+					}
+				} else {
+					headPartial = false
+				}
+				buf.Next(keepFrom)
 			}
 		}
 		if err != nil {
-			if err == io.EOF {
-				return buf.String(), nil
+			if err != io.EOF {
+				return "", err
 			}
-			return "", err
+			if headPartial {
+				// No complete line ever followed the cut — a
+				// timestamp-less fragment must not be matched as
+				// fresh evidence.
+				if nl := bytes.IndexByte(buf.Bytes(), '\n'); nl >= 0 {
+					return buf.String()[nl+1:], nil
+				}
+				return "", nil
+			}
+			return buf.String(), nil
 		}
 	}
 }

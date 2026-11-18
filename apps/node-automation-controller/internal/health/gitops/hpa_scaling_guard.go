@@ -157,11 +157,30 @@ func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
 
+	// The fleet heal budget is shared with every other module. One
+	// sweep of this check gets at most ONE budgeted action across
+	// BOTH heal shapes: a cold-start rescue that consumed a grant
+	// defers the remaining rescues and the metrics-server bounce,
+	// so a fleet-wide HPA signature cannot drain the whole window
+	// in one pass. A cleanly refunded grant did not spend the
+	// allowance and leaves the next action free.
+	grantSpent := false
 	for _, hpa := range unhealthy {
-		p.rescueZeroTarget(ctx, log, hpa, now)
+		if grantSpent {
+			log.Info("SKIP: heal budget already spent this sweep — cold-start rescues deferred",
+				"hpa", hpa.GetNamespace()+"/"+hpa.GetName())
+			continue
+		}
+		if p.rescueZeroTarget(ctx, log, hpa, now) {
+			grantSpent = true
+		}
 	}
 	if len(unhealthy) > 0 {
-		p.maybeBounceMetricsServer(ctx, log, now)
+		if grantSpent {
+			log.Info("SKIP: heal budget already spent this sweep — metrics-server bounce deferred")
+		} else {
+			p.maybeBounceMetricsServer(ctx, log, now)
+		}
 		p.emitHPAEvent(ctx, log, rep.Findings(), now)
 	}
 	return rep.Result(&p.emitted, hpaScalingUnhealthyGauge.DeleteLabelValues,
@@ -172,14 +191,17 @@ func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 // back to max(hpa.spec.minReplicas, 1) — the HPA-side cold-start
 // deadlock twin of the KEDA rescue. Deployment/StatefulSet targets
 // resolve through the typed censuses; other kinds are skipped
-// (unresolvable stays inconclusive, not "not at zero").
+// (unresolvable stays inconclusive, not "not at zero"). The bool
+// return reports whether a heal-budget grant was actually consumed
+// and kept (Run uses it to bound this check to one budgeted action
+// per sweep).
 func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
-	log logr.Logger, hpa *unstructured.Unstructured, now time.Time) {
+	log logr.Logger, hpa *unstructured.Unstructured, now time.Time) bool {
 
 	ns := hpa.GetNamespace()
 	target, ok := kube.NestedString(hpa.Object, "spec", "scaleTargetRef", "name")
 	if !ok || target == "" {
-		return
+		return false
 	}
 	minReplicas, _ := kube.NestedInt64(hpa.Object, "spec", "minReplicas")
 	rescue := int32(minReplicas)
@@ -190,40 +212,52 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 	var annotations map[string]string
 	var replicas *int32
 	var rv string
+	var targetObj metav1.Object // the census object FluxPatchGate inspects
 	kind := ""
 	declared, _ := kube.NestedString(hpa.Object, "spec", "scaleTargetRef", "kind")
 	if declared == "" || strings.EqualFold(declared, "Deployment") {
 		dep, err := p.Deployment(ctx, ns, target)
 		if err != nil {
-			return
+			return false
 		}
 		if dep != nil {
 			kind = "Deployment"
 			annotations = kube.EffectiveAnnos(ctx, dep)
 			replicas = dep.Spec.Replicas
 			rv = dep.ResourceVersion
+			targetObj = dep
 		}
 	}
 	if kind == "" && (declared == "" || strings.EqualFold(declared, "StatefulSet")) {
 		sts, serr := p.StatefulSet(ctx, ns, target)
 		if serr != nil {
-			return
+			return false
 		}
 		if sts != nil {
 			kind = "StatefulSet"
 			annotations = kube.EffectiveAnnos(ctx, sts)
 			replicas = sts.Spec.Replicas
 			rv = sts.ResourceVersion
+			targetObj = sts
 		}
 	}
 	if kind == "" {
-		return
+		return false
 	}
 	if replicas == nil || *replicas != 0 {
-		return
+		return false
 	}
 	if kube.IsIntentionallyDownscaled(annotations, replicas) {
-		return
+		return false
+	}
+	// spec.replicas is Git-owned on Flux-managed workloads. Writing
+	// it here without the loop gate would ping-pong with Flux every
+	// sweep on a workload Git intentionally parked at zero.
+	if targetObj != nil && !heal.FluxPatchGate(strings.ToLower(kind),
+		targetObj, ns+"/"+target, now) {
+		log.Info("SKIP: hpa cold-start rescue blocked by flux conflict gate",
+			"target", kind+" "+ns+"/"+target)
+		return false
 	}
 
 	ck := probefw.SelfHealKey(CheckNameHPAScalingGuard, "rescue/"+ns+"/"+target)
@@ -231,11 +265,13 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 		&p.Heals, ck, hpaRescueCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
-		return
+		return false
 	}
 	if !proceed {
-		return
+		return false
 	}
+	// The gate consumed the grant — from here on every clean bailout
+	// must hand it back (below), otherwise it stays spent.
 	// metadata.resourceVersion pins the write — a legitimate
 	// scale-up landing between the census read and this patch
 	// becomes a 409 instead of a silent revert to the rescue floor.
@@ -244,7 +280,8 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 		"spec":     map[string]any{"replicas": rescue},
 	})
 	if err != nil {
-		return
+		heal.RefundGrant(now) // no patch attempted — hand the token back
+		return false
 	}
 	var patchErr error
 	if kind == "Deployment" {
@@ -259,12 +296,12 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 			heal.RefundGrant(now)
 			log.Info("SKIP: hpa cold-start rescue raced (target changed or gone)",
 				"target", kind+" "+ns+"/"+target)
-			return
+			return false
 		}
 		metrics.IncError(p.Name)
 		log.Error(patchErr, "hpa cold-start rescue scale patch failed",
 			"target", kind+" "+ns+"/"+target, "replicas", rescue)
-		return
+		return true // attempted write spent the grant
 	}
 	switch kind {
 	case "Deployment":
@@ -275,6 +312,7 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 	p.Heals.Stamp(ck, now)
 	log.Info("SCALE: hpa cold-start rescue — target wedged at 0 while the HPA is unhealthy",
 		"target", kind+" "+ns+"/"+target, "replicas", rescue)
+	return true
 }
 
 // maybeBounceMetricsServer deletes an isolated unready
@@ -300,11 +338,20 @@ func (p *hpaScalingGuardCheck) maybeBounceMetricsServer(ctx context.Context,
 			!strings.Contains(pod.Name, "metrics-server") {
 			continue
 		}
-		if pod.DeletionTimestamp != nil {
-			continue
+		if pod.DeletionTimestamp != nil ||
+			pod.Status.Phase != corev1.PodRunning {
+			continue // Pending/Succeeded/Failed pods cannot be a
+			// metrics-server sibling that should be bounced.
 		}
 		if kube.PodReadyCond(pod) {
 			ready = true
+			continue
+		}
+		// A freshly created or just-flipped pod is still starting —
+		// killing it during rollout makes the outage worse. Reuse
+		// the same persistence window that gates the HPA finding.
+		if unreadyFor, ok := kube.PodUnreadyFor(pod, now); !ok ||
+			unreadyFor < hpaUnhealthyMinAge {
 			continue
 		}
 		unready = append(unready, pod)

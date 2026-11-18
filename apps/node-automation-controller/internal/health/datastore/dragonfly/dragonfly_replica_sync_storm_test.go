@@ -39,7 +39,7 @@ func TestDragonflySyncStormResumeRestarts(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("persisted link-storm window must FAIL on the first sweep")
 	}
@@ -69,9 +69,12 @@ func TestDragonflyPrimaryQueryFailureIsInfra(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Infra == nil {
 		t.Fatalf("primary master-link query failure must be Infra: %+v", res)
+	}
+	if res.Pass {
+		t.Fatalf("Infra error must not read as a passing check: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("dragonfly").
 		Get(ctx, "dragonfly-replica-1", metav1.GetOptions{}); err != nil {
@@ -92,11 +95,11 @@ func TestDragonflySyncStormRestartsReplicaNotMaster(t *testing.T) {
 
 	// First sweep stamps the link-down first-seen; second (past the
 	// 5m persistence window) confirms the storm.
-	if res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("first sighting inside window must pass: %+v", res)
 	}
 	base = base.Add(6 * time.Minute)
-	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("sustained link-down + sync storm must fail: %+v", res)
 	}
@@ -136,9 +139,9 @@ func TestDragonflySyncStormSkipsDownscaledCluster(t *testing.T) {
 	base := time.Now()
 	p.Now = func() time.Time { return base }
 
-	probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx))
+	probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	base = base.Add(6 * time.Minute)
-	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if !res.Pass {
 		t.Fatalf("downscaled dragonfly cluster must pass: %+v", res)
 	}
@@ -166,9 +169,9 @@ func TestDragonflyLinkDownAloneDoesNotRestart(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	base := time.Now()
 	p.Now = func() time.Time { return base }
-	probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx))
+	probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	base = base.Add(6 * time.Minute)
-	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("sustained link-down must still fail: %+v", res)
 	}
@@ -238,7 +241,7 @@ func TestDragonflySyncStormSkipsUnownedPod(t *testing.T) {
 	p.HTTPClient = srv.Client()
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("sustained link-down must still FAIL: %+v", res)
 	}
@@ -267,7 +270,7 @@ func TestDragonflySyncStormPromOutageCleansLedgers(t *testing.T) {
 	p.Now = func() time.Time { return base }
 
 	chk := probetest.MustCheck[*dragonflyReplicaSyncStormCheck](t, p)
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatal("first sweep must flag the storm replica")
 	}
 	if m := probetest.FindMetric(t, "node_automation_dragonfly_replica_sync_storm",
@@ -280,9 +283,12 @@ func TestDragonflySyncStormPromOutageCleansLedgers(t *testing.T) {
 	// the first-seen window must survive so the alert doesn't flap
 	// off and re-arm on the next successful sweep.
 	p.Cfg.HTTPContent.URL = "http://127.0.0.1:1"
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Infra == nil {
 		t.Fatalf("a dead Prometheus must report Infra: %+v", res)
+	}
+	if res.Pass {
+		t.Fatalf("a dead Prometheus must not report PASS: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_dragonfly_replica_sync_storm",
 		map[string]string{"namespace": "dragonfly", "pod": "dragonfly-replica-1"}); m == nil {

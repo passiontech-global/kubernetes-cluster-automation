@@ -65,13 +65,13 @@ func TestCriticalDSZeroDesiredPersistenceAndRestriction(t *testing.T) {
 	base := time.Now()
 
 	probetest.FreezeNow(d, base)
-	if res := ch.Run(probetest.SweepCtx(ctx)); res.Pass != true {
+	if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); res.Pass != true {
 		t.Fatalf("first sweep arms the window, must pass: %+v", res)
 	}
 	probetest.FreezeNow(d, base.Add(criticalDSMinAge-time.Minute))
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	probetest.FreezeNow(d, base.Add(criticalDSMinAge+time.Minute))
-	res := ch.Run(probetest.SweepCtx(ctx))
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	if res.Pass {
 		t.Fatal("persisted zero-desired must fail the sweep")
 	}
@@ -107,7 +107,7 @@ func TestCriticalDSDeprecatedSelectorHealsCompatLabels(t *testing.T) {
 	d := probetest.NewDeps(cs, probetest.OpDyn())
 	ch := &criticalDaemonSetStarvationCheck{Deps: d}
 
-	res := ch.Run(probetest.SweepCtx(ctx))
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	if res.Pass {
 		t.Fatal("deprecated-selector signature must flag immediately")
 	}
@@ -135,7 +135,7 @@ func TestCriticalDSNoStarvationPasses(t *testing.T) {
 	cs := fake.NewSimpleClientset(healthy, gaNode("node-a"))
 	d := probetest.NewDeps(cs, probetest.OpDyn())
 	ch := &criticalDaemonSetStarvationCheck{Deps: d}
-	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
 		t.Fatalf("healthy DS must pass: %+v", res)
 	}
 }
@@ -172,9 +172,9 @@ func TestCriticalDSNilRequiredAffinityNoPanic(t *testing.T) {
 	base := time.Now()
 
 	probetest.FreezeNow(d, base)
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	probetest.FreezeNow(d, base.Add(criticalDSMinAge+time.Minute))
-	res := ch.Run(probetest.SweepCtx(ctx))
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	if res.Pass {
 		t.Fatal("preferred-only/empty-affinity DSes are unrestricted — persisted zero-desired must flag")
 	}

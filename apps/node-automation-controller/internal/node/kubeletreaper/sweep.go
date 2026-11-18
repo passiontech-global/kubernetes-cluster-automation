@@ -20,13 +20,26 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
+// leaseVerdict is run()'s single kube-node-lease read for one failed
+// node. The mesh-dark census and the per-node taint gate need the
+// SAME answer; carrying it into sweep avoids a second Lease Get for
+// every dark worker.
+type leaseVerdict struct {
+	alive bool
+	err   error
+}
+
 // sweep applies the taint decision for one node. listed is the object
 // from this run's node list — already fresh enough to see our taint.
 // The per-node Get (the bash's `kubectl get node`) now only happens
 // when the probe FAILED: the liveness gate below needs a fresh read,
 // while a healthy probe with no listed taint has literally nothing to
-// decide — one fewer apiserver read per worker per cycle.
-func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool) error {
+// decide — one fewer apiserver read per worker per cycle. leases
+// carries run()'s lease verdicts by node name; a nil entry (a direct
+// test call or a node that wasn't dark during the census) falls back
+// to a fresh Lease read so the gate keeps its old standalone shape.
+func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node,
+	ok bool, leases map[string]leaseVerdict) error {
 	log := logf.FromContext(ctx)
 
 	if ok {
@@ -104,7 +117,7 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 	// so a HEALTHY kubelet routinely reads minutes stale on the old
 	// 120s heartbeat gate and got tainted exactly during the
 	// konnectivity/proxy outage this gate exists to ride out.
-	alive, err := r.kubeletAlive(ctx, name)
+	alive, err := r.leaseAlive(ctx, name, leases)
 	if err != nil {
 		// Fail closed: an unreadable lease is not evidence of death
 		// — tainting on our own read failure would punish live
@@ -189,6 +202,20 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node, ok bool)
 		log.Info("KEEP-TAINT: kubelet dead (lease stale/missing or fake-ready persisted)", "node", name)
 	}
 	return nil
+}
+
+// leaseAlive reuses run()'s per-node Lease verdict when present,
+// falling back to a direct read for standalone sweep callers. The
+// run's mesh-dark census already paid the Get for every failed node;
+// reusing it keeps the two gates consistent even if the Lease flips
+// between the census and the taint decision (fail closed stays
+// deterministic for the whole sweep).
+func (r *kubeletReaper) leaseAlive(ctx context.Context, node string,
+	leases map[string]leaseVerdict) (bool, error) {
+	if v, ok := leases[node]; ok {
+		return v.alive, v.err
+	}
+	return r.kubeletAlive(ctx, node)
 }
 
 // kubeletAlive reports whether the kube-node-lease/<node> Lease's

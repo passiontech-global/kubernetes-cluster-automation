@@ -99,7 +99,7 @@ func TestSprawlGCDeletesDeadOwnerReports(t *testing.T) {
 	rs := liveReplicaSet("apps", "live-rs")
 	cs := fake.NewSimpleClientset(rs)
 	p := testProberDyn(cs, sprawlDyn(orphan, liveOwner, young))
-	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("live orphans must fail: %+v", res)
 	}
@@ -150,7 +150,7 @@ func TestSprawlGCCollectsCompletedAnalysisRuns(t *testing.T) {
 		"apps", "ar-young", 30*time.Minute, "Successful")
 	p := testProberDyn(fake.NewSimpleClientset(),
 		sprawlDyn(done, failed, running, young))
-	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("uncollected completed AnalysisRuns must fail: %+v", res)
 	}
@@ -177,7 +177,7 @@ func TestSprawlGCCollectsCompletedExperiments(t *testing.T) {
 		"apps", "exp-running", 3*time.Hour, "Running")
 	p := testProberDyn(fake.NewSimpleClientset(),
 		sprawlDyn(done, running))
-	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("uncollected completed Experiment must fail: %+v", res)
 	}
@@ -200,7 +200,7 @@ func TestSprawlGCPrunesSupersededHelmSecrets(t *testing.T) {
 	objs = append(objs, helmSecret("apps", "myrelease", 14, "deployed"))
 	cs := fake.NewSimpleClientset(objs...)
 	p := testProberDyn(cs, sprawlDyn())
-	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("superseded excess must fail: %+v", res)
 	}
@@ -259,7 +259,7 @@ func TestSprawlGCKineLargeObjects(t *testing.T) {
 	p := testProberDyn(cs, sprawlDyn())
 	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
 
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Pass {
 		t.Fatalf("large objects must fail the check: %+v", res)
 	}
@@ -291,7 +291,7 @@ func TestSprawlGCKineLargeObjects(t *testing.T) {
 		t.Fatal(err)
 	}
 	chk.kineCycle = 0
-	res2 := chk.Run(probetest.SweepCtx(ctx))
+	res2 := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if !res2.Pass {
 		t.Fatalf("check must pass once the large objects are gone: %+v", res2)
 	}
@@ -338,7 +338,7 @@ func TestSprawlGCKineLargeObjectsCRDKinds(t *testing.T) {
 	testutil.CleanupMetric(t, kineLargeObjectBytesGauge, "application", "argocd", "small-app")
 
 	p := testProberDyn(fake.NewSimpleClientset(), sprawlDyn(crd, csv, app, chart, small))
-	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("large CRD-backed objects must fail the check: %+v", res)
 	}
@@ -392,7 +392,7 @@ func TestSprawlGCKineLargeObjectsCRDSkipAbsent(t *testing.T) {
 		testutil.CleanupMetric(t, kineLargeObjectBytesGauge, kv.kind, kv.ns, kv.name)
 	}
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
-	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("the surviving CRD census must still fail: %+v", res)
 	}
@@ -415,7 +415,7 @@ func TestSprawlGCKineLargeObjectsCRDInfraErrorKeepsSeries(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
 	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
 
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("large HelmChart must fail the check: %+v", res)
 	}
 	if _, ok := testutil.GaugeSeriesValue(t, "node_automation_kine_large_object_bytes",
@@ -432,7 +432,7 @@ func TestSprawlGCKineLargeObjectsCRDInfraErrorKeepsSeries(t *testing.T) {
 			return true, nil, fmt.Errorf("apiserver down")
 		})
 	chk.kineCycle = 0
-	res := chk.Run(probetest.SweepCtx(ctx))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if res.Infra == nil {
 		t.Fatalf("failed dynamic read must be Infra, got %+v", res)
 	}
@@ -459,13 +459,13 @@ func TestSprawlGCKineLargeObjectsCadenceCarryForward(t *testing.T) {
 	p := testProberDyn(cs, sprawlDyn())
 	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
 
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("audit cycle must flag the large object: %+v", res)
 	}
 	// Cycles 2..HeavyScanCycles skip the census — the carried
 	// findings keep the check failing and the tuple keeps its series.
 	for i := 2; i <= probefw.HeavyScanCycles; i++ {
-		res := chk.Run(probetest.SweepCtx(ctx))
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 		if res.Pass {
 			t.Fatalf("cycle %d must carry the audit's failure forward: %+v", i, res)
 		}
@@ -482,7 +482,7 @@ func TestSprawlGCKineLargeObjectsCadenceCarryForward(t *testing.T) {
 	if err := cs.CoreV1().ConfigMaps("apps").Delete(ctx, "big-cm", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	res := chk.Run(probetest.SweepCtx(ctx)) // cycle HeavyScanCycles+1 == next audit
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)) // cycle HeavyScanCycles+1 == next audit
 	if !res.Pass {
 		t.Fatalf("audit cycle after deletion must pass: %+v", res)
 	}
@@ -510,7 +510,7 @@ func TestSprawlGCKineGaugeScopeSeparate(t *testing.T) {
 	p := testProberDyn(cs, sprawlDyn(rep))
 	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
 
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("large object must fail the check: %+v", res)
 	}
 	// Kine ledger: exactly the kine tuple, no census tuples leaked in.
@@ -599,7 +599,7 @@ func TestSprawlGCKineCRDSizeFromInformerTable(t *testing.T) {
 		Version: "v1", Kind: "CustomResourceDefinition"}, "", name,
 		map[string]any{"spec": map[string]any{"group": "table.example.com"}})
 	p := testProberDyn(fake.NewSimpleClientset(), sprawlDyn(crd))
-	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("the table-recorded large CRD must fail the check: %+v", res)
 	}

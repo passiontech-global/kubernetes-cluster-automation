@@ -301,6 +301,35 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	}
 }
 
+// infraPassCheck models the check bug the prober must defend against:
+// a Result with Pass=true but an Infra error attached (the old
+// dragonfly infraClose shape). "Can't tell" must read FAIL.
+type infraPassCheck struct{ err error }
+
+func (c infraPassCheck) Run(context.Context) probefw.Result {
+	return probefw.Result{Pass: true, Infra: c.err}
+}
+
+func TestRunCheckIsolatedInfraErrorIsFail(t *testing.T) {
+	out := runCheckIsolated(checkEntry{
+		name: "infra-pass", check: infraPassCheck{err: errors.New("api down")},
+	}, t.Context(), time.Minute)
+	if !out.ran {
+		t.Fatal("check must have run")
+	}
+	if out.pass {
+		t.Fatalf("Result{Pass:true, Infra:err} must become a FAIL verdict: %+v", out)
+	}
+	if out.infra == nil {
+		t.Fatal("infra error must be carried through for the run's single IncError")
+	}
+	if clean := runCheckIsolated(checkEntry{
+		name: "clean", check: infraPassCheck{},
+	}, t.Context(), time.Minute); !clean.pass {
+		t.Fatalf("a clean pass must still pass: %+v", clean)
+	}
+}
+
 // A cancelled sweep context (SIGTERM during rollout/shutdown) aborts
 // the run silently: no FAIL series — a dying pod emitting FAIL=1 would
 // leave a fake health signal behind — and no run-error increment. The

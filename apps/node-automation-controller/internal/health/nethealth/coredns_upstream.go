@@ -15,6 +15,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -180,10 +181,19 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
 		pod := dnsByName[ns+"/"+name]
-		if pod != nil {
-			rep.Flag(coreDNSUpstreamFailingGauge, key, []string{ns, name})
-			rep.Find(key + "(" + flagged[key] + ")")
+		if pod == nil {
+			continue // census has no such pod — nothing to flag or heal
 		}
+		rep.Flag(coreDNSUpstreamFailingGauge, key, []string{ns, name})
+		rep.Find(key + "(" + flagged[key] + ")")
+		// Observe the persistence window for EVERY flagged pod,
+		// before any heal gating. Go's && short-circuits: putting
+		// Persisted last meant a second flagged pod (healed==true)
+		// or a pod temporarily without a healthy sibling never
+		// advanced its first-seen stamp, so a 10m signature had to
+		// start over every time the heal was deferred.
+		persisted := probefw.Persisted(&p.seen, key, now,
+			coreDNSUpstreamMinAge, log)
 		// Isolated-failure heal: a healthy Ready sibling in the same
 		// namespace means this is per-pod wedge, not a fleet outage.
 		// At most ONE pod is deleted per cycle — a sweep flagging
@@ -193,9 +203,19 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 		// still honors the window; the ledger stamp going from
 		// missing/stale to `now` is how a DELIVERED delete reads
 		// (DeletePodHeal swallows cooldown/mutex/delete failures).
-		if pod != nil && !healed && hasHealthySibling(pod, dnsByNS[ns], flagged) &&
-			probefw.Persisted(&p.seen, key, now, coreDNSUpstreamMinAge, log) {
+		if persisted && !healed && hasHealthySibling(pod, dnsByNS[ns], flagged) {
 			target := kube.PodControllerKey(pod)
+			// node-local-dns is a DaemonSet: one agent per node,
+			// and the controller key is SHARED by every node's
+			// pod. Keying only on it puts the whole DaemonSet in a
+			// 30m cooldown after one node's agent is bounced. Add
+			// the node as the real failure domain; the scoped
+			// dispatcher also runs the node-local maintenance
+			// gate for DaemonSet-owned pods.
+			if ctrl := metav1.GetControllerOf(pod); ctrl != nil &&
+				ctrl.Kind == "DaemonSet" {
+				target = target + "/" + pod.Spec.NodeName
+			}
 			hk := probefw.SelfHealKey(CheckNameCoreDNSUpstream, target)
 			before, _ := p.Heals.Last(hk)
 			p.DeletePodHealScoped(ctx, log, CheckNameCoreDNSUpstream,
@@ -310,6 +330,15 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 		rep.Flag(coreDNSUpstreamFailingGauge, key, lv)
 		if !healed && hasHealthySibling(pod, dnsByNS[ns], flagged) {
 			target := kube.PodControllerKey(pod)
+			// node-local-dns is a DaemonSet: every node's agent
+			// shares one controller key. Keying the cooldown on it
+			// alone would park the WHOLE DaemonSet for 30m after
+			// one node's agent is bounced; the node is the real
+			// failure domain here (same split as the PromQL path).
+			if ctrl := metav1.GetControllerOf(pod); ctrl != nil &&
+				ctrl.Kind == "DaemonSet" {
+				target += "/" + pod.Spec.NodeName
+			}
 			hk := probefw.SelfHealKey(CheckNameCoreDNSUpstream, target)
 			before, _ := p.Heals.Last(hk)
 			p.DeletePodHealScoped(ctx, log, CheckNameCoreDNSUpstream,

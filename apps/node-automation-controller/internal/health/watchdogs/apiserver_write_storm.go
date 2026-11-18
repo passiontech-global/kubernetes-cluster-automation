@@ -393,13 +393,14 @@ func (p *apiserverWriteStormCheck) restoreSuspendedFlux(ctx context.Context,
 // stormFluxTargets collects the Flux objects the breaker may act
 // on. stampedOnly=true returns ONLY objects carrying
 // AnnoWriteStormSuspendedBy (the restore pass); false returns the
-// suspend candidates. A nil return with stampedOnly=false means
-// "no targets"; with stampedOnly=true a nil return means "census
-// failed" — the caller distinguishes via the bool below.
+// suspend candidates. A nil return means "census failed" — so a
+// SUCCESSFUL census with zero matches must return a non-nil empty
+// slice, otherwise the restore pass reads a clean "nothing left to
+// restore" as a failed LIST and keeps reliefDue armed forever.
 func (p *apiserverWriteStormCheck) stormFluxTargets(ctx context.Context,
 	log logr.Logger, stampedOnly bool) []*fluxWriteStormObject {
 
-	var out []*fluxWriteStormObject
+	out := make([]*fluxWriteStormObject, 0)
 	for _, gvr := range []schema.GroupVersionResource{kube.GVRFluxKustomization, kube.GVRHelmReleaseV2} {
 		objs, err := p.AllUnstructured(ctx, gvr)
 		if kube.IsCRDAbsent(err) {
@@ -433,7 +434,13 @@ func (p *apiserverWriteStormCheck) stormFluxTargets(ctx context.Context,
 			if suspended, _ := kube.NestedBool(o.Object, "spec", "suspend"); suspended {
 				continue
 			}
-			if kube.EffectiveAnno(ctx, o, kube.AnnoWriteStormExempt) != "" {
+			// Truthiness, not presence: an explicit "false" opts the
+			// object back IN (the same spelling apiserver_relist_storm
+			// uses). Treating any value as exempt lets a single
+			// stray annotation silently disable storm relief.
+			if strings.EqualFold(
+				strings.TrimSpace(kube.EffectiveAnno(ctx, o, kube.AnnoWriteStormExempt)),
+				"true") {
 				continue
 			}
 			// Only suspend objects still Ready — a Ready=False

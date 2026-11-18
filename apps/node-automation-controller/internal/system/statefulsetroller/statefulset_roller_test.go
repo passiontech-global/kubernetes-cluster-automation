@@ -24,6 +24,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	natestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -253,6 +254,67 @@ func TestStatefulSetRollerCordonedNodeGate(t *testing.T) {
 	}
 	if !natestutil.PodExists(t, cs, "apps", "db-0") {
 		t.Fatal("pod deleted while a node is cordoned")
+	}
+}
+
+// A STATIC cordon (aged past the maintenance drain window, or with
+// no unschedulable taint at all) still vetoes the roll: the pod's
+// replacement cannot be scheduled on that node, regardless of
+// whether a drain is "in flight". NodeActivelyCordoned alone would
+// let this through.
+func TestStatefulSetRollerStaticCordonGate(t *testing.T) {
+	t0 := time.Now()
+	aged := metav1.NewTime(t0.Add(-2 * time.Hour))
+	cordoned := natestutil.Node("w1", corev1.ConditionTrue, nil)
+	cordoned.Spec.Unschedulable = true
+	cordoned.Spec.Taints = []corev1.Taint{{
+		Key: kube.UnschedulableTaintKey, Effect: corev1.TaintEffectNoSchedule,
+		TimeAdded: &aged,
+	}}
+	objs := []runtime.Object{cordoned,
+		srSTS("apps", "db", true),
+		srPod("db", 0, "rev-old", 30*time.Minute)}
+	cs := fake.NewSimpleClientset(objs...)
+	r := srRoller(cs, t0)
+	r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !natestutil.PodExists(t, cs, "apps", "db-0") {
+		t.Fatal("pod deleted while a node is statically cordoned")
+	}
+}
+
+// A node fenced by a remediation actor is NOT an active drain —
+// NodeActivelyCordoned deliberately exempts it — but it still may
+// not host the replacement pod. Gate 1 must refuse the roll while
+// any node carries a remediation/fence taint.
+func TestStatefulSetRollerRemediationTaintGate(t *testing.T) {
+	for _, key := range []string{
+		kube.TaintKubeletUnresponsive,
+		kube.TaintNetworkPartitioned,
+		kube.TaintNodeOutOfService,
+		"remediation.medik8s.io/kernel-deadlock",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t0 := time.Now()
+			fenced := natestutil.Node("w1", corev1.ConditionTrue, nil)
+			fenced.Spec.Taints = []corev1.Taint{{
+				Key: key, Effect: corev1.TaintEffectNoSchedule,
+			}}
+			objs := []runtime.Object{fenced,
+				srSTS("apps", "db", true),
+				srPod("db", 0, "rev-old", 30*time.Minute)}
+			cs := fake.NewSimpleClientset(objs...)
+			r := srRoller(cs, t0)
+			r.driftSince.Observe(srDBDriftKey, t0.Add(-time.Hour))
+			if err := r.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if !natestutil.PodExists(t, cs, "apps", "db-0") {
+				t.Fatalf("pod deleted while a node carries fence taint %q", key)
+			}
+		})
 	}
 }
 

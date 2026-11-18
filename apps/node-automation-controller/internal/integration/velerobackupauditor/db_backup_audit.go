@@ -42,10 +42,10 @@ type dbBackupAudit struct {
 	// is the operator-not-installed quiet no-op).
 	primaryListErr string
 	backupListErr  string
-	// listBackups gates the second list on the primary result: cnpg
+	// listBackups gates the second list on the primary count: cnpg
 	// skips the Backup read entirely when no schedule exists, everest
 	// always reads DatabaseClusterBackups.
-	listBackups func(primary *unstructured.UnstructuredList) bool
+	listBackups func(primaryCount int) bool
 	// ownerPath locates the owning cluster on a backup object
 	// (spec.dbClusterName / spec.clusterName) for the "ns/name" index.
 	ownerPath []string
@@ -75,49 +75,56 @@ func (a *veleroBackupAuditor) auditDBBackups(ctx context.Context,
 	seen.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
-	primary, err := a.veleroList(ctx, cfg.primaryGVR)
+	// Stream the primary census, keeping only the pointers the
+	// subject loop needs (page bodies die with their page).
+	primary := []*unstructured.Unstructured{}
+	err := a.veleroListEach(ctx, cfg.primaryGVR,
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				primary = append(primary, page[i].DeepCopy())
+			}
+			return nil
+		})
 	switch {
 	case err == nil:
 		// proceed below
 	case kube.IsCRDAbsent(err):
-		// Operator not installed — current stays empty so the
+		// Operator not installed — primary stays empty so the
 		// prune below still clears any stale series.
-		primary = &unstructured.UnstructuredList{}
 	default:
 		return fmt.Errorf("%s: %w", cfg.primaryListErr, err)
 	}
 
-	var backups *unstructured.UnstructuredList
-	if cfg.listBackups(primary) {
-		backups, err = a.veleroList(ctx, cfg.backupGVR)
+	// Index backups by owning cluster ("ns/name") once — each
+	// subject then judges only its own history. The backup census is
+	// streamed too; only the per-cluster history pointers survive.
+	byCluster := map[string][]*unstructured.Unstructured{}
+	if cfg.listBackups(len(primary)) {
+		err = a.veleroListEach(ctx, cfg.backupGVR,
+			func(page []unstructured.Unstructured) error {
+				for i := range page {
+					b := &page[i]
+					owner, _ := kube.NestedString(b.Object, cfg.ownerPath...)
+					if owner == "" {
+						continue
+					}
+					key := b.GetNamespace() + "/" + owner
+					byCluster[key] = append(byCluster[key], b.DeepCopy())
+				}
+				return nil
+			})
 		switch {
 		case err == nil:
 			// proceed
 		case kube.IsCRDAbsent(err):
-			backups = nil // backup CRD absent — subjects audit as "no backups"
+			// backup CRD absent — subjects audit as "no backups"
 		default:
 			return fmt.Errorf("%s: %w", cfg.backupListErr, err)
 		}
 	}
 
-	// Index backups by owning cluster ("ns/name") once —
-	// each subject then judges only its own history.
-	byCluster := map[string][]*unstructured.Unstructured{}
-	if backups != nil {
-		for i := range backups.Items {
-			b := &backups.Items[i]
-			owner, _ := kube.NestedString(b.Object, cfg.ownerPath...)
-			if owner == "" {
-				continue
-			}
-			key := b.GetNamespace() + "/" + owner
-			byCluster[key] = append(byCluster[key], b)
-		}
-	}
-
 	now := a.now.Now()
-	for i := range primary.Items {
-		obj := &primary.Items[i]
+	for _, obj := range primary {
 		ns, cluster, skip := cfg.identity(obj)
 		if skip {
 			continue

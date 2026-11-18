@@ -56,6 +56,28 @@ var outOfServiceTaintKeys = []string{
 // matched by prefix because the rule names are user-defined.
 const remediationMedik8sTaintPrefix = "remediation.medik8s.io/"
 
+// NodeHasOutOfServiceTaint reports whether n carries an explicit
+// out-of-service FENCE (node.kubernetes.io/out-of-service or medik8s
+// SNR's twin) — deliberately narrower than
+// HasRemediationOrOutOfServiceTaint: a plain NotReady node or a
+// kubelet-unresponsive remediation taint is NOT a fence. Callers
+// about to force-delete a pod on a dead node use this as the proof
+// the kubelet is gone for good (a NotReady node's kubelet may return
+// and still hold a RWO volume). Nil-safe.
+func NodeHasOutOfServiceTaint(n *corev1.Node) bool {
+	if n == nil {
+		return false
+	}
+	for _, t := range n.Spec.Taints {
+		for _, oos := range outOfServiceTaintKeys {
+			if t.Key == oos {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // HasRemediationTaint reports whether the node carries any
 // remediation taint from RemediationTaints (kubelet-unresponsive,
 // network-partitioned, node-hang-precordon, cpu-steal) —

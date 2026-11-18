@@ -155,7 +155,9 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 			uid:          rs.UID,
 			creationTime: rs.CreationTimestamp.Time,
 		}
-		if rev, err := strconv.ParseInt(rs.Annotations["deployment.kubernetes.io/revision"], 10, 64); err == nil {
+		if rev, err := strconv.ParseInt(
+			kube.EffectiveAnnos(ctx, rs)["deployment.kubernetes.io/revision"],
+			10, 64); err == nil {
 			row.revision = rev
 		}
 		if rs.Spec.Replicas != nil {
@@ -175,7 +177,12 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 	var findings []string
 	for i := range deps {
 		d := &deps[i]
-		if d.Spec.Paused || kube.IsIntentionallyDownscaled(d.Annotations, d.Spec.Replicas) {
+		// An explicit zero is not a wedged rollout — there is nothing
+		// to roll, so no stage may act on it. Read annotations through
+		// the sweep overlay so a stamp recorded earlier this sweep is
+		// visible to the downscaler verdict too.
+		if d.Spec.Paused || (d.Spec.Replicas != nil && *d.Spec.Replicas == 0) ||
+			kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, d), d.Spec.Replicas) {
 			continue
 		}
 		rsList := rsByDep[d.UID]
@@ -217,9 +224,11 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 		"deployments rollout-wedged: ", ", ")
 }
 
-// unwedgeDeployment runs the three stages for one wedged
+// unwedgeDeployment runs at most ONE stage per sweep for one wedged
 // Deployment: terminal-pod GC (mutex-exempt), stale-RS zeroing,
-// then the persisted template nudge.
+// then the persisted template nudge. A stage that actually mutated
+// returns immediately — the next sweep re-lists against the new
+// state instead of stacking a nudge on a just-deleted pod census.
 func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 	log logr.Logger, d *appsv1.Deployment, rsList []rsCensusRow,
 	pods []corev1.Pod, now time.Time) {
@@ -260,11 +269,19 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 			continue
 		}
 		deletedPods++
+		// Tombstone the UID in the sweep overlay: later checks in the
+		// same sweep must not act on (or re-delete) this pod without
+		// paying for another pod census LIST.
+		kube.MarkPodDeleted(ctx, pod.UID)
 		log.Info("GC: deleted terminal pod blocking rollout",
 			"pod", ns+"/"+pod.Name, "deployment", ns+"/"+name)
 	}
 	if deletedPods > 0 {
 		p.InvalidatePods(ctx)
+		// ONE stage per sweep: the pod census just changed, so the
+		// RS-zeroing / nudge verdicts below must be re-derived from a
+		// fresh snapshot next sweep instead of riding stale state.
+		return
 	}
 	// Stage 2 — stale ReplicaSet zeroing: old revisions with
 	// spec.replicas>0 but readyReplicas==0 hold ResourceQuota
@@ -317,9 +334,10 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 				}
 				if zeroed > 0 {
 					p.nudgeHeals.Stamp(ck2, now)
-				} else {
-					heal.RefundGrant(now)
+					// ONE stage per sweep — the quota picture changed.
+					return
 				}
+				heal.RefundGrant(now)
 			}
 		}
 	}
@@ -327,7 +345,7 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 	// Deployments (the wedge signature is expected there) and
 	// Git-owned objects (a template nudge on a Flux-managed
 	// Deployment ping-pongs the source every reconcile).
-	if kube.IsIntentionallyDownscaled(d.Annotations, d.Spec.Replicas) {
+	if kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, d), d.Spec.Replicas) {
 		return
 	}
 	if !heal.FluxPatchGate("deployment", d, ns+"/"+name, now) {

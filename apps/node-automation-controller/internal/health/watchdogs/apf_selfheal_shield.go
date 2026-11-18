@@ -12,17 +12,19 @@
 //     with nominalConcurrencyShares 40 and lendablePercent 50: it
 //     lends half its share to the cluster when idle and reclaims it
 //     the instant an API storm hits.
-//   - FlowSchema/selfheal-controllers — matchingPrecedence 500 (ahead
-//     of every workload-* schema at 1000..9000) matching the
-//     node-automation-controller, node-host-agent and coredns
+//   - FlowSchema/selfheal-controllers — matchingPrecedence 550 (ahead
+//     of every workload-* schema at 1000..9000 and behind the
+//     cilium-apf shield at 500 — matching node-ops-apf.yaml) matching
+//     the node-automation-controller, node-host-agent and coredns
 //     ServiceAccounts plus NODE_AUTOMATION_APF_SHIELD_EXTRA_SAS.
 //
 // Drift is repaired in place (spec replace on the fetched object) and
 // every write passes heal.FluxPatchGate — a Git source pinning these
 // objects would otherwise ping-pong the check every sweep. A missing
-// RBAC grant (403) degrades to the node_automation_apf_shield_degraded
-// gauge + WARN instead of failing the sweep: the shield is protection,
-// not a workload, and an ungrantable cluster must still report.
+// RBAC grant (403) is a WARN that PASSES with degraded=0: a cluster
+// that does not grant APF read/write RBAC simply has no shield, and
+// holding degraded=1 for it is a permanent false alarm — the shield
+// is optional protection, not a workload, and must not page anyone.
 package watchdogs
 
 import (
@@ -57,8 +59,10 @@ const (
 
 	// apfShieldMatchingPrecedence sits ahead of every stock
 	// workload-* FlowSchema (1000..9000) so the self-heal SAs win the
-	// priority contest during an API storm.
-	apfShieldMatchingPrecedence int32 = 500
+	// priority contest during an API storm. 550 — NOT 500 — is the
+	// node-ops-apf.yaml value: 500 belongs to cilium-apf and stealing
+	// it would fight that shield's own FlowSchema every sweep.
+	apfShieldMatchingPrecedence int32 = 550
 
 	// apfShieldControllerSA is the controller's own ServiceAccount
 	// name; its namespace comes from the shield namespace knob.
@@ -121,11 +125,12 @@ func apfShieldConfigFromEnv() apfShieldConfig {
 var (
 	// node_automation_apf_shield_degraded — 1 while the
 	// selfheal-critical PLC or selfheal-controllers FlowSchema is
-	// missing, spec-drifted, or unwritable (RBAC 403); 0 when both
-	// objects match the pinned spec.
+	// missing or spec-drifted; 0 when both match the pinned spec OR
+	// RBAC denies access (an ungrantable optional shield is not an
+	// incident — holding 1 would page forever).
 	apfShieldDegraded = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "node_automation_apf_shield_degraded",
-		Help: "1 while the apf-selfheal-shield PriorityLevelConfiguration/FlowSchema is missing, drifted, or unwritable — apf-selfheal-shield.",
+		Help: "1 while the apf-selfheal-shield PriorityLevelConfiguration/FlowSchema is missing or drifted; RBAC 403 is not degraded — apf-selfheal-shield.",
 	})
 )
 
@@ -158,7 +163,7 @@ func (c apfShieldConfig) plcDesired() *flowcontrolv1.PriorityLevelConfiguration 
 }
 
 // apfShieldFlowSchemaDesired is the pinned FlowSchema spec: precedence
-// 500 ahead of workload-*, ByUser distinguisher so each shielded SA
+// 550 ahead of workload-*, ByUser distinguisher so each shielded SA
 // gets its own flow, and resource rules covering both namespaced
 // (all namespaces) and cluster-scoped requests — self-heal touches
 // nodes, leases and cluster-scoped config alike.
@@ -218,11 +223,12 @@ func apfShieldSubject(namespace, name string) flowcontrolv1.Subject {
 // Run reconciles both shield objects and reports convergence as
 // OBSERVED at read time: an object that was missing or drifted this
 // sweep counts degraded even when the heal write landed — the next
-// sweep's clean read is what flips the gauge back to 0. Every
-// failure mode — read error, write error, RBAC-403 — degrades to
-// the gauge + FAIL reason rather than Infra: the shield is
-// protection, not a workload, and an ungrantable or briefly-
-// unreachable apiserver must not take the whole sweep down with it.
+// sweep's clean read is what flips the gauge back to 0. Read/write
+// errors degrade to the gauge + FAIL reason rather than Infra: the
+// shield is protection, not a workload, and a briefly-unreachable
+// apiserver must not take the whole sweep down with it. RBAC-403 is
+// the exception — it WARNs and PASSES with degraded=0, because a
+// cluster that never granted the permission is not a regression.
 func (p *apfSelfHealShieldCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
@@ -230,18 +236,16 @@ func (p *apfSelfHealShieldCheck) Run(ctx context.Context) probefw.Result {
 	degraded := false
 
 	plc := p.cfg.plcDesired()
-	if why, forbidden := p.reconcilePLC(ctx, log, now, plc); why != "" {
+	if why, forbidden := p.reconcilePLC(ctx, log, now, plc); why != "" && !forbidden {
+		// RBAC-403 is deliberately NOT degraded: an ungrantable
+		// optional shield is a WARN, not a cluster incident.
 		degraded = true
-		if !forbidden {
-			rep.Find("prioritylevelconfiguration/" + apfShieldPLCName + ": " + why)
-		}
+		rep.Find("prioritylevelconfiguration/" + apfShieldPLCName + ": " + why)
 	}
 	fs := p.cfg.flowSchemaDesired()
-	if why, forbidden := p.reconcileFlowSchema(ctx, log, now, fs); why != "" {
+	if why, forbidden := p.reconcileFlowSchema(ctx, log, now, fs); why != "" && !forbidden {
 		degraded = true
-		if !forbidden {
-			rep.Find("flowschema/" + apfShieldFlowSchemaName + ": " + why)
-		}
+		rep.Find("flowschema/" + apfShieldFlowSchemaName + ": " + why)
 	}
 
 	if degraded {
@@ -254,7 +258,7 @@ func (p *apfSelfHealShieldCheck) Run(ctx context.Context) probefw.Result {
 
 // reconcilePLC ensures selfheal-critical exists with the pinned
 // spec. Returns ("", false) when converged; forbidden=true marks RBAC 403
-// where the check warns and sets degraded=1 without failing the sweep.
+// where the check only warns — Run leaves degraded at 0 for it.
 func (p *apfSelfHealShieldCheck) reconcilePLC(ctx context.Context,
 	log logr.Logger, now time.Time,
 	want *flowcontrolv1.PriorityLevelConfiguration) (string, bool) {
@@ -344,8 +348,8 @@ func (p *apfSelfHealShieldCheck) reconcileFlowSchema(ctx context.Context,
 }
 
 // writeFailure renders a create/update error as the degraded reason:
-// RBAC-403 gets forbidden=true so the cluster does not alert FAIL for
-// an ungranted optional protection shield.
+// RBAC-403 gets forbidden=true so the cluster neither alerts FAIL nor
+// holds the degraded gauge high for an ungranted optional shield.
 func (p *apfSelfHealShieldCheck) writeFailure(log logr.Logger,
 	op string, err error) (string, bool) {
 

@@ -57,7 +57,7 @@ func TestFluxKustHealthPatchesStuck(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k))
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
@@ -82,7 +82,7 @@ func TestFluxKustHealthFreshQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("fresh failure must pass: %+v", res)
 	}
 }
@@ -101,7 +101,7 @@ func TestFluxKustHealthDepNotReady(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k, dep))
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("stuck Kustomization must FAIL even when nudge is deferred")
 	}
@@ -126,7 +126,7 @@ func TestFluxKustHealthDepReady(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k, dep))
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
@@ -156,7 +156,7 @@ func TestFluxKustHealthCheckFailedGate(t *testing.T) {
 		fake.NewSimpleClientset(readyDeploy("apps", "web", 2, 2)),
 		probetest.OpDyn(mk()))
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
 	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -171,7 +171,7 @@ func TestFluxKustHealthCheckFailedGate(t *testing.T) {
 		fake.NewSimpleClientset(readyDeploy("apps", "web", 2, 0)),
 		probetest.OpDyn(mk()))
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
 	got, _ = p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -207,7 +207,7 @@ func TestFluxKustHealthCheckFailedGateRollout(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(),
 		probetest.OpDyn(mk(), rollout(2, 2)))
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
 	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -221,7 +221,7 @@ func TestFluxKustHealthCheckFailedGateRollout(t *testing.T) {
 	p = testProberDyn(fake.NewSimpleClientset(),
 		probetest.OpDyn(mk(), rollout(2, 0)))
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
 	got, _ = p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -257,7 +257,7 @@ func TestFluxKustHealthCheckFailedGateStatefulSet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(readySTS(3, 3)),
 		probetest.OpDyn(mk()))
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
 	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -271,7 +271,7 @@ func TestFluxKustHealthCheckFailedGateStatefulSet(t *testing.T) {
 	p = testProberDyn(fake.NewSimpleClientset(readySTS(3, 1)),
 		probetest.OpDyn(mk()))
 	p.Now = func() time.Time { return base }
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
 	got, _ = p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -290,7 +290,7 @@ func TestFluxKustHealthOtherReasonNoNudge(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
 	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -310,7 +310,7 @@ func TestFluxKustHealthCooldown(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("precondition: stuck Kustomization must FAIL")
 	}
 	first, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -319,7 +319,7 @@ func TestFluxKustHealthCooldown(t *testing.T) {
 		first.Object, "metadata", "annotations", kube.AnnoFluxRequestedAt)
 
 	p.Now = func() time.Time { return base.Add(10 * time.Minute) }
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("still-stuck Kustomization must keep FAILING")
 	}
 	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -342,11 +342,11 @@ func TestFluxKustHealthQuiet(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k, ok))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("suspended/ready Kustomizations must pass: %+v", res)
 	}
 	p2 := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn())
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p2).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p2).Run(probetest.SweepCtx(ctx, p2.Deps)); !res.Pass {
 		t.Fatalf("empty flux tree must pass: %+v", res)
 	}
 }
@@ -359,7 +359,7 @@ func TestFluxKustHealthGaugeEmitted(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("precondition: must FAIL")
 	}
 	m := probetest.FindMetric(t, "node_automation_flux_kustomization_stuck",
@@ -401,7 +401,7 @@ func TestFluxKustHealthDefersOnFreshSourceNudge(t *testing.T) {
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k, repo))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("deferred Kustomization must still FAIL detection")
 	}
 	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").
@@ -425,7 +425,7 @@ func TestFluxKustHealthNudgesWhenSourceNudgeStale(t *testing.T) {
 			p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(k, repo))
 			p.Now = func() time.Time { return base }
 
-			if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+			if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 				t.Fatal("stuck Kustomization must FAIL")
 			}
 			// The artifact-fail path nudges the SOURCE first (both
@@ -474,7 +474,7 @@ func TestFluxKustHealthNonArtifactReasonIgnoresSourceNudge(t *testing.T) {
 		probetest.OpDyn(k, repo))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*fluxKustomizationHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck Kustomization must FAIL")
 	}
 	got, _ := p.Dyn.Resource(fluxKustGVR).Namespace("flux-system").

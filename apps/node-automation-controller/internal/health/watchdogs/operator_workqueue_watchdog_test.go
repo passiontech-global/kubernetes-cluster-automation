@@ -128,7 +128,7 @@ func TestCheckOperatorWorkqueuesSourceControllerHeals(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("source-controller/gitrepositories/apps/repo/"+kcmReasonStaleGen, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck gitrepository with a renewing lease must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "source-controller", kcmReasonStaleGen); v != 1 {
@@ -156,7 +156,7 @@ func TestCheckOperatorWorkqueuesCertManagerNoConditions(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("cert-manager/certificates/apps/tls/"+opReasonNoConditions, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("never-reconciled Certificate must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "cert-manager", opReasonNoConditions); v != 1 {
@@ -184,7 +184,7 @@ func TestCheckOperatorWorkqueuesPersistedFirstSeenResume(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("persisted first-seen must trip on the first post-restart sweep")
 	}
 	if v, _ := shOpFrozenGauge(t, "cert-manager", opReasonNoConditions); v != 1 {
@@ -209,7 +209,7 @@ func TestCheckOperatorWorkqueuesShipwrightOperatorNoConditions(t *testing.T) {
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
 		Observe("shipwright-operator/shipwrightbuilds//build-1/"+opReasonNoConditions, base.Add(-time.Hour))
 
-	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("never-reconciled ShipwrightBuild must FAIL")
 	}
 	if v, _ := shOpFrozenGauge(t, "shipwright-operator", opReasonNoConditions); v != 1 {

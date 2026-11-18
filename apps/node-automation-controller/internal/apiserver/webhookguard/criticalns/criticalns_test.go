@@ -237,6 +237,41 @@ func TestWebhookHeartbeatResourceExposedDetection(t *testing.T) {
 	}
 }
 
+// A fail-closed webhook with apiGroups: ["*"] and explicit heartbeat
+// resources really does intercept the core/coordination heartbeat path
+// — the group-aware audit must flag it with a selector that matches a
+// critical namespace (wave3.2/api-groups-wildcard).
+func TestWebhookHeartbeatWildcardAPIGroupFlagged(t *testing.T) {
+	const cfgName = "wildcard-group-vwc"
+	const hookName = "wildcard-group.example.com"
+	w := cpValidatingHook(hookName, nil, admissionv1.Fail, nil)
+	w.Rules = []admissionv1.RuleWithOperations{{
+		Operations: []admissionv1.OperationType{admissionv1.Create},
+		Rule: admissionv1.Rule{
+			APIGroups: []string{"*"}, APIVersions: []string{"v1"},
+			Resources: []string{"leases", "nodes/status", "pods/status"},
+		},
+	}}
+	vwc := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: cfgName},
+		Webhooks:   []admissionv1.ValidatingWebhook{w},
+	}
+	for _, res := range []string{"leases", "nodes/status", "pods/status"} {
+		testutil.CleanupMetric(t, metrics.WebhookHeartbeatResourceExposed,
+			guardstate.KindValidating, cfgName, hookName, res)
+	}
+	cs := fake.NewSimpleClientset(upNamespace("kube-system", ""), vwc)
+	s, g := upGuard(cs)
+	s.Sweep(g.TakeSnapshot(ctx))
+	for _, res := range []string{"leases", "nodes/status", "pods/status"} {
+		if got := ptestutil.ToFloat64(metrics.WebhookHeartbeatResourceExposed.WithLabelValues(
+			guardstate.KindValidating, cfgName, hookName, res)); got != 1 {
+			t.Fatalf("heartbeat %s/%s/%s/%s = %v, want 1",
+				guardstate.KindValidating, cfgName, hookName, res, got)
+		}
+	}
+}
+
 // The heartbeat audit's namespaceSelector split is resource-aware:
 // a webhook whose selector already excludes every critical namespace
 // still flags on the cluster-scoped/every-namespace paths

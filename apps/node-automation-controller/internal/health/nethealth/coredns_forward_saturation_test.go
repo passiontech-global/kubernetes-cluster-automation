@@ -63,13 +63,13 @@ func TestCoreDNSFwdSatPersistenceWindow(t *testing.T) {
 	base := time.Now()
 
 	probetest.FreezeNow(d, base)
-	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
 		t.Fatalf("first breaching sweep must pass inside window: %+v", res)
 	}
 	probetest.FreezeNow(d, base.Add(coreDNSFwdSatMinAge-time.Minute))
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	probetest.FreezeNow(d, base.Add(coreDNSFwdSatMinAge+time.Minute))
-	res := ch.Run(probetest.SweepCtx(ctx))
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	if res.Pass {
 		t.Fatal("sustained rejects past the window must fail")
 	}
@@ -85,6 +85,10 @@ func TestCoreDNSFwdSatPersistenceWindow(t *testing.T) {
 	if got.Annotations[kube.AnnoCoreDNSBoostUntil] == "" {
 		t.Fatal("boost-until stamp missing")
 	}
+	if got.Annotations[kube.AnnoCoreDNSBoostBase] != "2" {
+		t.Fatalf("boost-base stamp = %q, want %q (pre-boost replicas)",
+			got.Annotations[kube.AnnoCoreDNSBoostBase], "2")
+	}
 }
 
 func TestCoreDNSFwdSatBoostWindowIsCooldown(t *testing.T) {
@@ -94,11 +98,11 @@ func TestCoreDNSFwdSatBoostWindowIsCooldown(t *testing.T) {
 	ch := &coreDNSForwardSaturationCheck{Deps: d, boostReplicas: 3}
 	base := time.Now()
 	probetest.FreezeNow(d, base)
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	probetest.FreezeNow(d, base.Add(coreDNSFwdSatMinAge+time.Minute))
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	probetest.FreezeNow(d, base.Add(coreDNSFwdSatMinAge+2*time.Minute))
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	got, _ := d.CS.AppsV1().Deployments("kube-system").
 		Get(ctx, "coredns", metav1.GetOptions{})
 	if *got.Spec.Replicas != 5 {
@@ -110,7 +114,7 @@ func TestCoreDNSFwdSatBoostWindowIsCooldown(t *testing.T) {
 func TestCoreDNSFwdSatNoRejectsPasses(t *testing.T) {
 	d := fwdSatDeps(t, 0, corednsDep(2))
 	ch := &coreDNSForwardSaturationCheck{Deps: d, boostReplicas: 2}
-	if res := ch.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
 		t.Fatalf("zero rejects must pass: %+v", res)
 	}
 }
@@ -131,9 +135,9 @@ func TestCoreDNSFwdSatFluxGateBlocksBoost(t *testing.T) {
 	ch := &coreDNSForwardSaturationCheck{Deps: d, boostReplicas: 3}
 	base := time.Now()
 	probetest.FreezeNow(d, base)
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	probetest.FreezeNow(d, base.Add(coreDNSFwdSatMinAge+time.Minute))
-	ch.Run(probetest.SweepCtx(ctx))
+	ch.Run(probetest.SweepCtx(ctx, ch.Deps))
 	got, _ := d.CS.AppsV1().Deployments("kube-system").
 		Get(ctx, "coredns", metav1.GetOptions{})
 	if *got.Spec.Replicas != 2 {

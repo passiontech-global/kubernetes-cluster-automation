@@ -34,15 +34,47 @@ const (
 	defaultErrorRateThreshold = 0.5
 	defaultLatencyP99Seconds  = 5.0
 
+	// promLatencyMaxFiniteBucket is the largest finite bucket of the
+	// apiserver's apiserver_admission_webhook_admission_duration_seconds
+	// histogram (0.005, 0.025, 0.1, 0.5, 1, 2.5, 10, 25, +Inf).
+	// histogram_quantile can never return a value above it, so a
+	// configured threshold past 25s could never fire — clamp to it.
+	promLatencyMaxFiniteBucket = 25.0
+
 	reasonErrorRate  = "error_rate"
 	reasonLatencyP99 = "latency_p99"
 
-	// promErrorRateQuery measures 5xx / webhook-call failure ratio per
-	// admission webhook name, strictly excluding error_type="no_error".
-	promErrorRateQuery = `sum by (name) (rate(apiserver_admission_webhook_rejection_count{error_type=~"calling_webhook_error|apiserver_internal_error"}[5m])) / clamp_min(sum by (name) (rate(apiserver_admission_webhook_admission_duration_seconds_count[5m])), 0.001)`
+	// promRejectRate / promFailOpenRate are the two failure signals the
+	// error-rate numerator combines. Kept as named consts so the
+	// inner-join rescue below is provably complete (both appear twice).
+	promRejectRate   = `sum by (name) (rate(apiserver_admission_webhook_rejection_count{error_type=~"calling_webhook_error|apiserver_internal_error"}[5m]))`
+	promFailOpenRate = `sum by (name) (rate(apiserver_admission_webhook_fail_open_count[5m]))`
+
+	// promMinRequestsFilter is the request floor shared by BOTH signals:
+	// fewer than 5 admitted requests in [5m] cannot trip. `and` has lower
+	// precedence than `/`, so this constrains the whole ratio/quantile.
+	promMinRequestsFilter = `and (sum by (name) (increase(apiserver_admission_webhook_admission_duration_seconds_count[5m])) >= 5)`
+
+	// promErrorRateQuery measures admission failures per webhook name.
+	// The numerator MUST include apiserver_admission_webhook_fail_open_count:
+	// once the breaker flips failurePolicy to Ignore the apiserver stops
+	// recording rejections, so rejection_count alone drops to 0 and the
+	// breaker would re-close ~10m later — the 25m Fail↔Ignore sawtooth.
+	// A fail-open admission is exactly the degraded state we are holding.
+	//
+	// A bare `X + Y` is WRONG: PromQL `+` is an inner join on {name}, so
+	// when either series is absent (a Fail webhook that has never
+	// fail-opened, or an Ignore webhook after apiserver restart) the
+	// numerator is EMPTY and the error-rate trip can never fire. The
+	// `((X + Y) or X or Y)` form rescues either one-sided case: `or`
+	// keeps the left series' label sets and appends the right only where
+	// no left series matched. When both exist we still sum them.
+	promErrorRateQuery = `((` + promRejectRate + ` + ` + promFailOpenRate + `) or ` + promRejectRate + ` or ` + promFailOpenRate + `) / clamp_min(sum by (name) (rate(apiserver_admission_webhook_admission_duration_seconds_count[5m])), 0.001) ` + promMinRequestsFilter
 
 	// promLatencyP99Query measures p99 admission webhook duration per name.
-	promLatencyP99Query = `histogram_quantile(0.99, sum by (name, le) (rate(apiserver_admission_webhook_admission_duration_seconds_bucket[5m])))`
+	// Same request floor as the error-rate signal: a low-traffic webhook
+	// must not trip on a single slow admission.
+	promLatencyP99Query = `histogram_quantile(0.99, sum by (name, le) (rate(apiserver_admission_webhook_admission_duration_seconds_bucket[5m]))) ` + promMinRequestsFilter
 )
 
 type latencyKey struct {
@@ -79,6 +111,12 @@ func (b *Breaker) queryLatencySignals(ctx context.Context, g *guardstate.Guard) 
 	latThresh := g.WebhookLatencyP99Seconds
 	if latThresh <= 0 {
 		latThresh = defaultLatencyP99Seconds
+	}
+	// The apiserver histogram's last finite bucket is 25s; a higher
+	// configured threshold is unobservable through histogram_quantile
+	// and would silently disable the latency signal.
+	if latThresh > promLatencyMaxFiniteBucket {
+		latThresh = promLatencyMaxFiniteBucket
 	}
 	log := logf.FromContext(ctx)
 	breaches := map[string]string{}
@@ -122,17 +160,28 @@ type latencyVerdict struct {
 	holdForMetrics map[string]bool   // sub-webhook names blocked from Ignore->Fail recover
 	tripForMetrics map[string]string // sub-webhook names >=15m eligible to trip -> reason
 	bounceServices []string          // backend ns/name services >=10m to bounce
+	neverFailOpen  bool              // config opted out via AnnoWebhookNeverFailOpen
 }
 
-func (s *circuitSweep) evaluateLatency(cfg guardstate.WebhookConfigView) latencyVerdict {
+func (s *circuitSweep) evaluateLatency(ctx context.Context, cfg guardstate.WebhookConfigView) latencyVerdict {
 	var out latencyVerdict
-	neverFailOpen := cfg.Annotations[kube.AnnoWebhookNeverFailOpen] == "true"
+	// The opt-out must be read through the sweep overlay: a recorded
+	// annotation patch earlier in the same sweep (or an object whose
+	// snapshot copy predates the write) is visible here, not just the
+	// raw snapshot map.
+	neverFailOpen := kube.EffectiveAnnos(ctx, cfg.Object)[kube.AnnoWebhookNeverFailOpen] == "true"
+	out.neverFailOpen = neverFailOpen
 	broken := guardstate.ParseCircuitAnnotation(cfg.Anno)
 	degradedWindow := s.b.effDegradedThreshold()
 	tripWindow := s.b.effLatencyTripThreshold()
 
 	for _, h := range cfg.Hooks {
 		key := cfg.Kind + "/" + cfg.Name + "/" + h.Name
+		// A latency trip must only ever apply to Service-backed
+		// webhooks: a URL webhook's census ref is unmeasurable
+		// (svcEffective == -1), so a tripped entry freezes in
+		// evalStillBroken forever with no way to confirm recovery.
+		serviceBacked := h.Service != nil && h.Service.Namespace != "" && h.Service.Name != ""
 		if s.latency.queryError {
 			// When Prometheus cannot be queried, preserve any already-emitted
 			// metric-degraded sub-webhook so a broken entry does not prematurely recover.
@@ -172,10 +221,10 @@ func (s *circuitSweep) evaluateLatency(cfg guardstate.WebhookConfigView) latency
 		}
 		out.holdForMetrics[h.Name] = true
 
-		if s.allowTrips && h.Service != nil && h.Service.Namespace != "" && h.Service.Name != "" {
+		if s.allowTrips && serviceBacked {
 			out.bounceServices = append(out.bounceServices, h.Service.Namespace+"/"+h.Service.Name)
 		}
-		if s.allowTrips && elapsed >= tripWindow && !broken[h.Name] &&
+		if s.allowTrips && serviceBacked && elapsed >= tripWindow && !broken[h.Name] &&
 			s.g.LatencyBreakerTripEnabled && !neverFailOpen {
 			if out.tripForMetrics == nil {
 				out.tripForMetrics = map[string]string{}

@@ -109,7 +109,7 @@ func TestLocalPVStrandedConcourseHeals(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("stranded pod must FAIL")
 	}
@@ -151,7 +151,7 @@ func TestLocalPVStrandedDatabaseNoHeal(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stranded database pod must FAIL")
 	}
 	if _, err := cs.CoreV1().PersistentVolumeClaims("scylla").
@@ -182,7 +182,7 @@ func TestLocalPVStrandedAnnotatedEphemeralHeals(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	_ = probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	m := probetest.FindMetric(t, "node_automation_localpv_stranded_pods",
 		map[string]string{"namespace": "apps", "pod": "cache-0",
 			"pvc": "data-cache-0", "node": "node-f", "reason": strandedReasonOutOfService})
@@ -219,7 +219,7 @@ func TestLocalPVStrandedSoftStatesAlertOnly(t *testing.T) {
 			defer localPVStrandedPodsGauge.DeleteLabelValues(
 				"concourse", "concourse-worker-0", "pvc-w", "n1", tc.reason)
 
-			if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+			if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 				t.Fatal("stranded pod must FAIL")
 			}
 			if _, err := cs.CoreV1().PersistentVolumeClaims("concourse").
@@ -245,7 +245,7 @@ func TestLocalPVStrandedTooYoungForHeal(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stranded pod must FAIL")
 	}
 	if _, err := cs.CoreV1().PersistentVolumeClaims("concourse").
@@ -272,7 +272,7 @@ func TestLocalPVStrandedStatefulPodGauge(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stranded stateful pod must FAIL")
 	}
 	m := probetest.FindMetric(t, "node_automation_localpv_stranded_stateful_pod",
@@ -306,7 +306,7 @@ func TestLocalPVStrandedEphemeralNoStatefulGauge(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	_ = probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if m := probetest.FindMetric(t, "node_automation_localpv_stranded_stateful_pod",
 		map[string]string{"namespace": "concourse", "pod": "concourse-worker-0",
 			"dead_node": "dead-node"}); m != nil {
@@ -326,7 +326,7 @@ func TestLocalPVStrandedMaintenanceDefers(t *testing.T) {
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	_ = probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx))
+	_ = probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if _, err := cs.CoreV1().PersistentVolumeClaims("concourse").
 		Get(ctx, "pvc-w", metav1.GetOptions{}); err != nil {
 		t.Fatal("PVC deleted during maintenance")
@@ -342,21 +342,23 @@ func TestPVCStalledProvisionerHeals(t *testing.T) {
 	})
 	base := time.Now()
 	worker := testutil.Node("w1", corev1.ConditionTrue, nil)
-	provPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1",
-		OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: "apps/v1", Kind: "ReplicaSet",
-			Name: "openebs-localpv-provisioner-7d9f", UID: "rs-p1",
-			Controller: ptr.To(true),
-		}},
-	}}
+	provPod := &corev1.Pod{
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: "openebs-localpv-provisioner-7d9f", UID: "rs-p1",
+				Controller: ptr.To(true),
+			}},
+		}}
 	cs := fake.NewSimpleClientset(worker, provPod,
 		pendingPodForPVC("apps", "web-0", "data-x", 20*time.Minute, base),
 		stalledHostpathPVC("apps", "data-x"))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stalled provisioning must FAIL")
 	}
 	m := probetest.FindMetric(t, "node_automation_pvc_provisioning_stalled",
@@ -374,21 +376,23 @@ func TestPVCStalledProvisionerHeals(t *testing.T) {
 // stalled: no gauge, no heal.
 func TestPVCStalledNeedsAWorker(t *testing.T) {
 	base := time.Now()
-	provPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1",
-		OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: "apps/v1", Kind: "ReplicaSet",
-			Name: "openebs-localpv-provisioner-7d9f", UID: "rs-p1",
-			Controller: ptr.To(true),
-		}},
-	}}
+	provPod := &corev1.Pod{
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: "openebs-localpv-provisioner-7d9f", UID: "rs-p1",
+				Controller: ptr.To(true),
+			}},
+		}}
 	cs := fake.NewSimpleClientset(provPod,
 		pendingPodForPVC("apps", "web-0", "data-x", 20*time.Minute, base),
 		testPVC("apps", "data-x", "", "openebs-hostpath", corev1.ClaimPending))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("no schedulable worker must pass quietly: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("openebs").
@@ -404,21 +408,23 @@ func TestPVCStalledNeedsAWorker(t *testing.T) {
 func TestPVCStalledWithoutSelectedNodeIsQuiet(t *testing.T) {
 	base := time.Now()
 	worker := testutil.Node("w1", corev1.ConditionTrue, nil)
-	provPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1",
-		OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: "apps/v1", Kind: "ReplicaSet",
-			Name: "openebs-localpv-provisioner-7d9f", UID: "rs-p1",
-			Controller: ptr.To(true),
-		}},
-	}}
+	provPod := &corev1.Pod{
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: "openebs-localpv-provisioner-7d9f", UID: "rs-p1",
+				Controller: ptr.To(true),
+			}},
+		}}
 	cs := fake.NewSimpleClientset(worker, provPod,
 		pendingPodForPVC("apps", "web-0", "data-x", 20*time.Minute, base),
 		testPVC("apps", "data-x", "", "openebs-hostpath", corev1.ClaimPending))
 	p := testProberDyn(cs, probetest.OpDyn())
 	p.Now = func() time.Time { return base }
 
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("unselected pending claim must pass quietly: %+v", res)
 	}
 	if m := probetest.FindMetric(t, "node_automation_pvc_provisioning_stalled",
@@ -442,14 +448,16 @@ func TestPVCStalledProvisionerHealStampPersisted(t *testing.T) {
 		pvcProvisionerHealsTotal.DeleteLabelValues("openebs-localpv-provisioner")
 	})
 	build := func(base, healStamp time.Time) (*fake.Clientset, *probetest.Prober) {
-		provPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-			Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1",
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "apps/v1", Kind: "ReplicaSet",
-				Name: "openebs-localpv-provisioner-7d9f", UID: "rs-p1",
-				Controller: ptr.To(true),
-			}},
-		}}
+		provPod := &corev1.Pod{
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "openebs", Name: "openebs-localpv-provisioner-abc", UID: "p1",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1", Kind: "ReplicaSet",
+					Name: "openebs-localpv-provisioner-7d9f", UID: "rs-p1",
+					Controller: ptr.To(true),
+				}},
+			}}
 		dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
 			Namespace: openebsProvisionerNS, Name: openebsProvisionerName}}
 		if !healStamp.IsZero() {
@@ -467,7 +475,7 @@ func TestPVCStalledProvisionerHealStampPersisted(t *testing.T) {
 
 	// Healed 10m ago (annotation only — fresh process): deferred.
 	cs, p := build(time.Now(), time.Now().Add(-10*time.Minute))
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stalled provisioning must FAIL even under the persisted cooldown")
 	}
 	if _, err := cs.CoreV1().Pods("openebs").
@@ -477,7 +485,7 @@ func TestPVCStalledProvisionerHealStampPersisted(t *testing.T) {
 
 	// No stamp: the heal fires and stamps the Deployment on delivery.
 	cs2, p2 := build(time.Now(), time.Time{})
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p2).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p2).Run(probetest.SweepCtx(ctx, p2.Deps)); res.Pass {
 		t.Fatal("stalled provisioning must FAIL")
 	}
 	if _, err := cs2.CoreV1().Pods("openebs").
@@ -495,7 +503,7 @@ func TestPVCStalledProvisionerHealStampPersisted(t *testing.T) {
 
 	// Healed 2h ago: window cleared, the bounce resumes.
 	cs3, p3 := build(time.Now(), time.Now().Add(-2*time.Hour))
-	if res := probetest.MustCheck[*localPVStrandedCheck](t, p3).Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := probetest.MustCheck[*localPVStrandedCheck](t, p3).Run(probetest.SweepCtx(ctx, p3.Deps)); res.Pass {
 		t.Fatal("stalled provisioning must FAIL past the expired stamp")
 	}
 	if _, err := cs3.CoreV1().Pods("openebs").

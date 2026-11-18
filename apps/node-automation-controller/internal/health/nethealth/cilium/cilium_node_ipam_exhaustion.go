@@ -16,9 +16,12 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -210,38 +213,67 @@ func (p *ciliumNodeIPAMExhaustionCheck) Run(ctx context.Context) probefw.Result 
 
 // reapTerminalPodsOnNode deletes Succeeded/Failed pods on an
 // IP-exhausted node (capped) so kubelet releases their sandboxes and
-// pod IPs — once per node per cooldown, maintenance-gated. Terminal
-// pods hold no traffic; the delete is the safe existing shape (same
-// as the evicted-pod janitor, scoped to the exhausted node). The
-// node/terminal/cap pick rides BounceOperatorPod: the shared gate
-// runs once per node key and each delivered delete invalidates the
-// pod census and stamps the cooldown ledger.
+// pod IPs — once per node per cooldown. Terminal pods hold no
+// traffic, so this is GARBAGE COLLECTION, not a heal: the maintenance
+// mutex defers heal/restart churn, not cleanup, and a fleet
+// heal-budget token must not be spent on a dead pod. Going through
+// BounceOperatorPod was doubly wrong — it reserved the workload's
+// ONE disruption slot (silently capping a same-controller reap at a
+// single pod, the cap-50 promise defeated) and ticked the
+// ControlPlanePodHealsTotal counter for dead-object cleanup. Delete
+// directly with the same UID precondition + tombstone contract, and
+// stamp the per-node cooldown only on a delivered delete.
 func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Context,
 	log logr.Logger, node string, now time.Time) {
 
-	reaped := p.BounceOperatorPod(ctx, log, CheckNameCiliumNodeIPAM, "",
-		func(pods []corev1.Pod) []*corev1.Pod {
-			var targets []*corev1.Pod
-			for i := range pods {
-				pod := &pods[i]
-				if pod.Spec.NodeName != node {
-					continue // the old spec.nodeName FieldSelector, client-side
-				}
-				if pod.DeletionTimestamp != nil ||
-					(pod.Status.Phase != corev1.PodSucceeded &&
-						pod.Status.Phase != corev1.PodFailed) {
-					continue
-				}
-				if len(targets) >= ciliumIPAMMaxReaps {
-					break
-				}
-				targets = append(targets, pod)
-			}
-			return targets
-		},
-		&p.Heals, probefw.SelfHealKey(CheckNameCiliumNodeIPAM, "reap/"+node),
-		ciliumIPAMNodeCool, now)
+	key := probefw.SelfHealKey(CheckNameCiliumNodeIPAM, "reap/"+node)
+	if p.Heals.CooledDown(key, ciliumIPAMNodeCool, now) {
+		return
+	}
+	pods, err := p.AllPods(ctx)
+	if err != nil {
+		// Tolerated sub-failure: the sweep still reports the IPAM
+		// finding; only the cleanup is deferred to the next pass.
+		metrics.IncError(p.Name)
+		log.Info("WARN: list pods failed — terminal reap deferred",
+			"node", node, "error", err)
+		return
+	}
+	reaped := 0
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Spec.NodeName != node {
+			continue // the old spec.nodeName FieldSelector, client-side
+		}
+		if pod.DeletionTimestamp != nil ||
+			(pod.Status.Phase != corev1.PodSucceeded &&
+				pod.Status.Phase != corev1.PodFailed) {
+			continue
+		}
+		if reaped >= ciliumIPAMMaxReaps {
+			break
+		}
+		err := p.CS.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name,
+			kube.UIDDeleteOptions(pod.UID, ""))
+		switch {
+		case apierrors.IsNotFound(err), apierrors.IsConflict(err):
+			// Already gone, or recreated under a fresh UID — no
+			// delete was delivered, but tombstone the observed UID
+			// so later sweep readers hide it. No cooldown stamp.
+			kube.MarkPodDeleted(ctx, pod.UID)
+		case err != nil:
+			metrics.IncError(p.Name)
+			log.Error(err, "terminal pod reap failed",
+				"pod", pod.Namespace+"/"+pod.Name)
+		default:
+			// heal.DeletePod's tombstone contract, without the
+			// budget/mutex/heal-counter side effects.
+			kube.MarkPodDeleted(ctx, pod.UID)
+			reaped++
+		}
+	}
 	if reaped > 0 {
+		p.Heals.Stamp(key, now)
 		log.Info("REAP: deleted terminal pods on IP-exhausted node",
 			"node", node, "count", reaped)
 	}

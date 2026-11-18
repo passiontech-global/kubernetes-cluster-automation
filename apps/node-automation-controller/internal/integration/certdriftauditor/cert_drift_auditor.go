@@ -224,6 +224,43 @@ type certDriftAuditor struct {
 	seenLiveDrift         state.GaugeLedger[liveDriftMetricKey]
 	liveDriftEventSent    state.CooldownSet
 	liveDriftRolloutHeals state.CooldownSet
+
+	// Per-run read sharing: run() orders the webhook/TLS audits before
+	// auditLiveSockets, which lets the latter reuse the already-read
+	// TLS Secret meta, webhook configs and CRD conversion refs instead
+	// of re-listing (full-schema CRDs are the expensive one). The *Set
+	// flags distinguish "populated this sweep" from "nil because a
+	// unit test drives one duty in isolation" — the live audit falls
+	// back to its own reads in that case.
+	liveRunSecretMeta  map[secretMetricKey]tlsSecretMeta
+	liveRunSecretSet   bool
+	liveRunMWC         []admissionv1.MutatingWebhookConfiguration
+	liveRunVWC         []admissionv1.ValidatingWebhookConfiguration
+	liveRunWebhooksSet bool
+	liveRunCRDRefs     map[string]int32
+	liveRunCRDRefsSet  bool
+}
+
+func (a *certDriftAuditor) cachedWebhookConfigs() (
+	[]admissionv1.MutatingWebhookConfiguration,
+	[]admissionv1.ValidatingWebhookConfiguration, bool) {
+	return a.liveRunMWC, a.liveRunVWC, a.liveRunWebhooksSet
+}
+
+func (a *certDriftAuditor) cachedCRDRefs() map[string]int32 { return a.liveRunCRDRefs }
+func (a *certDriftAuditor) crdRefsCached() bool             { return a.liveRunCRDRefsSet }
+
+// beginLiveRun clears the per-run read-sharing cache. Called once at
+// the top of run() so a failed sweep cannot leak a previous sweep's
+// Secret/CRD census into the next one.
+func (a *certDriftAuditor) beginLiveRun() {
+	a.liveRunSecretMeta = nil
+	a.liveRunSecretSet = false
+	a.liveRunMWC = nil
+	a.liveRunVWC = nil
+	a.liveRunWebhooksSet = false
+	a.liveRunCRDRefs = nil
+	a.liveRunCRDRefsSet = false
 }
 
 // certSecretMemo caches one certSecretName resolution.
@@ -262,6 +299,7 @@ func Setup(d shared.Deps) error {
 }
 
 func (a *certDriftAuditor) run(ctx context.Context) error {
+	a.beginLiveRun()
 	// The audits are independent duties: a broken webhook list must
 	// not blind the TLS-expiry gauge (and vice versa), so all four
 	// run and their errors join (nil+nil+nil+nil → nil). The periodic

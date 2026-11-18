@@ -106,6 +106,35 @@ func TestDisruptionKeyNormalizesReplicaSetHash(t *testing.T) {
 	}
 }
 
+// Terminal pods (Succeeded/Failed) hold no traffic — GC of a dead
+// pod must not consume the one-disruption slot, so a reaper can
+// reap many terminal pods of the same controller while a sibling
+// check can still heal its wedged Running replica in the same sweep.
+func TestTryReserveWorkloadDisruptionTerminalPodsExempt(t *testing.T) {
+	ctx := WithSweepOverlay(t.Context())
+	rs := controllerRef("ReplicaSet", "web-6d9f")
+	live := overlayPod("web-live", rs)
+	deadA, deadB := overlayPod("web-dead-a", rs), overlayPod("web-dead-b", rs)
+	deadA.Status.Phase, deadB.Status.Phase = corev1.PodSucceeded, corev1.PodFailed
+
+	// Many terminal siblings all pass — no slot is consumed.
+	for _, p := range []*corev1.Pod{deadA, deadB} {
+		if !TryReserveWorkloadDisruption(ctx, p) {
+			t.Fatalf("terminal pod %s must not need the disruption slot", p.Name)
+		}
+	}
+	// The live replica of the SAME workload still gets its slot.
+	if !TryReserveWorkloadDisruption(ctx, live) {
+		t.Fatal("terminal reaping must not spend the live workload's disruption slot")
+	}
+	// ... and a second live sibling is still denied (the slot was
+	// genuinely reserved by the first live pod).
+	otherLive := overlayPod("web-live-2", rs)
+	if TryReserveWorkloadDisruption(ctx, otherLive) {
+		t.Fatal("live siblings still share one slot — the quorum guard must hold")
+	}
+}
+
 func TestTryReserveWorkloadDisruptionOutsideSweep(t *testing.T) {
 	// No overlay on ctx — every call is permissive (direct-Run
 	// checks and module periodics never share a sweep).

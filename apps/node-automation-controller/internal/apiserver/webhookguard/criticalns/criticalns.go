@@ -58,6 +58,18 @@ var webhookHeartbeatResources = map[string]bool{
 	"*/*":     true,
 }
 
+// ruleGroupMatches reports whether an admission rule's APIGroups
+// includes want. The API server treats a wildcard "*" group as
+// matching EVERY group — including the core group "" and
+// coordination.k8s.io — so a rule carrying ["*"] with an explicit
+// heartbeat resource really does intercept it. A non-wildcard foreign
+// group must still NOT be mistaken for the core/coordination groups:
+// that is the false-positive this group-aware check exists to avoid
+// (wave3.2/api-groups-wildcard).
+func ruleGroupMatches(groups []string, want string) bool {
+	return slices.Contains(groups, want) || slices.Contains(groups, "*")
+}
+
 // heartbeatClusterScopedResources are the heartbeat hits a
 // namespaceSelector can NEVER exclude: nodes/status is cluster-scoped
 // (the API server does not consult namespaceSelector for it at all),
@@ -371,9 +383,10 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 // literal alone lies, because a CRD group can serve its own "leases"
 // resource without ever touching the kubelet heartbeat. leases demands
 // coordination.k8s.io; nodes/status, pods/status and pods/eviction are
-// core-group subresources so a wildcard APIGroups ["*"] must not claim
-// them (only the wildcard RESOURCES "*", "*/*" cover every group); a
-// wildcard group behind a typed resource is exactly the false-positive
+// core-group subresources. An APIGroups entry of "*" DOES match both of
+// those groups server-side (wave3.2/api-groups-wildcard), so a wildcard
+// group with an explicit heartbeat resource is a real exposure; a
+// specific FOREIGN group behind a typed resource is the false-positive
 // shape this check exists to avoid.
 func heartbeatRuleHits(rule admissionv1.RuleWithOperations) []string {
 	var hits []string
@@ -388,16 +401,16 @@ func heartbeatRuleHits(rule admissionv1.RuleWithOperations) []string {
 		}
 		switch {
 		case res == "leases":
-			if !slices.Contains(rule.APIGroups, "coordination.k8s.io") {
+			if !ruleGroupMatches(rule.APIGroups, "coordination.k8s.io") {
 				continue
 			}
 		case res == "*" || res == "*/*":
 			// Wildcard resources cover every group by definition.
 		default:
 			// pods/*, nodes/* and the typed literals are all
-			// core-group resources — a wildcard APIGroups ["*"]
-			// must not claim them for a foreign group.
-			if !slices.Contains(rule.APIGroups, "") {
+			// core-group resources — but a wildcard APIGroups ["*"]
+			// reaches them too, so it must be accepted with "".
+			if !ruleGroupMatches(rule.APIGroups, "") {
 				continue
 			}
 		}

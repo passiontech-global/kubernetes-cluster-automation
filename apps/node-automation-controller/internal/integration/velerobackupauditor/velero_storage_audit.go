@@ -27,25 +27,27 @@ import (
 // restore has nothing to read. A missing CRD is a quiet no-op.
 func (a *veleroBackupAuditor) auditBSLs(ctx context.Context,
 	log logr.Logger) error {
-	bsls, err := a.veleroList(ctx, veleroBSLGVR)
+	err := a.veleroListEach(ctx, veleroBSLGVR,
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				bsl := &page[i]
+				ns, name := bsl.GetNamespace(), bsl.GetName()
+				phase, _ := kube.NestedString(bsl.Object, "status", "phase")
+				if phase == "Available" {
+					continue
+				}
+				k := pausedKey{ns, name}
+				a.seenBSL.Set(metrics.VeleroBSLUnavailable, 1, k, ns, name)
+				log.Info("velero BSL unavailable — backups/restore at risk",
+					"bsl", ns+"/"+name, "phase", phase)
+			}
+			return nil
+		})
 	switch {
 	case kube.IsCRDAbsent(err):
 		// CRD absent — nothing to audit.
 	case err != nil:
 		return fmt.Errorf("list velero backupstoragelocations: %w", err)
-	default:
-		for i := range bsls.Items {
-			bsl := &bsls.Items[i]
-			ns, name := bsl.GetNamespace(), bsl.GetName()
-			phase, _ := kube.NestedString(bsl.Object, "status", "phase")
-			if phase == "Available" {
-				continue
-			}
-			k := pausedKey{ns, name}
-			a.seenBSL.Set(metrics.VeleroBSLUnavailable, 1, k, ns, name)
-			log.Info("velero BSL unavailable — backups/restore at risk",
-				"bsl", ns+"/"+name, "phase", phase)
-		}
 	}
 	a.seenBSL.Prune(metrics.VeleroBSLUnavailable.DeleteLabelValues)
 	return nil
@@ -61,7 +63,46 @@ func (a *veleroBackupAuditor) auditBSLs(ctx context.Context,
 // re-initialized via reinitStaleRepo (velero-repo-reinit-heal).
 func (a *veleroBackupAuditor) auditBackupRepositories(ctx context.Context,
 	log logr.Logger) error {
-	repos, err := a.veleroList(ctx, veleroRepoGVR)
+	repoNotReadyNow := map[string]bool{}
+	err := a.veleroListEach(ctx, veleroRepoGVR,
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				repo := &page[i]
+				ns, name := repo.GetNamespace(), repo.GetName()
+				if phase, ok := kube.NestedString(
+					repo.Object, "status", "phase"); ok && phase != "Ready" {
+					a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
+						repoKey{ns, name, "phase_not_ready"},
+						ns, name, "phase_not_ready")
+					log.Info("velero backup repository not Ready — repo cannot be opened",
+						"repo", ns+"/"+name, "phase", phase)
+					// velero-repo-reinit-heal — a repo wedged NotReady >=30m gets
+					// deleted so Velero re-initializes the Kopia/
+					// Restic connection (heal-gated + cooled down).
+					if phase == "NotReady" {
+						lk := ns + "/" + name
+						repoNotReadyNow[lk] = true
+						first, _ := a.firstSeenRepoNotReady.Observe(
+							lk, a.now.Now())
+						if a.now.Now().Sub(first) >= veleroRepoNotReadyMinAge {
+							a.reinitStaleRepo(ctx, repo, ns, name)
+						}
+					}
+				}
+				t, ok := kube.NestedTime(repo.Object, "status", "lastMaintenanceTime")
+				if !ok || a.now.Now().Sub(t) <= veleroRepoMaintenanceMaxAge {
+					continue
+				}
+				a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
+					repoKey{ns, name, "maintenance_stale"},
+					ns, name, "maintenance_stale")
+				lmt, _ := kube.NestedString(repo.Object, "status", "lastMaintenanceTime")
+				log.Info("velero backup repository maintenance stale — prune/repack loop stopped",
+					"repo", ns+"/"+name, "lastMaintenanceTime", lmt,
+					"age", a.now.Now().Sub(t).Truncate(time.Hour))
+			}
+			return nil
+		})
 	switch {
 	case kube.IsCRDAbsent(err):
 		// CRD absent (older Velero without the repo API) — nothing
@@ -69,42 +110,6 @@ func (a *veleroBackupAuditor) auditBackupRepositories(ctx context.Context,
 	case err != nil:
 		return fmt.Errorf("list velero backuprepositories: %w", err)
 	default:
-		repoNotReadyNow := map[string]bool{}
-		for i := range repos.Items {
-			repo := &repos.Items[i]
-			ns, name := repo.GetNamespace(), repo.GetName()
-			if phase, ok := kube.NestedString(
-				repo.Object, "status", "phase"); ok && phase != "Ready" {
-				a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
-					repoKey{ns, name, "phase_not_ready"},
-					ns, name, "phase_not_ready")
-				log.Info("velero backup repository not Ready — repo cannot be opened",
-					"repo", ns+"/"+name, "phase", phase)
-				// velero-repo-reinit-heal — a repo wedged NotReady >=30m gets
-				// deleted so Velero re-initializes the Kopia/
-				// Restic connection (heal-gated + cooled down).
-				if phase == "NotReady" {
-					lk := ns + "/" + name
-					repoNotReadyNow[lk] = true
-					first, _ := a.firstSeenRepoNotReady.Observe(
-						lk, a.now.Now())
-					if a.now.Now().Sub(first) >= veleroRepoNotReadyMinAge {
-						a.reinitStaleRepo(ctx, repo, ns, name)
-					}
-				}
-			}
-			t, ok := kube.NestedTime(repo.Object, "status", "lastMaintenanceTime")
-			if !ok || a.now.Now().Sub(t) <= veleroRepoMaintenanceMaxAge {
-				continue
-			}
-			a.seenRepo.Set(metrics.VeleroRepoUnhealthy, 1,
-				repoKey{ns, name, "maintenance_stale"},
-				ns, name, "maintenance_stale")
-			lmt, _ := kube.NestedString(repo.Object, "status", "lastMaintenanceTime")
-			log.Info("velero backup repository maintenance stale — prune/repack loop stopped",
-				"repo", ns+"/"+name, "lastMaintenanceTime", lmt,
-				"age", a.now.Now().Sub(t).Truncate(time.Hour))
-		}
 		a.firstSeenRepoNotReady.Prune(
 			func(k string) bool { return repoNotReadyNow[k] })
 	}

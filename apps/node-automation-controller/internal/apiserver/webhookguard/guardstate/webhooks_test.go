@@ -206,6 +206,10 @@ func TestInjectorHealthy(t *testing.T) {
 			responsive, nil, nil, nil, nil, false, false},
 		{"mwc list error", nil, responsive, nil,
 			errors.New("mwc boom"), nil, nil, false, true},
+		// No MWC list and no list error (partial snapshot): fail closed
+		// instead of panicking on mwcs.Items (wave3.2/injector-nil-guard).
+		{"nil mwc list", nil, responsive, nil,
+			nil, nil, nil, false, false},
 		{"census error", gsInjMWC(hook, nil, "linkerd", "injector", ""),
 			responsive, nil, nil, errors.New("nodes boom"), nil, false, true},
 	} {

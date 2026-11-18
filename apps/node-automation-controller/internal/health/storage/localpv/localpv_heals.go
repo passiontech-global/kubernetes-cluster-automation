@@ -51,57 +51,103 @@ func (p *localPVStrandedCheck) healStrandedEphemeral(ctx context.Context,
 			continue
 		}
 		pvcUID := h.pvc.UID
+		// mutated tracks whether WE executed a write after the heal
+		// gate consumed its grant. Every clean bailout that ran no
+		// mutation hands the grant back (heal.DeletePod is a leaf and
+		// cannot refund for its caller).
+		mutated := false
 		pvcErr := p.CS.CoreV1().PersistentVolumeClaims(h.pvc.Namespace).
 			Delete(ctx, h.pvc.Name, metav1.DeleteOptions{
 				Preconditions: &metav1.Preconditions{UID: &pvcUID},
 			})
 		switch {
-		case pvcErr == nil || apierrors.IsNotFound(pvcErr):
+		case pvcErr == nil:
+			mutated = true
 			kube.MarkPVCDeleted(ctx, pvcUID)
-			// NotFound: the claim vanished between list and heal —
-			// the release half is already done, still free the pod.
+		case apierrors.IsNotFound(pvcErr):
+			// The claim vanished between list and heal — the
+			// release half is already done, still free the pod.
+			kube.MarkPVCDeleted(ctx, pvcUID)
+		case apierrors.IsConflict(pvcErr):
+			// UID precondition lost: the claim was recreated under
+			// a new UID between the census and this write. A race,
+			// not an apiserver failure — the next sweep vets the
+			// new object. No mutation, no error count.
+			heal.RefundGrant(now)
+			log.Info("SKIP: ephemeral localpv pvc delete raced (UID changed) — retry next sweep",
+				"pvc", pvcKey)
+			continue
 		case apierrors.IsForbidden(pvcErr):
 			// RBAC-denied is permanent (PVC delete is only granted
 			// via the concourse Role — an ephemeral-localpv opt-in
 			// elsewhere can never succeed). Stamp the cooldown so
 			// the check doesn't error-loop every sweep, keep the
 			// pod, and surface once.
+			heal.RefundGrant(now)
 			metrics.IncError(p.Name)
 			log.Error(pvcErr, "ephemeral localpv pvc delete forbidden — RBAC scope blocks the heal; stamping cooldown",
 				"pvc", pvcKey)
 			p.localPVHealed.Stamp(pvcKey, now)
 			continue
 		default:
+			heal.RefundGrant(now)
 			metrics.IncError(p.Name)
 			log.Error(pvcErr, "ephemeral localpv pvc delete failed", "pvc", pvcKey)
 			continue
 		}
-		// A pod already gone (NotFound) still counts the heal — the
-		// claim release landed and the pod slot is free either way —
-		// so the stamp stays manual rather than riding
-		// heal.DeletePod's delivered-delete stamp.
-		didDelete, err := heal.DeletePod(ctx, p.CS, nil, "", h.pod, now)
-		if err != nil && !apierrors.IsNotFound(err) {
+		// Re-confirm the POD itself on the live apiserver before the
+		// second half of the heal: the sweep's pod census is a
+		// snapshot, and a pod that got scheduled onto a live node in
+		// the meantime is a live workload — deleting it would be a
+		// kill the stranded-volume rescue never intended. A UID
+		// mismatch (same name recreated), a terminal/terminating pod,
+		// or an unverifiable read all keep the pod (fail closed,
+		// metered once here — the run absorbs the failure).
+		proceed, gone, err := p.strandedPodStillVetted(ctx, log, h)
+		if err != nil {
+			if !mutated {
+				heal.RefundGrant(now)
+			}
 			metrics.IncError(p.Name)
-			log.Error(err, "stranded pod delete failed",
+			log.Error(err, "stranded pod live confirm failed — keeping pod (fail closed)",
 				"pod", h.pod.Namespace+"/"+h.pod.Name)
 			continue
 		}
-		if err == nil && !didDelete {
-			// Quorum reservation denied — a sibling check already
-			// spent this workload's one-disruption slot this sweep.
-			// The PVC release already landed; the stranded pod is
-			// dead weight either way, so next sweep's re-detection
-			// finishes the job. (A NotFound err still falls through
-			// to the bookkeeping below — pod already gone counts.)
+		if !proceed && !gone {
+			if !mutated {
+				heal.RefundGrant(now)
+			}
 			continue
 		}
+		didDelete := false
+		// A pod that vanished between the live confirm and the delete
+		// still counts the heal — the claim release landed and the
+		// pod slot is free either way — so the stamp stays manual
+		// rather than riding heal.DeletePod's delivered-delete stamp.
+		if !gone {
+			var err error
+			didDelete, err = heal.DeletePod(ctx, p.CS, nil, "", h.pod, now)
+			if err != nil && !apierrors.IsNotFound(err) {
+				if !mutated {
+					heal.RefundGrant(now)
+				}
+				metrics.IncError(p.Name)
+				log.Error(err, "stranded pod delete failed",
+					"pod", h.pod.Namespace+"/"+h.pod.Name)
+				continue
+			}
+		}
+		// didDelete=false with no error means the pod was already
+		// gone (or its UID/quorum deferral landed): the claim release
+		// still freed the stranded slot, so stamp and count the heal
+		// rather than silently re-detecting it every sweep.
 		p.localPVHealed.Stamp(pvcKey, now)
 		localPVEphemeralHealsTotal.
 			WithLabelValues(h.pvc.Namespace, h.pvc.Name, h.node).Inc()
 		log.Info("DELETE: ephemeral localpv pvc+pod stranded on a confirmed-dead node — StatefulSet rebinds on a live node",
 			"pvc", pvcKey, "pod", h.pod.Namespace+"/"+h.pod.Name,
-			"node", h.node, "reason", h.reason)
+			"node", h.node, "reason", h.reason,
+			"podDeleted", didDelete, "podAlreadyGone", gone)
 	}
 }
 
@@ -154,7 +200,13 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 		func(pods []corev1.Pod) []*corev1.Pod {
 			for i := range pods {
 				pod := &pods[i]
+				// Only a RUNNING provisioner replica is the wedged
+				// controller this bounce restarts. A Pending pod is
+				// still starting (or unschedulable — bouncing it
+				// would just queue another), and Succeeded/Failed
+				// pods are finished, not stalled controllers.
 				if !strings.HasPrefix(pod.Name, openebsProvisionerPrefix) ||
+					pod.Status.Phase != corev1.PodRunning ||
 					pod.DeletionTimestamp != nil ||
 					metav1.GetControllerOf(pod) == nil {
 					continue
@@ -190,4 +242,53 @@ func (p *localPVStrandedCheck) healLocalPVProvisioner(ctx context.Context,
 		log.Error(err, "persist localpv provisioner heal stamp failed",
 			"deployment", openebsProvisionerNS+"/"+openebsProvisionerName)
 	}
+}
+
+// strandedPodStillVetted re-reads the heal target on the direct
+// clientset between the two halves of the rescue. The pod census is a
+// snapshot: a Pending pod stranded on a dead node can be scheduled
+// onto a live one, recreated under the same name, or start
+// terminating in the minutes since detection. None of those is a
+// stranded disposable volume any more, so the pod half must defer.
+// UID preconditions on both deletes close the write-side TOCTOU; this
+// confirm closes the verdict-side one. Returns (vetted, gone, err):
+// NotFound is NOT a deferral — the pod already vanished after the
+// claim release, which still counts as a delivered heal; a failed Get
+// is an error (fail closed — the caller meters it); the other
+// refusals are clean skips with no cooldown stamp.
+func (p *localPVStrandedCheck) strandedPodStillVetted(ctx context.Context,
+	log logr.Logger, h *strandedHeal) (vetted, gone bool, err error) {
+
+	live, err := p.CS.CoreV1().Pods(h.pod.Namespace).
+		Get(ctx, h.pod.Name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("SKIP: stranded pod already gone — claim release still counts",
+				"pod", h.pod.Namespace+"/"+h.pod.Name)
+			return false, true, nil
+		}
+		return false, false, err
+	}
+	if h.pod.UID != "" && live.UID != h.pod.UID {
+		log.Info("SKIP: stranded pod recreated since the census — UID mismatch",
+			"pod", h.pod.Namespace+"/"+h.pod.Name,
+			"listed", h.pod.UID, "live", live.UID)
+		return false, false, nil
+	}
+	if live.DeletionTimestamp != nil ||
+		live.Status.Phase == corev1.PodSucceeded ||
+		live.Status.Phase == corev1.PodFailed {
+		log.Info("SKIP: stranded pod now terminating or terminal",
+			"pod", h.pod.Namespace+"/"+h.pod.Name, "phase", live.Status.Phase)
+		return false, false, nil
+	}
+	if live.Spec.NodeName != "" {
+		// The scheduler placed it in the meantime — this is a live
+		// workload now, not an unscheduled pod stranded on a dead
+		// node. Killing it would be a needless disruption.
+		log.Info("SKIP: stranded pod got scheduled — no longer an orphan of the dead node",
+			"pod", h.pod.Namespace+"/"+h.pod.Name, "node", live.Spec.NodeName)
+		return false, false, nil
+	}
+	return true, false, nil
 }

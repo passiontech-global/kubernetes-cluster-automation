@@ -231,3 +231,190 @@ func TestLatencySignalNeverFailOpenBlocksTripButAllowsBounce(t *testing.T) {
 		t.Fatalf("expected degraded latency_p99 gauge=1, got %v", v)
 	}
 }
+
+// The 25-minute sawtooth: once the breaker flips to Ignore the
+// apiserver stops recording rejections, so a rejection-only numerator
+// falls to 0 and the breaker re-closes ~10m later. fail_open_count is
+// the signal that survives the flip and holds the degraded verdict.
+func TestLatencyErrorRateIncludesFailOpenAndRequestFloor(t *testing.T) {
+	var queries []string
+	srv := mockPromServer(t, func(query string) []promResult {
+		queries = append(queries, query)
+		if strings.Contains(query, "fail_open_count") {
+			// rejection_count is empty here — the webhook already
+			// flipped to Ignore and only fail-open admissions remain.
+			return []promResult{{
+				Metric: map[string]string{"name": "sawtooth.example.com"},
+				Value:  [2]any{1, "0.9"},
+			}}
+		}
+		return nil
+	})
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	g, b := wgBreakerGuard(fake.NewSimpleClientset(), &now)
+	g.PromEndpoint = srv.URL + "/api/v1/query"
+	g.PromClient = promq.Client{HTTP: srv.Client()}
+	g.WebhookErrorRateThreshold = 0.5
+
+	sig := b.queryLatencySignals(ctx, g)
+	if sig.queryError {
+		t.Fatal("unexpected prom query error")
+	}
+	if got := sig.breaches["sawtooth.example.com"]; got != reasonErrorRate {
+		t.Fatalf("breach reason = %q, want %q", got, reasonErrorRate)
+	}
+	if len(queries) == 0 || !strings.Contains(queries[0], "apiserver_admission_webhook_fail_open_count") {
+		t.Fatalf("error-rate query omits fail_open_count: %q", queries)
+	}
+	if !strings.Contains(queries[0], "increase(") {
+		t.Fatalf("error-rate query omits the minimum-request floor: %q", queries[0])
+	}
+}
+
+// A bare `X + Y` in PromQL is an inner join on {name}: a Fail webhook
+// that has NEVER fail-opened has no fail_open_count series, and an
+// Ignore webhook after an apiserver restart has no rejection_count
+// series. Either way the naked sum yields an EMPTY vector and the
+// error-rate trip is dead. The query must carry the `or X or Y`
+// rescue, and the one-sided result Prometheus returns after the
+// rescue must still register as a breach.
+func TestLatencyErrorRateRescuesOneSidedSeries(t *testing.T) {
+	// Structural guarantee: both signals appear in the (X+Y) sum AND
+	// in the rescue arms, so neither one-sided case can collapse to
+	// an empty numerator.
+	if n := strings.Count(promErrorRateQuery, promRejectRate); n != 2 {
+		t.Fatalf("rejection_count rate must appear in (X+Y) and in `or X`, got %d", n)
+	}
+	if n := strings.Count(promErrorRateQuery, promFailOpenRate); n != 2 {
+		t.Fatalf("fail_open_count rate must appear in (X+Y) and in `or Y`, got %d", n)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		webhook string
+	}{
+		{"never fail-opened (rejection series only)", "fail-only.example.com"},
+		{"Ignore after apiserver restart (fail-open series only)", "ignore-restart.example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// After the `or` rescue Prometheus returns one series
+			// for the webhook, carrying the surviving signal's value.
+			srv := mockPromServer(t, func(query string) []promResult {
+				if strings.Contains(query, "rejection_count") {
+					return []promResult{{
+						Metric: map[string]string{"name": tc.webhook, "error_type": "calling_webhook_error"},
+						Value:  [2]any{1, "0.9"},
+					}}
+				}
+				return nil
+			})
+			now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+			g, b := wgBreakerGuard(fake.NewSimpleClientset(), &now)
+			g.PromEndpoint = srv.URL + "/api/v1/query"
+			g.PromClient = promq.Client{HTTP: srv.Client()}
+			g.WebhookErrorRateThreshold = 0.5
+
+			sig := b.queryLatencySignals(ctx, g)
+			if sig.queryError {
+				t.Fatal("unexpected prom query error")
+			}
+			if got := sig.breaches[tc.webhook]; got != reasonErrorRate {
+				t.Fatalf("breach reason = %q, want %q", got, reasonErrorRate)
+			}
+		})
+	}
+}
+
+// The p99 latency signal must carry the same request floor as the
+// error-rate signal — a single slow admission on a low-traffic
+// webhook must not trip the breaker.
+func TestLatencyP99QueryHasRequestFloor(t *testing.T) {
+	if !strings.Contains(promLatencyP99Query, "increase(") ||
+		!strings.Contains(promLatencyP99Query, ">= 5") {
+		t.Fatalf("p99 query lost its minimum-request floor: %q", promLatencyP99Query)
+	}
+}
+
+// A URL webhook has no measurable backend (svcEffective == -1). A
+// latency trip there freezes in evalStillBroken forever — no census
+// evidence can ever confirm its recovery — so only Service-backed
+// webhooks may be tripped by the Prometheus signal.
+func TestLatencyTripSkipsURLWebhook(t *testing.T) {
+	metrics.WebhookAdmissionDegraded.Reset()
+	metrics.WebhookCircuitBroken.Reset()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "backend"}}
+	pod := wgPod("backend", "wh-pod-0", 30*time.Minute)
+	urlVal := "https://webhook.example.com/validate"
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "latency-url"},
+		Webhooks: []admissionv1.MutatingWebhook{
+			{
+				Name:          "url.example.com",
+				FailurePolicy: new(admissionv1.Fail),
+				ClientConfig:  admissionv1.WebhookClientConfig{URL: &urlVal},
+			},
+			{
+				Name:          "svc.example.com",
+				FailurePolicy: new(admissionv1.Fail),
+				ClientConfig:  admissionv1.WebhookClientConfig{Service: wgSvcRef("backend", "wh-svc")},
+			},
+		},
+	}
+	cs := fake.NewSimpleClientset(ns, mwc, readySliceWithPod("backend", "wh-svc", "wh-pod-0"), pod)
+	srv := mockPromServer(t, func(query string) []promResult {
+		if strings.Contains(query, "duration_seconds_bucket") {
+			return []promResult{
+				{Metric: map[string]string{"name": "url.example.com"}, Value: [2]any{1, "9.5"}},
+				{Metric: map[string]string{"name": "svc.example.com"}, Value: [2]any{1, "9.5"}},
+			}
+		}
+		return nil
+	})
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	g, b := wgBreakerGuard(cs, &now)
+	g.PromEndpoint = srv.URL + "/api/v1/query"
+	g.PromClient = promq.Client{HTTP: srv.Client()}
+	g.WebhookLatencyP99Seconds = 5.0
+	g.LatencyBreakerTripEnabled = true
+	b.degradedThreshold = 10 * time.Minute
+	b.latencyTripThreshold = 15 * time.Minute
+
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatalf("sweep T=0: %v", err)
+	}
+	now = now.Add(20 * time.Minute)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatalf("sweep T=20m: %v", err)
+	}
+	got, _ := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, "latency-url", metav1.GetOptions{})
+	if fp := *got.Webhooks[0].FailurePolicy; fp != admissionv1.Fail {
+		t.Fatalf("URL webhook must never be latency-tripped, got %q", fp)
+	}
+	if fp := *got.Webhooks[1].FailurePolicy; fp != admissionv1.Ignore {
+		t.Fatalf("Service-backed webhook must be latency-tripped, got %q", fp)
+	}
+}
+
+// RestoreOnly (kill-switch off) must not re-arm latency holds: querying
+// Prometheus there could hold a recovered entry Ignore indefinitely.
+func TestRestoreOnlySkipsLatencyQuery(t *testing.T) {
+	queries := 0
+	srv := mockPromServer(t, func(query string) []promResult {
+		queries++
+		return []promResult{{
+			Metric: map[string]string{"name": "x.example.com"},
+			Value:  [2]any{1, "0.9"},
+		}}
+	})
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	g, b := wgBreakerGuard(fake.NewSimpleClientset(), &now)
+	g.PromEndpoint = srv.URL + "/api/v1/query"
+	g.PromClient = promq.Client{HTTP: srv.Client()}
+	g.WebhookErrorRateThreshold = 0.5
+	if err := b.RestoreOnly(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatalf("RestoreOnly: %v", err)
+	}
+	if queries != 0 {
+		t.Fatalf("RestoreOnly issued %d Prometheus queries, want 0", queries)
+	}
+}

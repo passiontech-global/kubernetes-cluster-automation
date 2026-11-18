@@ -587,8 +587,20 @@ func (s *sweepSnapshot) resetUnstructs() {
 // MarkPodDeleted replaces).
 func WithSweepSnapshot(ctx context.Context, deps ...*Deps) context.Context {
 	var nowFn func() time.Time
-	if len(deps) > 0 && deps[0] != nil && deps[0].Now != nil {
-		nowFn = deps[0].Now
+	if len(deps) > 0 && deps[0] != nil {
+		// Close over the Deps pointer, never copy deps[0].Now by
+		// value: tests (and any caller) may install/replace the
+		// clock AFTER the snapshot is installed, and every memo's
+		// fetchedAt stamp must read the CURRENT seam — otherwise
+		// a frozen clock set via probetest.FreezeNow is ignored
+		// for the whole sweep.
+		d := deps[0]
+		nowFn = func() time.Time {
+			if d.Now != nil {
+				return d.Now()
+			}
+			return time.Now()
+		}
 	}
 	snap := newSweepSnapshot(ctx, nowFn)
 	ctx = context.WithValue(ctx, sweepCtxKey{}, snap)

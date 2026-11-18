@@ -59,17 +59,18 @@ type circuitEval struct {
 	recoverSeen map[string]bool
 	allowTrips  bool
 
-	broken      map[string]bool // annotation set being rebuilt
-	present     map[string]bool // every live sub-webhook name
-	blind       bool            // probe source itself suspect — see probeBlind
-	latencyHold map[string]bool
-	latencyTrip map[string]string
-	hookMerges  []map[string]any
-	changed     bool
-	trips       []string
-	recovered   []string
-	stillBroken []string
-	dropped     []string
+	broken        map[string]bool // annotation set being rebuilt
+	present       map[string]bool // every live sub-webhook name
+	blind         bool            // probe source itself suspect — see probeBlind
+	latencyHold   map[string]bool
+	latencyTrip   map[string]string
+	neverFailOpen bool // config-level AnnoWebhookNeverFailOpen, uniform across all trip paths
+	hookMerges    []map[string]any
+	changed       bool
+	trips         []string
+	recovered     []string
+	stillBroken   []string
+	dropped       []string
 }
 
 // circuitPatch evaluates one config's sub-webhooks against the ready
@@ -124,9 +125,10 @@ func (b *Breaker) circuitPatchWithLatency(log logr.Logger, queue, kind, cfgName,
 		// the healthy streak must not advance ("can't tell" holds the
 		// annotation, the SSOT). Apiserver-truth verdicts (0 effective
 		// endpoints) are unaffected.
-		blind:       probeBlind(ready),
-		latencyHold: lv.holdForMetrics,
-		latencyTrip: lv.tripForMetrics,
+		blind:         probeBlind(ready),
+		latencyHold:   lv.holdForMetrics,
+		latencyTrip:   lv.tripForMetrics,
+		neverFailOpen: lv.neverFailOpen,
 	}
 	for _, h := range e.hooks {
 		e.evalHook(h)
@@ -195,9 +197,11 @@ func (e *circuitEval) evalHook(h guardstate.WebhookView) {
 		e.evalRecover(h, key, svc)
 	case isBroken:
 		e.evalStillBroken(h, key)
-	case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.FailurePolicy) && e.allowTrips:
+	case (svcEffective == 0 || unresponsive) && guardstate.FailClosed(h.FailurePolicy) &&
+		e.allowTrips && !e.neverFailOpen:
 		e.evalTrip(h, key, svc, svcRaw, unresponsive)
-	case e.latencyTrip[h.Name] != "" && guardstate.FailClosed(h.FailurePolicy) && e.allowTrips:
+	case e.latencyTrip[h.Name] != "" && guardstate.FailClosed(h.FailurePolicy) &&
+		e.allowTrips && !e.neverFailOpen && svcEffective >= 0:
 		e.flip(h, admissionv1.Ignore)
 		e.broken[h.Name] = true
 		e.trips = append(e.trips, h.Name)

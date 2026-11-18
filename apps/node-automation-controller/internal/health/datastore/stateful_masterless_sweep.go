@@ -341,33 +341,47 @@ func (s *masterlessSweep) verdict() probefw.Result {
 	res := s.rep.Verdict(fmt.Sprintf(
 		"master-role services at 0 ready endpoints >=%s: ",
 		masterlessZeroMinAge), ", ")
-	if split := s.multiRep.Verdict(
+	split := s.multiRep.Verdict(
 		"master-role services with multiple ready masters (split brain) "+
-			">=2 sweeps: ", ", "); split.Why != "" {
+			">=2 sweeps: ", ", ")
+	if split.Why != "" {
 		if res.Why != "" {
 			res.Why += " | " + split.Why
 		} else {
 			res.Why = split.Why
 			res.Pass = false
 		}
-		if res.Infra == nil {
-			res.Infra = split.Infra
-		}
+	}
+	// An Infra-only report has NO findings (Verdict returns
+	// Result{Infra: err} with an empty Why). Folding Infra inside the
+	// Why!=="" branch above silently dropped a failed census/query and
+	// let a dead data source read as a passing check — the same bug the
+	// dragonfly check just fixed. Thread it out regardless of findings.
+	if res.Infra == nil {
+		res.Infra = split.Infra
+	}
+	if res.Infra != nil {
+		res.Pass = false
 	}
 	// Site-skew findings live on the skew sweep's own report — they
 	// get their own verdict wording instead of masquerading as a
 	// zero-endpoints or split-brain signature.
-	if skew := s.skew.rep.Verdict(
-		"stateful masters pinned to the standby site: ", ", "); skew.Why != "" {
+	skew := s.skew.rep.Verdict(
+		"stateful masters pinned to the standby site: ", ", ")
+	if skew.Why != "" {
 		if res.Why != "" {
 			res.Why += " | " + skew.Why
 		} else {
 			res.Why = skew.Why
 			res.Pass = false
 		}
-		if res.Infra == nil {
-			res.Infra = skew.Infra
-		}
+	}
+	// Same Infra-only propagation as the split-brain report above.
+	if res.Infra == nil {
+		res.Infra = skew.Infra
+	}
+	if res.Infra != nil {
+		res.Pass = false
 	}
 	return res
 }

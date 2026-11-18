@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -43,7 +44,7 @@ func TestCiliumIPAMExhaustionFailsAndReapsTerminalPods(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs) // dead prom -> pod-count fallback
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("exhausted node must fail: %+v", res)
 	}
@@ -65,7 +66,7 @@ func TestCiliumIPAMHealthyNodePasses(t *testing.T) {
 		Spec: corev1.NodeSpec{PodCIDR: "10.240.1.0/24"}}
 	cs := fake.NewSimpleClientset(node)
 	p := testProber(cs)
-	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("empty /24 must pass: %+v", res)
 	}
 }
@@ -136,7 +137,7 @@ func TestCiliumIPAMPrometheusAccountingWins(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("operator-reported 4.8%% free must fail despite an empty pod census: %+v", res)
 	}
@@ -177,7 +178,7 @@ func TestCiliumIPAMPrometheusPartialCoverage(t *testing.T) {
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("exhausted nodes must fail")
 	}
@@ -216,7 +217,7 @@ func TestCiliumIPAMAvailableQueryErrorFallsBack(t *testing.T) {
 
 	// Pod census says 100% free — only the (broken) prom path could
 	// have failed this node.
-	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("avail-query failure must degrade to pod-count, got %+v", res)
 	}
 }
@@ -235,7 +236,7 @@ func TestCiliumIPAMPodCountSkipsNonIPShapes(t *testing.T) {
 	cs := fake.NewSimpleClientset(node, hostNet, unscheduled, terminal, live)
 	p := testProber(cs) // dead prom -> pod-count fallback
 
-	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("only 1 IP-holding pod on a /30 must pass: %+v", res)
 	}
 }
@@ -253,7 +254,7 @@ func TestCiliumIPAMFreeClampsAtZero(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("3 pods on a 2-IP podCIDR must fail")
 	}
@@ -277,7 +278,7 @@ func TestCiliumIPAMSkipsBadPodCIDRNodes(t *testing.T) {
 	cs := fake.NewSimpleClientset(objs...)
 	p := testProber(cs)
 
-	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("unusable podCIDRs must be skipped, not failed: %+v", res)
 	}
 }
@@ -294,7 +295,7 @@ func TestCiliumIPAMReapSkipsDeletingPod(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("exhausted node must fail")
 	}
@@ -319,7 +320,7 @@ func TestCiliumIPAMReapCap(t *testing.T) {
 	testutil.EmulatePodNodeNameSelector(cs)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("exhausted node must fail")
 	}
@@ -332,6 +333,53 @@ func TestCiliumIPAMReapCap(t *testing.T) {
 	}
 	if remaining != 5 {
 		t.Fatalf("terminal pods remaining = %d, want exactly the 5 over cap", remaining)
+	}
+}
+
+// Terminal GC is exempt from both the one-disruption-per-workload
+// slot and the heal budget: five dead pods of the SAME controller
+// must all be reaped, and the pod-heal counter must not tick for
+// dead-object cleanup.
+func TestCiliumIPAMReapSameControllerDoesNotSpendHealBudget(t *testing.T) {
+	node := ipamNode("w-shared", "10.240.13.0/30")
+	objs := []runtime.Object{node,
+		ipamPodOnNode("apps", "live-1", "w-shared", corev1.PodRunning),
+		ipamPodOnNode("apps", "live-2", "w-shared", corev1.PodRunning)}
+	owner := metav1.OwnerReference{APIVersion: "batch/v1", Kind: "Job",
+		Name: "batch-job", Controller: ptr.To(true)}
+	for i := 0; i < 5; i++ {
+		dead := ipamPodOnNode("apps", fmt.Sprintf("dead-%d", i),
+			"w-shared", corev1.PodFailed)
+		dead.OwnerReferences = []metav1.OwnerReference{owner}
+		objs = append(objs, dead)
+	}
+	cs := fake.NewSimpleClientset(objs...)
+	testutil.EmulatePodNodeNameSelector(cs)
+	p := testProber(cs)
+
+	healCounter := func() float64 {
+		m := probetest.FindMetric(t, "node_automation_controlplane_pod_heals_total",
+			map[string]string{"check": CheckNameCiliumNodeIPAM})
+		if m == nil {
+			return 0
+		}
+		return m.GetCounter().GetValue()
+	}
+	before := healCounter()
+
+	res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).
+		Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatal("exhausted node must fail")
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := cs.CoreV1().Pods("apps").Get(ctx,
+			fmt.Sprintf("dead-%d", i), metav1.GetOptions{}); err == nil {
+			t.Fatalf("dead pod %d of the shared controller was not reaped", i)
+		}
+	}
+	if got := healCounter() - before; got != 0 {
+		t.Fatalf("terminal GC ticked the pod-heal counter by %v — no heal budget for dead pods", got)
 	}
 }
 
@@ -354,7 +402,7 @@ func TestCiliumIPAMInfraErrors(t *testing.T) {
 					return true, nil, errors.New("api down")
 				})
 			p := testProber(cs)
-			res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx))
+			res := probetest.MustCheck[*ciliumNodeIPAMExhaustionCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 			if res.Infra == nil {
 				t.Fatalf("%s list failure must surface as Infra, got %+v", tc.name, res)
 			}

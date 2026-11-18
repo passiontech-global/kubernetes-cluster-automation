@@ -210,8 +210,25 @@ func (r *statefulSetOnDeleteRoller) run(ctx context.Context) error {
 	}
 	nodesSafe := len(nodes) > 0
 	for i := range nodes {
-		if !kube.NodeReady(&nodes[i]) ||
-			kube.NodeActivelyCordoned(&nodes[i], now) {
+		n := &nodes[i]
+		// The roll deletes a LIVE pod whose replacement must be
+		// rescheduled. A cordoned node — including a STATIC cordon
+		// older than NodeActivelyCordoned's drain window — cannot
+		// take that replacement, and a node carrying a remediation
+		// or out-of-service fence is being quarantined, not drained:
+		// rolling on top of either can leave the set under-replicated
+		// with nowhere for the new member to land.
+		//
+		// NodeActivelyCordoned is deliberately NARROW here — it
+		// exempts fenced/remediation nodes and aged cordons so the
+		// maintenance mutex does not freeze *other* heals. That
+		// trade-off is wrong for a gate whose whole job is "can the
+		// cluster accept a replacement member?", so widen it with
+		// the raw spec flag and the shared fence vocabulary.
+		if !kube.NodeReady(n) ||
+			n.Spec.Unschedulable ||
+			kube.HasRemediationOrOutOfServiceTaint(n) ||
+			kube.NodeActivelyCordoned(n, now) {
 			nodesSafe = false
 			break
 		}

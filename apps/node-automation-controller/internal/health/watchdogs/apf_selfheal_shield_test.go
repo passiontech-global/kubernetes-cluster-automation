@@ -42,7 +42,7 @@ var apfTestCfg = apfShieldConfig{
 func TestAPFSelfHealShieldCreatesMissing(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	p := apfShieldCheck(t, cs, apfTestCfg)
-	res := p.Run(probetest.SweepCtx(ctx))
+	res := p.Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("missing shield objects must fail this sweep: %+v", res)
 	}
@@ -62,9 +62,13 @@ func TestAPFSelfHealShieldCreatesMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FlowSchema not created: %v", err)
 	}
+	if apfShieldMatchingPrecedence != 550 {
+		t.Fatalf("apfShieldMatchingPrecedence = %d, want 550 (node-ops-apf.yaml, not cilium-apf's 500)",
+			apfShieldMatchingPrecedence)
+	}
 	if fs.Spec.MatchingPrecedence != apfShieldMatchingPrecedence {
-		t.Fatalf("matchingPrecedence = %d, want 500",
-			fs.Spec.MatchingPrecedence)
+		t.Fatalf("FlowSchema matchingPrecedence = %d, want %d",
+			fs.Spec.MatchingPrecedence, apfShieldMatchingPrecedence)
 	}
 	// Subjects: controller@node-ops, node-host-agent@kube-system,
 	// coredns@kube-system, plus the extra SA.
@@ -101,7 +105,7 @@ func TestAPFSelfHealShieldCreatesMissing(t *testing.T) {
 		writes++
 		return false, nil, nil
 	})
-	res = p.Run(probetest.SweepCtx(ctx))
+	res = p.Run(probetest.SweepCtx(ctx, p.Deps))
 	if !res.Pass {
 		t.Fatalf("converged shield must pass: %+v", res)
 	}
@@ -141,7 +145,7 @@ func TestAPFSelfHealShieldRepairsDrift(t *testing.T) {
 	}
 	cs := fake.NewSimpleClientset(badPLC, badFS)
 	p := apfShieldCheck(t, cs, apfTestCfg)
-	res := p.Run(probetest.SweepCtx(ctx))
+	res := p.Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("drifted shield must fail — objects were divergent at read")
 	}
@@ -155,7 +159,7 @@ func TestAPFSelfHealShieldRepairsDrift(t *testing.T) {
 	}
 	fs, _ := cs.FlowcontrolV1().FlowSchemas().
 		Get(ctx, apfShieldFlowSchemaName, metav1.GetOptions{})
-	if fs.Spec.MatchingPrecedence != 500 ||
+	if fs.Spec.MatchingPrecedence != 550 ||
 		fs.Spec.PriorityLevelConfiguration.Name != apfShieldPLCName ||
 		len(fs.Spec.Rules) != 1 || len(fs.Spec.Rules[0].Subjects) != 6 {
 		t.Fatalf("FlowSchema not repaired: %+v", fs.Spec)
@@ -168,7 +172,7 @@ func TestAPFSelfHealShieldReportOnly(t *testing.T) {
 	cfg := apfTestCfg
 	cfg.enforce = false
 	p := apfShieldCheck(t, cs, cfg)
-	res := p.Run(probetest.SweepCtx(ctx))
+	res := p.Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("missing shield must fail even in report-only mode")
 	}
@@ -182,8 +186,9 @@ func TestAPFSelfHealShieldReportOnly(t *testing.T) {
 	}
 }
 
-// A 403 on create degrades gracefully — FAIL + degraded reason, no
-// panic, no Infra error.
+// A 403 on create is a WARN only: the optional shield is simply not
+// granted, so the sweep PASSES with degraded=0 — no panic, no Infra,
+// and above all no permanent false alarm.
 func TestAPFSelfHealShieldForbiddenDegrades(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	forbidden := apierrors.NewForbidden(
@@ -200,15 +205,15 @@ func TestAPFSelfHealShieldForbiddenDegrades(t *testing.T) {
 				apfShieldFlowSchemaName, nil)
 		})
 	p := apfShieldCheck(t, cs, apfTestCfg)
-	res := p.Run(probetest.SweepCtx(ctx))
+	res := p.Run(probetest.SweepCtx(ctx, p.Deps))
 	if !res.Pass {
-		t.Fatalf("forbidden writes must PASS gracefully (degraded=1): %+v", res)
+		t.Fatalf("forbidden writes must PASS gracefully (degraded=0): %+v", res)
 	}
 	if res.Infra != nil {
 		t.Fatalf("403 must not surface as Infra: %v", res.Infra)
 	}
-	if got := testutil.ToFloat64(apfShieldDegraded); got != 1 {
-		t.Fatalf("degraded gauge = %v, want 1", got)
+	if got := testutil.ToFloat64(apfShieldDegraded); got != 0 {
+		t.Fatalf("degraded gauge = %v, want 0 — RBAC 403 must not page", got)
 	}
 }
 
@@ -241,7 +246,7 @@ func TestAPFSelfHealShieldFluxGate(t *testing.T) {
 		}
 	}
 	p := apfShieldCheck(t, cs, apfTestCfg)
-	res := p.Run(probetest.SweepCtx(ctx))
+	res := p.Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("flux-gated drift must fail")
 	}

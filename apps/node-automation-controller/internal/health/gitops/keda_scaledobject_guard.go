@@ -224,6 +224,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	var annotations map[string]string
 	var replicas *int32
 	var rv string
+	var targetObj metav1.Object // the census object FluxPatchGate inspects
 	kind := ""
 	if want == "" || want == "Deployment" {
 		dep, err := p.Deployment(ctx, ns, target)
@@ -235,6 +236,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 			annotations = kube.EffectiveAnnos(ctx, dep)
 			replicas = dep.Spec.Replicas
 			rv = dep.ResourceVersion
+			targetObj = dep
 		}
 	}
 	if kind == "" && (want == "" || want == "StatefulSet") {
@@ -247,6 +249,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 			annotations = kube.EffectiveAnnos(ctx, sts)
 			replicas = sts.Spec.Replicas
 			rv = sts.ResourceVersion
+			targetObj = sts
 		}
 	}
 	if kind == "" && (want == "" || want == "Rollout") {
@@ -264,6 +267,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 				kind = "Rollout"
 				annotations = kube.EffectiveAnnos(ctx, r)
 				rv = r.GetResourceVersion()
+				targetObj = r
 				if reps, found := kube.NestedInt64(r.Object, "spec", "replicas"); found {
 					v := int32(reps)
 					replicas = &v
@@ -280,6 +284,14 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	}
 	if kube.IsIntentionallyDownscaled(annotations, replicas) {
 		return // downscaler-managed zero — the workload is asleep on purpose
+	}
+	// spec.replicas is Git-owned on Flux-managed targets — gate the
+	// write so a Git-vs-heal ping-pong cannot storm the apiserver.
+	if targetObj != nil && !heal.FluxPatchGate(strings.ToLower(kind),
+		targetObj, ns+"/"+target, now) {
+		log.Info("SKIP: keda zero-rescue blocked by flux conflict gate",
+			"target", kind+" "+ns+"/"+target)
+		return
 	}
 
 	ck := probefw.SelfHealKey(CheckNameKedaScaledObjectGuard, ns+"/"+target)
@@ -301,6 +313,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		"spec":     map[string]any{"replicas": rescue},
 	})
 	if err != nil {
+		heal.RefundGrant(now) // no patch attempted — hand the token back
 		return
 	}
 	switch kind {

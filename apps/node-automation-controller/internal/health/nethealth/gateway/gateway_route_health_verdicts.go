@@ -281,12 +281,34 @@ func (p *gatewayRouteHealthCheck) serviceDownscaled(ctx context.Context,
 	log logr.Logger, c *gatewayRouteCensus, svc *corev1.Service) bool {
 
 	p.loadNamespaceWorkloads(ctx, log, c, svc.Namespace)
+	// A selectorless Service (ExternalName, manually managed
+	// EndpointSlices) has NO workload binding — SelectorFromSet(nil)
+	// is labels.Everything(), which would match every workload in
+	// the namespace and let any unrelated downscaled Deployment
+	// suppress a real zero_endpoints alert. "Can't prove the
+	// backend is asleep" must fail closed.
+	if len(svc.Spec.Selector) == 0 {
+		return false
+	}
 	sel := labels.SelectorFromSet(svc.Spec.Selector)
+	matched := false
 	for _, w := range c.workloads[svc.Namespace] {
-		if sel.Matches(labels.Set(w.templateLabels)) &&
-			kube.IsIntentionallyDownscaled(w.annotations, w.replicas) {
-			return true
+		if !sel.Matches(labels.Set(w.templateLabels)) {
+			continue
+		}
+		matched = true
+		// A Service can be backed by several workloads (a blue/
+		// green pair, two ReplicaSets with the same labels). It is
+		// "asleep on purpose" only if ALL of them are parked at
+		// zero — one live replica must keep the zero-endpoints
+		// verdict live instead of being excused by a sibling at
+		// zero. An explicit spec.replicas=0 is intent in its own
+		// right (GitOps-parked backend), even without a
+		// downscaler/* schedule annotation; nil replicas means the
+		// apiserver default of 1 and stays a real finding.
+		if w.replicas == nil || *w.replicas != 0 {
+			return false
 		}
 	}
-	return false
+	return matched
 }

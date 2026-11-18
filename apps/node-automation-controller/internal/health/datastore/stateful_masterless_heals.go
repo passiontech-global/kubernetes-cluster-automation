@@ -195,10 +195,18 @@ func (p *statefulMasterlessCheck) dragonflyOperatorHealedAt(ctx context.Context,
 // ordinal — "<sts>-0" in the common case — or nil when none of the
 // pods match the "<sts>-<n>" naming. StatefulSet pod names are the
 // only source of truth for the ordinal (there is no field for it).
+// Terminating pods are never a delete target — a replacement is
+// already on its way and the UID-preconditioned delete would only
+// race the replica set back to zero.
 func smallestOrdinalPod(pods []*corev1.Pod, stsName string) *corev1.Pod {
 	var best *corev1.Pod
 	bestOrd := -1
 	for i := range pods {
+		if pods[i].DeletionTimestamp != nil ||
+			pods[i].Status.Phase == corev1.PodSucceeded ||
+			pods[i].Status.Phase == corev1.PodFailed {
+			continue
+		}
 		name := pods[i].Name
 		if !strings.HasPrefix(name, stsName+"-") {
 			continue
@@ -279,16 +287,23 @@ func (p *statefulMasterlessCheck) healDragonflyReplicaDeadlock(ctx context.Conte
 	var pods []*corev1.Pod
 	for i := range allPods {
 		pod := &allPods[i]
-		if pod.Namespace == sig.sts.Namespace &&
-			sel.Matches(labels.Set(pod.Labels)) {
-			pods = append(pods, pod)
+		if pod.Namespace != sig.sts.Namespace ||
+			!sel.Matches(labels.Set(pod.Labels)) ||
+			pod.DeletionTimestamp != nil ||
+			kube.IsPodDeleted(ctx, pod.UID) ||
+			pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Status.Phase == corev1.PodFailed {
+			continue
 		}
+		pods = append(pods, pod)
 	}
 
 	// Gate 2 — confirm the deadlock shape: all replicas Ready but
-	// nobody holds the master role.
-	if len(pods) == 0 {
-		return // no pods — nothing safe to delete
+	// nobody holds the master role. This is a DUAL-replica heal: a
+	// single-replica StatefulSet has no partner to re-elect and a
+	// delete here would take the only member down.
+	if len(pods) < 2 {
+		return // fewer than two live replicas — nothing safe to delete
 	}
 	allReady := true
 	hasMaster := false

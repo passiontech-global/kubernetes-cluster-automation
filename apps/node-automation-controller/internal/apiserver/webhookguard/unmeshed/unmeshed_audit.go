@@ -16,6 +16,7 @@ package unmeshed
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -86,6 +87,12 @@ type Auditor struct {
 // exported unconditionally; deletion additionally requires the
 // injector webhook provably healthy and the remediation flag on.
 func (a *Auditor) Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
+	// A partial snapshot must fail closed before ANY deps dereference:
+	// a nil namespace/deps census is "can't tell", never "nothing to
+	// classify" (which would silently prune every live series).
+	if snap == nil || snap.G == nil {
+		return errors.New("unmeshed audit skipped: nil snapshot/deps")
+	}
 	a.unmeshedEmitted.Begin() // drop any aborted sweep's leftover emissions
 	g := snap.G
 	log := logf.FromContext(ctx)

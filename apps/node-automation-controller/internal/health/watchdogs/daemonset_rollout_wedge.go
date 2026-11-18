@@ -25,9 +25,11 @@
 // node_automation_daemonset_rollout_wedged{namespace,daemonset}=1.
 // When NODE_AUTOMATION_DAEMONSET_ROLLOUT_HEAL_ENABLED is on (default)
 // the check deletes ONE blocking pod per DaemonSet per 30m — a live
-// pod through heal.DeletePod, an already-Terminating pod on a dead
-// node through heal.ForceDeletePod (grace=0; a plain delete on a
-// terminating pod is an apiserver no-op). The gate is
+// pod through heal.DeletePod, an already-Terminating pod ONLY on a
+// vanished/out-of-service-fenced node through heal.ForceDeletePod
+// (grace=0; a plain delete on a terminating pod is an apiserver
+// no-op). A plain NotReady node is never force-deleted, and a pod
+// claiming a PVC or already on the new revision is skipped. The gate is
 // HealAllowedClusterWideOnly: the wedge exists because a node is
 // cordoned/dead and the classic mutex holds on exactly that signal,
 // so only a cluster-wide maintenance hold defers the heal.
@@ -36,6 +38,7 @@ package watchdogs
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,9 +74,12 @@ const (
 
 // nodeRolloutState is the per-node census row the wedge check needs:
 // exists (in the live node list), notReady (Ready condition != True),
-// cordoned (spec.unschedulable or actively cordoned).
+// cordoned (spec.unschedulable or actively cordoned), and node (the
+// live object, so the force-delete gate can prove an out-of-service
+// fence rather than settling for a plain NotReady condition).
 type nodeRolloutState struct {
 	exists, notReady, cordoned bool
+	node                       *corev1.Node
 }
 
 // dsRolloutWedgeCheck detects DaemonSet rollout wedges.
@@ -140,7 +146,7 @@ func (p *dsRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 	nodes := map[string]nodeRolloutState{}
 	for i := range nodeList {
 		n := &nodeList[i]
-		st := nodeRolloutState{exists: true}
+		st := nodeRolloutState{exists: true, node: n}
 		for _, c := range n.Status.Conditions {
 			if c.Type == corev1.NodeReady {
 				st.notReady = c.Status != corev1.ConditionTrue
@@ -178,7 +184,7 @@ func (p *dsRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 		rep.Set(dsRolloutWedgedGauge, 1, key,
 			[]string{ds.Namespace, ds.Name})
 		rep.Find("daemonset " + key + " rollout wedged")
-		if blocker := p.blockingPod(ds, podsByDS[key], nodes); blocker != nil {
+		if blocker := p.blockingPod(ctx, ds, podsByDS[key], nodes); blocker != nil {
 			p.maybeHealPod(ctx, log, now, &rep, ds, blocker, healed)
 		}
 	}
@@ -213,13 +219,93 @@ func dsRolloutWedged(ds *appsv1.DaemonSet, now time.Time) bool {
 	return ds.Status.NumberUnavailable >= maxUnavail
 }
 
+// newRevisionHashes returns the controller-revision-hash values that
+// belong to the DaemonSet's TARGET revision. The target is derived from
+// object metadata ONLY — never inferred from PodReadyCond — so an old
+// pod that happens to be Ready can never poison the set into disabling
+// healing, and an unready new pod (ImagePullBackOff) can never be
+// misclassified as old and deleted.
+//
+// The bool says whether the target revision is KNOWN. An empty but
+// known set means "no pod can be proven to be on the new revision"
+// (roll not started, UpdatedNumberScheduled == 0) — every candidate
+// is old. An UNKNOWN set means the sources were unavailable: the
+// caller must fail closed, because treating "no hashes" as "all old"
+// would force-delete a brand-new pod whose revision we simply could
+// not read.
+func (p *dsRolloutWedgeCheck) newRevisionHashes(ctx context.Context,
+	ds *appsv1.DaemonSet, pods []*corev1.Pod) (map[string]bool, bool) {
+
+	hashes := map[string]bool{}
+	// No pod of the new template is scheduled yet — every pod in the
+	// census belongs to the old revision. Do NOT look at Ready here:
+	// the classic wedge is old pods all Ready pinning the budget.
+	if ds.Status.UpdatedNumberScheduled == 0 {
+		return hashes, true
+	}
+	// Primary source: the DaemonSet controller stamps every pod with
+	// pod-template-generation = ds.Generation when it creates it from
+	// the current template. Only trust it once the DS status has
+	// observed that generation (otherwise Generation may have advanced
+	// past what the running pods reflect).
+	if ds.Status.ObservedGeneration == ds.Generation {
+		gen := strconv.FormatInt(ds.Generation, 10)
+		for _, pod := range pods {
+			if pod.Labels["pod-template-generation"] != gen {
+				continue
+			}
+			if h := pod.Labels["controller-revision-hash"]; h != "" {
+				hashes[h] = true
+			}
+		}
+	}
+	if len(hashes) > 0 {
+		return hashes, true
+	}
+	// Fallback: ControllerRevision objects owned by this DS. The one
+	// with the largest .Revision is the target the controller is
+	// rolling toward, and its NAME is what the controller stamps into
+	// controller-revision-hash. Listing needs an RBAC grant some
+	// installs do not give us — on denial (or no matching CR) the
+	// target is UNKNOWN, so the caller must skip the heal rather than
+	// risk deleting a pod on the new revision.
+	crs, err := p.CS.AppsV1().ControllerRevisions(ds.Namespace).
+		List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, false
+	}
+	var target *appsv1.ControllerRevision
+	for i := range crs.Items {
+		cr := &crs.Items[i]
+		ref := metav1.GetControllerOf(cr)
+		if ref == nil || ref.Kind != "DaemonSet" || ref.Name != ds.Name {
+			continue
+		}
+		if target == nil || cr.Revision > target.Revision {
+			target = cr
+		}
+	}
+	if target == nil || target.Name == "" {
+		return nil, false
+	}
+	hashes[target.Name] = true
+	return hashes, true
+}
+
 // blockingPod picks the single pod holding the maxUnavailable budget:
-// prefers a Terminating pod on a dead/NotReady node (the kubelet can
+// prefers a Terminating pod on a vanished/fenced node (the kubelet can
 // never finish the delete), then an unready error-state pod on a
 // cordoned node (no replacement can ever schedule). Returns nil when
 // no owned pod matches — the wedge is then a scheduler/quota problem
 // the heal must not touch.
-func (p *dsRolloutWedgeCheck) blockingPod(ds *appsv1.DaemonSet,
+//
+// The force-delete preconditions live HERE, not in maybeHealPod: a
+// plain NotReady node is NOT a fence (its kubelet may come back),
+// a PVC-claiming pod must never lose its API object at grace=0, and
+// a pod already on the new revision cannot advance the roll when
+// recreated. Only a blocker that passes all three is handed to the
+// heal path.
+func (p *dsRolloutWedgeCheck) blockingPod(ctx context.Context, ds *appsv1.DaemonSet,
 	pods []*corev1.Pod, nodes map[string]nodeRolloutState) *corev1.Pod {
 
 	sorted := slices.Clone(pods)
@@ -229,16 +315,49 @@ func (p *dsRolloutWedgeCheck) blockingPod(ds *appsv1.DaemonSet,
 		}
 		return strings.Compare(a.Name, b.Name)
 	})
+	// The target revision comes from metadata, NOT from which pods are
+	// Ready: an old-but-Ready pod must not disable healing, and an
+	// unready new pod must not be deleted as if it were an old blocker.
+	newHashes, revisionKnown := p.newRevisionHashes(ctx, ds, sorted)
+	if !revisionKnown {
+		// Without a proven target revision there is no safe pod to
+		// delete: "no hashes" is NOT the same as "all pods are old"
+		// once a roll has actually started.
+		logf.FromContext(ctx).V(1).Info(
+			"skip daemonset wedge heal: target revision unresolvable",
+			"daemonset", ds.Namespace+"/"+ds.Name,
+			"updated", ds.Status.UpdatedNumberScheduled)
+		return nil
+	}
+	oldRevision := func(pod *corev1.Pod) bool {
+		h := pod.Labels["controller-revision-hash"]
+		return h != "" && !newHashes[h]
+	}
+	noPVC := func(pod *corev1.Pod) bool {
+		return len(kube.PodClaimedPVCs(pod)) == 0
+	}
+
 	var cordonedErr *corev1.Pod
 	for _, pod := range sorted {
 		if pod.DeletionTimestamp != nil {
-			st, ok := nodes[pod.Spec.NodeName]
-			if !ok || st.notReady {
-				return pod // terminating on a dead node — top priority
+			// An unscheduled pod has no node to be dead or fenced on.
+			// Without this guard nodes[""] reads as "node vanished" and
+			// an unbound Terminating pod gets force-deleted at grace=0.
+			if pod.Spec.NodeName == "" {
+				continue
+			}
+			st := nodes[pod.Spec.NodeName]
+			// ABSOLUTE gate: only a vanished node or an explicit
+			// out-of-service fence authorizes force-delete. A plain
+			// NotReady node must NEVER be force-deleted.
+			if (!st.exists || kube.NodeHasOutOfServiceTaint(st.node)) &&
+				noPVC(pod) && oldRevision(pod) {
+				return pod // terminating on a dead/fenced node — top priority
 			}
 			continue
 		}
-		if kube.PodReadyCond(pod) || !podInWedgeState(pod) {
+		if kube.PodReadyCond(pod) || !podInWedgeState(pod) ||
+			!noPVC(pod) || !oldRevision(pod) {
 			continue
 		}
 		st, ok := nodes[pod.Spec.NodeName]
@@ -250,6 +369,16 @@ func (p *dsRolloutWedgeCheck) blockingPod(ds *appsv1.DaemonSet,
 		}
 	}
 	return cordonedErr
+}
+
+// dsWedgeTargetKey is the per-target circuit key for a DaemonSet wedge
+// heal: (namespace, daemonset, node) — NOT the pod name, which the DS
+// controller regenerates on every recreate (resetting the circuit each
+// cycle). All three segments are DNS-1123 labels/subdomains, so the key
+// is also a legal prefix for the circuit-open Event name built in
+// shared/healwire.go; a "ns/pod" key produced an invalid Event name.
+func dsWedgeTargetKey(ds *appsv1.DaemonSet, pod *corev1.Pod) string {
+	return ds.Namespace + "." + ds.Name + "." + pod.Spec.NodeName
 }
 
 // maybeHealPod deletes the blocking pod — one per DaemonSet per
@@ -278,18 +407,25 @@ func (p *dsRolloutWedgeCheck) maybeHealPod(ctx context.Context,
 	case !proceed:
 		return
 	}
+	// Per-target non-convergent circuit breaker: a node that keeps
+	// wedging the same DS roll after repeated deletes is a deeper
+	// failure — re-deleting every sweep is churn. The PVC/old-revision
+	// and dead-node proof were already applied by blockingPod; here
+	// the grant buys the mutation, so refund it on a circuit denial.
+	targetKey := dsWedgeTargetKey(ds, pod)
+	if allowed, reason := heal.TryAcquireTarget(
+		CheckNameDaemonSetRolloutWedge, targetKey, now); !allowed {
+		heal.RefundGrant(now)
+		log.Info("DEFER: heal target circuit open — daemonset wedge pod delete skipped",
+			"daemonset", dsKey, "pod", targetKey, "reason", reason)
+		return
+	}
 	var deleted bool
 	var err error
 	if pod.DeletionTimestamp != nil {
-		// Already Terminating on a dead/unreachable node — a plain
-		// delete is an apiserver no-op, so the force path (grace=0,
-		// PVC-guarded inside heal.ForceDeletePod) is required.
-		if len(kube.PodClaimedPVCs(pod)) > 0 {
-			log.Info("daemonset wedge: force-delete refused — pod claims PVC",
-				"daemonset", dsKey, "pod", pod.Namespace+"/"+pod.Name)
-			heal.RefundGrant(now)
-			return
-		}
+		// Already Terminating on a vanished/fenced node — a plain
+		// delete is an apiserver no-op, so the force path (grace=0)
+		// is required. blockingPod proved no PVC and no live kubelet.
 		deleted, err = heal.ForceDeletePod(ctx, p.CS, &p.Heals, dsKey, pod, now)
 	} else {
 		deleted, err = heal.DeletePod(ctx, p.CS, &p.Heals, dsKey, pod, now)

@@ -201,12 +201,19 @@ func (h *rabbitHealPass) healPromFindings(ctx context.Context) {
 // Terminating pods are skipped (the stamp dies with them); a clear
 // failure is a tolerated sub-failure — the ledger Forget already
 // landed, the annotation retry is Warn-only. The stuck_unready
-// path's window is pod-carried (PodUnreadySince) and needs no
-// clear. seen.Prune then drops ledger keys no live signal kept.
+// path's own window is pod-carried (PodUnreadySince) and needs no
+// clear, BUT a pod flagged only stuck_unready has no live Prom
+// finding: an old prom stamp left on it from a healed incident
+// must still be cleared or the next prom recurrence fast-trips.
+// seen.Prune then drops ledger keys no live signal kept.
 func (h *rabbitHealPass) clearQuiet(ctx context.Context) {
 	for key, pod := range h.census.byName {
-		if h.findings[key] != nil || pod.DeletionTimestamp != nil {
+		if pod.DeletionTimestamp != nil {
 			continue
+		}
+		if reasons := h.findings[key]; len(reasons) > 0 &&
+			!(len(reasons) == 1 && reasons["stuck_unready"]) {
+			continue // a live Prom finding — keep its first-seen stamp
 		}
 		if err := heal.ClearPersistedFirstSeen(ctx, h.log, &h.p.seen, pod,
 			kube.AnnoFirstSeenRabbitQuorum, "prom/"+key,

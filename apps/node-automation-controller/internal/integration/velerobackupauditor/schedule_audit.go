@@ -9,6 +9,7 @@ package velerobackupauditor
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -28,47 +29,58 @@ import (
 // prunes clear series whose condition resolved — an unpaused
 // Schedule or a fresh healthy backup must not pin the gauge at 1.
 func (a *veleroBackupAuditor) auditSchedules(ctx context.Context,
-	schedules *unstructured.UnstructuredList,
-	latest map[string]*unstructured.Unstructured, log logr.Logger) {
+	latest map[string]*unstructured.Unstructured, log logr.Logger) (bool, int, error) {
 	pausedNow := map[string]bool{}
-	for i := range schedules.Items {
-		s := &schedules.Items[i]
-		ns, name := s.GetNamespace(), s.GetName()
+	count := 0
+	err := a.veleroListEach(ctx, veleroScheduleGVR,
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				s := &page[i]
+				count++
+				ns, name := s.GetNamespace(), s.GetName()
 
-		// Check 1 — spec.paused held past 24h. A Schedule carries no
-		// "paused since" timestamp, so firstSeenPaused measures the
-		// real pause duration from first sight; an entry pruned on
-		// unpause means a re-pause restarts the clock, and the UID in
-		// the key keeps a delete+recreate from inheriting pause time.
-		isPaused, _ := kube.NestedBool(s.Object, "spec", "paused")
-		if isPaused {
-			lk := pausedLedgerKey(string(s.GetUID()), ns, name)
-			pausedNow[lk] = true
-			first, _ := a.firstSeenPaused.Observe(lk, a.now.Now())
-			k := pausedKey{ns, name}
-			v := 0.0
-			if pausedFor := a.now.Now().Sub(first); pausedFor > veleroPausedMinAge {
-				v = 1
-				log.Info("velero schedule paused >24h — backups silently stopped",
-					"schedule", ns+"/"+name, "pausedFor", pausedFor.Truncate(time.Hour))
-			}
-			a.seenPaused.Set(metrics.VeleroSchedulePaused, v, k, ns, name)
-		}
+				// Check 1 — spec.paused held past 24h. A Schedule carries no
+				// "paused since" timestamp, so firstSeenPaused measures the
+				// real pause duration from first sight; an entry pruned on
+				// unpause means a re-pause restarts the clock, and the UID in
+				// the key keeps a delete+recreate from inheriting pause time.
+				isPaused, _ := kube.NestedBool(s.Object, "spec", "paused")
+				if isPaused {
+					lk := pausedLedgerKey(string(s.GetUID()), ns, name)
+					pausedNow[lk] = true
+					first, _ := a.firstSeenPaused.Observe(lk, a.now.Now())
+					k := pausedKey{ns, name}
+					v := 0.0
+					if pausedFor := a.now.Now().Sub(first); pausedFor > veleroPausedMinAge {
+						v = 1
+						log.Info("velero schedule paused >24h — backups silently stopped",
+							"schedule", ns+"/"+name, "pausedFor", pausedFor.Truncate(time.Hour))
+					}
+					a.seenPaused.Set(metrics.VeleroSchedulePaused, v, k, ns, name)
+				}
 
-		// Check 2 — the latest schedule-owned Backup empty/errored.
-		b := latest[ns+"/"+name]
-		if b == nil {
-			// zero-backup-guard — zero Backup objects is not "nothing to
-			// judge" once the Schedule itself is old enough to have
-			// produced some. A paused Schedule is exempt: it
-			// legitimately stops producing (check 1 already covers
-			// it).
-			if !isPaused {
-				a.flagMissingBackups(ctx, s, ns, name)
+				// Check 2 — the latest schedule-owned Backup empty/errored.
+				b := latest[ns+"/"+name]
+				if b == nil {
+					// zero-backup-guard — zero Backup objects is not "nothing to
+					// judge" once the Schedule itself is old enough to have
+					// produced some. A paused Schedule is exempt: it
+					// legitimately stops producing (check 1 already covers
+					// it).
+					if !isPaused {
+						a.flagMissingBackups(ctx, s, ns, name)
+					}
+					continue
+				}
+				a.flagBadBackup(ctx, s, b, ns, name)
 			}
-			continue
-		}
-		a.flagBadBackup(ctx, s, b, ns, name)
+			return nil
+		})
+	if kube.IsCRDAbsent(err) {
+		return false, count, nil // no Velero installed — caller prunes + skips
+	}
+	if err != nil {
+		return true, count, fmt.Errorf("list velero schedules: %w", err)
 	}
 
 	// Prune series whose condition resolved since the last sweep —
@@ -80,6 +92,7 @@ func (a *veleroBackupAuditor) auditSchedules(ctx context.Context,
 	// cumulative time it once spent paused.
 	a.firstSeenPaused.Prune(func(lk string) bool { return pausedNow[lk] })
 	a.seenBad.Prune(metrics.VeleroBackupEmptyOrErrored.DeleteLabelValues)
+	return true, count, nil
 }
 
 // flagMissingBackups is the zero-backup-guard zero-backup check: a Schedule

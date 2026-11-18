@@ -34,10 +34,10 @@ var everestDBBackupAudit = dbBackupAudit{
 	backupGVR:      everestDBBackupGVR,
 	primaryListErr: "list everest databaseclusters",
 	backupListErr:  "list everest databaseclusterbackups",
-	listBackups: func(*unstructured.UnstructuredList) bool {
+	listBackups: func(int) bool {
 		// everest reads DatabaseClusterBackups regardless of the
-		// cluster list — the primary result is non-nil past the
-		// 404/NoMatch switch either way.
+		// cluster list — an absent primary GVR still reaches here
+		// with an empty census.
 		return true
 	},
 	ownerPath: []string{"spec", "dbClusterName"},

@@ -139,7 +139,7 @@ func TestNamespaceTerminatingWedged(t *testing.T) {
 	cs := fake.NewSimpleClientset(wedged, fresh)
 	p := testProber(cs)
 
-	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("wedged namespace must fail: %+v", res)
 	}
@@ -188,7 +188,7 @@ func TestMaybeStripFinalizersDeadOwner(t *testing.T) {
 	dyn := testutil.NewFakeDyn(kinds, obj)
 	p := testProberDyn(cs, dyn)
 
-	if !probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if stripped, _ := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj); !stripped {
 		t.Fatal("dead-owner CR should be stripped")
 	}
 	got, err := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-1", metav1.GetOptions{})
@@ -240,7 +240,7 @@ func TestMaybeStripFinalizersDeadRolloutOwner(t *testing.T) {
 	dyn := testutil.NewFakeDyn(kinds, obj) // Rollout absent → dead owner
 	p := testProberDyn(cs, dyn)
 
-	if !probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if stripped, _ := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj); !stripped {
 		t.Fatal("dead-Rollout-owner CR should be stripped")
 	}
 	got, err := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-ro", metav1.GetOptions{})
@@ -295,7 +295,7 @@ func TestMaybeStripFinalizersLiveRolloutOwnerSkipped(t *testing.T) {
 	dyn := testutil.NewFakeDyn(kinds, obj, ro)
 	p := testProberDyn(cs, dyn)
 
-	if probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if stripped, _ := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj); stripped {
 		t.Fatal("live-Rollout-owner CR must not be stripped")
 	}
 	got, _ := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-ro-live", metav1.GetOptions{})
@@ -330,7 +330,7 @@ func TestMaybeStripFinalizersLiveOwnerSkipped(t *testing.T) {
 	dyn := testutil.NewFakeDyn(kinds, obj)
 	p := testProberDyn(cs, dyn)
 
-	if probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if stripped, _ := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj); stripped {
 		t.Fatal("live-owner CR must not be stripped")
 	}
 	got, _ := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-2", metav1.GetOptions{})
@@ -370,7 +370,7 @@ func TestMaybeStripFinalizersUnattributableKept(t *testing.T) {
 	dyn := testutil.NewFakeDyn(kinds, obj)
 	p := testProberDyn(cs, dyn)
 
-	if probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if stripped, _ := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj); stripped {
 		t.Fatal("unattributable finalizers must not be stripped")
 	}
 	got, err := dyn.Resource(gvr).Namespace("dead-ns").Get(ctx, "foo-4", metav1.GetOptions{})
@@ -401,7 +401,7 @@ func TestMaybeStripFinalizersProtectedOnly(t *testing.T) {
 	}, obj)
 	p := testProberDyn(cs, dyn)
 
-	if probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj) {
+	if stripped, _ := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).maybeStripFinalizers(ctx, logr.Discard(), gvr, obj); stripped {
 		t.Fatal("protected-only finalizers must never be stripped")
 	}
 }
@@ -569,7 +569,7 @@ func TestNsFinalizerSweepEndToEnd(t *testing.T) {
 		disc: sweepDiscovery{lists: nsSweepLists()}}
 	p := probetest.NewCheckProber(scs, dyn, harnessChecks...)
 
-	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*namespaceTerminatingWedgedCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatal("wedged namespace must FAIL")
 	}
@@ -621,7 +621,7 @@ func TestNsFinalizerSweepCooldown(t *testing.T) {
 		probefw.SelfHealKey(CheckNameNamespaceWedged, "finalsweep/dead-app"),
 		time.Now())
 
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatal("wedged namespace must FAIL even inside the sweep cooldown")
 	}
 	got, err := dyn.Resource(fooGVR).Namespace("dead-app").
@@ -743,7 +743,7 @@ func TestNsFinalizerSweepNilDyn(t *testing.T) {
 	cs := fake.NewSimpleClientset(wedged)
 	deps := probetest.NewDeps(cs, nil)
 	chk := &namespaceTerminatingWedgedCheck{Deps: deps}
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatal("wedged namespace must FAIL with nil dyn")
 	}
 }

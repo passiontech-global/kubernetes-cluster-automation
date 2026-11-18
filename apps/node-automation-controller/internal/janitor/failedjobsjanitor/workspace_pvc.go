@@ -125,6 +125,25 @@ func (j *failedJobsJanitor) runRefDone(ctx context.Context, ns string,
 	return runTerminal(obj), nil
 }
 
+// runRefsDone reports whether EVERY run ref is gone or terminal — the
+// "nobody will read this workspace again" verdict shared by collect
+// and Confirm. An error is cannot-prove (the caller keeps the claim);
+// a live ref short-circuits the rest so an errored sibling lookup is
+// never paid for a claim that is obviously still owned.
+func (j *failedJobsJanitor) runRefsDone(ctx context.Context, ns string,
+	refs []workspacePVCRef) (bool, error) {
+	for _, ref := range refs {
+		done, err := j.runRefDone(ctx, ns, ref)
+		if err != nil {
+			return false, err
+		}
+		if !done {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // claimedPVCNames lists the claim names non-terminal pods in ns still
 // reference — the same per-namespace scan the va-stuck-terminating pvc-protection
 // unstick runs (Succeeded/Failed pods released their volumes; every
@@ -226,6 +245,17 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 		if len(refs) == 0 {
 			continue // not a run-workspace claim at all
 		}
+		// Owner liveness BEFORE the per-namespace pod LIST: while any
+		// PipelineRun/TaskRun/BuildRun/Job is still running, the
+		// workspace is provably in use and no pod scan is needed for
+		// THIS claim (or for the namespace's claimsCache). The
+		// expensive LIST is paid only for claims whose owners are all
+		// gone/terminal. An errored lookup is left for Confirm to
+		// report (fail closed) rather than silently dropping a claim.
+		refsDone, err := j.runRefsDone(ctx, pvc.Namespace, refs)
+		if err == nil && !refsDone {
+			continue
+		}
 		if claimed(pvc.Namespace, pvc.Name) {
 			continue
 		}
@@ -246,27 +276,30 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 			}
 			return a.name < b.name
 		},
-		// Confirm re-vets live state close to the delete: a FRESH
-		// per-namespace pod re-query (the collect-time claimsCache
-		// predates this run's deletes and the minutes since), and
-		// EVERY owner ref still gone-or-terminal (a run recreated or
-		// re-Resumed since the list keeps its workspace).
+		// Confirm re-vets live state close to the delete: EVERY owner
+		// ref still gone-or-terminal (a run recreated or re-Resumed
+		// since the list keeps its workspace), and a FRESH per-
+		// namespace pod re-query (the collect-time claimsCache
+		// predates this run's deletes and the minutes since).
+		// Owner refs are checked FIRST: a still-live run rejects the
+		// candidate without paying the per-namespace pod LIST — the
+		// expensive part of Confirm — for a claim that was never
+		// orphaned. Both are still re-checked at confirm time, so
+		// the fail-closed verdict is unchanged.
 		Confirm: func(ctx context.Context, t orphanWorkspaceTarget) (bool, error) {
+			done, err := j.runRefsDone(ctx, t.ns, t.refs)
+			if err != nil {
+				return false, err // cannot prove — keep, report via OnError
+			}
+			if !done {
+				return false, nil
+			}
 			freshClaims, err := j.claimedPVCNames(ctx, t.ns)
 			if err != nil {
 				return false, err // cannot prove — keep, report via OnError
 			}
 			if freshClaims[t.name] {
 				return false, nil // a pod mounted the claim since collect
-			}
-			for _, ref := range t.refs {
-				done, err := j.runRefDone(ctx, t.ns, ref)
-				if err != nil {
-					return false, err // cannot prove — keep, report via OnError
-				}
-				if !done {
-					return false, nil
-				}
 			}
 			return true, nil
 		},

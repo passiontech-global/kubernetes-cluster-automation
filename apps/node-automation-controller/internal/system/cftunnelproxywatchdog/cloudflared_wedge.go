@@ -299,6 +299,13 @@ func (w *cfTunnelProxyWatchdog) stampHealPersisted(ctx context.Context,
 		},
 		cfTunnelHealAnno, nil, "", now)
 	if err != nil {
+		// A failed durable stamp leaves the in-RAM lastHeal cooldown
+		// holding (it was stamped on the delivered delete) — the
+		// heal stands, only its restart-surviving half is lost. It
+		// is still a tolerated sub-failure the run absorbs, so the
+		// queue counter is the accounting (the run never returns
+		// this error — IncError here is not a double count).
+		metrics.IncError(w.queue)
 		logf.FromContext(ctx).Error(err, "persist cloudflared heal stamp failed",
 			"replicaset", p.Namespace+"/"+ref.Name)
 	}

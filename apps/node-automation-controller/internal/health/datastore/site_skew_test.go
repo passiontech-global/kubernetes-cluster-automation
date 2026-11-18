@@ -5,14 +5,68 @@
 package datastore
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
+
+// A failed placement census is "can't tell": the held skew series
+// must be carried forward instead of being pruned by an empty
+// reconcile, and the sweep reports the census failure as Infra.
+func TestSiteSkewCloseCarriesOnCensusFailure(t *testing.T) {
+	const key = "db/pg-master/pg/lanit"
+	lv := []string{"db", "pg-master", "pg", statefulStandbySiteZone}
+	t.Cleanup(func() { statefulMasterSiteSkewGauge.DeleteLabelValues(lv...) })
+	w := &siteSkewWatch{}
+	w.emitted.Emit(key, lv...)
+	w.emitted.Prune(func(...string) bool { return false }) // commit as last sweep's series
+	s := &siteSkewSweep{
+		watch:    w,
+		censusOK: false,
+		infraErr: errors.New("placement census failed"),
+	}
+	s.close()
+	if s.rep.Flagged() != 1 {
+		t.Fatalf("census failure must carry the held tuple, got %d", s.rep.Flagged())
+	}
+	if s.rep.Verdict("", ", ").Infra == nil {
+		t.Fatal("census failure must surface as Infra")
+	}
+	if _, ok := w.emitted.Last()[key]; !ok {
+		t.Fatal("held skew series was pruned on a failed census")
+	}
+}
+
+// A worker under remediation/out-of-service does not keep its zone's
+// multi-site gate open — otherwise a dead standby site still lets
+// every standby-pinned master read as a healthy skew.
+func TestSiteSkewBeginIgnoresRemediatedWorker(t *testing.T) {
+	main := testutil.Node("main", corev1.ConditionTrue,
+		map[string]string{corev1.LabelTopologyZone: statefulMainSiteZone})
+	dr := testutil.Node("dr", corev1.ConditionTrue,
+		map[string]string{corev1.LabelTopologyZone: statefulStandbySiteZone},
+		corev1.Taint{
+			Key: kube.TaintKubeletUnresponsive, Effect: corev1.TaintEffectNoSchedule,
+		})
+	p := testProber(fake.NewSimpleClientset(main, dr))
+	s := (&siteSkewWatch{}).begin(
+		probetest.SweepCtx(ctx, p.Deps), logr.Discard(), p.Deps)
+	if !s.censusOK {
+		t.Fatal("census should succeed with the fake clientset")
+	}
+	if s.multiZone {
+		t.Fatal("remediated standby worker must not satisfy the multi-zone gate")
+	}
+}
 
 // endpointZone resolves the first non-empty placement field in order —
 // the slice's own zone hint, then the endpoint's nodeName through the

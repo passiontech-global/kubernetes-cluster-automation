@@ -8,7 +8,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,12 +20,14 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -164,24 +169,17 @@ func TestLiveSocketDriftFourClassesStreakEventAndRollout(t *testing.T) {
 			},
 		},
 		makeReadyTLSPod("apps", "api-pod", "10.0.0.2", "api-tls", metav1.OwnerReference{Kind: "StatefulSet", Name: "api-sts", Controller: &isCtrl}),
-		// Class 3: TLS Ingress Backend (port 8000 non-standard, discovered via Ingress).
+		// Class 3: TLS Service discovered by its TLS port. Ingress/HTTPRoute
+		// discovery was removed (NAC has no `ingresses` RBAC — the old
+		// list guaranteed a 403 that tore down the whole audit).
 		&corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "ing-svc", UID: "svc-3"},
 			Spec: corev1.ServiceSpec{
 				Selector: map[string]string{"app": "ing-pod"},
-				Ports:    []corev1.ServicePort{{Port: 8000}},
+				Ports:    []corev1.ServicePort{{Name: "https", Port: 443, TargetPort: intstr.FromInt32(8443)}},
 			},
 		},
 		makeReadyTLSPod("apps", "ing-pod", "10.0.0.3", "ing-tls", metav1.OwnerReference{Kind: "StatefulSet", Name: "plain-sts", Controller: &isCtrl}),
-		&networkingv1.Ingress{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "web-ing"},
-			Spec: networkingv1.IngressSpec{
-				TLS: []networkingv1.IngressTLS{{Hosts: []string{"web.example.com"}, SecretName: "ing-tls"}},
-				DefaultBackend: &networkingv1.IngressBackend{
-					Service: &networkingv1.IngressServiceBackend{Name: "ing-svc"},
-				},
-			},
-		},
 		// Class 4: Service with Ready TLS Pod exposing port 8443.
 		&corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "port-svc", UID: "svc-4"},
@@ -278,5 +276,332 @@ func TestLiveSocketDriftFourClassesStreakEventAndRollout(t *testing.T) {
 	}
 	if v := ptestutil.ToFloat64(metrics.TLSLiveSocketDrift.WithLabelValues("apps", "wh-svc", "wh-tls")); v != 0 {
 		t.Fatalf("expected drift pruned to 0 once socket serves fresh cert, got %v", v)
+	}
+}
+
+// The ingress RBAC denial is the exact production symptom: NAC has no
+// "ingresses" permission, so the old collectIngressTLSServices list
+// returned 403 and aborted the entire 15m live-socket audit. A Pod
+// mounting two TLS Secrets must also not be reported as drifted when
+// the socket serves EITHER of them.
+func TestLiveSocketAuditSkipsForbiddenIngressAndMultiSecret(t *testing.T) {
+	metrics.TLSLiveSocketDrift.Reset()
+	now := time.Date(2026, 11, 18, 9, 0, 0, 0, time.UTC)
+	_, pemA := genSelfSignedCert(t, 111, now.Add(90*24*time.Hour), "svc.apps.svc")
+	certB, pemB := genSelfSignedCert(t, 222, now.Add(90*24*time.Hour), "other.apps.svc")
+	isCtrl := true
+
+	cs := fake.NewSimpleClientset(
+		makeTLSSecret("apps", "svc-tls", pemA, now.Add(-time.Hour)),
+		makeTLSSecret("apps", "extra-tls", pemB, now.Add(-time.Hour)),
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "multi-svc", UID: "svc-multi"},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "multi-pod"},
+				Ports:    []corev1.ServicePort{{Name: "https", Port: 443, TargetPort: intstr.FromInt32(8443)}},
+			},
+		},
+		func() *corev1.Pod {
+			p := makeReadyTLSPod("apps", "multi-pod", "10.0.0.9", "svc-tls",
+				metav1.OwnerReference{Kind: "Deployment", Name: "multi", Controller: &isCtrl})
+			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
+				Name: "extra", VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: "extra-tls"},
+				},
+			})
+			return p
+		}(),
+	)
+	cs.PrependReactor("list", "ingresses", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(
+			schema.GroupResource{Group: "networking.k8s.io", Resource: "ingresses"}, "",
+			errors.New("ingresses is forbidden: User node-ops-operator cannot list"))
+	})
+
+	a := &certDriftAuditor{
+		cs: cs, now: func() time.Time { return now },
+		prober: func(context.Context, string, string) (*x509.Certificate, error) {
+			return certB, nil // the *second* mounted Secret's cert
+		},
+	}
+	for i := 0; i < liveDriftConfirmScans; i++ {
+		if err := a.auditLiveSockets(ctx); err != nil {
+			t.Fatalf("scan %d: forbidden ingress must not abort the audit: %v", i+1, err)
+		}
+	}
+	if v := ptestutil.ToFloat64(metrics.TLSLiveSocketDrift.WithLabelValues("apps", "multi-svc", "svc-tls")); v != 0 {
+		t.Fatalf("socket serving a mounted Secret must not be drift, got %v", v)
+	}
+}
+
+// A webhook ServiceReference.Port is a SERVICE port. The probe dials a
+// pod IP, so it must be translated through targetPort — otherwise every
+// webhook with port != targetPort dials a closed port and looks broken.
+// A TLS-port-only Service whose Pod mounts a client mTLS Secret must not
+// be restarted: the socket serves an identity no mounted Secret bears,
+// so there is no proof a mounted Secret serves the port. The old blind
+// mounted[0] fallback paged and bounced it every 2h.
+func TestLiveSocketAuditSkipsClientMTLSSecretOnTLSPortOnlyService(t *testing.T) {
+	metrics.TLSLiveSocketDrift.Reset()
+	now := time.Date(2026, 11, 18, 11, 0, 0, 0, time.UTC)
+	_, clientPEM := genSelfSignedCert(t, 111, now.Add(90*24*time.Hour), "client.apps.svc")
+	served, _ := genSelfSignedCert(t, 999, now.Add(90*24*time.Hour), "server.apps.svc")
+	isCtrl := true
+
+	cs := fake.NewSimpleClientset(
+		makeTLSSecret("apps", "client-mtls", clientPEM, now.Add(-time.Hour)),
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "client-svc", UID: "svc-client"},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "client-pod"},
+				Ports:    []corev1.ServicePort{{Name: "https", Port: 443, TargetPort: intstr.FromInt32(8443)}},
+			},
+		},
+		makeReadyTLSPod("apps", "client-pod", "10.0.0.21", "client-mtls",
+			metav1.OwnerReference{Kind: "Deployment", Name: "client-dep", Controller: &isCtrl}),
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "client-dep", UID: "dep-client"},
+			Spec: appsv1.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "client-pod"}}},
+			},
+		},
+		&appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "apps", Name: "client-dep-rs",
+				OwnerReferences: []metav1.OwnerReference{{Kind: "Deployment", Name: "client-dep", Controller: &isCtrl}},
+			},
+		},
+	)
+	probed := false
+	a := &certDriftAuditor{
+		cs: cs, now: func() time.Time { return now },
+		prober: func(context.Context, string, string) (*x509.Certificate, error) {
+			probed = true
+			return served, nil
+		},
+	}
+	for i := 0; i < liveDriftConfirmScans; i++ {
+		if err := a.auditLiveSockets(ctx); err != nil {
+			t.Fatalf("scan %d: %v", i+1, err)
+		}
+	}
+	if !probed {
+		t.Fatal("target was never probed — test setup did not exercise the audit")
+	}
+	if v := ptestutil.ToFloat64(metrics.TLSLiveSocketDrift.WithLabelValues("apps", "client-svc", "client-mtls")); v != 0 {
+		t.Fatalf("client mTLS Secret must not be flagged as drift, got %v", v)
+	}
+	got, _ := cs.AppsV1().Deployments("apps").Get(ctx, "client-dep", metav1.GetOptions{})
+	if got.Spec.Template.Annotations[kube.RestartedAtAnno] != "" {
+		t.Fatal("client mTLS pod must not be restarted on a guessed Secret")
+	}
+}
+
+// certWithIPSAN builds a real IP-SAN certificate so Check B's census
+// can be tested end-to-end (the DNS-only helper above cannot populate
+// cert.IPAddresses).
+func certWithIPSAN(t *testing.T, ip net.IP) []byte {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(4242),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		IPAddresses:  []net.IP{ip},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// Check B builds the census reused by the live-socket audit: an IP-only
+// served cert must find its Secret through ipNames (it was always nil
+// here, so the Secret was never matched).
+func TestAuditTLSSecretsFillsIPNames(t *testing.T) {
+	cs := fake.NewSimpleClientset(makeTLSSecret("apps", "ip-san",
+		certWithIPSAN(t, net.ParseIP("10.1.2.3")), time.Now()))
+	a := &certDriftAuditor{cs: cs, now: func() time.Time { return time.Now() }}
+	if err := a.auditTLSSecrets(ctx); err != nil {
+		t.Fatalf("auditTLSSecrets: %v", err)
+	}
+	meta, ok := a.liveRunSecretMeta[secretMetricKey{"apps", "ip-san"}]
+	if !ok {
+		t.Fatal("census missing the IP-SAN Secret")
+	}
+	if len(meta.ipNames) != 1 || meta.ipNames[0] != "10.1.2.3" {
+		t.Fatalf("ipNames = %v, want [10.1.2.3]", meta.ipNames)
+	}
+	served := &x509.Certificate{IPAddresses: []net.IP{net.ParseIP("10.1.2.3")}}
+	if matched, ok := matchServedSecret([]tlsSecretMeta{meta}, served); !ok || matched.name != "ip-san" {
+		t.Fatalf("IP-SAN served cert did not match its Secret: %+v ok=%v", matched, ok)
+	}
+}
+
+// An empty CN is not an identity: a served cert with an empty SAN
+// entry must not match every mounted Secret that also has no CN.
+func TestMatchServedSecretIgnoresEmptyCommonName(t *testing.T) {
+	served := &x509.Certificate{DNSNames: []string{""}}
+	mounted := []tlsSecretMeta{{name: "no-cn", dnsNames: []string{"other.example"}}}
+	if matched, ok := matchServedSecret(mounted, served); ok {
+		t.Fatalf("empty commonName must not match, got %+v", matched)
+	}
+}
+
+// A named targetPort owned by a native sidecar (restartPolicy: Always
+// init container) must resolve; one-shot init containers and main
+// containers keep their existing precedence.
+func TestResolveContainerPortIncludesRestartableInitContainers(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "app", Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}}},
+		InitContainers: []corev1.Container{
+			{Name: "oneshot", Ports: []corev1.ContainerPort{{Name: "tls", ContainerPort: 9443}}},
+			{Name: "proxy", RestartPolicy: &always, Ports: []corev1.ContainerPort{{Name: "tls", ContainerPort: 8443}}},
+		},
+	}}
+	for _, tc := range []struct {
+		port string
+		want int32
+	}{
+		{"tls", 8443},    // sidecar owns it; one-shot init's 9443 ignored
+		{"http", 8080},   // main container still resolved
+		{"missing", 443}, // unknown name falls back to the Service port
+	} {
+		sp := &corev1.ServicePort{Port: 443, TargetPort: intstr.FromString(tc.port)}
+		if got := resolveContainerPort(sp, pod); got != tc.want {
+			t.Errorf("targetPort %q = %d, want %d", tc.port, got, tc.want)
+		}
+	}
+}
+
+func TestPickServingSecretDoesNotGuess(t *testing.T) {
+	m := tlsSecretMeta{name: "client-mtls", commonName: "client.apps.svc", dnsNames: []string{"client.apps.svc"}}
+	got, ok := pickServingSecret([]tlsSecretMeta{m}, "server-svc", "server-svc.apps.svc")
+	if ok || got.name != "" {
+		t.Fatalf("pickServingSecret must not fall back to mounted[0], got %+v ok=%v", got, ok)
+	}
+	// A real SAN match is still picked so the probe gets the right SNI.
+	served := &x509.Certificate{
+		Subject:  pkix.Name{CommonName: "server.apps.svc"},
+		DNSNames: []string{"server.apps.svc"},
+	}
+	if matched, ok := matchServedSecret([]tlsSecretMeta{m}, served); ok || matched.name != "" {
+		t.Fatalf("unrelated served identity must not match, got %+v ok=%v", matched, ok)
+	}
+}
+
+func TestPodMountsTLSSecretFromInitContainer(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "init-pod"},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "init-tls", VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: "init-tls"},
+				},
+			}},
+			InitContainers: []corev1.Container{{
+				Name:         "cert-init",
+				VolumeMounts: []corev1.VolumeMount{{Name: "init-tls", MountPath: "/tls"}},
+			}},
+		},
+	}
+	secrets := map[secretMetricKey]tlsSecretMeta{
+		{"apps", "init-tls"}: {name: "init-tls"},
+	}
+	if !podMountsTLSSecret(pod, secrets) {
+		t.Fatal("Secret staged by an init container must be counted as mounted")
+	}
+	if got := mountedTLSSecrets(pod, secrets); len(got) != 1 || got[0].name != "init-tls" {
+		t.Fatalf("init container TLS Secret missing from mounted set: %+v", got)
+	}
+}
+
+// The census flag, not an empty map, decides whether Check B already ran
+// this sweep: an empty-but-populated census must not trigger a second
+// full TLS Secret list.
+func TestLiveSocketAuditReusesEmptySecretCensus(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	secretLists := 0
+	cs.PrependReactor("list", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		secretLists++
+		return true, &corev1.SecretList{}, nil
+	})
+	a := &certDriftAuditor{cs: cs, now: func() time.Time { return time.Now() }}
+	a.liveRunSecretSet = true
+	a.liveRunSecretMeta = map[secretMetricKey]tlsSecretMeta{}
+	if err := a.auditLiveSockets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if secretLists != 0 {
+		t.Fatalf("re-listed TLS Secrets %d time(s) despite liveRunSecretSet", secretLists)
+	}
+}
+
+func TestLiveDriftDBQuorumLabelsCoverStatefulOperators(t *testing.T) {
+	for _, want := range []string{
+		"pxc.percona.com/cluster", "psmdb.percona.com/cluster",
+		"dragonflydb.io/cluster", "nats_cluster",
+	} {
+		found := false
+		for _, label := range liveDriftDBQuorumLabels {
+			if label == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("liveDriftDBQuorumLabels missing %q", want)
+		}
+	}
+}
+
+func TestLiveSocketAuditPinnedServicePortIsTranslated(t *testing.T) {
+	metrics.TLSLiveSocketDrift.Reset()
+	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	served, _ := genSelfSignedCert(t, 1001, now.Add(3*24*time.Hour), "svc.apps.svc")
+	_, newPEM := genSelfSignedCert(t, 2002, now.Add(90*24*time.Hour), "svc.apps.svc")
+	isCtrl := true
+	pin := int32(8443)
+
+	cs := fake.NewSimpleClientset(
+		makeTLSSecret("apps", "pin-tls", newPEM, now.Add(-time.Hour)),
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "pin-svc", UID: "svc-pin"},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "pin-pod"},
+				Ports:    []corev1.ServicePort{{Port: 8443, TargetPort: intstr.FromInt32(9443)}},
+			},
+		},
+		makeReadyTLSPod("apps", "pin-pod", "10.0.0.11", "pin-tls",
+			metav1.OwnerReference{Kind: "Deployment", Name: "pin-dep", Controller: &isCtrl}),
+		&admissionv1.ValidatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{Name: "pin-vwc"},
+			Webhooks: []admissionv1.ValidatingWebhook{{
+				Name: "pin.example.com",
+				ClientConfig: admissionv1.WebhookClientConfig{
+					Service: &admissionv1.ServiceReference{Namespace: "apps", Name: "pin-svc", Port: &pin},
+				},
+			}},
+		},
+	)
+
+	var probedAddr string
+	a := &certDriftAuditor{
+		cs: cs, now: func() time.Time { return now },
+		prober: func(_ context.Context, addr, _ string) (*x509.Certificate, error) {
+			probedAddr = addr
+			return served, nil
+		},
+	}
+	if err := a.auditLiveSockets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(probedAddr, ":9443") {
+		t.Fatalf("pinned service port 8443 must be translated to targetPort 9443, probed %q", probedAddr)
 	}
 }

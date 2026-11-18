@@ -104,6 +104,25 @@ func (c *volumeAttachmentCleaner) stuckTerminatingNodeDead(ctx context.Context,
 func (c *volumeAttachmentCleaner) stripFinalizers(ctx context.Context,
 	va *storagev1.VolumeAttachment) error {
 	log := logf.FromContext(ctx)
+	// Write-site belt-and-braces: the sweep classifies ONLY a
+	// Terminating VA past the stuck age as a strip target, and the
+	// live confirm drops the verdict if DeletionTimestamp vanished.
+	// Never strip a live object's attacher finalizers if that
+	// classification went stale between the confirm and the patch
+	// (and never dereference a nil DeletionTimestamp below).
+	if va.DeletionTimestamp == nil {
+		log.Info("SKIP: VA no longer terminating — attacher finalizers stay",
+			"va", va.Name, "node", va.Spec.NodeName)
+		return nil
+	}
+	// Nothing to strip: the attacher already drained its finalizer
+	// between the census and the write. Never patch a no-op or count
+	// a "finalizer removed" that never happened.
+	if !hasAttacherFinalizer(va) {
+		log.Info("SKIP: VA has no external-attacher finalizer to strip",
+			"va", va.Name, "node", va.Spec.NodeName)
+		return nil
+	}
 	kept := make([]string, 0, len(va.Finalizers))
 	for _, f := range va.Finalizers {
 		if !strings.HasPrefix(f, "external-attacher/") {
@@ -262,7 +281,7 @@ func (c *volumeAttachmentCleaner) stuckReadyUnused(ctx context.Context,
 
 	node, ok := nodeByName[va.Spec.NodeName]
 	if !ok || !kube.NodeReady(node) ||
-		kube.HasTaint(node.Spec.Taints, kube.TaintNodeOutOfService) {
+		kube.HasRemediationOrOutOfServiceTaint(node) {
 		return false
 	}
 	pvName := ptr.Deref(va.Spec.Source.PersistentVolumeName, "")

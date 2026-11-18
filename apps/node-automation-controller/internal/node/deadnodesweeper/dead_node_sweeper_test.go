@@ -1001,6 +1001,89 @@ func TestDeadNodeSweeperStatelessBranchBFences(t *testing.T) {
 	}
 }
 
+// A generic ephemeral volume materializes an implicit <pod>-<volume>
+// PVC with the same single-writer contract as a pre-provisioned claim.
+// Resolving only vol.PersistentVolumeClaim would miss it and let the
+// sweeper force-detach an RWO disk off a not-really-dead node.
+func TestDeadNodeSweeperEphemeralRWOClaimHoldsGate(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "true")
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "false")
+
+	ephemeral := stuckTerminatingPod("db", "web-ephem", "w1", 20*time.Minute)
+	ephemeral.Spec.Volumes = []corev1.Volume{{
+		Name: "scratch",
+		VolumeSource: corev1.VolumeSource{
+			Ephemeral: &corev1.EphemeralVolumeSource{},
+		},
+	}}
+	implicitPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: "web-ephem-scratch"},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pv-rwo"},
+	}
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute), ephemeral,
+		pvWithModes("pv-rwo", corev1.ReadWriteOnce), implicitPVC)
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintNodeOutOfService) {
+		t.Fatal("node holding an RWO ephemeral volume was fenced")
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 1 {
+		t.Fatalf("skip gauge = %v, want 1", got)
+	}
+}
+
+// A terminal (Succeeded/Failed) StatefulSet pod with an RWO claim is
+// NOT a holder: the kubelet has already released the disk, so a
+// confirmed-dead node carrying only completed pods must fence rather
+// than be vetoed forever by the split-brain gate (wave3.2/stateful-holders).
+func TestDeadNodeSweeperTerminalPodsAreNotHolders(t *testing.T) {
+	for _, phase := range []corev1.PodPhase{corev1.PodSucceeded, corev1.PodFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+			testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "true")
+
+			completed := stsOwnedTerminatingPod("db", "pg-0", "w1", 20*time.Minute)
+			completed.DeletionTimestamp = nil
+			completed.Finalizers = nil
+			completed.Status.Phase = phase
+			completed.Spec.Volumes = []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: "data-pg-0"},
+				},
+			}}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: "data-pg-0"},
+				Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pv-rwo"},
+			}
+			// A non-terminal stuck pod makes the node a dead-node
+			// candidate; the terminal pod alone would never enter
+			// the census in the first place.
+			cs := fake.NewSimpleClientset(
+				unknownNode("w1", 45*time.Minute), completed,
+				stuckTerminatingPod("web", "web-stuck", "w1", 20*time.Minute),
+				pvWithModes("pv-rwo", corev1.ReadWriteOnce), pvc)
+			s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+
+			if err := s.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintNodeOutOfService) {
+				t.Fatal("dead node with only terminal pods not fenced")
+			}
+			if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 0 {
+				t.Fatalf("skip gauge set for terminal pod holder: %v", got)
+			}
+		})
+	}
+}
+
 // The DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL=true override fences
 // through the gate — counted with has_volumes=true — and clears any
 // stale skip flag from earlier cycles.

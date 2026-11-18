@@ -66,6 +66,12 @@ func (w *coreDNSWatchdog) previousLogLoopHit(ctx context.Context, pod *corev1.Po
 	log := logf.FromContext(ctx)
 	var hit string
 	_, err := kube.ReadPodLogTail(ctx, w.cs, pod, kube.PodLogOpts{
+		// Only the coredns container's previous termination can hold
+		// the plugin/loop signature. An injected sidecar (or the
+		// default-container annotation) pointing at another container
+		// would make the probe miss the loop or, worse, match an
+		// unrelated restart and delete a healthy DNS pod.
+		Container: "coredns",
 		Previous:  true,
 		TailLines: 100,
 		MaxBytes:  corednsMaxLogBytes,

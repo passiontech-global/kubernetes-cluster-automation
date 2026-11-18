@@ -147,7 +147,7 @@ func TestApiserverDarkFencesAndEvacuates(t *testing.T) {
 	check := anrCheck(t, p, map[string]bool{"w1": true})
 
 	// First sight: inside darkMinAge — pass, no taint yet.
-	if res := check.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := check.Run(probetest.SweepCtx(ctx, check.Deps)); !res.Pass {
 		t.Fatalf("first sight inside window must pass: %+v", res)
 	}
 	if kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints,
@@ -159,7 +159,7 @@ func TestApiserverDarkFencesAndEvacuates(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
 	anrRefreshLeases(t, cs,
 		[]string{"w1", "w2", "w3", "w4", "w5", "w6"}, base.Add(11*time.Minute))
-	res := check.Run(probetest.SweepCtx(ctx))
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if res.Pass {
 		t.Fatal("persisted apiserver-dark node must FAIL the sweep")
 	}
@@ -204,7 +204,7 @@ func TestApiserverDarkStaleLeaseSkips(t *testing.T) {
 	anrRefreshLeases(t, cs,
 		[]string{"w1", "w2", "w3", "w4", "w5"}, base.Add(11*time.Minute))
 	// w6 stays stale — the dead-kubelet case.
-	res := check.Run(probetest.SweepCtx(ctx))
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if !res.Pass {
 		t.Fatalf("dead-kubelet probe failure is not this check's evidence: %+v", res)
 	}
@@ -231,7 +231,7 @@ func TestApiserverDarkMeshWideAborts(t *testing.T) {
 
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
 	anrRefreshLeases(t, cs, []string{"w1", "w2", "w3", "w4"}, base.Add(11*time.Minute))
-	res := check.Run(probetest.SweepCtx(ctx))
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
 	// Mesh-wide dark is a real outage — the sweep FAILs with the
 	// finding but must fence nothing.
 	if res.Pass {
@@ -268,13 +268,13 @@ func TestApiserverDarkDeadKubeletFleetDoesNotAbort(t *testing.T) {
 	check := anrCheck(t, p, map[string]bool{
 		"w1": true, "w2": true, "w3": true,
 		"w4": true, "w5": true, "w6": true})
-	check.Run(probetest.SweepCtx(ctx))
+	check.Run(probetest.SweepCtx(ctx, check.Deps))
 
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
 	// Live kubelets keep renewing — w6 stays fresh, dead ones stay
 	// stale (nobody renews a dead kubelet's lease).
 	anrRefreshLeases(t, cs, []string{"w6"}, base.Add(11*time.Minute))
-	check.Run(probetest.SweepCtx(ctx))
+	check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if !kube.HasTaint(mustNode(t, cs, "w6").Spec.Taints,
 		kube.TaintApiserverUnreachable) {
 		t.Fatal("dead-kubelet fleet must not suppress the real dark node's fence")
@@ -300,11 +300,11 @@ func TestApiserverDarkRecoveryUntaints(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	check := anrCheck(t, p, map[string]bool{"w1": true})
 	// First sight at base — inside darkMinAge, no taint yet.
-	check.Run(probetest.SweepCtx(ctx))
+	check.Run(probetest.SweepCtx(ctx, check.Deps))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
 	anrRefreshLeases(t, cs,
 		[]string{"w1", "w2", "w3", "w4", "w5", "w6"}, base.Add(11*time.Minute))
-	check.Run(probetest.SweepCtx(ctx))
+	check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if !kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints,
 		kube.TaintApiserverUnreachable) {
 		t.Fatal("setup: node not fenced")
@@ -315,7 +315,7 @@ func TestApiserverDarkRecoveryUntaints(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base.Add(16*time.Minute))
 	anrRefreshLeases(t, cs,
 		[]string{"w1", "w2", "w3", "w4", "w5", "w6"}, base.Add(16*time.Minute))
-	check.Run(probetest.SweepCtx(ctx))
+	check.Run(probetest.SweepCtx(ctx, check.Deps))
 	if kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints,
 		kube.TaintApiserverUnreachable) {
 		t.Fatal("recovered node still fenced")
@@ -355,7 +355,41 @@ func TestApiserverNodeReachabilityProbe(t *testing.T) {
 	}
 }
 
-func TestApiserverDarkSingleWorkerFencesNormally(t *testing.T) {
+func TestApiserverDarkSingleWorkerNeverFences(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		anrNodeLease("w1", base),
+		anrWebhookConfig("wh-test", "ns", "svc", admissionv1.Fail),
+		anrSlice("ns", "svc", "ns", "backend-1"),
+		anrBackendPod("ns", "backend-1", "w1"),
+	)
+	p := testProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+	check := anrCheck(t, p, map[string]bool{"w1": true})
+
+	check.Run(probetest.SweepCtx(ctx, check.Deps))
+	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+	anrRefreshLeases(t, cs, []string{"w1"}, base.Add(11*time.Minute))
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if res.Pass {
+		t.Fatal("single dark worker must still fail the sweep (the finding is the alert)")
+	}
+	if kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints, kube.TaintApiserverUnreachable) {
+		t.Fatal("single-worker cluster must NOT fence its only worker — no peer to compare, nowhere to reschedule")
+	}
+	if _, err := cs.CoreV1().Pods("ns").Get(ctx, "backend-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("no fence means no webhook-backend evacuation: %v", err)
+	}
+}
+
+// A single HEALTHY worker (zero dark candidates) must PASS cleanly —
+// no finding, no FAIL, no taint. The mesh-wide/single-worker guard
+// exists to SUPPRESS fencing, so it may only fire when at least one
+// worker is actually dark. An unconditional `len(candidates) <= 1`
+// branch emitted a bogus "apiserver-dark on 0/1 workers" finding and
+// pinned every healthy one-worker cluster at FAIL=1 forever.
+func TestApiserverDarkSingleHealthyWorkerPasses(t *testing.T) {
 	base := time.Now()
 	cs := fake.NewSimpleClientset(
 		probetest.ReadyWorkerNode("w1", "", 0, false),
@@ -363,17 +397,90 @@ func TestApiserverDarkSingleWorkerFencesNormally(t *testing.T) {
 	)
 	p := testProber(cs)
 	probetest.FreezeNow(p.Deps, base)
-	check := anrCheck(t, p, map[string]bool{"w1": true})
+	check := anrCheck(t, p, nil) // w1 probes OK — no dark candidate
 
-	check.Run(probetest.SweepCtx(ctx))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
 	anrRefreshLeases(t, cs, []string{"w1"}, base.Add(11*time.Minute))
-	res := check.Run(probetest.SweepCtx(ctx))
-	if res.Pass {
-		t.Fatal("single dark worker must fail the sweep")
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if !res.Pass {
+		t.Fatalf("single healthy worker must PASS: %+v", res)
 	}
-	if !kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints, kube.TaintApiserverUnreachable) {
-		t.Fatal("single-worker cluster must still fence its dark worker")
+	if res.Why != "" {
+		t.Fatalf("healthy fleet must emit no finding, got %q", res.Why)
+	}
+	if kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints, kube.TaintApiserverUnreachable) {
+		t.Fatal("healthy worker must not be fenced")
+	}
+}
+
+// Recovery untaints BEFORE the mesh-wide guard: a previously fenced
+// node whose probe answers again must be unfenced even when a
+// majority of the other workers are dark in the same sweep. The old
+// order returned early on the mesh-wide verdict and stranded the
+// recovered node with its NoSchedule taint until the blip cleared.
+func TestApiserverDarkUntaintsBeforeMeshWideGuard(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		probetest.ReadyWorkerNode("w2", "", 0, false),
+		probetest.ReadyWorkerNode("w3", "", 0, false),
+		probetest.ReadyWorkerNode("w4", "", 0, false),
+		anrNodeLease("w1", base), anrNodeLease("w2", base),
+		anrNodeLease("w3", base), anrNodeLease("w4", base),
+	)
+	if err := kube.TaintNode(ctx, cs, "w1", kube.TaintApiserverUnreachable,
+		"true", corev1.TaintEffectNoSchedule); err != nil {
+		t.Fatalf("seed fence taint: %v", err)
+	}
+	p := testProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+	// w1 recovered (probe OK); w2+w3 dark -> 2/4 triggers mesh-wide.
+	check := anrCheck(t, p, map[string]bool{"w2": true, "w3": true})
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if res.Pass {
+		t.Fatal("mesh-wide dark must still fail the sweep")
+	}
+	if kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints, kube.TaintApiserverUnreachable) {
+		t.Fatal("recovered node must be unfenced even when the mesh-wide guard aborts fencing")
+	}
+	for _, n := range []string{"w2", "w3"} {
+		if kube.HasTaint(mustNode(t, cs, n).Spec.Taints, kube.TaintApiserverUnreachable) {
+			t.Fatalf("mesh-wide guard must not fence %s", n)
+		}
+	}
+}
+
+// A controller restart empties the in-RAM seen ledger: a node still
+// carrying the fence taint whose probe keeps failing must stay in
+// fencedDark so its Fail-policy webhook backends keep being
+// evacuated (instead of waiting a fresh darkMinAge after every
+// operator rollout).
+func TestApiserverDarkFenceSurvivesRestart(t *testing.T) {
+	base := time.Now()
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w1", "", 0, false),
+		probetest.ReadyWorkerNode("w2", "", 0, false),
+		probetest.ReadyWorkerNode("w3", "", 0, false),
+		probetest.ReadyWorkerNode("w4", "", 0, false),
+		anrNodeLease("w1", base), anrNodeLease("w2", base),
+		anrNodeLease("w3", base), anrNodeLease("w4", base),
+		anrWebhookConfig("wh-test", "ns", "svc", admissionv1.Fail),
+		anrSlice("ns", "svc", "ns", "backend-1"),
+		anrBackendPod("ns", "backend-1", "w1"),
+	)
+	if err := kube.TaintNode(ctx, cs, "w1", kube.TaintApiserverUnreachable,
+		"true", corev1.TaintEffectNoSchedule); err != nil {
+		t.Fatalf("seed fence taint: %v", err)
+	}
+	p := testProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+	// Fresh check instance (empty seen ledger) = controller restart.
+	check := anrCheck(t, p, map[string]bool{"w1": true})
+	if res := check.Run(probetest.SweepCtx(ctx, check.Deps)); res.Pass {
+		t.Fatal("persisted dark node must fail the sweep")
+	}
+	if _, err := cs.CoreV1().Pods("ns").Get(ctx, "backend-1", metav1.GetOptions{}); err == nil {
+		t.Fatal("fenced-dark node's webhook backend must be evacuated on the first post-restart sweep")
 	}
 }
 
@@ -397,10 +504,10 @@ func TestApiserverDarkSkipsPodEvictionWhenFenceDeferred(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	check := anrCheck(t, p, map[string]bool{"w1": true})
 
-	check.Run(probetest.SweepCtx(ctx))
+	check.Run(probetest.SweepCtx(ctx, check.Deps))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
 	anrRefreshLeases(t, cs, []string{"w1", "w2", "w3", "w4"}, base.Add(11*time.Minute))
-	check.Run(probetest.SweepCtx(ctx))
+	check.Run(probetest.SweepCtx(ctx, check.Deps))
 
 	if kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints, kube.TaintApiserverUnreachable) {
 		t.Fatal("unexpected fence taint on w1")

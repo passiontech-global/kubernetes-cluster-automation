@@ -83,7 +83,7 @@ func TestKubeletReaperDefersTaintUnderOpenCircuit(t *testing.T) {
 	now := time.Now()
 	krConfigureBreaker(t, "kubelet-liveness-reaper", "w1", now)
 	r := krReaper(cs, now)
-	if err := r.sweep(t.Context(), n, false); err != nil {
+	if err := r.sweep(t.Context(), n, false, nil); err != nil {
 		t.Fatalf("open circuit must defer, not error: %v", err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -101,7 +101,7 @@ func TestKubeletReaperFreshCircuitTaints(t *testing.T) {
 	heal.ConfigureTargetBreaker(3, time.Hour)
 	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
 	r := krReaper(cs, now)
-	if err := r.sweep(t.Context(), n, false); err != nil {
+	if err := r.sweep(t.Context(), n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -118,7 +118,7 @@ func TestKubeletReaperHealthyProbeClearsHistory(t *testing.T) {
 	now := time.Now()
 	krConfigureBreaker(t, "kubelet-liveness-reaper", "w1", now)
 	r := krReaper(cs, now)
-	if err := r.sweep(t.Context(), n, true); err != nil {
+	if err := r.sweep(t.Context(), n, true, nil); err != nil {
 		t.Fatal(err)
 	}
 	if ok, _ := heal.TryAcquireTarget("kubelet-liveness-reaper", "w1",
@@ -299,7 +299,7 @@ func TestKubeletReaperFreshLeaseSkipsTaintDespiteStaleHeartbeat(t *testing.T) {
 	}
 	now := time.Now()
 	r := krReaper(cs, now)
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -324,7 +324,7 @@ func TestKubeletReaperStaleLeaseTaintsDespiteFreshHeartbeat(t *testing.T) {
 	heal.ConfigureTargetBreaker(3, time.Hour)
 	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
 	r := krReaper(cs, now)
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -343,7 +343,7 @@ func TestKubeletReaperFutureLeaseRenewalSkipsTaint(t *testing.T) {
 	}
 	now := time.Now()
 	r := krReaper(cs, now)
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -365,7 +365,7 @@ func TestKubeletReaperLeaseGetErrorFailsClosed(t *testing.T) {
 	heal.ConfigureTargetBreaker(3, time.Hour)
 	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
 	r := krReaper(cs, now)
-	if err := r.sweep(ctx, n, false); err == nil {
+	if err := r.sweep(ctx, n, false, nil); err == nil {
 		t.Fatal("lease read failure must fail the node's sweep, not taint")
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -411,7 +411,7 @@ func TestKubeletReaperFreshLeaseFakeReadyTaintsAfterGrace(t *testing.T) {
 		}
 	}
 	// First observation — inside the grace window, no taint.
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -420,7 +420,7 @@ func TestKubeletReaperFreshLeaseFakeReadyTaintsAfterGrace(t *testing.T) {
 	// Still inside grace — second sweep must not taint either.
 	now = now.Add(kubeletReaperLeaseFreshGrace / 2)
 	renewLease()
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -429,7 +429,7 @@ func TestKubeletReaperFreshLeaseFakeReadyTaintsAfterGrace(t *testing.T) {
 	// Grace elapsed, lease still fresh — fake-ready confirmed.
 	now = now.Add(kubeletReaperLeaseFreshGrace)
 	renewLease()
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -465,17 +465,17 @@ func TestKubeletReaperFreshLeaseRecoveryRearms(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(kubeletReaperLeaseFreshGrace / 2)
 	renewLease()
-	if err := r.sweep(ctx, n, true); err != nil { // probe recovers
+	if err := r.sweep(ctx, n, true, nil); err != nil { // probe recovers
 		t.Fatal(err)
 	}
 	now = now.Add(kubeletReaperLeaseFreshGrace)
 	renewLease()
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -552,7 +552,7 @@ func TestKubeletReaperYieldsToLocalRemediationCondition(t *testing.T) {
 	heal.ConfigureTargetBreaker(3, time.Hour)
 	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
 	r := krReaper(cs, time.Now())
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -570,7 +570,7 @@ func TestKubeletReaperStaleRemediationHeartbeatDoesNotYield(t *testing.T) {
 	heal.ConfigureTargetBreaker(3, time.Hour)
 	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
 	r := krReaper(cs, time.Now())
-	if err := r.sweep(ctx, n, false); err != nil {
+	if err := r.sweep(ctx, n, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
@@ -676,6 +676,113 @@ func TestKubeletReaperMeshGuardNeverEngagesOnSingleWorker(t *testing.T) {
 	}
 	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
 		t.Fatal("single-worker fresh-lease failure suppressed — fake-ready can never fence")
+	}
+}
+
+// On a 2-worker cluster one dark worker is NOT a mesh outage —
+// ">=half" is trivially 1-of-2. Enabling the guard there would
+// suppress the only persisted fake-ready taint the cluster can
+// make, so meshDark must stay off and the worker gets fenced.
+func TestKubeletReaperTwoWorkersOneDarkIsNotMeshDark(t *testing.T) {
+	now := time.Now()
+	dark := krStaleNode("w1")
+	healthy := testutil.Node("w2", corev1.ConditionTrue, nil)
+	cs := fake.NewSimpleClientset(dark, healthy)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", 5*time.Second), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	r := krRunReaper(cs, now,
+		func(_ context.Context, node string) bool { return node != "w1" })
+	r.freshFail.Observe("w1", now.Add(-kubeletReaperLeaseFreshGrace-time.Minute))
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.meshDark {
+		t.Fatal("1-of-2 dark must not engage the mesh-wide guard")
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("persisted fake-ready worker was not fenced on a 2-worker cluster")
+	}
+}
+
+// The mesh-dark census and the per-node taint gate need the SAME
+// lease answer: run() reads each failed node's Lease once and hands
+// the verdict to sweep(), never re-Get'ing it for the same node.
+func TestKubeletReaperRunReadsFailedLeaseOnce(t *testing.T) {
+	now := time.Now()
+	dark := krStaleNode("w1")
+	healthy := testutil.Node("w2", corev1.ConditionTrue, nil)
+	cs := fake.NewSimpleClientset(dark, healthy)
+	if _, err := cs.CoordinationV1().Leases(kubeletLeaseNamespace).
+		Create(ctx, krLease("w1", 5*time.Second), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	gets := 0
+	cs.PrependReactor("get", "leases",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			gets++
+			return false, nil, nil
+		})
+	r := krRunReaper(cs, now,
+		func(_ context.Context, node string) bool { return node != "w1" })
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 1 {
+		t.Fatalf("Lease Get calls = %d, want 1 — the dark census and sweep must share it", gets)
+	}
+}
+
+// A panic inside a probe goroutine is OUR bug, not dark evidence:
+// probeSafe turns it into an inconclusive "ok" so the node is neither
+// tainted nor persisted as failing, and the process survives (an
+// unrecovered panic in a spawned goroutine would kill the whole
+// controller, bypassing Periodic's Run-level recover).
+func TestKubeletReaperProbePanicIsInconclusive(t *testing.T) {
+	now := time.Now()
+	wOK := testutil.Node("w-ok", corev1.ConditionTrue, nil)
+	wPanic := krStaleNode("w-panic")
+	cs := fake.NewSimpleClientset(wOK, wPanic)
+	r := krRunReaper(cs, now, func(_ context.Context, node string) bool {
+		if node == "w-panic" {
+			panic("probe bug")
+		}
+		return true
+	})
+	if err := r.run(t.Context()); err != nil {
+		t.Fatalf("run with a panicking probe must absorb it: %v", err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w-panic").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("panicking probe tainted the node — a panic is never death evidence")
+	}
+	if !r.probeSafe(t.Context(), "w-panic") {
+		t.Fatal("probeSafe must report inconclusive-ok on a panic")
+	}
+}
+
+// On a 2-worker cluster with one worker already fenced by another
+// actor, the survivor is the last capacity the cluster has: a failed
+// probe there must defer instead of fencing the whole fleet — even
+// with a stale lease and no fresh-lease grace to hide behind.
+func TestKubeletReaperTwoWorkerClusterKeepsLastWorker(t *testing.T) {
+	now := time.Now()
+	fenced := krStaleNode("w-fenced")
+	fenced.Spec.Taints = []corev1.Taint{{
+		Key: kube.TaintNodeOutOfService, Effect: corev1.TaintEffectNoExecute,
+	}}
+	last := krStaleNode("w-last") // no Lease — without the guard sweep() taints it
+	cs := fake.NewSimpleClientset(fenced, last)
+	r := krRunReaper(cs, now, func(_ context.Context, node string) bool {
+		return node == "w-fenced" // keeps anyOK true; last worker fails its probe
+	})
+	if err := r.run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w-last").Spec.Taints, kubeletReaperTaint) {
+		t.Fatal("last schedulable worker of a 2-worker cluster was fenced")
 	}
 }
 

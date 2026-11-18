@@ -25,7 +25,7 @@ func TestCiliumBPFMapPressureFailsAboveThreshold(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset())
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
-	res := probetest.MustCheck[*ciliumBPFMapPressureCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*ciliumBPFMapPressureCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {
 		t.Fatalf("expected FAIL above threshold, got %+v", res)
 	}
@@ -48,14 +48,14 @@ func TestCiliumBPFMapPressureEmptyPasses(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset())
 	p.Cfg.HTTPContent.URL = srv.URL
 	p.HTTPClient = srv.Client()
-	if res := probetest.MustCheck[*ciliumBPFMapPressureCheck](t, p).Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := probetest.MustCheck[*ciliumBPFMapPressureCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatalf("empty result must pass: %+v", res)
 	}
 }
 
 func TestCiliumBPFMapPressurePromDownInconclusive(t *testing.T) {
 	p := testProber(fake.NewSimpleClientset()) // httpURL is dead by default
-	res := probetest.MustCheck[*ciliumBPFMapPressureCheck](t, p).Run(probetest.SweepCtx(ctx))
+	res := probetest.MustCheck[*ciliumBPFMapPressureCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	// A Prometheus outage is infra-inconclusive, never a clean pass:
 	// the check must not claim health it could not verify.
 	if res.Pass {

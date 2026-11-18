@@ -141,7 +141,7 @@ func TestArgoCDAgentSpinDeletesAfterWindow(t *testing.T) {
 	chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
 
 	// First sighting stamps the ledger — detection only, no delete.
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("spinning agent must FAIL: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, spinning.Name, metav1.GetOptions{}); err != nil {
@@ -150,7 +150,7 @@ func TestArgoCDAgentSpinDeletesAfterWindow(t *testing.T) {
 
 	// Past the window the sustained signature deletes the pod.
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("sustained spin must FAIL: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, spinning.Name, metav1.GetOptions{}); err == nil {
@@ -187,19 +187,19 @@ func TestArgoCDAgentSpinInconclusiveSweepKeepsSeen(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
 
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("first spin sighting must FAIL: %+v", res)
 	}
 	// The log channel dies for one sweep (the cpu channel is already
 	// dead — no prometheus endpoint wired): inconclusive, not clean.
 	cs.PrependReactor("get", "pods",
 		agentLogFailReactor(errors.New("kubelet log read boom")))
-	_ = chk.Run(probetest.SweepCtx(ctx))
+	_ = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	// The log channel revives past the window: the sustained spin
 	// deletes the pod on the preserved clock.
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
 	cs.PrependReactor("get", "pods", agentLogLiveReactor(20, false))
-	chk.Run(probetest.SweepCtx(ctx))
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
 		t.Fatal("flaky-evidence spin pod was not deleted — the inconclusive sweep wiped the first-seen clock")
 	}
@@ -218,11 +218,11 @@ func TestArgoCDAgentSpinRecoveredLogsPass(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
 
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("recovered stream errors must pass: %+v", res)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("recovered stream errors must pass past the window: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, pod.Name, metav1.GetOptions{}); err != nil {
@@ -286,7 +286,7 @@ func TestArgoCDAgentSpinGuardBranchesSkip(t *testing.T) {
 	probetest.FreezeNow(p.Deps, base)
 	chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
 
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("unqualified pods must pass: %+v", res)
 	}
 	if keys := probetest.LedgerKeys(&chk.seen); len(keys) != 0 {
@@ -311,9 +311,9 @@ func TestArgoCDAgentSpinDeleteCooldown(t *testing.T) {
 	chk := probetest.MustCheck[*argoCDAgentSpinCheck](t, p)
 
 	// Detection at t0, delivered delete at t0+11m (past the window).
-	chk.Run(probetest.SweepCtx(ctx))
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("sustained spin must FAIL: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
@@ -341,7 +341,7 @@ func TestArgoCDAgentSpinDeleteCooldown(t *testing.T) {
 
 	// Past the cooldown the replacement is fair game again.
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute+argocdAgentCool+11*time.Minute))
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("sustained spin past cooldown must FAIL: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, repl.Name, metav1.GetOptions{}); err == nil {
@@ -394,7 +394,7 @@ func TestArgoCDAgentSpinLogBoundarySurvivesCPUChannel(t *testing.T) {
 
 	// Sweep 1 — cpu quiet → log channel scans; boundary = the
 	// tail's newest stamp; first sighting, no delete.
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("first spin sighting must FAIL: %+v", res)
 	}
 	if _, ok := chk.logScanAt[key]; !ok {
@@ -405,7 +405,7 @@ func TestArgoCDAgentSpinLogBoundarySurvivesCPUChannel(t *testing.T) {
 	// skipped. The boundary MUST survive: dropping it would make
 	// the next log read re-count the whole stale tail.
 	hot.Store(true)
-	if res := chk.Run(probetest.SweepCtx(ctx)); res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
 		t.Fatalf("cpu-channel spin must FAIL: %+v", res)
 	}
 	if _, ok := chk.logScanAt[key]; !ok {
@@ -417,7 +417,7 @@ func TestArgoCDAgentSpinLogBoundarySurvivesCPUChannel(t *testing.T) {
 	// zero FRESH errors → no spin, no delete past the window.
 	hot.Store(false)
 	probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
-	if res := chk.Run(probetest.SweepCtx(ctx)); !res.Pass {
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("stale-only tail re-flagged after a cpu-answered sweep: %+v", res)
 	}
 	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, pod.Name,

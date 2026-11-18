@@ -6,6 +6,7 @@ package kube
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,61 @@ func TestReadPodLogTail(t *testing.T) {
 			t.Fatalf("ReadPodLogTail = (%v,%v), want (false,err)", hit, err)
 		}
 	})
+}
+
+// chunkReader forces short reads so the ring trims across several
+// iterations — the path where the newline that terminates a cut
+// fragment has not arrived yet.
+type chunkReader struct {
+	data string
+	off  int
+	n    int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	end := r.off + r.n
+	if end > len(r.data) {
+		end = len(r.data)
+	}
+	copy(p, r.data[r.off:end])
+	read := end - r.off
+	r.off = end
+	return read, nil
+}
+
+// A cap that cuts through the middle of the oldest retained line
+// must discard the fragment up to the next newline — a timestamp-
+// less first line would make PodLogLineTS callers read a signature
+// match on it as freshly written.
+func TestReadPodLogTailBytesDropsCutHeadLine(t *testing.T) {
+	log := "2024-01-01T00:00:00Z old one\n" +
+		"2024-01-01T00:00:01Z old two\n" +
+		"2024-01-01T00:00:02Z needle here\n"
+	got, err := readPodLogTailBytes(&chunkReader{data: log, n: 7}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "needle here") {
+		t.Fatalf("newest line lost: %q", got)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+		if _, ok := PodLogLineTS(line); !ok {
+			t.Fatalf("tail retained a partial first line %q", line)
+		}
+	}
+	// The signature on the cut fragment itself must never match:
+	// a capped read of only that fragment yields no verifiable line.
+	frag, err := readPodLogTailBytes(strings.NewReader(
+		"2024-01-01T00:00:00Z needle in a cut line"), 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(frag, "needle") {
+		t.Fatalf("fragment without a timestamp must not be returned: %q", frag)
+	}
 }
 
 func TestResolveDefaultContainer(t *testing.T) {

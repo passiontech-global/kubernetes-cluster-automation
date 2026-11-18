@@ -123,6 +123,70 @@ func TestGatewayLoadGrantsMemoizesPerCensus(t *testing.T) {
 	}
 }
 
+// The downscaler verdict must never excuse a zero-endpoints Service
+// on a guess: a selectorless Service matches no workload, and a
+// Service backed by a live replica alongside a downscaled one is
+// still live. Only when EVERY matching workload is asleep is the
+// zero-endpoints finding suppressed.
+func TestGatewayServiceDownscaledVerdict(t *testing.T) {
+	p := testProber(fake.NewSimpleClientset())
+	chk := p.Checks[0].(*gatewayRouteHealthCheck)
+	zero, one := int32(0), int32(1)
+	asleep := routeWorkload{
+		templateLabels: map[string]string{"app": "web"},
+		annotations:    map[string]string{"downscaler/uptime": "08:00-20:00"},
+		replicas:       &zero}
+	awake := routeWorkload{
+		templateLabels: map[string]string{"app": "web"},
+		replicas:       &one}
+	otherAsleep := routeWorkload{
+		templateLabels: map[string]string{"app": "other"},
+		annotations:    map[string]string{"downscaler/uptime": "08:00-20:00"},
+		replicas:       &zero}
+	// GitOps-parked backends carry an explicit spec.replicas=0 but
+	// no downscaler annotation — still an intentional zero.
+	explicitZero := routeWorkload{
+		templateLabels: map[string]string{"app": "web"},
+		replicas:       &zero}
+	unsetReplicas := routeWorkload{
+		templateLabels: map[string]string{"app": "web"}}
+
+	cases := []struct {
+		name      string
+		selector  map[string]string
+		workloads []routeWorkload
+		want      bool
+	}{
+		{"selectorless never matches Everything", nil, []routeWorkload{asleep}, false},
+		{"all matching workloads downscaled", map[string]string{"app": "web"},
+			[]routeWorkload{asleep}, true},
+		{"explicit zero without downscaler annotation", map[string]string{"app": "web"},
+			[]routeWorkload{explicitZero}, true},
+		{"explicit zero alongside a live sibling", map[string]string{"app": "web"},
+			[]routeWorkload{explicitZero, awake}, false},
+		{"unset replicas is not an intentional zero", map[string]string{"app": "web"},
+			[]routeWorkload{unsetReplicas}, false},
+		{"one awake sibling keeps the service live", map[string]string{"app": "web"},
+			[]routeWorkload{asleep, awake}, false},
+		{"unrelated downscaled workload", map[string]string{"app": "web"},
+			[]routeWorkload{otherAsleep}, false},
+		{"no matching workload", map[string]string{"app": "missing"},
+			[]routeWorkload{asleep}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newGatewayRouteCensus()
+			c.workloads["ns"] = tc.workloads
+			c.wlLoaded["ns"] = true // inputs pre-seeded — no List
+			svc := clusterIPService("ns", "svc", tc.selector)
+			if got := chk.serviceDownscaled(ctx, logr.Discard(), c,
+				svc); got != tc.want {
+				t.Fatalf("serviceDownscaled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // An EndpointSlice LIST failure counts ONE run_error per sweep: the
 // census attempts once (esTried) and every later backendRef in the
 // sweep short-circuits on esErr instead of re-listing — and
