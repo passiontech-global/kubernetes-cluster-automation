@@ -159,6 +159,17 @@ func TestDiskBloatRunScanEvictCooldown(t *testing.T) {
 	e := &wdeps.CycleEnv{WorkerActive: true, APIOK: true,
 		Pods:     []corev1.Pod{*victim, *sys, *sts, *term},
 		PidsOnce: wdepstest.PidsOf()}
+	// freshEnv mirrors production: workerhygiene.Cycle swaps a NEW
+	// CycleEnv into the env cell every round, so the per-cycle walk
+	// memoization/budget (Deps.WalkBudgeted state on the env) never
+	// leaks stale sizings across cycles. This test drives several
+	// Runs against evolving dirs — each Run gets its own env or the
+	// walk cache would replay sizes of dirs already removed.
+	freshEnv := func() *wdeps.CycleEnv {
+		return &wdeps.CycleEnv{WorkerActive: true, APIOK: true,
+			Pods:     []corev1.Pod{*victim, *sys, *sts, *term},
+			PidsOnce: wdepstest.PidsOf()}
+	}
 
 	// First above-watermark cycle: scan runs → latch + ACTION lines.
 	c.Run(ctx, e)
@@ -171,7 +182,7 @@ func TestDiskBloatRunScanEvictCooldown(t *testing.T) {
 	}
 
 	// Inside the scan interval the walk is skipped entirely.
-	c.Run(ctx, e)
+	c.Run(ctx, freshEnv())
 
 	// Past the interval at 0.98 used (> critical) and APIOK → the
 	// hog (largest non-protected total) is evicted.
@@ -184,7 +195,7 @@ func TestDiskBloatRunScanEvictCooldown(t *testing.T) {
 	}
 	fullStatfs(d)
 	f.Now = f.Now.Add(2 * time.Minute)
-	c.Run(ctx, e)
+	c.Run(ctx, freshEnv())
 	evicted := wdepstest.EvictActions(f.CS)
 	if len(evicted) == 0 {
 		t.Fatal("the disk-bloat victim must be evicted")
@@ -201,7 +212,7 @@ func TestDiskBloatRunScanEvictCooldown(t *testing.T) {
 
 	// Next scan inside the evict budget → cooldown skip, no 2nd evict.
 	f.Now = f.Now.Add(2 * time.Minute)
-	c.Run(ctx, e)
+	c.Run(ctx, freshEnv())
 	if got := wdepstest.EvictActions(f.CS); len(got) != len(evicted) {
 		t.Fatalf("cooldown cycle evicted %v, want no second evict", got)
 	}
@@ -211,7 +222,7 @@ func TestDiskBloatRunScanEvictCooldown(t *testing.T) {
 
 	// Budget expired → evicted again.
 	f.Now = f.Now.Add(20 * time.Minute)
-	c.Run(ctx, e)
+	c.Run(ctx, freshEnv())
 	if got := wdepstest.EvictActions(f.CS); len(got) <= len(evicted) {
 		t.Fatalf("post-budget evicted=%v want a second evict", got)
 	}
@@ -227,7 +238,7 @@ func TestDiskBloatRunScanEvictCooldown(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Now = f.Now.Add(2 * time.Minute)
-	c.Run(ctx, e)
+	c.Run(ctx, freshEnv())
 	rtRequireLatch(t, d, latchdefs.LatchDiskBloat, false)
 }
 

@@ -146,6 +146,7 @@ func wlayerPod(name, uid string, lim bool) corev1.Pod {
 
 func TestWLayerSnapshotBloatEmitsEvent(t *testing.T) {
 	e := fixture(t)
+	e.DiskUsed = 0.90                            // > the 0.80 pressure gate — the scan walks
 	e.H.Cfg.Disk.WLayerBloatThresholdBytes = 100 // tiny threshold for the test
 	snapRoot := t.TempDir()
 	e.H.Cfg.Disk.WLayerSnapshotsDir = snapRoot
@@ -179,6 +180,7 @@ func TestWLayerSnapshotBloatEmitsEvent(t *testing.T) {
 
 func TestWLayerPodScopedEventAndLimitExempt(t *testing.T) {
 	e := fixture(t)
+	e.DiskUsed = 0.90 // > the 0.80 pressure gate — the scan walks
 	e.H.Cfg.Disk.WLayerBloatThresholdBytes = 100
 	snapRoot := t.TempDir()
 	e.H.Cfg.Disk.WLayerSnapshotsDir = snapRoot
@@ -238,6 +240,7 @@ func TestWLayerPodVolumeBloatEmitsEvent(t *testing.T) {
 
 func TestWLayerScanIntervalBudgeted(t *testing.T) {
 	e := fixture(t)
+	e.DiskUsed = 0.90 // > the 0.80 pressure gate — the scan walks
 	e.H.Cfg.Disk.WLayerBloatThresholdBytes = 100
 	snapRoot := t.TempDir()
 	e.H.Cfg.Disk.WLayerSnapshotsDir = snapRoot

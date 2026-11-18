@@ -46,21 +46,37 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 	// numeric on containerd; snapshotMountIDs binds each to its
 	// task id through the live rootfs mount's upperdir=, and
 	// taskDirPodUID resolves that to the pod uid annotation.
-	mountIDs := snapshotMountIDs(c.d)
-	for _, snap := range readDirNames(c.d.Cfg.Disk.WLayerSnapshotsDir) {
-		fsDir := filepath.Join(snap, "fs")
-		size, _ := walkBytes(c.d, e, fsDir)
-		if size <= threshold {
-			continue
+	//
+	// Disk-pressure gate BEFORE the snapshot walk (BUG nonprod-oom):
+	// this loop sizes EVERY fs/ tree on the node — nonprod carried
+	// 2809 snapshots at up to maxBloatWalkEntries entries apiece,
+	// and the dentry/inode slab the walk charged to the agent's own
+	// memcg (~480MB) hit the 512Mi memory.max and OOM-killed the
+	// pod every ~40min. Same statfs bar the orphan-hostpath removal
+	// gate and the localpv-quota walk gate use (one DiskUsageAbove-
+	// Watermark call): a writable layer only matters when its disk
+	// can fill, and on an unpressured disk kubelet eviction owns
+	// the early warning. The loop re-runs on the next interval once
+	// the bar trips. Part (b) below stays unconditional — its
+	// emptyDir trees are pod-scoped and small.
+	snapRoot := c.d.Cfg.Disk.WLayerSnapshotsDir
+	if c.d.DiskUsageAboveWatermark(snapRoot) {
+		mountIDs := snapshotMountIDs(c.d)
+		for _, snap := range readDirNames(snapRoot) {
+			fsDir := filepath.Join(snap, "fs")
+			size, _ := c.d.WalkBudgeted(e, fsDir)
+			if size <= threshold {
+				continue
+			}
+			var pod *corev1.Pod
+			if uid := snapshotPodUID(c.d, filepath.Base(snap), mountIDs); uid != "" {
+				pod = podByUID[uid]
+			}
+			if podDeclaresEphemeralStorage(pod) {
+				continue
+			}
+			c.emitWLayerBloatEvent(ctx, pod, fsDir, size)
 		}
-		var pod *corev1.Pod
-		if uid := snapshotPodUID(c.d, filepath.Base(snap), mountIDs); uid != "" {
-			pod = podByUID[uid]
-		}
-		if podDeclaresEphemeralStorage(pod) {
-			continue
-		}
-		c.emitWLayerBloatEvent(ctx, pod, fsDir, size)
 	}
 	// (b) kubelet pod emptyDir volumes of pods without the limit —
 	// the write surface the snapshot key can't see. Restricted to
@@ -81,7 +97,7 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 				vst.Type == int64(unix.TMPFS_MAGIC) {
 				continue // medium=Memory emptyDir — can't fill the disk
 			}
-			size, _ := walkBytes(c.d, e, vol)
+			size, _ := c.d.WalkBudgeted(e, vol)
 			if size <= threshold {
 				continue
 			}

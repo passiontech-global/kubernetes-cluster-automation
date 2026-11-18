@@ -84,16 +84,9 @@ func podLogDirUID(base string) string {
 // snapshot pins space no volume path accounts for). Over-threshold
 // dirs return as hits; podTotals/podByUID feed the
 // critical-watermark eviction decision.
-// walkBytes sizes one dir through the per-cycle WalkOnce cache when
-// the cycle provides it (scanBloat and writableLayerScan walk the
-// same snapshot/pod-volume dirs in one cycle — the walk runs once),
-// falling back to a direct bounded walk otherwise.
-func walkBytes(d *wdeps.Deps, e *wdeps.CycleEnv, root string) (int64, bool) {
-	if e != nil && e.WalkOnce != nil {
-		return e.WalkOnce(root)
-	}
-	return d.WalkBytes(root)
-}
+// All dir sizings go through Deps.WalkBudgeted: the per-cycle
+// WalkOnce cache (memoize each path once per cycle) plus the
+// MaxBloatScanEntries entry budget live there now.
 
 func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits []bloatHit,
 	podTotals map[string]int64, podByUID map[string]*corev1.Pod) {
@@ -113,7 +106,7 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 				vst.Type == int64(unix.TMPFS_MAGIC) {
 				continue // medium=Memory emptyDir — can't fill the disk
 			}
-			size, _ := walkBytes(c.d, e, vol)
+			size, _ := c.d.WalkBudgeted(e, vol)
 			podTotals[uid] += size
 			if size > threshold {
 				label := "pod-uid " + uid
@@ -138,7 +131,7 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 	mountIDs := snapshotMountIDs(c.d)
 	for _, snap := range readDirNames(snapRoot) {
 		id := filepath.Base(snap)
-		size, _ := walkBytes(c.d, e, filepath.Join(snap, "fs"))
+		size, _ := c.d.WalkBudgeted(e, filepath.Join(snap, "fs"))
 		if size <= 0 {
 			continue
 		}
@@ -157,7 +150,7 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 	for _, logDir := range readDirNames(c.d.Cfg.Disk.PodLogsDir) {
 		base := filepath.Base(logDir)
 		uid := podLogDirUID(base)
-		size, _ := walkBytes(c.d, e, logDir)
+		size, _ := c.d.WalkBudgeted(e, logDir)
 		if uid != "" {
 			podTotals[uid] += size
 		}

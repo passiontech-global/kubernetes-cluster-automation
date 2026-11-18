@@ -27,12 +27,15 @@ func TestWalkBytes(t *testing.T) {
 	wdepstest.WriteFile(t, filepath.Join(root, "sub", "b.txt"), strings.Repeat("y", 50))
 	wdepstest.WriteFile(t, filepath.Join(root, "sub", "c.bin"), strings.Repeat("z", 25))
 
-	total, truncated := e.D.WalkBytes(root)
+	total, entries, truncated := e.D.WalkBytes(root)
 	if truncated {
 		t.Fatal("small tree reported truncated")
 	}
 	if total != 175 {
 		t.Fatalf("total=%d want 175", total)
+	}
+	if entries != 5 { // root + a.txt + sub/ + b.txt + c.bin
+		t.Fatalf("entries=%d want 5", entries)
 	}
 
 	// Past the cap the walk stops and reports truncated.
@@ -40,7 +43,7 @@ func TestWalkBytes(t *testing.T) {
 	for i := range wdepsMaxWalkEntries() + 1 {
 		wdepstest.WriteFile(t, filepath.Join(big, strconv.Itoa(i)), "")
 	}
-	total, truncated = e.D.WalkBytes(big)
+	total, _, truncated = e.D.WalkBytes(big)
 	if !truncated {
 		t.Fatal("oversized tree not reported truncated")
 	}
@@ -59,7 +62,7 @@ func TestWalkBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = os.Chmod(secret, 0o755) }() // keep TempDir cleanup working
-	total, truncated = e.D.WalkBytes(locked)
+	total, _, truncated = e.D.WalkBytes(locked)
 	if truncated {
 		t.Fatal("locked dir reported truncated")
 	}
@@ -71,6 +74,57 @@ func TestWalkBytes(t *testing.T) {
 // wdepsMaxWalkEntries exposes the walk cap for the truncation case —
 // the production const is unexported, so restate it here.
 func wdepsMaxWalkEntries() int { return 10000 }
+
+// TestWalkBudgeted — per-root memoization, the cumulative per-cycle
+// entry budget, and the nil-env / stub-env contracts. The budget
+// skip must fail toward "no data" (0, truncated) so no consumer can
+// act on a half-scanned tree, and a fresh CycleEnv must reset both
+// cache and allowance.
+func TestWalkBudgeted(t *testing.T) {
+	e := fixture(t)
+	tree := func(name string, files int) string {
+		root := filepath.Join(t.TempDir(), name)
+		for i := range files {
+			wdepstest.WriteFile(t, filepath.Join(root, strconv.Itoa(i)), "xx")
+		}
+		return root
+	}
+	r1 := tree("one", 2) // root + 2 files = 3 entries, 4 bytes
+	r2 := tree("two", 2) // same shape
+
+	old := wdeps.MaxBloatScanEntries
+	wdeps.MaxBloatScanEntries = 3 // r1 exactly exhausts it — r2 never walks
+	t.Cleanup(func() { wdeps.MaxBloatScanEntries = old })
+
+	env := &wdeps.CycleEnv{}
+	if total, truncated := e.D.WalkBudgeted(env, r1); total != 4 || truncated {
+		t.Fatalf("first walk=(%d,%v), want (4,false)", total, truncated)
+	}
+	// Budget exhausted: the next root reports no data — every
+	// threshold comparison then fails toward no action.
+	if total, truncated := e.D.WalkBudgeted(env, r2); total != 0 || !truncated {
+		t.Fatalf("post-budget walk=(%d,%v), want (0,true)", total, truncated)
+	}
+	// Memoized: the first root replays its cached sizing even with
+	// the budget gone — no second walk of the same tree in a cycle.
+	if total, truncated := e.D.WalkBudgeted(env, r1); total != 4 || truncated {
+		t.Fatalf("cached walk=(%d,%v), want (4,false)", total, truncated)
+	}
+	// Fresh cycle env: budget and cache reset with it.
+	fresh := &wdeps.CycleEnv{}
+	if total, truncated := e.D.WalkBudgeted(fresh, r2); total != 4 || truncated {
+		t.Fatalf("fresh-cycle walk=(%d,%v), want (4,false)", total, truncated)
+	}
+	// Nil env: the direct unbounded walk the non-cycle callers kept.
+	if total, truncated := e.D.WalkBudgeted(nil, r1); total != 4 || truncated {
+		t.Fatalf("nil-env walk=(%d,%v), want (4,false)", total, truncated)
+	}
+	// Hand-built stub env: delegated verbatim (unit-test path).
+	stub := &wdeps.CycleEnv{WalkOnce: func(string) (int64, bool) { return 7, true }}
+	if total, truncated := e.D.WalkBudgeted(stub, r1); total != 7 || !truncated {
+		t.Fatalf("stub walk=(%d,%v), want (7,true)", total, truncated)
+	}
+}
 
 // TestDiskUsageAboveWatermark — statfs through the seam: above 80%
 // used → true, at/below → false, unmeasurable → false (fail closed).

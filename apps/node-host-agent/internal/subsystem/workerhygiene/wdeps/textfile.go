@@ -35,9 +35,11 @@ const orphanHostPathDiskHigh = 0.80
 // truncated=true — the total is then a lower bound (a tree that
 // huge is bloat by definition, but the walk must never become its
 // own IO problem on the disk that is already full). Shared: the
-// disk-bloat and orphan-hostpath checks walk with it.
-func (d *Deps) WalkBytes(root string) (total int64, truncated bool) {
-	entries := 0
+// disk-bloat, orphan-hostpath and localpv-quota checks walk with
+// it — always through WalkBudgeted, which reports the entry count
+// into the per-cycle budget. entries counts EVERY visited entry
+// (dirs included, root itself first), cap hit included.
+func (d *Deps) WalkBytes(root string) (total int64, entries int, truncated bool) {
 	_ = filepath.WalkDir(root, func(path string, de fs.DirEntry, err error) error {
 		if err != nil {
 			logger().Debug("workerhygiene: bloat walk entry skipped — unreadable",
@@ -56,6 +58,69 @@ func (d *Deps) WalkBytes(root string) (total int64, truncated bool) {
 		}
 		return nil
 	})
+	return total, entries, truncated
+}
+
+// MaxBloatScanEntries is the per-cycle cumulative entry budget
+// WalkBudgeted enforces across every bloat walk. The per-root cap
+// (maxBloatWalkEntries) alone cannot bound a scan that walks
+// THOUSANDS of roots: nonprod ran 2809 containerd snapshot fs/
+// trees at up to 10k entries each, and the kernel dentry/inode
+// slab the walk farm charged to the agent's own memcg (~480MB)
+// drove the pod into its 512Mi memory.max — an OOMKill every
+// ~40min. 100k entries is orders of magnitude under that while
+// still sizing any plausible tree set; a scan past the budget
+// fails toward "no data" (skipped roots report 0, truncated=true)
+// and every consumer treats a truncated total as no evidence.
+// Var, not const, only so tests can shrink it — production never
+// mutates it.
+var MaxBloatScanEntries = 100000
+
+// walkResult is one memoized WalkBudgeted sizing in the per-cycle
+// cache CycleEnv carries for it.
+type walkResult struct {
+	total     int64
+	truncated bool
+}
+
+// WalkBudgeted sizes root for one cycle: memoized per root on e so
+// the disk-bloat scan, the writable-layer scan, the orphan-hostpath
+// scan and the localpv-quota scan share one sizing of the same
+// tree, and charged against the MaxBloatScanEntries budget so a
+// farm of walkable roots can never compound into unbounded IO,
+// slab or GC churn. The budget is per CYCLE (e), so each cycle
+// restarts with a fresh allowance; per-root bounding stays in
+// WalkBytes. Callers must go through here, never WalkBytes
+// directly, or they skip both the memoization and the budget.
+//
+// e == nil (no cycle context) walks directly and unbounded — the
+// same contract the pre-budget code had for its one non-cycle
+// caller; a hand-built env with WalkOnce set (unit-test stubs)
+// delegates to the stub unchanged.
+func (d *Deps) WalkBudgeted(e *CycleEnv, root string) (total int64, truncated bool) {
+	if e == nil {
+		total, _, truncated = d.WalkBytes(root)
+		return total, truncated
+	}
+	if e.WalkOnce != nil {
+		return e.WalkOnce(root)
+	}
+	if e.walkCache == nil {
+		e.walkCache = make(map[string]walkResult)
+	}
+	if r, ok := e.walkCache[root]; ok {
+		return r.total, r.truncated
+	}
+	if e.walkSpent >= MaxBloatScanEntries {
+		// Budget exhausted: skip the walk, cache the skip so later
+		// callers of the same root are map hits, and report no data —
+		// every threshold comparison then fails toward no action.
+		e.walkCache[root] = walkResult{truncated: true}
+		return 0, true
+	}
+	total, entries, truncated := d.WalkBytes(root)
+	e.walkSpent += entries
+	e.walkCache[root] = walkResult{total: total, truncated: truncated}
 	return total, truncated
 }
 

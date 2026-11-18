@@ -116,7 +116,20 @@ type CycleEnv struct {
 	// and the writable-layer scan walk the same snapshot/pod-volume
 	// dirs in one cycle; the cache makes the IO-bounded walk run at
 	// most once per path per cycle. Nil in tests → direct walks.
+	// PRODUCTION leaves this nil: Cycle refreshes no closure here,
+	// and the memoization + per-cycle entry budget live in
+	// Deps.WalkBudgeted (walkCache/walkSpent below) next to
+	// WalkBytes. A non-nil WalkOnce is the unit-test stub path —
+	// WalkBudgeted delegates to it verbatim, bypassing the budget.
 	WalkOnce func(root string) (total int64, truncated bool)
+
+	// walkCache and walkSpent back Deps.WalkBudgeted: per-root
+	// memoized sizings and the cumulative entries walked this
+	// cycle against wdeps.MaxBloatScanEntries. Unexported — every
+	// consumer goes through WalkBudgeted; hand-built envs start
+	// zeroed and the cache map is created lazily on first use.
+	walkCache map[string]walkResult
+	walkSpent int
 
 	podByUID map[string]*corev1.Pod
 }

@@ -142,7 +142,7 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			continue // can't confirm "PV gone" — not an orphan yet
 		}
 		orphans++
-		size, _ := c.d.WalkBytes(cd.path)
+		size, _ := c.d.WalkBudgeted(e, cd.path)
 		totalBytes += size
 		fi, err := os.Stat(cd.path)
 		if err != nil {

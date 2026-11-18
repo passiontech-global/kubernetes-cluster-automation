@@ -41,6 +41,11 @@ func TestScanBloatAndWLayerShareWalkCache(t *testing.T) {
 	f := wdepstest.New(t)
 	cfg := f.Cfg
 	cfg.ApplyDefaults()
+	// DiskUsageAboveWatermark must pass — the writable-layer scan
+	// skips its snapshot walk on an unpressured disk now (the gate
+	// under test in writable_layer_test.go), and this test pins the
+	// shared WalkOnce dedup ACROSS the two scans.
+	f.DiskUsed = 0.9
 	// Point both consumers at the same snapshot root — production
 	// wiring derives both from the containerd snapshotter root.
 	snaps := filepath.Join(cfg.K0sDataDir, "containerd",

@@ -150,7 +150,7 @@ func TestWalkBytesBoundsAndSizes(t *testing.T) {
 	wdepstest.WriteFile(t, filepath.Join(root, "a", "f1"), "12345")
 	wdepstest.WriteFile(t, filepath.Join(root, "a", "sub", "f2"), "1234567890")
 	h := &Hygiene{}
-	total, truncated := h.WalkBytes(root)
+	total, _, truncated := h.WalkBytes(root)
 	if total != 15 || truncated {
 		t.Fatalf("walkBytes = (%d,%v), want (15,false)", total, truncated)
 	}

@@ -164,7 +164,7 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 		if !pressured[filepath.Dir(dir)] {
 			continue
 		}
-		size, _ := c.d.WalkBytes(dir)
+		size, _ := c.d.WalkBudgeted(e, dir)
 		if size <= int64(float64(cap)*c.d.Cfg.Disk.LocalPVQuotaRatio) {
 			continue
 		}

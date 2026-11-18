@@ -58,12 +58,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
-// walkResult is one memoized WalkBytes call in the per-cycle cache.
-type walkResult struct {
-	total     int64
-	truncated bool
-}
-
 // Hygiene runs the worker checks on one ticker. It is the
 // orchestrator only: everything the checks consume (config, procfs
 // view, state store, journal tracker, metric vecs, cross-check
@@ -402,20 +396,11 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// starve the "disabled" count of a kill-switched check.
 	// WD_SIG_<NAME>=off counts cycles{check,"disabled"} exactly
 	// like the old run gate.
-	// WalkBytes results memoize per cycle too — the disk-bloat scan
-	// and the writable-layer scan walk the same overlayfs snapshot
-	// and pod-volume dirs; the cache halves the IO on the disk that
-	// is already full. Lazy like the other once-snapshots: an idle
-	// cycle never walks anything.
-	walkCache := map[string]walkResult{}
-	walkOnce := func(root string) (int64, bool) {
-		if r, ok := walkCache[root]; ok {
-			return r.total, r.truncated
-		}
-		total, truncated := h.WalkBytes(root)
-		walkCache[root] = walkResult{total: total, truncated: truncated}
-		return total, truncated
-	}
+	// Walk memoization + the per-cycle entry budget no longer need
+	// a closure here: CycleEnv.WalkOnce stays nil in production and
+	// every dir sizing goes through Deps.WalkBudgeted, which owns
+	// the per-root cache and the wdeps.MaxBloatScanEntries budget
+	// on the env itself.
 	// The per-pid /proc stat parse is shared too — zombie-storm and
 	// d-state-storm each swept every pid's stat file back-to-back;
 	// one memoized map serves both (and any later stat consumer).
@@ -441,7 +426,6 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		PidsOnce:        pidsOnce,
 		JournalOnce:     journalOnce,
 		StatsOnce:       statsOnce,
-		WalkOnce:        walkOnce,
 	}
 	subframe.Dispatch(ctx, sigOn, h.Cycles, h.groups)
 	// node_agent_* gauges — one textfile per cycle carrying the
