@@ -349,6 +349,14 @@ func (c *EphemeralPortsCheck) podCloseWait(inodes map[string]bool,
 // last-port-leak-evict cooldown.
 func (c *EphemeralPortsCheck) evictPortLeakers(ctx context.Context,
 	e *wdeps.CycleEnv, closeWait, ceiling int, reps, pids []int) {
+	// An inconclusive pod LIST must never reach the pruning tail: an
+	// empty active set there would erase every leak-window first-seen
+	// marker and restart ConfirmMarker's window on every API blip.
+	if e == nil || !e.APIOK {
+		c.d.State.AppendLog(
+			"suspect: ephemeral-port-pressure leak evict skipped - pod LIST inconclusive")
+		return
+	}
 	activeMarkers := map[string]bool{}
 	defer func() {
 		c.d.State.PruneMarkers("port-leak-", func(id string) bool {
@@ -356,11 +364,6 @@ func (c *EphemeralPortsCheck) evictPortLeakers(ctx context.Context,
 		})
 	}()
 	if !c.d.Cfg.Wave2.PortEvictRunawayPod || closeWait <= 0 {
-		return
-	}
-	if e == nil || !e.APIOK {
-		c.d.State.AppendLog(
-			"suspect: ephemeral-port-pressure leak evict skipped - pod LIST inconclusive")
 		return
 	}
 	inodes := c.closeWaitInodes(reps)

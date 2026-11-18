@@ -277,8 +277,9 @@ func TestDNSQuery(t *testing.T) {
 // frame carrying the query back — QR bit set when qr=true, echoed
 // unchanged otherwise. mode steers the broken-server cases:
 // "" is the healthy echo, "badlen" sends an out-of-range length
-// prefix, "short" truncates the frame mid-message, "wrongid"
-// rewrites the echoed id, "silent" never replies.
+// prefix, "shortheader" announces a sub-12-byte frame and stalls,
+// "short" truncates the frame mid-message, "wrongid" rewrites the
+// echoed id, "silent" never replies.
 func tcpDNSFake(t *testing.T, qr bool, mode string) (addr string) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -303,6 +304,16 @@ func tcpDNSFake(t *testing.T, qr bool, mode string) (addr string) {
 					// n=4097 — one past the probe's frame cap, so the
 					// length check rejects before any body read.
 					_, _ = c.Write([]byte{0x10, 0x01})
+					return
+				}
+				if mode == "shortheader" {
+					// n=4 — shorter than the 12-byte DNS header.
+					// Send only half the announced body and stall:
+					// the probe must reject from the length prefix
+					// instead of waiting for bytes that never come.
+					_, _ = c.Write([]byte{0x00, 0x04})
+					_, _ = c.Write([]byte{0x12, 0x34})
+					<-time.After(2 * time.Second)
 					return
 				}
 				n := int(hdr[0])<<8 | int(hdr[1])
@@ -336,6 +347,64 @@ func tcpDNSFake(t *testing.T, qr bool, mode string) (addr string) {
 	return ln.Addr().String()
 }
 
+// udpDNSCustom replies to each query with a caller-supplied transform
+// of the first four header bytes — enough to pin the id/QR contract
+// without a full resolver. mode "silent" reads and never answers.
+func udpDNSCustom(t *testing.T, mode string) (addr string) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("udp listen: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, src, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if mode == "silent" || n < 4 {
+				continue
+			}
+			resp := append([]byte(nil), buf[:4]...) // short reply
+			if mode == "short" {
+				resp[2] |= 0x80
+			}
+			_, _ = pc.WriteTo(resp, src)
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
+// A short datagram (id + flags only, < DNS header size) must not be
+// read as a live resolver: a truncated or stray packet has no full
+// header to verify. The old >=4 check accepted it.
+func TestDNSQueryShortReplyRejected(t *testing.T) {
+	if DNSQuery(context.Background(), udpDNSCustom(t, "short"),
+		"example.test", 2*time.Second) {
+		t.Fatal("DNSQuery accepted a <12-byte reply")
+	}
+	if validDNSReply([]byte{1, 2, 0x80, 0}, []byte{1, 2, 0, 0}) {
+		t.Fatal("validDNSReply accepted a 4-byte header")
+	}
+}
+
+// The caller's ctx deadline must bound the whole exchange, not just
+// the dial: a silent listener with timeout=5s and a 100ms ctx must
+// fail on the ctx budget. Both transports share dnsDeadline.
+func TestDNSQueryHonorsContextDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if DNSQuery(ctx, udpDNSCustom(t, "silent"), "example.test", 5*time.Second) {
+		t.Fatal("silent listener reported true")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("DNSQuery took %v — ctx deadline not applied to the conn", elapsed)
+	}
+}
+
 func TestDNSQueryTCP(t *testing.T) {
 	name := "kubernetes.default.svc.cluster.local"
 	if !DNSQueryTCP(context.Background(), tcpDNSFake(t, true, ""), name, 2*time.Second) {
@@ -366,6 +435,20 @@ func TestDNSQueryTCP(t *testing.T) {
 	// Nothing listening at all — the wedge verdict.
 	if DNSQueryTCP(context.Background(), "127.0.0.1:1", name, 300*time.Millisecond) {
 		t.Fatal("DNSQueryTCP: dead listener reported true")
+	}
+}
+
+// DNSQueryTCP must apply the same 12-byte header floor as the UDP
+// probe's validDNSReply. The old n<4 check let a short frame reach
+// ReadFull, which stalls until the deadline on a malformed peer.
+func TestDNSQueryTCPShortHeaderRejectedBeforeBodyRead(t *testing.T) {
+	start := time.Now()
+	if DNSQueryTCP(context.Background(), tcpDNSFake(t, true, "shortheader"),
+		"example.test", 3*time.Second) {
+		t.Fatal("DNSQueryTCP accepted a <12-byte header frame")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("short header waited %v for the body — length-prefix header check not applied", d)
 	}
 }
 

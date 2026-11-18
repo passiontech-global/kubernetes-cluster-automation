@@ -24,20 +24,39 @@ const (
 
 func (m *Maint) checkAndWidenSequence(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string)) {
-	if !m.d.Cfg.SeqWidenEnabled || m.d.Cfg.ReadOnly {
+	if m.d.Cfg.ReadOnly {
+		logger().Debug("kinedb: seq-widen skipped (read-only mode)",
+			"table", m.d.Cfg.Table)
+		return
+	}
+	if !m.d.Cfg.SeqWidenEnabled {
 		return
 	}
 	tblQ := kdeps.SQLQuote(m.d.Cfg.Table)
 	seqFallbackQ := kdeps.SQLQuote(m.d.Cfg.Table + "_id_seq")
+	// Resolve the sequence by OID (regclass cast) instead of parsing the
+	// string from pg_get_serial_sequence — a name with double quotes or a
+	// dot cannot survive that substring. pg_class.relname is the raw name.
+	seqByOID := "(SELECT c.relname FROM pg_class c WHERE c.oid = " +
+		"pg_get_serial_sequence(" + tblQ + ", 'id')::regclass)"
+	// kine.id frequently has no OWNED BY link (manual bigint migrations,
+	// restored dumps), so pg_get_serial_sequence() returns NULL. The SELECT
+	// list already falls back to <table>_id_seq; the pg_sequences WHERE MUST
+	// use the SAME expression or it matches zero rows and MAX(max_value)
+	// parses as a misleading 0 — silently disabling the widen guard.
+	seqNameExpr := "COALESCE(" + seqByOID + ", " + seqFallbackQ + ")"
 	sql := "SELECT COALESCE((SELECT a.atttypid::bigint FROM pg_attribute a " +
 		"JOIN pg_class c ON c.oid = a.attrelid " +
 		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
 		"WHERE n.nspname = current_schema() AND c.relname = " + tblQ +
 		" AND a.attname = 'id' AND NOT a.attisdropped), 0), " +
-		"COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + "); " +
-		"SELECT COALESCE((SELECT last_value FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), 0), " +
-		"COALESCE((SELECT max_value FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), 0), " +
-		"COALESCE((SELECT data_type::text FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), '')"
+		seqNameExpr + "; " +
+		// One catalog read for all three columns (the old three correlated
+		// subqueries read pg_sequences three times). MAX() keeps the row
+		// count at exactly one even when the sequence is absent.
+		"SELECT COALESCE(MAX(last_value),0), COALESCE(MAX(max_value),0), " +
+		"COALESCE(MAX(data_type::text),'') FROM pg_sequences " +
+		"WHERE schemaname = current_schema() AND sequencename = " + seqNameExpr + ";"
 
 	out, err := m.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameMaint, sql)
 	if err != nil {
@@ -57,7 +76,10 @@ func (m *Maint) checkAndWidenSequence(ctx context.Context, pg, user, pass string
 	if err != nil || attType == 0 {
 		return
 	}
-	seqName := strings.TrimSpace(colParts[1])
+	// pg_get_serial_sequence may hand back a quoted identifier; the raw
+	// relname from pg_class is plain, but normalise defensively before the
+	// final SQLIdent re-quote so a doubled quote cannot be double-escaped.
+	seqName := kdeps.UnquoteSQLIdent(strings.TrimSpace(colParts[1]))
 	lastVal, err := strconv.ParseInt(strings.TrimSpace(seqParts[0]), 10, 64)
 	if err != nil {
 		return
@@ -100,12 +122,21 @@ func (m *Maint) checkAndWidenSequence(ctx context.Context, pg, user, pass string
 	if dataType == "bigint" && maxVal > int4MaxVal {
 		return
 	}
-	if !kdeps.ReTableIdent.MatchString(seqName) {
+	// SQLIdent escapes embedded quotes, so quoted/spaced names are safe;
+	// only reject empty, over-long or control-char names.
+	if seqName == "" || len(seqName) > 63 ||
+		strings.ContainsAny(seqName, "\x00\n\r\t") {
 		note(fmt.Sprintf("seq-widen-skipped: unsafe sequence identifier %q", seqName))
 		return
 	}
 
-	stmt := fmt.Sprintf("ALTER SEQUENCE %s AS bigint MAXVALUE %d;\n",
+	// The ALTER takes an ACCESS EXCLUSIVE lock. Without bounded waits it
+	// queues behind (and then blocks) the kube-apiserver's nextval() — a
+	// frozen Kine/APIServer. The timeouts are set immediately before the
+	// DDL so a busy lock fails fast instead of freezing the control plane.
+	stmt := fmt.Sprintf(
+		"SET lock_timeout = '2s';\nSET statement_timeout = '5s';\n"+
+			"ALTER SEQUENCE %s AS bigint MAXVALUE %d;\n",
 		kdeps.SQLIdent(seqName), bigintMax)
 	script := kdeps.WrapAdvisoryLockScript(m.d.Cfg.AdvisoryLockID, "kw_locked", stmt)
 	sout, serr := m.d.PsqlScript(ctx, pg, user, pass, kdeps.AppNameMaint, script)

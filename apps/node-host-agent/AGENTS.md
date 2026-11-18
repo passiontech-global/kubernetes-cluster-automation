@@ -41,9 +41,15 @@ env-gated behind `NODE_HOST_AGENT_ENABLE_*` knobs.
   `KnownLatchName`/`SharedOwners` lookups, and `CondDefs` — the
   latch→NodeCondition surface registry (type name, OK/problem
   reason+message, alt latches) that nodereporter projects into its
-  rendered-condition order. Stdlib-only; both the platform leaf
-  (`hoststate` imports it for shared-owner validation) and every
-  producing subsystem import it.
+  rendered-condition order. The NodeCondition surface is 68 name
+  constants in `libs/hostkit/nodecond` (60 in the latch-backed
+  declaration block + 7 monitor/kubelet-owned + the nodes/status
+  `CondLocalRemediation`), of which 62 are latch-backed — 61
+  `CondDefs` rows plus the `WatchdogStale` probe entry in
+  `nodereporter`'s 62-entry `conditionOrder`;
+  `TestHeartbeatSweptCoversLatchBackedExactly` pins the same 62.
+  Stdlib-only; both the platform leaf (`hoststate` imports it for
+  shared-owner validation) and every producing subsystem import it.
 - `internal/platform/*` — leaf libraries: cycle (period loop +
   loop liveness registry), subframe (the shared ordered-check
   dispatcher — declared check/group order is load-bearing),
@@ -59,6 +65,8 @@ env-gated behind `NODE_HOST_AGENT_ENABLE_*` knobs.
   journalwatch (the shared journalctl Multiplexer +
   ClassifyRead), promfile (node-exporter textfile writer),
   kmsg (/dev/kmsg drain), pagecache (page-cache eviction),
+  kubeutil (UID-preconditioned delete/evict options — the
+  controller's `kube.UIDDeleteOptions` parity),
   sshclient (ctx-aware SSH dial/handshake), netlinkx (netlink
   sock-diag: TCP states, listener destroy, LinkDel), nodecoord
   (L1↔L3 node coordination: maintenance verdicts, coord
@@ -74,7 +82,8 @@ env-gated behind `NODE_HOST_AGENT_ENABLE_*` knobs.
   a shared deps bundle + exported test fixture: workerhygiene
   (`{cilium,ctr,guards,kubelet,pods,runtime}` + `wdeps` +
   `wdepstest`), controllerhygiene
-  (`{apiserver,etcd,kine,oom,pki,feeder}` + `cdeps` + `cdepstest`),
+  (`{apiserver,etcd,feeder,oom,pki,storelocal}` + `cdeps` + `cdepstest`
+   — `storelocal` owns the kine TTL/pool/storage checks),
   kinedb (`{probe,compact,maint}` + `kdeps` + `kdepstest`),
   nodereporter (`npd` — the NPD monitor ports behind a
   `Monitor`/`Deps`/`Sink` injection boundary; no deps bundle since
@@ -101,6 +110,11 @@ env-gated behind `NODE_HOST_AGENT_ENABLE_*` knobs.
   import ops.
 - `internal/testutil` — shared fakes/fixture builders for the
   internal test suites.
+- `internal/envdoc` — test-only AST scanner + `cmd/genenvdoc` that
+  regenerate `ENV.md` from `internal/envnames` and every call site
+  (`scripts/gen-envdoc.sh` is the wrapper); `internal/releaseglob`
+  is the test-only guard pinning the release workflow's `paths:`
+  globs to the hostkit/jinja trees `./cmd/...` actually imports.
 - `internal/subsystem/*/depstest` (`wdepstest`, `cdepstest`,
   `kdepstest`) — exported fixture builders (`Fixture` + the generic
   `Check[T]` accessor) so the domain subpackages' external

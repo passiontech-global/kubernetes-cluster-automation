@@ -357,15 +357,19 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	if wd != nil && h.Cfg.WatchdogSrc != nil {
 		h.Cfg.APIBackends = wd.APIBackendIPs()
 	}
-	// workerActive is the WD_REQUIRES k0sworker gate for ALL worker
+	// workerActive is the WD_REQUIRES k0sworker gate for the worker
 	// checks — a node where k0sworker is intentionally down/inactive
-	// skips every check exactly like the runner did. A nil Systemd
-	// client (tests, unwired agent) can't answer → treat as active
-	// so the checks still run on their other evidence. A client that
-	// answers with an ERROR (dbus down, systemctl missing) is
-	// different from nil — the gate is wired but unverifiable, so
-	// fail closed: gate the checks off this cycle rather than risk
-	// hygiene actions on a possibly intentionally-downed worker.
+	// skips those checks exactly like the runner did. SystemdSessionCheck
+	// is the deliberate exception: it gates only on the unit file's
+	// existence (checked at the top of Cycle) + its own WD_SIG switch
+	// (subframe dispatch), so it still probes PID 1 when the unit is
+	// inactive — the frozen-init signal must not disappear with the
+	// worker. A nil Systemd client (tests, unwired agent) can't answer
+	// → treat as active so the checks still run on their other
+	// evidence. A client that answers with an ERROR (dbus down,
+	// systemctl missing) is different from nil — the gate is wired
+	// but unverifiable, so fail closed: gate the checks off this cycle
+	// rather than risk hygiene actions on a possibly downed worker.
 	workerActive := true
 	systemdProbeErr := false
 	if h.Cfg.Systemd != nil {

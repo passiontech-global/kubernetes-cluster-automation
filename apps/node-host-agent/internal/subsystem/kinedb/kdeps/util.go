@@ -128,6 +128,19 @@ func SQLIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
+// UnquoteSQLIdent strips the double quotes that PostgreSQL's
+// pg_get_serial_sequence() emits around a non-plain sequence name and
+// collapses the doubled-quote escape. The result is the raw identifier;
+// callers re-quote it with SQLIdent before it lands in DDL. A plain name
+// is returned unchanged.
+func UnquoteSQLIdent(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+		s = strings.ReplaceAll(s, `""`, `"`)
+	}
+	return s
+}
+
 // IntOrNA renders an int64 gauge value or "NA" when its read did
 // not land this cycle — the cycle-summary formatter.
 func IntOrNA(ok bool, v int64) string {

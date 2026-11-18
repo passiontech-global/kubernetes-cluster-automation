@@ -36,9 +36,29 @@ func buildDNSAQuery(name string, id uint16) []byte {
 	return append(q, 0, 0, 1, 0, 1) // root label + QTYPE A + QCLASS IN
 }
 
-// validDNSReply reports whether buf echoes q's id with the QR bit set.
+// dnsHeaderLen is the fixed RFC 1035 header size (ID, flags and the
+// four count fields). A datagram shorter than this has no usable
+// id/flags to verify — accepting a 4-byte short read as a live
+// resolver turned truncated/stray packets into false positives.
+const dnsHeaderLen = 12
+
+// validDNSReply reports whether buf is a full DNS header echoing q's
+// id with the QR bit set.
 func validDNSReply(buf, q []byte) bool {
-	return len(buf) >= 4 && buf[0] == q[0] && buf[1] == q[1] && buf[2]&0x80 != 0
+	return len(buf) >= dnsHeaderLen &&
+		buf[0] == q[0] && buf[1] == q[1] && buf[2]&0x80 != 0
+}
+
+// dnsDeadline is the earlier of ctx's deadline and now+timeout. The
+// conn deadline must never outlive the caller: with timeout=5s and
+// a ctx cancelled at 100ms, a wedged resolver used to hold the
+// read until 5s even though the caller had long given up.
+func dnsDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	return deadline
 }
 
 // DNSQuery sends one minimal A-record query for name to addr over
@@ -46,19 +66,21 @@ func validDNSReply(buf, q []byte) bool {
 // deadline — the node-local-dns :53 datapath probe. Any reply
 // matching the query id with the QR bit set proves the listener is
 // alive: NXDOMAIN/SERVFAIL still mean the server answers; silence
-// means the datapath is wedged. ctx bounds the dial; timeout still
-// bounds the whole exchange via the conn deadline.
+// means the datapath is wedged. The conn deadline is the earlier of
+// ctx's deadline and now+timeout, so a caller's cancellation bounds
+// the whole exchange, not just the dial.
 //
 // Mirrors workerhygiene.probeDNSUDP (cilium.go).
 func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) bool {
 	q := buildDNSAQuery(name, nextDNSQueryID())
-	d := net.Dialer{Timeout: timeout}
+	deadline := dnsDeadline(ctx, timeout)
+	d := net.Dialer{Deadline: deadline}
 	conn, err := d.DialContext(ctx, "udp", addr)
 	if err != nil {
 		return false
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	_ = conn.SetDeadline(deadline)
 	if _, err := conn.Write(q); err != nil {
 		return false
 	}
@@ -76,21 +98,22 @@ func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) boo
 // fallback every large SRV/A response depends on — so a node whose
 // UDP probe passes can still blackhole headless-StatefulSet lookups.
 // The reply check reads the length-prefixed frame and applies the
-// same id/QR-bit contract. ctx bounds the dial; timeout still
-// bounds the whole exchange via the conn deadline.
+// same id/QR-bit contract. As in DNSQuery, the conn deadline is the
+// earlier of ctx's deadline and now+timeout.
 func DNSQueryTCP(ctx context.Context, addr, name string, timeout time.Duration) bool {
 	q := buildDNSAQuery(name, nextDNSQueryID())
+	deadline := dnsDeadline(ctx, timeout)
 	// TCP framing: 2-byte big-endian length prefix on both directions.
 	frame := make([]byte, 2+len(q))
 	frame[0], frame[1] = byte(len(q)>>8), byte(len(q))
 	copy(frame[2:], q)
-	d := net.Dialer{Timeout: timeout}
+	d := net.Dialer{Deadline: deadline}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return false
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	_ = conn.SetDeadline(deadline)
 	if _, err := conn.Write(frame); err != nil {
 		return false
 	}
@@ -101,7 +124,12 @@ func DNSQueryTCP(ctx context.Context, addr, name string, timeout time.Duration) 
 		return false
 	}
 	n := int(hdr[0])<<8 | int(hdr[1])
-	if n < 4 || n > 4096 {
+	// A DNS message needs the full 12-byte RFC 1035 header before
+	// its id/QR bits mean anything. The old n<4 floor let a 4-8 byte
+	// frame through to ReadFull (waiting on a body that may never
+	// arrive); match the UDP path's validDNSReply requirement and
+	// reject short frames straight from the length prefix.
+	if n < dnsHeaderLen || n > 4096 {
 		return false
 	}
 	buf := make([]byte, n)

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -152,6 +153,89 @@ func TestCSIGuardMissingRegistrationLatchRecovers(t *testing.T) {
 	}
 }
 
+// TestCSIGuardTerminatingPodWedgeLatches pins the stuck-Terminating
+// deadlock: with healing on, a plugin pod that never finishes deleting
+// is skipped by the bounce, so bouncedThisWindow stays false. The
+// wedge latch must still arm once the desync outlives the wait window
+// plus the grace (clock seam advanced), rather than waiting forever.
+func TestCSIGuardTerminatingPodWedgeLatches(t *testing.T) {
+	cn := csiNode("node-a", "csi.stuck.com", "csi.healthy.com")
+	stuck := csiPluginPod("csi-stuck-node-a", "kube-system", "uid-stuck")
+	now := metav1.Now()
+	stuck.DeletionTimestamp = &now // stuck Terminating — bounce always skips it
+	stuck.Spec.Volumes = []corev1.Volume{{
+		Name: "plugin-dir",
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/k0s/kubelet/plugins/csi.stuck.com"},
+		},
+	}}
+	e := fixture(t, cn)
+	e.H.Cfg.Wave2.CSIGuardMode = envx.ModeOn
+	e.H.Cfg.Wave2.CSIHealEnabled = true
+	e.H.Cfg.Wave2.CSIGuardMissingMin = 0 // wait window already open
+	mkRegSocket(t, e, "csi.healthy.com") // passes the local pre-filter, no orphan
+	chk := wdepstest.Check[*runtime.CSIGuardCheck](e.H, wdeps.CheckCSIGuard)
+	ctx := context.Background()
+
+	// Cycle 1: the pod is Terminating so no bounce lands. Before the
+	// grace elapses there is no latch and no streak advance.
+	chk.Run(ctx, cycleWithPods(*stuck))
+	if latched(e, latchdefs.LatchCSIRegistrationWedged) {
+		t.Fatal("CSIRegistrationWedged armed before the grace window")
+	}
+
+	// Advance the clock past the grace. Two past-grace cycles confirm
+	// the streak (ConsecNeeded=2) and arm the wedge.
+	e.Now = e.Now.Add(16 * time.Minute)
+	chk.Run(ctx, cycleWithPods(*stuck))
+	chk.Run(ctx, cycleWithPods(*stuck))
+	if !latched(e, latchdefs.LatchCSIRegistrationWedged) {
+		t.Fatal("stuck-Terminating CSI pod never latched CSIRegistrationWedged")
+	}
+}
+
+// TestCSIGuardTerminatingPodDoesNotSpendBounceBudget: a desync whose
+// only matching plugin pod is already Terminating has nothing to
+// bounce. The cooldown must stay unspent and no remediation may be
+// stamped; a live pod in the same desync still gets the real bounce.
+func TestCSIGuardTerminatingPodDoesNotSpendBounceBudget(t *testing.T) {
+	cn := csiNode("node-a", "csi.stuck.com")
+	stuck := csiPluginPod("csi-stuck-node-a", "kube-system", "uid-stuck")
+	now := metav1.Now()
+	stuck.DeletionTimestamp = &now
+	stuck.Spec.Volumes = []corev1.Volume{{
+		Name: "plugin-dir",
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/k0s/kubelet/plugins/csi.stuck.com"},
+		},
+	}}
+	live := csiPluginPod("csi-live-node-a", "kube-system", "uid-live")
+	live.Spec.Volumes = stuck.Spec.Volumes
+	e := fixture(t, cn, stuck, live)
+	if err := os.MkdirAll(pluginsRegistryDir(e), 0o755); err != nil {
+		t.Fatal(err) // readable registry dir — no sockets, no orphans
+	}
+	e.H.Cfg.Wave2.CSIGuardMode = envx.ModeOn
+	e.H.Cfg.Wave2.CSIHealEnabled = true
+	e.H.Cfg.Wave2.CSIGuardMissingMin = 0 // wait window already open
+	e.H.Cfg.Wave2.CSIGuardBounceCooldownMin = 30
+	budget := filepath.Join(e.StateDir, "last-csi-reg-bounce")
+	chk := wdepstest.Check[*runtime.CSIGuardCheck](e.H, wdeps.CheckCSIGuard)
+	ctx := context.Background()
+
+	chk.Run(ctx, cycleWithPods(*stuck))
+	if _, err := os.Stat(budget); !os.IsNotExist(err) {
+		t.Fatalf("all-Terminating CSI bounce spent the cooldown (stat err=%v)", err)
+	}
+
+	// Positive control: the same desync with a live target DOES bounce
+	// and spend the budget.
+	chk.Run(ctx, cycleWithPods(*live))
+	if _, err := os.Stat(budget); err != nil {
+		t.Fatalf("live CSI bounce did not spend the cooldown: %v", err)
+	}
+}
+
 // csiPluginPod builds a DaemonSet-owned CSI node-plugin pod — the
 // shape csiPluginPods must select (and *-csi-controller
 // Deployments must not).
@@ -288,6 +372,40 @@ func TestGPUGuardLiveGPUZeroAllocatable(t *testing.T) {
 	}
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("unexpected pod get error: %v", err)
+	}
+}
+
+// TestGPUGuardTerminatingPluginDoesNotSpendBounceBudget: same no-op
+// rule for the GPU half — a Terminating device-plugin pod must not
+// burn last-gpu-plugin-bounce or stamp LocalRemediation. A live pod
+// in the desync still takes the real bounce.
+func TestGPUGuardTerminatingPluginDoesNotSpendBounceBudget(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	plugin := gpuPluginPod("nvidia-device-plugin-x", "gpu-operator", "uid-gpu")
+	now := metav1.Now()
+	plugin.DeletionTimestamp = &now
+	live := gpuPluginPod("nvidia-device-plugin-live", "gpu-operator", "uid-gpu-live")
+	e := gpuEnv(t, node, plugin, live)
+	root := filepath.Dir(e.KubepodsDir)
+	mkSysfsGPU(t, filepath.Join(root, "sys"), "0000:01:00.0")
+	e.H.Cfg.Wave2.GPUGuardMode = envx.ModeOn
+	e.H.Cfg.Wave2.GPUHealEnabled = true
+	e.H.Cfg.Wave2.GPUGuardDesyncMin = 0
+	e.H.Cfg.Wave2.GPUGuardBounceCooldownMin = 30
+	budget := filepath.Join(e.StateDir, "last-gpu-plugin-bounce")
+	chk := wdepstest.Check[*runtime.GPUGuardCheck](e.H, wdeps.CheckGPUGuard)
+	ctx := context.Background()
+
+	chk.Run(ctx, cycleWithPods(*plugin))
+	if _, err := os.Stat(budget); !os.IsNotExist(err) {
+		t.Fatalf("all-Terminating GPU bounce spent the cooldown (stat err=%v)", err)
+	}
+
+	// Positive control: a live plugin pod still gets bounced and
+	// spends the budget.
+	chk.Run(ctx, cycleWithPods(*live))
+	if _, err := os.Stat(budget); err != nil {
+		t.Fatalf("live GPU bounce did not spend the cooldown: %v", err)
 	}
 }
 

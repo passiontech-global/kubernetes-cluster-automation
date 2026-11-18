@@ -124,13 +124,17 @@ func dnsTCPServer(t *testing.T, replyQR bool, replyLen int, delay time.Duration)
 		if replyLen < 0 {
 			return // silence — the wedged-listener shape
 		}
-		body := make([]byte, 4)
+		// A full RFC 1035 header is 12 bytes: the probe now rejects
+		// anything shorter as a short/truncated read, so the
+		// well-formed fixture must carry the whole header.
+		body := make([]byte, 12)
 		body[0], body[1] = q[0], q[1] // ID echo
 		if replyQR {
 			body[2] |= 0x80
 		}
 		// The advertised length is whatever the case wants — a
-		// truncated reply (3) exercises the client's rlen<4 guard.
+		// truncated reply (3) exercises the client's minimum-
+		// header guard.
 		plen := replyLen
 		if plen > len(body) {
 			plen = len(body)
@@ -148,13 +152,13 @@ func dnsTCPServer(t *testing.T, replyQR bool, replyLen int, delay time.Duration)
 // replies and silence all read wedged.
 func TestTcpDNSQuery(t *testing.T) {
 	name := "kubernetes.default.svc.cluster.local."
-	addr := dnsTCPServer(t, true, 4, 0)
+	addr := dnsTCPServer(t, true, 12, 0)
 	if !probee.DNSQueryTCP(context.Background(), addr, name, 2*time.Second) {
 		t.Fatal("well-formed reply read as wedged")
 	}
 
 	// QR bit clear — a request echo is not an answer.
-	if probee.DNSQueryTCP(context.Background(), dnsTCPServer(t, false, 4, 0), name, 2*time.Second) {
+	if probee.DNSQueryTCP(context.Background(), dnsTCPServer(t, false, 12, 0), name, 2*time.Second) {
 		t.Fatal("QR-clear reply counted as alive")
 	}
 	// Short reply (rlen < 4) — unreadable, not alive.

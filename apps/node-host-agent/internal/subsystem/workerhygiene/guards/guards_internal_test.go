@@ -122,11 +122,11 @@ func TestOwnedByStatefulSet(t *testing.T) {
 	if !wdeps.OwnedByStatefulSet(p) {
 		t.Fatal("StatefulSet owner must be true")
 	}
-	// Database-operator owner kinds count too — CNPG Cluster,
-	// Dragonfly, Scylla, Percona PGv2/PSMDB/PXC pods are never the
-	// preferred eviction tier.
+	// DaemonSets (node-local agents) and database-operator owner kinds
+	// count too — CNPG Cluster, Dragonfly, Scylla, Percona
+	// PGv2/PSMDB/PXC pods are never the preferred eviction tier.
 	for _, kind := range []string{
-		"Cluster", "Dragonfly", "ScyllaCluster", "ScyllaDBDatacenter",
+		"DaemonSet", "Cluster", "Dragonfly", "ScyllaCluster", "ScyllaDBDatacenter",
 		"PerconaServerMongoDB", "PerconaXtraDBCluster", "PerconaPGCluster",
 	} {
 		q := &corev1.Pod{OwnerReferences: []metav1.OwnerReference{{Kind: kind}}}

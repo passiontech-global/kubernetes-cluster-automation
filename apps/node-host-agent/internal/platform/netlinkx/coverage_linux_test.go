@@ -69,6 +69,24 @@ func TestListenAddrsAndDestroyListenersNoMatch(t *testing.T) {
 	}
 }
 
+func TestUDPBoundPorts(t *testing.T) {
+	pid := os.Getpid()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	port := uint16(conn.LocalAddr().(*net.UDPAddr).Port)
+
+	bound, err := UDPBoundPorts(pid)
+	if err != nil {
+		t.Fatalf("UDPBoundPorts(%d): %v", pid, err)
+	}
+	if !bound[port] {
+		t.Fatalf("UDPBoundPorts missing the bound UDP port %d (got %d ports)", port, len(bound))
+	}
+}
+
 func TestV6StringAndNoInet6Family(t *testing.T) {
 	v4mapped := net.ParseIP("::ffff:127.0.0.53").To16()
 	if got := v6String(v4mapped); got != "::ffff:127.0.0.53" {

@@ -52,11 +52,17 @@ const (
 	// event — the table bloats slowly, one event per hour is ample.
 	mountinfoBloatEventBudget = time.Hour
 
-	mountTableClearRatio     = 0.65
-	mountSharedStormClearMax = 2048
-	mountMaxDefaultCeiling   = int64(100000)
-	mountMaxRaiseCooldown    = 30 * time.Minute
-	mountMaxRaiseBudgetFile  = "last-mount-max-raise"
+	// The clear thresholds are DERIVED from the configured enter thresholds
+	// (enterRatio*0.80, sharedMax*3/4) — a fixed 0.65/2048 pair would never
+	// be reachable when an operator lowers the enter knobs, wedging the
+	// MountTablePressure latch permanently.
+	mountTableClearFactor     = 0.80
+	mountSharedClearDivisor   = 4
+	mountSharedClearNumerator = 3
+	mountMaxDefaultCeiling    = int64(100000)
+	mountMaxRaiseCooldown     = 30 * time.Minute
+	mountMaxRaiseBudgetFile   = "last-mount-max-raise"
+	mountPressureLogCadence   = time.Hour
 )
 
 // MountinfoCheck is the mountinfo table hygiene check.
@@ -224,15 +230,22 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if n := countLines(data); n > mountinfoBloatLines {
 		c.emitBloatEvent(ctx, n)
 	}
-	c.checkMountPressure(data)
+	c.checkMountPressure(ctx, data)
 	c.reapOrphanLoops(ctx, e, data, hostPodsDir, podLive, tasksOnce)
 	c.d.CycleResult(wdeps.CheckMountinfo, "ok")
 }
 
-func (c *MountinfoCheck) checkMountPressure(data []byte) {
+func (c *MountinfoCheck) checkMountPressure(ctx context.Context, data []byte) {
 	totalMounts := countLines(data)
 	maxShared, maxGroup, maxMount := maxSharedPeerGroup(data)
 	c.d.Series.MountMaxSharedPeers = int64(maxShared)
+
+	enterRatio := c.d.Cfg.Wave3.MountTableEnterRatio
+	sharedMax := c.d.Cfg.Wave3.MountSharedStormMax
+	// Clear thresholds move WITH the enter knobs so the latch can always
+	// recover (no fixed 0.65/2048 that an operator cannot reach).
+	clearRatio := enterRatio * mountTableClearFactor
+	sharedClearMax := sharedMax * mountSharedClearNumerator / mountSharedClearDivisor
 
 	mountMaxPath := filepath.Join(c.d.Cfg.ProcRoot, "sys", "fs", "mount-max")
 	mountMax := mountMaxDefaultCeiling
@@ -245,9 +258,19 @@ func (c *MountinfoCheck) checkMountPressure(data []byte) {
 	}
 
 	ratio := float64(totalMounts) / float64(mountMax)
-	enterRatio := c.d.Cfg.Wave3.MountTableEnterRatio
 	ceiling := c.d.Cfg.Wave3.MountMaxCeiling
-	if mountMaxReadable && ratio >= enterRatio && mountMax < ceiling &&
+	// The raise is the ONLY destructive action in this function. Ask
+	// the maintenance gate only when it is actually candidates —
+	// calling HoldLocalAction on a healthy sweep hits Nodes().Get
+	// every 60s from every node for no reason.
+	eligible := mountMaxReadable && ratio >= enterRatio && mountMax < ceiling
+	held := false
+	if eligible {
+		// Maintenance gate: a local action hold must not be
+		// overridden by a background kernel-tuning write.
+		held = c.d.HoldLocalAction(ctx)
+	}
+	if eligible && !held &&
 		c.d.State.RateTrySpend(mountMaxRaiseBudgetFile, mountMaxRaiseCooldown) {
 		newMax := mountMax * 2
 		if newMax > ceiling {
@@ -265,23 +288,32 @@ func (c *MountinfoCheck) checkMountPressure(data []byte) {
 			mountMax = newMax
 			ratio = float64(totalMounts) / float64(mountMax)
 		}
+	} else if eligible && held {
+		c.d.State.SuspectLog("mount-max-raise-held", fmt.Sprintf(
+			"suspect: mountinfo-hygiene fs.mount-max raise held by maintenance (entries=%d ratio=%.2f)",
+			totalMounts, ratio), mountPressureLogCadence)
 	}
 	c.d.Series.MountTableUtilRatio = ratio
 
-	sharedMax := c.d.Cfg.Wave3.MountSharedStormMax
 	tripped := ratio >= enterRatio || maxShared >= sharedMax
-	clear := ratio <= mountTableClearRatio && maxShared < mountSharedStormClearMax
+	cleared := ratio <= clearRatio && maxShared < sharedClearMax
 	switch {
 	case tripped:
-		c.fails++
-		if c.fails >= c.d.Cfg.ConsecNeeded {
-			c.d.State.Enter(latchdefs.LatchMountTablePressure, fmt.Sprintf(
-				"entries=%d/%d (%.2f) max_shared=%d (group=%s mount=%s)",
-				totalMounts, mountMax, ratio, maxShared, maxGroup, maxMount))
+		if c.d.StreakPending(&c.fails, fmt.Sprintf(
+			"suspect: mountinfo-hygiene mount pressure entries=%d/%d (%.2f) max_shared=%d",
+			totalMounts, mountMax, ratio, maxShared)) {
+			return
 		}
-	case clear:
+		c.d.State.Enter(latchdefs.LatchMountTablePressure, fmt.Sprintf(
+			"entries=%d/%d (%.2f) max_shared=%d (group=%s mount=%s)",
+			totalMounts, mountMax, ratio, maxShared, maxGroup, maxMount))
+	case cleared:
 		c.fails = 0
 		c.d.State.Exit(latchdefs.LatchMountTablePressure, nil)
+	default:
+		// Inside the hysteresis band: no verdict change, but drop any
+		// stale streak so a re-trip needs a fresh confirmation window.
+		c.fails = 0
 	}
 }
 

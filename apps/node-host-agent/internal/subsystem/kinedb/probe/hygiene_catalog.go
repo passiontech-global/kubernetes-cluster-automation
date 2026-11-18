@@ -46,19 +46,34 @@ import (
 func (p *Probe) hygieneCatalog(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
 	tblQ := kdeps.SQLQuote(p.d.Cfg.Table)
+	// Resolve the sequence by OID rather than string-parsing
+	// pg_get_serial_sequence — quoted/dotted names survive the regclass
+	// cast. pg_class.relname is the raw pg_sequences.sequencename.
+	seqByOID := "(SELECT c.relname FROM pg_class c WHERE c.oid = " +
+		"pg_get_serial_sequence(" + tblQ + ", 'id')::regclass)"
+	// kine.id may have no OWNED BY link, so pg_get_serial_sequence() returns
+	// NULL. The pg_sequences WHERE must fall back to <table>_id_seq just like
+	// the reported sequence name; otherwise the clause matches zero rows,
+	// MAX(max_value) is 0 and parseSeqCliffLines drops the whole reading.
 	seqFallbackQ := kdeps.SQLQuote(p.d.Cfg.Table + "_id_seq")
+	seqNameExpr := "COALESCE(" + seqByOID + ", " + seqFallbackQ + ")"
 	sql := "SELECT COALESCE(MAX(age(datminmxid)),0) FROM pg_database; " +
 		"SELECT COUNT(indexrelid) FROM pg_index WHERE NOT indisvalid; " +
-		"SELECT COALESCE(seq_scan,0), COALESCE(seq_tup_read,0) " +
+		// MAX() folds the empty stats view into one 0|0 row. A plain
+		// SELECT returned ZERO rows under psql -tAc, shifting line(3)
+		// (atttypid) and line(4) (seq cliff) up by one and misparsing both.
+		"SELECT COALESCE(MAX(seq_scan),0), COALESCE(MAX(seq_tup_read),0) " +
 		"FROM pg_stat_user_tables WHERE relname=" + tblQ + "; " +
 		"SELECT COALESCE((SELECT a.atttypid::bigint FROM pg_attribute a " +
 		"JOIN pg_class c ON c.oid = a.attrelid " +
 		"JOIN pg_namespace n ON n.oid = c.relnamespace " +
 		"WHERE n.nspname = current_schema() AND c.relname = " + tblQ +
 		" AND a.attname = 'id' AND NOT a.attisdropped), 0); " +
-		"SELECT COALESCE((SELECT last_value FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), 0), " +
-		"COALESCE((SELECT max_value FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), 0), " +
-		"COALESCE((SELECT data_type::text FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = COALESCE(substring(pg_get_serial_sequence(" + tblQ + ", 'id') from '[^.]+$'), " + seqFallbackQ + ")), '')"
+		// One pg_sequences read for all three columns (was three
+		// correlated subqueries). MAX keeps the single-row shape.
+		"SELECT COALESCE(MAX(last_value),0), COALESCE(MAX(max_value),0), " +
+		"COALESCE(MAX(data_type::text),'') FROM pg_sequences " +
+		"WHERE schemaname = current_schema() AND sequencename = " + seqNameExpr + ";"
 	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, sql)
 	if err != nil {
 		note(fmt.Sprintf("mxid-age-fail: %v", err))

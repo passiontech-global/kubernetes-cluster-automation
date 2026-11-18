@@ -1,6 +1,7 @@
 package cdeps
 
 import (
+	"math"
 	"os"
 	"strconv"
 
@@ -151,8 +152,11 @@ func ConfigFromEnv(d EnvDeps) Config {
 		{Name: envnames.EnvEtcdFsyncP99MaxSeconds, Resolve: func(name string) {
 			cfg.EtcdGuard.FsyncP99MaxSeconds = defaultEtcdFsyncP99MaxSec
 			if v := envx.String(name, ""); v != "" {
-				if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+				if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 &&
+					!math.IsNaN(f) && !math.IsInf(f, 0) && f <= 1.0 {
 					cfg.EtcdGuard.FsyncP99MaxSeconds = f
+				} else {
+					envx.Warnf("invalid %s (want 0 < f <= 1): %q — using default", name, v)
 				}
 			}
 		}},

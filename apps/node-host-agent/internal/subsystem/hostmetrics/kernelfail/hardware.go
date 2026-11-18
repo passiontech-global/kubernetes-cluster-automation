@@ -277,7 +277,12 @@ func (r *Runner) edacCounters() []edacMC {
 	for _, dir := range globOr(r.deps.EDACGlob) {
 		u, okU := fsx.ReadUintFile(filepath.Join(dir, "ue_count"))
 		c, okC := fsx.ReadUintFile(filepath.Join(dir, "ce_count"))
-		if !okU && !okC {
+		// A controller that serves only ONE of its two counters is
+		// mid-reset, not healthy: including it would fabricate a
+		// zero for the missing counter (a ue_count=0 series that
+		// falsely reassures the scrape and hides the UE signal).
+		// Skip unless BOTH parsed — the fail-safe direction.
+		if !okU || !okC {
 			continue
 		}
 		out = append(out, edacMC{name: filepath.Base(dir), ue: u, ce: c})

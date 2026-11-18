@@ -124,6 +124,31 @@ func TestHardwareNoEDACFailSafe(t *testing.T) {
 	}
 }
 
+// TestHardwarePartialEDACCounterSkipped is the partial-read regression:
+// a controller that serves only ONE of its two counters is mid-
+// reset, not healthy. It must contribute NOTHING — including no
+// fabricated ue=0/ce=0 gauge that would reassure the scrape and
+// hide a genuine uncorrectable-error signal.
+func TestHardwarePartialEDACCounterSkipped(t *testing.T) {
+	f := kfixture(t)
+	seedHardwareFixture(t, f)
+	base := filepath.Join(f.deps.HostRoot, "sys", "devices", "system", "edac", "mc")
+	// ue_count readable (nonzero!) but ce_count missing.
+	writePrefailFile(t, filepath.Join(base, "mc-no-ce", "ue_count"), "9\n")
+	// ce_count readable but ue_count missing.
+	writePrefailFile(t, filepath.Join(base, "mc-no-ue", "ce_count"), "77\n")
+	f.r.updateHardwareHealth()
+	if hwLatchSet(f.r, latchdefs.LatchHardwareCorrupted) {
+		t.Fatal("partially-readable EDAC controller armed the hardware latch")
+	}
+	prom := readHardwareProm(t, f.r)
+	for _, mc := range []string{"mc-no-ce", "mc-no-ue"} {
+		if strings.Contains(prom, mc) {
+			t.Fatalf("partial-read controller %s emitted a fabricated gauge:\n%s", mc, prom)
+		}
+	}
+}
+
 func TestHardwareKmsgCorrectedMCEDoesNotLatch(t *testing.T) {
 	f := kfixture(t)
 	seedHardwareFixture(t, f)

@@ -85,6 +85,16 @@ var (
 		"create": true, "start": true, "delete": true, "kill": true,
 		"state": true, "pause": true, "resume": true, "init": true,
 	}
+	// runcValueFlags are the global runc flags whose value is the NEXT
+	// argv token. containerd-shim-runc-v2 always spawns
+	// `runc --root <dir> --log <file> --log-format json create <id>`;
+	// without consuming the value, "<dir>" is read as the subcommand
+	// and EVERY real lifecycle command looks foreign (the bug).
+	// `--flag=value` carries the value inline and must NOT skip it.
+	runcValueFlags = map[string]bool{
+		"--root": true, "--log": true, "--log-format": true,
+		"--criu": true, "-r": true, "-l": true,
+	}
 )
 
 // hungCandidate is one qualifying pid with its recorded wchan and
@@ -108,10 +118,19 @@ func runcCmdlineQualifies(d *wdeps.Deps, pid int, comm string) bool {
 		return true
 	}
 	parts := bytes.Split(raw, []byte{0})
-	// Find first non-empty arg after argv[0] that isn't a flag.
+	// Find the first non-empty arg after argv[0] that isn't a flag,
+	// stepping over the space-separated VALUE of a global flag. The
+	// exec/run exclusion and the "bracket comm" shortcut below stay
+	// untouched — only the subcommand lookup changes.
 	for i := 1; i < len(parts); i++ {
 		arg := strings.TrimSpace(string(parts[i]))
-		if arg == "" || strings.HasPrefix(arg, "-") {
+		if arg == "" {
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			if !strings.Contains(arg, "=") && runcValueFlags[arg] && i+1 < len(parts) {
+				i++ // consume the flag's separate value
+			}
 			continue
 		}
 		if runcAllowedSubcmds[arg] {

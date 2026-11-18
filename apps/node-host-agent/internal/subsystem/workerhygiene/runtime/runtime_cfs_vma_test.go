@@ -65,6 +65,46 @@ func TestCPUCFSThrottleRequiresHostIdleAnd3Cycles(t *testing.T) {
 	}
 }
 
+// Burstable pods carry the CFS quota on container *.scope cgroups — the
+// pod slice's own cpu.stat shows no throttling, so scanning only it misses.
+func TestCPUCFSThrottleScansChildScopes(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "scope-pod", UID: "uid-cfs-scope"},
+	}
+	e := fixture(t, pod)
+	sliceDir := filepath.Join(e.H.Cfg.Runtime.CgroupRoot,
+		"kubepods.slice", "kubepods-burstable.slice",
+		"kubepods-burstable-poduid_cfs_scope.slice")
+	scopeDir := filepath.Join(sliceDir, "cri-containerd-abc.scope")
+	if err := os.MkdirAll(scopeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Pod-level cpu.stat is quiet; the container scope is throttled.
+	wdepstest.WriteFile(t, filepath.Join(sliceDir, "cpu.stat"),
+		"nr_periods 100\nnr_throttled 0\n")
+	wdepstest.WriteFile(t, filepath.Join(scopeDir, "cpu.stat"),
+		"nr_periods 100\nnr_throttled 0\n")
+	statPath := filepath.Join(e.ProcDir, "stat")
+	wdepstest.WriteFile(t, statPath, "cpu  0 0 0 0 0 0 0 0\n")
+
+	chk := e.H.Check(wdeps.CheckCgroupThrottle)
+	ce := &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}}
+	chk.Run(context.Background(), ce) // baseline
+	for i := 1; i <= 3; i++ {
+		wdepstest.WriteFile(t, statPath,
+			fmt.Sprintf("cpu  %d 0 0 %d 0 0 0 0\n", i*30, i*70))
+		wdepstest.WriteFile(t, filepath.Join(scopeDir, "cpu.stat"),
+			fmt.Sprintf("nr_periods %d\nnr_throttled %d\n", 100+i*100, i*80))
+		chk.Run(context.Background(), ce)
+	}
+	if e.H.Series.PodCgroupCPUThrottled != 1 {
+		t.Fatalf("PodCgroupCPUThrottled=%d, want 1 from child scope", e.H.Series.PodCgroupCPUThrottled)
+	}
+	if !strings.Contains(e.LogLines(t), "cpu.stat") {
+		t.Fatalf("missing CPU CFS suspect log:\n%s", e.LogLines(t))
+	}
+}
+
 func TestVMAPressureRaisesMaxMapCountAndEmitsEvent(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "vma-pod", UID: "11111111-2222-3333-4444-555555555555"},

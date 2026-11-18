@@ -884,3 +884,35 @@ func TestRunTmpfsSweepSkipsForeignMount(t *testing.T) {
 		t.Fatal("same-fs orphan .tmp not removed")
 	}
 }
+
+// The first /proc/stat read records a baseline only — publishing the
+// since-boot cumulative idle ratio would mis-gate every heal. Only the
+// first 8 jiffy columns count (guest/guest_nice are already in user/nice).
+func TestHostCPUIdleRatioBaselineAndFirstEightColumns(t *testing.T) {
+	d, f := rtDeps(t)
+	statPath := filepath.Join(f.ProcDir, "stat")
+	// 1000 jiffies total (idle 900 = 90% since boot), plus three extra
+	// guest columns that must NOT inflate the total.
+	wdepstest.WriteFile(t, statPath,
+		"cpu  100 0 0 900 0 0 0 0 5000 6000 7000\n")
+	c := &CgroupThrottleCheck{d: d}
+	if ratio, ok := c.readHostCPUIdleRatio(); ok || ratio != 0 {
+		t.Fatalf("first read ratio=%v ok=%v, want baseline-only (0,false)", ratio, ok)
+	}
+	// New delta 100 total / 50 idle -> 50% (extra columns unchanged).
+	wdepstest.WriteFile(t, statPath,
+		"cpu  150 0 0 950 0 0 0 0 5000 6000 7000\n")
+	if ratio, ok := c.readHostCPUIdleRatio(); !ok || ratio < 0.49 || ratio > 0.51 {
+		t.Fatalf("delta ratio=%v ok=%v, want ~0.5 from first 8 columns", ratio, ok)
+	}
+}
+
+// Count maps lines including an unterminated final line (bytes.Count path).
+func TestCountProcMapsLines(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "maps")
+	wdepstest.WriteFile(t, p, "a\nb\nc") // no trailing newline
+	got, err := countProcMapsLines(p)
+	if err != nil || got != 3 {
+		t.Fatalf("countProcMapsLines=%d,%v want 3,nil", got, err)
+	}
+}

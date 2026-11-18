@@ -191,8 +191,11 @@ type Deps struct {
 	GPUExpectedCount int
 
 	// Wave-3 #10: eBPF resource leak latch. EBPFSnapshot reuses the
-	// collector's cached fd-link sweep at zero extra I/O cost.
-	EBPFSnapshot func() (progs, maps int, scanned bool)
+	// collector's cached fd-link sweep at zero extra I/O cost. scanAt is
+	// the cache stamp: the latch streak advances only when a genuinely
+	// new sweep produced the numbers, not when a faster ticker re-reads
+	// the same 60s snapshot (Wave-5 P0).
+	EBPFSnapshot func() (progs, maps int, scanned bool, scanAt time.Time)
 	EBPFProgsMax int
 	EBPFMapsMax  int
 
@@ -277,9 +280,10 @@ type Runner struct {
 	// at neighLatchTicks and clears only when every readable family
 	// sits below neighLatchExitRatio (P0.4 hysteresis; the per-tick
 	// fills ride updateNeighborTable's local map, not Runner state).
-	neighPinned map[string]int
-	nic         nicState
-	ebpfStreak  int // Wave-3 #10 consecutive ticks >= EBPFProgsMax / EBPFMapsMax
+	neighPinned    map[string]int
+	nic            nicState
+	ebpfStreak     int       // Wave-3 #10 consecutive NEW SCANS >= EBPFProgsMax / EBPFMapsMax
+	ebpfLastScanAt time.Time // stamp of the snapshot the streak last consumed (zero = none)
 }
 
 // defaultTickInterval is the latch ticker cadence the warp detector

@@ -58,17 +58,28 @@ func scanBPFIDLines(data []byte, progs, maps map[uint64]bool) {
 // opening every fdinfo file on the host (inotify sweep parity).
 const ebpfFDTarget = "anon_inode:bpf-"
 
-// ebpfSnapshot returns the eBPF half of the shared fd-link sweep
+// ebpfSnapshotAt returns the eBPF half of the shared fd-link sweep
 // (collect_fdlinks.go), re-walking at most once per
 // EBPFScanInterval. Unresolved pins fold into the maps count — the
 // leak-audit headline (a cilium map-pin leak grows that series even
 // when bpffs refuses the opens an id harvest would need). scanned
 // mirrors the old sweep's verdict: the proc root OR the bpffs dir
-// listed.
-func (c *Collector) ebpfSnapshot() (progs, maps int, scanned bool) {
+// listed. at is the cache stamp: a latch ticker running faster than
+// the sweep must not count the same snapshot as fresh evidence N
+// times (Wave-5 P0 — a 30s ticker re-reading a 60s cache latched
+// after 3 ticks instead of 3 real scans).
+func (c *Collector) ebpfSnapshotAt() (progs, maps int, scanned bool, at time.Time) {
 	res := c.fdLinkSnapshot(c.cfg.EBPFScanInterval)
 	return len(res.progs), len(res.maps) + res.pins,
-		res.procOK || res.bpffsOK
+		res.procOK || res.bpffsOK, res.at
+}
+
+// ebpfSnapshot is the metric-side wrapper — the collector emits every
+// scrape and does not care about the stamp; only the latch consumer
+// uses ebpfSnapshotAt.
+func (c *Collector) ebpfSnapshot() (progs, maps int, scanned bool) {
+	progs, maps, scanned, _ = c.ebpfSnapshotAt()
+	return progs, maps, scanned
 }
 
 // collectEBPF emits the unique-id counts — 0 is real data (a node

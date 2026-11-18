@@ -3,6 +3,7 @@
 package wdeps
 
 import (
+	"math"
 	"strconv"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
@@ -37,8 +38,13 @@ func float64Knob(name string, dst *float64, def float64) envx.Knob {
 		Resolve: func(k string) {
 			*dst = def
 			if v := envx.String(k, ""); v != "" {
-				if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+				// Ratios must be finite and in (0, 1] — a NaN/Inf or a
+				// >1 value would silently disable every pressure guard.
+				if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 &&
+					!math.IsNaN(f) && !math.IsInf(f, 0) && f <= 1.0 {
 					*dst = f
+				} else {
+					envx.Warnf("invalid %s (want finite 0 < f <= 1): %q — using default", k, v)
 				}
 			}
 		},

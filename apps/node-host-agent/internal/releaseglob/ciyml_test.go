@@ -282,3 +282,22 @@ func TestDockerDetectMappingMatchesDeps(t *testing.T) {
 		}
 	}
 }
+
+// mise.toml pins go/moon/golangci-lint for every module — a toolchain
+// bump can change any app's image, so all three must rebuild. The
+// lib-only mapping checks above never probe a repo-root file, so an
+// explicitly asserted consumers() arm is what keeps a dropped
+// mise.toml branch from silently emptying the docker-build matrix.
+func TestMiseTomlConsumers(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	appDir := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	root := filepath.Dir(filepath.Dir(appDir))
+
+	arms := parseConsumerArms(t, root)
+	if got := consumersFor(arms, "mise.toml"); !slices.Equal(got, appsUnderTest) {
+		t.Fatalf("consumers(\"mise.toml\") = %v, want %v", got, appsUnderTest)
+	}
+}

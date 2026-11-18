@@ -291,10 +291,15 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 	d.Cfg.Seams.Host.DumpConnectedUDPFn = func(int) ([]netlinkx.ConnectedUDPSocket, error) {
 		return nil, nil
 	}
-	d.Cfg.Seams.Host.DestroyUDPSocketFn = func(int, uint8, [48]byte) error {
-		return nil
+	// No bound UDP ports by default — tests that exercise the server
+	// reply-socket guard stub this explicitly.
+	d.Cfg.Seams.Host.UDPBoundPortsFn = func(int) (map[uint16]bool, error) {
+		return map[uint16]bool{}, nil
 	}
-	d.Cfg.Seams.Host.DetachLoopFn = func(string) error {
+	d.Cfg.Seams.Host.DestroyUDPSocketFn = func(int, uint8, [48]byte) (bool, error) {
+		return true, nil
+	}
+	d.Cfg.Seams.Host.DetachLoopFn = func(context.Context, string) error {
 		return nil
 	}
 	d.Cfg.Seams.Host.TCPTablesFn = func(int) (netlinkx.TCPCensus, error) {

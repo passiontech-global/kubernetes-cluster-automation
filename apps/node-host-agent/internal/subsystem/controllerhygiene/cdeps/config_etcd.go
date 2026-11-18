@@ -40,7 +40,9 @@ const (
 	defaultEtcdBackupDir = "/var/backups/etcd"
 
 	// Wave-3 #8: embedded etcd quorum/learner/wal_fsync guard defaults.
-	DefaultEtcdMetricsURL     = "http://127.0.0.1:2381/metrics"
+	// k0s embedded etcd serves /metrics on its mTLS client port :2379 —
+	// the old :2381 plain-http scrape is not exposed on these controllers.
+	DefaultEtcdMetricsURL     = "https://127.0.0.1:2379/metrics"
 	defaultEtcdLearnerMaxAge  = 30 * time.Minute
 	defaultEtcdFsyncP99MaxSec = 0.10
 )
@@ -59,7 +61,7 @@ type EtcdGuardConfig struct {
 	// Wave-3 #8: stuck learner, WAL fsync p99, and etcd /metrics URL.
 	LearnerMaxAge      time.Duration // <=0 → 30m
 	FsyncP99MaxSeconds float64       // <=0 → 0.10s
-	MetricsURL         string        // "" → http://127.0.0.1:2381/metrics
+	MetricsURL         string        // "" → https://127.0.0.1:2379/metrics (mTLS)
 }
 
 func (c *Config) applyEtcdGuardDefaults() {

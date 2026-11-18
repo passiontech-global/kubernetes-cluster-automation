@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -85,6 +86,64 @@ func TestMountinfoBloatEvent(t *testing.T) {
 }
 
 // --- orphan task rootfs (group 1) ---
+
+// mountingGateFixture plants a mount-max file and counts how often
+// nodecoord reaches the apiserver (a proxy for HoldLocalAction calls).
+func mountingGateFixture(t *testing.T, max int, lines ...string) (*env, *int) {
+	t.Helper()
+	e := fixture(t)
+	e.H.Cfg.MountinfoFile = filepath.Join(t.TempDir(), "mountinfo")
+	sysFS := filepath.Join(e.ProcDir, "sys", "fs")
+	if err := os.MkdirAll(sysFS, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sysFS, "mount-max"), fmt.Sprintf("%d\n", max))
+	wdepstest.WriteFile(t, e.H.Cfg.MountinfoFile, strings.Join(lines, ""))
+	calls := 0
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			calls++
+			return map[string]string{}, nil
+		},
+	}
+	return e, &calls
+}
+
+// TestMountPressureHealthyCycleSkipsMaintenanceGet: a healthy sweep
+// has no destructive action, so it must not hit Nodes().Get through
+// HoldLocalAction (that was an unconditional call every 60s per node).
+func TestMountPressureHealthyCycleSkipsMaintenanceGet(t *testing.T) {
+	e, calls := mountingGateFixture(t, 1000,
+		miLine("/mnt/a"), miLine("/mnt/b"))
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(),
+		&wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	if *calls != 0 {
+		t.Fatalf("maintenance queried %d time(s) on a healthy cycle, want 0", *calls)
+	}
+}
+
+// TestMountPressureEligibleCycleConsultsMaintenance: the gate is
+// still applied when a raise is actually within reach.
+func TestMountPressureEligibleCycleConsultsMaintenance(t *testing.T) {
+	var lines []string
+	for range 90 {
+		lines = append(lines, miLine("/mnt/filler"))
+	}
+	e, calls := mountingGateFixture(t, 100, lines...)
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(),
+		&wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	if *calls == 0 {
+		t.Fatal("maintenance gate was never consulted on an eligible raise")
+	}
+	got, err := os.ReadFile(filepath.Join(e.ProcDir, "sys", "fs", "mount-max"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != "200" {
+		t.Fatalf("mount-max=%q, want 200", got)
+	}
+}
 
 func TestMountinfoTaskRootfsOrphanConfirmedThenReaped(t *testing.T) {
 	e := fixture(t)

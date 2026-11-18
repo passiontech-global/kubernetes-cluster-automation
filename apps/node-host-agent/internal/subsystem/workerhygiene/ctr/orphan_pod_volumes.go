@@ -23,6 +23,10 @@
 //     / etc-hosts metadata and kubelet device symlinks — any other
 //     file, symlink or unreadable entry means user data and the
 //     dir is reported, never touched.
+//  6. The pod dir itself holds NOTHING but those three kubelet volume
+//     trees — a foreign file/dir at the root is data we cannot account
+//     for, so the whole dir is kept even when the volume trees are
+//     clean. An unreadable pod dir fails closed too.
 //
 // At most orphanPodVolsMaxReapPerCycle pod dirs are removed per
 // cycle so a mass orphan event drains at a fixed rate.
@@ -82,7 +86,10 @@ func (c *OrphanPodVolsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	for i := range e.Pods {
 		podLive[string(e.Pods[i].UID)] = true
 	}
-	hostPodsDir := fsx.HostSidePath(c.d.Cfg.PodsDir)
+	// Normalize the host-side root once: a trailing slash or a ".."
+	// in the configured PodsDir would otherwise desync the mount
+	// prefix check from the paths mountinfo reports.
+	hostPodsDir := filepath.Clean(fsx.HostSidePath(c.d.Cfg.PodsDir))
 	minAge := c.d.Cfg.Ctr.OrphanPodVolsMinAge
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 
@@ -147,7 +154,7 @@ func (c *OrphanPodVolsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			continue // still mounted — mountinfo-hygiene owns it
 		}
 		seen[uid] = true
-		podDir := filepath.Join(c.d.Cfg.PodsDir, uid)
+		podDir := filepath.Clean(filepath.Join(c.d.Cfg.PodsDir, uid))
 		// Gate 4 — BOTH the dir mtime and the confirm marker must
 		// be past minAge: mtime alone can be refreshed by a late
 		// kubelet write, the marker alone can't see a recycled dir.
@@ -170,11 +177,20 @@ func (c *OrphanPodVolsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// skeleton + kubelet metadata; anything else is user data.
 		// volumes/ and volume-subpaths/ share the residue rule;
 		// volumeDevices/ holds kubelet device symlinks only.
-		if !orphanPodVolsResidueOnly(filepath.Join(podDir, "volumes")) ||
-			!orphanPodVolsResidueOnly(filepath.Join(podDir, "volume-subpaths")) ||
-			!orphanVolDevicesResidueOnly(filepath.Join(podDir, "volumeDevices")) {
+		if !orphanPodVolsResidueOnly(filepath.Clean(filepath.Join(podDir, "volumes"))) ||
+			!orphanPodVolsResidueOnly(filepath.Clean(filepath.Join(podDir, "volume-subpaths"))) ||
+			!orphanVolDevicesResidueOnly(filepath.Clean(filepath.Join(podDir, "volumeDevices"))) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: orphan pod dir %.8s holds volume data - left in place",
+				uid))
+			continue
+		}
+		// Gate 6 — the volume trees are clean, but a foreign entry at
+		// the pod-dir root is not ours to judge: keep the whole dir
+		// rather than RemoveAll something we did not inspect.
+		if !orphanPodDirOnlyVolumeTrees(podDir) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: orphan pod dir %.8s holds unexpected entries - left in place",
 				uid))
 			continue
 		}
@@ -236,7 +252,9 @@ func isPodUIDDirName(name string) bool {
 
 // loadHostMounts parses <MountinfoFile> into the mountpoint list —
 // the same field-5 + unescape the mountinfo-hygiene check uses.
-// ok=false on a read failure (the caller fails closed).
+// ok=false on a read failure OR an empty parse: "no mounts found"
+// is not positive evidence that the pod dir is unmounted, so the
+// caller must fail closed rather than detach on it.
 func (c *OrphanPodVolsCheck) loadHostMounts(out *[]string) bool {
 	data, err := os.ReadFile(c.d.Cfg.MountinfoFile)
 	if err != nil {
@@ -250,22 +268,58 @@ func (c *OrphanPodVolsCheck) loadHostMounts(out *[]string) bool {
 		if len(f) < 5 {
 			continue
 		}
-		*out = append(*out, procfs.UnescapeMountPath(f[4]))
+		// Clean every path: mountinfo may carry a trailing slash or
+		// a ".." segment, and an unnormalized path would evade the
+		// subtree prefix match below.
+		p := filepath.Clean(procfs.UnescapeMountPath(f[4]))
+		if p != "." && p != "" {
+			*out = append(*out, p)
+		}
+	}
+	if len(*out) == 0 {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: orphan-pod-volumes read %s yielded no mountpoints — mount gate unverifiable",
+			c.d.Cfg.MountinfoFile))
+		return false
 	}
 	return true
 }
 
-// mountUnderPodDir reports whether any mountpoint sits AT or BELOW
-// <hostPodsDir>/<uid> — the still-mounted case mountinfo-hygiene
-// unmounts earlier in the dispatch order.
+// mountUnderPodDir reports whether any mountpoint sits ANYWHERE in
+// the subtree AT or BELOW <hostPodsDir>/<uid> — deep volume paths
+// as well as direct children. Both sides are cleaned so a trailing
+// slash or ".." segment cannot slip a still-mounted volume past
+// the check and let the reaper detach it.
 func mountUnderPodDir(mounts []string, hostPodsDir, uid string) bool {
-	base := hostPodsDir + "/" + uid
+	base := filepath.Clean(filepath.Join(hostPodsDir, uid))
+	prefix := base + string(filepath.Separator)
 	for _, m := range mounts {
-		if m == base || strings.HasPrefix(m, base+"/") {
+		m = filepath.Clean(m)
+		if m == base || strings.HasPrefix(m, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+// orphanPodDirOnlyVolumeTrees reports whether podDir holds nothing
+// but the three kubelet-created volume trees. Any other entry — a
+// user file, a stray directory, a symlink — means we cannot account
+// for what RemoveAll would destroy, so the dir is kept. A read error
+// (including a dir that vanished mid-sweep) is fail-closed too.
+func orphanPodDirOnlyVolumeTrees(podDir string) bool {
+	ents, err := os.ReadDir(podDir)
+	if err != nil {
+		return false
+	}
+	for _, en := range ents {
+		switch en.Name() {
+		case "volumes", "volume-subpaths", "volumeDevices":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // orphanPodVolsResidueOnly reports whether one pod volume tree

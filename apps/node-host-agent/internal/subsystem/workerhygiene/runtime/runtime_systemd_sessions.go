@@ -117,11 +117,20 @@ func (c *SystemdSessionCheck) scanSessions() (total int, stale []string) {
 
 // Run executes one systemd-session round.
 func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
-	// Never gate SystemdSessionCheck solely because the k0sworker D-Bus probe
-	// failed — that is when PID 1 SIGCONT recovery is needed most.
-	if (e == nil || !e.SystemdProbeErr) && c.d.Gated(e, wdeps.CheckSystemdSessions) {
+	// A check that runs after earlier ones already exhausted the shared
+	// CycleTimeout must NOT probe PID 1: the D-Bus read would fail with
+	// DeadlineExceeded instantly, be mistaken for a frozen init, build
+	// LatchSystemdUnresponsive (NHC reboots a HEALTHY node) and SIGCONT
+	// PID 1. Abort this round instead — no streak, no latch, no signal.
+	if ctx.Err() != nil {
+		c.d.CycleResult(wdeps.CheckSystemdSessions, "abort")
 		return
 	}
+	// This check is gated ONLY by the k0sworker unit file (Cycle's
+	// WD_REQUIRES early return) plus its own WD_SIG switch (subframe
+	// dispatch) — NOT by workerActive. A D-Bus probe failure or an
+	// intentionally inactive k0sworker is exactly when the PID 1
+	// unresponsive detector is needed most, so it must still run.
 	total, stale := c.scanSessions()
 	c.d.SystemdSessionsTotal = int64(total)
 	c.d.SystemdSessionsStale = int64(len(stale))
@@ -158,9 +167,28 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// — the latency number already carries the verdict.
 			logger().Debug("workerhygiene: is-system-running probe non-ok",
 				"error", probeErr)
-			probeTimedOut = errors.Is(probeErr, context.DeadlineExceeded) ||
-				errors.Is(timedOutCtx, context.DeadlineExceeded) ||
-				elapsed >= systemdInitProbeBudget
+			// If the PARENT cycle ctx was cancelled/exhausted during
+			// the probe, the deadline is OURS, not PID 1's — an
+			// answered-late/no-answer here is an aborted round, not
+			// the frozen-init signature. Counting it would build
+			// LatchSystemdUnresponsive and SIGCONT a healthy init.
+			if ctx.Err() == nil {
+				probeTimedOut = errors.Is(probeErr, context.DeadlineExceeded) ||
+					errors.Is(timedOutCtx, context.DeadlineExceeded) ||
+					elapsed >= systemdInitProbeBudget
+			}
+			// The parent cycle ctx expired DURING the probe: the
+			// deadline is ours, not PID 1's. Abort the round right
+			// here — falling through would zero unrespFails and
+			// Exit() the unresponsive latch (destroying the evidence
+			// of a REAL frozen init), write the session-bloat latch
+			// from an incomplete scan, and run loginctl/reset-failed
+			// on an already-cancelled ctx. The guard at the top of
+			// Run only covers a ctx expired BEFORE the probe.
+			if !probeTimedOut && ctx.Err() != nil {
+				c.d.CycleResult(wdeps.CheckSystemdSessions, "abort")
+				return
+			}
 		}
 	}
 	// PID1-frozen detector: consecutive probe timeouts Enter

@@ -175,6 +175,23 @@ func readNICCounters(sysClassNetDir, iface string) (carrier, crcFrame uint64, ok
 	return c, rc + rf, true
 }
 
+// nicHasPhysicalSysfs reports whether the resolved iface has the
+// sysfs backing of a real uplink: a "device" symlink (a PCI/NIC
+// device) OR a "bonding" dir (a bond master, which is device-less
+// by design). /proc/net/route can name synthetic/virtual ifaces
+// that carry counter files but no device entry — latching on
+// those is how a virtual datapath flap becomes a phantom
+// state-host-network-problems alarm. Neither entry means
+// inconclusive, never a verdict.
+func nicHasPhysicalSysfs(sysClassNetDir, iface string) bool {
+	for _, entry := range []string{"device", "bonding"} {
+		if _, err := os.Lstat(filepath.Join(sysClassNetDir, iface, entry)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // counterAtOrBefore returns the counter value of the newest sample
 // at-or-before t — the window-base lookup. ok=false when no sample
 // covers t (insufficient history — the signature stays unevaluated
@@ -323,6 +340,13 @@ func (r *Runner) updateNICHealth() {
 	iface := physicalUplinkIface(r.deps.RouteFile)
 	if iface == "" {
 		return // no physical uplink visible — inconclusive
+	}
+	// A route entry alone is not proof of a physical NIC: virtual
+	// and synthetic ifaces often expose carrier/CRC counters but
+	// have no sysfs device (or bonding) backing. Require one
+	// before any signature may move the latch.
+	if !nicHasPhysicalSysfs(r.deps.SysClassNetDir, iface) {
+		return // no physical sysfs backing — inconclusive
 	}
 	if r.nic.iface != iface {
 		// Uplink changed — counter baselines belong to the old

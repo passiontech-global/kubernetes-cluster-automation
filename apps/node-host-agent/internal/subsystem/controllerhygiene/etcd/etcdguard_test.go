@@ -443,6 +443,8 @@ func TestEtcdGuardPreMaintSnapshot(t *testing.T) {
 		switch {
 		case strings.Contains(j, "endpoint status"):
 			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return []byte(""), nil // conclusive: no CORRUPT, no NOSPACE
 		case strings.Contains(j, "snapshot save"):
 			// The real seam lands a file at the argv path — mirror it
 			// so the verify sees a non-empty artifact.
@@ -502,6 +504,8 @@ func TestEtcdGuardSnapshotInvalidAbortsRescue(t *testing.T) {
 		switch {
 		case strings.Contains(j, "endpoint status"):
 			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return []byte(""), nil // conclusive: no CORRUPT, no NOSPACE
 		case strings.Contains(j, "snapshot save"):
 			// Save "succeeds" but lands a zero-byte artifact — the
 			// verify must fail and the destructive half must NOT run.
@@ -803,6 +807,72 @@ func TestEtcdGuardAlarmListErrorKeepsGaugeAndOk(t *testing.T) {
 	}
 }
 
+// A failed alarm read must ABSOLUTELY block the destructive half when the
+// size trigger is live — eventpurge/etcdmaint issue alarm disarm + defrag.
+func TestEtcdGuardAlarmListErrorAboveLimitBlocksRemediation(t *testing.T) {
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.wireEtcdGuard(t, g)
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return nil, errors.New("alarm boom")
+		}
+		return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
+	}
+	e.H.Cycle(context.Background())
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("alarm-read failure triggered remediation: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+	if got := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckEtcd, "alarm_blocked")); got != 1 {
+		t.Fatalf("cycles{alarm_blocked}=%v want 1", got)
+	}
+	if !strings.Contains(e.LogLines(), "alarm state unverifiable/CORRUPT") {
+		t.Fatalf("missing block ACTION log:\n%s", e.LogLines())
+	}
+}
+
+// Once a CORRUPT alarm was observed, an inconclusive later alarm read keeps
+// the destructive half blocked (sticky corruptArmed in quorumTracker).
+func TestEtcdGuardCorruptArmedSticksThroughAlarmReadError(t *testing.T) {
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+		alarms: "memberID:1 alarm:CORRUPT\n",
+	}
+	e.wireEtcdGuard(t, g)
+	e.H.Cycle(context.Background())
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("CORRUPT did not block first cycle: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+
+	// Second cycle: alarm list unreadable — the sticky armed state plus
+	// the inconclusive read must keep remediation off.
+	g.alarms = ""
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return nil, errors.New("alarm boom")
+		}
+		return nil, fmt.Errorf("fake: unexpected etcdctl args %q", j)
+	}
+	e.H.Cycle(context.Background())
+	if g.purges != 0 || len(g.rescues) != 0 {
+		t.Fatalf("armed CORRUPT + alarm error triggered remediation: purges=%d rescues=%d",
+			g.purges, len(g.rescues))
+	}
+}
+
 // A transport-level endpoint status failure (not just a parse
 // failure) skips the cycle — nothing measurable, status_error.
 func TestEtcdGuardStatusTransportErrorNoop(t *testing.T) {
@@ -916,6 +986,8 @@ func TestEtcdGuardSnapshotSaveFailAborts(t *testing.T) {
 		switch {
 		case strings.Contains(j, "endpoint status"):
 			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return []byte(""), nil // conclusive: no CORRUPT, no NOSPACE
 		case strings.Contains(j, "snapshot save"):
 			return nil, errors.New("save boom")
 		}
@@ -948,6 +1020,8 @@ func TestEtcdGuardSnapshotVerifyAfterSaveFailAborts(t *testing.T) {
 		switch {
 		case strings.Contains(j, "endpoint status"):
 			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return []byte(""), nil // conclusive: no CORRUPT, no NOSPACE
 		case strings.Contains(j, "snapshot save"):
 			// Non-empty this time — the size check must pass so the
 			// snapshot-status verify is what fails.
@@ -1024,6 +1098,8 @@ func TestEtcdGuardSnapshotFallbackVerifyFailAborts(t *testing.T) {
 		switch {
 		case strings.Contains(j, "endpoint status"):
 			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return []byte(""), nil // conclusive: no CORRUPT, no NOSPACE
 		case strings.Contains(j, "snapshot status"):
 			return nil, errors.New("corrupt snapshot")
 		}

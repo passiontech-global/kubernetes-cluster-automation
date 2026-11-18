@@ -443,27 +443,33 @@ func ruidNeedsKCMP(tot inotifyTotals, instLimit, watchLimit int64) bool {
 	return false
 }
 
-const maxKCMPCompareKeepers = 512
-
+// dedupRUIDEntriesKCMP collapses entries sharing one open file
+// description (proved by kcmp/KCMP_FILE) into a single census entry.
+// A shared OFD is one struct file, so its fdinfo always reports the
+// SAME watch count: bucket candidates by watches before paying for the
+// kcmp syscall. Every keeper in the matching bucket is compared — the
+// old flat maxKCMPCompareKeepers=512 cut silently stopped dedup once a
+// RUID held >512 OFDs (a forked RUID past that point leaked dupes and
+// overstated pressure). Bucketing keeps the comparison set small
+// without ever dropping a genuine duplicate behind a hard cap.
 func dedupRUIDEntriesKCMP(entries []inotifyRUIDEntry, sameOFD func(int, int, int, int) bool) []inotifyRUIDEntry {
-	var kept []inotifyRUIDEntry
+	kept := make([]inotifyRUIDEntry, 0, len(entries))
+	buckets := map[int64][]int{} // watch count → indices into kept
 	for _, ent := range entries {
 		dup := false
-		limit := min(len(kept), maxKCMPCompareKeepers)
-		for i := range limit {
+		for _, i := range buckets[ent.watches] {
 			k := kept[i]
-			if k.pid == ent.pid && k.fdNum == ent.fdNum {
-				dup = true
-				break
-			}
-			if sameOFD(k.pid, k.fdNum, ent.pid, ent.fdNum) {
+			if (k.pid == ent.pid && k.fdNum == ent.fdNum) ||
+				sameOFD(k.pid, k.fdNum, ent.pid, ent.fdNum) {
 				dup = true
 				break
 			}
 		}
-		if !dup {
-			kept = append(kept, ent)
+		if dup {
+			continue
 		}
+		buckets[ent.watches] = append(buckets[ent.watches], len(kept))
+		kept = append(kept, ent)
 	}
 	return kept
 }

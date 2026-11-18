@@ -8,10 +8,10 @@
 package runtime
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
-	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -69,11 +69,14 @@ func (c *CgroupThrottleCheck) checkVMAPressure(ctx context.Context, e *wdeps.Cyc
 		if len(st.Fields) <= 20 {
 			continue
 		}
-		vsize, verr := strconv.ParseInt(st.Fields[20], 10, 64)
-		if verr != nil || vsize <= 0 {
+		// VmSize is a byte/page count — never negative. ParseUint makes a
+		// malformed negative/garbage field inconclusive instead of feeding
+		// a bogus ranking into the top-N selection.
+		vsize, verr := strconv.ParseUint(st.Fields[20], 10, 64)
+		if verr != nil || vsize == 0 || vsize > math.MaxInt64 {
 			continue
 		}
-		candidates = append(candidates, pidVMSize{pid: pid, vmSize: vsize})
+		candidates = append(candidates, pidVMSize{pid: pid, vmSize: int64(vsize)})
 	}
 	if len(candidates) == 0 {
 		c.d.Series.VMAMaxUtilRatio = 0
@@ -113,8 +116,13 @@ func (c *CgroupThrottleCheck) checkVMAPressure(ctx context.Context, e *wdeps.Cyc
 		return
 	}
 
+	// Keep the limit that TRIGGERED the event — a successful raise is a
+	// separate remedy and must not rewrite the evidence in the Event note.
+	prevMax := maxMapCount
 	ceiling := c.d.Cfg.Wave3.VMAMaxCeiling
-	if maxMapCount < ceiling && c.d.State.RateTrySpend(vmaRaiseBudgetFile, vmaRaiseCooldown) {
+	held := c.d.HoldLocalAction(ctx)
+	if maxMapCount < ceiling && !held &&
+		c.d.State.RateTrySpend(vmaRaiseBudgetFile, vmaRaiseCooldown) {
 		newMax := maxMapCount * 2
 		if newMax > ceiling {
 			newMax = ceiling
@@ -131,6 +139,10 @@ func (c *CgroupThrottleCheck) checkVMAPressure(ctx context.Context, e *wdeps.Cyc
 			maxMapCount = newMax
 			c.d.Series.VMAMaxUtilRatio = float64(worstVMACount) / float64(maxMapCount)
 		}
+	} else if held && maxMapCount < ceiling {
+		c.d.State.SuspectLog("vma-max-raise-held", fmt.Sprintf(
+			"suspect: vma-pressure vm.max_map_count raise held by maintenance (pid=%d vmas=%d util=%.2f)",
+			worstPID, worstVMACount, util), cgroupSuspectLogCadence)
 	}
 
 	uid, ok := wdeps.PodUIDForPID(c.d, worstPID)
@@ -150,31 +162,23 @@ func (c *CgroupThrottleCheck) checkVMAPressure(ctx context.Context, e *wdeps.Cyc
 	}
 	if err := c.d.EmitPodEvent(ctx, pod, "vma-pressure", "PodVMAMapCountPressure",
 		fmt.Sprintf("pod process pid=%d holds %d VMA mappings (%.1f%% of vm.max_map_count=%d)",
-			worstPID, worstVMACount, util*100, maxMapCount)); err == nil {
+			worstPID, worstVMACount, util*100, prevMax)); err == nil {
 		c.vmaEvented[uid] = true
 		c.d.Actions.WithLabelValues(wdeps.CheckCgroupThrottle, "vma_event").Inc()
 	}
 }
 
 func countProcMapsLines(path string) (int64, error) {
-	f, err := os.Open(path)
+	// /proc/<pid>/maps is line-oriented and bounded in practice; one read
+	// plus bytes.Count is both faster and simpler than a buffered scanner
+	// that had to handle ErrBufferFull on long mapping lines.
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = f.Close() }()
-	r := bufio.NewReaderSize(f, 32*1024)
-	var count int64
-	for {
-		line, err := r.ReadSlice('\n')
-		if len(line) > 0 {
-			count++
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil && err != bufio.ErrBufferFull {
-			return count, err
-		}
+	count := int64(bytes.Count(data, []byte{'\n'}))
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		count++ // unterminated final line
 	}
 	return count, nil
 }

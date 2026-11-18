@@ -6,6 +6,7 @@ package netlinkx
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 
@@ -62,6 +63,67 @@ func dumpConnectedUDPInNS() ([]ConnectedUDPSocket, error) {
 	return out, nil
 }
 
+// UDPBoundPorts returns the UDP ports with a socket bound in pid's
+// netns — the `ss -lun` UNCONN rows (UDP has no LISTEN state, so every
+// UDP socket with sport != 0 counts). This is the "is this port a
+// local server" evidence the stale-socket check needs: a connected
+// UDP socket whose SrcPort is bound here is a server replying to a
+// client, never a blackhole to a dead Service backend.
+func UDPBoundPorts(pid int) (map[uint16]bool, error) {
+	out := map[uint16]bool{}
+	err := InNetNS(pid, func() error { return udpBoundPortsDump(out) })
+	return out, err
+}
+
+func udpBoundPortsDump(out map[uint16]bool) error {
+	fd, err := diagSock()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
+
+	bufp := diagBufPool.Get().(*[]byte)
+	defer diagBufPool.Put(bufp)
+	buf := *bufp
+
+	seq := uint32(300)
+	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
+		seq++
+		req := diagRequestProto(seq, family, unix.IPPROTO_UDP,
+			0xFFF, nil, unix.SOCK_DIAG_BY_FAMILY,
+			unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
+		if err := unix.Sendto(fd, req, 0, sa); err != nil {
+			return fmt.Errorf("udp bound-port sock_diag send %d: %w", family, err)
+		}
+		if err := diagRecvLoop(fd, buf,
+			fmt.Sprintf("udp bound-port sock_diag recv %d", family),
+			func(b []byte) (bool, error) {
+				return parseUDPBoundPorts(b, family, out)
+			}); err != nil {
+			if family == unix.AF_INET6 && noInet6Family(err) {
+				continue // kernel has no IPv6 — not an error
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func parseUDPBoundPorts(buf []byte, family uint8, out map[uint16]bool) (bool, error) {
+	_, done, err := walkNLMsgs(buf, false, func(payload []byte) {
+		if len(payload) < diagMsg || payload[0] != family {
+			return
+		}
+		// inet_diag_msg's sockid starts at payload+4; idiag_sport
+		// is its first 2 bytes, big-endian. sport==0 is unbound.
+		if sport := binary.BigEndian.Uint16(payload[4:6]); sport != 0 {
+			out[sport] = true
+		}
+	})
+	return done, err
+}
+
 func parseConnectedUDP(buf []byte, family uint8, out *[]ConnectedUDPSocket) (bool, error) {
 	_, done, err := walkNLMsgs(buf, false, func(payload []byte) {
 		if len(payload) < diagMsg {
@@ -97,17 +159,24 @@ func parseConnectedUDP(buf []byte, family uint8, out *[]ConnectedUDPSocket) (boo
 
 // DestroyUDPSocket sends NETLINK_SOCK_DIAG SOCK_DESTROY for one connected
 // UDP socket identified by family + verbatim idiag_sockid inside pid's
-// netns. ENOENT is treated as idempotent success.
-func DestroyUDPSocket(pid int, family uint8, id [48]byte) error {
-	return InNetNS(pid, func() error {
-		return destroyUDPSocketInNS(family, id)
+// netns. destroyed reports whether the kernel actually accepted the
+// kill: ENOENT (the socket vanished between dump and destroy) is
+// idempotent success with destroyed=false — the caller must NOT count
+// that as a real SOCK_DESTROY (Wave-5 P0).
+func DestroyUDPSocket(pid int, family uint8, id [48]byte) (bool, error) {
+	var destroyed bool
+	err := InNetNS(pid, func() error {
+		var derr error
+		destroyed, derr = destroyUDPSocketInNS(family, id)
+		return derr
 	})
+	return destroyed, err
 }
 
-func destroyUDPSocketInNS(family uint8, id [48]byte) error {
+func destroyUDPSocketInNS(family uint8, id [48]byte) (bool, error) {
 	fd, err := diagSock()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = unix.Close(fd) }()
 	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
@@ -122,9 +191,25 @@ func destroyUDPSocketInNS(family uint8, id [48]byte) error {
 		1<<tcpStateEstablished, &sid,
 		unix.SOCK_DESTROY, unix.NLM_F_REQUEST|unix.NLM_F_ACK)
 	if err := unix.Sendto(fd, req, 0, sa); err != nil {
-		return fmt.Errorf("udp sock_diag destroy send: %w", err)
+		return false, fmt.Errorf("udp sock_diag destroy send: %w", err)
 	}
-	return diagRecvLoop(fd, buf, "udp sock_diag destroy recv", func(b []byte) (bool, error) {
-		return true, parseDiagAck(b)
-	})
+	// Use walkNLMsgs' done flag directly instead of parseDiagAck's
+	// "ENOENT == success" fold: a positive ACK / NLMSG_DONE means the
+	// kernel destroyed the socket and set done=true; ENOENT means the
+	// id was already gone (idempotent, but NOT a kill we performed).
+	var destroyed bool
+	if err := diagRecvLoop(fd, buf, "udp sock_diag destroy recv", func(b []byte) (bool, error) {
+		_, done, err := walkNLMsgs(b, true, nil)
+		if err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				return true, nil // already gone — no real destroy
+			}
+			return true, err
+		}
+		destroyed = done
+		return true, nil
+	}); err != nil {
+		return false, err
+	}
+	return destroyed, nil
 }

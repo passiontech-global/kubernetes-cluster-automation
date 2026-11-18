@@ -203,6 +203,14 @@ func (c *CSIGuardCheck) csiPluginPods(e *wdeps.CycleEnv) []*corev1.Pod {
 	return out
 }
 
+// csiGuardWedgeGrace bounds how long a past-window desync may keep
+// retrying a bounce before the wedge latch is forced. Without it a
+// plugin pod stuck Terminating (or a delete that keeps failing) leaves
+// bouncedThisWindow=false forever, so CSIRegistrationWedged can never
+// arm — exactly the wedge the latch exists to report. The clock seam
+// drives the grace so tests advance it without real time.
+const csiGuardWedgeGrace = 15 * time.Minute
+
 // CSIGuardCheck is the P1.6 healer as a Check; it owns the
 // per-driver ECONNREFUSED streaks and the desync marker.
 type CSIGuardCheck struct {
@@ -334,16 +342,22 @@ func (c *CSIGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.bouncedThisWindow = false
 	}
 	desyncFor := c.d.Cfg.Seams.Host.Clock.Now().Sub(c.desyncSince)
-	pastWindow := len(missing) > 0 && desyncFor >= time.Duration(c.d.Cfg.Wave2.CSIGuardMissingMin)*time.Minute
+	window := time.Duration(c.d.Cfg.Wave2.CSIGuardMissingMin) * time.Minute
+	pastWindow := len(missing) > 0 && desyncFor >= window
 	bouncedBefore := c.bouncedThisWindow
 	if heal && pastWindow {
 		if c.bounceStaleCSIPods(ctx, e, targetPods, missing) {
 			c.bouncedThisWindow = true
 		}
 	}
+	// A desync older than the wait window PLUS the grace latches even
+	// when no bounce ever landed: a pod stuck Terminating (or a failing
+	// delete) must not pin bouncedThisWindow=false forever.
+	pastGrace := pastWindow && desyncFor >= window+csiGuardWedgeGrace
 	// When healing is active, wait until at least one prior bounce failed to
-	// recover before latching CSIRegistrationWedged.
-	if pastWindow && (!heal || bouncedBefore) {
+	// recover before latching CSIRegistrationWedged — or until the grace
+	// window proves bounces cannot clear the wedge.
+	if pastWindow && (!heal || bouncedBefore || pastGrace) {
 		joined := strings.Join(missing, ",")
 		if c.d.StreakPending(&c.fails,
 			"suspect: csi-registration-guard drivers missing registration: "+joined) {
@@ -369,6 +383,19 @@ func (c *CSIGuardCheck) bounceStaleCSIPods(ctx context.Context,
 	if e == nil || !e.APIOK || len(pods) == 0 {
 		return false
 	}
+	// A pod already Terminating is on its way out — there is nothing
+	// to bounce. Filter FIRST: an all-terminating target set must not
+	// burn the 30-minute cooldown or stamp LocalRemediation for a
+	// no-op cycle (the budget is spent atomically before the action).
+	var live []*corev1.Pod
+	for _, p := range pods {
+		if p.DeletionTimestamp == nil {
+			live = append(live, p)
+		}
+	}
+	if len(live) == 0 {
+		return false
+	}
 	if c.d.HoldLocalAction(ctx) {
 		c.d.State.AppendLog(
 			"cleanup: csi-registration-guard bounce held - cluster maintenance in progress")
@@ -380,10 +407,7 @@ func (c *CSIGuardCheck) bounceStaleCSIPods(ctx context.Context,
 	}
 	c.d.StampLocalRemediation(ctx)
 	bounced := false
-	for _, p := range pods {
-		if p.DeletionTimestamp != nil {
-			continue
-		}
+	for _, p := range live {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"ACTION csi-reg-bounce: deleting stale CSI plugin pod %s/%s (drivers missing registration: %s)",
 			p.Namespace, p.Name, strings.Join(missing, ",")))
@@ -604,13 +628,21 @@ func (c *GPUGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Past the window: bounce the plugin pods (hold + cooldown gated).
 	// GPUHealEnabled gates the REMEDY only — detection keeps running.
 	cooldown := time.Duration(c.d.Cfg.Wave2.GPUGuardBounceCooldownMin) * time.Minute
-	if c.d.Cfg.Wave2.GPUHealEnabled && e != nil && e.APIOK && !c.d.HoldLocalAction(ctx) &&
+	// Same no-op guard as the CSI bounce: filter already-Terminating
+	// plugin pods BEFORE spending the cooldown or stamping
+	// LocalRemediation. A set of pods that is on its way out has
+	// nothing to bounce and must not burn the restart budget.
+	var livePods []*corev1.Pod
+	for _, p := range pods {
+		if p.DeletionTimestamp == nil {
+			livePods = append(livePods, p)
+		}
+	}
+	if c.d.Cfg.Wave2.GPUHealEnabled && len(livePods) > 0 && e != nil && e.APIOK &&
+		!c.d.HoldLocalAction(ctx) &&
 		c.d.State.RateTrySpend("last-gpu-plugin-bounce", cooldown) {
 		c.d.StampLocalRemediation(ctx)
-		for _, p := range pods {
-			if p.DeletionTimestamp != nil {
-				continue
-			}
+		for _, p := range livePods {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"ACTION gpu-plugin-bounce: deleting device-plugin pod %s/%s (live=%d allocatable=%d, desync %.0fm)",
 				p.Namespace, p.Name, live, alloc, desyncFor.Minutes()))

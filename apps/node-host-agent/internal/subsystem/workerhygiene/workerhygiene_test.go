@@ -262,7 +262,10 @@ func TestStateEnterAtomicTmpLeavesNoResidue(t *testing.T) {
 	}
 }
 
-func TestWorkerInactiveGatesAllChecks(t *testing.T) {
+// SystemdSessionCheck is the deliberate exception: with the worker unit
+// inactive it still runs (gated by unit-file + WD_SIG existence) so PID 1
+// unresponsiveness stays observable. The healing checks below must gate.
+func TestWorkerInactiveGatesHealingChecks(t *testing.T) {
 	e := fixture(t)
 	e.SDReply["systemctl is-active k0sworker.service"] = "inactive\n"
 	e.Probes[wdeps.DefaultKubeletHealthzURL] = errors.New("refused")

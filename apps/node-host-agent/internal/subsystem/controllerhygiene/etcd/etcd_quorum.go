@@ -52,6 +52,20 @@ type quorumTracker struct {
 
 	fsyncHighStreak int
 	cleanStreak     int
+	// corruptArmed is sticky within the process: once a CORRUPT alarm was
+	// observed (or the last alarm read was inconclusive while armed), any
+	// compact/defrag/alarm-disarm remediation stays absolutely blocked so
+	// BoltDB/WAL evidence cannot be destroyed. Cleared only by a conclusive
+	// alarm read showing no CORRUPT entry.
+	corruptArmed bool
+}
+
+// corruptBlocked reports the sticky CORRUPT state under the tracker lock —
+// the etcdguard remediation gate reads this after evalQuorumAndMetrics.
+func (c *GuardCheck) corruptBlocked() bool {
+	c.qt.mu.Lock()
+	defer c.qt.mu.Unlock()
+	return c.qt.corruptArmed
 }
 
 func (c *GuardCheck) evalQuorumAndMetrics(ctx context.Context, st etcdStatusInfo,
@@ -64,7 +78,8 @@ func (c *GuardCheck) evalQuorumAndMetrics(ctx context.Context, st etcdStatusInfo
 		leaderMetric  float64
 		hasLeaderChg  bool
 	)
-	if !corrupt && c.d.Cfg.EtcdMetricsFn != nil && c.d.Cfg.EtcdGuard.MetricsURL != "" {
+	if !corrupt && alarmReadOK && c.d.Cfg.EtcdMetricsFn != nil &&
+		c.d.Cfg.EtcdGuard.MetricsURL != "" {
 		if body, err := c.d.Cfg.EtcdMetricsFn(ctx, c.d.Cfg.EtcdGuard.MetricsURL); err == nil {
 			buckets, total := parseFsyncBuckets(body)
 			if len(buckets) > 0 {
@@ -84,7 +99,18 @@ func (c *GuardCheck) evalQuorumAndMetrics(ctx context.Context, st etcdStatusInfo
 		c.qt.fsyncMeasured = true
 		c.qt.lastFsyncP99 = fsyncP99
 		c.d.EtcdWALFsyncP99.Set(fsyncP99)
+	} else if !c.qt.fsyncMeasured {
+		// No measurement has ever landed — advertise -1 ("unknown") rather
+		// than a misleading 0s that dashboards read as a healthy fsync.
+		c.d.EtcdWALFsyncP99.Set(-1)
 	}
+
+	// A conclusive alarm read updates the sticky armed state; an
+	// inconclusive one leaves it untouched (fail closed).
+	if alarmReadOK {
+		c.qt.corruptArmed = corrupt
+	}
+	corruptNow := corrupt || c.qt.corruptArmed
 
 	// Track stuck learner via persisted first-seen-etcd-learner marker.
 	stuckLearner := false
@@ -96,14 +122,16 @@ func (c *GuardCheck) evalQuorumAndMetrics(ctx context.Context, st etcdStatusInfo
 		c.d.State.ClearBudget(cdeps.FileFirstSeenEtcdLearner)
 	}
 
-	// Track leader loss and Status.Leader transitions.
-	lostLeader := st.leader != nil && *st.leader == 0
+	// Track leader loss and Status.Leader transitions. proto3 JSON omits
+	// scalar zero fields, so a missing "leader" decodes to 0 (= no leader)
+	// with the plain uint64 — a nil-able pointer would hide exactly that.
+	lostLeader := st.leader == 0
 	var statusDelta float64
-	if st.leader != nil && *st.leader != 0 {
-		if c.qt.hasPrevLeader && *st.leader != c.qt.prevLeader {
+	if st.leader != 0 {
+		if c.qt.hasPrevLeader && st.leader != c.qt.prevLeader {
 			statusDelta = 1
 		}
-		c.qt.prevLeader = *st.leader
+		c.qt.prevLeader = st.leader
 		c.qt.hasPrevLeader = true
 	}
 
@@ -141,7 +169,7 @@ func (c *GuardCheck) evalQuorumAndMetrics(ctx context.Context, st etcdStatusInfo
 
 	var enterReason string
 	switch {
-	case corrupt:
+	case corruptNow:
 		enterReason = "corrupt-alarm"
 	case stuckLearner:
 		enterReason = fmt.Sprintf("stuck-learner>=%s", c.d.Cfg.EtcdGuard.LearnerMaxAge)
@@ -154,10 +182,14 @@ func (c *GuardCheck) evalQuorumAndMetrics(ctx context.Context, st etcdStatusInfo
 			fsyncP99, c.d.Cfg.EtcdGuard.FsyncP99MaxSeconds, c.qt.fsyncHighStreak)
 	}
 
-	anyDegradedSignal := corrupt || stuckLearner || lostLeader || leaderStorm || fsyncHigh
+	anyDegradedSignal := corruptNow || stuckLearner || lostLeader || leaderStorm || fsyncHigh
 	if enterReason != "" {
 		c.qt.cleanStreak = 0
 		c.d.State.Enter(cdeps.StateEtcdQuorumDegraded, enterReason)
+	} else if !alarmReadOK {
+		// An inconclusive alarm read can never be the evidence that CLEARS
+		// the degraded latch — no cleanStreak advance, no exit.
+		c.qt.cleanStreak = 0
 	} else if !anyDegradedSignal {
 		c.qt.cleanStreak++
 		if c.qt.cleanStreak >= etcdQuorumConfirmCycles {
@@ -168,7 +200,8 @@ func (c *GuardCheck) evalQuorumAndMetrics(ctx context.Context, st etcdStatusInfo
 		c.qt.cleanStreak = 0
 	}
 
-	c.emitQuorumTextfile(st.isLearner, corrupt, alarmReadOK, c.qt.fsyncMeasured, c.qt.lastFsyncP99)
+	c.emitQuorumTextfile(st.isLearner, corruptNow, alarmReadOK,
+		c.qt.fsyncMeasured, c.qt.lastFsyncP99)
 }
 
 func (c *GuardCheck) emitQuorumTextfile(isLearner, corrupt, alarmReadOK, fsyncMeasured bool, fsyncP99 float64) {
@@ -269,10 +302,12 @@ func (qt *quorumTracker) computeFsyncP99(cur map[float64]float64, curTotal float
 	}
 	deltaTotal := curTotal - qt.prevTotal
 	if deltaTotal == 0 {
-		// Zero new WAL fsync samples in this interval — report 0s rather than
-		// repeating an old high reading that would wedge fsyncHighStreak/latch.
+		// Zero new WAL fsync samples in this interval (idle etcd / NOHZ):
+		// keep the last measured value for the gauge but report "not a new
+		// measurement" so a stale high reading cannot re-arm fsyncHighStreak
+		// and wedge the degraded latch forever.
 		qt.prevBuckets, qt.prevTotal = cur, curTotal
-		return 0, true
+		return qt.lastFsyncP99, false
 	}
 
 	effective := make([]histBucket, 0, len(cur))

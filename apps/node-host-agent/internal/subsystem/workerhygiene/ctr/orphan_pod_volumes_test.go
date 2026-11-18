@@ -44,7 +44,8 @@ func mkOrphanPodDir(t *testing.T, e *env, uid string, age time.Duration) string 
 	}
 	wdepstest.WriteFile(t, filepath.Join(podDir, "volumes",
 		"kubernetes.io~csi", "pvc-abc", "vol_data.json"), "{}")
-	wdepstest.WriteFile(t, filepath.Join(podDir, "etc-hosts"), "127.0.0.1 localhost\n")
+	wdepstest.WriteFile(t, filepath.Join(podDir, "volumes",
+		"kubernetes.io~csi", "pvc-abc", "etc-hosts"), "127.0.0.1 localhost\n")
 	stale := e.Now.Add(-age)
 	if err := os.Chtimes(podDir, stale, stale); err != nil {
 		t.Fatal(err)
@@ -223,6 +224,45 @@ func TestOrphanPodVolsUserDataKept(t *testing.T) {
 	}
 }
 
+// Gate 6 — a clean volumes/ tree does not license RemoveAll when the
+// pod dir root carries an entry we did not inspect. Both a loose file
+// and a foreign directory keep the whole pod dir.
+func TestOrphanPodVolsForeignRootEntryKept(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		plant func(t *testing.T, podDir string)
+	}{
+		{"file", func(t *testing.T, podDir string) {
+			wdepstest.WriteFile(t, filepath.Join(podDir, "notes.txt"), "user data")
+		}},
+		{"directory", func(t *testing.T, podDir string) {
+			if err := os.MkdirAll(filepath.Join(podDir, "scratch"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			writeMountinfo(t, e, []string{miLine("/mnt/ordinary")})
+			uid := opvUIDs[0]
+			podDir := mkOrphanPodDir(t, e, uid, 61*time.Minute)
+			tc.plant(t, podDir)
+			// Re-age after planting: gate 4 must not be what keeps it.
+			stale := e.Now.Add(-61 * time.Minute)
+			if err := os.Chtimes(podDir, stale, stale); err != nil {
+				t.Fatal(err)
+			}
+			opvConfirm(e, opvEnv(e, true))
+			if _, err := os.Stat(podDir); err != nil {
+				t.Fatal("pod dir with a foreign root entry was reaped")
+			}
+			if !strings.Contains(e.LogLines(t), "holds unexpected entries") {
+				t.Fatalf("missing root-entry hold line:\n%s", e.LogLines(t))
+			}
+		})
+	}
+}
+
 func TestOrphanPodVolsSymlinkKept(t *testing.T) {
 	e := fixture(t)
 	writeMountinfo(t, e, []string{miLine("/mnt/ordinary")})
@@ -356,7 +396,6 @@ func TestOrphanPodVolsMissingVolumesReaped(t *testing.T) {
 	if err := os.MkdirAll(podDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	wdepstest.WriteFile(t, filepath.Join(podDir, "etc-hosts"), "127.0.0.1 localhost\n")
 	stale := e.Now.Add(-61 * time.Minute)
 	if err := os.Chtimes(podDir, stale, stale); err != nil {
 		t.Fatal(err)
@@ -446,5 +485,44 @@ func TestOrphanPodVolsSubPathAndDeviceTrees(t *testing.T) {
 	opvConfirm(e, opvEnv(e, true))
 	if _, err := os.Stat(podDir); err != nil {
 		t.Fatal("dir with volumeDevices regular file was reaped")
+	}
+}
+
+// An empty (or all-garbage) mountinfo is inconclusive, not "nothing
+// is mounted": reaping on it would detach a dir that may still hold
+// a live mount.
+func TestOrphanPodVolsEmptyMountinfoKeepsAll(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"empty", ""},
+		{"garbage only", "not-a-mount-line\nanother\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			uid := opvUIDs[0]
+			podDir := mkOrphanPodDir(t, e, uid, 61*time.Minute)
+			wdepstest.WriteFile(t, mountinfoPath(e), tc.body)
+			opvConfirm(e, opvEnv(e, true))
+			if _, err := os.Stat(podDir); err != nil {
+				t.Fatal("dir reaped while mountinfo had no parseable mountpoints")
+			}
+		})
+	}
+}
+
+// mountinfo paths are not guaranteed normalized: a trailing slash
+// or a ".." segment must not hide a still-mounted deep volume from
+// the subtree check and let the reaper detach it.
+func TestOrphanPodVolsUncleanMountPathKeepsAll(t *testing.T) {
+	e := fixture(t)
+	uid := opvUIDs[0]
+	podDir := mkOrphanPodDir(t, e, uid, 61*time.Minute)
+	deep := filepath.Join(podDir, "volumes", "kubernetes.io~csi", "pvc-abc", "mount")
+	writeMountinfo(t, e, []string{
+		miLine("/mnt/ordinary"),
+		miLine(deep + "/../mount/"), // same dir, unnormalized
+	})
+	opvConfirm(e, opvEnv(e, true))
+	if _, err := os.Stat(podDir); err != nil {
+		t.Fatal("dir reaped although an unnormalized mountpoint sat in its subtree")
 	}
 }

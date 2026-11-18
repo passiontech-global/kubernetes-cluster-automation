@@ -200,13 +200,15 @@ var EvictCriticalPriorityClasses = map[string]bool{
 }
 
 // StatefulOwnerKinds are ownerReference kinds whose pods hold
-// stateful/quorum workloads — a plain StatefulSet plus the database
+// stateful/quorum workloads — a plain StatefulSet, DaemonSets (the
+// node-local agents whose loss blinds a node), plus the database
 // operators that raise pods under their own CRD kinds (CloudNativePG
 // Cluster, Dragonfly, ScyllaCluster/ScyllaDBDatacenter, Percona
 // PGv2/PSMDB/PXC). Losing one replica under pressure can cost
 // quorum.
 var StatefulOwnerKinds = map[string]bool{
 	"StatefulSet":          true,
+	"DaemonSet":            true,
 	"Cluster":              true, // CloudNativePG postgresql.cnpg.io
 	"Dragonfly":            true,
 	"ScyllaCluster":        true,

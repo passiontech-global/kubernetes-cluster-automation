@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -78,11 +79,25 @@ type Host struct {
 	// read host proc/netlink sockets.
 	TCPTablesFn func(pid int) (netlinkx.TCPCensus, error)
 	// Wave-3 #3: connected-UDP socket dump + SOCK_DESTROY seams.
+	// DestroyUDPSocketFn's bool is "kernel actually destroyed it" —
+	// ENOENT returns (false, nil) and must not be counted as a kill.
 	DumpConnectedUDPFn func(pid int) ([]netlinkx.ConnectedUDPSocket, error)
-	DestroyUDPSocketFn func(pid int, family uint8, id [48]byte) error
-	// Wave-3 #4b: orphan /dev/loop* LOOP_CLR_FD ioctl detach seam.
-	DetachLoopFn func(devPath string) error
+	// UDPBoundPortsFn reports the UDP ports bound in a pod netns —
+	// the `ss -lun` UNCONN rows. A connected socket whose SrcPort is
+	// one of them is a local server replying to a client, NOT a
+	// dead-Service-backend blackhole. Fail closed when it errors.
+	UDPBoundPortsFn    func(pid int) (map[uint16]bool, error)
+	DestroyUDPSocketFn func(pid int, family uint8, id [48]byte) (bool, error)
+	// Wave-3 #4b: orphan /dev/loop* detach seam. The default runs
+	// `losetup -d <devPath>` through Systemd.ExecBounded so the ioctl lands
+	// in the HOST namespace (devPath is the plain /dev/loopN host path);
+	// tests re-stub it to record the request without touching loop devices.
+	DetachLoopFn func(ctx context.Context, devPath string) error
 }
+
+// loopDetachBudget bounds the host-namespace losetup call — far below the
+// shared 30s systemd default so a wedged device can never stall a cycle.
+const loopDetachBudget = 30 * time.Second
 
 func (s *Host) applyDefaults(c *Config) {
 	if s.KillFn == nil {
@@ -154,11 +169,21 @@ func (s *Host) applyDefaults(c *Config) {
 	if s.DumpConnectedUDPFn == nil {
 		s.DumpConnectedUDPFn = netlinkx.DumpConnectedUDP
 	}
+	if s.UDPBoundPortsFn == nil {
+		s.UDPBoundPortsFn = netlinkx.UDPBoundPorts
+	}
 	if s.DestroyUDPSocketFn == nil {
 		s.DestroyUDPSocketFn = netlinkx.DestroyUDPSocket
 	}
 	if s.DetachLoopFn == nil {
-		s.DetachLoopFn = detachLoop
+		s.DetachLoopFn = func(ctx context.Context, devPath string) error {
+			if c.Systemd == nil {
+				return errors.New("workerhygiene: no systemd client for loop detach")
+			}
+			_, err := c.Systemd.ExecBounded(ctx, loopDetachBudget,
+				"losetup", "-d", devPath)
+			return err
+		}
 	}
 }
 

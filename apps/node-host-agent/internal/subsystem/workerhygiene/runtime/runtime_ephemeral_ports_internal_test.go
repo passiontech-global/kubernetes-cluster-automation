@@ -7,6 +7,7 @@
 package runtime
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -79,6 +80,49 @@ func TestNetnsRepsPid1AlwaysAnchors(t *testing.T) {
 	reps := c.netnsReps([]int{2})
 	if len(reps) != 2 || reps[0] != 1 || reps[1] != 2 {
 		t.Fatalf("reps=%v want [1 2]", reps)
+	}
+}
+
+// TestEvictPortLeakersNoPruneWhenAPINotOK pins the marker-preservation
+// contract: an inconclusive pod LIST must not run PruneMarkers with an
+// empty active set, which would erase the leak-window first-seen
+// markers and restart ConfirmMarker's window on every API blip.
+func TestEvictPortLeakersNoPruneWhenAPINotOK(t *testing.T) {
+	d, _ := rtDeps(t)
+	d.Cfg.Wave2.PortEvictRunawayPod = true
+	marker := "port-leak-stale"
+	d.State.RateSpend(marker)
+	markerPath := filepath.Join(d.Cfg.WatchdogStateDir, marker)
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("setup marker: %v", err)
+	}
+
+	NewEphemeralPorts(d).evictPortLeakers(context.Background(),
+		&wdeps.CycleEnv{WorkerActive: true, APIOK: false},
+		100, 1000, nil, nil)
+
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("inconclusive API pruned port-leak marker: %v", err)
+	}
+}
+
+// TestEvictPortLeakersPrunesWhenPressureResolved is the companion
+// rail: with a conclusive API, a resolved pressure (no CLOSE_WAIT)
+// still prunes stale first-seen markers so a future leak starts a
+// fresh ConfirmMarker window.
+func TestEvictPortLeakersPrunesWhenPressureResolved(t *testing.T) {
+	d, _ := rtDeps(t)
+	d.Cfg.Wave2.PortEvictRunawayPod = true
+	marker := "port-leak-stale"
+	d.State.RateSpend(marker)
+	markerPath := filepath.Join(d.Cfg.WatchdogStateDir, marker)
+
+	NewEphemeralPorts(d).evictPortLeakers(context.Background(),
+		&wdeps.CycleEnv{WorkerActive: true, APIOK: true},
+		0, 1000, nil, nil) // closeWait=0 → pressure resolved, no active leaker
+
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("resolved pressure did not prune stale port-leak marker: %v", err)
 	}
 }
 

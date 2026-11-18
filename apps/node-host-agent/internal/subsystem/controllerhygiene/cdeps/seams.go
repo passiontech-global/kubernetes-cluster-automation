@@ -20,11 +20,15 @@ package cdeps
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +37,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -231,7 +236,20 @@ func (s *Seams) applyDefaults(c *Config) {
 		s.EtcdRescueFn = etcdmaint.Run
 	}
 	if s.EtcdMetricsFn == nil {
+		// k0s embedded etcd exposes /metrics on its mTLS client port
+		// :2379 — the scrape needs the apiserver's etcd client cert (the
+		// same triple etcdctl uses). When the certs are absent (kine host
+		// or standalone) fall back to the insecure probe so the URL knob
+		// still works for a plaintext endpoint. The client is resolved
+		// LAZILY per call: at agent boot k0scontroller may not have
+		// finished writing the PKI triple yet — building it here once
+		// would pin the scrape to the insecure fallback forever.
+		metricsClient := lazyEtcdMetricsClient(c.K0sDir)
 		s.EtcdMetricsFn = func(ctx context.Context, url string) (string, error) {
+			if client := metricsClient(); client != nil {
+				return probee.HTTPBodyStreamInsecure(ctx, url, 5*time.Second,
+					keepEtcdMetricsLine, 2<<20, client)
+			}
 			return probee.HTTPBodyStreamInsecure(ctx, url, 5*time.Second,
 				keepEtcdMetricsLine, 2<<20)
 		}
@@ -303,6 +321,81 @@ func keepEtcdMetricsLine(ln []byte) bool {
 		}
 	}
 	return false
+}
+
+// lazyEtcdMetricsClient returns a resolver that caches the first mTLS
+// client it can build and keeps RETRYING on every call while certs are
+// still missing/unreadable. At agent startup k0scontroller may not
+// have written the apiserver-etcd-client triple yet; resolving it once
+// in applyDefaults would fall back to the insecure probe for the whole
+// process lifetime. Caching the first success still keeps one pooled
+// transport per agent (the per-handshake cert reload lives inside
+// etcdMetricsClient's GetClientCertificate).
+func lazyEtcdMetricsClient(k0sDir string) func() *http.Client {
+	var mu sync.Mutex
+	var client *http.Client
+	return func() *http.Client {
+		mu.Lock()
+		defer mu.Unlock()
+		if client == nil {
+			client = etcdMetricsClient(k0sDir)
+		}
+		return client
+	}
+}
+
+// etcdMetricsClient builds the mTLS HTTP client for the k0s embedded-etcd
+// :2379 /metrics scrape. It uses the same apiserver-etcd-client cert/key
+// triple etcdctl does; a missing/unreadable triple returns nil so the
+// caller falls back to the plain insecure probe (kine hosts, tests).
+//
+// The client cert is loaded LAZILY through GetClientCertificate on every
+// handshake, not just once at construction: k0s rotates
+// apiserver-etcd-client.{crt,key} on disk, and a static Certificates slice
+// would keep presenting the stale pair and fail every scrape until the
+// agent restarted. The last good pair is kept across a transient read
+// failure so an atomic-replace rotation cannot fail the scrape mid-write.
+func etcdMetricsClient(k0sDir string) *http.Client {
+	if k0sDir == "" {
+		return nil
+	}
+	certFile := filepath.Join(k0sDir, "pki", "apiserver-etcd-client.crt")
+	keyFile := filepath.Join(k0sDir, "pki", "apiserver-etcd-client.key")
+	caFile := filepath.Join(k0sDir, "pki", "etcd", "ca.crt")
+	// Prove the triple is usable at startup; a missing one means a kine host
+	// or standalone target, which must keep the insecure fallback.
+	initial, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil
+	}
+	caPEM, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil
+	}
+	var mu sync.Mutex
+	current := initial
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    pool,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				mu.Lock()
+				lastGood := current
+				mu.Unlock()
+				return &lastGood, nil //nolint:nilerr // transient rotation read: keep presenting the last good pair
+			}
+			mu.Lock()
+			current = cert
+			mu.Unlock()
+			return &cert, nil
+		},
+	}
+	return &http.Client{Transport: httpx.PooledTransport(0, tlsCfg)}
 }
 
 // statfsFreeBytes returns the free and total byte counts of the

@@ -25,12 +25,17 @@ func NewRunTmpfs(d *wdeps.Deps) *RunTmpfsCheck { return &RunTmpfsCheck{d: d} }
 // Name returns the check label / WD_SIG key.
 func (c *RunTmpfsCheck) Name() string { return wdeps.CheckRunTmpfs }
 
-// Run executes one runTmpfs round under its own gate.
+// Run executes one runTmpfs round under its own gate. It owns the
+// single CycleResult bump for the cycle — the guard reports whether
+// its evidence was conclusive, it never double-counts the frame.
 func (c *RunTmpfsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckRunTmpfs) {
 		return
 	}
-	c.runTmpfsGuard(ctx)
+	if !c.runTmpfsGuard(ctx) {
+		c.d.CycleResult(wdeps.CheckRunTmpfs, "inconclusive")
+		return
+	}
 	c.d.CycleResult(wdeps.CheckRunTmpfs, "ok")
 }
 
@@ -53,18 +58,21 @@ const (
 	runTmpfsSweepMax   = 64 // bound one cycle's tmp sweep
 )
 
-// runTmpfsGuard executes one run-tmpfs round.
-func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
+// runTmpfsGuard executes one run-tmpfs round. It reports whether the
+// cycle produced conclusive evidence (false only when the /run root
+// device cannot be stat'd — the mount-boundary check is the guard's
+// precondition). The caller owns the single CycleResult bump.
+func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) bool {
 	used, ok := c.d.DiskMaxUsageRatio(c.d.Cfg.Disk.HostRunDir)
 	if !ok {
-		return // unmeasurable — keep the last ratio, never act blind
+		return true // unmeasurable — keep the last ratio, never act blind
 	}
 	c.d.RunTmpfsUsedRatio = used
 	if used <= runTmpfsHighRatio {
-		return
+		return true
 	}
 	if !c.d.State.RateTrySpend("last-run-tmpfs-clean", runTmpfsCleanEvery) {
-		return
+		return true
 	}
 	cleaned := false
 	// (1) journald vacuum — the usual filler. Exec runs
@@ -104,8 +112,15 @@ func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
 		}
 	}
 	if !rootDevOK {
-		c.d.CycleResult(wdeps.CheckRunTmpfs, "inconclusive")
-		return
+		// Step (1) may already have succeeded: a journal vacuum that
+		// really ran must still be logged/counted even though the
+		// sweep cannot pass its mount-boundary precondition. Only
+		// the cycle VERDICT stays inconclusive — the caller records
+		// that exactly once; the cleanup metric/log is independent.
+		if cleaned {
+			c.recordRunTmpfsClean(used, 0)
+		}
+		return false
 	}
 	// The /proc/*/fd pass is built ONCE per sweep, lazily on the
 	// first stale .tmp — a busy /run can hold dozens of candidates
@@ -170,12 +185,21 @@ func (c *RunTmpfsCheck) runTmpfsGuard(ctx context.Context) {
 			return nil
 		})
 	if cleaned {
-		c.d.RunTmpfsCleanups++
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: run-tmpfs-clean — /run at %.0f%%, journal vacuumed to 16M, %d orphan .tmp removed",
-			used*100, removed))
-		c.d.Actions.WithLabelValues(wdeps.CheckRunTmpfs, "run_tmpfs_clean").Inc()
+		c.recordRunTmpfsClean(used, removed)
 	}
+	return true
+}
+
+// recordRunTmpfsClean emits the cleanup log + metric for a /run clean
+// that actually happened (journal vacuum and/or the orphan sweep).
+// One place for both paths so the inconclusive early return cannot
+// drift from the normal path's log format or action label.
+func (c *RunTmpfsCheck) recordRunTmpfsClean(used float64, removed int) {
+	c.d.RunTmpfsCleanups++
+	c.d.State.AppendLog(fmt.Sprintf(
+		"ACTION: run-tmpfs-clean — /run at %.0f%%, journal vacuumed to 16M, %d orphan .tmp removed",
+		used*100, removed))
+	c.d.Actions.WithLabelValues(wdeps.CheckRunTmpfs, "run_tmpfs_clean").Inc()
 }
 
 // fdID is the (dev,ino) identity of an open file — the same

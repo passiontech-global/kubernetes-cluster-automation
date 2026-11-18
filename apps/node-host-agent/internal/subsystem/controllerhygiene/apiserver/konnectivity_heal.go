@@ -32,6 +32,8 @@ import (
 	"syscall"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
 
@@ -74,6 +76,10 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 			"suspect: konnectivity-server unhealthy %d cycles "+
 				"(uds_ok=%v backends=%v) but no Ready workers — heal suppressed",
 			c.konnBadCycles, sockErr == nil, backends))
+		// No worker could use the tunnel, so these were not actionable
+		// bad cycles. Clearing the streak stops a cluster-wide outage
+		// from tripping the kill the moment the FIRST worker returns.
+		c.konnBadCycles = 0
 		return
 	}
 	pid := c.konnectivityPID()
@@ -113,6 +119,10 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 				"ready_backends=%v bad_cycles=%d",
 			pid, sockErr == nil, backends, c.konnBadCycles))
 		d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "dryrun").Inc()
+		// An action was taken (kill or its dry-run twin) — clear the
+		// streak so the next heal must rebuild 3 fresh bad cycles
+		// instead of chaining off the spent one every tick.
+		c.konnBadCycles = 0
 	default:
 		// off — the streak + gauge still surface the degradation.
 	}
@@ -180,10 +190,25 @@ func (c *FreezeCheck) konnectivityPID() int {
 	return 0
 }
 
-// readyWorkers counts Ready, non-control-plane nodes via the
-// apiserver client — the heal only makes sense while a worker can
-// actually dial the tunnel; a zero count suppresses the kill (a
-// cluster-wide outage is not a konnectivity fault).
+// isVirtualWorkerNodeLabels filters Liqo / virtual-kubelet /
+// external-capacity shadow nodes out of the ready-worker census.
+// They report Ready but run no real workload — a virtual node
+// cannot dial the tunnel, so treating it as a worker would permit
+// a disruptive kill with nobody left to benefit from the heal.
+// Presence-based checks (any liqo.io/type or provider value) keep
+// the census conservative: undercounting only suppresses a heal.
+func isVirtualWorkerNodeLabels(labels map[string]string) bool {
+	if labels["liqo.io/type"] != "" || labels["virtual-kubelet.io/provider"] != "" {
+		return true
+	}
+	return labels["type"] == "virtual-kubelet" ||
+		labels[corev1.LabelInstanceTypeStable] == "external"
+}
+
+// readyWorkers counts Ready, non-control-plane, non-virtual nodes
+// via the apiserver client — the heal only makes sense while a
+// real worker can actually dial the tunnel; a zero count suppresses
+// the kill (a cluster-wide outage is not a konnectivity fault).
 func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
 	client := c.d.EnsureClient()
 	if client == nil {
@@ -242,6 +267,13 @@ func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
 			return 0
 		}
 		for _, item := range list.Items {
+			// Virtual/shadow nodes report Ready but run no real
+			// kubelet or konnectivity-agent — counting one as a
+			// worker would green-light a tunnel kill during a
+			// genuine worker outage.
+			if isVirtualWorkerNodeLabels(item.Metadata.Labels) {
+				continue
+			}
 			if _, cp := item.Metadata.Labels["node-role.kubernetes.io/control-plane"]; cp {
 				continue
 			}

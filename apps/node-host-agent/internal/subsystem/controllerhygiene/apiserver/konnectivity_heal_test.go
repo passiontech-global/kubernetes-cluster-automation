@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/apiserver"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
@@ -123,6 +124,45 @@ func TestKonnectivityNoWorkerSuppressesHeal(t *testing.T) {
 	e.H.Cycle(context.Background())
 	if v := promtest.ToFloat64(e.H.KonnReadyBackends); v != -1 {
 		t.Fatalf("scrape-failed gauge=%v want -1", v)
+	}
+}
+
+// TestKonnectivityNoWorkerResetsStreak: cycles spent with no Ready
+// worker cannot justify a tunnel kill, so they must not accumulate
+// toward the 3-cycle gate. Without the reset, the FIRST bad cycle
+// after a worker returns would fire the kill on the back of a stale
+// streak from the outage; the streak has to rebuild from zero.
+func TestKonnectivityNoWorkerResetsStreak(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.K0sRunDir = t.TempDir() // UDS missing — bad every cycle
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.MkProc(t, 4242, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+
+	// Cluster-wide outage: three bad cycles but nobody to heal for.
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 0}}
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("heal fired with zero Ready workers: %v", e.Kills)
+	}
+
+	// A real worker returns — the heal needs three FRESH bad cycles.
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 0 {
+		t.Fatalf("stale no-worker streak fired the kill on worker return: %v", e.Kills)
+	}
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 || e.Kills[0].PID != 4242 {
+		t.Fatalf("kills=%v want one kill after the rebuilt 3-cycle streak", e.Kills)
 	}
 }
 
@@ -414,5 +454,85 @@ func TestKonnectivityBudgetNotSpentOffOrDryRun(t *testing.T) {
 				t.Fatalf("dry-run not logged:\n%s", log)
 			}
 		})
+	}
+}
+
+// virtualNodesTransport answers the node LIST with Ready nodes that
+// are all virtual/shadow capacity (Liqo, virtual-kubelet, external
+// instances) — none of them can dial the konnectivity tunnel.
+type virtualNodesTransport struct{}
+
+func (virtualNodesTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Path, "/api/v1/nodes") {
+		ready := `"status":{"conditions":[{"type":"Ready","status":"True"}]}`
+		items := []string{
+			`{"metadata":{"labels":{"type":"virtual-kubelet"}},` + ready + `}`,
+			`{"metadata":{"labels":{"virtual-kubelet.io/provider":"azure"}},` + ready + `}`,
+			`{"metadata":{"labels":{"liqo.io/type":"virtual-node"}},` + ready + `}`,
+			// The real k8s label is node.kubernetes.io/instance-type;
+			// the old bare "instance-type" check let these nodes
+			// count as Ready workers.
+			`{"metadata":{"labels":{"` + corev1.LabelInstanceTypeStable + `":"external"}},` + ready + `}`,
+		}
+		return &http.Response{
+			Status: "200 OK", StatusCode: http.StatusOK,
+			Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"items":[` + strings.Join(items, ",") + `]}`)),
+			Request: req,
+		}, nil
+	}
+	return nil, errors.New("virtualNodesTransport: unexpected url " + req.URL.String())
+}
+
+// A node list made entirely of virtual/shadow nodes must read as
+// zero usable workers — a kill there would sever the tunnel while
+// no real worker could use it.
+func TestKonnectivityVirtualNodesDoNotCountAsWorkers(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.K0sRunDir = t.TempDir() // UDS missing — bad every cycle
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: virtualNodesTransport{}}
+	e.MkProc(t, 4242, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+	for range 4 {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("virtual nodes counted as Ready workers: %v", e.Kills)
+	}
+	if log := e.LogLines(); !strings.Contains(log, "no Ready workers") {
+		t.Fatalf("virtual-node suppression not logged:\n%s", log)
+	}
+}
+
+// After a heal action the bad-cycle streak must restart: otherwise
+// every subsequent bad cycle re-fires the action (a chained latch).
+// Dry-run mode has no rate budget to mask the chain, so count the
+// DRY-RUN lines across six continuously-bad cycles.
+func TestKonnectivityDryRunHealResetsStreak(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.K0sRunDir = t.TempDir() // UDS missing — bad every cycle
+	e.H.Cfg.Sig13.Mode = cdeps.ModeDryRun
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 1}}
+	e.MkProc(t, 4242, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server"}, 600)
+	for range 6 {
+		e.H.Cycle(context.Background())
+	}
+	if n := strings.Count(e.LogLines(), "DRY-RUN: would kill konnectivity-server"); n != 2 {
+		t.Fatalf("dry-run action fired %d times across 6 bad cycles, want 2 "+
+			"(streak must restart after each action):\n%s", n, e.LogLines())
 	}
 }

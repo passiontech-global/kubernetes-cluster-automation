@@ -33,6 +33,71 @@ func TestSeqWidenAutoWidensInt8ColumnWithInt4Sequence(t *testing.T) {
 		!strings.Contains(allStdin, "pg_try_advisory_lock") {
 		t.Fatalf("missing advisory-locked ALTER SEQUENCE in stdins:\n%s\ncmds:\n%s", allStdin, fr.Joined())
 	}
+	// The ACCESS EXCLUSIVE lock must be bounded or it blocks apiserver nextval.
+	lockTO := strings.Index(allStdin, "SET lock_timeout = '2s'")
+	stmtTO := strings.Index(allStdin, "SET statement_timeout = '5s'")
+	alter := strings.Index(allStdin, "ALTER SEQUENCE")
+	if lockTO < 0 || stmtTO < 0 || alter < 0 || lockTO > stmtTO || stmtTO > alter {
+		t.Fatalf("want lock_timeout then statement_timeout then ALTER, got:\n%s", allStdin)
+	}
+}
+
+// A quoted sequence identifier from pg_get_serial_sequence must be
+// unquoted once and re-quoted safely in the DDL (no double-escaping).
+// A kine.id without an OWNED BY link makes pg_get_serial_sequence() NULL.
+// The generated pg_sequences WHERE must COALESCE to the same fallback name
+// the SELECT reports; otherwise it matches zero rows and MAX(max_value)
+// parses as 0 — silently disabling the widen guard.
+func TestSeqWidenFallbackSeqUsedInWhere(t *testing.T) {
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
+		{Substr: "pg_sequences", Out: "20|kine_id_seq\n1500000000|2147483647|integer\n"},
+	})
+	var seqSQL string
+	origRun := k.d.Cfg.Run
+	k.d.Cfg.Run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+		for i := range argv {
+			if strings.Contains(argv[i], "pg_sequences") {
+				seqSQL = argv[i]
+			}
+		}
+		return origRun(ctx, env, argv, stdin)
+	}
+	res := k.Cycle(context.Background())
+	if !res.seqWidened {
+		t.Fatalf("expected widen with fallback seq, notes=%v", res.notes)
+	}
+	wantWhere := "WHERE schemaname = current_schema() AND sequencename = COALESCE("
+	if !strings.Contains(seqSQL, wantWhere) || !strings.Contains(seqSQL, ", 'kine_id_seq')") {
+		t.Fatalf("pg_sequences WHERE lacks the fallback COALESCE:\n%s", seqSQL)
+	}
+	if !strings.Contains(seqSQL, "COALESCE(MAX(max_value),0)") {
+		t.Fatalf("single-row MAX shape changed:\n%s", seqSQL)
+	}
+}
+
+func TestSeqWidenQuotedSequenceName(t *testing.T) {
+	k, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "inspect", Out: "true"},
+		{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
+		{Substr: "pg_sequences", Out: "20|\"my\"\"seq\"\n1500000000|2147483647|integer\n"},
+	})
+	var stdins []string
+	origRun := k.d.Cfg.Run
+	k.d.Cfg.Run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+		if stdin != "" {
+			stdins = append(stdins, stdin)
+		}
+		return origRun(ctx, env, argv, stdin)
+	}
+	res := k.Cycle(context.Background())
+	if !res.seqWidened {
+		t.Fatalf("expected seqWidened=true for quoted name, notes=%v", res.notes)
+	}
+	if !strings.Contains(strings.Join(stdins, "\n"), `ALTER SEQUENCE "my""seq" AS bigint`) {
+		t.Fatalf("quoted name not re-quoted correctly:\n%s", strings.Join(stdins, "\n"))
+	}
 }
 
 func TestSeqWidenSkipsLockBusyAndReadOnlyAndDisabled(t *testing.T) {

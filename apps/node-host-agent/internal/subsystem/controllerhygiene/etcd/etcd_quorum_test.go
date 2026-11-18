@@ -55,6 +55,34 @@ func TestEtcdCorruptAlarmBlocksRescueEvenAboveSizeLimit(t *testing.T) {
 	}
 }
 
+// proto3 JSON omits scalar zero fields — a missing "leader" must decode as
+// leader=0 (no leader) and enter the degraded latch, not silently vanish.
+func TestEtcdMissingLeaderFieldLatchesNoLeader(t *testing.T) {
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: `[{"Endpoint":"https://127.0.0.1:2379","Status":{"dbSize":100,"dbSizeInUse":50}}]`,
+	}
+	e.wireEtcdGuard(t, g)
+	e.H.Cycle(context.Background())
+	if !e.H.State.Exists(cdeps.StateEtcdQuorumDegraded) {
+		t.Fatal("expected StateEtcdQuorumDegraded when leader field is absent (leader=0)")
+	}
+}
+
+// Until the first p99 sample lands the gauge advertises -1 ("unknown"),
+// never a misleading healthy-looking 0.
+func TestEtcdWALFsyncP99UnknownIsMinusOne(t *testing.T) {
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: etcdStatusFullJSON(1<<20, 1<<19, 123, false),
+	}
+	e.wireEtcdGuard(t, g) // EtcdMetricsFn returns "" → no measurement
+	e.H.Cycle(context.Background())
+	if got := promtest.ToFloat64(e.H.EtcdWALFsyncP99); got != -1 {
+		t.Fatalf("EtcdWALFsyncP99 = %v, want -1 when unmeasured", got)
+	}
+}
+
 func TestEtcdStuckLearnerLatchesAfterMaxAge(t *testing.T) {
 	e := fixture(t)
 	now := time.Unix(1700000000, 0)
@@ -155,13 +183,15 @@ func TestEtcdWALFsyncP99AndLeaderStormHysteresis(t *testing.T) {
 	}
 
 	// Quiet period (deltaTotal == 0, same cumulative counts) for 3 cycles ->
-	// reports 0s (does not pin stale high p99) and exits latch.
+	// the LAST measured p99 is retained for the gauge (no stale-0 lie) but
+	// it is NOT a new measurement, so no fresh fsyncHigh streak can form
+	// and the degraded latch clears after 3 quiet/clean cycles.
 	for i := 0; i < 3; i++ {
 		now = now.Add(time.Minute)
 		e.H.Cycle(context.Background())
 	}
-	if got := promtest.ToFloat64(e.H.EtcdWALFsyncP99); got != 0 {
-		t.Fatalf("quiet delta==0 EtcdWALFsyncP99 = %v, want 0", got)
+	if got := promtest.ToFloat64(e.H.EtcdWALFsyncP99); got < 0.20 || got > 0.25 {
+		t.Fatalf("quiet delta==0 EtcdWALFsyncP99 = %v, want retained ~0.235", got)
 	}
 	if e.H.State.Exists(cdeps.StateEtcdQuorumDegraded) {
 		t.Fatal("expected latch to clear after 3 quiet/clean cycles")

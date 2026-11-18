@@ -20,6 +20,19 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
+// TestParseMountSourcesUnescapes: mountinfo octal escapes in the mount
+// source are decoded before a loop device is compared against them.
+func TestParseMountSourcesUnescapes(t *testing.T) {
+	data := []byte("36 35 98:0 / /mnt rw - ext4 /dev/loop\\0400 rw\n" +
+		"37 36 98:1 / /other rw shared:9 - ext4 /dev/loop1 rw\n")
+	got := parseMountSources(data)
+	for _, want := range []string{"/dev/loop 0", "/dev/loop1"} {
+		if !got[want] {
+			t.Fatalf("parseMountSources missing %q: %v", want, got)
+		}
+	}
+}
+
 // ctrDeps builds a minimal *wdeps.Deps over the shared fixture —
 // the same construction workerhygiene.New does, minus the parent
 // package (importing it here would cycle).

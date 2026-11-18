@@ -119,6 +119,17 @@ func (c *GuardCheck) Run(ctx context.Context) {
 		return
 	}
 
+	// ABSOLUTE block: eventpurge + etcdmaint issue `alarm disarm` and
+	// `defrag` — if the alarm list could not be read this cycle (or a
+	// CORRUPT alarm was ever seen), running them would destroy the exact
+	// BoltDB/WAL evidence we cannot verify. No remediation, ever.
+	if aerr != nil || c.corruptBlocked() {
+		c.d.State.AppendLog(
+			"ACTION: etcdguard alarm state unverifiable/CORRUPT — blocking eventpurge + etcdmaint to preserve BoltDB/WAL evidence")
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "alarm_blocked").Inc()
+		return
+	}
+
 	if !c.d.State.RateOK(cdeps.FileRateEtcdGuard,
 		c.d.Cfg.EtcdGuard.MinRun) {
 		c.d.State.SuspectLog(cdeps.CheckEtcd, fmt.Sprintf(
@@ -276,9 +287,12 @@ func (c *GuardCheck) VerifySnapshots() {
 }
 
 type etcdStatusInfo struct {
-	dbSize    int64
-	dbUse     int64
-	leader    *uint64
+	dbSize int64
+	dbUse  int64
+	// proto3 JSON omits scalar zero fields: leader=0 (no leader) arrives
+	// with the field ABSENT, so decoding into a plain uint64 is essential —
+	// a *uint64 would decode nil and hide leader loss.
+	leader    uint64
 	isLearner bool
 }
 
@@ -292,10 +306,10 @@ func (c *GuardCheck) etcdStatus(ctx context.Context) (etcdStatusInfo, error) {
 	}
 	var arr []struct {
 		Status struct {
-			DBSize      int64   `json:"dbSize"`
-			DBSizeInUse int64   `json:"dbSizeInUse"`
-			Leader      *uint64 `json:"leader"`
-			IsLearner   bool    `json:"isLearner"`
+			DBSize      int64  `json:"dbSize"`
+			DBSizeInUse int64  `json:"dbSizeInUse"`
+			Leader      uint64 `json:"leader"`
+			IsLearner   bool   `json:"isLearner"`
 		} `json:"Status"`
 	}
 	if err := json.Unmarshal(b, &arr); err != nil {

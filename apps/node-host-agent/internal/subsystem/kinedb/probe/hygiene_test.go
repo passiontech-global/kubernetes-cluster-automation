@@ -39,6 +39,35 @@ var hygieneRules = append(append([]testutil.ExecRule{}, kdepstest.ProbeOKRules..
 	testutil.ExecRule{Substr: "pg_replication_slots", Out: ""},
 )
 
+// The read-only catalog census must use the same sequence-name fallback
+// in its pg_sequences WHERE as in the reported identity. Without it a
+// kine.id lacking OWNED BY matches zero rows and parseSeqCliffLines drops
+// the whole seq-cliff reading.
+func TestHygieneCatalogFallbackSeqUsedInWhere(t *testing.T) {
+	p, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_sequences", Out: "5\n0\n10|100\n20\n1500000000|2147483647|integer\n"},
+	})
+	var seqSQL string
+	origRun := p.d.Cfg.Run
+	p.d.Cfg.Run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+		for i := range argv {
+			if strings.Contains(argv[i], "pg_sequences") {
+				seqSQL = argv[i]
+			}
+		}
+		return origRun(ctx, env, argv, stdin)
+	}
+	p.hygieneCatalog(context.Background(), "kine-postgres", "postgres", "secret",
+		&hygieneResult{}, func(string) {})
+	wantWhere := "WHERE schemaname = current_schema() AND sequencename = COALESCE("
+	if !strings.Contains(seqSQL, wantWhere) || !strings.Contains(seqSQL, ", 'kine_id_seq')") {
+		t.Fatalf("pg_sequences WHERE lacks the fallback COALESCE:\n%s", seqSQL)
+	}
+	if !strings.Contains(seqSQL, "COALESCE(MAX(max_value),0)") {
+		t.Fatalf("single-row MAX shape changed:\n%s", seqSQL)
+	}
+}
+
 func TestProbeCycleHygieneEmitsAllSeries(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
 	res := k.Cycle(context.Background())

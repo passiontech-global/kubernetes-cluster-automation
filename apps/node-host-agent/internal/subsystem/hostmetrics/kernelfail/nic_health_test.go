@@ -40,6 +40,10 @@ func seedNICFixture(t *testing.T, f *fixture) *nicFixture {
 			t.Fatal(err)
 		}
 	}
+	// A real uplink has a sysfs device link (a bond master uses a
+	// bonding dir instead) — updateNICHealth requires one of the
+	// two before a signature may arm the latch.
+	writePrefailFile(t, filepath.Join(f.r.deps.SysClassNetDir, "eth0", "device"), "")
 	// Default route via eth0 (metric 100); a lower-metric virtual
 	// default route must lose to the physical one.
 	writePrefailFile(t, nf.route,
@@ -283,5 +287,68 @@ func TestPhysicalUplinkIfaceRejectsSplitTunnel(t *testing.T) {
 			"tun0\t00000000\t010011AC\t0003\t0\t0\t10\t00000080\t0\t0\t0\n")
 	if got := physicalUplinkIface(nf.route); got != "" {
 		t.Fatalf("uplink=%q want empty — no true default route", got)
+	}
+}
+
+// TestNICHasPhysicalSysfs pins the OR rule: either a device symlink
+// (physical NIC) or a bonding dir (bond master, device-less by
+// design) is enough; neither means inconclusive.
+func TestNICHasPhysicalSysfs(t *testing.T) {
+	root := t.TempDir()
+	if nicHasPhysicalSysfs(root, "veth0") {
+		t.Fatal("virtual iface with no sysfs entry reported physical")
+	}
+	writePrefailFile(t, filepath.Join(root, "eth0", "device"), "")
+	if !nicHasPhysicalSysfs(root, "eth0") {
+		t.Fatal("device entry not accepted as physical sysfs backing")
+	}
+	if err := os.MkdirAll(filepath.Join(root, "bond0", "bonding"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !nicHasPhysicalSysfs(root, "bond0") {
+		t.Fatal("bonding dir not accepted as physical sysfs backing")
+	}
+}
+
+// TestNICNoSysfsDeviceNeverLatches is the virtual-iface regression:
+// /proc/net/route alone is not proof of a physical uplink. Without
+// the sysfs device/bonding backing, even a huge carrier flap must
+// stay inconclusive instead of arming state-host-network-problems.
+func TestNICNoSysfsDeviceNeverLatches(t *testing.T) {
+	f := kfixture(t)
+	nf := seedNICFixture(t, f)
+	if err := os.Remove(filepath.Join(f.r.deps.SysClassNetDir, "eth0", "device")); err != nil {
+		t.Fatal(err)
+	}
+	nf.setCounters(t, 100, 0, 0)
+	f.r.updateNICHealth()
+	nf.advance(t, f, 6*time.Minute)
+	nf.setCounters(t, 200, 0, 0) // +100, far past the flap threshold
+	f.r.updateNICHealth()
+	if nicLatchSet(f.r) {
+		t.Fatal("iface without sysfs device/bonding armed the NIC latch")
+	}
+}
+
+// TestNICBondingMasterLatches proves the other arm of the OR: a
+// device-less bond master is still a valid physical uplink and a
+// real flap on it must latch.
+func TestNICBondingMasterLatches(t *testing.T) {
+	f := kfixture(t)
+	nf := seedNICFixture(t, f)
+	ifaceDir := filepath.Join(f.r.deps.SysClassNetDir, "eth0")
+	if err := os.Remove(filepath.Join(ifaceDir, "device")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(ifaceDir, "bonding"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nf.setCounters(t, 100, 0, 0)
+	f.r.updateNICHealth()
+	nf.advance(t, f, 6*time.Minute)
+	nf.setCounters(t, 105, 0, 0)
+	f.r.updateNICHealth()
+	if !nicLatchSet(f.r) {
+		t.Fatal("bond master with a real carrier flap did not latch")
 	}
 }

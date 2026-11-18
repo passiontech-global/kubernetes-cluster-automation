@@ -32,11 +32,14 @@ func DefaultChownFD(_ string, fd, uid, gid int) error {
 	return unix.Fchown(fd, uid, gid)
 }
 
-// WithNoFollowFD opens path with O_NOFOLLOW, verifies via fstat that the held
-// fd is a plain directory (or regular file when allowFile is true), and
-// invokes fn on that fd so callers avoid Lstat-then-chown/chmod symlink races.
+// WithNoFollowFD opens path with O_NOFOLLOW|O_NONBLOCK, verifies via
+// fstat that the held fd is a plain directory (or regular file when
+// allowFile is true), and invokes fn on that fd so callers avoid
+// Lstat-then-chown/chmod symlink races. O_NONBLOCK is load-bearing:
+// a FIFO substituted at path must not block the OS thread in open()
+// before fstat can reject it (unix.Open is not Go-netpoller aware).
 func WithNoFollowFD(path string, allowFile bool, fn func(fd int, st *unix.Stat_t) error) error {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return fmt.Errorf("open %s (nofollow): %w", path, err)
 	}

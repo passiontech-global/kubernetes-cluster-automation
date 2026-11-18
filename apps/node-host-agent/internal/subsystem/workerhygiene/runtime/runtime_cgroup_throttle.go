@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -51,6 +52,13 @@ const (
 
 	cpuCFSMinPeriodDelta = 20
 	cpuCFSConfirmCycles  = 3
+	// cpuHostIdleMinJiffies is the minimum /proc/stat delta before an idle
+	// ratio is published — below it the tickless kernel's NOHZ jitter makes
+	// the ratio meaningless (and a first read would be a since-boot value).
+	cpuHostIdleMinJiffies = 10
+	// cgroupSuspectLogCadence throttles the per-pod CPU CFS suspect lines —
+	// a throttle episode lasts many cycles, one line per hour is ample.
+	cgroupSuspectLogCadence = time.Hour
 )
 
 type cpuStatSample struct {
@@ -289,14 +297,16 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			delete(c.evented, dir)
 		}
 	}
-	for dir := range c.prevCPUStat {
-		if !seen[dir] {
-			delete(c.prevCPUStat, dir)
+	// CPU CFS deltas are keyed by cpu.stat PATH (pod slice + child scopes),
+	// not by pod dir — map each key back to its slice before the prune.
+	for key := range c.prevCPUStat {
+		if !seen[cpuStatSliceOf(key)] {
+			delete(c.prevCPUStat, key)
 		}
 	}
-	for dir := range c.cpuStreak {
-		if !seen[dir] {
-			delete(c.cpuStreak, dir)
+	for key := range c.cpuStreak {
+		if !seen[cpuStatSliceOf(key)] {
+			delete(c.cpuStreak, key)
 		}
 	}
 	for dir := range c.cpuEvented {
@@ -319,33 +329,37 @@ func (c *CgroupThrottleCheck) readHostCPUIdleRatio() (float64, bool) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 5 {
+		// Only the first 8 jiffy columns (user..steal) are the CPU time
+		// accounting contract; newer kernels append guest/guest_nice etc.
+		// Summing those double-counts the guest time already in user.
+		if len(fields) < 9 {
 			return 0, false
 		}
 		var total, idle int64
-		for i, raw := range fields[1:] {
+		for _, raw := range fields[1:9] {
 			v, perr := strconv.ParseInt(raw, 10, 64)
 			if perr != nil {
 				return 0, false
 			}
 			total += v
-			if i == 3 { // idle column (0=user,1=nice,2=system,3=idle)
-				idle = v
-			}
 		}
-		if total <= 0 {
+		idle, _ = strconv.ParseInt(fields[4], 10, 64) // fields[4] = field 4 "idle"
+
+		// First read: record the baseline only. A since-boot cumulative
+		// ratio is NOT current idle and must never gate a heal decision.
+		if !c.hasPrevHostCPU || total <= c.prevHostCPUTotal || idle < c.prevHostCPUIdle {
+			c.prevHostCPUTotal, c.prevHostCPUIdle, c.hasPrevHostCPU = total, idle, true
 			return 0, false
 		}
-		var ratio float64
-		if c.hasPrevHostCPU && total > c.prevHostCPUTotal && idle >= c.prevHostCPUIdle {
-			ratio = float64(idle-c.prevHostCPUIdle) / float64(total-c.prevHostCPUTotal)
-		} else {
-			ratio = float64(idle) / float64(total)
+		dTotal := total - c.prevHostCPUTotal
+		if dTotal < cpuHostIdleMinJiffies {
+			// NOHZ jitter — keep the baseline so the delta accumulates
+			// until it is statistically meaningful; no ratio this cycle.
+			return 0, false
 		}
-		c.prevHostCPUTotal = total
-		c.prevHostCPUIdle = idle
-		c.hasPrevHostCPU = true
-		return ratio, true
+		dIdle := idle - c.prevHostCPUIdle
+		c.prevHostCPUTotal, c.prevHostCPUIdle = total, idle
+		return float64(dIdle) / float64(dTotal), true
 	}
 	return 0, false
 }
@@ -378,42 +392,76 @@ func readCPUStat(path string) (cpuStatSample, bool) {
 	return s, gotPeriods && gotThrottled
 }
 
+// cpuStatPathsForSlice returns the pod-level cpu.stat plus every child
+// *.scope/cpu.stat. Burstable pods carry their CPU quota on the container
+// scopes, so a pod-slice-only read would see zero throttling there.
+func cpuStatPathsForSlice(dir string) []string {
+	paths := []string{filepath.Join(dir, "cpu.stat")}
+	if m, err := filepath.Glob(filepath.Join(dir, "*.scope", "cpu.stat")); err == nil {
+		paths = append(paths, m...)
+	}
+	return paths
+}
+
+// cpuStatSliceOf maps a path-keyed CPU CFS ledger entry back to its pod slice.
+func cpuStatSliceOf(key string) string {
+	d := filepath.Dir(key)
+	if filepath.Ext(d) == ".scope" {
+		return filepath.Dir(d)
+	}
+	return d
+}
+
 func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, dir string,
 	hostIdleRatio float64, hostIdleOK bool, podByUID map[string]*corev1.Pod) {
-	cur, ok := readCPUStat(filepath.Join(dir, "cpu.stat"))
-	if !ok {
-		return
+	var worstPath string
+	var worstDP, worstDT int64
+	var worstRatio float64
+	var worstStreak int
+	fired := false
+	for _, path := range cpuStatPathsForSlice(dir) {
+		cur, ok := readCPUStat(path)
+		if !ok {
+			continue
+		}
+		prev, hadPrev := c.prevCPUStat[path]
+		c.prevCPUStat[path] = cur
+		if !hadPrev || cur.periods < prev.periods || cur.throttled < prev.throttled {
+			c.cpuStreak[path] = 0
+			continue
+		}
+		dPeriods := cur.periods - prev.periods
+		dThrottled := cur.throttled - prev.throttled
+		if dPeriods < cpuCFSMinPeriodDelta {
+			c.cpuStreak[path] = 0
+			continue
+		}
+		ratio := float64(dThrottled) / float64(dPeriods)
+		if !(ratio > c.d.Cfg.Wave3.CPUCFSThrottleRatio && hostIdleOK &&
+			hostIdleRatio >= c.d.Cfg.Wave3.CPUHostIdleMinRatio) {
+			c.cpuStreak[path] = 0
+			continue
+		}
+		c.cpuStreak[path]++
+		if c.cpuStreak[path] < cpuCFSConfirmCycles {
+			continue
+		}
+		fired = true
+		if ratio > worstRatio {
+			worstRatio, worstDP, worstDT = ratio, dPeriods, dThrottled
+			worstPath, worstStreak = path, c.cpuStreak[path]
+		}
 	}
-	prev, hadPrev := c.prevCPUStat[dir]
-	c.prevCPUStat[dir] = cur
-	if !hadPrev || cur.periods < prev.periods || cur.throttled < prev.throttled {
-		c.cpuStreak[dir] = 0
-		return
-	}
-	dPeriods := cur.periods - prev.periods
-	dThrottled := cur.throttled - prev.throttled
-	if dPeriods < cpuCFSMinPeriodDelta {
-		c.cpuStreak[dir] = 0
+	if !fired {
 		delete(c.cpuEvented, dir)
-		return
-	}
-	throttleRatio := float64(dThrottled) / float64(dPeriods)
-	throttled := throttleRatio > c.d.Cfg.Wave3.CPUCFSThrottleRatio &&
-		hostIdleOK && hostIdleRatio >= c.d.Cfg.Wave3.CPUHostIdleMinRatio
-	if !throttled {
-		c.cpuStreak[dir] = 0
-		delete(c.cpuEvented, dir)
-		return
-	}
-	c.cpuStreak[dir]++
-	if c.cpuStreak[dir] < cpuCFSConfirmCycles {
 		return
 	}
 	c.d.Series.PodCgroupCPUThrottled++
 	uid := podUIDFromSlice(dir)
-	c.d.State.AppendLog(fmt.Sprintf(
-		"suspect: cgroup-pod-throttle pod uid=%s cpu.stat throttled=%d/%d (%.1f%%) host_idle=%.1f%% (%dx)",
-		uid, dThrottled, dPeriods, throttleRatio*100, hostIdleRatio*100, c.cpuStreak[dir]))
+	c.d.State.SuspectLog("cgroup-cfs-"+dir, fmt.Sprintf(
+		"suspect: cgroup-pod-throttle pod uid=%s %s throttled=%d/%d (%.1f%%) host_idle=%.1f%% (%dx)",
+		uid, filepath.Base(worstPath), worstDT, worstDP, worstRatio*100,
+		hostIdleRatio*100, worstStreak), cgroupSuspectLogCadence)
 	if !c.cpuEvented[dir] {
 		pod := podByUID[uid]
 		if pod == nil || c.d.Cfg.Client == nil {
@@ -422,7 +470,7 @@ func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, dir string
 		}
 		if err := c.d.EmitPodEvent(ctx, pod, "cpu-cfs", "PodCPUCFSThrottled",
 			fmt.Sprintf("pod cgroup CPU CFS throttled %d/%d periods (%.1f%%) while host CPU idle=%.1f%% — CPU limit is starving pod despite ample host capacity",
-				dThrottled, dPeriods, throttleRatio*100, hostIdleRatio*100)); err == nil {
+				worstDT, worstDP, worstRatio*100, hostIdleRatio*100)); err == nil {
 			c.cpuEvented[dir] = true
 			c.d.Actions.WithLabelValues(wdeps.CheckCgroupThrottle, "cpu_event").Inc()
 		}
