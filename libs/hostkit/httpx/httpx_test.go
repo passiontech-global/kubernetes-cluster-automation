@@ -370,6 +370,60 @@ func TestCloseRacesServe(t *testing.T) {
 	}
 }
 
+// Shutdown must tolerate a nil receiver, a zero-value Server and a
+// nil ctx — a defensive teardown path must never itself panic. A
+// nil ctx on a real Server still gets the drain budget (it behaves
+// like Background), not an immediate return.
+func TestShutdownNilReceiverContextAndZeroServer(t *testing.T) {
+	// A typed nil keeps staticcheck's SA1012 quiet while still
+	// exercising the exact nil-ctx path a defensive caller hits.
+	var nilCtx context.Context
+	var nilSrv *Server
+	if err := nilSrv.Shutdown(nilCtx); err != nil {
+		t.Fatalf("nil receiver Shutdown = %v, want nil", err)
+	}
+	zero := &Server{}
+	if err := zero.Shutdown(nilCtx); err != nil {
+		t.Fatalf("zero-value Server Shutdown = %v, want nil", err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv, err := New("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}), Opts{ShutdownBudget: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := srv.Serve()
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		cl := &http.Client{Timeout: 5 * time.Second}
+		resp, _ := cl.Get("http://" + srv.Addr() + "/slow")
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}()
+	<-started
+	start := time.Now()
+	err = srv.Shutdown(nilCtx) // nil ctx must not panic, and still budget
+	elapsed := time.Since(start)
+	close(release)
+	<-clientDone
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("nil-ctx Shutdown err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("nil-ctx Shutdown took %v — drain budget not applied", elapsed)
+	}
+	if serveErr := <-served; serveErr != nil {
+		t.Fatalf("serve after nil-ctx Shutdown = %v, want nil", serveErr)
+	}
+}
+
 func TestListenLoopback(t *testing.T) {
 	ln, err := ListenLoopback(0)
 	if err != nil {

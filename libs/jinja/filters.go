@@ -40,6 +40,19 @@ const maxIndentWidth = 10_000
 // unbounded CPU/memory sink.
 const parseMaxBytes = 4 << 20 // 4 MiB
 
+// outputSizeCap is the post-serialization byte ceiling shared by
+// the codec/format filters: a value that walked inside its step
+// budget can still marshal to an unbounded document (YAML quotes,
+// indentation and line breaks amplify every node). Kept as a tiny
+// helper so the cap branch is testable without building a 16 MiB
+// document under -race.
+func outputSizeCap(n int, filter string) error {
+	if n > maxStringBytes {
+		return fmt.Errorf("%s: output exceeds %d bytes", filter, maxStringBytes)
+	}
+	return nil
+}
+
 // hexish reports whether s looks like a hex number (0x/0X prefix,
 // after python's sign/whitespace conventions): strconv.ParseFloat
 // accepts "0x1p-2"-style hex floats python's float() rejects, so the
@@ -413,6 +426,13 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		b, err := yaml3.Marshal(node)
 		if err != nil {
+			return nil, err
+		}
+		// Marshal can amplify a wide-but-in-budget value well past
+		// the string cap (quotes, indentation, line breaks). Fail
+		// instead of returning an unbounded document — the same
+		// contract |join / |regex_replace / ~ already honor.
+		if err := outputSizeCap(len(b), "to_yaml"); err != nil {
 			return nil, err
 		}
 		return string(b), nil

@@ -170,7 +170,7 @@ const (
 )
 
 // HeartbeatSweptNames is every NodeCondition the nodereporter owns
-// and re-stamps LastHeartbeatTime on each cycle while alive: all 49
+// and re-stamps LastHeartbeatTime on each cycle while alive: all 62
 // latch-backed conditions plus ReadonlyFilesystem (the NPD mount
 // monitor rides the same heartbeat patch). InodePressure is in since
 // inode-pressure: the hostmetrics inode-pressure latch sets/clears it and
@@ -260,12 +260,15 @@ var HangPreCordonNames = []string{
 	// degrading and new pods must stay off it.
 	EphemeralPortPressure, NeighborTablePressure,
 	NetfilterLockWedged, CSIRegistrationWedged,
-	// Wave-3 self-healing additions: mount-table exhaustion and eBPF
-	// resource exhaustion take the 2m hang fuse so precordon isolates
-	// the worker before kernel ENOSPC/ENOMEM. EtcdQuorumDegraded stays
-	// off HangPreCordonNames (control-plane quorum degradation is handled
-	// via StormGateNames, not worker hang precordon).
-	MountTablePressure, EBPFResourcePressure,
+	// Wave-3 self-healing addition: mount-table exhaustion takes the 2m
+	// hang fuse so precordon isolates the worker before kernel ENOSPC.
+	// EBPFResourcePressure deliberately does NOT live here: cordon does
+	// not shrink BPF maps (the Cilium datapath keeps every prog/pin), so
+	// the 2m fuse only starts a cluster-wide cordon domino. Like
+	// CiliumBPFMapPressure it stays in StormGateNames +
+	// HeartbeatSweptNames only. EtcdQuorumDegraded stays off too
+	// (control-plane quorum degradation is handled via StormGateNames).
+	MountTablePressure,
 }
 
 // ClockSkewPreCordonNames are the clock-health conditions on the

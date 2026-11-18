@@ -183,6 +183,7 @@ jobs:
               elif ($p | startswith("libs/hostkit/nodecond/")) or ($p | startswith("libs/hostkit/timex/")) then ["node-host-agent","node-automation-controller"]
               elif ($p | startswith("libs/hostkit/fsx/")) then ["node-host-agent"]
               elif ($p | startswith("libs/hostkit/ledger/")) then ["node-host-agent","node-automation-controller"]
+              elif $p == "mise.toml" then ["node-host-agent","node-automation-controller","webhook-dispatcher"]
               elif $p == ".dockerignore" then ["node-host-agent","node-automation-controller","webhook-dispatcher"]
               else [] end;
             [ $changed | split("\n")[] | select(length > 0) | consumers(.) ]

@@ -168,6 +168,35 @@ linters:
             - "!**/kdepstest/**"
           deny:
             - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil", desc: "internal/testutil is test scaffolding; production code must not import it"}
+        # These helpers are ordinary (non-_test.go) packages so sibling
+        # EXTERNAL test packages can import them — which also makes
+        # them importable by production code. Deny that: a shipped
+        # binary would carry fake clients/clock seams, and importing
+        # probetest would arm its snapshot-mutation tripwire in prod.
+        # The helper packages themselves and the testutil shims that
+        # re-export testhelp are the sanctioned non-test importers;
+        # *_test.go are exempt here (and excluded from depguard below).
+        no-test-helpers-in-production:
+          files:
+            - "**/node-automation-controller/**"
+            - "!**/node-automation-controller/**/*_test.go"
+            - "!**/node-automation-controller/internal/testutil/**"
+            - "!**/node-automation-controller/internal/platform/testhelp/**"
+            - "!**/node-automation-controller/internal/health/probetest/**"
+            - "**/node-host-agent/**"
+            - "!**/node-host-agent/**/*_test.go"
+            - "!**/node-host-agent/internal/testutil/**"
+            - "!**/node-host-agent/internal/subsystem/workerhygiene/wdepstest/**"
+            - "!**/node-host-agent/internal/subsystem/controllerhygiene/cdepstest/**"
+            - "!**/node-host-agent/internal/subsystem/kinedb/kdepstest/**"
+          deny:
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil", desc: "internal/testutil is test scaffolding; production code must not import it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil", desc: "internal/testutil is test scaffolding; production code must not import it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp", desc: "platform/testhelp is test scaffolding; production code must not import it — use the real platform seams"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest", desc: "health/probetest is test scaffolding; production code must not import it — it arms the snapshot mutation guard"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest", desc: "wdepstest is a test fixture; production code must not import it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdepstest", desc: "cdepstest is a test fixture; production code must not import it"}
+            - {pkg: "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest", desc: "kdepstest is a test fixture; production code must not import it"}
         # ===== node-host-agent sibling-subsystem isolation =====
         # One rule per subsystem (each scoped to its own tree and
         # denying the other eleven), because a single all-roots rule

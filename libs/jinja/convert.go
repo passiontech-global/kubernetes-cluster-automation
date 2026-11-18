@@ -56,7 +56,17 @@ func yamlValueAt(v any, depth int, steps *int) (*yaml3.Node, error) {
 		return nil, fmt.Errorf("yaml: value walk exceeds %d steps (exponentially branching value?)", walkMaxSteps)
 	}
 	if depth > walkMaxDepth {
-		return yamlLeafNode("[...]")
+		// Build the elision leaf directly. yamlLeafNode would run a
+		// full yaml Encode + re-parse for EVERY branch that sits at
+		// the depth cap — a branching cycle (l.V=[l,l]) hits those
+		// leaves ~walkMaxSteps times and spent 3–10s under -race.
+		// This marker is a static scalar; no emitter round-trip is
+		// needed for a value that is always exactly "[...]".
+		return &yaml3.Node{
+			Kind:  yaml3.ScalarNode,
+			Tag:   "!!str",
+			Value: "[...]",
+		}, nil
 	}
 	switch t := v.(type) {
 	case *OMap:

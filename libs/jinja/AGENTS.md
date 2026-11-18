@@ -29,7 +29,8 @@ the inversion point), no knowledge of any consumer.
 | `convert.go` | `to_json`/`to_yaml`/`to_nice_yaml` (order-preserving), `from_json`/`from_yaml` |
 | `lookup.go` | `lookup('file'|'pipe', …)` dispatch via `Env` hooks |
 | `cache.go` | Compiled-AST + regex compile caches — CLOCK (second-chance) rings behind `sync.RWMutex` (thread-safety contract below) |
-| `omap.go` | `OMap` ordered map, YAML decode (`DecodeYAML`), typed getters |
+| `omap.go` | `OMap` ordered map + typed getters (`Str`, `Bool`, `BoolDef`, `Int`, `Slice`, `StrMap`, `Items`) |
+| `omap_yaml.go` | `DecodeYAML` — order-preserving YAML decode into `*OMap` (yaml3 node walk with depth/step budgets, `<<` merge keys, scalar-key normalization) |
 
 ## The OMap ordering guarantee
 

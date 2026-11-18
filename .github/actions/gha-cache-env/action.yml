@@ -7,5 +7,5 @@ description: >-
   JS actions — never into shell steps — which is why moon's image task
   checks for them before enabling the gha cache exporter.
 runs:
-  using: node20
+  using: node24
   main: index.js

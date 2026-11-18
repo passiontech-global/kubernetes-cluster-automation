@@ -9,9 +9,12 @@ import (
 // allConditionNames enumerates every exported condition constant BY
 // IDENTIFIER — a renamed or deleted constant breaks this file's
 // compilation instead of silently drifting out of the test's reach.
-// 60 latch-backed + 7 monitor/kubelet-owned = 67.
+// 62 latch-backed + 6 non-heartbeat-owned (4 kubelet/permanent +
+// ReadonlyFilesystem + the LocalRemediationInProgress coordination
+// condition) = 68. The constant must be enumerated here or it silently
+// escapes every coverage assertion below.
 var allConditionNames = []string{
-	// Latch-backed (60).
+	// Latch-backed (62).
 	NodeOverloaded, WatchdogStale,
 	CiliumAgentDown, CiliumInitStuck,
 	KubeletRuntimeStall, DNSFallbackActive, DNSResolvStale,
@@ -36,12 +39,15 @@ var allConditionNames = []string{
 	EphemeralPortPressure, NeighborTablePressure,
 	NetfilterLockWedged, CSIRegistrationWedged,
 	MountTablePressure, EBPFResourcePressure, EtcdQuorumDegraded,
-	// Monitor- and kubelet-owned (7) — HostNetworkProblems sits here
+	// Monitor- and kubelet-owned (6) — HostNetworkProblems sits here
 	// by declaration block but IS heartbeat-managed now that the
 	// kernelfail NIC-health guard latches it (see notHeartbeatManaged).
 	KernelDeadlock, ReadonlyFilesystem, InodePressure,
 	HostNetworkProblems, ClusterNetworkProblems,
 	HostNetworkProblem, ClusterNetworkProblem,
+	// L1 coordination condition: stamped from a node annotation, never
+	// heartbeat-swept by the agent's own latch producer.
+	CondLocalRemediation,
 }
 
 // notHeartbeatManaged is the complement inside allConditionNames —
@@ -52,6 +58,7 @@ var notHeartbeatManaged = []string{
 	KernelDeadlock, // permanent latch, never reconciles False
 	ClusterNetworkProblems,
 	HostNetworkProblem, ClusterNetworkProblem,
+	CondLocalRemediation, // L1 annotation, not an agent latch
 }
 
 // foreignStormGateNames are StormGateNames members with no constant
@@ -71,8 +78,8 @@ var legacyControllerSpellings = []string{
 }
 
 func TestConstantsNonEmptyAndUnique(t *testing.T) {
-	if len(allConditionNames) != 67 {
-		t.Fatalf("allConditionNames = %d entries, want 67 (60 latch-backed + 7 monitor/kubelet)",
+	if len(allConditionNames) != 68 {
+		t.Fatalf("allConditionNames = %d entries, want 68 (62 latch-backed + 6 non-heartbeat-owned)",
 			len(allConditionNames))
 	}
 	seen := make(map[string]bool, len(allConditionNames))
@@ -175,9 +182,11 @@ var conditionClasses = map[string]conditionClass{
 	NeighborTablePressure: {stormGate: true, hangPreCordon: true},
 	NetfilterLockWedged:   {stormGate: true, hangPreCordon: true},
 	CSIRegistrationWedged: {stormGate: true, hangPreCordon: true},
-	// Wave-3 self-healing classifications.
+	// Wave-3 self-healing classifications. EBPFResourcePressure mirrors
+	// CiliumBPFMapPressure: storm gate + heartbeat sweep only, never the
+	// 2m hang-precordon fuse (a cordon cannot shrink BPF maps/progs).
 	MountTablePressure:   {stormGate: true, hangPreCordon: true},
-	EBPFResourcePressure: {stormGate: true, hangPreCordon: true},
+	EBPFResourcePressure: {stormGate: true},
 	EtcdQuorumDegraded:   {stormGate: true},
 }
 
@@ -295,7 +304,7 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 	if !swept[InodePressure] {
 		t.Error("HeartbeatSweptNames must contain InodePressure (agent inode latch, inode-pressure)")
 	}
-	// Every remaining constant — exactly the 55 latch-backed — in.
+	// Every remaining constant — exactly the 62 latch-backed — in.
 	latchBacked := 0
 	for _, name := range allConditionNames {
 		if name == ReadonlyFilesystem {

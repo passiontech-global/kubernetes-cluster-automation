@@ -132,6 +132,13 @@ func pyFormat(format string, args []any) (string, error) {
 			return "", fmt.Errorf("format: output exceeds %d bytes", maxStringBytes)
 		}
 	}
+	// The in-loop check runs only after a % conversion — a format
+	// made entirely of literal bytes (or with a large tail after the
+	// last spec) would otherwise return an unbounded string. Pin the
+	// final buffer too, so every output path is capped.
+	if b.Len() > maxStringBytes {
+		return "", fmt.Errorf("format: output exceeds %d bytes", maxStringBytes)
+	}
 	if argi < len(args) {
 		return "", fmt.Errorf("format: not all arguments converted (%d given)", len(args))
 	}

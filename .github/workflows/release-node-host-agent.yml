@@ -31,6 +31,7 @@ on:
       - ".moon/**"
       - "mise.toml"
       - ".dockerignore"
+      - ".github/actions/gha-cache-env/**"
       - ".github/workflows/release-app.yml"
       - ".github/workflows/release-node-host-agent.yml"
       - '!**/*.md'

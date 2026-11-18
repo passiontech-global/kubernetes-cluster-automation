@@ -195,23 +195,53 @@ func (s *Server) isClosed() bool {
 // The listener is closed HERE, not only via srv.Shutdown: a Server
 // that was bound but never Served was never handed to the
 // http.Server, so Shutdown cannot see it — without the explicit
-// close the socket would leak.
+// close the socket would leak. A nil receiver, a zero-value Server
+// (no listener, no http.Server) and a nil ctx are all clean no-ops
+// rather than panics; a nil ctx still gets the drain budget.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	// A nil ctx is a caller bug, not a reason to panic: context
+	// constructors dereference it. Treat it like Background and let
+	// the drain budget below bound the wait.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// New normalizes a non-positive ShutdownBudget, but a zero-value
+	// Server (or one assembled without New) can still reach here with
+	// no budget. Fall back to the same default so the drain is always
+	// bounded rather than waiting forever.
+	budget := s.budget
+	if budget <= 0 {
+		budget = DefaultShutdownBudget
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.budget)
+		ctx, cancel = context.WithTimeout(ctx, budget)
 		defer cancel()
 	}
 	s.mu.Lock()
 	s.closed = true
+	srv := s.srv
+	ln := s.ln
+	s.ln = nil
 	s.mu.Unlock()
-	err := s.srv.Shutdown(ctx)
-	s.mu.Lock()
-	if s.ln != nil {
-		_ = s.ln.Close()
-		s.ln = nil
+	var err error
+	if srv != nil {
+		err = srv.Shutdown(ctx)
 	}
-	s.mu.Unlock()
+	if ln != nil {
+		// A bound-but-never-Served listener is unknown to srv —
+		// close it here so the socket never leaks (same contract
+		// as before, now guarded for a zero-value Server). srv.Shutdown
+		// already closed any listener it was Serving, so net.ErrClosed
+		// here is the expected already-closed state; any other error
+		// is real (the listener srv never saw) and must reach the caller.
+		if closeErr := ln.Close(); err == nil && !errors.Is(closeErr, net.ErrClosed) {
+			err = closeErr
+		}
+	}
 	return err
 }
 
