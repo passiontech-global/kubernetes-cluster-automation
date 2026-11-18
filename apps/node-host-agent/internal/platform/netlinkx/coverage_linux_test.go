@@ -78,12 +78,33 @@ func TestUDPBoundPorts(t *testing.T) {
 	defer conn.Close()
 	port := uint16(conn.LocalAddr().(*net.UDPAddr).Port)
 
+	// A connected UDP client gets an ephemeral sport too — it must NOT
+	// be reported as a locally bound (server) port, or every client
+	// SrcPort would be classified as a server reply socket and
+	// SOCK_DESTROY would be suppressed 100% on a real kernel.
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	client, err := net.DialUDP("udp",
+		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+		peer.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	clientPort := uint16(client.LocalAddr().(*net.UDPAddr).Port)
+
 	bound, err := UDPBoundPorts(pid)
 	if err != nil {
 		t.Fatalf("UDPBoundPorts(%d): %v", pid, err)
 	}
 	if !bound[port] {
 		t.Fatalf("UDPBoundPorts missing the bound UDP port %d (got %d ports)", port, len(bound))
+	}
+	if bound[clientPort] {
+		t.Fatalf("UDPBoundPorts wrongly includes connected client ephemeral port %d", clientPort)
 	}
 }
 

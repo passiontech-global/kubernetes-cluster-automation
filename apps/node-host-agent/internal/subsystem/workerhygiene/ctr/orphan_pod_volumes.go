@@ -302,11 +302,13 @@ func mountUnderPodDir(mounts []string, hostPodsDir, uid string) bool {
 	return false
 }
 
-// orphanPodDirOnlyVolumeTrees reports whether podDir holds nothing
-// but the three kubelet-created volume trees. Any other entry — a
-// user file, a stray directory, a symlink — means we cannot account
-// for what RemoveAll would destroy, so the dir is kept. A read error
-// (including a dir that vanished mid-sweep) is fail-closed too.
+// orphanPodDirOnlyVolumeTrees reports whether podDir holds only the
+// entries kubelet's makePodDataDirs always creates: the three volume
+// trees plus etc-hosts, the empty plugins/ skeleton and containers/
+// (subdirs + kubelet log symlinks). Any other entry — a user file, a
+// stray directory, a symlink — means we cannot account for what
+// RemoveAll would destroy, so the dir is kept. A read error (including
+// a dir that vanished mid-sweep) is fail-closed too.
 func orphanPodDirOnlyVolumeTrees(podDir string) bool {
 	ents, err := os.ReadDir(podDir)
 	if err != nil {
@@ -315,7 +317,41 @@ func orphanPodDirOnlyVolumeTrees(podDir string) bool {
 	for _, en := range ents {
 		switch en.Name() {
 		case "volumes", "volume-subpaths", "volumeDevices":
+			continue
+		case "etc-hosts":
+			// Regular file only — a symlink named etc-hosts is not
+			// the kubelet metadata file.
+			if en.Type().IsRegular() {
+				continue
+			}
+			return false
+		case "plugins":
+			if orphanDirTreeEmpty(filepath.Join(podDir, "plugins")) {
+				continue
+			}
+			return false
+		case "containers":
+			if orphanVolDevicesResidueOnly(filepath.Join(podDir, "containers")) {
+				continue
+			}
+			return false
 		default:
+			return false
+		}
+	}
+	return true
+}
+
+// orphanDirTreeEmpty reports whether dir is an empty directory tree
+// (the plugin skeleton kubelet leaves behind). Missing counts as empty;
+// any file or symlink anywhere inside stays fail-closed.
+func orphanDirTreeEmpty(dir string) bool {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	for _, en := range ents {
+		if !en.IsDir() || !orphanDirTreeEmpty(filepath.Join(dir, en.Name())) {
 			return false
 		}
 	}

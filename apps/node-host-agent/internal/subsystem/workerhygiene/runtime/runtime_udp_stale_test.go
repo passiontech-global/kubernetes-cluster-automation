@@ -832,3 +832,45 @@ func TestUDPStaleLocalBoundSrcPortIsReplySocketNeverDestroyed(t *testing.T) {
 		t.Fatalf("destroyed a server reply socket (SrcPort bound locally): %x", destroyed)
 	}
 }
+
+// A backend that is still in the slice but Terminating / Serving=false
+// is in the ever-seen ledger yet NOT live: its blackhole must be
+// destroyed without waiting for the endpoint object to disappear.
+func TestUDPStaleNonServingEndpointIsNotLive(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Spec:       corev1.NodeSpec{PodCIDR: "10.244.0.0/16"},
+	}
+	sl := udpEndpointSlice("dns-svc-abc", 53, "10.244.2.50")
+	notServing := false
+	sl.Endpoints[0].Conditions.Serving = &notServing
+	e := fixture(t, node, sl)
+	setupPodNetnsProc(t, e.Fixture, 1, "40001")
+	setupPodNetnsProc(t, e.Fixture, 200, "40002")
+
+	var sock [48]byte
+	sock[0] = 0x74
+	var destroyed [][48]byte
+	e.H.Cfg.Seams.Host.DumpConnectedUDPFn = func(pid int) ([]netlinkx.ConnectedUDPSocket, error) {
+		if pid != 200 {
+			return nil, nil
+		}
+		return []netlinkx.ConnectedUDPSocket{
+			{Family: 2, SrcPort: 40002, DstIP: net.ParseIP("10.244.2.50"), DstPort: 53, ID: sock},
+		}, nil
+	}
+	e.H.Cfg.Seams.Host.DestroyUDPSocketFn = func(_ int, _ uint8, id [48]byte) (bool, error) {
+		destroyed = append(destroyed, id)
+		return true, nil
+	}
+	chk := e.H.Check(wdeps.CheckUDPStale)
+	ce := udpCycleEnv(200)
+	// First cycle seeds the ledger; the endpoint is already non-serving,
+	// so there is no live window — every later cycle is a valid kill.
+	for range 3 {
+		chk.Run(context.Background(), ce)
+	}
+	if len(destroyed) == 0 {
+		t.Fatal("non-serving EndpointSlice endpoint must not count as live")
+	}
+}

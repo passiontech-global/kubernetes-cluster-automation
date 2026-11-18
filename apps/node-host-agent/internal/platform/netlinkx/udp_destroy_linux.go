@@ -115,6 +115,19 @@ func parseUDPBoundPorts(buf []byte, family uint8, out map[uint16]bool) (bool, er
 		if len(payload) < diagMsg || payload[0] != family {
 			return
 		}
+		// Only UNCONN sockets count as "a local server is bound to
+		// this port" (the `ss -lun` rows). A connected UDP client's
+		// ephemeral sport MUST NOT be recorded: on a real kernel
+		// every connected socket has sport!=0 with state
+		// TCP_ESTABLISHED and dport!=0, so accepting those would
+		// mark every client SrcPort as bound and permanently
+		// suppress SOCK_DESTROY (the check would never act).
+		if payload[1] == tcpStateEstablished {
+			return
+		}
+		if dport := binary.BigEndian.Uint16(payload[6:8]); dport != 0 {
+			return // connected socket, not an UNCONN bind
+		}
 		// inet_diag_msg's sockid starts at payload+4; idiag_sport
 		// is its first 2 bytes, big-endian. sport==0 is unbound.
 		if sport := binary.BigEndian.Uint16(payload[4:6]); sport != 0 {

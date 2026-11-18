@@ -71,6 +71,11 @@ type UDPStaleCheck struct {
 	// a direct Pod-to-Pod UDP flow that merely reuses a Service's
 	// port was never an endpoint and must never be destroyed.
 	everSeenUDP ledger.SeenSet
+	// everSeenSeeded marks the one-time backfill of local Pod IPs into
+	// the ledger — a backend on this very node is excluded from the
+	// candidate scan while alive, so its ip:port would otherwise never
+	// enter everSeenUDP and a later blackhole could not be recognised.
+	everSeenSeeded bool
 }
 
 // ipPort is the destination identity a Socket points at. A port being
@@ -380,14 +385,25 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// the ledger but no longer live — that is a dead Service backend,
 	// not a direct Pod-to-Pod flow reusing the port.
 	udpPorts := make(map[uint16]map[string]bool)
+	// liveByAddr distinguishes a genuinely serving endpoint from one
+	// that merely still appears in a slice while Terminating /
+	// Serving=false. The latter must stay in the ever-seen ledger but
+	// must NOT count as live, or a stale socket is held hostage for the
+	// whole grace window.
+	liveByAddr := map[string]bool{}
 	for i := range sliceList.Items {
 		sl := &sliceList.Items[i]
-		// EndpointSlice v1 inlines its spec fields on the object.
-		var addrs []string
 		for _, ep := range sl.Endpoints {
+			serving := ep.Conditions.Serving != nil && *ep.Conditions.Serving
+			if ep.Conditions.Serving == nil &&
+				(ep.Conditions.Ready == nil || *ep.Conditions.Ready) {
+				serving = true
+			}
 			for _, addr := range ep.Addresses {
 				if s := canonicalIP(addr); s != "" {
-					addrs = append(addrs, s)
+					if _, seen := liveByAddr[s]; !seen || serving {
+						liveByAddr[s] = serving
+					}
 				}
 			}
 		}
@@ -407,12 +423,24 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				active = map[string]bool{}
 				udpPorts[port] = active
 			}
-			for _, s := range addrs {
-				active[s] = true // liveUDPSet
+			for s, serving := range liveByAddr {
 				c.everSeenUDP.Add(ipPort{ip: s, port: port}.key())
+				if serving {
+					active[s] = true // liveUDPSet — only serving endpoints
+				}
+			}
+			// One-time backfill: a backend on THIS node is excluded
+			// from rawCandidates while it lives, so without this its
+			// ip:port would never enter the ledger and a later
+			// blackhole to it could not be recognised (P0 F.1.2).
+			if !c.everSeenSeeded {
+				for ip := range localPodIPs {
+					c.everSeenUDP.Add(ipPort{ip: ip, port: port}.key())
+				}
 			}
 		}
 	}
+	c.everSeenSeeded = true
 
 	// A connected socket whose SrcPort is locally bound in the same
 	// netns is a server replying to a client, not a blackhole. One

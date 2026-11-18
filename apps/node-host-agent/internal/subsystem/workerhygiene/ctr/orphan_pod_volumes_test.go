@@ -263,6 +263,37 @@ func TestOrphanPodVolsForeignRootEntryKept(t *testing.T) {
 	}
 }
 
+// A real kubelet pod dir always carries etc-hosts at the root plus the
+// plugins/ and containers/ skeletons (the latter holds container subdirs
+// with log symlinks). These are NOT foreign data — the dir must still
+// be reaped once every volume tree passed gates 3–5.
+func TestOrphanPodVolsKubeletStandardRootReaped(t *testing.T) {
+	e := fixture(t)
+	writeMountinfo(t, e, []string{miLine("/mnt/ordinary")})
+	uid := opvUIDs[0]
+	podDir := mkOrphanPodDir(t, e, uid, 61*time.Minute)
+	wdepstest.WriteFile(t, filepath.Join(podDir, "etc-hosts"), "127.0.0.1 localhost\n")
+	if err := os.MkdirAll(filepath.Join(podDir, "plugins", "kubernetes.io~csi", "pvc-abc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	contDir := filepath.Join(podDir, "containers", "app", "2024_01_01_00_00_00.1")
+	if err := os.MkdirAll(contDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/var/log/pods/ns/pod/app/1.log",
+		filepath.Join(contDir, "app.log")); err != nil {
+		t.Fatal(err)
+	}
+	stale := e.Now.Add(-61 * time.Minute)
+	if err := os.Chtimes(podDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	opvConfirm(e, opvEnv(e, true))
+	if _, err := os.Stat(podDir); !os.IsNotExist(err) {
+		t.Fatalf("kubelet-standard orphan pod dir was not reaped: %v", err)
+	}
+}
+
 func TestOrphanPodVolsSymlinkKept(t *testing.T) {
 	e := fixture(t)
 	writeMountinfo(t, e, []string{miLine("/mnt/ordinary")})
