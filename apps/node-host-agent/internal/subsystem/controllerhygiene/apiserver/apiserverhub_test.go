@@ -190,6 +190,28 @@ func TestDeadFallbackKineOK(t *testing.T) {
 	}
 }
 
+// The journal SILENT variant (nonprod 2026-11-17/18): apiserver never
+// started — a foreign process held kine's port, so every boot attempt
+// died before any cache-error line could reach the journal. The self
+// probe dead on an empty journal is the evidence; the dead-fallback
+// restart must still fire.
+func TestDeadFallbackNeverStarted(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Hub.PeerAPI = "" // single hub
+	e.H.Cfg.TotalControllers = 2
+	e.H.Cfg.Hub.KineDBProbe = "10.0.0.9:6432"
+	e.Journal = "" // silent — no cacheErrRe match, by construction
+	for i := 0; i < 12 && e.RstN() == 0; i++ {
+		e.H.Cycle(context.Background())
+	}
+	if e.RstN() != 1 {
+		t.Fatalf("never-started dead-fallback restart missing: %d", e.RstN())
+	}
+	if e.HasState(cdeps.StateKineUnreachable) {
+		t.Fatal("kine-backend-unreachable latched despite healthy DB")
+	}
+}
+
 func TestDeadFallbackKineDead(t *testing.T) {
 	e := fixture(t)
 	e.H.Cfg.Hub.KineDBProbe = "10.0.0.9:6432"

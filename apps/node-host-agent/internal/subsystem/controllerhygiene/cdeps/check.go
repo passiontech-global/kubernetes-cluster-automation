@@ -42,12 +42,19 @@ const (
 // prom_emit contract, node_watchdog_state{signal=...}); the values
 // come from the canonical hoststate latch registry.
 const (
-	StateCacheStale       = latchdefs.LatchAPIServerCacheStale
-	StateCacheWedged      = latchdefs.LatchAPIServerCacheWedged
-	StateKineUnreachable  = latchdefs.LatchKineBackendUnreachable
-	StateKinePoolRunaway  = latchdefs.LatchKinePoolRunaway
-	StateKineTTLDead      = latchdefs.LatchKineTTLDead
-	StateKineTTLLoop      = latchdefs.LatchKineTTLLoop
+	StateCacheStale      = latchdefs.LatchAPIServerCacheStale
+	StateCacheWedged     = latchdefs.LatchAPIServerCacheWedged
+	StateKineUnreachable = latchdefs.LatchKineBackendUnreachable
+	StateKinePoolRunaway = latchdefs.LatchKinePoolRunaway
+	StateKineTTLDead     = latchdefs.LatchKineTTLDead
+	StateKineTTLLoop     = latchdefs.LatchKineTTLLoop
+	// StateKineDown latches while NO kine process exists in either the
+	// k0scontroller cgroup or the standalone kine.service cgroup — the
+	// never-started signature (bind conflict with a foreign process,
+	// crash faster than the poll cycle sees it). The TTL regexes never
+	// match this state because the pid is gone before its journal
+	// lines accumulate.
+	StateKineDown         = latchdefs.LatchKineDown
 	StateControllerOOMLop = latchdefs.LatchK0sControllerOOMLoop
 	// StateJournalUnreadable latches while journal reads keep
 	// producing nothing although journal storage exists — every
@@ -143,6 +150,11 @@ const (
 	// process outside it — a foreign daemon or a recycled pid —
 	// must never inherit the check's trust.
 	K0sControllerCgroupSubstr = "k0scontroller"
+	// KineServiceCgroupSubstr identifies the standalone kine.service
+	// unit (Phase-3 kine split, kine_service_hosts). TTLCheck consults
+	// it so a host running the external unit does not latch kine-down
+	// for an in-unit pid absence that is the expected shape there.
+	KineServiceCgroupSubstr = "kine.service"
 	// tcpStateListen is the hex st column of /proc/net/tcp(6) rows
 	// in LISTEN — excluded from the kine conn-spiral count.
 	TCPStateListen = "0A"

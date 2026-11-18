@@ -15,9 +15,64 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // --- Guard a tail: kine TTL ---
+
+// The never-started signature (nonprod 2026-11-17/18): no kine pid in
+// either cgroup while the unit is active — the old branch counted the
+// cycle "ok" and the outage ran 25h without a signal.
+func TestKineDownLatchedWhenPidAbsent(t *testing.T) {
+	e := fixture(t)
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateKineDown) {
+		t.Fatal("kine-down missing with no kine pid anywhere")
+	}
+}
+
+// Phase-3 split hosts run kine as the standalone kine.service unit —
+// an empty k0scontroller cgroup is the expected shape there, not an
+// outage.
+func TestExternalKineServiceSparesKineDown(t *testing.T) {
+	e := fixture(t)
+	e.MkProc(t, 3100, "kine", []string{"kine"}, 1000)
+	testutil.WriteFile(t, filepath.Join(e.Proc, "3100", "cgroup"),
+		"0::/system.slice/kine.service\n")
+	e.H.Cycle(context.Background())
+	if e.HasState(cdeps.StateKineDown) {
+		t.Fatal("kine-down latched although kine.service owns the pid")
+	}
+}
+
+func TestKineDownClearedWhenPidReturns(t *testing.T) {
+	e := fixture(t)
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateKineDown) {
+		t.Fatal("precondition: kine-down not latched")
+	}
+	e.MkProc(t, 3200, "kine", []string{"kine"}, 1000)
+	e.H.Cycle(context.Background())
+	if e.HasState(cdeps.StateKineDown) {
+		t.Fatal("kine-down not cleared when the pid returned")
+	}
+}
+
+// Bind conflict with a foreign port holder: the respawn dies before
+// any TTL line exists — the bind line is the only journal evidence.
+func TestTTLBindConflictKills(t *testing.T) {
+	e := fixture(t)
+	e.MkProc(t, 3300, "kine", []string{"kine"}, 1000)
+	e.Journal = "FATA error creating the metrics listener: " +
+		"listen tcp :2380: bind: address already in use\n"
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateKineTTLDead) {
+		t.Fatal("bind-conflict wedge not latched as kine-ttl-dead")
+	}
+	if len(e.Kills) != 1 || e.Kills[0].PID != 3300 {
+		t.Fatalf("expected kine kill, got %v", e.Kills)
+	}
+}
 
 func TestTTLDeadKill(t *testing.T) {
 	e := fixture(t)

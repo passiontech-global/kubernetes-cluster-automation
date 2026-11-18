@@ -121,6 +121,7 @@ const (
 	LatchKinePoolRunaway        = "kine-pool-runaway"
 	LatchKineTTLDead            = "kine-ttl-dead"
 	LatchKineTTLLoop            = "kine-ttl-loop"
+	LatchKineDown               = "kine-down"
 	LatchK0sControllerOOMLoop   = "k0scontroller-oom-loop"
 	LatchCPComponentFrozen      = "cp-component-frozen"      // cp-freeze-heal
 	LatchCPCertReloadStale      = "cp-cert-reload-stale"     // pki-cert-drift
@@ -319,6 +320,7 @@ var LatchDefs = []LatchDef{
 	{Name: LatchKinePoolRunaway, Owner: "controllerhygiene"},
 	{Name: LatchKineTTLDead, Owner: "controllerhygiene"},
 	{Name: LatchKineTTLLoop, Owner: "controllerhygiene"},
+	{Name: LatchKineDown, Owner: "controllerhygiene"},
 	{Name: LatchK0sControllerOOMLoop, Owner: "controllerhygiene"},
 	{Name: LatchCPComponentFrozen, Owner: "controllerhygiene"},
 	{Name: LatchCPCertReloadStale, Owner: "controllerhygiene"},

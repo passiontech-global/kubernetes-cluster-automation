@@ -11,6 +11,9 @@
 //	                race (WAN DB + large seed list); fast-kill
 //	                suppressed, only a low-cadence recovery-probe
 //	                kill.
+//	kine-down       NO kine pid anywhere (unit cgroup or
+//	                kine.service) while the unit is active — the
+//	                never-started signature; no kill, alert-only.
 package storelocal
 
 import (
@@ -26,8 +29,13 @@ import (
 )
 
 // ttlErrRe is the kine TTL-dead journal grep (pkg/ttl/ttl.go
-// workqueue ShutDown).
-var ttlErrRe = regexp.MustCompile(`TTL initial list failed|TTL event watch (failed|error)`)
+// workqueue ShutDown) plus the bind-conflict death: a foreign process
+// holding the kine metrics port (stray kine.service — nonprod
+// 2026-11-17/18) FATALs each respawn before the TTL workqueue ever
+// starts, so only the bind line is on the record.
+var ttlErrRe = regexp.MustCompile(
+	`TTL initial list failed|TTL event watch (failed|error)|` +
+		`metrics listener: listen tcp :2380: bind: address already in use`)
 
 // TTLCheck is the module-22 tail as a Check — stateless: the
 // rewedge streak and wedged-pid dedupe live in consecutive-ttl-
@@ -50,11 +58,39 @@ func (c *TTLCheck) Run(ctx context.Context) {
 	// never inherit the kill trust.
 	kpid := c.d.Proc.FindByCommInCgroup("kine", cdeps.K0sControllerCgroupSubstr)
 	if kpid == 0 {
-		c.d.StateExit(cdeps.StateKineTTLDead)
-		c.d.StateExit(cdeps.StateKineTTLLoop)
-		c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "ok").Inc()
+		// Phase-3 split hosts (kine_service_hosts) run kine as the
+		// standalone kine.service unit — its cgroup is not
+		// k0scontroller, so an absent in-unit pid is the expected
+		// shape there. Detect it by cgroup, not by a config knob, so
+		// the verdict stays right if the split is re-enabled without
+		// a controllerhygiene config change.
+		if c.d.Proc.FindByCommInCgroup("kine", cdeps.KineServiceCgroupSubstr) != 0 {
+			c.d.StateExit(cdeps.StateKineDown)
+			c.d.StateExit(cdeps.StateKineTTLDead)
+			c.d.StateExit(cdeps.StateKineTTLLoop)
+			c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "ok").Inc()
+			return
+		}
+		// NO kine anywhere while the unit is active (this check is
+		// uptime-gated >=20m, so this is not a boot window): the
+		// never-started signature. Treating absent == ok made the
+		// fastest-crash failure modes invisible — a bind conflict
+		// with a foreign process (stray kine.service holding :2380,
+		// nonprod 2026-11-17/18, 25h silent apiserver outage) kills
+		// each respawn within seconds, so the pid is almost always
+		// absent when this check samples it, and no journal regex
+		// ever matched. Latch kine-down instead.
+		c.d.State.Enter(cdeps.StateKineDown,
+			"no kine pid in k0scontroller or kine.service cgroup")
+		c.d.State.SuspectLog(cdeps.StateKineDown, fmt.Sprintf(
+			"suspect: kine-down - no kine process in the %s or kine.service cgroup while the unit is active; kube-apiserver cannot start without its datastore",
+			cdeps.K0sControllerCgroupSubstr), c.d.Cfg.SuspectLogCadence)
+		c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "kine_down").Inc()
 		return
 	}
+	// A live in-unit pid clears the never-started latch: whatever
+	// killed the previous pids is no longer winning.
+	c.d.StateExit(cdeps.StateKineDown)
 	now := c.d.Cfg.Clock.Now()
 	kage, err := c.d.Proc.PIDAgeSeconds(kpid, cdeps.ClkTck)
 	if err != nil {

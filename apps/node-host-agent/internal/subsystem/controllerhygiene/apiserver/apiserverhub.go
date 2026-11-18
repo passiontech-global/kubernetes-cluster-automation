@@ -71,6 +71,11 @@ type rvProbe struct {
 	prvRV      int64
 	pfn        int
 	peerFrozen bool
+	// selfAlive: the self CACHE read answered (okC). False with an
+	// empty journal = the apiserver never started — the journal has
+	// no cache-error lines to match, so cacheErrs alone cannot see
+	// this state.
+	selfAlive bool
 }
 
 // Run executes the journal early-warning plus the rv probe wedge
@@ -115,7 +120,16 @@ func (c *HubCheck) Run(ctx context.Context) {
 		if p.gapKnown {
 			c.d.State.ResetCounter(cdeps.FileCtrDead)
 		}
-		if !p.gapKnown && cacheErrs > 0 {
+		// Two dead-fallback entries: (a) cacheErrs > 0 — the journal
+		// speaks, apiserver is wedged/mute (incident 2026-09-25);
+		// (b) self probe dead on a SILENT journal — the apiserver
+		// never started (bind conflict upstream of it, stray
+		// kine.service holding :2380 — nonprod 2026-11-17/18, 25h
+		// outage with zero journal matches for cacheErrRe).
+		// deadFallback's pg-wire probe sorts out DB-side vs
+		// apiserver-side; its streak/rate/quorum fences hold the
+		// restart for either.
+		if !p.gapKnown && (cacheErrs > 0 || !p.selfAlive) {
 			c.deadFallback(ctx)
 		}
 		c.d.Cycles.WithLabelValues(cdeps.CheckHub, "ok").Inc()
@@ -167,6 +181,7 @@ func (c *HubCheck) probeSelfAndPeerRV(ctx context.Context) rvProbe {
 	var okC, okN bool
 	p.rvC, okC = c.d.ListRV(ctx, c.d.Cfg.Hub.SelfEndpoint, true)
 	p.rvN, okN = c.d.ListRV(ctx, c.d.Cfg.Hub.SelfEndpoint, false)
+	p.selfAlive = okC
 	// Consistent read via self failed (apiserver too wedged) → fall
 	// back to the peer: every consistent read goes to the storage
 	// backend so the rv is equivalent.
