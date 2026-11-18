@@ -38,9 +38,9 @@ of guaranteeing 401s/502s at request time.
   per-deployment overrides would only add ways to misconfigure the shutdown
   contract.
 - **HTTP server timeouts** (public: read 10s / read-header 5s / write 45s /
-  idle 60s; internal: read-header 10s, 5s shutdown budget) — likewise constants;
-  the write timeout safely covers the 7s request-path index-wait budget (and
-  30s detached fetch).
+  idle 60s; internal: read-header 5s with an 8 KiB header cap, 5s shutdown
+  budget) — likewise constants; the write timeout safely covers the 7s
+  request-path index-wait budget (and 30s detached fetch).
 
 ## CLI flags
 
