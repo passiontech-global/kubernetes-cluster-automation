@@ -7,7 +7,8 @@
 package jinja
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"maps"
 	"math"
@@ -323,7 +324,7 @@ func writeJSONAt(v any, b *strings.Builder, depth int, steps *int) error {
 	// Non-jinja container types (and the scalars the fast path
 	// defers) marshal exactly as encoding/json handled them before —
 	// including HTML escaping and json.Marshaler support.
-	bb, err := json.Marshal(v)
+	bb, err := jsonv2.Marshal(v, jsonv2.Deterministic(true), jsontext.EscapeForHTML(true))
 	if err != nil {
 		return err
 	}
