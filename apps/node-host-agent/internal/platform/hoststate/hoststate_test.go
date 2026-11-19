@@ -162,21 +162,17 @@ func TestRateOKGarbageIsOK(t *testing.T) {
 	}
 }
 
-// TestRateOKFutureStampStaysCooled: a stamp from a stepped-back clock
-// (NTP correction, manual set) sits in the future — its age is
-// negative. RateOKIn clamps negative age to 0 so a future stamp is
-// exactly "not expired yet" (fail-closed), never an early gate: the
-// verdict no longer depends on the sign accident of
-// (negative-age >= interval) surviving every interval comparison.
-// RateTrySpend's check branch rides the same clamp (it checks via
-// RateOK).
-func TestRateOKFutureStampStaysCooled(t *testing.T) {
+// TestRateOKSmallFutureStampStaysCooled: a stamp a hair into the
+// future (clock step noise, concurrent readers) is exactly "not
+// expired yet" (fail-closed) — the verdict no longer depends on the
+// sign accident of (negative-age >= interval) surviving every
+// interval comparison. Sub-margin future stamps leave the file
+// untouched.
+func TestRateOKSmallFutureStampStaysCooled(t *testing.T) {
 	s, clk, _ := newTestStore(t)
 
-	// Stamp one hour in the future — the clock stepped back after
-	// the spend.
-	s.WriteEpochFile(filepath.Join(s.Dir, "last-stepped"),
-		clk.now.Add(time.Hour).Unix())
+	stamp := clk.now.Add(30 * time.Second) // inside the 60s skew margin
+	s.WriteEpochFile(filepath.Join(s.Dir, "last-stepped"), stamp.Unix())
 
 	if s.RateOK("last-stepped", time.Hour) {
 		t.Fatal("future stamp must stay cooled, not open the gate")
@@ -184,12 +180,45 @@ func TestRateOKFutureStampStaysCooled(t *testing.T) {
 	if s.RateTrySpend("last-stepped", time.Hour) {
 		t.Fatal("RateTrySpend must inherit the clamp through its RateOK check")
 	}
-	// The budget was NOT spent by the losing try-spend — the stamp
-	// still reads future. Once the clock passes the stamp the budget
-	// expires normally.
+	if got := s.Epoch(filepath.Join(s.Dir, "last-stepped")); got != stamp.Unix() {
+		t.Fatalf("sub-margin clamp rewrote the stamp: got %d want %d",
+			got, stamp.Unix())
+	}
+	// Once the clock passes the stamp the budget expires normally.
 	clk.now = clk.now.Add(2 * time.Hour)
 	if !s.RateOK("last-stepped", time.Hour) {
 		t.Fatal("expired stamp must be OK again after the clock catches up")
+	}
+}
+
+// TestRateOKFutureStampBeyondSkewHeals: a stamp HOURS into the
+// future is a boot-skew artifact, not a cooldown (cicd vmi2940967
+// 2026-11-19 — the VM booted with UTC+7 stored as RTC/UTC, one
+// writable-layer spend wrote its budget ~5h ahead, NTP stepped the
+// kernel back, and the clamp starved the scan until wall time
+// crawled past the stamp). Beyond the 60s margin the budget heals:
+// re-stamped to now on disk AND in the RAM mirror, gate closed for
+// one interval, then expires normally.
+func TestRateOKFutureStampBeyondSkewHeals(t *testing.T) {
+	s, clk, _ := newTestStore(t)
+
+	p := filepath.Join(s.Dir, "last-skewed")
+	s.WriteEpochFile(p, clk.now.Add(5*time.Hour).Unix())
+
+	if s.RateOK("last-skewed", time.Hour) {
+		t.Fatal("just-healed budget must read freshly spent")
+	}
+	if got, want := s.Epoch(p), clk.now.Unix(); got != want {
+		t.Fatalf("heal stamp=%d want %d", got, want)
+	}
+	// The RAM mirror must carry the heal too — a second verdict
+	// max(disk, ram) would otherwise resurrect the skew stamp.
+	if s.RateOK("last-skewed", time.Hour) {
+		t.Fatal("healed budget must stay cooled for the interval")
+	}
+	clk.now = clk.now.Add(2 * time.Hour)
+	if !s.RateOK("last-skewed", time.Hour) {
+		t.Fatal("healed budget must expire on its own interval")
 	}
 }
 

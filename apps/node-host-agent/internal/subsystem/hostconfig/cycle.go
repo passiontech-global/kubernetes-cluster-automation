@@ -129,6 +129,7 @@ func (c *cyc) groups() []cycGroup {
 		{"coredns", c.groupCoreDNS},             // T9 (stub + hub)
 		{"bwaudit", c.groupBwAudit},             // T11
 		{"security", c.groupSecurity},           // fail2ban + sshd hardening
+		{"timesync", c.groupTimesync},           // timesyncd converge + RTC-in-UTC
 		{"apilb", c.groupAPILB},                 // T12 (incl. fallback-map strip)
 		{"swap", c.groupSwap},                   // node_tuning_swap.yaml
 		{"hub-metrics-fw", c.groupHubMetricsFW}, // node_exporter_hub.yaml (standalone)

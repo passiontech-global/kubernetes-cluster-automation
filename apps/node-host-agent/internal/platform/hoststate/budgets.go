@@ -18,6 +18,12 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
+// budgetFutureSkew is the future margin a last-* stamp may carry
+// before rateOKInLocked treats it as corrupt and re-stamps it: NTP
+// corrections of real skews dwarf 60s, and a stamp a few seconds
+// ahead of Now (concurrent readers, coarse clocks) is benign noise.
+const budgetFutureSkew = time.Minute
+
 // --- epoch files ---
 
 // Epoch reads an epoch file — absent/garbage → 0 (rate_ok parity:
@@ -142,7 +148,30 @@ func (s *Store) rateOKInLocked(dir, name string, interval time.Duration) bool {
 	if ram := s.shared.lastSpent[rateSpendKey(dir, name)]; ram > last {
 		last = ram
 	}
-	age := s.Now().Unix() - last
+	now := s.Now().Unix()
+	// A stamp more than a minute into the future is corrupt data, not
+	// a pending cooldown. The clamp below only stops it from OPENING
+	// the gate — it still KEEPS the gate shut for as long as the
+	// skew: a VM that boots with the RTC holding local time writes
+	// last-* stamps hours ahead, NTP steps the kernel back, and the
+	// budget sits "not expired yet" until wall time crawls past the
+	// stamp (cicd vmi2940967 2026-11-19: one boot-skewed writable-
+	// layer spend starved its 15-minute scan for 2h+ while the
+	// snapshot farm held ~1GB of slab). Heal instead: re-stamp now
+	// (disk + RAM mirror, best-effort like rateSpendInLocked) and
+	// read the budget as freshly spent — gate stays closed for one
+	// interval, the file self-corrects, no multi-hour starvation.
+	// The clamp below remains for the sub-minute future noise.
+	if last > now+int64(budgetFutureSkew.Seconds()) {
+		now = s.Now().Unix()
+		if s.shared.lastSpent == nil {
+			s.shared.lastSpent = map[string]int64{}
+		}
+		s.shared.lastSpent[rateSpendKey(dir, name)] = now
+		s.WriteEpochFile(filepath.Join(dir, name), now)
+		last = now
+	}
+	age := now - last
 	if age < 0 {
 		age = 0
 	}
