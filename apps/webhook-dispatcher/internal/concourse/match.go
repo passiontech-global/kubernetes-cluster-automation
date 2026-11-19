@@ -7,7 +7,7 @@ package concourse
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"maps"
@@ -416,7 +416,7 @@ func instanceVarsQuery(vars map[string]any) string {
 	})
 	var b strings.Builder
 	for _, p := range pairs {
-		v, err := json.Marshal(p.value)
+		v, err := json.Marshal(p.value, json.Deterministic(true))
 		if err != nil {
 			continue
 		}

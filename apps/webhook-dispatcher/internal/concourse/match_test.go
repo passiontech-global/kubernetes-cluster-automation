@@ -5,7 +5,7 @@
 package concourse
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"slices"
 	"testing"

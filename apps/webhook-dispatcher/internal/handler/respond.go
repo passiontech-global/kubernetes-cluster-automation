@@ -7,7 +7,7 @@
 package handler
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"net/http"
 	"strings"
@@ -93,16 +93,16 @@ func logSafe(s string) string {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_ = json.MarshalWrite(w, v)
 }
 
 // skippedBodies pre-renders the skip responses — the reasons are
 // internal literals, so the JSON body is built once instead of
-// paying a map+Encoder alloc per filtered delivery. The fallback
+// paying a map+MarshalWrite alloc per filtered delivery. The fallback
 // keeps writeSkipped total over any future reason.
 var skippedBodies = map[string][]byte{
-	"action":  []byte("{\"matched\":0,\"skipped\":\"action\"}\n"),
-	"deleted": []byte("{\"matched\":0,\"skipped\":\"deleted\"}\n"),
+	"action":  []byte(`{"matched":0,"skipped":"action"}`),
+	"deleted": []byte(`{"matched":0,"skipped":"deleted"}`),
 }
 
 // writeSkipped acknowledges an authenticated delivery that was
@@ -116,7 +116,7 @@ func writeSkipped(w http.ResponseWriter, reason string) {
 		_, _ = w.Write(body)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	_ = json.MarshalWrite(w, map[string]any{
 		"matched": 0,
 		"skipped": reason,
 	})

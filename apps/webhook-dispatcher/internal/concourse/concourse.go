@@ -11,7 +11,7 @@ package concourse
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -308,7 +308,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 		}
 		// Bound the decode: without LimitReader a 2xx body longer than
 		// maxJSONBody (an ATC streaming forever) would be buffered whole.
-		err = json.NewDecoder(io.LimitReader(resp.Body, maxJSONBody)).Decode(out)
+		err = json.UnmarshalRead(io.LimitReader(resp.Body, maxJSONBody), out)
 		// Drain whatever the decoder left before the body closes: a decode
 		// that finished before EOF (trailing newline, whitespace, extra
 		// documents) or one that failed at the maxJSONBody cap would
