@@ -7,7 +7,7 @@
 package webhookguard
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"sync/atomic"

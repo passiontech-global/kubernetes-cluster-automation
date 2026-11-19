@@ -11,7 +11,7 @@ package apiserverendpointguard
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"net"
@@ -177,7 +177,7 @@ func fetchJSON(ctx context.Context, client *http.Client, ip, path, accept string
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.UnmarshalRead(resp.Body, out)
 }
 
 // fetchListRV GETs a core-API list path on one backend and returns the

@@ -26,7 +26,7 @@ package nethealth
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"strconv"
 	"time"

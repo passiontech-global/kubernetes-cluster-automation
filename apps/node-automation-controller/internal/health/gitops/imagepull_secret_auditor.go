@@ -12,7 +12,7 @@ package gitops
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"strings"
 	"time"
@@ -89,10 +89,10 @@ type pullSecretRef struct {
 // fields the audit reads.
 type dockerConfig struct {
 	Auths map[string]struct {
-		Auth          string `json:"auth"`
-		IdentityToken string `json:"identitytoken"`
-		Password      string `json:"password"`
-	} `json:"auths"`
+		Auth          string `json:"auth,case:ignore"`
+		IdentityToken string `json:"identitytoken,case:ignore"`
+		Password      string `json:"password,case:ignore"`
+	} `json:"auths,case:ignore"`
 }
 
 // Run enumerates every pull secret in use — pod

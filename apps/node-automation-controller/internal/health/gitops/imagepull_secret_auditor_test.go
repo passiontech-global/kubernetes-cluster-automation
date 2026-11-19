@@ -4,7 +4,7 @@ package gitops
 
 import (
 	"encoding/base64"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"testing"
 	"time"

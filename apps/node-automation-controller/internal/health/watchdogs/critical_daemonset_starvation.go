@@ -32,7 +32,7 @@ package watchdogs
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"strings"
 	"time"
@@ -355,7 +355,7 @@ func (p *criticalDaemonSetStarvationCheck) healCompatLabels(ctx context.Context,
 // merge-patch embedding — values are label strings (no escaping
 // surprises beyond what encoding/json handles).
 func mustJSONMap(m map[string]string) string {
-	b, err := json.Marshal(m)
+	b, err := json.Marshal(m, json.Deterministic(true))
 	if err != nil {
 		return "{}"
 	}

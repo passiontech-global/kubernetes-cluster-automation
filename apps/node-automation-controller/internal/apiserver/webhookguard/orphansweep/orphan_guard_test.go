@@ -6,7 +6,7 @@
 package orphansweep
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"strings"
 	"sync/atomic"

@@ -8,7 +8,8 @@
 package olm
 
 import (
-	"encoding/json"
+	jsonv1 "encoding/json"
+	json "encoding/json/v2"
 	"testing"
 	"time"
 
@@ -36,8 +37,8 @@ func TestUnstructuredNumber(t *testing.T) {
 		{"int64", int64(60), 60, true},
 		{"float64", float64(60.5), 60.5, true},
 		{"int", int(7), 7, true},
-		{"json.Number", json.Number("42"), 42, true},
-		{"json.Number bad", json.Number("abc"), 0, false},
+		{"json.Number", jsonv1.Number("42"), 42, true},
+		{"json.Number bad", jsonv1.Number("abc"), 0, false},
 		{"string", "60", 0, false},
 		{"nil", nil, 0, false},
 		{"bool", true, 0, false},

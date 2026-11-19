@@ -2,7 +2,8 @@ package fluentbitroller
 
 import (
 	"context"
-	"encoding/json"
+	jsonv1 "encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"testing"
 	"time"
@@ -534,11 +535,11 @@ type cacheReader struct{ sec *corev1.Secret }
 func (c *cacheReader) Get(_ context.Context, key client.ObjectKey,
 	obj client.Object, _ ...client.GetOption) error {
 	if key.Namespace == fluentNS && key.Name == pipelineName && c.sec != nil {
-		data, err := json.Marshal(c.sec)
+		data, err := jsonv2.Marshal(c.sec, jsonv1.DefaultOptionsV1())
 		if err != nil {
 			return err
 		}
-		return json.Unmarshal(data, obj)
+		return jsonv2.Unmarshal(data, obj, jsonv1.DefaultOptionsV1())
 	}
 	return apierrors.NewNotFound(
 		corev1.SchemeGroupVersion.WithResource("secrets").GroupResource(),

@@ -7,7 +7,8 @@ package promq
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"math"
@@ -167,7 +168,7 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 		Data   struct {
 			Result []struct {
 				Metric map[string]string `json:"metric"`
-				Value  []json.RawMessage `json:"value"`
+				Value  []jsontext.Value  `json:"value"`
 			} `json:"result"`
 		} `json:"data"`
 	}

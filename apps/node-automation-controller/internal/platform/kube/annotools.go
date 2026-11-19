@@ -15,7 +15,7 @@ package kube
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,5 +64,5 @@ func AnnoTimeCtx(ctx context.Context, obj metav1.Object, key string) (time.Time,
 func MergePatchAnnos(annos map[string]any) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"metadata": map[string]any{"annotations": annos},
-	})
+	}, json.FormatNilMapAsNull(true))
 }

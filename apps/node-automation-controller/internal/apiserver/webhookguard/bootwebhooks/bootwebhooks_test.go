@@ -7,7 +7,7 @@ package bootwebhooks
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"

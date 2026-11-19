@@ -28,7 +28,7 @@ package heal
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -65,7 +65,7 @@ func firstSeenValue(m map[string]string) any {
 	if len(m) == 0 {
 		return nil
 	}
-	data, err := json.Marshal(m)
+	data, err := json.Marshal(m, json.Deterministic(true))
 	if err != nil {
 		return nil
 	}

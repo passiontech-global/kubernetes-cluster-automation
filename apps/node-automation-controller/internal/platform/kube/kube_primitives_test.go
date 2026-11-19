@@ -6,7 +6,7 @@ package kube
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"testing"
 	"time"

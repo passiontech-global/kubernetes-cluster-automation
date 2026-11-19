@@ -82,7 +82,7 @@ package helmreleaseunlocker
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"regexp"
 	"strings"

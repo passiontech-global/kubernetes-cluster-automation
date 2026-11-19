@@ -16,7 +16,7 @@ package watchdogs
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"maps"
@@ -76,7 +76,7 @@ type topologyRelaxRecord struct {
 
 type topologyRelaxEntry struct {
 	Index      int    `json:"i"`
-	MinDomains *int32 `json:"m,omitempty"`
+	MinDomains *int32 `json:"m,omitzero"`
 }
 
 type topologySpreadZoneDeadlockCheck struct {

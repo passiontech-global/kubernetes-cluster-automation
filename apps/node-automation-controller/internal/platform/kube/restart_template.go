@@ -8,7 +8,7 @@
 package kube
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"time"
 )
 
@@ -57,7 +57,7 @@ func RestartTemplatePatchAnnos(ts time.Time, extra map[string]string) []byte {
 				},
 			},
 		},
-	})
+	}, json.Deterministic(true))
 	if err != nil {
 		// Unreachable for string-only maps; a panic here means the
 		// doc above was edited into something json cannot render.

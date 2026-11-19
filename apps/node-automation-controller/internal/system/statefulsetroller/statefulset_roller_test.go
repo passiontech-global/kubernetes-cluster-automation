@@ -2,7 +2,8 @@ package statefulsetroller
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -1047,7 +1048,7 @@ func srPromStub(t *testing.T, status int, series map[string]float64) *httptest.S
 		Data   struct {
 			Result []struct {
 				Metric map[string]string `json:"metric"`
-				Value  []json.RawMessage `json:"value"`
+				Value  []jsontext.Value  `json:"value"`
 			} `json:"result"`
 		} `json:"data"`
 	}
@@ -1063,17 +1064,17 @@ func srPromStub(t *testing.T, status int, series map[string]float64) *httptest.S
 			bar := strings.IndexByte(k, '/')
 			env.Data.Result = append(env.Data.Result, struct {
 				Metric map[string]string `json:"metric"`
-				Value  []json.RawMessage `json:"value"`
+				Value  []jsontext.Value  `json:"value"`
 			}{
 				Metric: map[string]string{
 					"namespace": k[:bar], "pod": k[bar+1:],
 				},
-				Value: []json.RawMessage{json.RawMessage("1770000000"),
+				Value: []jsontext.Value{jsontext.Value("1770000000"),
 					// Prometheus ships sample values as JSON STRINGS.
-					json.RawMessage(strconv.Quote(strconv.FormatFloat(v, 'f', -1, 64)))},
+					jsontext.Value(strconv.Quote(strconv.FormatFloat(v, 'f', -1, 64)))},
 			})
 		}
-		_ = json.NewEncoder(w).Encode(env)
+		_ = json.MarshalWrite(w, env)
 	}))
 	t.Cleanup(srv.Close)
 	return srv

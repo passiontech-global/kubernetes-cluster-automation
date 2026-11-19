@@ -6,7 +6,8 @@
 package kube
 
 import (
-	"encoding/json"
+	jsonv1 "encoding/json"
+	jsonv2 "encoding/json/v2"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -37,8 +38,8 @@ func JSONSize(v any) (int64, error) {
 		v = u.Object
 	}
 	w := &countingWriter{}
-	if err := json.NewEncoder(w).Encode(v); err != nil {
+	if err := jsonv2.MarshalWrite(w, v, jsonv1.DefaultOptionsV1()); err != nil {
 		return 0, err
 	}
-	return w.n - 1, nil
+	return w.n, nil
 }

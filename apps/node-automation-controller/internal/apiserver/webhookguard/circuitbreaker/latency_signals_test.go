@@ -1,7 +1,7 @@
 package circuitbreaker
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -44,7 +44,7 @@ func mockPromServer(t *testing.T, handler func(query string) []promResult) *http
 		q := r.FormValue("query")
 		res := handler(q)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(promResponse{
+		_ = json.MarshalWrite(w, promResponse{
 			Status: "success",
 			Data:   promData{ResultType: "vector", Result: res},
 		})

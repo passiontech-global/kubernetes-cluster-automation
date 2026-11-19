@@ -24,7 +24,8 @@ package olm
 
 import (
 	"context"
-	"encoding/json"
+	jsonv1 "encoding/json"
+	json "encoding/json/v2"
 	"strings"
 	"time"
 
@@ -327,7 +328,7 @@ func unstructuredNumber(v any) (float64, bool) {
 		return n, true
 	case int:
 		return float64(n), true
-	case json.Number:
+	case jsonv1.Number:
 		f, err := n.Float64()
 		return f, err == nil
 	}

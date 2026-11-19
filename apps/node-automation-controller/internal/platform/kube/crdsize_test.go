@@ -9,7 +9,8 @@
 package kube
 
 import (
-	"encoding/json"
+	jsonv1 "encoding/json"
+	jsonv2 "encoding/json/v2"
 	"testing"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -132,12 +133,12 @@ func TestCRDJSONSizeTypedMatchesUnstructured(t *testing.T) {
 	// The legacy shape: wire JSON decoded to map[string]any (numbers
 	// become float64, key order alphabetical) — what the dynamic
 	// client listed and the old census measured.
-	wire, err := json.Marshal(crd)
+	wire, err := jsonv2.Marshal(crd, jsonv1.DefaultOptionsV1())
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	var asMap map[string]any
-	if err := json.Unmarshal(wire, &asMap); err != nil {
+	if err := jsonv2.Unmarshal(wire, &asMap); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	unstrSize, err := JSONSize(asMap)

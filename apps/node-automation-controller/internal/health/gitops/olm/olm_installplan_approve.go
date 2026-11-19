@@ -2,7 +2,7 @@ package olm
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"time"
 
 	"github.com/go-logr/logr"

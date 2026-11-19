@@ -52,7 +52,7 @@ package kube
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"reflect"
 	"regexp"
