@@ -7,7 +7,8 @@ package cilium
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -20,20 +21,20 @@ import (
 // an array (counted by length) or an object/map (counted by keys),
 // because the plan's used/available fields may be reported either as
 // counters or as the IP collections themselves.
-func ipamCount(v json.RawMessage) (int, bool) {
+func ipamCount(v jsontext.Value) (int, bool) {
 	s := bytes.TrimSpace(v)
 	if len(s) == 0 || bytes.Equal(s, []byte("null")) {
 		return 0, false
 	}
 	switch s[0] {
 	case '[':
-		var arr []json.RawMessage
+		var arr []jsontext.Value
 		if err := json.Unmarshal(s, &arr); err != nil {
 			return 0, false
 		}
 		return len(arr), true
 	case '{':
-		var m map[string]json.RawMessage
+		var m map[string]jsontext.Value
 		if err := json.Unmarshal(s, &m); err != nil {
 			return 0, false
 		}
@@ -56,7 +57,7 @@ func ipamCount(v json.RawMessage) (int, bool) {
 // ok=false when the map is absent or fully owned: an all-owned map
 // can't be told apart from an allocated-only dump (the non-pool
 // modes), and reporting "0 free" there would false-latch exhaustion.
-func freeIPAMPool(m map[string]json.RawMessage) (int, bool) {
+func freeIPAMPool(m map[string]jsontext.Value) (int, bool) {
 	if len(m) == 0 {
 		return 0, false
 	}
@@ -96,8 +97,8 @@ func freeIPAMPool(m map[string]json.RawMessage) (int, bool) {
 func ParseCiliumIPAM(body []byte) (used, available int, ok bool) {
 	var resp struct {
 		IPAM *struct {
-			IPV4        json.RawMessage            `json:"ipv4"`
-			Allocations map[string]json.RawMessage `json:"allocations"`
+			IPV4        jsontext.Value            `json:"ipv4"`
+			Allocations map[string]jsontext.Value `json:"allocations"`
 		} `json:"ipam"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil || resp.IPAM == nil {
@@ -111,8 +112,8 @@ func ParseCiliumIPAM(body []byte) (used, available int, ok bool) {
 	switch raw[0] {
 	case '{':
 		var obj struct {
-			Used      json.RawMessage `json:"used"`
-			Available json.RawMessage `json:"available"`
+			Used      jsontext.Value `json:"used"`
+			Available jsontext.Value `json:"available"`
 		}
 		if err := json.Unmarshal(raw, &obj); err != nil {
 			return 0, -1, false
@@ -125,7 +126,7 @@ func ParseCiliumIPAM(body []byte) (used, available int, ok bool) {
 		}
 		return used, available, true
 	case '[':
-		var arr []json.RawMessage
+		var arr []jsontext.Value
 		if err := json.Unmarshal(raw, &arr); err != nil {
 			return 0, -1, false
 		}

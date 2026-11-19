@@ -33,7 +33,7 @@ package nodecoord
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"sync"
@@ -465,7 +465,7 @@ func NewKube(nodeName string, cs kubernetes.Interface) *Coord {
 		PatchPodAnno: func(ctx context.Context, ns, name string, annos map[string]string) error {
 			payload, err := json.Marshal(map[string]any{
 				"metadata": map[string]any{"annotations": annos},
-			})
+			}, json.FormatNilMapAsNull(true))
 			if err != nil {
 				return err
 			}

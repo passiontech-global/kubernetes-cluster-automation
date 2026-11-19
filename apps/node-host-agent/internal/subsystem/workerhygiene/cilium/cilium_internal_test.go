@@ -8,7 +8,7 @@ package cilium
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -385,7 +385,7 @@ func TestIPAMCountShapes(t *testing.T) {
 		{`{"nope"`, 0, false},
 		{`[{"nope"`, 0, false},
 	} {
-		got, ok := ipamCount(json.RawMessage(tc.in))
+		got, ok := ipamCount(jsontext.Value(tc.in))
 		if got != tc.want || ok != tc.wantOK {
 			t.Fatalf("ipamCount(%q)=%d,%v want %d,%v", tc.in, got, ok, tc.want, tc.wantOK)
 		}
@@ -399,25 +399,25 @@ func TestIPAMCountShapes(t *testing.T) {
 func TestFreeIPAMPoolShapes(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		m      map[string]json.RawMessage
+		m      map[string]jsontext.Value
 		want   int
 		wantOK bool
 	}{
-		{"empty map", map[string]json.RawMessage{}, 0, false},
-		{"all owned", map[string]json.RawMessage{
-			"10.0.0.1": json.RawMessage(`"pod-a"`),
-			"10.0.0.2": json.RawMessage(`"node-x"`),
+		{"empty map", map[string]jsontext.Value{}, 0, false},
+		{"all owned", map[string]jsontext.Value{
+			"10.0.0.1": jsontext.Value(`"pod-a"`),
+			"10.0.0.2": jsontext.Value(`"node-x"`),
 		}, 0, false},
-		{"mixed string owners", map[string]json.RawMessage{
-			"10.0.0.1": json.RawMessage(`"pod-a"`),
-			"10.0.0.2": json.RawMessage(`""`),
+		{"mixed string owners", map[string]jsontext.Value{
+			"10.0.0.1": jsontext.Value(`"pod-a"`),
+			"10.0.0.2": jsontext.Value(`""`),
 		}, 1, true},
-		{"object owner shapes", map[string]json.RawMessage{
-			"10.0.0.1": json.RawMessage(`{"owner":""}`),
-			"10.0.0.2": json.RawMessage(`{"owner":"pod-b"}`),
+		{"object owner shapes", map[string]jsontext.Value{
+			"10.0.0.1": jsontext.Value(`{"owner":""}`),
+			"10.0.0.2": jsontext.Value(`{"owner":"pod-b"}`),
 		}, 1, true},
-		{"garbage value skipped", map[string]json.RawMessage{
-			"10.0.0.1": json.RawMessage(`garbage`),
+		{"garbage value skipped", map[string]jsontext.Value{
+			"10.0.0.1": jsontext.Value(`garbage`),
 		}, 0, false},
 	} {
 		got, ok := freeIPAMPool(tc.m)

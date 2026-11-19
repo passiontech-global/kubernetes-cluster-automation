@@ -11,7 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -517,11 +517,11 @@ func TestFailDetail(t *testing.T) {
 // walk), i.e. apiserver-side evidence vs a stream fault.
 func TestDecodeListRVTokenWalk(t *testing.T) {
 	t.Run("stops at metadata past nested values", func(t *testing.T) {
-		// Nested objects and arrays before metadata force the depth
-		// tracking (delim open/close + continue) to actually run; the
-		// trailing items must stay unread.
+		// Nested objects and arrays before metadata force SkipValue to
+		// advance past non-metadata members; the trailing items must stay
+		// unread.
 		var rv string
-		dec := json.NewDecoder(strings.NewReader(
+		dec := jsontext.NewDecoder(strings.NewReader(
 			`{"apiVersion":"v1","spec":{"nested":{"deep":1}},"arr":[1,2],` +
 				`"metadata":{"resourceVersion":"42"},"items":[]}`))
 		if err := decodeListRV(dec, &rv); err != nil {
@@ -532,7 +532,7 @@ func TestDecodeListRVTokenWalk(t *testing.T) {
 		}
 	})
 	t.Run("unexpected start", func(t *testing.T) {
-		err := decodeListRV(json.NewDecoder(strings.NewReader(`[1,2]`)),
+		err := decodeListRV(jsontext.NewDecoder(strings.NewReader(`[1,2]`)),
 			new(string))
 		if !errors.Is(err, errBadPayload) ||
 			!strings.Contains(err.Error(), "unexpected JSON start") {
@@ -540,44 +540,42 @@ func TestDecodeListRVTokenWalk(t *testing.T) {
 		}
 	})
 	t.Run("empty payload", func(t *testing.T) {
-		if err := decodeListRV(json.NewDecoder(strings.NewReader(``)),
+		if err := decodeListRV(jsontext.NewDecoder(strings.NewReader(``)),
 			new(string)); !errors.Is(err, io.EOF) {
 			t.Fatalf("decodeListRV(empty)=%v want EOF", err)
 		}
 	})
 	t.Run("truncated mid-walk", func(t *testing.T) {
-		// EOF before metadata lands — a stream fault. Mid-object the
-		// decoder surfaces io.ErrUnexpectedEOF (plain io.EOF only for
-		// a fully empty body); listRV classes everything but
-		// syntax/errBadPayload as failBody, so this is a body fault.
+		// EOF before metadata lands — *jsontext.SyntacticError wrapping io.ErrUnexpectedEOF.
 		err := decodeListRV(
-			json.NewDecoder(strings.NewReader(`{"metadata"`)), new(string))
-		if !errors.Is(err, io.ErrUnexpectedEOF) {
-			t.Fatalf("decodeListRV(truncated)=%v want ErrUnexpectedEOF", err)
+			jsontext.NewDecoder(strings.NewReader(`{"metadata"`)), new(string))
+		var syn *jsontext.SyntacticError
+		if !errors.As(err, &syn) || !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("decodeListRV(truncated)=%v want SyntacticError wrapping ErrUnexpectedEOF", err)
 		}
 	})
 	t.Run("truncated before metadata key completes", func(t *testing.T) {
-		// Dies inside the walk's own Token() — metadata never seen.
-		// (Top-of-value exhaustion surfaces plain io.EOF, mid-object
-		// io.ErrUnexpectedEOF; listRV classes both as failParse.)
+		// Dies inside SkipValue — *jsontext.SyntacticError wrapping io.ErrUnexpectedEOF.
 		err := decodeListRV(
-			json.NewDecoder(strings.NewReader(`{"a"`)), new(string))
-		if !errors.Is(err, io.EOF) {
-			t.Fatalf("decodeListRV(truncated key)=%v want EOF", err)
+			jsontext.NewDecoder(strings.NewReader(`{"a"`)), new(string))
+		var syn *jsontext.SyntacticError
+		if !errors.As(err, &syn) || !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("decodeListRV(truncated key)=%v want SyntacticError wrapping ErrUnexpectedEOF", err)
 		}
 	})
 	t.Run("metadata not an object", func(t *testing.T) {
-		// A decode fault inside the walk is neither syntax nor
+		// A semantic decode fault (*json.SemanticError) is neither syntax nor
 		// errBadPayload — listRV must NOT class it as failParse.
-		err := decodeListRV(json.NewDecoder(strings.NewReader(`{"metadata":5}`)),
+		err := decodeListRV(jsontext.NewDecoder(strings.NewReader(`{"metadata":5}`)),
 			new(string))
-		if err == nil || errors.Is(err, errBadPayload) || errors.Is(err, io.EOF) {
+		var syn *jsontext.SyntacticError
+		if err == nil || errors.As(err, &syn) || errors.Is(err, errBadPayload) || errors.Is(err, io.EOF) {
 			t.Fatalf("decodeListRV(metadata=5)=%v want body-read class", err)
 		}
 	})
 	t.Run("empty resourceVersion", func(t *testing.T) {
 		err := decodeListRV(
-			json.NewDecoder(strings.NewReader(`{"metadata":{"resourceVersion":""}}`)),
+			jsontext.NewDecoder(strings.NewReader(`{"metadata":{"resourceVersion":""}}`)),
 			new(string))
 		if !errors.Is(err, errBadPayload) ||
 			!strings.Contains(err.Error(), "empty metadata.resourceVersion") {

@@ -15,7 +15,8 @@ package journalwatch
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"strconv"
 	"strings"
@@ -61,11 +62,11 @@ func ParseJSON(data string) []Entry {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			var e struct {
-				Message   json.RawMessage `json:"MESSAGE"`
-				TS        string          `json:"__REALTIME_TIMESTAMP"`
-				Cursor    string          `json:"__CURSOR"`
-				Unit      string          `json:"_SYSTEMD_UNIT"`
-				Transport string          `json:"_TRANSPORT"`
+				Message   jsontext.Value `json:"MESSAGE"`
+				TS        string         `json:"__REALTIME_TIMESTAMP"`
+				Cursor    string         `json:"__CURSOR"`
+				Unit      string         `json:"_SYSTEMD_UNIT"`
+				Transport string         `json:"_TRANSPORT"`
 			}
 			if err := json.Unmarshal([]byte(line), &e); err == nil {
 				ts, _ := strconv.ParseInt(e.TS, 10, 64)
@@ -82,7 +83,7 @@ func ParseJSON(data string) []Entry {
 
 // messageField unwraps the MESSAGE field — journald emits a JSON
 // string for text but an array of byte values for non-UTF8 payloads.
-func messageField(raw json.RawMessage) string {
+func messageField(raw jsontext.Value) string {
 	if len(raw) == 0 {
 		return ""
 	}
@@ -90,8 +91,15 @@ func messageField(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
 	}
-	var b []byte
-	if err := json.Unmarshal(raw, &b); err == nil {
+	var nums []uint16
+	if err := json.Unmarshal(raw, &nums); err == nil {
+		b := make([]byte, len(nums))
+		for i, n := range nums {
+			if n > 255 {
+				return ""
+			}
+			b[i] = byte(n)
+		}
 		return string(b)
 	}
 	return ""

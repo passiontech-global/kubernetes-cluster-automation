@@ -7,7 +7,8 @@
 package wdeps
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"strconv"
 	"strings"
 )
@@ -64,7 +65,7 @@ func ParseWGDump(out string) []WGDumpPeer {
 func ParseCiliumHealthNodes(body []byte) (int, bool) {
 	var resp struct {
 		Cluster *struct {
-			Nodes []json.RawMessage `json:"nodes"`
+			Nodes []jsontext.Value `json:"nodes"`
 		} `json:"cluster"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil ||
@@ -91,7 +92,7 @@ func ParseCiliumServiceBackends(body []byte) (map[string]int, error) {
 				Name      string `json:"name"`
 				Namespace string `json:"namespace"`
 			} `json:"flags"`
-			BackendAddresses []json.RawMessage `json:"backend-addresses"`
+			BackendAddresses []jsontext.Value `json:"backend-addresses"`
 		} `json:"spec"`
 	}
 	if err := json.Unmarshal(body, &list); err != nil {

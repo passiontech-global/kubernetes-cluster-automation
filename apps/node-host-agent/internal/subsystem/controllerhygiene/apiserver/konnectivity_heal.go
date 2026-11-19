@@ -19,7 +19,7 @@ package apiserver
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -260,7 +260,7 @@ func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
 			} `json:"items"`
 		}
 		statusOK := resp.StatusCode/100 == 2
-		decErr := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&list)
+		decErr := json.UnmarshalRead(io.LimitReader(resp.Body, 8<<20), &list)
 		_ = resp.Body.Close()
 		cancel()
 		if !statusOK || decErr != nil {

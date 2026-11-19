@@ -3,7 +3,7 @@ package eventpurge
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -40,7 +40,7 @@ func (s *eventServer) handler(t *testing.T) http.HandlerFunc {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if q.Get("continue") == "page2" {
-				_ = json.NewEncoder(w).Encode(map[string]any{
+				_ = json.MarshalWrite(w, map[string]any{
 					"metadata": map[string]any{},
 					"items": []any{
 						ev("default", "old-2", "2020-01-01T00:00:00Z"),
@@ -49,7 +49,7 @@ func (s *eventServer) handler(t *testing.T) http.HandlerFunc {
 				})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			_ = json.MarshalWrite(w, map[string]any{
 				"metadata": map[string]any{"continue": "page2"},
 				"items": []any{
 					ev("default", "old-1", "2020-01-01T00:00:00Z"),
@@ -198,7 +198,7 @@ func TestRunCapsDeletes(t *testing.T) {
 				"namespace": "default", "name": fmt.Sprintf("old-%d", i),
 				"creationTimestamp": "2020-01-01T00:00:00Z"}})
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		_ = json.MarshalWrite(w, map[string]any{
 			"metadata": map[string]any{}, "items": items})
 	})
 	mux.HandleFunc("/api/v1/namespaces/", func(w http.ResponseWriter, r *http.Request) {
@@ -266,7 +266,7 @@ func staleList(w http.ResponseWriter, n int) {
 			"creationTimestamp": "2020-01-01T00:00:00Z"}}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	_ = json.MarshalWrite(w, map[string]any{
 		"metadata": map[string]any{}, "items": items})
 }
 

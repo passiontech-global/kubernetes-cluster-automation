@@ -1,7 +1,8 @@
 package concourseinit
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"os"
 	"path/filepath"
@@ -60,7 +61,7 @@ func readMounts(t *testing.T, configPath string) []map[string]any {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var spec map[string]json.RawMessage
+	var spec map[string]jsontext.Value
 	if err := json.Unmarshal(data, &spec); err != nil {
 		t.Fatalf("rewritten config is not JSON: %v", err)
 	}
@@ -139,7 +140,7 @@ func TestWrapperCreateInjectsSharedCache(t *testing.T) {
 	}
 	// Other top-level fields survive.
 	data, _ := os.ReadFile(configPath)
-	var spec map[string]json.RawMessage
+	var spec map[string]jsontext.Value
 	if err := json.Unmarshal(data, &spec); err != nil {
 		t.Fatal(err)
 	}

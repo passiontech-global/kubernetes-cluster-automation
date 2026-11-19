@@ -22,7 +22,8 @@
 package concourseinit
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -153,7 +154,7 @@ func injectSharedCacheMount(configPath, source string) {
 	// key order re-sorts alphabetically on marshal and insignificant
 	// whitespace is compacted; byte-parity of the whole file was
 	// never the contract (the awk rewrite changed formatting too).
-	var spec map[string]json.RawMessage
+	var spec map[string]jsontext.Value
 	if err := json.Unmarshal(data, &spec); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"concourse-runc-wrapper: parse %s: %v — passthrough\n",
@@ -179,7 +180,7 @@ func injectSharedCacheMount(configPath, source string) {
 	}
 
 	// Conditions 2+3: /scratch present, /shared-cache absent.
-	var mounts []json.RawMessage
+	var mounts []jsontext.Value
 	if raw, ok := spec["mounts"]; ok {
 		if err := json.Unmarshal(raw, &mounts); err != nil {
 			fmt.Fprintf(os.Stderr,
@@ -225,7 +226,7 @@ func injectSharedCacheMount(configPath, source string) {
 			err)
 		return
 	}
-	mounts = slices.Insert(mounts, scratch, json.RawMessage(entry))
+	mounts = slices.Insert(mounts, scratch, jsontext.Value(entry))
 	newMounts, err := json.Marshal(mounts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
@@ -234,7 +235,7 @@ func injectSharedCacheMount(configPath, source string) {
 		return
 	}
 	spec["mounts"] = newMounts
-	out, err := json.Marshal(spec)
+	out, err := json.Marshal(spec, json.Deterministic(true))
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
 			"concourse-runc-wrapper: marshal %s: %v — passthrough\n",

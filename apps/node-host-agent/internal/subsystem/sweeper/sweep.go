@@ -6,7 +6,7 @@ package sweeper
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"log/slog"
 	"os"
 	"path/filepath"

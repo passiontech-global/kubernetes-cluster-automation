@@ -4,7 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -204,11 +205,11 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 			ResourceVersion string `json:"resourceVersion"`
 		} `json:"metadata"`
 	}
-	dec := json.NewDecoder(io.LimitReader(resp.Body, maxProbeBody))
+	dec := jsontext.NewDecoder(io.LimitReader(resp.Body, maxProbeBody))
 	if err := decodeListRV(dec, &list.Metadata.ResourceVersion); err != nil {
 		// A syntax/EOF fault is a parse; anything else inside the
 		// token walk is the body stream itself failing.
-		var syn *json.SyntaxError
+		var syn *jsontext.SyntacticError
 		if errors.As(err, &syn) || errors.Is(err, io.EOF) ||
 			errors.Is(err, errBadPayload) {
 			return 0, failParse, err
@@ -231,45 +232,39 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 
 // decodeListRV token-walks a List JSON just deep enough to surface
 // top-level metadata.resourceVersion, then returns — the caller stops
-// reading. depth==1 is the top-level object (its opening '{' counted).
-func decodeListRV(dec *json.Decoder, rv *string) error {
-	t, err := dec.Token()
+// reading.
+func decodeListRV(dec *jsontext.Decoder, rv *string) error {
+	t, err := dec.ReadToken()
 	if err != nil {
 		return err
 	}
-	if d, ok := t.(json.Delim); !ok || d != '{' {
-		return fmt.Errorf("%w: unexpected JSON start %v", errBadPayload, t)
+	if t.Kind() != '{' {
+		return fmt.Errorf("%w: unexpected JSON start %v", errBadPayload, t.Kind())
 	}
-	depth := 1
 	for {
-		t, err := dec.Token()
+		t, err := dec.ReadToken()
 		if err != nil {
 			return err
 		}
-		if d, ok := t.(json.Delim); ok {
-			switch d {
-			case '{', '[':
-				depth++
-			default:
-				depth--
-			}
-			continue
+		if t.Kind() == '}' {
+			return io.EOF
 		}
-		if depth == 1 {
-			if s, ok := t.(string); ok && s == "metadata" {
-				var m struct {
-					ResourceVersion string `json:"resourceVersion"`
-				}
-				if err := dec.Decode(&m); err != nil {
-					return err
-				}
-				if m.ResourceVersion == "" {
-					return fmt.Errorf("%w: empty metadata.resourceVersion",
-						errBadPayload)
-				}
-				*rv = m.ResourceVersion
-				return nil
+		if t.Kind() == '"' && t.String() == "metadata" {
+			var m struct {
+				ResourceVersion string `json:"resourceVersion"`
 			}
+			if err := json.UnmarshalDecode(dec, &m); err != nil {
+				return err
+			}
+			if m.ResourceVersion == "" {
+				return fmt.Errorf("%w: empty metadata.resourceVersion",
+					errBadPayload)
+			}
+			*rv = m.ResourceVersion
+			return nil
+		}
+		if err := dec.SkipValue(); err != nil {
+			return err
 		}
 	}
 }

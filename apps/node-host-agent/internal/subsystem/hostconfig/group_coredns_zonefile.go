@@ -8,7 +8,7 @@ package hostconfig
 
 import (
 	"crypto/sha256"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"math/big"
 	"strings"
@@ -91,8 +91,8 @@ func (c *cyc) renderZoneFile() ([]byte, error) {
 // | hash('sha256') | int(0,16) % 4294967295. Changes only when the
 // inputs change (no DNS blip on every converge).
 func (c *cyc) zoneSerial() int64 {
-	nj, _ := json.Marshal(topologyPlain(c.t.Nodes))
-	zj, _ := json.Marshal(topologyPlain(c.t.Zone))
+	nj, _ := json.Marshal(topologyPlain(c.t.Nodes), json.Deterministic(true))
+	zj, _ := json.Marshal(topologyPlain(c.t.Zone), json.Deterministic(true))
 	h := sha256.Sum256(append(nj, zj...))
 	i := new(big.Int).SetBytes(h[:])
 	i.Mod(i, big.NewInt(4294967295))

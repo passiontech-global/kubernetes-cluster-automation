@@ -24,7 +24,7 @@ package apiserver
 
 import (
 	"context"
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"path/filepath"
 	"regexp"

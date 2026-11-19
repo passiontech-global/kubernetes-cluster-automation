@@ -6,7 +6,7 @@
 package hostconfig
 
 import (
-	"encoding/json"
+	json "encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
