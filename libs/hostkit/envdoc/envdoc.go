@@ -229,14 +229,15 @@ func ScanTree(opts Options) (Result, error) {
 		scan.inEnvx = dirAbs == envxDirAbs
 
 		for _, f := range files {
-			scan.envxName, scan.envxDot = importLocalName(f, EnvxImportPath)
-			scan.osName, _ = importLocalName(f, "os")
+			scan.envxNames, scan.envxDot = importLocalNames(f, EnvxImportPath)
+			scan.osNames, scan.osDot = importLocalNames(f, "os")
 			// Reset the per-file walk state instead of re-allocating
 			// the scan (and a visitor per AST node) for every file —
 			// the stack slices are balanced-empty between walks, so a
 			// truncate keeps the backing arrays for reuse.
 			scan.stack = scan.stack[:0]
-			visitor.pushed = visitor.pushed[:0]
+			scan.scopes = scan.scopes[:0]
+			visitor.frames = visitor.frames[:0]
 			ast.Walk(visitor, f)
 		}
 	}
@@ -270,18 +271,20 @@ type rangeFrame struct {
 	coverValue bool
 	dynKey     bool
 	dynValue   bool
+	scopeDepth int
 }
 
 // fileScan carries one file's scan state: import aliases, the
-// package const table, the registry/envx directory flags and the
-// live range-binding stack.
+// package const table, the registry/envx directory flags, the
+// lexical declaration scopes, and the live range-binding stack.
 type fileScan struct {
 	fset       *token.FileSet
 	res        *Result
 	consts     map[string]string
-	envxName   string
+	envxNames  []string
 	envxDot    bool
-	osName     string
+	osNames    []string
+	osDot      bool
 	inEnvx     bool
 	inRegistry bool
 	allowRawOS bool
@@ -289,49 +292,137 @@ type fileScan struct {
 	site       func(fset *token.FileSet, pos token.Pos) string
 	record     func(fset *token.FileSet, value string, pos token.Pos)
 	stack      []*rangeFrame
+	scopes     []map[string]bool
+}
+
+type visitFrame struct {
+	popRange   bool
+	popScope   bool
+	assignDecl *ast.AssignStmt
+	valueDecl  *ast.ValueSpec
 }
 
 // rangeVisitor is the ast.Visitor Walk drives. It exists so a
-// RangeStmt's frame can be pushed on entry and popped on exit —
-// ast.Inspect has no exit hook, and a file-level variable set (the
-// bug this replaces) let a loop variable's coverage leak onto
-// same-named identifiers anywhere later in the file. One instance is
-// reused for a whole ScanTree run: each enter appends the node's
-// pushed flag and each matching Visit(nil) pops it, so the
-// enter/exit events stay paired LIFO exactly like the old
-// one-visitor-per-node chain — a node's flag sits on top for the
-// whole span of its subtree walk. `pushed` records the flag for
-// every node still open, so a RangeStmt binding no identifiers
-// cannot pop an outer frame.
+// RangeStmt's frame and lexical declaration scopes can be pushed on
+// entry and popped/committed on exit — ast.Inspect has no exit hook.
 type rangeVisitor struct {
 	s      *fileScan
-	pushed []bool
+	frames []visitFrame
 }
 
 func (v *rangeVisitor) Visit(n ast.Node) ast.Visitor {
 	if n == nil {
 		// Walk calls Visit(nil) on the visitor a node returned after
-		// that node's children — unwind the matching enter event and
-		// pop the frame if THAT node pushed one.
-		if last := len(v.pushed) - 1; last >= 0 {
-			if v.pushed[last] && len(v.s.stack) > 0 {
+		// that node's children — commit any post-walk declarations
+		// (RHS/Values are walked before the LHS/Name enters scope)
+		// and unwind any pushed range/scope frames in LIFO order.
+		if last := len(v.frames) - 1; last >= 0 {
+			frame := v.frames[last]
+			v.frames = v.frames[:last]
+			if frame.assignDecl != nil {
+				for _, lhs := range frame.assignDecl.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						v.s.declareLocal(id.Name)
+					}
+				}
+			}
+			if frame.valueDecl != nil {
+				for _, name := range frame.valueDecl.Names {
+					v.s.declareLocal(name.Name)
+				}
+			}
+			if frame.popRange && len(v.s.stack) > 0 {
 				v.s.stack = v.s.stack[:len(v.s.stack)-1]
 			}
-			v.pushed = v.pushed[:last]
+			if frame.popScope && len(v.s.scopes) > 0 {
+				v.s.scopes = v.s.scopes[:len(v.s.scopes)-1]
+			}
 		}
 		return nil
 	}
-	v.pushed = append(v.pushed, v.s.inspect(n))
+	v.frames = append(v.frames, v.s.inspect(n))
 	return v
 }
 
-// inspect handles the node types the scan cares about and reports
-// whether it pushed a range frame (RangeStmt with bound identifiers).
-// Called for every node in preorder (before its children).
-func (s *fileScan) inspect(n ast.Node) bool {
+func (s *fileScan) pushScope() {
+	s.scopes = append(s.scopes, nil)
+}
+
+func (s *fileScan) declareLocal(name string) {
+	if name == "" || name == "_" || len(s.scopes) == 0 {
+		return
+	}
+	top := len(s.scopes) - 1
+	if s.scopes[top] == nil {
+		s.scopes[top] = map[string]bool{}
+	}
+	s.scopes[top][name] = true
+}
+
+func (s *fileScan) declareFieldList(fl *ast.FieldList) {
+	if fl == nil {
+		return
+	}
+	for _, field := range fl.List {
+		for _, name := range field.Names {
+			s.declareLocal(name.Name)
+		}
+	}
+}
+
+func (s *fileScan) localDeclDepth(name string) int {
+	for i := len(s.scopes) - 1; i >= 0; i-- {
+		if s.scopes[i][name] {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *fileScan) isLocalAt(name string, pos token.Pos) bool {
+	if s.localDeclDepth(name) >= 0 {
+		return true
+	}
+	bound, _, _ := s.rangeResolve(name, pos)
+	return bound
+}
+
+// inspect handles the node types the scan cares about and returns
+// the visitFrame recording any range/scope pushes or deferred local
+// declarations. Called for every node in preorder (before children).
+func (s *fileScan) inspect(n ast.Node) visitFrame {
+	var frame visitFrame
 	switch e := n.(type) {
+	case *ast.FuncDecl:
+		frame.popScope = true
+		s.pushScope()
+		s.declareFieldList(e.Recv)
+		if e.Type != nil {
+			s.declareFieldList(e.Type.TypeParams)
+			s.declareFieldList(e.Type.Params)
+			s.declareFieldList(e.Type.Results)
+		}
+	case *ast.FuncLit:
+		frame.popScope = true
+		s.pushScope()
+		if e.Type != nil {
+			s.declareFieldList(e.Type.TypeParams)
+			s.declareFieldList(e.Type.Params)
+			s.declareFieldList(e.Type.Results)
+		}
+	case *ast.BlockStmt, *ast.IfStmt, *ast.ForStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.CaseClause, *ast.CommClause:
+		frame.popScope = true
+		s.pushScope()
 	case *ast.RangeStmt:
-		return s.scanRange(e)
+		frame.popRange = s.scanRange(e)
+	case *ast.AssignStmt:
+		if e.Tok == token.DEFINE && len(s.scopes) > 0 {
+			frame.assignDecl = e
+		}
+	case *ast.ValueSpec:
+		if len(s.scopes) > 0 {
+			frame.valueDecl = e
+		}
 	case *ast.CallExpr:
 		s.scanCall(e)
 	case *ast.KeyValueExpr:
@@ -341,7 +432,7 @@ func (s *fileScan) inspect(n ast.Node) bool {
 			}
 		}
 	}
-	return false
+	return frame
 }
 
 // scanRange classifies a `for ... range X` binding: a composite
@@ -369,6 +460,7 @@ func (s *fileScan) scanRange(e *ast.RangeStmt) bool {
 		body: e.Body, names: names,
 		coverKey: coverKey, coverValue: coverValue,
 		dynKey: dynKey, dynValue: dynValue,
+		scopeDepth: len(s.scopes),
 	})
 	return true
 }
@@ -410,12 +502,23 @@ func (s *fileScan) scanRangeLit(cl *ast.CompositeLit, pos token.Pos) (coverKey, 
 	return coverKey, coverValue, dynKey, dynValue
 }
 
+func (s *fileScan) resolvePkgConst(id *ast.Ident) (string, bool) {
+	if bound, _, _ := s.rangeResolve(id.Name, id.Pos()); bound {
+		return "", false
+	}
+	if s.localDeclDepth(id.Name) >= 0 {
+		return "", false
+	}
+	v, ok := s.consts[id.Name]
+	return v, ok
+}
+
 // scanRangeCover classifies one binding position's element list:
 // cover reports at least one static element (string literal or
-// package-level string const — both already recorded as env reads),
-// dyn reports at least one element the scanner cannot resolve. A
-// non-string literal counts as dynamic: it cannot be an env name,
-// so a binding that can take one is not provably covered.
+// unshadowed package-level string const — both already recorded as
+// env reads), dyn reports at least one element the scanner cannot
+// resolve. A non-string literal counts as dynamic: it cannot be an
+// env name, so a binding that can take one is not provably covered.
 func (s *fileScan) scanRangeCover(elts []ast.Expr) (cover, dyn bool) {
 	var walk func(ast.Expr)
 	walk = func(e ast.Expr) {
@@ -432,7 +535,7 @@ func (s *fileScan) scanRangeCover(elts []ast.Expr) (cover, dyn bool) {
 				dyn = true
 			}
 		case *ast.Ident:
-			if _, ok := s.consts[v.Name]; ok {
+			if _, ok := s.resolvePkgConst(v); ok {
 				cover = true
 			} else {
 				dyn = true
@@ -448,10 +551,10 @@ func (s *fileScan) scanRangeCover(elts []ast.Expr) (cover, dyn bool) {
 }
 
 // scanRangeElt records one element of a ranged composite literal:
-// string literals and package-level string consts are env reads; a
-// KeyValueExpr (map literal) contributes BOTH sides — `for k := range`
-// binds keys while `for _, v := range` binds values, and the scanner
-// cannot tell which the caller treats as the env name.
+// string literals and unshadowed package-level string consts are env
+// reads; a KeyValueExpr (map literal) contributes BOTH sides —
+// `for k := range` binds keys while `for _, v := range` binds values,
+// and the scanner cannot tell which the caller treats as the env name.
 func (s *fileScan) scanRangeElt(elt ast.Expr, pos token.Pos) {
 	if kv, ok := elt.(*ast.KeyValueExpr); ok {
 		s.scanRangeElt(kv.Key, pos)
@@ -466,7 +569,7 @@ func (s *fileScan) scanRangeElt(elt ast.Expr, pos token.Pos) {
 			}
 		}
 	case *ast.Ident:
-		if c, ok := s.consts[v.Name]; ok {
+		if c, ok := s.resolvePkgConst(v); ok {
 			s.record(s.fset, c, pos)
 		}
 	}
@@ -475,12 +578,10 @@ func (s *fileScan) scanRangeElt(elt ast.Expr, pos token.Pos) {
 // rangeResolve reports whether name is bound by an enclosing range
 // frame at pos and, when it is, whether that binding is cleanly
 // covered — every element the variable can take was recorded as an
-// env read. Walking the stack top-down finds the innermost binding
-// first, so a non-literal inner range correctly shadows an outer
-// literal one. Unresolved reporting is deferred to the USE site:
-// a loop whose body never feeds an env read contributes nothing,
-// however dynamic its ranged literal is.
-func (s *fileScan) rangeResolve(name string, pos token.Pos) (bound, clean bool) {
+// env read — plus the scopeDepth at which the RangeStmt was entered.
+// Walking the stack top-down finds the innermost binding first, so a
+// non-literal inner range correctly shadows an outer literal one.
+func (s *fileScan) rangeResolve(name string, pos token.Pos) (bound, clean bool, scopeDepth int) {
 	for i := len(s.stack) - 1; i >= 0; i-- {
 		f := s.stack[i]
 		p, ok := f.names[name]
@@ -492,13 +593,13 @@ func (s *fileScan) rangeResolve(name string, pos token.Pos) (bound, clean bool) 
 		}
 		switch p {
 		case bindKey:
-			return true, f.coverKey && !f.dynKey
+			return true, f.coverKey && !f.dynKey, f.scopeDepth
 		case bindValue:
-			return true, f.coverValue && !f.dynValue
+			return true, f.coverValue && !f.dynValue, f.scopeDepth
 		}
-		return true, false
+		return true, false, f.scopeDepth
 	}
-	return false, false
+	return false, false, 0
 }
 
 // scanCall resolves env-reading call sites: raw os.Getenv-family
@@ -509,7 +610,10 @@ func (s *fileScan) scanCall(e *ast.CallExpr) {
 	if len(e.Args) == 0 {
 		return
 	}
-	if isRawEnvRead(e, s.osName) {
+	isLocal := func(name string) bool {
+		return s.isLocalAt(name, e.Pos())
+	}
+	if isRawEnvRead(e, s.osNames, s.osDot, isLocal) {
 		if s.allowRawOS {
 			s.addKey(e.Args[0], e.Pos())
 		} else {
@@ -517,19 +621,17 @@ func (s *fileScan) scanCall(e *ast.CallExpr) {
 		}
 		return
 	}
-	if !isEnvCall(e, s.envxName, s.envxDot, s.inEnvx, s.helpers) {
+	if !isEnvCall(e, s.envxNames, s.envxDot, s.inEnvx, s.helpers, isLocal) {
 		return
 	}
 	s.addKey(e.Args[0], e.Pos())
 }
 
-// addKey records a literal env key, resolves a package-level string
-// const, accepts a range variable bound to a recorded literal inside
-// its loop body, and reports anything else as unresolved — an env
-// key the scanner cannot name is one docs/env.md cannot be checked
-// against. Keys written as arbitrary other expressions (a field
-// read, a concatenation, a call result) are ignored rather than
-// flagged.
+// addKey records a literal env key, accepts a range variable bound to
+// a recorded literal inside its loop body (unless shadowed by an
+// inner local declaration), resolves an unshadowed package-level
+// string const, and reports anything else as unresolved — an env key
+// the scanner cannot name is one docs/env.md cannot be checked against.
 func (s *fileScan) addKey(expr ast.Expr, pos token.Pos) {
 	switch k := expr.(type) {
 	case *ast.BasicLit:
@@ -540,16 +642,28 @@ func (s *fileScan) addKey(expr ast.Expr, pos token.Pos) {
 			s.record(s.fset, v, pos)
 		}
 	case *ast.Ident:
-		if v, ok := s.consts[k.Name]; ok {
-			s.record(s.fset, v, pos)
+		localDepth := s.localDeclDepth(k.Name)
+		if bound, clean, scopeDepth := s.rangeResolve(k.Name, k.Pos()); bound && localDepth < scopeDepth {
+			if clean {
+				// Bound to a []string literal already recorded at the
+				// RangeStmt with no dynamic sibling — the keys are
+				// covered.
+				return
+			}
+			// Bound-but-unclean range variable shadows any outer
+			// package const: never fall through to s.consts.
+			s.res.Unresolved = append(s.res.Unresolved,
+				fmt.Sprintf("%s (%s)", s.site(s.fset, pos), k.Name))
 			return
 		}
-		if bound, clean := s.rangeResolve(k.Name, k.Pos()); bound && clean {
-			// Bound to a []string literal already recorded at the
-			// RangeStmt with no dynamic sibling — the keys are
-			// covered. Anything else bound-but-unclean (non-literal
-			// range, dynamic element, uncovered position) cannot be
-			// named and falls through to Unresolved.
+		if localDepth >= 0 {
+			// Local var/const/:=/param shadows any package-level const.
+			s.res.Unresolved = append(s.res.Unresolved,
+				fmt.Sprintf("%s (%s)", s.site(s.fset, pos), k.Name))
+			return
+		}
+		if v, ok := s.consts[k.Name]; ok {
+			s.record(s.fset, v, pos)
 			return
 		}
 		// An identifier that is neither a string const nor a

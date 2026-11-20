@@ -13,6 +13,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -114,12 +115,13 @@ func PackageStringConsts(files []*ast.File) map[string]string {
 	return consts
 }
 
-// importLocalName returns the identifier a file binds importPath to
-// — the explicit alias when present, else the package's default
-// name — plus whether it is dot-imported (unqualified calls). A
-// blank/_ import yields ("", false): the package's funcs are
-// unreachable.
-func importLocalName(f *ast.File, importPath string) (string, bool) {
+// importLocalNames collects every identifier a file binds importPath
+// to (explicit aliases and default package names) plus whether
+// importPath is dot-imported. Blank (_) imports are skipped without
+// short-circuiting later imports of the same path.
+func importLocalNames(f *ast.File, importPath string) ([]string, bool) {
+	var names []string
+	dot := false
 	for _, spec := range f.Imports {
 		path, err := strconv.Unquote(spec.Path.Value)
 		if err != nil || path != importPath {
@@ -127,42 +129,44 @@ func importLocalName(f *ast.File, importPath string) (string, bool) {
 		}
 		switch {
 		case spec.Name == nil:
-			return importPath[strings.LastIndex(importPath, "/")+1:], false
+			names = append(names, importPath[strings.LastIndex(importPath, "/")+1:])
 		case spec.Name.Name == ".":
-			return "", true
+			dot = true
 		case spec.Name.Name == "_":
-			return "", false
+			continue
 		default:
-			return spec.Name.Name, false
+			names = append(names, spec.Name.Name)
 		}
 	}
-	return "", false
+	return names, dot
 }
 
 // isEnvCall reports whether call is a read of an env var through one
 // of the shared helpers — the qualified `envxName.Xxx(...)` form
-// (alias resolved from the file's imports), the bare `Xxx(...)` form
-// a dot import or an in-tree envx package produces. An unqualified
-// same-named function anywhere else is not our business.
-func isEnvCall(call *ast.CallExpr, envxName string, envxDot, inEnvx bool, helpers map[string]bool) bool {
+// (aliases resolved from the file's imports), or the bare `Xxx(...)`
+// form a dot import or an in-tree envx package produces, provided the
+// receiver or function name is not shadowed by a local declaration.
+func isEnvCall(call *ast.CallExpr, envxNames []string, envxDot, inEnvx bool, helpers map[string]bool, isLocal func(string) bool) bool {
 	switch fun := call.Fun.(type) {
 	case *ast.SelectorExpr:
 		recv, ok := fun.X.(*ast.Ident)
-		return ok && envxName != "" && recv.Name == envxName && helpers[fun.Sel.Name]
+		return ok && slices.Contains(envxNames, recv.Name) && !isLocal(recv.Name) && helpers[fun.Sel.Name]
 	case *ast.Ident:
-		return (inEnvx || envxDot) && helpers[fun.Name]
+		return (inEnvx || envxDot) && !isLocal(fun.Name) && helpers[fun.Name]
 	}
 	return false
 }
 
-// isRawEnvRead reports whether call is os.Getenv/LookupEnv/
-// ExpandEnv under whatever local name the file binds the os import
-// to.
-func isRawEnvRead(call *ast.CallExpr, osName string) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
+// isRawEnvRead reports whether call is os.Getenv/LookupEnv/ExpandEnv
+// under any local name (or dot import) the file binds the os import
+// to, provided the receiver or function name is not locally shadowed.
+func isRawEnvRead(call *ast.CallExpr, osNames []string, osDot bool, isLocal func(string) bool) bool {
+	switch fun := call.Fun.(type) {
+	case *ast.SelectorExpr:
+		recv, ok := fun.X.(*ast.Ident)
+		return ok && slices.Contains(osNames, recv.Name) && !isLocal(recv.Name) && rawEnvReadNames[fun.Sel.Name]
+	case *ast.Ident:
+		return osDot && !isLocal(fun.Name) && rawEnvReadNames[fun.Name]
 	}
-	recv, ok := sel.X.(*ast.Ident)
-	return ok && osName != "" && recv.Name == osName && rawEnvReadNames[sel.Sel.Name]
+	return false
 }

@@ -291,6 +291,8 @@ func TestWarnfIsInvokedOnRejectedValues(t *testing.T) {
 	}
 }
 
+var gateIntentTestRun atomic.Uint64
+
 // A gate value that reads as boolean intent but misses the exact
 // "true"/"false" spelling warns exactly once per key per process and
 // keeps the default outcome in both defaultOn modes — the warning must
@@ -301,7 +303,8 @@ func TestGateWarnsOnIntentLikeMisspellings(t *testing.T) {
 	SetWarnf(func(msg string, kv ...any) { calls = append(calls, fmt.Sprint(msg, kv)) })
 	t.Cleanup(func() { SetWarnf(nil) })
 
-	const keyPrefix = "ENVX_TEST_GATE_INTENT_"
+	runID := gateIntentTestRun.Add(1)
+	keyPrefix := fmt.Sprintf("ENVX_TEST_GATE_INTENT_%d_", runID)
 	intents := []string{"True", "False", "TRUE", "FALSE", "1", "0", "yes", "no", "on", "off", "Yes", "ON"}
 	for i, v := range intents {
 		key := fmt.Sprintf("%s%d", keyPrefix, i) // fresh key: warn-once is per KEY
@@ -322,7 +325,7 @@ func TestGateWarnsOnIntentLikeMisspellings(t *testing.T) {
 	// Once per key per process: the first resolve of a key warns, a
 	// later resolve of the SAME key with another intent-like value is
 	// silent.
-	const key = "ENVX_TEST_GATE_INTENT_ONCE"
+	key := fmt.Sprintf("ENVX_TEST_GATE_INTENT_ONCE_%d", runID)
 	t.Setenv(key, "0")
 	if !Gate(key, true) {
 		t.Fatal(`Gate("0", true)=false, want true`)

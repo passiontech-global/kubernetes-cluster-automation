@@ -443,3 +443,101 @@ func TestListenLoopback(t *testing.T) {
 		t.Fatal("ListenLoopback(-1) unexpectedly succeeded")
 	}
 }
+
+// Close, Addr, and Serve must all tolerate a nil receiver and a
+// zero-value Server without panicking or hanging.
+func TestCloseNilReceiverAndZeroServer(t *testing.T) {
+	var nilSrv *Server
+	if err := nilSrv.Close(); err != nil {
+		t.Fatalf("nil receiver Close = %v, want nil", err)
+	}
+	if addr := nilSrv.Addr(); addr != "" {
+		t.Fatalf("nil receiver Addr = %q, want empty", addr)
+	}
+	select {
+	case err := <-nilSrv.Serve():
+		if err != nil {
+			t.Fatalf("nil receiver Serve = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("nil receiver Serve hung")
+	}
+
+	zero := &Server{}
+	if err := zero.Close(); err != nil {
+		t.Fatalf("zero-value Server Close = %v, want nil", err)
+	}
+	if err := zero.Close(); err != nil {
+		t.Fatalf("repeated zero-value Server Close = %v, want nil", err)
+	}
+	if addr := zero.Addr(); addr != "" {
+		t.Fatalf("zero-value Server Addr = %q, want empty", addr)
+	}
+	select {
+	case err := <-zero.Serve():
+		if err != nil {
+			t.Fatalf("zero-value Server Serve = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("zero-value Server Serve hung")
+	}
+
+	// Hand-assembled Server with done channel but nil srv must also
+	// resolve Serve cleanly rather than panicking on srv.Serve(ln).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	halfBuilt := &Server{ln: ln, done: make(chan error, 1)}
+	select {
+	case err := <-halfBuilt.Serve():
+		if err != nil {
+			t.Fatalf("half-built Server Serve = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("half-built Server Serve hung")
+	}
+	if err := halfBuilt.Close(); err != nil {
+		t.Fatalf("half-built Server Close = %v, want nil", err)
+	}
+}
+
+// A bound-but-never-Served Server closed via Close must release the
+// socket immediately, clear Addr, resolve a later Serve with nil, and
+// allow repeated Close/Shutdown calls.
+func TestCloseBeforeServeClosesListener(t *testing.T) {
+	srv, err := New("127.0.0.1:0", http.NotFoundHandler(), Opts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := srv.Addr()
+	if addr == "" {
+		t.Fatal("Addr empty before Serve")
+	}
+
+	if err := srv.Close(); err != nil {
+		t.Fatalf("Close before Serve: %v", err)
+	}
+	if got := srv.Addr(); got != "" {
+		t.Fatalf("Addr after Close = %q, want empty", got)
+	}
+	if conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("listener still accepting after Close")
+	}
+	select {
+	case err := <-srv.Serve():
+		if err != nil {
+			t.Fatalf("Serve after pre-Serve Close = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve after pre-Serve Close hung")
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatalf("second Close = %v, want nil", err)
+	}
+	if err := srv.Shutdown(t.Context()); err != nil {
+		t.Fatalf("Shutdown after Close = %v, want nil", err)
+	}
+}

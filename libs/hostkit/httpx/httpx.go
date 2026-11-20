@@ -130,8 +130,11 @@ func ListenLoopback(port int) (net.Listener, error) {
 }
 
 // Addr returns the bound listener's address — usable before Serve, so
-// the endpoint URL can be published first.
+// the endpoint URL can be published first. A nil receiver returns "".
 func (s *Server) Addr() string {
+	if s == nil {
+		return ""
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ln == nil {
@@ -140,6 +143,14 @@ func (s *Server) Addr() string {
 	return s.ln.Addr().String()
 }
 
+// closedDone is a pre-closed error channel returned by Serve on nil or
+// zero-value Servers so receives resolve immediately with nil.
+var closedDone = func() chan error {
+	ch := make(chan error)
+	close(ch)
+	return ch
+}()
+
 // Serve starts accepting connections in the background. The returned
 // channel yields nil after a graceful Shutdown (http.ErrServerClosed
 // is folded away — shutting down is not a serve failure) or the
@@ -147,21 +158,26 @@ func (s *Server) Addr() string {
 // repeated receives keep answering nil. Serve is idempotent — a
 // second call returns the same channel without spawning a second
 // accept loop (serveOnce) — and a call after Close/Shutdown resolves
-// nil on the closed listener.
+// nil on the closed listener. A nil receiver or zero-value Server
+// returns an already-closed channel.
 func (s *Server) Serve() <-chan error {
+	if s == nil || s.done == nil {
+		return closedDone
+	}
 	s.serveOnce.Do(func() {
 		s.mu.Lock()
 		ln := s.ln
+		srv := s.srv
 		s.mu.Unlock()
 		go func() {
 			var err error
 			switch {
-			case ln == nil || s.isClosed():
+			case ln == nil || srv == nil || s.isClosed():
 				// Torn down before the accept loop started — a clean
 				// close, not a serve failure.
 				err = http.ErrServerClosed
 			default:
-				err = s.srv.Serve(ln)
+				err = srv.Serve(ln)
 			}
 			if errors.Is(err, http.ErrServerClosed) ||
 				(errors.Is(err, net.ErrClosed) && s.isClosed()) {
@@ -248,10 +264,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // Close tears the server down immediately: in-flight requests are
 // cut rather than drained, and the bound socket is released even on
 // a Server that was never Served. It is the counterpart of Shutdown
-// for callers that must not block — and safe to call repeatedly or
-// before Serve.
+// for callers that must not block — and safe to call repeatedly,
+// before Serve, on a nil receiver, or on a zero-value Server.
 func (s *Server) Close() error {
+	if s == nil {
+		return nil
+	}
 	s.mu.Lock()
+	srv := s.srv
 	ln := s.ln
 	s.ln = nil
 	s.closed = true
@@ -260,8 +280,10 @@ func (s *Server) Close() error {
 	// srv.Close FIRST: it closes the listener internally and waits
 	// for in-flight handlers; closing ln first made srv.Close's own
 	// accept loop surface spurious net.ErrClosed errors.
-	if err := s.srv.Close(); err != nil {
-		first = err
+	if srv != nil {
+		if err := srv.Close(); err != nil {
+			first = err
+		}
 	}
 	if ln != nil {
 		// srv.Close already closed a listener it was Serving — the

@@ -301,3 +301,315 @@ const (
 		t.Fatal("non-string const row leaked into the table")
 	}
 }
+
+func scanSingleFile(t *testing.T, src string, allowRawOS bool) Result {
+	t.Helper()
+	root := t.TempDir()
+	envxDir := filepath.Join(root, "envxlib")
+	fixtureEnvx(t, envxDir)
+	modRoot := filepath.Join(root, "mod")
+	writeFile(t, filepath.Join(modRoot, "main.go"), src)
+	res, err := ScanTree(Options{
+		Root:       modRoot,
+		EnvxDir:    envxDir,
+		AllowRawOS: allowRawOS,
+	})
+	if err != nil {
+		t.Fatalf("ScanTree: %v", err)
+	}
+	return res
+}
+
+func TestScanTreeDotImportOS(t *testing.T) {
+	src := `package main
+
+import . "os"
+
+func main() {
+	_ = Getenv("DOT_GETENV")
+	_, _ = LookupEnv("DOT_LOOKUP")
+	_ = ExpandEnv("$DOT_EXPAND")
+}
+`
+	denied := scanSingleFile(t, src, false)
+	if len(denied.RawReads) != 3 {
+		t.Fatalf("AllowRawOS=false RawReads = %v, want 3 entries", denied.RawReads)
+	}
+	if len(denied.Referenced) != 0 {
+		t.Fatalf("AllowRawOS=false Referenced = %v, want empty", denied.Referenced)
+	}
+
+	allowed := scanSingleFile(t, src, true)
+	if len(allowed.RawReads) != 0 {
+		t.Fatalf("AllowRawOS=true RawReads = %v, want empty", allowed.RawReads)
+	}
+	for _, want := range []string{"DOT_GETENV"} {
+		if _, ok := allowed.Referenced[want]; !ok {
+			t.Errorf("AllowRawOS=true Referenced missing %s (got %v)", want, allowed.Referenced)
+		}
+	}
+	// LookupEnv key is also collected verbatim.
+	if _, ok := allowed.Referenced["DOT_LOOKUP"]; !ok {
+		t.Errorf("AllowRawOS=true Referenced missing DOT_LOOKUP (got %v)", allowed.Referenced)
+	}
+	// ExpandEnv("$DOT_EXPAND") does not match ^[A-Z][A-Z0-9_]*$, test with literal key too.
+	src2 := `package main
+
+import . "os"
+
+func main() {
+	_ = Getenv("DOT_GETENV")
+	_, _ = LookupEnv("DOT_LOOKUP")
+	_ = ExpandEnv("DOT_EXPAND")
+}
+`
+	allowed2 := scanSingleFile(t, src2, true)
+	for _, want := range []string{"DOT_GETENV", "DOT_LOOKUP", "DOT_EXPAND"} {
+		if _, ok := allowed2.Referenced[want]; !ok {
+			t.Errorf("Referenced missing %s (got %v)", want, allowed2.Referenced)
+		}
+	}
+}
+
+func TestScanTreeBlankAndMultiImports(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{
+			name: "blank then default os",
+			src: `package main
+import (
+	_ "os"
+	"os"
+)
+func main() { _ = os.Getenv("BLANK_THEN_DEFAULT") }
+`,
+			want: []string{"BLANK_THEN_DEFAULT"},
+		},
+		{
+			name: "blank then aliased os",
+			src: `package main
+import (
+	_ "os"
+	myos "os"
+)
+func main() { _ = myos.Getenv("BLANK_THEN_ALIAS") }
+`,
+			want: []string{"BLANK_THEN_ALIAS"},
+		},
+		{
+			name: "blank then dot os",
+			src: `package main
+import (
+	_ "os"
+	. "os"
+)
+func main() { _ = Getenv("BLANK_THEN_DOT") }
+`,
+			want: []string{"BLANK_THEN_DOT"},
+		},
+		{
+			name: "dot and aliased os together",
+			src: `package main
+import (
+	. "os"
+	myos "os"
+)
+func main() {
+	_ = Getenv("MULTI_DOT")
+	_ = myos.Getenv("MULTI_ALIAS")
+}
+`,
+			want: []string{"MULTI_DOT", "MULTI_ALIAS"},
+		},
+		{
+			name: "blank then default and aliased envx",
+			src: `package main
+import (
+	_ "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	myenvx "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+)
+func main() {
+	_ = envx.Getenv("ENVX_DEFAULT", "")
+	_ = myenvx.Getenv("ENVX_ALIAS", "")
+}
+`,
+			want: []string{"ENVX_DEFAULT", "ENVX_ALIAS"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := scanSingleFile(t, tc.src, true)
+			for _, w := range tc.want {
+				if _, ok := res.Referenced[w]; !ok {
+					t.Errorf("Referenced missing %s (got %v)", w, res.Referenced)
+				}
+			}
+			if len(res.Unresolved) != 0 {
+				t.Errorf("unexpected Unresolved: %v", res.Unresolved)
+			}
+		})
+	}
+
+	// Blank-only import of os must not flag a local struct/var named os.
+	blankOnly := `package main
+import _ "os"
+type fakeOS struct{}
+func (fakeOS) Getenv(s string) string { return s }
+func main() {
+	var os fakeOS
+	_ = os.Getenv("SHOULD_NOT_MATCH")
+}
+`
+	res := scanSingleFile(t, blankOnly, false)
+	if len(res.RawReads) != 0 || len(res.Referenced) != 0 {
+		t.Fatalf("blank-only os matched local var: raw=%v ref=%v", res.RawReads, res.Referenced)
+	}
+}
+
+func TestScanTreeRangeAndLocalShadowing(t *testing.T) {
+	// 1. Dynamic range variable shadowing package const must be Unresolved
+	//    and must NOT falsely record PKG_CONST.
+	dynRangeShadow := `package main
+import "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+const k = "PKG_CONST"
+func getKeys() []string { return nil }
+func main() {
+	for _, k := range getKeys() {
+		_ = envx.Getenv(k, "")
+	}
+}
+`
+	res := scanSingleFile(t, dynRangeShadow, false)
+	if _, ok := res.Referenced["PKG_CONST"]; ok {
+		t.Fatalf("dynamic range shadowing package const falsely recorded PKG_CONST")
+	}
+	if len(res.Unresolved) != 1 {
+		t.Fatalf("Unresolved = %v, want 1", res.Unresolved)
+	}
+
+	// 2. Literal range variable shadowing package const resolves to loop
+	//    literals only, NOT PKG_CONST.
+	litRangeShadow := `package main
+import "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+const k = "PKG_CONST"
+func main() {
+	for _, k := range []string{"LOOP_ONLY"} {
+		_ = envx.Getenv(k, "")
+	}
+}
+`
+	res = scanSingleFile(t, litRangeShadow, false)
+	if _, ok := res.Referenced["LOOP_ONLY"]; !ok {
+		t.Fatalf("Referenced missing LOOP_ONLY: %v", res.Referenced)
+	}
+	if _, ok := res.Referenced["PKG_CONST"]; ok {
+		t.Fatalf("literal range shadowing package const falsely recorded PKG_CONST")
+	}
+	if len(res.Unresolved) != 0 {
+		t.Fatalf("Unresolved = %v, want 0", res.Unresolved)
+	}
+
+	// 3. Local shadowing forms (param, var, :=, local const, if init,
+	//    inner := inside literal range, shadowed const inside range literal,
+	//    switch case block scoping, and RHS-before-LHS in :=).
+	localShadows := `package main
+import (
+	"os"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+)
+const k = "PKG_CONST"
+const rhsKey = "RHS_PKG_CONST"
+const unshadowed = "UNSHADOWED_CONST"
+func dyn() string { return "" }
+type fakeOS struct{}
+func (fakeOS) Getenv(s string) string { return s }
+
+func byParam(k string) {
+	_ = envx.Getenv(k, "")
+}
+
+func byLocalDecls() {
+	var k = dyn()
+	_ = envx.Getenv(k, "")
+}
+
+func byShortDeclAndIf() {
+	if k := dyn(); k != "" {
+		_ = envx.Getenv(k, "")
+	}
+	k := dyn()
+	_ = envx.Getenv(k, "")
+}
+
+func byLocalConst() {
+	const k = "LOCAL_ONLY"
+	_ = envx.Getenv(k, "")
+}
+
+func byInnerShadowInsideRange() {
+	for _, k := range []string{"OUTER_LOOP"} {
+		k := dyn()
+		_ = envx.Getenv(k, "")
+	}
+}
+
+func byShadowedRangeLitElem() {
+	k := dyn()
+	for _, x := range []string{k} {
+		_ = envx.Getenv(x, "")
+	}
+}
+
+func rhsBeforeLHS() {
+	rhsKey := envx.Getenv(rhsKey, "")
+	_ = envx.Getenv(rhsKey, "")
+}
+
+func switchCaseBlocks(x int) {
+	switch x {
+	case 1:
+		unshadowed := dyn()
+		_ = envx.Getenv(unshadowed, "")
+	case 2:
+		_ = envx.Getenv(unshadowed, "")
+	}
+}
+
+func shadowOS(os fakeOS) {
+	_ = os.Getenv("FAKE_OS_KEY")
+}
+`
+	res = scanSingleFile(t, localShadows, false)
+	if _, ok := res.Referenced["PKG_CONST"]; ok {
+		t.Fatalf("local declarations falsely resolved PKG_CONST: %v", res.Referenced)
+	}
+	if _, ok := res.Referenced["RHS_PKG_CONST"]; !ok {
+		t.Fatalf("RHS of rhsKey := envx.Getenv(rhsKey, \"\") missed RHS_PKG_CONST: %v", res.Referenced)
+	}
+	if _, ok := res.Referenced["UNSHADOWED_CONST"]; !ok {
+		t.Fatalf("case 2 unshadowed const missed UNSHADOWED_CONST: %v", res.Referenced)
+	}
+	if _, ok := res.Referenced["OUTER_LOOP"]; !ok {
+		t.Fatalf("outer range literal element OUTER_LOOP missing: %v", res.Referenced)
+	}
+	if len(res.RawReads) != 0 {
+		t.Fatalf("shadowed os param triggered RawReads: %v", res.RawReads)
+	}
+	// Expected Unresolved sites:
+	// 1. byParam: k
+	// 2. byLocalDecls: k
+	// 3. byShortDeclAndIf (if): k
+	// 4. byShortDeclAndIf (:=): k
+	// 5. byLocalConst: k
+	// 6. byInnerShadowInsideRange: k
+	// 7. byShadowedRangeLitElem: x
+	// 8. rhsBeforeLHS (2nd call): rhsKey
+	// 9. switchCaseBlocks (case 1): unshadowed
+	if len(res.Unresolved) != 9 {
+		t.Fatalf("Unresolved = %v (count=%d), want 9", res.Unresolved, len(res.Unresolved))
+	}
+}

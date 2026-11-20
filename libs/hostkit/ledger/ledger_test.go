@@ -396,3 +396,196 @@ func TestStreakLedgerClearAndMax(t *testing.T) {
 		t.Fatalf("Hit after Clear = %d, want 1", n)
 	}
 }
+
+func TestCooldownSetSmallFutureSkewStaysCooled(t *testing.T) {
+	var c CooldownSet
+	now := time.Unix(1_700_000_000, 0)  // wall-clock only, no monotonic reading
+	future := now.Add(30 * time.Second) // <= cooldownFutureSkew (1m)
+	c.Stamp("k", future)
+
+	if !c.CooledDown("k", 5*time.Minute, now) {
+		t.Fatal("small future skew should remain cooled")
+	}
+	// Small skew stays on the RLock path without mutating the stored stamp.
+	if got, ok := c.Last("k"); !ok || !got.Equal(future) {
+		t.Fatalf("Last = (%v, %v), want (%v, true)", got, ok, future)
+	}
+	// PruneExpired must retain entries within cooldownFutureSkew.
+	if pruned := c.PruneExpired(now, 30*time.Minute); pruned != 0 {
+		t.Fatalf("PruneExpired evicted small-skew entry (%d)", pruned)
+	}
+	// Once now advances past stamp + cooldown, cooldown expires normally.
+	if c.CooledDown("k", 5*time.Minute, future.Add(5*time.Minute)) {
+		t.Fatal("cooldown did not expire once now passed stamp+cooldown")
+	}
+}
+
+func TestCooldownSetBackwardStepHeals(t *testing.T) {
+	var c CooldownSet
+	now := time.Unix(1_700_000_000, 0)
+	future := now.Add(5 * time.Hour) // > cooldownFutureSkew (1m)
+	c.Stamp("k", future)
+
+	// Non-positive cooldown always returns false even with future skew,
+	// without healing or mutating.
+	if c.CooledDown("k", 0, now) {
+		t.Fatal("zero cooldown should return false")
+	}
+	if c.CooledDown("k", -time.Minute, now) {
+		t.Fatal("negative cooldown should return false")
+	}
+
+	// Backward step beyond cooldownFutureSkew returns true (closed for one
+	// window) and heals Last(k) to now.
+	if !c.CooledDown("k", 5*time.Minute, now) {
+		t.Fatal("backward step should return true while self-healing")
+	}
+	if got, ok := c.Last("k"); !ok || !got.Equal(now) {
+		t.Fatalf("Last after heal = (%v, %v), want (%v, true)", got, ok, now)
+	}
+	// After one cooldown window from healed now, cooldown expires (no 5h lockup).
+	if c.CooledDown("k", 5*time.Minute, now.Add(6*time.Minute)) {
+		t.Fatal("healed stamp still blocked after 6m (>5m cooldown)")
+	}
+}
+
+func TestCooldownSetPruneExpiredEvictsFutureSkew(t *testing.T) {
+	var c CooldownSet
+	now := time.Unix(1_700_000_000, 0)
+	c.Stamp("skew-5h", now.Add(5*time.Hour))
+	c.Stamp("skew-30s", now.Add(30*time.Second))
+	c.Stamp("live", now.Add(-time.Minute))
+
+	if n := c.PruneExpired(now, 30*time.Minute); n != 1 {
+		t.Fatalf("PruneExpired = %d, want 1 (5h future skew)", n)
+	}
+	if _, ok := c.Last("skew-5h"); ok {
+		t.Fatal("5h future-skewed entry survived PruneExpired")
+	}
+	if _, ok := c.Last("skew-30s"); !ok {
+		t.Fatal("30s small-skew entry was evicted")
+	}
+	if _, ok := c.Last("live"); !ok {
+		t.Fatal("live entry was evicted")
+	}
+}
+
+func TestCooldownSetBackwardStepConcurrentRace(t *testing.T) {
+	var c CooldownSet
+	now := time.Unix(1_700_000_000, 0)
+	c.Stamp("skew", now.Add(5*time.Hour))
+
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := range 200 {
+				_ = c.CooledDown("skew", 5*time.Minute, now)
+				if i%10 == 0 {
+					c.Stamp("skew", now.Add(time.Duration(g+2)*time.Minute))
+				}
+				if i%25 == 0 {
+					_ = c.PruneExpired(now, 30*time.Minute)
+				}
+				if i%40 == 0 {
+					c.Forget("skew")
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+func TestFirstSeenLedgerSeedZeroIgnored(t *testing.T) {
+	var l FirstSeenLedger
+	l.Seed("missing", time.Time{})
+	if l.seen != nil {
+		t.Fatalf("Seed with zero time allocated map: %v", l.seen)
+	}
+	if _, ok := l.Seen("missing", time.Now()); ok {
+		t.Fatal("Seed with zero time tracked missing key")
+	}
+
+	valid := time.Unix(1_700_000_000, 0)
+	l.Seed("existing", valid)
+	l.Seed("existing", time.Time{})
+	got, seen := l.Observe("existing", valid.Add(time.Minute))
+	if !seen || !got.Equal(valid) {
+		t.Fatalf("Seed with zero time overwrote valid stamp: (%v, %v)", got, seen)
+	}
+}
+
+func TestLedgersReclaimEmptyMaps(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	// CooldownSet: Forget, Prune, PruneExpired.
+	var c CooldownSet
+	c.Stamp("a", now)
+	c.Forget("a")
+	if c.last != nil {
+		t.Fatalf("CooldownSet.Forget left non-nil empty map: %v", c.last)
+	}
+	c.Stamp("b", now)
+	if n := c.Prune(func(string, time.Time) bool { return false }); n != 1 || c.last != nil {
+		t.Fatalf("CooldownSet.Prune n=%d map=%v, want 1/nil", n, c.last)
+	}
+	c.Stamp("c", now.Add(-time.Hour))
+	if n := c.PruneExpired(now, time.Minute); n != 1 || c.last != nil {
+		t.Fatalf("CooldownSet.PruneExpired n=%d map=%v, want 1/nil", n, c.last)
+	}
+	c.Stamp("d", now)
+	if !c.CooledDown("d", time.Minute, now) {
+		t.Fatal("CooldownSet failed to re-arm after map reclamation")
+	}
+
+	// FirstSeenLedger: Forget, Prune.
+	var f FirstSeenLedger
+	f.Observe("a", now)
+	f.Forget("a")
+	if f.seen != nil {
+		t.Fatalf("FirstSeenLedger.Forget left non-nil empty map: %v", f.seen)
+	}
+	f.Seed("b", now)
+	if n := f.Prune(func(string) bool { return false }); n != 1 || f.seen != nil {
+		t.Fatalf("FirstSeenLedger.Prune n=%d map=%v, want 1/nil", n, f.seen)
+	}
+	if _, seen := f.Observe("c", now); seen {
+		t.Fatal("FirstSeenLedger failed to re-arm after map reclamation")
+	}
+
+	// SeenSet: Forget, Prune.
+	var s SeenSet
+	s.Add("a")
+	s.Forget("a")
+	if s.set != nil {
+		t.Fatalf("SeenSet.Forget left non-nil empty map: %v", s.set)
+	}
+	s.Add("b")
+	if n := s.Prune(func(string) bool { return false }); n != 1 || s.set != nil {
+		t.Fatalf("SeenSet.Prune n=%d map=%v, want 1/nil", n, s.set)
+	}
+	if !s.Add("c") {
+		t.Fatal("SeenSet failed to re-arm after map reclamation")
+	}
+
+	// StreakLedger: Reset, Set(<=0), Prune.
+	var st StreakLedger
+	st.Hit("a")
+	st.Reset("a")
+	if st.streaks != nil {
+		t.Fatalf("StreakLedger.Reset left non-nil empty map: %v", st.streaks)
+	}
+	st.Set("b", 2)
+	st.Set("b", 0)
+	if st.streaks != nil {
+		t.Fatalf("StreakLedger.Set(0) left non-nil empty map: %v", st.streaks)
+	}
+	st.Hit("c")
+	if n := st.Prune(func(string) bool { return false }); n != 1 || st.streaks != nil {
+		t.Fatalf("StreakLedger.Prune n=%d map=%v, want 1/nil", n, st.streaks)
+	}
+	if n := st.Hit("d"); n != 1 {
+		t.Fatalf("StreakLedger failed to re-arm after map reclamation: Hit=%d", n)
+	}
+}

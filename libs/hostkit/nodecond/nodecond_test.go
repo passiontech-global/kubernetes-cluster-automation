@@ -452,6 +452,9 @@ func TestParseAnnoTime(t *testing.T) {
 	}{
 		{"empty", "", time.Time{}, false},
 		{"rfc3339", now.Format(time.RFC3339), now, true},
+		{"rfc3339 non-utc offset", "2026-11-05T12:30:00+02:00",
+			time.Date(2026, 11, 5, 10, 30, 0, 0, time.UTC), true},
+		{"padded rfc3339", "  " + now.Format(time.RFC3339) + "  ", now, true},
 		{"rfc3339nano", now.Add(123 * time.Millisecond).Format(time.RFC3339Nano),
 			now.Add(123 * time.Millisecond), true},
 		{"unix seconds", "1700000000", time.Unix(1700000000, 0), true},
@@ -507,5 +510,42 @@ func TestEvaluateCoordAnnos(t *testing.T) {
 	// Unparseable stamp + no lock → inactive, zero until.
 	if v := EvaluateCoordAnnos(map[string]string{AnnoClusterMaintenanceUntil: "bogus"}, now); v.Active {
 		t.Fatalf("bogus stamp: %+v, want inactive", v)
+	}
+}
+
+func TestEvaluateCoord(t *testing.T) {
+	if KuredRebootTaintKey != "weave.works/kured-node-reboot" {
+		t.Fatalf("KuredRebootTaintKey = %q, want weave.works/kured-node-reboot", KuredRebootTaintKey)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	future := now.Add(time.Hour).Format(time.RFC3339)
+	past := now.Add(-time.Hour).Format(time.RFC3339)
+
+	// Nil annos + nil taints → inactive.
+	if v := EvaluateCoord(nil, nil, now); v.Active || v.KuredLocked || !v.MaintenanceUntil.IsZero() {
+		t.Fatalf("nil annos + nil taints: %+v, want zero verdict", v)
+	}
+	// Nil annos + KuredRebootTaintKey → active + KuredLocked.
+	if v := EvaluateCoord(nil, []string{KuredRebootTaintKey}, now); !v.Active || !v.KuredLocked {
+		t.Fatalf("kured reboot taint alone: %+v, want active+kured", v)
+	}
+	// Unrelated taint only → inactive.
+	if v := EvaluateCoord(nil, []string{"node-role.kubernetes.io/control-plane"}, now); v.Active || v.KuredLocked {
+		t.Fatalf("unrelated taint: %+v, want inactive", v)
+	}
+	// KuredLockAnno + unrelated taint → active + KuredLocked.
+	if v := EvaluateCoord(map[string]string{KuredLockAnno: `{"nodeID":"w1"}`}, []string{"other-taint"}, now); !v.Active || !v.KuredLocked {
+		t.Fatalf("kured lock anno + unrelated taint: %+v, want active+kured", v)
+	}
+	// Expired maintenance + KuredRebootTaintKey → active + KuredLocked, MaintenanceUntil preserved.
+	v := EvaluateCoord(map[string]string{AnnoClusterMaintenanceUntil: past}, []string{KuredRebootTaintKey}, now)
+	if !v.Active || !v.KuredLocked || v.MaintenanceUntil.IsZero() {
+		t.Fatalf("expired maintenance + kured taint: %+v, want active+kured+MaintenanceUntil", v)
+	}
+	// Live maintenance + nil taints → active, not KuredLocked.
+	v = EvaluateCoord(map[string]string{AnnoClusterMaintenanceUntil: future}, nil, now)
+	if !v.Active || v.KuredLocked || v.MaintenanceUntil.IsZero() {
+		t.Fatalf("live maintenance + nil taints: %+v, want active non-kured", v)
 	}
 }

@@ -20,6 +20,7 @@
 package nodecond
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -372,36 +373,40 @@ var heartbeatSweptSet = func() map[string]struct{} {
 // key off the kured DaemonSet — one spelling, both sides.
 const KuredLockAnno = "weave.works/kured-node-lock"
 
+// KuredRebootTaintKey is the taint kured places on a node it is
+// rebooting (weave.works/kured-node-reboot).
+const KuredRebootTaintKey = "weave.works/kured-node-reboot"
+
 // CoordVerdict is the decoded Cluster→Node maintenance state both
-// apps derive from the same annotation pair — the L1 nodecoord
-// cache and any L3 re-derivation must agree bit-for-bit.
+// apps derive from the same annotation pair (and optional node taints)
+// — the L1 nodecoord cache and any L3 re-derivation must agree
+// bit-for-bit.
 type CoordVerdict struct {
 	// Active is the hold signal: a live maintenance stamp
-	// (MaintenanceUntil > now) OR the kured drain lock present.
+	// (MaintenanceUntil > now) OR the kured drain lock/reboot taint
+	// present.
 	Active bool
 	// MaintenanceUntil is the parsed
 	// AnnoClusterMaintenanceUntil — zero when absent/unparseable.
 	MaintenanceUntil time.Time
-	// KuredLocked reports the kured drain-lock annotation present —
-	// it carries NO timestamp, so consumers needing a freshness
-	// bound apply their own TTL on top of this verdict.
+	// KuredLocked reports the kured drain-lock annotation or reboot
+	// taint present — it carries NO timestamp, so consumers needing a
+	// freshness bound apply their own TTL on top of this verdict.
 	KuredLocked bool
 }
 
-// ParseAnnoTime parses an annotation timestamp — RFC3339Nano and
-// RFC3339 first, then a bare unix-seconds integer (the legacy stamp
-// format several annotations still carry and the hand-set escape
-// hatch). ok=false on absent/empty/unparseable input: callers treat
-// a stamp they cannot read as no stamp at all, never as now.
+// ParseAnnoTime parses an annotation timestamp — RFC3339Nano (which
+// also accepts RFC3339 without fractional seconds) first, then a bare
+// unix-seconds integer (the legacy stamp format several annotations
+// still carry and the hand-set escape hatch). ok=false on
+// absent/empty/unparseable input: callers treat a stamp they cannot
+// read as no stamp at all, never as now.
 func ParseAnnoTime(raw string) (time.Time, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return time.Time{}, false
 	}
 	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
-		return t, true
-	}
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
 		return t, true
 	}
 	// Bare unix seconds — but only a plausible epoch: a stamp past
@@ -428,6 +433,19 @@ func EvaluateCoordAnnos(annos map[string]string, now time.Time) CoordVerdict {
 	}
 	v.KuredLocked = annos[KuredLockAnno] != ""
 	v.Active = v.KuredLocked || v.MaintenanceUntil.After(now)
+	return v
+}
+
+// EvaluateCoord folds a node's annotation map and taint keys into the
+// Cluster→Node maintenance verdict. KuredLocked is true when either
+// KuredLockAnno is present in annos or KuredRebootTaintKey is present
+// in taintKeys.
+func EvaluateCoord(annos map[string]string, taintKeys []string, now time.Time) CoordVerdict {
+	v := EvaluateCoordAnnos(annos, now)
+	if !v.KuredLocked && slices.Contains(taintKeys, KuredRebootTaintKey) {
+		v.KuredLocked = true
+		v.Active = true
+	}
 	return v
 }
 

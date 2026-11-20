@@ -52,11 +52,14 @@ const forCacheCap = 256
 // by main() is always the one that emits.
 //
 // Concurrency: the hot path is one atomic load — concurrent For calls
-// share no lock. Rebuilds serialize on forMu and re-check the freshly
-// published snapshot before building, so two goroutines racing the same
-// name's first resolve still get the identical *slog.Logger, and a
-// rebuild copies the latest snapshot so concurrent misses for different
-// names keep each other's entries.
+// share no lock, including overflow names once the snapshot reaches
+// forCacheCap. Rebuilds serialize on forMu, re-read slog.Default(), and
+// re-check the freshly published snapshot before building, so two
+// goroutines racing the same name's first resolve still get the
+// identical *slog.Logger, a concurrent slog.SetDefault cannot be
+// clobbered by a stale pre-lock default, and a rebuild copies the
+// latest snapshot so concurrent misses for different names keep each
+// other's entries.
 func For(name string) *slog.Logger {
 	def := slog.Default()
 	// Fast path: a single atomic load — logger() runs on every log
@@ -66,9 +69,19 @@ func For(name string) *slog.Logger {
 		if l, ok := s.loggers[name]; ok {
 			return l
 		}
+		if len(s.loggers) >= forCacheCap {
+			// Snapshot is immutable and capped for this def:
+			// overflow names bypass forMu so high-cardinality
+			// callers stay lock-free.
+			return def.With("logger", name)
+		}
 	}
 	forMu.Lock()
 	defer forMu.Unlock()
+	// Re-read slog.Default() under forMu: a concurrent slog.SetDefault
+	// while we waited on forMu would otherwise let a stale def clobber
+	// a newer snapshot.
+	def = slog.Default()
 	// Re-read under the rebuild lock: another goroutine may have
 	// published a snapshot for this exact default while we waited,
 	// or dropped the cache after a SetDefault swap.

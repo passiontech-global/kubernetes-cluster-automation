@@ -28,6 +28,14 @@ import (
 	"time"
 )
 
+// cooldownFutureSkew is the tolerance for small clock skew when
+// comparing now against a stored stamp. Deltas in [-cooldownFutureSkew, 0)
+// are treated as benign jitter (still cooled, no mutation on RLock);
+// deltas more negative than -cooldownFutureSkew indicate a genuine backward
+// clock step or corrupt future stamp, which CooledDown self-heals to now
+// and PruneExpired evicts.
+const cooldownFutureSkew = time.Minute
+
 // CooldownSet tracks the last action stamp per key.
 type CooldownSet struct {
 	mu   sync.RWMutex
@@ -35,15 +43,51 @@ type CooldownSet struct {
 }
 
 // CooledDown reports whether key was stamped inside cooldown of now.
-// An unstamped key is never cooled down.
+// An unstamped key (or non-positive cooldown) is never cooled down.
+//
+// If now trails last by more than cooldownFutureSkew (backward clock step
+// on wall-clock-only stamps or skewed peer stamp), CooledDown upgrades to
+// the write lock and self-heals the stamp to now while returning true so
+// the gate stays closed for one window and then expires normally.
 func (c *CooldownSet) CooledDown(key string, cooldown time.Duration, now time.Time) bool {
+	if cooldown <= 0 {
+		return false
+	}
 	// Reads dominate writes (every check consults the shared ledger
 	// per sweep, only the acting one stamps) — a read lock keeps
 	// concurrent lookups off each other.
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 	last, ok := c.last[key]
-	return ok && now.Sub(last) < cooldown
+	if !ok {
+		c.mu.RUnlock()
+		return false
+	}
+	delta := now.Sub(last)
+	if delta >= 0 {
+		c.mu.RUnlock()
+		return delta < cooldown
+	}
+	if delta >= -cooldownFutureSkew {
+		c.mu.RUnlock()
+		return true
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	last, ok = c.last[key]
+	if !ok {
+		return false
+	}
+	delta = now.Sub(last)
+	if delta >= 0 {
+		return delta < cooldown
+	}
+	if delta >= -cooldownFutureSkew {
+		return true
+	}
+	c.last[key] = now
+	return true
 }
 
 // Stamp records now as key's last-action time, creating the ledger
@@ -66,6 +110,9 @@ func (c *CooldownSet) Forget(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.last, key)
+	if len(c.last) == 0 {
+		c.last = nil
+	}
 }
 
 // Prune deletes every tracked key for which keep returns false and
@@ -84,6 +131,9 @@ func (c *CooldownSet) Prune(keep func(key string, last time.Time) bool) int {
 			pruned++
 		}
 	}
+	if len(c.last) == 0 {
+		c.last = nil
+	}
 	return pruned
 }
 
@@ -98,25 +148,28 @@ func (c *CooldownSet) Entries() map[string]time.Time {
 	return maps.Clone(c.last)
 }
 
-// PruneExpired evicts every stamp older than maxAge and returns the
-// evicted count — the leak bound for ledgers keyed by EPHEMERAL
-// names (pod/Job/CertificateRequest names with rotating suffixes):
-// a stamp whose window has long passed can never suppress an action
-// again, so holding it only grows the map one dead name per heal
-// forever. Call once per sweep with the LONGEST cooldown the ledger
-// serves — a shorter bound would drop still-binding stamps (when a
-// keyspace mixes cooldowns, the widest window wins). Unlike Prune
-// this needs no complete-sweep precondition: expiry is computed per
-// entry, not voted by a keep set.
+// PruneExpired evicts every stamp older than maxAge (or further in the
+// future than cooldownFutureSkew) and returns the evicted count — the
+// leak bound for ledgers keyed by EPHEMERAL names (pod/Job/
+// CertificateRequest names with rotating suffixes): a stamp whose
+// window has long passed can never suppress an action again, so holding
+// it only grows the map one dead name per heal forever. Call once per
+// sweep with the LONGEST cooldown the ledger serves — a shorter bound
+// would drop still-binding stamps (when a keyspace mixes cooldowns, the
+// widest window wins). Unlike Prune this needs no complete-sweep
+// precondition: expiry is computed per entry, not voted by a keep set.
 func (c *CooldownSet) PruneExpired(now time.Time, maxAge time.Duration) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	pruned := 0
 	for k, last := range c.last {
-		if now.Sub(last) > maxAge {
+		if delta := now.Sub(last); delta > maxAge || delta < -cooldownFutureSkew {
 			delete(c.last, k)
 			pruned++
 		}
+	}
+	if len(c.last) == 0 {
+		c.last = nil
 	}
 	return pruned
 }
@@ -161,6 +214,9 @@ func (l *FirstSeenLedger) Observe(key string, now time.Time) (first time.Time, s
 // wins, matching the wider-of-two-clocks persisted-cooldown
 // contract); a later seed never rejuvenates the window.
 func (l *FirstSeenLedger) Seed(key string, first time.Time) {
+	if first.IsZero() {
+		return
+	}
 	if l.seen == nil {
 		l.seen = map[string]time.Time{}
 	}
@@ -183,6 +239,9 @@ func (l *FirstSeenLedger) Seen(key string, now time.Time) (time.Duration, bool) 
 // Forget drops key's entry — the next Observe re-arms the window.
 func (l *FirstSeenLedger) Forget(key string) {
 	delete(l.seen, key)
+	if len(l.seen) == 0 {
+		l.seen = nil
+	}
 }
 
 // Prune deletes every tracked key for which keep returns false and
@@ -198,6 +257,9 @@ func (l *FirstSeenLedger) Prune(keep func(key string) bool) int {
 			delete(l.seen, k)
 			pruned++
 		}
+	}
+	if len(l.seen) == 0 {
+		l.seen = nil
 	}
 	return pruned
 }
@@ -231,6 +293,9 @@ func (s *SeenSet) Has(key string) bool {
 // Forget drops key — a re-added key reads as new again.
 func (s *SeenSet) Forget(key string) {
 	delete(s.set, key)
+	if len(s.set) == 0 {
+		s.set = nil
+	}
 }
 
 // Prune deletes every key for which live returns false and returns
@@ -245,6 +310,9 @@ func (s *SeenSet) Prune(live func(key string) bool) int {
 			delete(s.set, k)
 			pruned++
 		}
+	}
+	if len(s.set) == 0 {
+		s.set = nil
 	}
 	return pruned
 }
@@ -284,6 +352,9 @@ func (s *StreakLedger) Hit(key string) int {
 func (s *StreakLedger) Set(key string, n int) {
 	if n <= 0 {
 		delete(s.streaks, key)
+		if len(s.streaks) == 0 {
+			s.streaks = nil
+		}
 		return
 	}
 	if s.streaks == nil {
@@ -311,6 +382,9 @@ func (s *StreakLedger) Len() int {
 // inheriting the streak.
 func (s *StreakLedger) Reset(key string) {
 	delete(s.streaks, key)
+	if len(s.streaks) == 0 {
+		s.streaks = nil
+	}
 }
 
 // Clear drops every streak — the feature-disabled/empty-config
@@ -347,6 +421,9 @@ func (s *StreakLedger) Prune(keep func(key string) bool) int {
 			delete(s.streaks, k)
 			pruned++
 		}
+	}
+	if len(s.streaks) == 0 {
+		s.streaks = nil
 	}
 	return pruned
 }

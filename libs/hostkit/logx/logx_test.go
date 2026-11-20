@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // For resolves slog.With at call time so a handler installed later by
@@ -176,5 +177,149 @@ func TestForCacheCap(t *testing.T) {
 	// Cached names keep their identity and stay warm.
 	if got := For("cap-first"); got != first {
 		t.Fatal("cached name lost identity after overflow resolves")
+	}
+}
+
+// TestForOverflowLockFree proves that once the snapshot reaches
+// forCacheCap, both cached hits and overflow misses bypass forMu and
+// return immediately even while another goroutine holds forMu.
+func TestForOverflowLockFree(t *testing.T) {
+	old := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	first := For("lf-first")
+	for i := 1; i < forCacheCap; i++ {
+		For(fmt.Sprintf("lf-fill-%d", i))
+	}
+
+	forMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			forMu.Unlock()
+		}
+	}()
+
+	type result struct {
+		cached   *slog.Logger
+		overflow *slog.Logger
+	}
+	ch := make(chan result, 1)
+	go func() {
+		ch <- result{
+			cached:   For("lf-first"),
+			overflow: For("lf-overflow"),
+		}
+	}()
+
+	var res result
+	select {
+	case res = <-ch:
+	case <-time.After(time.Second):
+		forMu.Unlock()
+		locked = false
+		t.Fatal("overflow For blocked on forMu past forCacheCap")
+	}
+	forMu.Unlock()
+	locked = false
+
+	if res.cached != first {
+		t.Fatal("cached name lost identity while forMu was held")
+	}
+	res.overflow.Info("lockfree-line")
+	if !strings.Contains(buf.String(), "logger=lf-overflow") {
+		t.Fatalf("overflow logger did not emit its attribute: %q", buf.String())
+	}
+}
+
+// TestForDefaultSwapWhileWaitingOnLock proves that a goroutine
+// blocked on forMu while slog.SetDefault swaps in a new default
+// re-reads slog.Default() inside the lock instead of clobbering the
+// newer snapshot with its stale pre-lock default.
+func TestForDefaultSwapWhileWaitingOnLock(t *testing.T) {
+	old := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	for round := range 5 {
+		var bufA, bufB bytes.Buffer
+		hA := slog.New(slog.NewTextHandler(&bufA, nil))
+		hB := slog.New(slog.NewTextHandler(&bufB, nil))
+
+		slog.SetDefault(hA)
+		For("prime") // establish hA snapshot (not full)
+
+		forMu.Lock()
+		got := make(chan *slog.Logger, 1)
+		go func() {
+			got <- For(fmt.Sprintf("wait-swap-%d", round))
+		}()
+		// Give the goroutine time to read hA and block on forMu.Lock.
+		time.Sleep(5 * time.Millisecond)
+		slog.SetDefault(hB)
+		forMu.Unlock()
+
+		l := <-got
+		l.Info("after-lock-swap")
+		if bufA.Len() != 0 {
+			t.Fatalf("round %d: stale pre-lock default emitted output: %q", round, bufA.String())
+		}
+		if !strings.Contains(bufB.String(), "msg=after-lock-swap") {
+			t.Fatalf("round %d: new default did not receive output: %q", round, bufB.String())
+		}
+		if snap := forSnap.Load(); snap == nil || snap.def != hB {
+			t.Fatalf("round %d: forSnap.def clobbered by stale default (got %v, want %v)", round, snap, hB)
+		}
+	}
+}
+
+// TestForOverflowConcurrentDefaultSwap exercises the lock-free
+// overflow fast path concurrently with slog.SetDefault swaps under
+// -race.
+func TestForOverflowConcurrentDefaultSwap(t *testing.T) {
+	old := slog.Default()
+	var bufA, bufB bytes.Buffer
+	hA := slog.New(slog.NewTextHandler(&bufA, nil))
+	hB := slog.New(slog.NewTextHandler(&bufB, nil))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	slog.SetDefault(hA)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 200 {
+			if i%2 == 0 {
+				slog.SetDefault(hA)
+			} else {
+				slog.SetDefault(hB)
+			}
+		}
+	}()
+
+	for w := range 4 {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := range forCacheCap + 100 {
+				For("envx")
+				For("fsx")
+				For(fmt.Sprintf("overflow-%d-%d", w, i))
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	slog.SetDefault(hA)
+	bufA.Reset()
+	if l1, l2 := For("envx"), For("envx"); l1 != l2 {
+		t.Fatal("cached identity unstable after overflow + swap race")
+	}
+	For("overflow-final").Info("done")
+	line := bufA.String()
+	if !strings.Contains(line, "logger=overflow-final") || !strings.Contains(line, "msg=done") {
+		t.Fatalf("final overflow logger did not emit to hA: %q", line)
 	}
 }
