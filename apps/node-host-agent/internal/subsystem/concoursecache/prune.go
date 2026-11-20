@@ -111,6 +111,14 @@ func goBuildReferencedOutput(dir, indexPath string) (string, bool) {
 // entry seen this pass references them; "-a" indexes and every other
 // file prune exactly as before — a missing index is a plain cache
 // miss Go rebuilds, never a dangling reference.
+//
+// On top of that, entries younger than ccGoBuildGraceAge are never
+// pruned at all — the crit-pressure age floor (5min, sized for
+// write-then-done artifacts) would otherwise delete the entire
+// working set of every in-flight build each pass: a resolved "-d"
+// is read for the whole ~1h lint/typecheck phase, far past 5min
+// (ci-main builds 87/88). Young files still count toward `sz` but
+// are neither age-pruned nor size-cap candidates.
 func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Config, log *slog.Logger) {
 	if !isDir(dir) {
 		return
@@ -120,6 +128,7 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 	var ageFreed int64
 	var ageErr error
 	var sz uint64
+	var graceBytes int64
 	var candidates []cacheFile
 	var dataFiles []cacheFile // "-d" outputs — deferred until index refs are known
 	var indexFiles []string   // "-a" indexes that survived the age prune
@@ -141,6 +150,11 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 		}
 		blocks := entryBlocks(info)
 		if !d.IsDir() && d.Type().IsRegular() {
+			if now.Sub(info.ModTime()) < ccGoBuildGraceAge {
+				graceBytes += int64(blocks)
+				sz += blocks
+				return nil
+			}
 			cf := cacheFile{path: path, size: int64(blocks), modTime: info.ModTime()}
 			switch goBuildEntryKind(d.Name()) {
 			case 'a':
@@ -258,9 +272,11 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 		log.Warn("go-build trim removals failed",
 			"files", failed, "error", lastErr)
 	}
-	if acc < need && protectedBytes > 0 {
-		log.Warn("go-build size cap unsatisfiable — outputs still referenced by live index entries",
-			"bucket", bucket, "protectedGiB", float64(protectedBytes)/(1<<30))
+	if acc < need && protectedBytes+graceBytes > 0 {
+		log.Warn("go-build size cap unsatisfiable — referenced outputs and in-flight entries retained",
+			"bucket", bucket,
+			"protectedGiB", float64(protectedBytes)/(1<<30),
+			"graceGiB", float64(graceBytes)/(1<<30))
 	}
 	// freed is the successful-remove total — logging it avoids a
 	// second full-tree du just for the "after" number.

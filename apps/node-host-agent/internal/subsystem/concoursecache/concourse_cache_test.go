@@ -622,9 +622,10 @@ func TestFSPressureMaxRatio(t *testing.T) {
 }
 
 // H3 early trigger: inode exhaustion alone (bytes still low) must
-// escalate the prune — here inodes at 90% cross DiskCritPct so every
-// file in the prunable buckets is eligible, even a 1h-old one that
-// the normal 72h go-build age would keep.
+// escalate the prune — here inodes at 90% cross DiskCritPct so the
+// collapsed crit age applies. The 40h file dies; the 1h file
+// survives on ccGoBuildGraceAge — export data a running build
+// still reads must outlive even the emergency floor.
 func TestInodePressureEarlyTrigger(t *testing.T) {
 	root := t.TempDir()
 	sc := mkSharedCache(t, root, ccPVCName("ino"))
@@ -638,7 +639,7 @@ func TestInodePressureEarlyTrigger(t *testing.T) {
 		t.Fatal(err)
 	}
 	ccMissing(t, f40h)
-	ccMissing(t, f1h)
+	ccPresent(t, f1h)
 }
 
 // Byte pressure between the thresholds escalates to the high level:

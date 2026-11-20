@@ -139,8 +139,8 @@ func TestGoBuildTrimRemoveFailure(t *testing.T) {
 	sc := mkSharedCache(t, root, ccPVCName("gbf"))
 	dir := filepath.Join(sc, "go-build")
 	ro := filepath.Join(dir, "ro")
-	stuck := ccFile(t, filepath.Join(ro, "stuck"), 4, time.Hour)
-	fresh := ccFile(t, filepath.Join(dir, "fresh"), 4, 2*time.Hour)
+	stuck := ccFile(t, filepath.Join(ro, "stuck"), 4, 3*time.Hour)
+	fresh := ccFile(t, filepath.Join(dir, "fresh"), 4, 3*time.Hour)
 	if err := os.Chmod(ro, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestGoBuildCapPreservesReferencedOutput(t *testing.T) {
 	dir := filepath.Join(sc, "go-build")
 	aid := strings.Repeat("a", 64)
 	oid := strings.Repeat("b", 64)
-	indexPath, outputPath := ccGoIndexPair(t, dir, aid, oid, time.Hour)
+	indexPath, outputPath := ccGoIndexPair(t, dir, aid, oid, 10*time.Hour)
 
 	// Make the protected output the oldest file in the cache — the
 	// cap would kill it first without reference awareness.
@@ -447,7 +447,7 @@ func TestGoBuildAgeProtectsThenOrphansOutput(t *testing.T) {
 	dir := filepath.Join(sc, "go-build")
 	aid := strings.Repeat("c", 64)
 	oid := strings.Repeat("d", 64)
-	indexPath, outputPath := ccGoIndexPair(t, dir, aid, oid, time.Hour)
+	indexPath, outputPath := ccGoIndexPair(t, dir, aid, oid, 10*time.Hour)
 	// Age ONLY the output past the 72h limit — the index stays fresh.
 	old := time.Now().Add(-80 * time.Hour)
 	if err := os.Chtimes(outputPath, old, old); err != nil {
@@ -475,7 +475,7 @@ func TestGoBuildOrphanOutputAgePruned(t *testing.T) {
 	sc := mkSharedCache(t, root, ccPVCName("gbo"))
 	dir := filepath.Join(sc, "go-build")
 	old := ccFile(t, filepath.Join(dir, "aa", strings.Repeat("e", 64)+"-d"), 4, 80*time.Hour)
-	fresh := ccFile(t, filepath.Join(dir, "bb", strings.Repeat("f", 64)+"-d"), 4, time.Hour)
+	fresh := ccFile(t, filepath.Join(dir, "bb", strings.Repeat("f", 64)+"-d"), 4, 10*time.Hour)
 
 	p := ccPruner(t, nil)
 	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
@@ -489,7 +489,7 @@ func TestGoBuildCorruptIndexProtectsNothing(t *testing.T) {
 	root := t.TempDir()
 	sc := mkSharedCache(t, root, ccPVCName("gbc"))
 	dir := filepath.Join(sc, "go-build")
-	badIndex := ccFile(t, filepath.Join(dir, "aa", strings.Repeat("0", 64)+"-a"), 100, time.Hour)
+	badIndex := ccFile(t, filepath.Join(dir, "aa", strings.Repeat("0", 64)+"-a"), 100, 10*time.Hour)
 	orphan := ccFile(t, filepath.Join(dir, "bb", strings.Repeat("1", 64)+"-d"), 4, 80*time.Hour)
 
 	p := ccPruner(t, nil)
@@ -512,4 +512,54 @@ func TestGoBuildSiblingCachesPruned(t *testing.T) {
 	ccMissing(t, sharedOld)
 	ccMissing(t, siblingOld)
 	ccPresent(t, otherOld)
+}
+
+// The crit-pressure age floor (5min) is sized for write-then-done
+// artifacts — go-build entries a running build still reads must
+// survive it. Files younger than ccGoBuildGraceAge are exempt from
+// BOTH the collapsed age limit and the size cap; only older files
+// prune.
+func TestGoBuildInFlightGrace(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("gbg"))
+	dir := filepath.Join(sc, "go-build")
+	aid := strings.Repeat("a", 64)
+	oid := strings.Repeat("b", 64)
+	// Resolved 30min ago — mid-build. Under the crit floor both
+	// files are stale; under the grace they are in-flight.
+	indexPath, outputPath := ccGoIndexPair(t, dir, aid, oid, 30*time.Minute)
+	plain := ccFile(t, filepath.Join(dir, "plain"), 4, 10*time.Minute)
+	stale := ccFile(t, filepath.Join(dir, "stale"), 4, 3*time.Hour)
+
+	p := ccPruner(t, func(c *Config) {
+		c.GoBuildMaxAge = ccCritFloorAge // what crit escalation produces
+		c.GoBuildHighMark = 1
+		c.GoBuildLowMark = 1
+	})
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+
+	ccPresent(t, indexPath)
+	ccPresent(t, outputPath)
+	ccPresent(t, plain)
+	ccMissing(t, stale)
+}
+
+// The grace also excludes young files from size-cap candidates: with
+// a normal age limit nothing is stale, yet the cap still cannot
+// touch entries younger than ccGoBuildGraceAge.
+func TestGoBuildGraceSurvivesSizeCap(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("gby"))
+	dir := filepath.Join(sc, "go-build")
+	young := ccFile(t, filepath.Join(dir, "young"), 100, time.Hour)
+	old := ccFile(t, filepath.Join(dir, "old"), 100, 3*time.Hour)
+
+	p := ccPruner(t, func(c *Config) {
+		c.GoBuildHighMark = 1 // always over
+		c.GoBuildLowMark = 1  // need exceeds every candidate
+	})
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+
+	ccPresent(t, young) // <2h — never a cap candidate
+	ccMissing(t, old)   // >2h — trimmed
 }

@@ -81,6 +81,17 @@ const (
 	// (in-flight lock files / staging dirs) survive even a crit
 	// prune. The cache is rebuildable — an active install isn't.
 	ccCritFloorAge = 5 * time.Minute
+	// ccGoBuildGraceAge is the absolute in-flight floor for the
+	// go-build buckets: entries younger than this are never pruned —
+	// not by the age rules (which collapse to ccCritFloorAge under
+	// fs pressure) and not by the size cap. A resolved "-d" output
+	// is read for the entire build that resolved it (golangci-lint
+	// typecheck runs ~1h), so the floor must cover the longest
+	// in-flight build — ccCritFloorAge was sized for write-then-done
+	// artifacts like node-deps locks, not export data held open
+	// across a whole phase. 2h exceeds the longest observed ci-main
+	// build (~75min) with margin.
+	ccGoBuildGraceAge = 2 * time.Hour
 )
 
 // Config carries the pruner's knobs — every field maps
