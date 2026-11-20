@@ -103,12 +103,62 @@ func netfilterComm(comm string) bool {
 	return false
 }
 
-// nftMonitor reports whether the pid is `nft monitor` — the one
-// netfilter comm that is SUPPOSED to live forever; killing it
-// would be a false positive, not a wedge heal.
-func (c *NetfilterGuardCheck) nftMonitor(pid int) bool {
+type nftMonitorResult uint8
+
+const (
+	nftCmdNonMonitor nftMonitorResult = iota
+	nftCmdMonitor
+	nftCmdStateD
+	nftCmdSkip
+	nftCmdReadErr
+)
+
+// nftMonitor classifies an `nft` pid without opening mm-backed cmdline
+// on D/Z/X/x/R or non-ENOENT stat states, distinguishing `nft monitor`,
+// mid-scan state transitions, and non-ENOENT read errors.
+func (c *NetfilterGuardCheck) nftMonitor(pid int) nftMonitorResult {
+	st, ok := c.d.Proc.Stat(pid)
+	if !ok {
+		if statNonENOENT(c.d, pid) {
+			return nftCmdReadErr
+		}
+		return nftCmdSkip
+	}
+	if len(st.Fields) == 0 {
+		return nftCmdSkip
+	}
+	switch st.Fields[0] {
+	case "D":
+		return nftCmdStateD
+	case "Z", "X", "x", "R":
+		return nftCmdSkip
+	}
 	args := c.d.Proc.Cmdline(pid)
-	return len(args) >= 2 && args[0] == "nft" && args[1] == "monitor"
+	if len(args) == 0 {
+		if st, ok := c.d.Proc.Stat(pid); !ok {
+			if statNonENOENT(c.d, pid) {
+				return nftCmdReadErr
+			}
+			return nftCmdSkip
+		} else if len(st.Fields) == 0 {
+			return nftCmdSkip
+		} else {
+			switch st.Fields[0] {
+			case "D":
+				return nftCmdStateD
+			case "Z", "X", "x", "R":
+				return nftCmdSkip
+			}
+		}
+		if procFileNonENOENT(c.d, pid, "cmdline") {
+			return nftCmdReadErr
+		}
+		return nftCmdNonMonitor
+	}
+	if len(args) >= 2 && filepath.Base(args[0]) == "nft" && args[1] == "monitor" {
+		return nftCmdMonitor
+	}
+	return nftCmdNonMonitor
 }
 
 // stuckNetfilterProc is one qualifying hung command.
@@ -123,25 +173,49 @@ type stuckNetfilterProc struct {
 // scanStuck returns the pids currently qualifying: netfilter comm
 // + non-running state (D preferred — S counts too because a
 // process parked on flock() shows S, not D) + age >= HungCmdSec.
+// unreadable marks PIDs whose stat or cmdline failed with !ENOENT so
+// callers preserve their confirmation streaks and abort.
 func (c *NetfilterGuardCheck) scanStuck(now time.Time,
-	pids []int) []stuckNetfilterProc {
+	pids []int) (out []stuckNetfilterProc, unreadable map[int]bool, inconclusive bool) {
 	minAge := time.Duration(c.d.Cfg.Wave2.NetfilterGuardHungCmdSec) * time.Second
 	if minAge <= 0 {
 		minAge = 60 * time.Second
 	}
-	var out []stuckNetfilterProc
 	for _, pid := range pids {
 		st, ok := c.d.Proc.Stat(pid)
-		if !ok || !st.HasComm || !netfilterComm(st.Comm) {
+		if !ok {
+			if statNonENOENT(c.d, pid) {
+				if unreadable == nil {
+					unreadable = map[int]bool{}
+				}
+				unreadable[pid] = true
+				inconclusive = true
+			}
 			continue
 		}
-		if st.Comm == "nft" && c.nftMonitor(pid) {
-			continue // `nft monitor` is meant to live forever
-		}
-		if len(st.Fields) == 0 {
+		if !st.HasComm || !netfilterComm(st.Comm) || len(st.Fields) == 0 {
 			continue
 		}
 		state := st.Fields[0]
+		if state == "R" || state == "Z" || state == "X" || state == "x" {
+			continue // running or dead/zombie — SIGKILL cannot clear Z/X or busy R
+		}
+		if st.Comm == "nft" && state != "D" {
+			switch c.nftMonitor(pid) {
+			case nftCmdReadErr:
+				if unreadable == nil {
+					unreadable = map[int]bool{}
+				}
+				unreadable[pid] = true
+				inconclusive = true
+				continue
+			case nftCmdMonitor, nftCmdSkip:
+				continue // `nft monitor` or exited/Z/X/R mid-scan
+			case nftCmdStateD:
+				state = "D"
+			case nftCmdNonMonitor:
+			}
+		}
 		// R/S are normal for a command mid-run; only age makes
 		// them suspect — but D is always suspect regardless of
 		// the bound (a netfilter tool in D for ANY duration is a
@@ -149,9 +223,6 @@ func (c *NetfilterGuardCheck) scanStuck(now time.Time,
 		age := c.d.Proc.Age(pid, now)
 		if state != "D" && age < minAge {
 			continue
-		}
-		if state == "R" || state == "Z" || state == "X" || state == "x" {
-			continue // running or dead/zombie — SIGKILL cannot clear Z/X or busy R
 		}
 		// stat Fields[19] is field 22 (starttime, jiffies) — the
 		// process-instance identity the streak keys on. A stat
@@ -169,7 +240,7 @@ func (c *NetfilterGuardCheck) scanStuck(now time.Time,
 			age: age,
 		})
 	}
-	return out
+	return out, unreadable, inconclusive
 }
 
 // lockPath resolves the host xtables.lock — the explicit knob
@@ -186,28 +257,42 @@ func (c *NetfilterGuardCheck) lockPath() string {
 // lockHeld passively inspects <ProcRoot>/locks (falling back to /proc/locks
 // if <ProcRoot>/locks does not exist) for any kernel lock referencing the
 // xtables.lock (dev, ino), avoiding flock(LOCK_EX) lock-stealing races.
-func (c *NetfilterGuardCheck) lockHeld() bool {
+// ok=false when lockPath or locks cannot be read due to non-ENOENT errors
+// (inconclusive — caller preserves lockStreak and LatchNetfilterLocked).
+func (c *NetfilterGuardCheck) lockHeld() (held, ok bool) {
 	var st unix.Stat_t
 	if err := unix.Stat(c.lockPath(), &st); err != nil {
-		return false
+		if os.IsNotExist(err) {
+			return false, true
+		}
+		return false, false
 	}
 	target := fmt.Sprintf("%02x:%02x:%d", unix.Major(st.Dev), unix.Minor(st.Dev), st.Ino)
-	locksPath := filepath.Join(c.d.Cfg.ProcRoot, "locks")
-	data, err := os.ReadFile(locksPath)
-	if err != nil {
-		data, err = os.ReadFile("/proc/locks")
+	var data []byte
+	var err error
+	if c.d.Cfg.ProcRoot != "" {
+		locksPath := filepath.Join(c.d.Cfg.ProcRoot, "locks")
+		data, err = os.ReadFile(locksPath)
 		if err != nil {
-			return false
+			if !os.IsNotExist(err) {
+				return false, false
+			}
+			data, err = os.ReadFile("/proc/locks")
 		}
+	} else {
+		data, err = os.ReadFile("/proc/locks")
+	}
+	if err != nil {
+		return false, false
 	}
 	for line := range strings.SplitSeq(string(data), "\n") {
 		fields := strings.Fields(line)
 		// Expected fields: N: FLOCK ADVISORY WRITE PID MAJ:MIN:INO START END
 		if len(fields) >= 6 && fields[5] == target {
-			return true
+			return true, true
 		}
 	}
-	return false
+	return false, true
 }
 
 // Run executes one netfilter-guard round.
@@ -228,29 +313,23 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// vocabulary stays intact) and hold every streak: the
 	// "consecutive cycles" the plan counts are scan cycles.
 	interval := time.Duration(c.d.Cfg.Wave2.NetfilterGuardIntervalSec) * time.Second
+	var scanNow time.Time
 	if interval > 0 {
-		now := c.d.Cfg.Seams.Host.Clock.Now()
-		if !c.lastScan.IsZero() && now.Sub(c.lastScan) < interval {
+		scanNow = c.d.Cfg.Seams.Host.Clock.Now()
+		if !c.lastScan.IsZero() && scanNow.Sub(c.lastScan) < interval {
 			return
 		}
-		c.lastScan = now
 	}
-	var pids []int
-	var err error
-	if e != nil && e.PidsOnce != nil {
-		pids = e.PidsOnce()
-	} else {
-		pids, err = c.d.Proc.PIDs()
-	}
-	if err != nil {
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
 		c.d.CycleResult(wdeps.CheckNetfilterGuard, "inconclusive")
 		return
 	}
-	stuck := c.scanStuck(c.d.Cfg.Seams.Host.Clock.Now(), pids)
-	held := c.lockHeld()
-	if c.d.Cfg.Wave2.NetfilterGuardLegacyProbe && !held {
-		c.probeLegacyRules(ctx)
+	if interval > 0 {
+		c.lastScan = scanNow
 	}
+	stuck, unreadable, scanInconclusive := c.scanStuck(c.d.Cfg.Seams.Host.Clock.Now(), pids)
+	held, lockOK := c.lockHeld()
 
 	// Per-pid consecutive-cycle confirmation — a pid must qualify
 	// NetfilterGuardStuckCycles cycles running before the kill
@@ -270,6 +349,13 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			confirmed = append(confirmed, sp)
 		}
 	}
+	if scanInconclusive {
+		for k, v := range c.seen {
+			if unreadable[k.pid] {
+				streak[k] = v
+			}
+		}
+	}
 	c.seen = streak
 
 	// Kill pass — bounded per cycle, detect-only when disabled.
@@ -278,14 +364,61 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		maxKills = 1
 	}
 	killed := 0
+	healHoldChecked := false
+	healHeld := false
+	holdEmergency := func() bool {
+		if !healHoldChecked {
+			healHoldChecked = true
+			healHeld = c.d.HoldEmergencyHeal(ctx)
+		}
+		return healHeld
+	}
 	if c.d.Cfg.Wave2.NetfilterGuardKillEnabled {
 		for _, sp := range confirmed {
+			if sp.state == "D" {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: netfilter-guard pid=%d comm=%s uninterruptible D-state (SIGKILL ineffective)",
+					sp.pid, sp.comm))
+				continue
+			}
 			if killed >= maxKills {
 				break
 			}
+			if holdEmergency() {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"cleanup: netfilter-guard kill pid=%d held by maintenance window, skip",
+					sp.pid))
+				continue
+			}
+			// Re-verify process identity and starttime immediately
+			// before SIGKILL to close any PID-reuse window.
+			st, ok := c.d.Proc.Stat(sp.pid)
+			if !ok || !st.HasComm || !netfilterComm(st.Comm) || len(st.Fields) == 0 {
+				continue
+			}
+			curState := st.Fields[0]
+			if curState == "D" || curState == "Z" || curState == "R" || curState == "X" || curState == "x" {
+				if curState == "D" {
+					c.d.State.AppendLog(fmt.Sprintf(
+						"suspect: netfilter-guard pid=%d comm=%s uninterruptible D-state (SIGKILL ineffective)",
+						sp.pid, st.Comm))
+				}
+				continue
+			}
+			if sp.start >= 0 {
+				var curStart int64 = -1
+				if len(st.Fields) > 19 {
+					if v, perr := strconv.ParseInt(st.Fields[19], 10, 64); perr == nil {
+						curStart = v
+					}
+				}
+				if curStart != sp.start {
+					continue
+				}
+			}
 			c.d.State.AppendLog(fmt.Sprintf(
 				"ACTION netfilter-hung-kill: pid=%d comm=%s state=%s age=%s",
-				sp.pid, sp.comm, sp.state, sp.age.Round(time.Second)))
+				sp.pid, sp.comm, curState, sp.age.Round(time.Second)))
 			if err := c.d.Cfg.Seams.Host.KillFn(sp.pid, syscall.SIGKILL); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: netfilter-guard kill pid=%d failed: %v", sp.pid, err))
@@ -296,22 +429,31 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	c.d.Actions.WithLabelValues(wdeps.CheckNetfilterGuard, "cmd_kill").Add(float64(killed))
+	if c.d.Cfg.Wave2.NetfilterGuardLegacyProbe && lockOK && !held {
+		c.probeLegacyRules(ctx)
+	}
 
 	// Lock wedge — the passive /proc/locks probe's >=3-cycle streak owns the latch.
-	if held {
-		c.lockStreak++
-	} else {
-		c.lockStreak = 0
-		c.d.State.Exit(latchdefs.LatchNetfilterLocked, nil)
+	if lockOK {
+		if held {
+			c.lockStreak++
+		} else {
+			c.lockStreak = 0
+			c.d.State.Exit(latchdefs.LatchNetfilterLocked, nil)
+		}
 	}
 	switch {
-	case c.lockStreak >= netfilterLockStreakCycles:
+	case lockOK && c.lockStreak >= netfilterLockStreakCycles:
 		c.d.State.Enter(latchdefs.LatchNetfilterLocked, fmt.Sprintf(
 			"xtables.lock held %d consecutive cycles", c.lockStreak))
 	case len(confirmed) > 0 || len(stuck) > 0:
 		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: netfilter-guard %d stuck netfilter cmd(s) (%d confirmed), lock_held=%v streak=%d",
-			len(stuck), len(confirmed), held, c.lockStreak))
+			"suspect: netfilter-guard %d stuck netfilter cmd(s) (%d confirmed), lock_held=%v lock_ok=%v streak=%d",
+			len(stuck), len(confirmed), held, lockOK, c.lockStreak))
+	}
+	if !lockOK || scanInconclusive {
+		c.d.CycleResult(wdeps.CheckNetfilterGuard, "abort")
+		return
 	}
 	c.d.CycleResult(wdeps.CheckNetfilterGuard, "ok")
 }
@@ -321,7 +463,14 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 func (c *NetfilterGuardCheck) probeLegacyRules(ctx context.Context) {
 	namesPath := filepath.Join(c.d.Cfg.ProcRoot, "1", "net", "ip_tables_names")
 	names, err := os.ReadFile(namesPath)
-	if err != nil || strings.TrimSpace(string(names)) == "" {
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No legacy tables registered → definitively zero leaked.
+			c.d.Series.IPTablesLegacyLeakedRules = 0
+		}
+		return
+	}
+	if strings.TrimSpace(string(names)) == "" {
 		// No legacy tables registered → definitively zero leaked.
 		c.d.Series.IPTablesLegacyLeakedRules = 0
 		return

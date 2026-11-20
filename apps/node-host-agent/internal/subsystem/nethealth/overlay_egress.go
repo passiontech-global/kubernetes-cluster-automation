@@ -2,6 +2,7 @@ package nethealth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
@@ -238,8 +240,32 @@ func (n *NetHealth) probeEgressUnderlay(
 		return "relay", false
 	}
 	hadRule := live == "relay"
+	markDirect := func() {
+		if _, err := os.Stat(icmpBlk); err != nil {
+			if werr := fsx.WriteFileAtomic(icmpBlk,
+				strconv.FormatInt(n.cfg.Clock.Now().Unix(), 10)+"\n"); werr != nil {
+				logger().Warn("nethealth: egress "+
+					"icmp-blocked marker write failed",
+					"path", icmpBlk, "error", werr)
+			}
+			n.state.AppendLog(fmt.Sprintf(
+				"egress %s: ICMP blocked but tcp/%s alive — treat as direct (provider blocks ICMP?)", r, tcpPort))
+		}
+	}
 	ruleDropped := false
 	if hadRule {
+		probeErr, markErr := n.cfg.tcpProbeMarked(ctx, r, tcpPort, 5*time.Second)
+		if markErr == nil {
+			if probeErr == nil {
+				markDirect()
+				return "direct", false
+			}
+			return "relay", false
+		}
+		if !errors.Is(markErr, unix.EPERM) && !errors.Is(markErr, unix.EACCES) && !errors.Is(markErr, unix.ENOPROTOOPT) {
+			logger().Debug("nethealth: marked tcp probe failed to set SO_MARK — falling back to rule drop",
+				"relay", r, "error", markErr)
+		}
 		if _, derr := n.ip(ctx, "rule", "del", "pref", "1500",
 			"to", r+"/32", "lookup", strconv.Itoa(table)); derr != nil {
 			logger().Warn("nethealth: probe-window rule del "+
@@ -252,24 +278,17 @@ func (n *NetHealth) probeEgressUnderlay(
 	probe = "relay"
 	if n.cfg.tcpProbe(ctx, r, tcpPort, 5*time.Second) == nil {
 		probe = "direct"
-		if _, err := os.Stat(icmpBlk); err != nil {
-			if werr := fsx.WriteFileAtomic(icmpBlk,
-				strconv.FormatInt(n.cfg.Clock.Now().Unix(), 10)+"\n"); werr != nil {
-				logger().Warn("nethealth: egress "+
-					"icmp-blocked marker write failed",
-					"path", icmpBlk, "error", werr)
-			}
-			n.state.AppendLog(fmt.Sprintf(
-				"egress %s: ICMP blocked but tcp/%s alive — treat as direct (provider blocks ICMP?)", r, tcpPort))
-		}
+		markDirect()
 	}
 	if ruleDropped {
-		_, aerr := n.ip(ctx, "rule", "add", "pref", "1500",
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		_, aerr := n.ip(rctx, "rule", "add", "pref", "1500",
 			"to", r+"/32", "lookup", strconv.Itoa(table))
 		if aerr != nil {
-			_, aerr = n.ip(ctx, "rule", "add", "pref", "1500",
+			_, aerr = n.ip(rctx, "rule", "add", "pref", "1500",
 				"to", r+"/32", "lookup", strconv.Itoa(table))
 		}
+		cancel()
 		if aerr != nil {
 			logger().Warn("nethealth: probe-window rule "+
 				"restore failed — relay rule left removed "+

@@ -7,6 +7,7 @@ package wdeps
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -78,13 +79,22 @@ func PodReady(p *corev1.Pod) bool {
 // propagation — reached only after zero-live-task verification, so it
 // is pure object cleanup (no split-brain/dual-mount risk).
 func (d *Deps) ForceDeletePod(ctx context.Context, p *corev1.Pod) error {
+	if d == nil || d.Cfg.Client == nil {
+		return errors.New("node-host-agent: no kubernetes client")
+	}
+	if p == nil {
+		return errors.New("node-host-agent: nil pod")
+	}
+	var termSec int64
+	if p.DeletionTimestamp != nil {
+		termSec = int64(d.Cfg.Seams.Host.Clock.Now().Sub(p.DeletionTimestamp.Time).Seconds())
+	}
 	// Log line is an NPD contract: ends in "force-delete pod ..." so
 	// the StuckPodForceDeleted filelog pattern still fires.
 	d.State.AppendLog(fmt.Sprintf(
 		"POD-TEARDOWN-FORCE-DELETE: "+latchdefs.ReasonForceDeletePod+
 			"%s/%s (uid %.8s) - Terminating %ds, zero live tasks",
-		p.Namespace, p.Name, string(p.UID),
-		int64(d.Cfg.Seams.Host.Clock.Now().Sub(p.DeletionTimestamp.Time).Seconds())))
+		p.Namespace, p.Name, string(p.UID), termSec))
 	return d.Cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
 		metav1.DeleteOptions{
 			GracePeriodSeconds: ptr.To[int64](0),
@@ -97,6 +107,12 @@ func (d *Deps) ForceDeletePod(ctx context.Context, p *corev1.Pod) error {
 // the pod with a 5s grace period and UID precondition so a same-name
 // recycle cannot be killed by mistake.
 func (d *Deps) DeletePodGraceful(ctx context.Context, p *corev1.Pod) error {
+	if d == nil || d.Cfg.Client == nil {
+		return errors.New("node-host-agent: no kubernetes client")
+	}
+	if p == nil {
+		return errors.New("node-host-agent: nil pod")
+	}
 	d.StampPodHealed(ctx, p.Namespace, p.Name)
 	return d.Cfg.Client.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name,
 		metav1.DeleteOptions{

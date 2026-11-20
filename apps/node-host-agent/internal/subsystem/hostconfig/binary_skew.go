@@ -9,22 +9,25 @@
 package hostconfig
 
 import (
-	"errors"
+	"math"
 	"os"
 	"strconv"
 	"strings"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // binaryNewerThanService reports whether the managed binary at
 // hostPath was written AFTER unit's current active incarnation
 // started — the running daemon predates the on-disk binary, so only
 // a restart picks it up (SIGHUP reloads config inside the old
-// image). Both sides resolve to unix epoch seconds: the binary's
-// mtime vs ActiveEnterTimestampMonotonic anchored by /proc/stat
-// btime — the formatted ActiveEnterTimestamp is unusable (its zone
-// abbrev misparses off-UTC; platform/systemd documents the same
-// trap for ActiveAge). Every probe failure answers false: "can't
-// prove skew" must never flap the unit.
+// image). Both sides resolve in CLOCK_MONOTONIC: ActiveEnterTimestampMonotonic
+// counts on CLOCK_MONOTONIC (which pauses across VM suspend/live-migration,
+// unlike /proc/stat btime's CLOCK_BOOTTIME origin), so computing
+// activeSince as Clock.Now().Add(-(nowMono - monoDur)) avoids false-positive
+// restarts after suspend/resume. Every probe failure answers false:
+// "can't prove skew" must never flap the unit.
 func (c *cyc) binaryNewerThanService(hostPath, unit string) bool {
 	fi, err := os.Stat(c.r.hp(hostPath))
 	if err != nil {
@@ -36,34 +39,29 @@ func (c *cyc) binaryNewerThanService(hostPath, unit string) bool {
 		return false
 	}
 	monoUS, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-	if err != nil || monoUS <= 0 {
+	if err != nil || monoUS <= 0 || monoUS > math.MaxInt64/int64(time.Microsecond) {
 		// 0/"n/a"/empty = never activated this boot — nothing to
 		// compare against (an inactive unit execs the on-disk
 		// binary on its next start anyway).
 		return false
 	}
-	btime, err := procBootEpoch()
-	if err != nil {
+	monoDur := time.Duration(monoUS) * time.Microsecond
+	monoFn := c.monoNow
+	if monoFn == nil {
+		monoFn = defaultMonoNow
+	}
+	nowMono, err := monoFn()
+	if err != nil || monoDur > nowMono {
 		return false
 	}
-	activeSince := btime + monoUS/1_000_000
-	return fi.ModTime().Unix() > activeSince
+	activeSince := c.r.cfg.Clock.Now().Add(-(nowMono - monoDur))
+	return fi.ModTime().Unix() > activeSince.Unix()
 }
 
-// procBootEpoch returns /proc/stat btime — the realtime epoch the
-// monotonic clock (ActiveEnterTimestampMonotonic, /proc/uptime)
-// counts from. btime is a system property, not PID-namespaced, so
-// the container's /proc/stat reports the host's boot time in both
-// pod (hostPID) and standalone mode.
-func procBootEpoch() (int64, error) {
-	data, err := os.ReadFile("/proc/stat")
-	if err != nil {
+func defaultMonoNow() (time.Duration, error) {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
 		return 0, err
 	}
-	for line := range strings.SplitSeq(string(data), "\n") {
-		if rest, ok := strings.CutPrefix(line, "btime "); ok {
-			return strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
-		}
-	}
-	return 0, errors.New("/proc/stat: btime not found")
+	return time.Duration(ts.Sec)*time.Second + time.Duration(ts.Nsec)*time.Nanosecond, nil
 }

@@ -55,23 +55,22 @@ type CgroupDyingCheck struct {
 func (c *CgroupDyingCheck) Name() string { return wdeps.CheckCgroupDying }
 
 // cgroupStatDying parses one cgroup.stat file for the
-// nr_dying_descendants field — ok=false when the file or the field
-// is unreadable (cgroup v1 host, missing mount: the check is
-// dormant there).
-func cgroupStatDying(path string) (int64, bool) {
+// nr_dying_descendants field — returns any read error so callers can
+// distinguish absent ENOENT files (cgroup v1) from EACCES/EIO.
+func cgroupStatDying(path string) (int64, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, false
+		return 0, false, err
 	}
 	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) == 2 && f[0] == "nr_dying_descendants" {
-			if v, err := strconv.ParseInt(f[1], 10, 64); err == nil {
-				return v, true
+			if v, perr := strconv.ParseInt(f[1], 10, 64); perr == nil {
+				return v, true, nil
 			}
 		}
 	}
-	return 0, false
+	return 0, false, nil
 }
 
 // Run executes one cgroup-dying round.
@@ -82,21 +81,28 @@ func (c *CgroupDyingCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	root := c.d.Cfg.Runtime.CgroupRoot
 	var dying int64
 	found := false
+	nonENOENT := false
 	for _, p := range []string{
 		filepath.Join(root, "cgroup.stat"),
 		filepath.Join(root, "kubepods.slice", "cgroup.stat"),
 	} {
-		if v, ok := cgroupStatDying(p); ok {
+		v, ok, err := cgroupStatDying(p)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				nonENOENT = true
+			}
+			continue
+		}
+		if ok {
 			found = true
 			if v > dying {
 				dying = v
 			}
 		}
 	}
-	if !found {
-		// cgroup v1 host or the hierarchy isn't mounted — the whole
-		// check is dormant (same "unreadable → abort" rule as the
-		// other procfs probes).
+	if !found || (nonENOENT && dying <= cgroupDyingThreshold) {
+		// cgroup v1 host, hierarchy unmounted, or a cgroup.stat read failed
+		// with non-ENOENT below threshold — abort without clobbering.
 		c.d.CycleResult(wdeps.CheckCgroupDying, "abort")
 		return
 	}
@@ -166,7 +172,7 @@ func (c *CgroupDyingCheck) reclaim(root string, dying int64) {
 				continue
 			}
 			child := filepath.Join(kubepods, e.Name())
-			childDying, ok := cgroupStatDying(
+			childDying, ok, _ := cgroupStatDying(
 				filepath.Join(child, "cgroup.stat"))
 			if !ok || childDying <= cgroupDyingChildThreshold {
 				continue

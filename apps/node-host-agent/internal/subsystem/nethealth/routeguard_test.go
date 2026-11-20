@@ -699,11 +699,17 @@ func TestRouteGuardRespawnsAfterExit(t *testing.T) {
 	waitForCond(t, 2*time.Second, func() bool {
 		return !e.n.routeGuardRunning.Load()
 	})
+	waitForCond(t, 2*time.Second, func() bool {
+		st := e.n.mtuState()
+		st.Mu.Lock()
+		defer st.Mu.Unlock()
+		return !st.Running
+	})
 
 	// The guard exited with ctx — a restarted Run respawns it.
 	// (Production waits routeGuardRespawnBackoff between spawn
 	// attempts after an exit; the test clears the backoff stamp.)
-	e.n.routeGuardLastExit.Store(0)
+	e.n.routeGuardLastExit.Store(nil)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan struct{})
 	go func() {
@@ -713,6 +719,15 @@ func TestRouteGuardRespawnsAfterExit(t *testing.T) {
 	waitForCond(t, 2*time.Second, func() bool { return opens.Load() >= 2 })
 	cancel2()
 	<-done2
+	waitForCond(t, 2*time.Second, func() bool {
+		return !e.n.routeGuardRunning.Load()
+	})
+	waitForCond(t, 2*time.Second, func() bool {
+		st := e.n.mtuState()
+		st.Mu.Lock()
+		defer st.Mu.Unlock()
+		return !st.Running
+	})
 }
 
 // A panic inside the guard is recovered (no daemon crash), logged,
@@ -725,7 +740,8 @@ func TestRouteGuardPanicRecoveredAndRearms(t *testing.T) {
 		calls.Add(1)
 		panic("boom")
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	e.n.spawnRouteGuard(ctx)
 	waitForCond(t, 2*time.Second, func() bool {
 		return !e.n.routeGuardRunning.Load()
@@ -740,11 +756,46 @@ func TestRouteGuardPanicRecoveredAndRearms(t *testing.T) {
 	}
 	// …until it elapses — then the guard re-arms (and panics again,
 	// recovered again).
-	e.n.routeGuardLastExit.Store(0)
+	e.n.routeGuardLastExit.Store(nil)
 	e.n.spawnRouteGuard(ctx)
 	waitForCond(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
 	waitForCond(t, 2*time.Second, func() bool {
 		return !e.n.routeGuardRunning.Load()
+	})
+	cancel()
+	waitForCond(t, 2*time.Second, func() bool {
+		st := e.n.mtuState()
+		st.Mu.Lock()
+		defer st.Mu.Unlock()
+		return !st.Running
+	})
+}
+
+func TestRouteGuardBackwardClockDoesNotLockOutRespawn(t *testing.T) {
+	e := routeGuardFixture(t)
+	var calls atomic.Int32
+	e.n.cfg.openRouteSocket = func() (int, error) {
+		calls.Add(1)
+		panic("boom")
+	}
+	// Seed lastExit at e.now, then step fake clock backward by 1h (NTP jump).
+	t0 := e.now
+	e.n.routeGuardLastExit.Store(&t0)
+	e.now = t0.Add(-time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.n.spawnRouteGuard(ctx)
+	waitForCond(t, 2*time.Second, func() bool { return calls.Load() >= 1 })
+	waitForCond(t, 2*time.Second, func() bool {
+		return !e.n.routeGuardRunning.Load()
+	})
+	cancel()
+	waitForCond(t, 2*time.Second, func() bool {
+		st := e.n.mtuState()
+		st.Mu.Lock()
+		defer st.Mu.Unlock()
+		return !st.Running
 	})
 }
 

@@ -108,3 +108,43 @@ func TestEBPFPressureCachedReadDoesNotAdvanceStreak(t *testing.T) {
 		t.Fatalf("expected latch after %d fresh scans: %v", ebpfConfirmTicks, err)
 	}
 }
+
+func TestEBPFPressureHysteresisTouchesHeldMtime(t *testing.T) {
+	f := kfixture(t)
+	now := time.Unix(1760000000, 0)
+	f.deps.Clock.Set(func() time.Time { return now })
+
+	progs, maps, scanned := DefaultEBPFProgsMax*3/4, 500, true // inside [clear, max) hysteresis band
+	scanAt := now
+	f.deps.EBPFSnapshot = func() (int, int, bool, time.Time) {
+		return progs, maps, scanned, scanAt
+	}
+	r := New(f.deps)
+	latchFile := filepath.Join(f.deps.StateDir, latchdefs.LatchFilePrefix+latchdefs.LatchEBPFPressure)
+
+	// Absent latch must NOT be materialized in the hysteresis band.
+	r.updateEBPFPressure()
+	if _, err := os.Stat(latchFile); !os.IsNotExist(err) {
+		t.Fatal("absent latch materialized inside hysteresis band")
+	}
+
+	// Held latch aged past LatchTouchMinInterval gets its mtime refreshed.
+	if err := os.WriteFile(latchFile, []byte("1700000000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-48 * time.Hour)
+	if err := os.Chtimes(latchFile, old, old); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	scanAt = now
+	r.updateEBPFPressure()
+
+	fi, err := os.Stat(latchFile)
+	if err != nil {
+		t.Fatalf("latch vanished: %v", err)
+	}
+	if !fi.ModTime().Equal(now) {
+		t.Fatalf("hysteresis mtime = %v, want %v", fi.ModTime(), now)
+	}
+}

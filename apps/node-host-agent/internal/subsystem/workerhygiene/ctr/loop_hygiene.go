@@ -36,21 +36,28 @@ func (c *MountinfoCheck) reapOrphanLoops(
 	hostPodsDir string,
 	podLive map[string]bool,
 	tasksOnce func() (map[string][]wdeps.CtrTask, bool),
-) {
+) bool {
 	if !c.d.Cfg.Wave3.LoopGCEnabled {
-		return
+		return true
 	}
 	// The caller derives this from PodsDir; a trailing slash would
 	// otherwise turn "<dir>/" into "<dir>//" in the prefix compare.
 	hostPodsDir = filepath.Clean(hostPodsDir)
 	sysBlock := c.d.Cfg.Wave3.SysBlockDir
 	if sysBlock == "" {
-		return
+		return true
+	}
+	if _, rerr := os.ReadDir(sysBlock); rerr != nil {
+		if os.IsNotExist(rerr) {
+			c.d.State.PruneMarkers(loopMarkerPrefix, func(string) bool { return false })
+			return true
+		}
+		return false
 	}
 	loopDirs, err := filepath.Glob(filepath.Join(sysBlock, "loop*"))
 	if err != nil || len(loopDirs) == 0 {
 		c.d.State.PruneMarkers(loopMarkerPrefix, func(string) bool { return false })
-		return
+		return true
 	}
 
 	pid1Sources := parseMountSources(mountinfoData)
@@ -60,6 +67,7 @@ func (c *MountinfoCheck) reapOrphanLoops(
 	// loop mounted in a container's mount ns is never mistaken for an orphan.
 	allSources := map[string]bool{}
 	allScanned := false
+	sawScanErr := false
 	seen := map[string]bool{}
 	reaped := 0
 
@@ -79,12 +87,22 @@ func (c *MountinfoCheck) reapOrphanLoops(
 		}
 		// autoclear=1 means the kernel clears the device on last close;
 		// it is still wired into a live teardown path, never an orphan.
+		// Non-ENOENT read errors leave autoclear indeterminate -> fail closed.
 		auto, aerr := os.ReadFile(filepath.Join(dir, "loop", "autoclear"))
-		if aerr == nil && strings.TrimSpace(string(auto)) == "1" {
+		if aerr != nil {
+			if !os.IsNotExist(aerr) {
+				sawScanErr = true
+				seen[devName] = true
+				continue
+			}
+		} else if strings.TrimSpace(string(auto)) == "1" {
 			continue
 		}
 		backingBytes, err := os.ReadFile(filepath.Join(dir, "loop", "backing_file"))
 		if err != nil {
+			if !os.IsNotExist(err) {
+				sawScanErr = true
+			}
 			continue
 		}
 		backing := strings.TrimSpace(string(backingBytes))
@@ -93,15 +111,22 @@ func (c *MountinfoCheck) reapOrphanLoops(
 		}
 
 		isOrphan := strings.HasSuffix(backing, " (deleted)")
-		if !isOrphan && e != nil && e.APIOK && hostPodsDir != "" && strings.HasPrefix(backing, hostPodsDir+"/") {
+		if !isOrphan && hostPodsDir != "" && strings.HasPrefix(backing, hostPodsDir+"/") {
+			if e == nil || !e.APIOK {
+				// Transient API outage makes pod-backed loop liveness
+				// indeterminate: preserve markers rather than pruning.
+				sawScanErr = true
+				seen[devName] = true
+				continue
+			}
 			rel := strings.TrimPrefix(backing, hostPodsDir+"/")
 			uid, _, _ := strings.Cut(rel, "/")
 			if uid != "" && !podLive[uid] {
 				taskMap, tasksComplete := tasksOnce()
-				if tasksComplete {
-					if _, hasTask := taskMap[uid]; !hasTask {
-						isOrphan = true
-					}
+				if !tasksComplete {
+					sawScanErr = true
+				} else if _, hasTask := taskMap[uid]; !hasTask {
+					isOrphan = true
 				}
 			}
 		}
@@ -112,14 +137,26 @@ func (c *MountinfoCheck) reapOrphanLoops(
 		// holders/ MUST be readable and empty — any error (including a
 		// missing/unstatable dir) is indeterminate → fail closed.
 		holders, err := os.ReadDir(filepath.Join(dir, "holders"))
-		if err != nil || len(holders) > 0 {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				sawScanErr = true
+			}
+			seen[devName] = true
+			continue
+		}
+		if len(holders) > 0 {
 			continue
 		}
 
 		// /dev/loopN must be absent from EVERY mount namespace, not just
 		// PID 1's — a container may hold the only mount of the loop.
 		mounted, ok := c.loopMountedAnywhere(pid1Sources, devName, &allSources, &allScanned)
-		if !ok || mounted {
+		if !ok {
+			sawScanErr = true
+			seen[devName] = true
+			continue
+		}
+		if mounted {
 			continue
 		}
 
@@ -173,7 +210,10 @@ func (c *MountinfoCheck) reapOrphanLoops(
 			devPath, backing))
 	}
 
-	c.d.State.PruneMarkers(loopMarkerPrefix, func(id string) bool { return seen[id] })
+	if !sawScanErr {
+		c.d.State.PruneMarkers(loopMarkerPrefix, func(id string) bool { return seen[id] })
+	}
+	return !sawScanErr
 }
 
 // loopMountedAnywhere reports whether devName is a mount source in any mount
@@ -188,25 +228,52 @@ func (c *MountinfoCheck) loopMountedAnywhere(pid1Sources map[string]bool,
 		return true, true
 	}
 	if !*allScanned {
-		*allScanned = true
 		m := map[string]bool{}
 		pids, err := c.d.Proc.PIDs()
 		if err != nil {
 			// An unreadable /proc cannot prove the loop is unused.
 			return false, false
 		}
+		seenNS := map[string]bool{}
+		if c.d.Cfg.MountinfoFile == c.d.Proc.File(1, "mountinfo") {
+			if ns, nerr := os.Readlink(c.d.Proc.File(1, "ns", "mnt")); nerr == nil && ns != "" {
+				seenNS[ns] = true
+			}
+		}
+		scanErr := false
 		for _, pid := range pids {
+			ns, nerr := os.Readlink(c.d.Proc.File(pid, "ns", "mnt"))
+			if nerr == nil && ns != "" && seenNS[ns] {
+				continue
+			}
 			data, err := os.ReadFile(c.d.Proc.File(pid, "mountinfo"))
 			if err != nil {
-				// A process exited mid-walk — its namespace is gone, so
-				// skipping it cannot hide a live mount.
+				if !os.IsNotExist(err) {
+					// Unreadable /proc/<pid>/mountinfo (e.g. EACCES) cannot
+					// prove a container mount namespace does not mount dev.
+					scanErr = true
+				}
+				// ENOENT: process exited mid-walk — its namespace is gone.
+				// Do not record seenNS[ns] until ReadFile succeeds so sibling
+				// PIDs in the same mount namespace are still scanned.
 				continue
+			}
+			if nerr == nil && ns != "" {
+				seenNS[ns] = true
 			}
 			for src := range parseMountSources(data) {
 				m[src] = true
 			}
 		}
 		*allSources = m
+		if scanErr {
+			*allScanned = false
+			if m[dev] {
+				return true, true
+			}
+			return false, false
+		}
+		*allScanned = true
 	}
 	return (*allSources)[dev], true
 }

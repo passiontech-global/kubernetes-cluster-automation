@@ -598,8 +598,12 @@ func listenAddrsDump(out map[string]struct{}) error {
 		{unix.AF_INET6, unix.IPPROTO_UDP},
 	} {
 		seq++
+		states := uint32(1) << tcpStateListen
+		if spec.proto == unix.IPPROTO_UDP {
+			states = uint32(0xFFF) &^ (uint32(1) << 1 /* TCP_ESTABLISHED */)
+		}
 		if err := unix.Sendto(fd, diagRequestProto(seq, spec.family,
-			spec.proto, 0xFFF, nil,
+			spec.proto, states, nil,
 			unix.SOCK_DIAG_BY_FAMILY, unix.NLM_F_REQUEST|unix.NLM_F_DUMP),
 			0, sa); err != nil {
 			return fmt.Errorf("sock_diag send %d/%d: %w",

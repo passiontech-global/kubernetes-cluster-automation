@@ -14,15 +14,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/runtime"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // mkOOMScope lays down one kubepods pod slice with a container
@@ -304,6 +307,99 @@ func TestSATokenTTLHealthy(t *testing.T) {
 	}
 	if strings.Contains(e.LogLines(t), "not-a-jwt") {
 		t.Fatal("token contents leaked into the log")
+	}
+}
+
+func TestSATokenTTLExpiredNegativeAndTerminalPods(t *testing.T) {
+	expiredPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "expired", Namespace: "default", UID: types.UID(wdepstest.UIDA)},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	healthyPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "healthy", Namespace: "default", UID: types.UID(wdepstest.UIDB)},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	succeededPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "done", Namespace: "default", UID: types.UID(wdepstest.UIDC)},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	deletingPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "term", Namespace: "default", UID: types.UID(wdepstest.UIDD),
+			DeletionTimestamp: new(metav1.NewTime(time.Now())),
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, expiredPod, healthyPod, succeededPod, deletingPod)
+	ctx := context.Background()
+
+	// Expired Running pod (-30s) + healthy Running pod (+2400s): minTTL must stay -30.
+	wdepstest.WriteFile(t, filepath.Join(e.KubepodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~projected", "v", "token"),
+		fakeJWT(e.Now.Add(-30*time.Second).Unix()))
+	wdepstest.WriteFile(t, filepath.Join(e.KubepodsDir, wdepstest.UIDB, "volumes", "kubernetes.io~projected", "v", "token"),
+		fakeJWT(e.Now.Add(40*time.Minute).Unix()))
+	// Terminal/deleting/orphan pods with even older tokens must be ignored.
+	wdepstest.WriteFile(t, filepath.Join(e.KubepodsDir, wdepstest.UIDC, "volumes", "kubernetes.io~projected", "v", "token"),
+		fakeJWT(e.Now.Add(-5*time.Hour).Unix()))
+	wdepstest.WriteFile(t, filepath.Join(e.KubepodsDir, wdepstest.UIDD, "volumes", "kubernetes.io~projected", "v", "token"),
+		fakeJWT(e.Now.Add(-6*time.Hour).Unix()))
+	wdepstest.WriteFile(t, filepath.Join(e.KubepodsDir, wdepstest.UIDE, "volumes", "kubernetes.io~projected", "v", "token"),
+		fakeJWT(e.Now.Add(-7*time.Hour).Unix()))
+
+	chk := wdepstest.Check[*runtime.SATokenTTLCheck](e.H, wdeps.CheckSATokenTTL)
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		Pods:         []corev1.Pod{*expiredPod, *healthyPod, *succeededPod, *deletingPod},
+	})
+	if e.H.SATokenMinTTLSec != -30 {
+		t.Fatalf("SATokenMinTTLSec=%v want -30 (expired token overwritten or terminal pod leaked)", e.H.SATokenMinTTLSec)
+	}
+
+	// Only terminal/deleting/orphan pods -> none measured -> -1 sentinel.
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		Pods:         []corev1.Pod{*succeededPod, *deletingPod},
+	})
+	if e.H.SATokenMinTTLSec != -1 {
+		t.Fatalf("SATokenMinTTLSec=%v want -1 when no Running non-deleting pod measured", e.H.SATokenMinTTLSec)
+	}
+}
+
+func TestSATokenTTLFutureSkewSelfHeals(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "skewed", Namespace: "default", UID: types.UID(wdepstest.UIDA),
+			Annotations: map[string]string{
+				"passiontech.dev/token-resync-at": fmt.Sprintf("%d", time.Now().Add(2*time.Hour).Unix()),
+			},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, pod)
+	pod.Annotations["passiontech.dev/token-resync-at"] = fmt.Sprintf("%d", e.Now.Add(2*time.Hour).Unix())
+	if _, err := e.CS.CoreV1().Pods("default").Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(e.KubepodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~projected", "v", "token"),
+		fakeJWT(e.Now.Add(60*time.Second).Unix()))
+
+	chk := wdepstest.Check[*runtime.SATokenTTLCheck](e.H, wdeps.CheckSATokenTTL)
+	chk.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}})
+
+	got, err := e.CS.CoreV1().Pods("default").Get(context.Background(), "skewed", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Annotations["passiontech.dev/token-resync-at"] != fmt.Sprintf("%d", e.Now.Unix()) {
+		t.Fatalf("future-skewed annotation was not self-healed: got %q want %d",
+			got.Annotations["passiontech.dev/token-resync-at"], e.Now.Unix())
 	}
 }
 
@@ -640,4 +736,464 @@ func TestSubprocOOMMemoryStatBreakdown(t *testing.T) {
 	if !strings.Contains(e.LogLines(t), want) {
 		t.Fatalf("log missing breakdown %q:\n%s", want, e.LogLines(t))
 	}
+}
+
+func TestLocalPVQuotaProtectedRailsAndHold(t *testing.T) {
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+		hold bool
+	}{
+		{
+			name: "protected_namespace",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "sys", Namespace: "kube-system", UID: types.UID(wdepstest.UIDA)},
+				Spec: corev1.PodSpec{
+					NodeName: "node-a",
+					Volumes: []corev1.Volume{{Name: "d", VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"},
+					}}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+		},
+		{
+			name: "db_quorum_label",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pg", Namespace: "default", UID: types.UID(wdepstest.UIDA),
+					Labels: map[string]string{"cnpg.io/cluster": "pg"},
+				},
+				Spec: corev1.PodSpec{
+					NodeName: "node-a",
+					Volumes: []corev1.Volume{{Name: "d", VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"},
+					}}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+		},
+		{
+			name: "statefulset_owner",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "sts-0", Namespace: "default", UID: types.UID(wdepstest.UIDA),
+					OwnerReferences: []metav1.OwnerReference{{Kind: "StatefulSet", Name: "sts"}},
+				},
+				Spec: corev1.PodSpec{
+					NodeName: "node-a",
+					Volumes: []corev1.Volume{{Name: "d", VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"},
+					}}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+		},
+		{
+			name: "hold_local_action",
+			hold: true,
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "hog", Namespace: "default", UID: types.UID(wdepstest.UIDA)},
+				Spec: corev1.PodSpec{
+					NodeName: "node-a",
+					Volumes: []corev1.Volume{{Name: "d", VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "c"},
+					}}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pv := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-abc123"},
+				Spec: corev1.PersistentVolumeSpec{
+					Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+				},
+			}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: tc.pod.Namespace},
+				Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pvc-abc123"},
+			}
+			e := fixture(t, pv, pvc, tc.pod)
+			prov := t.TempDir()
+			e.H.Cfg.Disk.LocalPVQuotaDir = prov
+			pvcDir := filepath.Join(prov, "pvc-abc123")
+			if err := os.MkdirAll(pvcDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			bf, err := os.Create(filepath.Join(pvcDir, "big.bin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = bf.Truncate(1717986918)
+			_ = bf.Close()
+
+			e.Live[7777] = true
+			e.MkTask(t, wdepstest.UIDA, "hog", 7777)
+			e.DiskUsed = 0.85
+			reniced := false
+			e.H.Cfg.Seams.Host.ReniceFn = func(int) error { reniced = true; return nil }
+			if tc.hold {
+				e.H.Cfg.Coord = &nodecoord.Coord{
+					Now: func() time.Time { return e.Now },
+					GetAnnos: func(context.Context) (map[string]string, error) {
+						return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+					},
+				}
+			}
+			tasks, _ := e.H.BuildTaskMap()
+			wdepstest.Check[*runtime.LocalPVQuotaCheck](e.H, wdeps.CheckLocalPVQuota).Run(
+				context.Background(), &wdeps.CycleEnv{
+					WorkerActive: true,
+					APIOK:        true,
+					Pods:         []corev1.Pod{*tc.pod},
+					TasksOnce:    func() (map[string][]wdeps.CtrTask, bool) { return tasks, true },
+				})
+			if reniced || e.H.LocalPVQuotaThrottled != 0 {
+				t.Fatalf("protected/held pod was throttled: reniced=%v throttled=%d",
+					reniced, e.H.LocalPVQuotaThrottled)
+			}
+		})
+	}
+}
+
+func TestSATokenTTLStallSkipsTerminalOrDeletingLivePod(t *testing.T) {
+	cases := []struct {
+		name       string
+		deleteLive bool
+		mutate     func(p *corev1.Pod, now time.Time)
+	}{
+		{
+			name: "transitioned_to_succeeded",
+			mutate: func(p *corev1.Pod, _ time.Time) {
+				p.Status.Phase = corev1.PodSucceeded
+			},
+		},
+		{
+			name: "transitioned_to_deleting",
+			mutate: func(p *corev1.Pod, now time.Time) {
+				ts := metav1.NewTime(now)
+				p.DeletionTimestamp = &ts
+			},
+		},
+		{
+			name:       "NotFound",
+			deleteLive: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapPod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "racy", Namespace: "default", UID: types.UID(wdepstest.UIDA)},
+				Spec:       corev1.PodSpec{NodeName: "node-a"},
+				Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+			}
+			livePod := snapPod.DeepCopy()
+			e := fixture(t, livePod)
+			ctx := context.Background()
+			if tc.deleteLive {
+				if err := e.CS.CoreV1().Pods("default").Delete(ctx, livePod.Name, metav1.DeleteOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				tc.mutate(livePod, e.Now)
+				if _, err := e.CS.CoreV1().Pods("default").Update(ctx, livePod, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			tokDir := filepath.Join(e.KubepodsDir, wdepstest.UIDA,
+				"volumes", "kubernetes.io~projected", "kube-api-access-xyz")
+			wdepstest.WriteFile(t, filepath.Join(tokDir, "token"),
+				fakeJWT(e.Now.Add(120*time.Second).Unix())+"\n")
+
+			chk := wdepstest.Check[*runtime.SATokenTTLCheck](e.H, wdeps.CheckSATokenTTL)
+			chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*snapPod}})
+
+			evs, err := e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(evs.Items) != 0 {
+				t.Fatalf("expected 0 events for %s live pod, got %+v", tc.name, evs.Items)
+			}
+			for _, a := range e.CS.Actions() {
+				if a.GetVerb() == "patch" && a.GetResource().Resource == "pods" {
+					t.Fatalf("unexpected pod patch for %s live pod", tc.name)
+				}
+			}
+		})
+	}
+}
+
+func TestSATokenTTLAPIOKFalsePreservesGaugeAndAborts(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "api-client", Namespace: "default", UID: types.UID(wdepstest.UIDA)},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, pod)
+	ctx := context.Background()
+	tokDir := filepath.Join(e.KubepodsDir, wdepstest.UIDA,
+		"volumes", "kubernetes.io~projected", "kube-api-access-xyz")
+	wdepstest.WriteFile(t, filepath.Join(tokDir, "token"),
+		fakeJWT(e.Now.Add(420*time.Second).Unix())+"\n")
+
+	chk := wdepstest.Check[*runtime.SATokenTTLCheck](e.H, wdeps.CheckSATokenTTL)
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}})
+	if e.H.SATokenMinTTLSec != 420 {
+		t.Fatalf("initial SATokenMinTTLSec=%v want 420", e.H.SATokenMinTTLSec)
+	}
+
+	// APIOK=false must abort without clobbering SATokenMinTTLSec to -1.
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: false})
+	if e.H.SATokenMinTTLSec != 420 {
+		t.Fatalf("APIOK=false overwrote SATokenMinTTLSec=%v want 420", e.H.SATokenMinTTLSec)
+	}
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckSATokenTTL, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1", got)
+	}
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckSATokenTTL, "ok")); got != 1 {
+		t.Fatalf("ok cycles=%v want 1", got)
+	}
+}
+
+func TestSATokenTTLStallRecycledUIDSkipped(t *testing.T) {
+	snapPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "recycled", Namespace: "default", UID: types.UID(wdepstest.UIDA)},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	recycledLivePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "recycled", Namespace: "default", UID: types.UID(wdepstest.UIDB)},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, recycledLivePod)
+	ctx := context.Background()
+	tokDir := filepath.Join(e.KubepodsDir, wdepstest.UIDA,
+		"volumes", "kubernetes.io~projected", "kube-api-access-xyz")
+	wdepstest.WriteFile(t, filepath.Join(tokDir, "token"),
+		fakeJWT(e.Now.Add(30*time.Second).Unix())+"\n")
+
+	chk := wdepstest.Check[*runtime.SATokenTTLCheck](e.H, wdeps.CheckSATokenTTL)
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*snapPod}})
+
+	evs, err := e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs.Items) != 0 {
+		t.Fatalf("expected 0 events for recycled same-name pod with different UID, got %+v", evs.Items)
+	}
+	for _, a := range e.CS.Actions() {
+		if a.GetVerb() == "patch" && a.GetResource().Resource == "pods" {
+			t.Fatalf("unexpected pod patch on recycled same-name pod with different UID")
+		}
+	}
+}
+
+func TestLocalPVQuotaIncompleteTasksDefersWithoutPoisoningLedger(t *testing.T) {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-incomplete"},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pvc-incomplete"},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "hog", Namespace: "default", UID: types.UID(wdepstest.UIDA)},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, pv, pvc, pod)
+	ctx := context.Background()
+	prov := t.TempDir()
+	e.H.Cfg.Disk.LocalPVQuotaDir = prov
+	pvcDir := filepath.Join(prov, "pvc-incomplete")
+	if err := os.MkdirAll(pvcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bf, err := os.Create(filepath.Join(pvcDir, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bf.Truncate(1717986918); err != nil {
+		t.Fatal(err)
+	}
+	_ = bf.Close()
+
+	e.Live[7779] = true
+	e.MkTask(t, wdepstest.UIDA, "hog", 7779)
+	e.DiskUsed = 0.85
+	reniced := false
+	e.H.Cfg.Seams.Host.ReniceFn = func(pid int) error {
+		if pid == 7779 {
+			reniced = true
+		}
+		return nil
+	}
+
+	chk := wdepstest.Check[*runtime.LocalPVQuotaCheck](e.H, wdeps.CheckLocalPVQuota)
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		Pods:         []corev1.Pod{*pod},
+		TasksOnce:    func() (map[string][]wdeps.CtrTask, bool) { return nil, false },
+	})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckLocalPVQuota, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1", got)
+	}
+	if e.H.LocalPVQuotaThrottled != 0 || reniced {
+		t.Fatalf("throttled on incomplete task map: throttled=%d reniced=%v", e.H.LocalPVQuotaThrottled, reniced)
+	}
+
+	// Recovery cycle with complete task map must now throttle (ledger was not poisoned).
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		Pods:         []corev1.Pod{*pod},
+	})
+	if !reniced || e.H.LocalPVQuotaThrottled != 1 {
+		t.Fatalf("recovery failed because ledger was poisoned: reniced=%v throttled=%d", reniced, e.H.LocalPVQuotaThrottled)
+	}
+}
+
+func TestConntrackLiberalSysClassNetUnreadableAborts(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	notDir := filepath.Join(t.TempDir(), "not-a-dir")
+	wdepstest.WriteFile(t, notDir, "x")
+	e.H.Cfg.SysClassNet = notDir
+
+	chk := wdepstest.Check[*runtime.ConntrackLiberalCheck](e.H, wdeps.CheckConntrackLiberal)
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckConntrackLiberal, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1 on ENOTDIR", got)
+	}
+}
+
+func TestOrphanHPUnreadableRootAbortsPreservingGauges(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	notDir := filepath.Join(t.TempDir(), "not-a-dir")
+	wdepstest.WriteFile(t, notDir, "x")
+	e.H.Cfg.Disk.OrphanHostPathDirs = []string{notDir}
+	e.H.OrphanHostPathDirs = 3
+	e.H.OrphanHostPathBytes = 4096
+
+	chk := wdepstest.Check[*runtime.OrphanHPCheck](e.H, wdeps.CheckOrphanHP)
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1 on ENOTDIR", got)
+	}
+	if e.H.OrphanHostPathDirs != 3 || e.H.OrphanHostPathBytes != 4096 {
+		t.Fatalf("gauges clobbered on ENOTDIR: dirs=%d bytes=%d want 3/4096",
+			e.H.OrphanHostPathDirs, e.H.OrphanHostPathBytes)
+	}
+}
+
+func TestOrphanHPMultiRootCacheWarmPartialReadErrAbortsPreservingGauges(t *testing.T) {
+	t.Run("pvCacheFresh-allKnown-readErr", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 0000 does not block root")
+		}
+		pv := &corev1.PersistentVolume{ObjectMeta: metav1.ObjectMeta{Name: "pvc-live1"}}
+		e := fixture(t, pv)
+		ctx := context.Background()
+
+		root1 := t.TempDir()
+		root2 := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root1, "pvc-live1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		wdepstest.WriteFile(t, filepath.Join(root2, "pvc-orphan2", "data.bin"), strings.Repeat("a", 2048))
+		e.H.Cfg.Disk.OrphanHostPathDirs = []string{root1, root2}
+
+		chk := wdepstest.Check[*runtime.OrphanHPCheck](e.H, wdeps.CheckOrphanHP)
+		// Cycle 1: warms orphanPVAt and records 1 orphan dir / 2048 bytes from root2.
+		chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+		if e.H.OrphanHostPathDirs != 1 || e.H.OrphanHostPathBytes != 2048 {
+			t.Fatalf("setup gauges: dirs=%d bytes=%d want 1/2048",
+				e.H.OrphanHostPathDirs, e.H.OrphanHostPathBytes)
+		}
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "ok")); got != 1 {
+			t.Fatalf("setup ok cycles=%v want 1", got)
+		}
+
+		// Cycle 2: within 30m cache TTL, root2 becomes 0o000 (readErr=true) while root1
+		// still yields pvc-live1 (allKnown=true). Must abort and preserve gauges.
+		e.Now = e.Now.Add(1 * time.Minute)
+		if err := os.Chmod(root2, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(root2, 0o755) })
+
+		chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1 on partial-root readErr with warm cache", got)
+		}
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "ok")); got != 1 {
+			t.Fatalf("ok cycles=%v want 1 (fast path must not emit ok on readErr)", got)
+		}
+		if e.H.OrphanHostPathDirs != 1 || e.H.OrphanHostPathBytes != 2048 {
+			t.Fatalf("fast path clobbered gauges on partial readErr: dirs=%d bytes=%d want 1/2048",
+				e.H.OrphanHostPathDirs, e.H.OrphanHostPathBytes)
+		}
+
+		// Recovery: restore root2 without orphan -> fast path clears gauges cleanly.
+		if err := os.Chmod(root2, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.RemoveAll(filepath.Join(root2, "pvc-orphan2")); err != nil {
+			t.Fatal(err)
+		}
+		chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "ok")); got != 2 {
+			t.Fatalf("ok cycles=%v want 2 after recovery", got)
+		}
+		if e.H.OrphanHostPathDirs != 0 || e.H.OrphanHostPathBytes != 0 {
+			t.Fatalf("gauges not cleared after recovery: dirs=%d bytes=%d want 0/0",
+				e.H.OrphanHostPathDirs, e.H.OrphanHostPathBytes)
+		}
+	})
+
+	t.Run("nil-client-with-readErr", func(t *testing.T) {
+		e := fixture(t)
+		ctx := context.Background()
+		root1 := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root1, "pvc-live1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		notDir := filepath.Join(t.TempDir(), "not-a-dir")
+		wdepstest.WriteFile(t, notDir, "x")
+		e.H.Cfg.Disk.OrphanHostPathDirs = []string{root1, notDir}
+		e.H.Cfg.Client = nil
+		e.H.OrphanHostPathDirs = 2
+		e.H.OrphanHostPathBytes = 1024
+
+		chk := wdepstest.Check[*runtime.OrphanHPCheck](e.H, wdeps.CheckOrphanHP)
+		chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckOrphanHP, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1 on Client==nil with readErr", got)
+		}
+		if e.H.OrphanHostPathDirs != 2 || e.H.OrphanHostPathBytes != 1024 {
+			t.Fatalf("Client==nil clobbered gauges on readErr: dirs=%d bytes=%d want 2/1024",
+				e.H.OrphanHostPathDirs, e.H.OrphanHostPathBytes)
+		}
+	})
 }

@@ -7,7 +7,9 @@ package pods
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -43,36 +46,56 @@ var (
 
 // k0sWorkerNodeIP reads --node-ip=<ip> out of the k0sworker unit —
 // the node's InternalIP konnectivity-agent should have baked in.
-func k0sWorkerNodeIP(d *wdeps.Deps) string {
+// Absent unit files (ENOENT) return ("", nil); non-ENOENT read errors
+// propagate so KonnCheck aborts instead of clearing its latch/streak.
+func k0sWorkerNodeIP(d *wdeps.Deps) (string, error) {
 	data, err := os.ReadFile(d.Cfg.K0sWorkerUnitFile)
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
 	}
 	if m := nodeIPRe.FindSubmatch(data); m != nil {
-		return string(m[1])
+		return string(m[1]), nil
 	}
-	return ""
+	return "", nil
+}
+
+func isProxyAgentComm(comm string) bool {
+	return strings.Contains(comm, "proxy") ||
+		strings.HasPrefix(comm, "konnectivity")
 }
 
 // proxyAgentComm reports whether the pid's comm can carry a
 // proxy-agent argv — the dedicated proxy-agent binary or the
-// konnectivity-agent (stat comm truncates to "konnectivity-agen").
+// konnectivity-agent (stat comm truncates to "konnectivity-agen") —
+// along with its stat state when known.
 // known=false (unreadable stat) means "cannot rule the pid out" —
 // the caller falls through to the cmdline read as before.
-func proxyAgentComm(e *wdeps.CycleEnv, d *wdeps.Deps, pid int) (match, known bool) {
-	var comm string
+func proxyAgentComm(e *wdeps.CycleEnv, d *wdeps.Deps, pid int) (match bool, state string, known bool) {
+	var st procfs.Stat
+	var ok bool
 	if e != nil && e.StatsOnce != nil {
-		if st, ok := e.StatsOnce()[pid]; ok && st.HasComm {
-			comm, known = st.Comm, true
-		}
-	} else if st, ok := d.Proc.Stat(pid); ok && st.HasComm {
-		comm, known = st.Comm, true
+		st, ok = e.StatsOnce()[pid]
 	}
-	if !known {
-		return false, false
+	if !ok || !st.HasComm {
+		st, ok = d.Proc.Stat(pid)
 	}
-	return strings.Contains(comm, "proxy") ||
-		strings.HasPrefix(comm, "konnectivity"), true
+	if !ok {
+		return false, "", false
+	}
+	if len(st.Fields) > 0 {
+		state = st.Fields[0]
+	}
+	if !st.HasComm {
+		return false, state, false
+	}
+	return isProxyAgentComm(st.Comm), state, true
+}
+
+func procStateMMUnsafe(state string) bool {
+	return state == "D" || state == "Z" || state == "X" || state == "x"
 }
 
 // isProxyAgent matches `pgrep -f 'proxy-agent --'` on the joined
@@ -89,13 +112,28 @@ func isProxyAgent(argv []string) bool {
 // NODE_IP from environ (downward status.hostIP, set at pod create),
 // falling back to --agent-identifiers=host=<ip> on the cmdline.
 func proxyAgentHost(d *wdeps.Deps, pid int, argv []string) string {
-	if v := d.Proc.EnvValue(pid, "NODE_IP"); v != "" {
-		return v
+	host, _ := proxyAgentHostChecked(d, pid, argv)
+	return host
+}
+
+func proxyAgentHostChecked(d *wdeps.Deps, pid int, argv []string) (string, bool) {
+	canReadEnv := false
+	if st, ok := d.Proc.Stat(pid); ok {
+		canReadEnv = len(st.Fields) == 0 || !procStateMMUnsafe(st.Fields[0])
+	} else if procFileReadNonENOENT(d.Proc.File(pid, "stat")) {
+		return "", true
+	} else {
+		canReadEnv = true // genuine ENOENT stat (synthetic test without stat)
+	}
+	if canReadEnv {
+		if v := d.Proc.EnvValue(pid, "NODE_IP"); v != "" {
+			return v, false
+		}
 	}
 	if m := agentHostRe.FindStringSubmatch(strings.Join(argv, " ")); m != nil {
-		return m[1]
+		return m[1], false
 	}
-	return ""
+	return "", false
 }
 
 // KonnDeleteResult is the tri-state outcome of DeleteKonnectivityPod.
@@ -146,6 +184,17 @@ func DeleteKonnectivityPod(d *wdeps.Deps, ctx context.Context, pods []corev1.Pod
 	return KonnNoPod
 }
 
+func procFileReadNonENOENT(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return !os.IsNotExist(err)
+	}
+	var b [1]byte
+	_, rerr := f.Read(b[:])
+	_ = f.Close()
+	return rerr != nil && !errors.Is(rerr, io.EOF) && !os.IsNotExist(rerr)
+}
+
 // KonnCheck is the 30-konnectivity stale-identifier guard as a
 // Check; it owns the mismatch streak (ex-Hygiene.konnFails).
 type KonnCheck struct {
@@ -161,7 +210,14 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckKonn) {
 		return
 	}
-	nodeIP := k0sWorkerNodeIP(c.d)
+	nodeIP, err := k0sWorkerNodeIP(c.d)
+	if err != nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: konnectivity read %s failed: %v — inconclusive, keeping state",
+			c.d.Cfg.K0sWorkerUnitFile, err))
+		c.d.CycleResult(wdeps.CheckKonn, "abort")
+		return
+	}
 	// Healthy = ANY proxy-agent process baked with the current node
 	// IP. Scan ALL processes, never take the first match: an orphaned
 	// agent (task dir gone, process alive under a dead shim) keeps its
@@ -169,20 +225,82 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// read the orphan's environ and report "stale" forever
 	// (incident 2026-09-19..23: 163 pause kills). Only when NO
 	// process matches do we suspect.
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		c.d.CycleResult(wdeps.CheckKonn, "inconclusive")
+		return
+	}
 	healthy := false
 	agentHost := ""
 	stalePID := 0
-	for _, pid := range e.PidsOnce() {
+	procInconclusive := false
+	for _, pid := range pids {
 		// Comm pre-filter: only proxy/konnectivity comms can match
 		// isProxyAgent — every other pid skips the cmdline read.
-		if match, known := proxyAgentComm(e, c.d, pid); known && !match {
+		match, state, known := proxyAgentComm(e, c.d, pid)
+		if known && !match {
+			continue
+		}
+		if procStateMMUnsafe(state) {
+			if match && state == "D" {
+				procInconclusive = true
+			}
+			continue
+		}
+		if st, ok := c.d.Proc.Stat(pid); ok {
+			if !known && st.HasComm {
+				match = isProxyAgentComm(st.Comm)
+				known = true
+				if !match {
+					continue
+				}
+			}
+			if len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
+				if (match || !known) && st.Fields[0] == "D" {
+					procInconclusive = true
+				}
+				continue
+			}
+		} else if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) {
+			procInconclusive = true
 			continue
 		}
 		argv := c.d.Proc.Cmdline(pid)
+		if len(argv) == 0 {
+			// Avoid touching mm-backed cmdline on D/Z/X processes; flag
+			// D-state proxy candidates and non-ENOENT cmdline errors.
+			if st, ok := c.d.Proc.Stat(pid); ok && len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
+				isCandidate := match
+				if !known {
+					isCandidate = !st.HasComm || isProxyAgentComm(st.Comm)
+				}
+				if isCandidate && st.Fields[0] == "D" {
+					procInconclusive = true
+				}
+			} else if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) ||
+				procFileReadNonENOENT(c.d.Proc.File(pid, "cmdline")) {
+				procInconclusive = true
+			}
+			continue
+		}
 		if !isProxyAgent(argv) {
 			continue
 		}
-		phost := proxyAgentHost(c.d, pid, argv)
+		phost, hostStatInc := proxyAgentHostChecked(c.d, pid, argv)
+		if hostStatInc {
+			procInconclusive = true
+			continue
+		}
+		if phost == "" {
+			if st, ok := c.d.Proc.Stat(pid); ok && len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
+				if st.Fields[0] == "D" {
+					procInconclusive = true
+				}
+			} else if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) ||
+				procFileReadNonENOENT(c.d.Proc.File(pid, "environ")) {
+				procInconclusive = true
+			}
+		}
 		if nodeIP != "" && phost == nodeIP {
 			healthy = true
 			break
@@ -191,6 +309,11 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			agentHost = phost
 			stalePID = pid
 		}
+	}
+
+	if !healthy && procInconclusive {
+		c.d.CycleResult(wdeps.CheckKonn, "abort")
+		return
 	}
 
 	if healthy || nodeIP == "" || agentHost == "" {

@@ -22,10 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/runtime"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // pluginsRegistryDir mirrors the check's derivation —
@@ -112,6 +114,26 @@ func TestCSIGuardHealDisabledKeepsOrphan(t *testing.T) {
 	chk.Run(context.Background(), cycleWithPods())
 	if _, err := os.Stat(orphan); err != nil {
 		t.Fatalf("heal-off removed orphan socket: %v", err)
+	}
+}
+
+func TestCSIGuardOrphanSocketRemoveHeldByMaintenance(t *testing.T) {
+	cn := csiNode("node-a")
+	e := fixture(t, cn)
+	e.H.Cfg.Wave2.CSIGuardMode = envx.ModeOn
+	e.H.Cfg.Wave2.CSIHealEnabled = true
+	e.H.Cfg.Wave2.CSIGuardECONNRefusedCycle = 1
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+		},
+	}
+	orphan := mkRegSocket(t, e, "csi.orphan.com")
+	wdepstest.Check[*runtime.CSIGuardCheck](e.H, wdeps.CheckCSIGuard).Run(
+		context.Background(), cycleWithPods())
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("orphan socket removed despite HoldLocalAction: %v", err)
 	}
 }
 

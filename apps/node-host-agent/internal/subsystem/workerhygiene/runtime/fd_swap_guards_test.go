@@ -13,9 +13,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/runtime"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // mkDeletedFD links <proc>/<pid>/fd/<fd> to a " (deleted)" target —
@@ -140,6 +145,31 @@ func TestUnlinkedOpenFilesSweepAndSighup(t *testing.T) {
 	}
 }
 
+func TestUnlinkedOpenFilesHoldLocalActionPreservesBudget(t *testing.T) {
+	e := fixture(t)
+	e.DiskUsed = 0.90
+	e.MkStatProc(t, 4343, "app", "S", "")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4343", "comm"), "fluent-bit\n")
+	e.mkDeletedFD(t, 4343, 3, "/var/log/app.log")
+	e.stubDeletedFDStats(map[string]deletedStat{"4343:3": {dev: 1, ino: 1, size: mib(600)}})
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+		},
+	}
+
+	wdepstest.Check[*runtime.UnlinkedOpenFilesCheck](e.H, wdeps.CheckUnlinkedOpenFiles).Run(
+		context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+
+	if len(e.Kills) != 0 {
+		t.Fatalf("SIGHUP fired while held: %v", e.Kills)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "last-unlinked-fd-sighup")); !os.IsNotExist(err) {
+		t.Fatal("last-unlinked-fd-sighup budget spent while held")
+	}
+}
+
 func TestUnlinkedOpenFilesBelowWatermarkSkips(t *testing.T) {
 	e := fixture(t)
 	h := e.H
@@ -234,5 +264,58 @@ func TestCgroupSwapLeakBelowFloorAndDormant(t *testing.T) {
 	wdepstest.Check[*runtime.CgroupSwapCheck](h2.H, wdeps.CheckCgroupSwap).Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
 	if h2.H.KubepodsSwapUsedBytes != 0 {
 		t.Fatal("gauge written on a dormant (no swap.current) cycle")
+	}
+}
+
+func TestUnlinkedOpenFilesPidsOKFalseAndProcErrorPreserveGaugesAndLastScan(t *testing.T) {
+	e := fixture(t)
+	h := e.H
+	ctx := context.Background()
+	e.DiskUsed = 0.90
+	h.UnlinkedOpenFileBytes = mib(256)
+	h.UnlinkedOpenFileCount = 2
+
+	chk := wdepstest.Check[*runtime.UnlinkedOpenFilesCheck](h, wdeps.CheckUnlinkedOpenFiles)
+
+	// PidsOnce() == nil + PidsOK() == false must abort "inconclusive" without zeroing gauges or stamping lastScan.
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		PidsOnce:     func() []int { return nil },
+		PidsOK:       func() bool { return false },
+	})
+	if got := testutil.ToFloat64(h.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "inconclusive")); got != 1 {
+		t.Fatalf("inconclusive cycles=%v want 1", got)
+	}
+	if h.UnlinkedOpenFileBytes != mib(256) || h.UnlinkedOpenFileCount != 2 {
+		t.Fatalf("gauges clobbered on PidsOK()=false: bytes=%d count=%d",
+			h.UnlinkedOpenFileBytes, h.UnlinkedOpenFileCount)
+	}
+
+	// PidsOnce == nil + Proc.PIDs() error must also abort "inconclusive" without zeroing gauges or stamping lastScan.
+	h.Deps.Proc = procfs.New(filepath.Join(t.TempDir(), "missing-proc"))
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if got := testutil.ToFloat64(h.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "inconclusive")); got != 2 {
+		t.Fatalf("inconclusive cycles=%v want 2", got)
+	}
+	if h.UnlinkedOpenFileBytes != mib(256) || h.UnlinkedOpenFileCount != 2 {
+		t.Fatalf("gauges clobbered on Proc.PIDs() error: bytes=%d count=%d",
+			h.UnlinkedOpenFileBytes, h.UnlinkedOpenFileCount)
+	}
+
+	// Restore /proc without advancing clock: because lastScan was NOT stamped on failure,
+	// the recovery sweep runs immediately and updates gauges.
+	h.Deps.Proc = procfs.New(e.ProcDir)
+	e.MkStatProc(t, 4245, "app", "S", "")
+	e.mkDeletedFD(t, 4245, 3, "/var/log/recovered.log")
+	e.stubDeletedFDStats(map[string]deletedStat{
+		"4245:3": {dev: 100, ino: 44, size: mib(128)},
+	})
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if got := testutil.ToFloat64(h.Cycles.WithLabelValues(wdeps.CheckUnlinkedOpenFiles, "ok")); got != 1 {
+		t.Fatalf("ok cycles=%v want 1 (lastScan must not suppress immediate recovery sweep)", got)
+	}
+	if h.UnlinkedOpenFileBytes != mib(128) || h.UnlinkedOpenFileCount != 1 {
+		t.Fatalf("recovered gauges=%d/%d want %d/1",
+			h.UnlinkedOpenFileBytes, h.UnlinkedOpenFileCount, mib(128))
 	}
 }

@@ -71,31 +71,11 @@ func (r *rescuer) findEtcdProcess() (int, []string, error) {
 	}
 	slices.Sort(pids)
 	for _, pid := range pids {
-		// Raw cmdline bytes, not procfs.Cmdline: matchEtcdCmdline's
-		// argv[0] boundary check and the verbatim argv[1:] capture
-		// (interior empty args preserved) are byte-exact contracts.
-		cl, rerr := os.ReadFile(r.proc.File(pid, "cmdline"))
-		if rerr != nil || len(cl) == 0 {
+		args := r.proc.Cmdline(pid)
+		if len(args) == 0 || args[0] != r.etcdBin {
 			continue
 		}
-		if !matchEtcdCmdline(cl, r.etcdBin) {
-			continue
-		}
-		var flags []string
-		for i, a := range strings.Split(string(cl), "\x00") {
-			if i == 0 { // drop argv[0] only
-				continue
-			}
-			flags = append(flags, a)
-		}
-		// cmdline ends in a NUL, so the split leaves one trailing ""
-		// — drop ONLY that. Interior empty elements are legitimate
-		// empty flag values; removing them would shift every
-		// flag→value pairing (flagValue + the standalone argv).
-		if n := len(flags); n > 0 && flags[n-1] == "" {
-			flags = flags[:n-1]
-		}
-		return pid, flags, nil
+		return pid, args[1:], nil
 	}
 	return 0, nil, errors.New(
 		"no running etcd process found to capture flags from")

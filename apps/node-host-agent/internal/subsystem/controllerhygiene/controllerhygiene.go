@@ -89,6 +89,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -333,6 +334,10 @@ func (h *Hygiene) Run(ctx context.Context) {
 					// spawned).
 					defer func() {
 						if r := recover(); r != nil {
+							stack := string(debug.Stack())
+							logger().Error("feeder panicked — WATCHDOG=1 stops (agent kept alive)",
+								"panic", r,
+								"stack", stack)
 							h.State.AppendLogWarn(fmt.Sprintf(
 								"feeder: PANIC %v — feeder dead, WATCHDOG=1 stops (agent kept alive)", r))
 							panic(r)

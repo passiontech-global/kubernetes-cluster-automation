@@ -68,7 +68,9 @@ func ParseJSON(data string) []Entry {
 				Unit      string         `json:"_SYSTEMD_UNIT"`
 				Transport string         `json:"_TRANSPORT"`
 			}
-			if err := json.Unmarshal([]byte(line), &e); err == nil {
+			if err := json.Unmarshal([]byte(line), &e,
+				jsontext.AllowInvalidUTF8(true),
+				jsontext.AllowDuplicateNames(true)); err == nil {
 				ts, _ := strconv.ParseInt(e.TS, 10, 64)
 				out = append(out, Entry{Msg: messageField(e.Message), TSUS: ts,
 					Cursor: e.Cursor, Unit: e.Unit, Transport: e.Transport})
@@ -88,7 +90,9 @@ func messageField(raw jsontext.Value) string {
 		return ""
 	}
 	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
+	if err := json.Unmarshal(raw, &s,
+		jsontext.AllowInvalidUTF8(true),
+		jsontext.AllowDuplicateNames(true)); err == nil {
 		return s
 	}
 	var nums []uint16
@@ -137,6 +141,7 @@ func messageField(raw jsontext.Value) string {
 func Fetch(ctx context.Context, execFn ExecFunc, now time.Time,
 	lookback time.Duration, cursor *string, args ...string) ([]Entry, error) {
 	full := append([]string(nil), args...)
+	full = append(full, "--output-fields=MESSAGE,_SYSTEMD_UNIT,_TRANSPORT")
 	if *cursor == "" {
 		// First fetch: bound the replay window to lookback.
 		full = append(full, "--since",

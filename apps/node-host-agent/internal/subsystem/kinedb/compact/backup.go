@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
@@ -23,6 +24,9 @@ const (
 	// backupKeepDumps is the *.dump retention bound under BackupDir —
 	// at the default 6h cadence four dumps cover the last 24h.
 	backupKeepDumps = 4
+	// backupFutureSkewSec tolerates minor clock jitter before
+	// healing a future-mtime dump back to now.
+	backupFutureSkewSec = 60
 )
 
 // backupVerify is the backup-health physical-backup verifier: the
@@ -37,10 +41,21 @@ const (
 func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 	res *Result, note func(string)) {
 
+	now := g.d.Cfg.Clock.Now()
 	newest, mtime := newestDump(g.d.Cfg.BackupDir)
 	if mtime > 0 {
 		res.backupSeen = true
-		res.backupAge = g.d.Cfg.Clock.Now().Unix() - mtime
+		age := now.Unix() - mtime
+		if age < -backupFutureSkewSec {
+			if os.Chtimes(newest, now, now) == nil {
+				age = 0
+			} else {
+				age = int64(g.d.Cfg.BackupInterval.Seconds())
+			}
+		} else if age < 0 {
+			age = 0
+		}
+		res.backupAge = age
 		res.backupValid = dumpValidMagic(newest)
 	}
 	// A fresh-but-invalid dump (failed magic sniff) must not ride its
@@ -74,10 +89,32 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 	// outlasts the 2-minute ExecEnv cap (same class of work as
 	// VACUUM/REINDEX).
 	tmp := "/tmp/kine-backup.dump"
-	if _, err := g.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass, kdeps.AppNameCompact), []string{g.d.Cfg.Runtime,
-		"exec", "-e", "PGPASSWORD", pg,
-		"pg_dump", "-Fc", "-U", user, "-d", "postgres", "-f", tmp}, ""); err != nil {
-		note(fmt.Sprintf("pg_dump-fail: %v", err))
+	g.d.MaintMu.Lock()
+	release, held, herr := g.d.HoldAdvisoryLock(ctx, pg, user, pass,
+		kdeps.AppNameCompact, 30*time.Second)
+	if herr != nil {
+		g.d.MaintMu.Unlock()
+		note(fmt.Sprintf("backup-lock-hold-fail: %v", herr))
+		return
+	}
+	if !held {
+		g.d.MaintMu.Unlock()
+		note("backup skipped: advisory lock busy")
+		return
+	}
+	t0 := g.d.Cfg.Clock.Now()
+	_, dumpErr := g.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass, kdeps.AppNameCompact), []string{g.d.Cfg.Runtime,
+		"exec", "-e", "PGPASSWORD", "-e", "PGAPPNAME", pg,
+		"pg_dump", "-Fc", "-U", user, "-d", "postgres", "-f", tmp}, "")
+	release()
+	g.d.MaintMu.Unlock()
+	if dumpErr != nil {
+		if g.d.LongBudgetExceeded(t0, dumpErr) {
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), g.d.Cfg.CmdTimeout)
+			_, _ = g.d.ReapOrphanedMaintSessions(rctx, pg, user, pass, kdeps.AppNameCompact, "pg_dump")
+			rcancel()
+		}
+		note(fmt.Sprintf("pg_dump-fail: %v", dumpErr))
 		// A failed pg_dump can leave a partial file in the
 		// container — drop it like the validate-fail path does.
 		_, _ = g.d.Exec(ctx, []string{g.d.Cfg.Runtime, "exec", pg, "rm", "-f", tmp}, "")

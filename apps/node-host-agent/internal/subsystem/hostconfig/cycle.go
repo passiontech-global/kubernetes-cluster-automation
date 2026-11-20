@@ -11,6 +11,7 @@ import (
 	"embed"
 	"errors"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -95,6 +96,8 @@ type cyc struct {
 	// backend, zoneSerial hashes the topology) and five groups
 	// render against it; one build per converge is enough.
 	tplCtxMemo map[string]any
+	// monoNow overrides CLOCK_MONOTONIC in unit tests for binaryNewerThanService.
+	monoNow func() (time.Duration, error)
 }
 
 // err logs at Error level AND marks the current cycle (and the group
@@ -148,7 +151,7 @@ func (c *cyc) group(name string, fn func()) {
 	before := c.errs
 	defer func() {
 		if rec := recover(); rec != nil {
-			c.err("hostconfig group panicked", "group", name, "panic", rec)
+			c.err("hostconfig group panicked", "group", name, "panic", rec, "stack", string(debug.Stack()))
 			c.r.cycles.WithLabelValues(name, "panic").Inc()
 			return
 		}

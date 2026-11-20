@@ -7,6 +7,7 @@ package cycle
 
 import (
 	"context"
+	"runtime/debug"
 	"sync"
 )
 
@@ -53,7 +54,9 @@ func Spawn(ctx context.Context, name string, fn func(context.Context)) (stop fun
 		defer func() {
 			if r := recover(); r != nil {
 				logger().Error(name+" panicked — spawned goroutine "+
-					"exits, not restarted", "panic", r)
+					"exits, not restarted",
+					"panic", r,
+					"stack", string(debug.Stack()))
 			}
 		}()
 		fn(cctx)

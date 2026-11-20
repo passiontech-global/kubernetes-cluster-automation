@@ -379,6 +379,8 @@ func (r *Runner) updateNeighborLatch(fills map[string]float64) {
 		r.deps.Store.Enter(latchdefs.LatchNeighborPressure, "pinned")
 	case low:
 		r.deps.Store.Exit(latchdefs.LatchNeighborPressure, nil)
+	default:
+		r.touchHeldLatch(latchdefs.LatchNeighborPressure)
 	}
 }
 

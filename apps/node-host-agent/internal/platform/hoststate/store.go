@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
@@ -204,6 +205,30 @@ func (s *Store) Exists(name string) bool {
 	_, ok := s.shared.ramEpochs[filepath.Clean(p)]
 	s.shared.ramMu.RUnlock()
 	return ok
+}
+
+// RAMLatches returns the state-<name> latch names currently held in
+// the ENOSPC/EROFS RAM fallback table for s.Dir, so Prometheus
+// collectors can surface Prefix: true parameterized latches even
+// before any disk file has ever been created.
+func (s *Store) RAMLatches() []string {
+	if s == nil || s.shared == nil {
+		return nil
+	}
+	prefix := filepath.Join(s.Dir, latchdefs.LatchFilePrefix)
+	s.shared.ramMu.RLock()
+	defer s.shared.ramMu.RUnlock()
+	if len(s.shared.ramEpochs) == 0 {
+		return nil
+	}
+	var names []string
+	for k := range s.shared.ramEpochs {
+		if name, ok := strings.CutPrefix(k, prefix); ok && name != "" &&
+			!strings.ContainsRune(name, filepath.Separator) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // Enter creates state-<name> with the current epoch — only when

@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -153,5 +155,41 @@ func TestProcVMRSSMalformed(t *testing.T) {
 	testutil.WriteFile(t, p, "VmRSS:\t12 kB\n")
 	if v, ok := procVMRSS(p); !ok || v != 12<<10 {
 		t.Fatalf("VmRSS=%v ok=%v want %v bytes", v, ok, 12<<10)
+	}
+}
+
+func TestK0sChildLabelSkipsDZXxCmdlineFIFONonBlocking(t *testing.T) {
+	for _, state := range []string{"D", "Z", "X", "x"} {
+		t.Run("state_"+state, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "proc")
+			if err := os.MkdirAll(p, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			testutil.WriteFile(t, filepath.Join(p, "comm"), "etcd\n")
+			testutil.WriteFile(t, filepath.Join(p, "stat"),
+				"1 ("+state+") "+state+" 0 0 0")
+			cmdFIFO := filepath.Join(p, "cmdline")
+			if err := syscall.Mkfifo(cmdFIFO, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if f, err := os.OpenFile(cmdFIFO, os.O_RDWR, 0); err == nil {
+					_ = f.Close()
+				}
+			})
+
+			done := make(chan string, 1)
+			go func() {
+				done <- k0sChildLabel(p)
+			}()
+			select {
+			case got := <-done:
+				if got != "etcd" {
+					t.Fatalf("state %s k0sChildLabel=%q want etcd", state, got)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("k0sChildLabel blocked opening FIFO cmdline for state %q", state)
+			}
+		})
 	}
 }

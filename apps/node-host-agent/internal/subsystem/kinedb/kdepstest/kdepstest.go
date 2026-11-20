@@ -90,6 +90,26 @@ postgres|postgres|4|0|3|7|0|0|0|0|0|transaction
 pgbouncer|pgbouncer|1|0|0|0|0|0|0|0|0|transaction
 `
 
+// ProbeBatchSubstr uniquely matches the batched read-only probe query
+// (longer than "MAX(id)" in ProbeOKRules, shorter than all per-section
+// error/override substrings in hygiene_test.go).
+const ProbeBatchSubstr = "'idtype'"
+
+// ProbeBatchOKOut is the healthy tagged reply for ProbeBatchSubstr.
+const ProbeBatchOKOut = "rev|1000|200|290\n" +
+	"idle|0\n" +
+	"dead|0|290\n" +
+	"xid|100000\n" +
+	"wal|0\n" +
+	"arch|0\n" +
+	"mxid|100000\n" +
+	"invidx|0\n" +
+	"seq|0|0\n" +
+	"idtype|20\n" +
+	"seqcliff|1000|9223372036854775807|bigint\n" +
+	"xmin|activity|10\n" +
+	"xmin|replication|0\n"
+
 // ProbeOKRules is the full-success command set. The revision query
 // answers head|compact_rev|live_tup — no COUNT(*) (the row count is
 // the guard's job; a per-2min seq-scan bloats what it measures).
@@ -98,5 +118,6 @@ var ProbeOKRules = []testutil.ExecRule{
 	{Substr: "SHOW POOLS", Out: ShowPoolsOut},
 	{Substr: "logs --since", Out: "all quiet"},
 	{Substr: "MAX(id)", Out: "1000|200|290|1\n"},
+	{Substr: ProbeBatchSubstr, Out: ProbeBatchOKOut},
 	{Substr: "select 1", Out: "1\n"},
 }

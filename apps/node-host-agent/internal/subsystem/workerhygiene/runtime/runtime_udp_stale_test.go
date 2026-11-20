@@ -874,3 +874,299 @@ func TestUDPStaleNonServingEndpointIsNotLive(t *testing.T) {
 		t.Fatal("non-serving EndpointSlice endpoint must not count as live")
 	}
 }
+
+func TestUDPStaleSliceIsolationNoCrossContamination(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Spec:       corev1.NodeSpec{PodCIDR: "10.244.0.0/16"},
+	}
+	// Slice 0: TCP port 80 with 10.244.5.5 Serving=true.
+	tcpProto := corev1.ProtocolTCP
+	tcpPort := int32(80)
+	servingTrue := true
+	slTCP := &discoveryv1.EndpointSlice{
+		ObjectMeta:  metav1.ObjectMeta{Namespace: "default", Name: "web-tcp"},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Ports:       []discoveryv1.EndpointPort{{Port: &tcpPort, Protocol: &tcpProto}},
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{"10.244.5.5"},
+			Conditions: discoveryv1.EndpointConditions{Serving: &servingTrue},
+		}},
+	}
+	// Slice 1: UDP port 53 with 10.244.5.5 Serving=false.
+	slUDP := udpEndpointSlice("dns-udp", 53, "10.244.5.5")
+	servingFalse := false
+	slUDP.Endpoints[0].Conditions.Serving = &servingFalse
+
+	e := fixture(t, node, slTCP, slUDP)
+	setupPodNetnsProc(t, e.Fixture, 1, "40001")
+	setupPodNetnsProc(t, e.Fixture, 200, "40002")
+
+	var sock [48]byte
+	sock[0] = 0x88
+	var destroyed [][48]byte
+	e.H.Cfg.Seams.Host.DumpConnectedUDPFn = func(pid int) ([]netlinkx.ConnectedUDPSocket, error) {
+		if pid != 200 {
+			return nil, nil
+		}
+		return []netlinkx.ConnectedUDPSocket{
+			{Family: 2, SrcPort: 40002, DstIP: net.ParseIP("10.244.5.5"), DstPort: 53, ID: sock},
+		}, nil
+	}
+	e.H.Cfg.Seams.Host.DestroyUDPSocketFn = func(_ int, _ uint8, id [48]byte) (bool, error) {
+		destroyed = append(destroyed, id)
+		return true, nil
+	}
+
+	chk := e.H.Check(wdeps.CheckUDPStale)
+	ce := udpCycleEnv(200)
+	for range 3 {
+		chk.Run(context.Background(), ce)
+	}
+	if len(destroyed) == 0 {
+		t.Fatal("TCP slice Serving=true contaminated UDP slice Serving=false liveByAddr")
+	}
+}
+
+func TestUDPStaleCtrTaskRootUnreadableAbortsPreservingStreaks(t *testing.T) {
+	t.Run("tasks-incomplete-flag", func(t *testing.T) {
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+			Spec:       corev1.NodeSpec{PodCIDR: "10.244.0.0/16"},
+		}
+		epSlice := udpEndpointSlice("dns-svc-abc", 53, "10.244.2.50")
+		deadSeed := udpEndpointSlice("dead-backend-seed", 53, "10.244.9.99")
+		e := fixture(t, node, epSlice, deadSeed)
+		setupPodNetnsProc(t, e.Fixture, 1, "40001")
+		setupPodNetnsProc(t, e.Fixture, 200, "40002")
+
+		var sock [48]byte
+		sock[0] = 0x99
+		var destroyed [][48]byte
+		e.H.Cfg.Seams.Host.DumpConnectedUDPFn = func(pid int) ([]netlinkx.ConnectedUDPSocket, error) {
+			if pid != 200 {
+				return nil, nil
+			}
+			return []netlinkx.ConnectedUDPSocket{
+				{Family: 2, SrcPort: 50000, DstIP: net.ParseIP("10.244.9.99"), DstPort: 53, ID: sock},
+			}, nil
+		}
+		e.H.Cfg.Seams.Host.DestroyUDPSocketFn = func(_ int, _ uint8, id [48]byte) (bool, error) {
+			destroyed = append(destroyed, id)
+			return true, nil
+		}
+
+		ce := udpCycleEnv(200)
+		chk := e.H.Check(wdeps.CheckUDPStale)
+		seedDeadUDPBackend(t, e, ce, "dead-backend-seed", "10.244.9.99")
+
+		// Cycle 1: streak hits 1/2.
+		chk.Run(context.Background(), ce)
+		if len(destroyed) != 0 {
+			t.Fatalf("destroyed prematurely on cycle 1: %v", destroyed)
+		}
+
+		// Cycle 2: incomplete task map -> must abort and preserve streak at 1/2.
+		chk.Run(context.Background(), &wdeps.CycleEnv{
+			WorkerActive: true,
+			APIOK:        true,
+			TasksOnce:    func() (map[string][]wdeps.CtrTask, bool) { return nil, false },
+		})
+		if got := promtestutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckUDPStale, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1", got)
+		}
+		if len(destroyed) != 0 {
+			t.Fatalf("destroyed during incomplete task map: %v", destroyed)
+		}
+
+		// Cycle 3: task map recovers -> streak reaches 2/2 and destroys socket immediately.
+		chk.Run(context.Background(), ce)
+		if len(destroyed) != 1 || destroyed[0] != sock {
+			t.Fatalf("streak wiped during incomplete task map: destroyed=%v want [%x]", destroyed, sock)
+		}
+	})
+
+	t.Run("ctrtaskroot-chmod-0000", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 0000 does not block root")
+		}
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+			Spec:       corev1.NodeSpec{PodCIDR: "10.244.0.0/16"},
+		}
+		epSlice := udpEndpointSlice("dns-svc-abc", 53, "10.244.2.50")
+		deadSeed := udpEndpointSlice("dead-backend-seed", 53, "10.244.9.99")
+		e := fixture(t, node, epSlice, deadSeed)
+		setupPodNetnsProc(t, e.Fixture, 1, "40001")
+		setupPodNetnsProc(t, e.Fixture, 200, "40002")
+		e.Live[200] = true
+		e.MkTask(t, wdepstest.UIDA, "pause", 200)
+
+		var sock [48]byte
+		sock[0] = 0xAB
+		var destroyed [][48]byte
+		e.H.Cfg.Seams.Host.DumpConnectedUDPFn = func(pid int) ([]netlinkx.ConnectedUDPSocket, error) {
+			if pid != 200 {
+				return nil, nil
+			}
+			return []netlinkx.ConnectedUDPSocket{
+				{Family: 2, SrcPort: 50000, DstIP: net.ParseIP("10.244.9.99"), DstPort: 53, ID: sock},
+			}, nil
+		}
+		e.H.Cfg.Seams.Host.DestroyUDPSocketFn = func(_ int, _ uint8, id [48]byte) (bool, error) {
+			destroyed = append(destroyed, id)
+			return true, nil
+		}
+
+		ce := &wdeps.CycleEnv{WorkerActive: true, APIOK: true}
+		chk := e.H.Check(wdeps.CheckUDPStale)
+		seedDeadUDPBackend(t, e, ce, "dead-backend-seed", "10.244.9.99")
+
+		chk.Run(context.Background(), ce) // streak = 1/2
+
+		if err := os.Chmod(e.CtrDir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(e.CtrDir, 0o755) })
+		chk.Run(context.Background(), ce) // unreadable CtrTaskRoot -> abort
+		if got := promtestutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckUDPStale, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1", got)
+		}
+
+		if err := os.Chmod(e.CtrDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		chk.Run(context.Background(), ce) // recovery -> streak reaches 2/2 -> destroy
+		if len(destroyed) != 1 || destroyed[0] != sock {
+			t.Fatalf("streak lost during CtrTaskRoot 0o000: destroyed=%v", destroyed)
+		}
+	})
+}
+
+func TestUDPStalePartialDumpErrPreservesStreaks(t *testing.T) {
+	t.Run("partial-dump-err-with-other-candidates", func(t *testing.T) {
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+			Spec:       corev1.NodeSpec{PodCIDR: "10.244.0.0/16"},
+		}
+		epSlice := udpEndpointSlice("dns-svc-abc", 53, "10.244.2.50")
+		deadSeed := udpEndpointSlice("dead-backend-seed", 53, "10.244.9.99", "10.244.8.88")
+		e := fixture(t, node, epSlice, deadSeed)
+		setupPodNetnsProc(t, e.Fixture, 1, "40001")
+		setupPodNetnsProc(t, e.Fixture, 200, "40002")
+		setupPodNetnsProc(t, e.Fixture, 201, "40003")
+
+		var sock200 [48]byte
+		sock200[0] = 0x20
+		var sock201 [48]byte
+		sock201[0] = 0x21
+
+		fail200 := false
+		var destroyed [][48]byte
+		e.H.Cfg.Seams.Host.DumpConnectedUDPFn = func(pid int) ([]netlinkx.ConnectedUDPSocket, error) {
+			switch pid {
+			case 200:
+				if fail200 {
+					return nil, errors.New("netlink EACCES on pid 200")
+				}
+				return []netlinkx.ConnectedUDPSocket{
+					{Family: 2, SrcPort: 40000, DstIP: net.ParseIP("10.244.9.99"), DstPort: 53, ID: sock200},
+				}, nil
+			case 201:
+				return []netlinkx.ConnectedUDPSocket{
+					{Family: 2, SrcPort: 40001, DstIP: net.ParseIP("10.244.8.88"), DstPort: 53, ID: sock201},
+				}, nil
+			default:
+				return nil, nil
+			}
+		}
+		e.H.Cfg.Seams.Host.DestroyUDPSocketFn = func(_ int, _ uint8, id [48]byte) (bool, error) {
+			destroyed = append(destroyed, id)
+			return true, nil
+		}
+
+		ce := &wdeps.CycleEnv{
+			WorkerActive: true,
+			APIOK:        true,
+			TasksOnce: func() (map[string][]wdeps.CtrTask, bool) {
+				return map[string][]wdeps.CtrTask{
+					wdepstest.UIDA: {{Name: "pause", PID: 200, Live: true}},
+					wdepstest.UIDB: {{Name: "pause", PID: 201, Live: true}},
+				}, true
+			},
+		}
+		chk := e.H.Check(wdeps.CheckUDPStale)
+		seedDeadUDPBackend(t, e, ce, "dead-backend-seed", "10.244.9.99")
+
+		// Cycle 1: both 200 and 201 reach streak 1/2.
+		chk.Run(context.Background(), ce)
+		if len(destroyed) != 0 {
+			t.Fatalf("premature destroy on cycle 1: %v", destroyed)
+		}
+
+		// Cycle 2: pid 200 netns dump fails (dumpErr=true), pid 201 succeeds ->
+		// 201 confirms and is destroyed, while 200's streak 1/2 is preserved!
+		fail200 = true
+		chk.Run(context.Background(), ce)
+		if len(destroyed) != 1 || destroyed[0] != sock201 {
+			t.Fatalf("expected pid 201 destroyed during partial dumpErr: destroyed=%v", destroyed)
+		}
+
+		// Cycle 3: pid 200 recovers -> reaches 2/2 immediately and destroys sock200.
+		fail200 = false
+		chk.Run(context.Background(), ce)
+		if len(destroyed) != 2 || destroyed[1] != sock200 {
+			t.Fatalf("pid 200 streak wiped by partial dumpErr: destroyed=%v want [sock201, sock200]", destroyed)
+		}
+	})
+
+	t.Run("dump-err-with-zero-candidates-aborts-preserving-streak", func(t *testing.T) {
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+			Spec:       corev1.NodeSpec{PodCIDR: "10.244.0.0/16"},
+		}
+		epSlice := udpEndpointSlice("dns-svc-abc", 53, "10.244.2.50")
+		deadSeed := udpEndpointSlice("dead-backend-seed", 53, "10.244.9.99")
+		e := fixture(t, node, epSlice, deadSeed)
+		setupPodNetnsProc(t, e.Fixture, 1, "40001")
+		setupPodNetnsProc(t, e.Fixture, 200, "40002")
+
+		var sock200 [48]byte
+		sock200[0] = 0x22
+		fail200 := false
+		var destroyed [][48]byte
+		e.H.Cfg.Seams.Host.DumpConnectedUDPFn = func(pid int) ([]netlinkx.ConnectedUDPSocket, error) {
+			if pid != 200 {
+				return nil, nil
+			}
+			if fail200 {
+				return nil, errors.New("transient netns dump err")
+			}
+			return []netlinkx.ConnectedUDPSocket{
+				{Family: 2, SrcPort: 40000, DstIP: net.ParseIP("10.244.9.99"), DstPort: 53, ID: sock200},
+			}, nil
+		}
+		e.H.Cfg.Seams.Host.DestroyUDPSocketFn = func(_ int, _ uint8, id [48]byte) (bool, error) {
+			destroyed = append(destroyed, id)
+			return true, nil
+		}
+
+		ce := udpCycleEnv(200)
+		chk := e.H.Check(wdeps.CheckUDPStale)
+		seedDeadUDPBackend(t, e, ce, "dead-backend-seed", "10.244.9.99")
+
+		chk.Run(context.Background(), ce) // streak = 1/2
+
+		fail200 = true
+		chk.Run(context.Background(), ce) // dumpErr=true, len(rawCandidates)==0 -> abort
+		if got := promtestutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckUDPStale, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1", got)
+		}
+
+		fail200 = false
+		chk.Run(context.Background(), ce) // recovery -> streak reaches 2/2 -> destroy
+		if len(destroyed) != 1 || destroyed[0] != sock200 {
+			t.Fatalf("streak wiped when dumpErr=true & len(candidates)==0: destroyed=%v", destroyed)
+		}
+	})
+}

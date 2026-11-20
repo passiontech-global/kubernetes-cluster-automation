@@ -26,18 +26,43 @@ func mergedStatsOut(idle, deadLive, xid, wal, arch string) string {
 	return idle + "\n" + deadLive + "\n" + xid + "\n" + wal + "\n" + arch + "\n"
 }
 
-// hygieneRules is kdepstest.ProbeOKRules plus canned replies for the
-// kine-pg-hygiene + WAL archive guard queries — the merged scalar
-// census (2 idle-in-tx sessions, quiet dead-tuple ratio, healthy XID
-// age, 1GiB WAL, clean archiver), a 100GiB filesystem for the df
-// ratio and no inactive slots.
-var hygieneRules = append(append([]testutil.ExecRule{}, kdepstest.ProbeOKRules...),
-	testutil.ExecRule{Substr: "pg_terminate_backend", Out: "t\nt\n"},
-	testutil.ExecRule{Substr: mergedStatsSubstr,
-		Out: mergedStatsOut("2", "100|1000", "5000000", "1073741824", "0")},
-	testutil.ExecRule{Substr: "--output=size", Out: "Size\n107374182400\n"},
-	testutil.ExecRule{Substr: "pg_replication_slots", Out: ""},
-)
+func hygieneBatchOut(idle, deadLive, xid, wal, arch string) string {
+	return "rev|1000|200|290\n" +
+		"idle|" + idle + "\n" +
+		"dead|" + deadLive + "\n" +
+		"xid|" + xid + "\n" +
+		"wal|" + wal + "\n" +
+		"arch|" + arch + "\n" +
+		"mxid|100000\n" +
+		"invidx|0\n" +
+		"seq|0|0\n" +
+		"idtype|20\n" +
+		"seqcliff|1000|9223372036854775807|bigint\n" +
+		"xmin|activity|10\n" +
+		"xmin|replication|0\n"
+}
+
+// hygieneRules replaces ProbeOKRules's ProbeBatchSubstr with a
+// hygiene-rich tagged batch reply (2 idle-in-tx sessions, quiet
+// dead-tuple ratio, healthy XID age, 1GiB WAL, clean archiver) and
+// retains mergedStatsSubstr for standalone fallback tests.
+var hygieneRules = func() []testutil.ExecRule {
+	var r []testutil.ExecRule
+	for _, rule := range kdepstest.ProbeOKRules {
+		if rule.Substr == kdepstest.ProbeBatchSubstr {
+			continue
+		}
+		r = append(r, rule)
+	}
+	return append(r,
+		testutil.ExecRule{Substr: "pg_terminate_backend", Out: "t\nt\n"},
+		testutil.ExecRule{Substr: kdepstest.ProbeBatchSubstr,
+			Out: hygieneBatchOut("2", "100|1000", "5000000", "1073741824", "0")},
+		testutil.ExecRule{Substr: mergedStatsSubstr,
+			Out: mergedStatsOut("2", "100|1000", "5000000", "1073741824", "0")},
+		testutil.ExecRule{Substr: "--output=size", Out: "Size\n107374182400\n"},
+	)
+}()
 
 // The read-only catalog census must use the same sequence-name fallback
 // in its pg_sequences WHERE as in the reported identity. Without it a
@@ -153,7 +178,7 @@ func TestDeadTupleVacuumFiresAndCoolsDown(t *testing.T) {
 	k, fr, _ := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
 		testutil.ExecRule{Substr: "ON_ERROR_STOP", Out: "VACUUM\n"},
 	))
-	fr.On(mergedStatsSubstr, mergedStatsOut("2", "60000|30000", "5000000", "1073741824", "0"))
+	fr.On(kdepstest.ProbeBatchSubstr, hygieneBatchOut("2", "60000|30000", "5000000", "1073741824", "0"))
 	res := k.Cycle(context.Background())
 	if !res.hyg.vacuumFired {
 		t.Fatalf("vacuum did not fire: notes=%v", res.notes)
@@ -189,7 +214,7 @@ func TestDeadTupleVacuumFiresAndCoolsDown(t *testing.T) {
 // the compact session ends in VACUUM itself.
 func TestDeadTupleVacuumLockBusy(t *testing.T) {
 	k, fr, _ := fixture(t, hygieneRules)
-	fr.On(mergedStatsSubstr, mergedStatsOut("2", "60000|30000", "5000000", "1073741824", "0"))
+	fr.On(kdepstest.ProbeBatchSubstr, hygieneBatchOut("2", "60000|30000", "5000000", "1073741824", "0"))
 	fr.On("ON_ERROR_STOP", kdeps.LockBusyMarker+"\n")
 	res := k.Cycle(context.Background())
 	if res.hyg.vacuumFired {
@@ -255,7 +280,7 @@ func TestInactiveSlotDropAndWarn(t *testing.T) {
 
 func TestProbeArchiveStaleEmitsOne(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
-	fr.On(mergedStatsSubstr, mergedStatsOut("2", "100|1000", "5000000", "1073741824", "1"))
+	fr.On(kdepstest.ProbeBatchSubstr, hygieneBatchOut("2", "100|1000", "5000000", "1073741824", "1"))
 	k.Cycle(context.Background())
 	content := kdepstest.ReadText(t, dir, "kine-db.prom")
 	if !strings.Contains(content, "kine_db_wal_archive_stale 1") {
@@ -517,9 +542,9 @@ func TestProbeSeqScanDegradesOnQueryFailure(t *testing.T) {
 func TestProbeHygieneReadOnlyDiagnostics(t *testing.T) {
 	k, fr, dir := fixture(t, hygieneRules)
 	k.d.Cfg.ReadOnly = true
-	fr.On("pg_prepared_xacts", "gid-one\ngid-two\n")
-	fr.On(mergedStatsSubstr, mergedStatsOut("2", "60000|30000", "5000000", "1073741824", "0"))
-	fr.On("pg_replication_slots", "slot-orphan|16106127360\n") // 15GiB > 10GiB gate
+	fr.On(kdepstest.ProbeBatchSubstr, hygieneBatchOut("2", "60000|30000", "5000000", "1073741824", "0")+
+		"slot|slot-orphan|16106127360\n"+
+		"px|gid-one\npx|gid-two\n")
 	fr.On("SHOW POOLS", `database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode
 postgres|postgres|4|50|3|7|0|0|0|0|0|transaction
 `)
@@ -945,7 +970,7 @@ func TestProbeSequenceCliffScalarSubquery(t *testing.T) {
 		t.Fatalf("xact prom missing seq cliff metrics:\n%s", content)
 	}
 	// Verify scalar-subquery wrapping in SQL batch.
-	if !strings.Contains(fr.Joined(), "SELECT COALESCE((SELECT a.atttypid::bigint FROM pg_attribute") ||
+	if !strings.Contains(fr.Joined(), "COALESCE((SELECT a.atttypid::bigint FROM pg_attribute") ||
 		!strings.Contains(fr.Joined(), "pg_get_serial_sequence('kine', 'id')") {
 		t.Fatalf("catalog query missing scalar subqueries:\n%s", fr.Joined())
 	}

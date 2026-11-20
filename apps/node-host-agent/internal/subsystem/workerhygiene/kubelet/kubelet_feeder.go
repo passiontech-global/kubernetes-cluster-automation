@@ -241,7 +241,15 @@ func (f *Feeder) remediate(ctx context.Context) {
 
 	// G1 uptime (WD_REQUIRES: uptime) — a node <20m up is still
 	// bringing kubelet online; a restart inside the window only churns.
-	if up, err := d.Proc.UptimeSeconds(); err == nil && up < wdeps.MinUptimeSeconds {
+	// Absent /proc/uptime (ENOENT in tests) stays fail-open, while a
+	// non-ENOENT error (e.g. EACCES) skips safely instead of restarting blind.
+	if up, err := d.Proc.UptimeSeconds(); err != nil {
+		if !os.IsNotExist(err) {
+			d.State.AppendLog(fmt.Sprintf(
+				"kubelet-remediate: SKIP(G1-uptime) uptime unreadable: %v", err))
+			return
+		}
+	} else if up < wdeps.MinUptimeSeconds {
 		d.State.AppendLog(fmt.Sprintf(
 			"kubelet-remediate: SKIP(G1-uptime) uptime %.0fs < %ds", up, wdeps.MinUptimeSeconds))
 		return

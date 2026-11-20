@@ -224,3 +224,41 @@ func TestClearAllSuspectsBadPattern(t *testing.T) {
 	s := New("/nonexistent-[", "", nil, nil)
 	s.ClearAllSuspects() // must not panic
 }
+
+func TestClearSuspectAndClearAllSuspectsDropRAMEpochs(t *testing.T) {
+	s, _, _ := newTestStore(t)
+
+	nowEpoch := s.Now().Unix()
+	keyA := filepath.Clean(suspectBudgetPath(s, "a"))
+	keyB := filepath.Clean(suspectBudgetPath(s, "b"))
+	keyKeep := filepath.Clean(filepath.Join(s.Dir, "last-restart"))
+
+	// Seed ramEpochs directly (simulating ENOSPC/EROFS fallback where no
+	// file exists on disk, or disk file was already removed).
+	s.shared.ramMu.Lock()
+	s.shared.ramEpochs = map[string]int64{
+		keyA:    nowEpoch,
+		keyB:    nowEpoch,
+		keyKeep: nowEpoch,
+	}
+	s.shared.ramMu.Unlock()
+
+	if s.RateOK(SuspectBudgetPrefix+"a", time.Hour) {
+		t.Fatal("budget a should be suppressed by ramEpochs")
+	}
+	s.ClearSuspect("a")
+	if !s.RateOK(SuspectBudgetPrefix+"a", time.Hour) {
+		t.Fatal("ClearSuspect did not clear ramEpochs for a")
+	}
+	if s.RateOK(SuspectBudgetPrefix+"b", time.Hour) {
+		t.Fatal("ClearSuspect(a) must not clear b")
+	}
+
+	s.ClearAllSuspects()
+	if !s.RateOK(SuspectBudgetPrefix+"b", time.Hour) {
+		t.Fatal("ClearAllSuspects did not clear ramEpochs for b")
+	}
+	if s.RateOK("last-restart", time.Hour) {
+		t.Fatal("ClearAllSuspects must not clear non-suspect ramEpochs")
+	}
+}

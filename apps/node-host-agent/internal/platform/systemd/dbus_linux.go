@@ -13,9 +13,12 @@
 package systemd
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -52,7 +55,8 @@ type dbusBackend struct {
 	// disabled latches the backend off for the process lifetime
 	// when the socket is PERMANENTLY unreachable (EACCES — the
 	// private socket is root-only and the agent runs unprivileged
-	// under some unit configs — or ENOENT — no systemd at all).
+	// under some unit configs). Transient failures such as ENOENT
+	// during `systemctl daemon-reexec` must NOT latch permanently.
 	// Without the latch every verb would redial + re-warn each
 	// cycle; with it the CLI fallback serves silently after one
 	// warnOnce diagnostic.
@@ -76,6 +80,140 @@ func newDBusBackend(hostRoot string) *dbusBackend {
 // bound exists to prevent). 5s is generous for a local socket
 // handshake and still lands far inside any caller's op budget.
 const dbusHandshakeTimeout = 5 * time.Second
+
+const (
+	dbusBeginLine   = "BEGIN\r\n"
+	dbusMaxMsgBytes = 1 << 27
+)
+
+// dbusFrameConn wraps a stream net.Conn passed to godbus.NewConn so
+// post-SASL D-Bus messages are buffered frame-by-frame before
+// godbus.DecodeMessageWithFDs reads them. godbus.NewConn selects
+// genericTransport, whose DecodeMessageWithFDs calls decoder.align(8)
+// outside decoder.Decode's recover() and panics unrecoverably in
+// inWorker if the peer or dropConn closes the socket between a(yv) and
+// its 8-byte alignment padding. Buffering one full message frame from
+// nc before returning bytes to DecodeMessageWithFDs turns mid-frame
+// socket close/EOF into a clean Read error that shuts down inWorker.
+type dbusFrameConn struct {
+	nc       net.Conn
+	framed   atomic.Bool
+	authTail []byte
+	frame    []byte
+	off      int
+}
+
+func newDBusFrameConn(nc net.Conn) *dbusFrameConn {
+	return &dbusFrameConn{nc: nc}
+}
+
+func (fc *dbusFrameConn) Close() error {
+	return fc.nc.Close()
+}
+
+func (fc *dbusFrameConn) Write(p []byte) (int, error) {
+	if !fc.framed.Load() && fc.sawBegin(p) {
+		fc.authTail = nil
+		fc.framed.Store(true)
+	}
+	return fc.nc.Write(p)
+}
+
+func (fc *dbusFrameConn) sawBegin(p []byte) bool {
+	if len(p) == 0 {
+		return false
+	}
+	if len(fc.authTail) == 0 {
+		if bytes.Contains(p, []byte(dbusBeginLine)) {
+			return true
+		}
+	} else {
+		combined := make([]byte, 0, len(fc.authTail)+len(p))
+		combined = append(combined, fc.authTail...)
+		combined = append(combined, p...)
+		if bytes.Contains(combined, []byte(dbusBeginLine)) {
+			return true
+		}
+	}
+	keep := len(dbusBeginLine) - 1
+	if len(p) >= keep {
+		fc.authTail = append(fc.authTail[:0], p[len(p)-keep:]...)
+		return false
+	}
+	fc.authTail = append(fc.authTail, p...)
+	if len(fc.authTail) > keep {
+		copy(fc.authTail, fc.authTail[len(fc.authTail)-keep:])
+		fc.authTail = fc.authTail[:keep]
+	}
+	return false
+}
+
+func (fc *dbusFrameConn) Read(p []byte) (int, error) {
+	if !fc.framed.Load() {
+		return fc.nc.Read(p)
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if fc.off >= len(fc.frame) {
+		if err := fc.readNextFrame(); err != nil {
+			return 0, err
+		}
+	}
+	n := copy(p, fc.frame[fc.off:])
+	fc.off += n
+	if fc.off >= len(fc.frame) {
+		fc.frame = nil
+		fc.off = 0
+	}
+	return n, nil
+}
+
+func (fc *dbusFrameConn) readNextFrame() error {
+	var hdr [16]byte
+	if _, err := io.ReadFull(fc.nc, hdr[:]); err != nil {
+		return err
+	}
+	var order binary.ByteOrder
+	switch hdr[0] {
+	case 'l':
+		order = binary.LittleEndian
+	case 'B':
+		order = binary.BigEndian
+	default:
+		// Invalid byte order: buffer hdr[:] so DecodeMessageWithFDs
+		// produces InvalidMessageError as before.
+		hdrCopy := hdr
+		fc.frame = hdrCopy[:]
+		fc.off = 0
+		return nil
+	}
+	blen := order.Uint32(hdr[4:8])
+	hlen := order.Uint32(hdr[12:16])
+	paddedHlen := uint64(hlen)
+	if rem := paddedHlen % 8; rem != 0 {
+		paddedHlen += 8 - rem
+	}
+	total := uint64(16) + paddedHlen + uint64(blen)
+	if total > dbusMaxMsgBytes {
+		// Oversized frame: buffer hdr[:] so DecodeMessageWithFDs
+		// rejects it without allocating an unbounded buffer.
+		hdrCopy := hdr
+		fc.frame = hdrCopy[:]
+		fc.off = 0
+		return nil
+	}
+	frame := make([]byte, int(total))
+	copy(frame[:16], hdr[:])
+	if len(frame) > 16 {
+		if _, err := io.ReadFull(fc.nc, frame[16:]); err != nil {
+			return err
+		}
+	}
+	fc.frame = frame
+	fc.off = 0
+	return nil
+}
 
 // dialSystemdPrivate opens ONE authenticated connection to the
 // systemd private socket. godbus.Connect is FORBIDDEN here: it ends
@@ -102,7 +240,7 @@ func dialSystemdPrivate(path string) (*godbus.Conn, net.Conn, error) {
 		_ = nc.Close()
 		return nil, nil, err
 	}
-	c, err := godbus.NewConn(nc)
+	c, err := godbus.NewConn(newDBusFrameConn(nc))
 	if err == nil {
 		err = c.Auth([]godbus.Auth{
 			godbus.AuthExternal(strconv.Itoa(os.Getuid())),
@@ -154,9 +292,9 @@ func (b *dbusBackend) systemConn(ctx context.Context) (*sdbus.Conn, error) {
 // the job wait watching a conn nobody is using).
 func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error) {
 	if b.disabled.Load() {
-		// Permanently unreachable socket (EACCES/ENOENT latched on
-		// an earlier dial) — skip straight to the unavailable
-		// verdict so the CLI fallback serves without re-dialing.
+		// Permanently unreachable socket (EACCES latched on an
+		// earlier dial) — skip straight to the unavailable verdict
+		// so the CLI fallback serves without re-dialing.
 		return nil, fmt.Errorf("%w: systemd dbus disabled (socket unreachable)",
 			errDBusUnavailable)
 	}
@@ -168,6 +306,9 @@ func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error)
 		b.conn = nil
 		b.rawSys = nil
 		b.rawSig = nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	var rawSys, rawSig *godbus.Conn
 	var netSys, netSig net.Conn
@@ -243,12 +384,11 @@ func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error)
 }
 
 // isFatalDialErr reports whether a dial/auth failure can NEVER
-// succeed later this boot: EACCES (socket is root-only) or ENOENT
-// (no systemd private socket at all). Transient failures — bus
-// restart, fd exhaustion — must keep retrying.
+// succeed later this boot: EACCES (socket is root-only). Transient
+// failures — ENOENT during daemon-reexec, bus restart, fd exhaustion —
+// must keep retrying.
 func isFatalDialErr(err error) bool {
-	return errors.Is(err, os.ErrPermission) ||
-		errors.Is(err, os.ErrNotExist)
+	return errors.Is(err, os.ErrPermission)
 }
 
 // maybeDisable latches the backend off + warns once when err is a
@@ -261,7 +401,7 @@ func (b *dbusBackend) maybeDisable(err error) {
 	b.disabled.Store(true)
 	b.warnOnce.Do(func() {
 		logger().Warn("systemd: dbus socket permanently unreachable "+
-			"(EACCES/ENOENT) — dbus backend disabled, systemctl "+
+			"(EACCES) — dbus backend disabled, systemctl "+
 			"fallback serves for the process lifetime",
 			"path", b.path, "error", err)
 	})
@@ -289,7 +429,7 @@ func (b *dbusBackend) close() {
 func (b *dbusBackend) dropConn(conn *sdbus.Conn) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.conn != conn {
+	if b.conn == nil || b.conn != conn {
 		return
 	}
 	b.conn.Close()

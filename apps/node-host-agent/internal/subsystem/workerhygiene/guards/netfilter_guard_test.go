@@ -7,17 +7,23 @@ package guards
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // mkNetfilterProc plants /proc/<pid>/stat (+ optional cmdline)
@@ -90,7 +96,7 @@ func nfCheck(t *testing.T, d *wdeps.Deps) *NetfilterGuardCheck {
 
 func TestNetfilterGuardKillNeedsPerPidConfirmation(t *testing.T) {
 	d, f := gDeps(t)
-	mkNetfilterProc(t, d, 6101, "iptables", "D", nil, 0)
+	mkNetfilterProc(t, d, 6101, "iptables", "S", nil, 5*time.Minute)
 	c := nfCheck(t, d)
 	ctx := context.Background()
 
@@ -122,7 +128,7 @@ func TestNetfilterGuardKillNeedsPerPidConfirmation(t *testing.T) {
 func TestNetfilterGuardPidReuseResetsStreak(t *testing.T) {
 	d, f := gDeps(t)
 	// First process: starttime=100, qualifies cycle 1.
-	mkNetfilterProcStart(t, d, 7101, "iptables", "D", nil, 0, 100)
+	mkNetfilterProcStart(t, d, 7101, "iptables", "S", nil, 2*time.Minute, 100)
 	d.Cfg.Wave2.NetfilterGuardHungCmdSec = 1
 	c := nfCheck(t, d)
 	ctx := context.Background()
@@ -133,7 +139,7 @@ func TestNetfilterGuardPidReuseResetsStreak(t *testing.T) {
 	}
 	// PID reuse: same pid dir, NEW starttime — the old process is
 	// gone, a different one now holds 7101.
-	mkNetfilterProcStart(t, d, 7101, "iptables", "D", nil, 0, 999)
+	mkNetfilterProcStart(t, d, 7101, "iptables", "S", nil, 2*time.Minute, 999)
 	c.Run(ctx, nfEnv(7101))
 	if len(f.Kills) != 0 {
 		t.Fatalf("cycle 2 kills=%d want 0 — recycled pid must not "+
@@ -289,5 +295,136 @@ func TestNetfilterGuardSkipsZombieAndRunnable(t *testing.T) {
 	c.Run(context.Background(), nfEnv(301, 302, 303))
 	if len(f.Kills) != 1 || f.Kills[0].PID != 303 {
 		t.Fatalf("kills=%+v want only PID 303 (skipped Z/R)", f.Kills)
+	}
+}
+
+func TestNetfilterGuardUsrSbinNftMonitorExcluded(t *testing.T) {
+	d, f := gDeps(t)
+	mkNetfilterProc(t, d, 6202, "nft", "S",
+		[]string{"/usr/sbin/nft", "monitor"}, 2*time.Hour)
+	d.Cfg.Wave2.NetfilterGuardHungCmdSec = 1
+	c := nfCheck(t, d)
+	c.Run(context.Background(), nfEnv(6202))
+	c.Run(context.Background(), nfEnv(6202))
+	if len(f.Kills) != 0 || len(c.seen) != 0 {
+		t.Fatalf("/usr/sbin/nft monitor was not excluded: kills=%+v seen=%+v", f.Kills, c.seen)
+	}
+}
+
+func TestNetfilterGuardDStateNotKilled(t *testing.T) {
+	d, f := gDeps(t)
+	mkNetfilterProc(t, d, 6203, "iptables", "D", nil, 0)
+	c := nfCheck(t, d)
+	c.Run(context.Background(), nfEnv(6203))
+	c.Run(context.Background(), nfEnv(6203))
+	if len(f.Kills) != 0 {
+		t.Fatalf("D-state iptables must not be SIGKILLed: %+v", f.Kills)
+	}
+	if !strings.Contains(f.LogLines(t), "uninterruptible D-state") {
+		t.Fatalf("missing D-state suspect log:\n%s", f.LogLines(t))
+	}
+}
+
+func TestNetfilterGuardPidReuseMidCyclePreventsKill(t *testing.T) {
+	d, f := gDeps(t)
+	mkNetfilterProcStart(t, d, 6204, "iptables", "S", nil, 2*time.Minute, 111)
+	d.Cfg.Wave2.NetfilterGuardHungCmdSec = 1
+	c := nfCheck(t, d)
+	d.Cfg.Wave2.NetfilterGuardStuckCycles = 1
+	d.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return f.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			// Simulate PID reuse mid-cycle between scanStuck and KillFn.
+			mkNetfilterProcStart(t, d, 6204, "iptables", "S", nil, 2*time.Minute, 222)
+			return map[string]string{}, nil
+		},
+	}
+	c.Run(context.Background(), nfEnv(6204))
+	if len(f.Kills) != 0 {
+		t.Fatalf("PID reuse mid-cycle must abort SIGKILL: %+v", f.Kills)
+	}
+}
+
+func TestNetfilterGuardHoldEmergencyHeal(t *testing.T) {
+	// 1. Active maintenance holds SIGKILL.
+	d, f := gDeps(t)
+	mkNetfilterProc(t, d, 6205, "iptables", "S", nil, 5*time.Minute)
+	c := nfCheck(t, d)
+	d.Cfg.Wave2.NetfilterGuardStuckCycles = 1
+	d.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return f.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+		},
+	}
+	c.Run(context.Background(), nfEnv(6205))
+	if len(f.Kills) != 0 {
+		t.Fatalf("HoldEmergencyHeal did not block SIGKILL under kured lock: %+v", f.Kills)
+	}
+
+	// 2. API outage fails OPEN for HoldEmergencyHeal so netfilter recovery still runs.
+	d2, f2 := gDeps(t)
+	mkNetfilterProc(t, d2, 6206, "iptables", "S", nil, 5*time.Minute)
+	c2 := nfCheck(t, d2)
+	d2.Cfg.Wave2.NetfilterGuardStuckCycles = 1
+	d2.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return f2.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			return nil, errors.New("apiserver unreachable")
+		},
+	}
+	c2.Run(context.Background(), nfEnv(6206))
+	if len(f2.Kills) != 1 || f2.Kills[0].PID != 6206 {
+		t.Fatalf("HoldEmergencyHeal must fail open on API error; kills=%+v", f2.Kills)
+	}
+}
+
+func TestNetfilterGuardPidsOKFalseAndProcErrorPreserveStreak(t *testing.T) {
+	d, f := gDeps(t)
+	mkNetfilterProc(t, d, 6210, "iptables", "S", nil, 5*time.Minute)
+	c := nfCheck(t, d)
+	ctx := context.Background()
+
+	// Cycle 1: builds confirmation streak = 1.
+	c.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		PidsOnce:     func() []int { return []int{6210} },
+		PidsOK:       func() bool { return true },
+	})
+	if got := testutil.ToFloat64(d.Cycles.WithLabelValues(wdeps.CheckNetfilterGuard, "ok")); got != 1 {
+		t.Fatalf("ok cycles=%v want 1", got)
+	}
+	if len(c.seen) != 1 || len(f.Kills) != 0 {
+		t.Fatalf("unexpected cycle 1 state: seen=%+v kills=%+v", c.seen, f.Kills)
+	}
+
+	// PidsOnce() == nil + PidsOK() == false must abort "inconclusive" and preserve c.seen.
+	c.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		PidsOnce:     func() []int { return nil },
+		PidsOK:       func() bool { return false },
+	})
+	if got := testutil.ToFloat64(d.Cycles.WithLabelValues(wdeps.CheckNetfilterGuard, "inconclusive")); got != 1 {
+		t.Fatalf("inconclusive cycles=%v want 1", got)
+	}
+	if len(c.seen) != 1 {
+		t.Fatalf("c.seen wiped on PidsOK()=false: %+v", c.seen)
+	}
+
+	// PidsOnce == nil + Proc.PIDs() error must also abort "inconclusive" and preserve c.seen.
+	d.Proc = procfs.New(filepath.Join(t.TempDir(), "missing-proc"))
+	c.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+	if got := testutil.ToFloat64(d.Cycles.WithLabelValues(wdeps.CheckNetfilterGuard, "inconclusive")); got != 2 {
+		t.Fatalf("inconclusive cycles=%v want 2", got)
+	}
+	if len(c.seen) != 1 || len(f.Kills) != 0 {
+		t.Fatalf("unexpected state after Proc.PIDs error: seen=%+v kills=%+v", c.seen, f.Kills)
+	}
+
+	// Recovery cycle: preserved streak=1 immediately confirms & kills on cycle 2.
+	d.Proc = procfs.New(f.ProcDir)
+	c.Run(ctx, nfEnv(6210))
+	if len(f.Kills) != 1 || f.Kills[0].PID != 6210 {
+		t.Fatalf("kills=%+v want SIGKILL on 6210 on preserved streak=2", f.Kills)
 	}
 }

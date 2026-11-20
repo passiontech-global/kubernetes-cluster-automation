@@ -256,6 +256,10 @@ func (c *CSIGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckCSIGuard, "ok")
 		return
 	}
+	if e == nil || !e.APIOK {
+		c.d.CycleResult(wdeps.CheckCSIGuard, "abort")
+		return
+	}
 	socks, ok := regSockets(c.d)
 	if !ok {
 		c.d.CycleResult(wdeps.CheckCSIGuard, "inconclusive")
@@ -292,6 +296,12 @@ func (c *CSIGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.refused[drv] = 0
 		}
 		if heal && c.refused[drv] >= c.d.Cfg.Wave2.CSIGuardECONNRefusedCycle {
+			if c.d.HoldLocalAction(ctx) {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"cleanup: csi-registration-guard orphan -reg.sock %s remove held - cluster maintenance in progress",
+					path))
+				continue
+			}
 			if err := os.Remove(path); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: csi-registration-guard orphan -reg.sock %s remove failed: %v",
@@ -537,11 +547,20 @@ func (c *GPUGuardCheck) liveGPUs() (int, bool) {
 		}
 		dir := filepath.Join(pciDir, e.Name())
 		vendor, err := os.ReadFile(filepath.Join(dir, "vendor"))
-		if err != nil || strings.TrimSpace(string(vendor)) != "0x10de" {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return 0, false
+			}
+			continue
+		}
+		if strings.TrimSpace(string(vendor)) != "0x10de" {
 			continue
 		}
 		class, err := os.ReadFile(filepath.Join(dir, "class"))
 		if err != nil {
+			if !os.IsNotExist(err) {
+				return 0, false
+			}
 			continue
 		}
 		cls := strings.TrimSpace(string(class))
@@ -563,6 +582,10 @@ func (c *GPUGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if c.d.Cfg.Wave2.GPUGuardMode == envx.ModeOff {
 		c.d.CycleResult(wdeps.CheckGPUGuard, "ok")
+		return
+	}
+	if e == nil || !e.APIOK {
+		c.d.CycleResult(wdeps.CheckGPUGuard, "abort")
 		return
 	}
 	live, liveOK := c.liveGPUs()
@@ -609,6 +632,10 @@ func (c *GPUGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		desynced = unready
 	}
 	if !desynced {
+		if !liveOK {
+			c.d.CycleResult(wdeps.CheckGPUGuard, "abort")
+			return
+		}
 		c.desyncSince = time.Time{}
 		c.d.CycleResult(wdeps.CheckGPUGuard, "ok")
 		return

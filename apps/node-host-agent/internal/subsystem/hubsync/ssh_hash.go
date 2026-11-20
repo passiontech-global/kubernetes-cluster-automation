@@ -241,6 +241,7 @@ type sshDialer struct {
 	// conn's SetDeadline bounding never overlaps ops; one jump
 	// handshake per cycle replaces one per target. Entries live
 	// for the dialer's lifetime (the agent process).
-	mu    sync.Mutex
-	jumps map[string]*sshclient.Bastion
+	mu      sync.Mutex
+	jumps   map[string]*sshclient.Bastion
+	jumpGen uint64
 }

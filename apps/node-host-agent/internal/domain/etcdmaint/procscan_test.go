@@ -57,3 +57,46 @@ func TestProcZombie(t *testing.T) {
 		t.Error("missing stat file must read as not-zombie")
 	}
 }
+
+func TestFindEtcdProcessSkipsDZAndCapturesLiveArgs(t *testing.T) {
+	root := t.TempDir()
+	writeProc := func(pid int, stat, cmdline string) {
+		t.Helper()
+		dir := filepath.Join(root, strconv.Itoa(pid))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if stat != "" {
+			if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(cmdline), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const etcdBin = "/fake/k0s/bin/etcd"
+	// PID 100 is in D-state and must be skipped even though cmdline matches.
+	writeProc(100, "100 (etcd) D 1 1 0 0\n", etcdBin+"\x00--name=wedged\x00")
+	// PID 150 is in Z-state and must be skipped.
+	writeProc(150, "150 (etcd) Z 1 1 0 0\n", etcdBin+"\x00--name=zombie\x00")
+	// PID 200 is healthy S-state with an interior empty arg preserved.
+	writeProc(200, "200 (etcd) S 1 1 0 0\n", etcdBin+"\x00--name\x00\x00--data-dir=/var/lib/etcd\x00")
+
+	r := &rescuer{
+		proc:    procfs.New(root),
+		etcdBin: etcdBin,
+		cfg:     Config{ProcRoot: root},
+	}
+	pid, args, err := r.findEtcdProcess()
+	if err != nil {
+		t.Fatalf("findEtcdProcess: %v", err)
+	}
+	if pid != 200 {
+		t.Fatalf("pid = %d, want 200 (D/Z-state PIDs must be skipped)", pid)
+	}
+	if len(args) != 3 || args[0] != "--name" || args[1] != "" || args[2] != "--data-dir=/var/lib/etcd" {
+		t.Fatalf("args = %q, want [--name \"\" --data-dir=/var/lib/etcd]", args)
+	}
+}

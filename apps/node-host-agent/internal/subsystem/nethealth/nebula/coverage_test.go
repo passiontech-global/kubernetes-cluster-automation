@@ -116,14 +116,6 @@ func newTestDeps(t *testing.T) *nebulaTestEnv {
 		NebulaUpExists: func(_ *watchdogconf.Config) bool {
 			return true
 		},
-		EgressFiles: func(prefixes ...string) []string {
-			var out []string
-			for _, p := range prefixes {
-				matches, _ := filepath.Glob(filepath.Join(dir, "state", p+"*"))
-				out = append(out, matches...)
-			}
-			return out
-		},
 		FlushStaleUDPConntrack:   func(_ context.Context, _ string) {},
 		FlushPeerNebulaConntrack: func(_ context.Context, _ string, _ ...string) {},
 		TrimRunErr:               func(s string) string { return strings.TrimSpace(s) },
@@ -338,4 +330,29 @@ func TestMTUBlackholeProberAndInvariants(t *testing.T) {
 	<-pctx.Done()
 	// Wait briefly for goroutine defer to clear Running.
 	time.Sleep(15 * time.Millisecond)
+}
+
+func TestMaybeClampNebulaMSSBackwardClock(t *testing.T) {
+	env := newTestDeps(t)
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	env.deps.Clock = func() *timex.Cell {
+		return timex.NewCell(func() time.Time { return now })
+	}
+	clamped := 0
+	env.deps.RunMountCmd = func(_ context.Context, argv []string) (string, error) {
+		for _, a := range argv {
+			if a == "-C" {
+				return "", errors.New("not found")
+			}
+			if a == "-A" {
+				clamped++
+			}
+		}
+		return "", nil
+	}
+	st := &MTUProbeState{LastClamp: now.Add(time.Hour)} // clock stepped backward relative to LastClamp
+	env.deps.MaybeClampNebulaMSS(context.Background(), env.wd, st)
+	if clamped == 0 {
+		t.Fatal("MaybeClampNebulaMSS skipped clamping across backward clock jump")
+	}
 }

@@ -8,12 +8,18 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/storelocal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // --- Guard b: kine pool ---
@@ -265,5 +271,162 @@ func TestKinePoolAbortBeforeKillKeepsBudget(t *testing.T) {
 		Run(context.Background())
 	if len(e.Kills) != 1 || e.Kills[0].PID != 1001 {
 		t.Fatalf("expected the follow-up live cycle to kill, got %v", e.Kills)
+	}
+}
+
+func TestKinePoolHoldEmergencyHeal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		annos  map[string]string
+		taints []string
+	}{
+		{
+			name:  "cluster_maintenance_anno",
+			annos: map[string]string{nodecond.AnnoClusterMaintenanceUntil: "2099-01-01T00:00:00Z"},
+		},
+		{
+			name:   "kured_reboot_taint",
+			taints: []string{nodecond.KuredRebootTaintKey},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			e.H.Cfg.KinePool.Cycles = 1
+			var active atomic.Bool
+			active.Store(true)
+			e.H.Cfg.Coord = &nodecoord.Coord{
+				Now: func() time.Time { return e.Now },
+				GetNode: func(context.Context) (map[string]string, []string, error) {
+					if active.Load() {
+						return tc.annos, tc.taints, nil
+					}
+					return nil, nil, nil
+				},
+			}
+			e.MkProc(t, 1001, "kine",
+				[]string{"kine", "--endpoint=postgres://10.0.0.9:6432/kine"}, 1000)
+			for i := range 80 {
+				e.MkSock(t, 1001, 100+i, strconv.Itoa(50000+i), 6432)
+			}
+
+			e.H.Cycle(context.Background())
+			if !e.HasState(cdeps.StateKinePoolRunaway) {
+				t.Fatal("kine-pool-runaway not latched under maintenance hold")
+			}
+			if len(e.Kills) != 0 {
+				t.Fatalf("killed kine while maintenance held: %v", e.Kills)
+			}
+			if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRatePoolKill)); got != 0 {
+				t.Fatalf("FileRatePoolKill spent while held: %d", got)
+			}
+			if v := promtest.ToFloat64(e.H.Actions.WithLabelValues(cdeps.CheckKinePool, "maint_hold")); v != 1 {
+				t.Fatalf("maint_hold actions=%v want 1", v)
+			}
+			if v := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckKinePool, "maint_hold")); v != 1 {
+				t.Fatalf("maint_hold cycles=%v want 1", v)
+			}
+
+			active.Store(false)
+			e.Now = e.Now.Add(nodecoord.CacheTTL + time.Second)
+			e.H.Cycle(context.Background())
+			if len(e.Kills) != 1 || e.Kills[0].PID != 1001 || e.Kills[0].Sig != syscall.SIGTERM {
+				t.Fatalf("expected SIGTERM after maintenance cleared, got %v", e.Kills)
+			}
+		})
+	}
+}
+
+func TestKinePoolHealthySkipsCoord(t *testing.T) {
+	e := fixture(t)
+	var calls atomic.Int32
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetNode: func(context.Context) (map[string]string, []string, error) {
+			calls.Add(1)
+			return nil, nil, nil
+		},
+	}
+	e.MkProc(t, 1001, "kine",
+		[]string{"kine", "--endpoint=postgres://10.0.0.9:6432/kine"}, 1000)
+	for i := range 5 {
+		e.MkSock(t, 1001, 100+i, strconv.Itoa(60000+i), 6432)
+	}
+	e.H.Cycle(context.Background())
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("healthy kinepool cycle called Coord %d times, want 0", got)
+	}
+}
+
+func TestKinePoolFailOpenOnCoordError(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.KinePool.Cycles = 1
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetNode: func(context.Context) (map[string]string, []string, error) {
+			return nil, nil, errors.New("apiserver unreachable")
+		},
+	}
+	e.MkProc(t, 1001, "kine",
+		[]string{"kine", "--endpoint=postgres://10.0.0.9:6432/kine"}, 1000)
+	for i := range 80 {
+		e.MkSock(t, 1001, 100+i, strconv.Itoa(50000+i), 6432)
+	}
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 || e.Kills[0].PID != 1001 {
+		t.Fatalf("HoldEmergencyHeal failed closed on transient Coord error: kills=%v", e.Kills)
+	}
+}
+
+func TestKinePoolHoldSuspectLogWithStuckConnsAndExitClear(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.KinePool.Cycles = 1
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetNode: func(context.Context) (map[string]string, []string, error) {
+			return map[string]string{nodecond.AnnoClusterMaintenanceUntil: "2099-01-01T00:00:00Z"}, nil, nil
+		},
+	}
+	e.MkProc(t, 1001, "kine",
+		[]string{"kine", "--endpoint=postgres://10.0.0.9:6432/kine"}, 1000)
+	for i := range 80 {
+		e.MkSock(t, 1001, 100+i, strconv.Itoa(50000+i), 6432)
+	}
+	appendTCPRow(t, filepath.Join(e.Proc, "1001", "net", "tcp"),
+		"   2: 0100007F:1234 0A0000FF:1920 05 00000000:00000000 00:00000000 00000000 0 0 50000 1 0000000000000000\n")
+
+	// Same cycle hits stuck > 0 (SuspectLog StateKinePoolRunaway) AND HoldEmergencyHeal ->
+	// holding kill must NOT be dropped by SuspectLog key collision.
+	e.H.Cycle(context.Background())
+	if n := e.CountLogLines("suspect: kine db conns stuck"); n != 1 {
+		t.Fatalf("stuck-conn suspect lines=%d want 1", n)
+	}
+	if n := e.CountLogLines("holding kill"); n != 1 {
+		t.Fatalf("expected holding kill log on same cycle as stuck conns, got %d:\n%s", n, e.LogLines())
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("killed kine while maintenance held: %v", e.Kills)
+	}
+
+	// Pool recovers -> StateKinePoolRunaway exits and clears -hold suspect key.
+	if err := os.RemoveAll(filepath.Join(e.Proc, "1001")); err != nil {
+		t.Fatal(err)
+	}
+	e.MkProc(t, 1001, "kine",
+		[]string{"kine", "--endpoint=postgres://10.0.0.9:6432/kine"}, 1000)
+	for i := range 5 {
+		e.MkSock(t, 1001, 100+i, strconv.Itoa(60000+i), 6432)
+	}
+	e.H.Cycle(context.Background())
+	if e.HasState(cdeps.StateKinePoolRunaway) {
+		t.Fatal("kine-pool-runaway did not exit after pool recovery")
+	}
+
+	// New spiral episode within SuspectLogCadence emits a fresh holding kill log.
+	for i := range 80 {
+		e.MkSock(t, 1001, 200+i, strconv.Itoa(51000+i), 6432)
+	}
+	e.H.Cycle(context.Background())
+	if n := e.CountLogLines("holding kill"); n != 2 {
+		t.Fatalf("expected fresh holding kill log on new episode, got %d:\n%s", n, e.LogLines())
 	}
 }

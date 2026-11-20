@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -232,5 +234,42 @@ func TestCollectContainerdMetaDB(t *testing.T) {
 		"node_host_agent_containerd_metadb_bytes",
 		map[string]string{"node": "node-a"}); ok {
 		t.Fatal("metadb emitted with no file")
+	}
+}
+
+func TestSweepProcsSkipsDZXxCmdlineFIFONonBlocking(t *testing.T) {
+	for _, state := range []string{"D", "Z", "X", "x"} {
+		t.Run("state_"+state, func(t *testing.T) {
+			procRoot := t.TempDir()
+			pidDir := filepath.Join(procRoot, "700")
+			if err := os.MkdirAll(pidDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			testutil.WriteFile(t, filepath.Join(pidDir, "stat"),
+				"700 (k0s) "+state+" 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n")
+			cmdFIFO := filepath.Join(pidDir, "cmdline")
+			if err := syscall.Mkfifo(cmdFIFO, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if f, err := os.OpenFile(cmdFIFO, os.O_RDWR, 0); err == nil {
+					_ = f.Close()
+				}
+			})
+
+			done := make(chan map[string]procScan, 1)
+			go func() {
+				done <- sweepProcs(procRoot)
+			}()
+			select {
+			case procs := <-done:
+				ps, ok := procs["700"]
+				if !ok || ps.comm != "k0s" || ps.cmdline != "" {
+					t.Fatalf("state %s procScan = %+v (ok=%v), want comm=k0s cmdline=\"\"", state, ps, ok)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("sweepProcs blocked opening FIFO cmdline for state %q", state)
+			}
+		})
 	}
 }

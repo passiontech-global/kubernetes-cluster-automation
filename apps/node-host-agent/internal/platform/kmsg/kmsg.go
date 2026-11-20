@@ -146,8 +146,8 @@ func SplitLines(pending, data []byte) (lines [][]byte, rest []byte) {
 // all-EPIPE reader cannot spin the drain forever.
 //
 // A hard read error returns what the drain gathered: data is nil
-// when the erroring read delivered nothing, otherwise the bytes read
-// so far accompany the error — partial-output-vs-fatal is the
+// when no bytes were gathered before the error, otherwise the bytes
+// read so far accompany the error — partial-output-vs-fatal is the
 // caller's policy.
 // readKmsgChunk performs one raw read step on the kmsg source. An
 // *os.File opened O_NONBLOCK goes through the runtime netpoller on
@@ -210,7 +210,7 @@ func Drain(r io.Reader, maxBytes int) (data []byte, caughtUp bool, err error) {
 				errors.Is(rerr, io.EOF) || errors.Is(rerr, os.ErrClosed) {
 				return out, true, nil
 			}
-			if n == 0 {
+			if len(out) == 0 {
 				return nil, false, rerr
 			}
 			// Delivered bytes plus a sticky error — keep them.

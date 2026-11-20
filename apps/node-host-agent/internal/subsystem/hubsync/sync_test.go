@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -1256,5 +1258,164 @@ func TestPutAtomicKeyMaterialChmodEarly(t *testing.T) {
 		"run:mv '/etc/x/.plain.yaml.tmp' '/etc/x/plain.yaml'")
 	if strings.Contains(strings.Join(c2.opsLog(), "\n"), "install") {
 		t.Fatalf("non-secret upload ran install: %v", c2.opsLog())
+	}
+}
+
+func TestLocalBinarySumCacheHitAndInvalidation(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "node-host-agent")
+	if err := os.WriteFile(bin, []byte("binary-v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(testConfig(t, newClientsetWithSecret(), newFakeDialer(), []byte("binary-v1")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum1, err := s.localBinarySum(bin)
+	if err != nil {
+		t.Fatalf("first localBinarySum: %v", err)
+	}
+	// Poison s.binSum artificially to prove the second call hits the FileStatKey cache
+	// instead of re-reading/re-hashing from disk.
+	s.binMu.Lock()
+	s.binSum = "cached-sentinel"
+	s.binMu.Unlock()
+	sumCached, err := s.localBinarySum(bin)
+	if err != nil || sumCached != "cached-sentinel" {
+		t.Fatalf("expected FileStatKey cache hit returning sentinel, got (%q, %v)", sumCached, err)
+	}
+
+	// Atomic replacement changes inode/size -> invalidates cache and computes real v2 hash.
+	tmp := filepath.Join(dir, ".node-host-agent.tmp")
+	if err := os.WriteFile(tmp, []byte("binary-v2-longer"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, bin); err != nil {
+		t.Fatal(err)
+	}
+	sum2, err := s.localBinarySum(bin)
+	if err != nil {
+		t.Fatalf("second localBinarySum: %v", err)
+	}
+	if sum2 == "cached-sentinel" || sum2 == sum1 {
+		t.Fatalf("expected fresh v2 hash after atomic replace, got %q", sum2)
+	}
+
+	// Missing file clears cache and returns error.
+	if err := os.Remove(bin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.localBinarySum(bin); err == nil {
+		t.Fatal("expected error for missing binary")
+	}
+	s.binMu.Lock()
+	cachedAfterErr := s.binSum
+	s.binMu.Unlock()
+	if cachedAfterErr != "" {
+		t.Fatalf("cache not cleared on read error: %q", cachedAfterErr)
+	}
+}
+
+type batchedFakeConn struct {
+	*fakeConn
+	sessions      int
+	readOnlyProbe int
+	prepareCalls  int
+	probeCalls    int
+}
+
+func (b *batchedFakeConn) Run(ctx context.Context, cmd string) (string, error) {
+	b.sessions++
+	if strings.HasPrefix(cmd, "sha256sum ") || (b.sudo && strings.HasPrefix(cmd, "sudo -n sha256sum ")) {
+		b.readOnlyProbe++
+	}
+	return b.fakeConn.Run(ctx, cmd)
+}
+
+func (b *batchedFakeConn) PrepareHost(_ context.Context, dirs []remoteDir) error {
+	b.sessions++
+	b.prepareCalls++
+	for _, d := range dirs {
+		b.seedDir(d.path)
+	}
+	return nil
+}
+
+func (b *batchedFakeConn) PutAtomic(ctx context.Context, remotePath string, r io.Reader, _ string) error {
+	b.sessions++
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	b.seedFile(remotePath, data)
+	return nil
+}
+
+func (b *batchedFakeConn) ProbeDirs(_ context.Context, lsDirs, orphanDirs []string) (ls, orphans map[string][]string, err error) {
+	b.sessions++
+	b.readOnlyProbe++
+	b.probeCalls++
+	ls = make(map[string][]string, len(lsDirs))
+	orphans = make(map[string][]string, len(orphanDirs))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, d := range lsDirs {
+		for fpath := range b.files {
+			if path.Dir(fpath) == d {
+				ls[d] = append(ls[d], path.Base(fpath))
+			}
+		}
+		slices.Sort(ls[d])
+	}
+	for _, d := range orphanDirs {
+		for fpath := range b.files {
+			if path.Dir(fpath) == d && b.staleTmp[fpath] {
+				orphans[d] = append(orphans[d], path.Base(fpath))
+			}
+		}
+	}
+	return ls, orphans, nil
+}
+
+type batchedDialer struct{ conn Conn }
+
+func (d batchedDialer) Dial(context.Context, Target) (Conn, error) { return d.conn, nil }
+
+// TestSyncTargetSteadyStateBatching verifies E17: steady-state syncTarget on a
+// full-role (InterDC + APILB) target opens <= 4 SSH sessions total and <= 2
+// read-only probe sessions.
+func TestSyncTargetSteadyStateBatching(t *testing.T) {
+	bc := &batchedFakeConn{fakeConn: newFakeConn()}
+	bc.sudo = true
+	cfg := testConfig(t, newClientsetWithSecret(), newFakeDialer(), []byte("bin-v1"))
+	cfg.Dialer = batchedDialer{conn: bc}
+	cfg.NebulaCertsDir = t.TempDir()
+	// Ensure cert file exists in NebulaCertsDir for InterDC mirror.
+	if err := os.WriteFile(filepath.Join(cfg.NebulaCertsDir, "nebula-ca.crt"), []byte("ca"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := Target{Name: "hub-api-1", IP: "10.0.0.10", SSHUser: "ubuntu", InterDC: true, APILB: true}
+	if err := s.syncTarget(context.Background(), target, []byte("guard-token-value"), []byte("guard-ca-pem"), ""); err != nil {
+		t.Fatalf("seed syncTarget: %v", err)
+	}
+	bc.sessions = 0
+	bc.readOnlyProbe = 0
+	bc.prepareCalls = 0
+	bc.probeCalls = 0
+	if err := s.syncTarget(context.Background(), target, []byte("guard-token-value"), []byte("guard-ca-pem"), ""); err != nil {
+		t.Fatalf("steady-state syncTarget: %v", err)
+	}
+	if bc.sessions > 4 {
+		t.Fatalf("steady-state sessions = %d, want <= 4", bc.sessions)
+	}
+	if bc.readOnlyProbe > 2 {
+		t.Fatalf("steady-state read-only probe sessions = %d, want <= 2", bc.readOnlyProbe)
+	}
+	if bc.prepareCalls != 1 || bc.probeCalls != 1 {
+		t.Fatalf("prepareCalls=%d probeCalls=%d want 1,1", bc.prepareCalls, bc.probeCalls)
 	}
 }

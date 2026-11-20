@@ -77,7 +77,9 @@ func (r *Runner) updateEBPFPressure() {
 		}
 	default:
 		// Inside the hysteresis band [clear, max): keep held latch if any,
-		// but reset the entry streak so a noisy edge cannot accumulate.
+		// refresh its mtime so janitor cannot reap a live episode, and
+		// reset the entry streak so a noisy edge cannot accumulate.
 		r.ebpfStreak = 0
+		r.touchHeldLatch(latchdefs.LatchEBPFPressure)
 	}
 }

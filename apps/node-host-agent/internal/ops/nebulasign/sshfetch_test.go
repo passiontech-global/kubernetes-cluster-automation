@@ -30,12 +30,13 @@ import (
 // accepted. Mode picks the exec behaviour; bridge != "" turns it into
 // a bastion that tunnels direct-tcpip opens onto that TCP address.
 type sshTestServer struct {
-	ln     net.Listener
-	cfg    *ssh.ServerConfig
-	bridge string // dial target for direct-tcpip ("" → reject)
-	mode   string // "cat" | "fail" | "hang" | "reject-session"
-	out    string
-	quit   chan struct{}
+	ln      net.Listener
+	cfg     *ssh.ServerConfig
+	hostKey ssh.PublicKey
+	bridge  string // dial target for direct-tcpip ("" → reject)
+	mode    string // "cat" | "fail" | "hang" | "reject-session"
+	out     string
+	quit    chan struct{}
 
 	mu   sync.Mutex
 	cmds []string
@@ -52,6 +53,7 @@ func newSSHTestServer(t *testing.T, mode, out string) *sshTestServer {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.hostKey = signer.PublicKey()
 	s.cfg = &ssh.ServerConfig{
 		PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
 			return &ssh.Permissions{}, nil
@@ -284,5 +286,42 @@ func TestSSHFetchHostPubCancelMidCommand(t *testing.T) {
 		"interdc", fetchKey(t), true)
 	if err == nil {
 		t.Fatal("hang want ctx error")
+	}
+}
+
+func TestSSHFetchHostPubKnownHostsThroughBastion(t *testing.T) {
+	final := newSSHTestServer(t, "cat", testPubPEM)
+	bastion := newSSHTestServer(t, "cat", "")
+	bastion.bridge = final.ln.Addr().String()
+
+	keyPath := fetchKey(t)
+	kh := filepath.Join(filepath.Dir(keyPath), "known_hosts")
+	khContent := "[127.0.0.1]:" + strconv.Itoa(bastion.port()) + " " +
+		string(ssh.MarshalAuthorizedKey(bastion.hostKey)) +
+		"127.0.0.1 " + string(ssh.MarshalAuthorizedKey(final.hostKey))
+	if err := os.WriteFile(kh, []byte(khContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := sshFetchHostPub(context.Background(),
+		fetchJob(bastion.port()), "interdc", keyPath, false)
+	if err != nil {
+		t.Fatalf("known_hosts fetch failed: %v", err)
+	}
+	if out != testPubPEM {
+		t.Fatalf("out=%q want PEM block", out)
+	}
+
+	// Wrong target key in known_hosts must fail closed.
+	otherKey := genHostKey(t)
+	badKH := "[127.0.0.1]:" + strconv.Itoa(bastion.port()) + " " +
+		string(ssh.MarshalAuthorizedKey(bastion.hostKey)) +
+		"127.0.0.1 " + string(ssh.MarshalAuthorizedKey(otherKey))
+	if err := os.WriteFile(kh, []byte(badKH), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sshFetchHostPub(context.Background(),
+		fetchJob(bastion.port()), "interdc", keyPath, false); err == nil {
+		t.Fatal("mismatched target host key accepted with insecure=false")
 	}
 }

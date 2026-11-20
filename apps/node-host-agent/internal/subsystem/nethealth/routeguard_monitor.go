@@ -10,6 +10,7 @@ package nethealth
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -46,7 +47,7 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 			if r := recover(); r != nil {
 				logger().Error("route-guard: netlink reader panicked — "+
 					"monitor exits, socket will reopen",
-					"panic", r)
+					"panic", r, "stack", string(debug.Stack()))
 			}
 		}()
 		defer close(done)
@@ -107,7 +108,7 @@ func (n *NetHealth) routeGuardRead(ctx context.Context, fd int,
 		defer func() {
 			if r := recover(); r != nil {
 				logger().Error("route-guard: cancel watcher panicked",
-					"panic", r)
+					"panic", r, "stack", string(debug.Stack()))
 			}
 		}()
 		select {

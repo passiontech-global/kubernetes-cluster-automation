@@ -8,17 +8,22 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 func TestEphemeralPortsPerNetnsNotSummedAcrossPods(t *testing.T) {
@@ -103,5 +108,147 @@ func TestEphemeralPortsCloseWaitEvictRespectsFloor(t *testing.T) {
 	}
 	if n := len(wdepstest.DeleteActions(e.CS)); n != 0 {
 		t.Fatalf("healthy pod with 1 CLOSE_WAIT evicted (floor ignored): %d deletes", n)
+	}
+}
+
+func TestEphemeralPortsReapSynSentHoldLocalAction(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Wave2.SynSentKillEnabled = true
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "sys", "net", "ipv4", "ip_local_port_range"),
+		"32768 60999\n")
+	coordCalls := 0
+	synSent := 1
+	e.H.Cfg.Seams.Host.TCPTablesFn = func(int) (netlinkx.TCPCensus, error) {
+		return netlinkx.TCPCensus{States: map[uint8]int{2: synSent}}, nil
+	}
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			coordCalls++
+			return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+		},
+	}
+
+	chk := e.H.Check(wdeps.CheckEphemeralPorts)
+	// Below floor -> must not consult Coord.
+	chk.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true, PidsOnce: wdepstest.PidsOf()})
+	if coordCalls != 0 {
+		t.Fatalf("healthy cycle called Coord %d times, want 0", coordCalls)
+	}
+
+	// Above synSentKillFloor -> HoldLocalAction blocks netlinkx.DestroyStuckSynSent.
+	synSent = 40
+	chk.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true, PidsOnce: wdepstest.PidsOf()})
+	if coordCalls == 0 {
+		t.Fatal("reapSynSent did not consult HoldLocalAction")
+	}
+	logs := e.LogLines(t)
+	if !strings.Contains(logs, "syn_sent destroy held") {
+		t.Fatalf("missing syn_sent hold log:\n%s", logs)
+	}
+	if strings.Contains(logs, "syn_sent destroy failed") {
+		t.Fatalf("DestroyStuckSynSent ran despite maintenance hold:\n%s", logs)
+	}
+}
+
+func TestEphemeralPortsEvictSkipsWalkBelowFloor(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Wave2.PortEvictRunawayPod = true
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "sys", "net", "ipv4", "ip_local_port_range"),
+		"32768 60999\n")
+	// Pre-existing stale port-leak-* marker must still be pruned when closeWait < floor.
+	staleMarker := filepath.Join(e.StateDir, "port-leak-stale-uid")
+	wdepstest.WriteFile(t, staleMarker, "1\n")
+
+	e.H.Cfg.Seams.Host.TCPTablesFn = func(int) (netlinkx.TCPCensus, error) {
+		return netlinkx.TCPCensus{States: map[uint8]int{8: 10}}, nil
+	}
+	e.H.Check(wdeps.CheckEphemeralPorts).Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true, APIOK: true, PidsOnce: wdepstest.PidsOf(),
+	})
+	if _, err := os.Stat(staleMarker); !os.IsNotExist(err) {
+		t.Fatal("stale port-leak marker not pruned when closeWait < floor")
+	}
+}
+
+func TestEphemeralPortsPidsOKFalseAndProcErrorPreserveFailsAndLatch(t *testing.T) {
+	e := fixture(t)
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "sys", "net", "ipv4", "ip_local_port_range"),
+		"32768 60999\n")
+	for _, pair := range []struct {
+		pid int
+		ns  string
+	}{
+		{1, "net:[1001]"},
+		{500, "net:[5000]"},
+	} {
+		nsDir := filepath.Join(e.ProcDir, strconv.Itoa(pair.pid), "ns")
+		if err := os.MkdirAll(nsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(pair.ns, filepath.Join(nsDir, "net")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.H.Cfg.Seams.Host.TCPTablesFn = func(pid int) (netlinkx.TCPCensus, error) {
+		if pid == 500 {
+			return netlinkx.TCPCensus{States: map[uint8]int{8: 6000}}, nil
+		}
+		return netlinkx.TCPCensus{States: map[uint8]int{1: 10}}, nil
+	}
+
+	chk := e.H.Check(wdeps.CheckEphemeralPorts)
+	ctx := context.Background()
+	validEnv := &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     func() []int { return []int{1, 500} },
+		PidsOK:       func() bool { return true },
+	}
+	// Cycle 1: pending (fails=1).
+	chk.Run(ctx, validEnv)
+	if e.H.Deps.State.Exists(latchdefs.LatchEphemeralPortPressure) {
+		t.Fatal("latch armed on cycle 1")
+	}
+
+	// PidsOK() == false during pending must abort inconclusive and preserve fails=1.
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     func() []int { return nil },
+		PidsOK:       func() bool { return false },
+	})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckEphemeralPorts, "inconclusive")); got != 1 {
+		t.Fatalf("inconclusive cycles=%v want 1", got)
+	}
+
+	// Cycle 2: preserved fails=1 confirms and arms LatchEphemeralPortPressure.
+	chk.Run(ctx, validEnv)
+	if !e.H.Deps.State.Exists(latchdefs.LatchEphemeralPortPressure) {
+		t.Fatal("expected LatchEphemeralPortPressure to arm on preserved fails=2")
+	}
+
+	// PidsOK() == false while armed must abort inconclusive and NOT fall back to PID 1 only / clear latch.
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     func() []int { return nil },
+		PidsOK:       func() bool { return false },
+	})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckEphemeralPorts, "inconclusive")); got != 2 {
+		t.Fatalf("inconclusive cycles=%v want 2", got)
+	}
+	if !e.H.Deps.State.Exists(latchdefs.LatchEphemeralPortPressure) {
+		t.Fatal("LatchEphemeralPortPressure cleared on PidsOK()=false")
+	}
+
+	// Proc.PIDs() error with PidsOnce == nil must also abort inconclusive and preserve latch.
+	e.H.Deps.Proc = procfs.New(filepath.Join(t.TempDir(), "missing-proc"))
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckEphemeralPorts, "inconclusive")); got != 3 {
+		t.Fatalf("inconclusive cycles=%v want 3", got)
+	}
+	if !e.H.Deps.State.Exists(latchdefs.LatchEphemeralPortPressure) {
+		t.Fatal("LatchEphemeralPortPressure cleared on Proc.PIDs() error")
 	}
 }

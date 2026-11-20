@@ -115,7 +115,8 @@ var serverTimeouts = httpx.Opts{
 // supervision loop (panic recovery, restart backoff,
 // subUp/restarts metrics) lives in supervisor.go.
 func (a *Agent) Run(ctx context.Context) error {
-	a.started.Store(time.Now().UnixNano())
+	now := time.Now()
+	a.started.Store(&now)
 
 	metricsSrv, err := httpx.New(a.cfg.MetricsAddr, a.metricsMux(), serverTimeouts)
 	if err != nil {

@@ -8,6 +8,7 @@
 package probee
 
 import (
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"strconv"
 )
@@ -23,7 +24,9 @@ func ListResourceVersion(body []byte) (int64, bool) {
 			ResourceVersion string `json:"resourceVersion"`
 		} `json:"metadata"`
 	}
-	if err := json.Unmarshal(body, &list); err != nil {
+	if err := json.Unmarshal(body, &list,
+		jsontext.AllowInvalidUTF8(true),
+		jsontext.AllowDuplicateNames(true)); err != nil {
 		return 0, false
 	}
 	rv, err := strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)

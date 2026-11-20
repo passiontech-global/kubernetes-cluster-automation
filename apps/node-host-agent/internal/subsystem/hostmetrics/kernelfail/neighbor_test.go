@@ -483,3 +483,34 @@ func TestUpdateNeighborLatchHysteresis(t *testing.T) {
 		t.Fatal("guard-off left the latch stuck")
 	}
 }
+
+func TestNeighborHysteresisTouchesHeldMtime(t *testing.T) {
+	f := kfixture(t)
+	now := time.Unix(1760000000, 0)
+	f.deps.Clock.Set(func() time.Time { return now })
+	f.r.deps.NeighFlushGuard = true
+
+	stateFile := filepath.Join(f.deps.StateDir, latchdefs.LatchFilePrefix+latchdefs.LatchNeighborPressure)
+	// Absent latch in [0.80, 0.92) hysteresis band must stay absent.
+	f.r.updateNeighborLatch(map[string]float64{"ipv4": 0.85})
+	if _, err := os.Stat(stateFile); !os.IsNotExist(err) {
+		t.Fatal("absent latch materialized in hysteresis band")
+	}
+
+	// Held latch aged past LatchTouchMinInterval refreshes mtime.
+	if err := os.WriteFile(stateFile, []byte("1700000000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-48 * time.Hour)
+	if err := os.Chtimes(stateFile, old, old); err != nil {
+		t.Fatal(err)
+	}
+	f.r.updateNeighborLatch(map[string]float64{"ipv4": 0.85})
+	fi, err := os.Stat(stateFile)
+	if err != nil {
+		t.Fatalf("latch vanished: %v", err)
+	}
+	if !fi.ModTime().Equal(now) {
+		t.Fatalf("neighbor hysteresis mtime = %v, want %v", fi.ModTime(), now)
+	}
+}

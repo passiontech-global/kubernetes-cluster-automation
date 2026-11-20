@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -162,7 +163,9 @@ func TestInotifyBumpCooldown(t *testing.T) {
 	if got := readSysctl(t, e, "max_user_instances"); got != "256" {
 		t.Fatalf("first bump failed: %s", got)
 	}
-	// Usage grows past 85% of the NEW ceiling inside the 30m window.
+	// Usage grows past 85% of the NEW ceiling inside the 30m window;
+	// advance past the 60s SharedFDCache TTL so the mutated /proc fd dir is re-read.
+	e.Now = e.Now.Add(2 * time.Minute)
 	mkInotifyPID(t, e, 100, 230, 0, "")
 	inotifyRun(e, 100)
 	if got := readSysctl(t, e, "max_user_instances"); got != "256" {
@@ -171,8 +174,8 @@ func TestInotifyBumpCooldown(t *testing.T) {
 	if !strings.Contains(e.LogLines(t), "in 30m cooldown") {
 		t.Fatalf("missing cooldown suspect line:\n%s", e.LogLines(t))
 	}
-	// 31m later the budget reopens and the next doubling lands.
-	e.Now = e.Now.Add(31 * time.Minute)
+	// 30m later (32m total > 30m budget) the budget reopens and the next doubling lands.
+	e.Now = e.Now.Add(30 * time.Minute)
 	inotifyRun(e, 100)
 	if got := readSysctl(t, e, "max_user_instances"); got != "512" {
 		t.Fatalf("post-cooldown bump failed: %s want 512", got)
@@ -263,7 +266,8 @@ func TestInotifyLatchExitAt80Percent(t *testing.T) {
 	if !inotifyLatched(e) {
 		t.Fatal("latch did not arm")
 	}
-	// Usage collapses → next cycle exits the latch.
+	// Usage collapses → advance past 60s SharedFDCache TTL so the next cycle sees 4 and exits the latch.
+	e.Now = e.Now.Add(2 * time.Minute)
 	mkInotifyPID(t, e, 100, 4, 0, "")
 	inotifyRun(e, 100)
 	if inotifyLatched(e) {
@@ -590,5 +594,141 @@ func TestInotifyEvictRailsNakedPVCAndMirror(t *testing.T) {
 				t.Fatalf("%s missing protection suspect log:\n%s", tc.name, e.LogLines(t))
 			}
 		})
+	}
+}
+
+func TestInotifySharedFDCacheTTLAndProcUnreadableAbort(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 100
+	e.H.Cfg.Pressure.InotifyEvictRunawayPod = false
+	writeInotifySysctls(t, e, 100, 8192)
+	mkInotifyPID(t, e, 100, 96, 0, "")
+
+	// Latch after 2 cycles.
+	inotifyRun(e, 100)
+	inotifyRun(e, 100)
+	if !inotifyLatched(e) {
+		t.Fatal("latch did not arm")
+	}
+
+	// Mutate /proc/100/fd down to 4 WITHOUT advancing e.Now past 60s ->
+	// SharedFDCache serves the cached 96 snapshot, so latch stays armed.
+	mkInotifyPID(t, e, 100, 4, 0, "")
+	e.Now = e.Now.Add(30 * time.Second)
+	inotifyRun(e, 100)
+	if !inotifyLatched(e) {
+		t.Fatal("expected SharedFDCache 60s TTL reuse to keep cached snapshot")
+	}
+
+	// Advance past 60s -> cache expires, re-scans /proc, sees 4, exits latch.
+	e.Now = e.Now.Add(31 * time.Second)
+	inotifyRun(e, 100)
+	if inotifyLatched(e) {
+		t.Fatal("expected latch to exit after SharedFDCache 60s TTL expired")
+	}
+
+	// Re-arm latch on a second fixture, then remove ProcDir pid dirs ->
+	// wait: sysctls are still read from ProcDir, so point ProcRoot after
+	// reading? No, if ProcDir itself is unreadable, readSysctls aborts too;
+	// if we test !snap.ProcOK specifically, keep sysctls in ProcDir? Wait:
+	// SharedFDCache lists ProcRoot; if ProcRoot doesn't exist, readSysctls
+	// fails first. Both abort cleanly without exiting the latch!
+	e2 := fixture(t)
+	e2.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 100
+	e2.H.Cfg.Pressure.InotifyEvictRunawayPod = false
+	writeInotifySysctls(t, e2, 100, 8192)
+	mkInotifyPID(t, e2, 100, 96, 0, "")
+	inotifyRun(e2, 100)
+	inotifyRun(e2, 100)
+	if !inotifyLatched(e2) {
+		t.Fatal("latch did not arm on e2")
+	}
+	// Remove /proc/100 only? No, empty /proc has ProcOK=true.
+	// Remove ProcRoot entirely -> abort keeps latch intact!
+	if err := os.RemoveAll(e2.ProcDir); err != nil {
+		t.Fatal(err)
+	}
+	e2.Now = e2.Now.Add(2 * time.Minute)
+	inotifyRun(e2, 100)
+	if !inotifyLatched(e2) {
+		t.Fatal("unreadable /proc must abort without clearing state-inotify-pressure")
+	}
+}
+
+func TestInotifyWarmSharedFDCachePidsOKFalseAbortsAndKeepsLatch(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 100
+	e.H.Cfg.Pressure.InotifyEvictRunawayPod = false
+	writeInotifySysctls(t, e, 100, 8192)
+	mkInotifyPID(t, e, 100, 96, 0, "")
+
+	inotifyRun(e, 100)
+	inotifyRun(e, 100)
+	if !inotifyLatched(e) {
+		t.Fatal("latch did not arm")
+	}
+
+	// Within the 60s SharedFDCache TTL, simulate Proc.PIDs() failure via PidsOK=false.
+	e.Now = e.Now.Add(10 * time.Second)
+	chk := e.H.Check(wdeps.CheckInotifyHygiene)
+	chk.Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     func() []int { return nil },
+		PidsOK:       func() bool { return false },
+	})
+	if !inotifyLatched(e) {
+		t.Fatal("PidsOK=false inside SharedFDCache TTL falsely cleared LatchInotifyPressure")
+	}
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1", got)
+	}
+
+	// Contrast: genuine 0 PIDs (PidsOK=true) after TTL expires exits normally.
+	e.Now = e.Now.Add(61 * time.Second)
+	if err := os.RemoveAll(filepath.Join(e.ProcDir, "100")); err != nil {
+		t.Fatal(err)
+	}
+	chk.Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     wdepstest.PidsOf(),
+		PidsOK:       func() bool { return true },
+	})
+	if inotifyLatched(e) {
+		t.Fatal("genuine empty /proc with PidsOK=true did not clear LatchInotifyPressure")
+	}
+}
+
+func TestInotifyColdSharedFDCacheProcChmod0111ImmediateRecovery(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0111 does not block root")
+	}
+	e := fixture(t)
+	e.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 100
+	e.H.Cfg.Pressure.InotifyEvictRunawayPod = false
+	writeInotifySysctls(t, e, 100, 8192)
+	mkInotifyPID(t, e, 100, 4, 0, "")
+
+	// Cold SharedFDCache while /proc is 0o111 (sysctls readable via +x, ReadDir fails EACCES).
+	if err := os.Chmod(e.ProcDir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.ProcDir, 0o755) })
+
+	chk := e.H.Check(wdeps.CheckInotifyHygiene)
+	chk.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1 on 0o111 /proc", got)
+	}
+
+	// Restore /proc to 0o755 and advance only +10s (well within 60s SharedFDCache TTL).
+	if err := os.Chmod(e.ProcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.Now = e.Now.Add(10 * time.Second)
+	chk.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "ok")); got != 1 {
+		t.Fatalf("ok cycles=%v want 1 at +10s recovery (pinned in abort by negative FDCache?)", got)
 	}
 }

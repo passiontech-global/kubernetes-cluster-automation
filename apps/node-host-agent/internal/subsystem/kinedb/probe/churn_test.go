@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdepstest"
@@ -136,5 +137,36 @@ func TestResHeadQueryFailZeros(t *testing.T) {
 	})
 	if got := k.resHead(context.Background(), "pg", "postgres", "secret"); got != 0 {
 		t.Fatalf("resHead=%d want 0", got)
+	}
+}
+
+func TestProbeTopChurnBackwardClockReseeds(t *testing.T) {
+	now := time.Unix(kdepstest.TestNow, 0)
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "split_part(name", Out: "pods|42\n"},
+		{Substr: "MAX(id)", Out: "9500\n"},
+	})
+	k.d.Cfg.Clock.Set(func() time.Time { return now })
+	gdir := filepath.Join(dir, "guard")
+	// Future watermark (2h ahead of now due to backward clock step).
+	kdeps.WriteIntFile(filepath.Join(gdir, churnFileHead), 12000)
+	kdeps.WriteIntFile(filepath.Join(gdir, churnFileTS), now.Add(2*time.Hour).Unix())
+
+	k.probeTopChurn(context.Background(), "pg", "postgres", "secret", func(string) {})
+	if strings.Contains(fr.Joined(), "split_part(name") {
+		t.Fatalf("expected watermark re-seed, not churn query:\n%s", fr.Joined())
+	}
+	if ts, _ := kdeps.ReadIntFile(filepath.Join(gdir, churnFileTS)); ts != now.Unix() {
+		t.Fatalf("churn ts not re-seeded to now: got %d want %d", ts, now.Unix())
+	}
+	if h, _ := kdeps.ReadIntFile(filepath.Join(gdir, churnFileHead)); h != 9500 {
+		t.Fatalf("churn head not re-seeded to resHead: got %d want 9500", h)
+	}
+
+	// Advancing past defaultChurnWindow (5m, well before +2h) resumes sampling.
+	now = now.Add(defaultChurnWindow + time.Second)
+	k.probeTopChurn(context.Background(), "pg", "postgres", "secret", func(string) {})
+	if len(k.d.ChurnTop) != 1 || k.d.ChurnTop[0].Resource != "pods" {
+		t.Fatalf("churn sampling stayed frozen after re-seed: %+v", k.d.ChurnTop)
 	}
 }

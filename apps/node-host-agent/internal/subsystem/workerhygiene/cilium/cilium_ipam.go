@@ -118,11 +118,18 @@ func ParseCiliumIPAM(body []byte) (used, available int, ok bool) {
 		if err := json.Unmarshal(raw, &obj); err != nil {
 			return 0, -1, false
 		}
+		hasUsed := false
 		if n, found := ipamCount(obj.Used); found {
 			used = n
+			hasUsed = true
 		}
+		hasAvail := false
 		if n, found := ipamCount(obj.Available); found {
 			available = n
+			hasAvail = true
+		}
+		if !hasUsed && !hasAvail {
+			return 0, -1, false
 		}
 		return used, available, true
 	case '[':
@@ -173,7 +180,7 @@ func (c *CiliumIPAMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckCiliumIPAM, "abort")
 		return
 	}
-	body, err := c.d.Cfg.Seams.Cilium.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/healthz")
+	body, err := c.d.CiliumHealthz(ctx, e)
 	if err != nil {
 		// Socket unreadable — inconclusive: keep counters/latch
 		// (same rule as checkCiliumInitStuck).

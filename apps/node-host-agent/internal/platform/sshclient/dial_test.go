@@ -270,7 +270,8 @@ func TestHandshakeDeadConnIsLoud(t *testing.T) {
 
 	var buf bytes.Buffer
 	cfg.Log = slog.New(slog.NewTextHandler(&buf, nil))
-	if _, err := cfg.Handshake(context.Background(), deadConn(), deadConn(),
+	dc := deadConn()
+	if _, err := cfg.Handshake(context.Background(), dc, dc,
 		addr, sshCfg); err == nil {
 		t.Fatal("handshake on a dead conn want error")
 	}

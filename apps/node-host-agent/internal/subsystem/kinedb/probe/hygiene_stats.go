@@ -33,6 +33,24 @@ import (
 // hygieneWAL's disk-ratio read consume the fields it sets.
 func (p *Probe) hygieneScalarStats(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
+	p.hygieneScalarStatsWithBatch(ctx, pg, user, pass, h, nil, 1, note)
+}
+
+func (p *Probe) hygieneScalarStatsWithBatch(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, batch *probeBatch, backendEnv int64, note func(string)) {
+	if batch != nil && batch.err == nil &&
+		(batch.idleSeen || batch.deadSeen || batch.xidSeen || batch.walSeen || batch.archSeen) {
+		p.parseScalarStatsLines(batch.idleLine, batch.deadLine, batch.xidLine, batch.walLine, batch.archLine, h, note)
+		return
+	}
+	if batch != nil && !batch.canFallback(ctx, backendEnv) {
+		note(fmt.Sprintf("idle-tx-fail: %v", batch.err))
+		note(fmt.Sprintf("dead-tuple-fail: %v", batch.err))
+		note(fmt.Sprintf("xid-age-fail: %v", batch.err))
+		note(fmt.Sprintf("wal-size-fail: %v", batch.err))
+		note(fmt.Sprintf("archiver-fail: %v", batch.err))
+		return
+	}
 	table := kdeps.SQLQuote(p.d.Cfg.Table)
 	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
 		// 1. idle-in-transaction census (COUNT(pid), never COUNT(*)
@@ -73,28 +91,33 @@ func (p *Probe) hygieneScalarStats(ctx context.Context, pg, user, pass string,
 		}
 		return ""
 	}
-	if v, perr := strconv.ParseInt(line(0), 10, 64); perr != nil {
+	p.parseScalarStatsLines(line(0), line(1), line(2), line(3), line(4), h, note)
+}
+
+func (p *Probe) parseScalarStatsLines(idleLine, deadLine, xidLine, walLine, archLine string,
+	h *hygieneResult, note func(string)) {
+	if v, perr := strconv.ParseInt(idleLine, 10, 64); perr != nil {
 		note(fmt.Sprintf("idle-tx-unparsed: %v", perr))
 	} else {
 		h.idleInTx, h.idleSeen = v, true
 	}
-	if dead, live, perr := kdeps.ParsePair(line(1)); perr != nil {
+	if dead, live, perr := kdeps.ParsePair(deadLine); perr != nil {
 		note(fmt.Sprintf("dead-tuple-unparsed: %v", perr))
 	} else {
 		h.deadTup, h.deadSeen = dead, true
 		h.deadRatio = float64(dead) / float64(max(live, 1))
 	}
-	if v, perr := strconv.ParseInt(line(2), 10, 64); perr != nil {
+	if v, perr := strconv.ParseInt(xidLine, 10, 64); perr != nil {
 		note(fmt.Sprintf("xid-age-unparsed: %v", perr))
 	} else {
 		h.xidAge, h.xidSeen = v, true
 	}
-	if v, perr := strconv.ParseInt(line(3), 10, 64); perr != nil {
+	if v, perr := strconv.ParseInt(walLine, 10, 64); perr != nil {
 		note(fmt.Sprintf("wal-size-unparsed: %v", perr))
 	} else {
 		h.walBytes, h.walSeen = v, true
 	}
-	if v, perr := strconv.ParseInt(line(4), 10, 64); perr != nil {
+	if v, perr := strconv.ParseInt(archLine, 10, 64); perr != nil {
 		note(fmt.Sprintf("archiver-unparsed: %v", perr))
 	} else {
 		h.archiveStale, h.archiveSeen = v, true

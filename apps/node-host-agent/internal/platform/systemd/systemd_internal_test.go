@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -64,4 +65,128 @@ func TestClientMethodsAndCLIFallbacks(t *testing.T) {
 	if err := c.ResetFailed(ctx, "k0sworker"); err != nil {
 		t.Fatalf("ResetFailed: %v", err)
 	}
+}
+
+func TestRunVerbHonorsCallerDeadline(t *testing.T) {
+	const cfgTimeout = 2 * time.Second
+
+	t.Run("dbus_preserves_longer_deadline", func(t *testing.T) {
+		c := New(Config{
+			HostRoot: t.TempDir(),
+			Timeout:  cfgTimeout,
+			RunCmd: func(context.Context, []string) (string, error) {
+				return "", errors.New("cli should not run")
+			},
+		})
+		defer c.Close()
+		c.dbus = newDBusBackend(t.TempDir())
+
+		wantDL := time.Now().Add(90 * time.Second)
+		ctx, cancel := context.WithDeadline(context.Background(), wantDL)
+		defer cancel()
+
+		var gotDL time.Time
+		if err := c.runVerb(ctx, func(dctx context.Context) error {
+			var ok bool
+			gotDL, ok = dctx.Deadline()
+			if !ok {
+				t.Fatal("dbusCtx missing deadline")
+			}
+			return nil
+		}, "restart", "k0sworker"); err != nil {
+			t.Fatalf("runVerb: %v", err)
+		}
+		if gotDL.Sub(wantDL).Abs() > time.Millisecond {
+			t.Fatalf("dbusCtx deadline = %v, want %v (diff %v)", gotDL, wantDL, gotDL.Sub(wantDL))
+		}
+	})
+
+	t.Run("dbus_bounds_unbudgeted_ctx", func(t *testing.T) {
+		c := New(Config{
+			HostRoot: t.TempDir(),
+			Timeout:  cfgTimeout,
+			RunCmd: func(context.Context, []string) (string, error) {
+				return "", errors.New("cli should not run")
+			},
+		})
+		defer c.Close()
+		c.dbus = newDBusBackend(t.TempDir())
+
+		before := time.Now()
+		var gotDL time.Time
+		if err := c.runVerb(context.Background(), func(dctx context.Context) error {
+			var ok bool
+			gotDL, ok = dctx.Deadline()
+			if !ok {
+				t.Fatal("dbusCtx missing fallback deadline")
+			}
+			return nil
+		}, "restart", "k0sworker"); err != nil {
+			t.Fatalf("runVerb: %v", err)
+		}
+		rem := gotDL.Sub(before)
+		if rem < cfgTimeout-200*time.Millisecond || rem > cfgTimeout+200*time.Millisecond {
+			t.Fatalf("dbusCtx fallback timeout = %v, want ~%v", rem, cfgTimeout)
+		}
+	})
+
+	t.Run("cli_fallback_preserves_longer_deadline", func(t *testing.T) {
+		var gotDL time.Time
+		c := New(Config{
+			HostRoot: t.TempDir(),
+			Timeout:  cfgTimeout,
+			RunCmd: func(ctx context.Context, _ []string) (string, error) {
+				var ok bool
+				gotDL, ok = ctx.Deadline()
+				if !ok {
+					t.Fatal("RunCmd ctx missing deadline")
+				}
+				return "", nil
+			},
+		})
+		defer c.Close()
+		c.dbus = newDBusBackend(t.TempDir())
+
+		wantDL := time.Now().Add(90 * time.Second)
+		ctx, cancel := context.WithDeadline(context.Background(), wantDL)
+		defer cancel()
+
+		err := c.runVerb(ctx, func(context.Context) error {
+			return errDBusUnavailable
+		}, "restart", "k0sworker")
+		if err != nil {
+			t.Fatalf("runVerb: %v", err)
+		}
+		if gotDL.Sub(wantDL).Abs() > 50*time.Millisecond {
+			t.Fatalf("CLI fallback deadline = %v, want ~%v (diff %v)", gotDL, wantDL, gotDL.Sub(wantDL))
+		}
+	})
+
+	t.Run("cli_fallback_respects_shorter_deadline", func(t *testing.T) {
+		var gotDL time.Time
+		c := New(Config{
+			HostRoot: t.TempDir(),
+			Timeout:  cfgTimeout,
+			RunCmd: func(ctx context.Context, _ []string) (string, error) {
+				var ok bool
+				gotDL, ok = ctx.Deadline()
+				if !ok {
+					t.Fatal("RunCmd ctx missing deadline")
+				}
+				return "", nil
+			},
+		})
+		defer c.Close()
+
+		wantDL := time.Now().Add(500 * time.Millisecond)
+		ctx, cancel := context.WithDeadline(context.Background(), wantDL)
+		defer cancel()
+
+		if err := c.Restart(ctx, "k0sworker"); err != nil {
+			t.Fatalf("Restart: %v", err)
+		}
+		if gotDL.After(wantDL.Add(5 * time.Millisecond)) {
+			t.Fatalf("shorter deadline exceeded: got %v > want %v", gotDL, wantDL)
+		}
+	})
 }

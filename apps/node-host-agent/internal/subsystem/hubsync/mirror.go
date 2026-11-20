@@ -30,23 +30,13 @@ func isKeyMaterial(name string) bool {
 		strings.Contains(n, "private")
 }
 
-// syncDir mirrors every regular file of localDir into remoteDir —
-// sha256-gated, atomic tmp+chmod+mv writes; the remote sums hash in
-// ONE batched session (remoteSHA256All) instead of one SSH
-// round-trip per file. ConfigMap
-// volumes expose keys as symlinks, so "regular" means non-dir,
-// non-hidden entries; ReadFile resolves the ..data links. A non-nil
-// keep filter further restricts which filenames are mirrored. Key
-// material is chmod'd 0600 regardless of mode. Finally, remote files
-// absent from the local set are removed — remoteDir is a dedicated
-// managed dir, and a locally-deleted file would otherwise linger on
-// every target forever.
-func (s *Syncer) syncDir(ctx context.Context, c Conn, localDir, remoteDir, mode string, keep func(string) bool) error {
+// readLocalMirror lists local non-hidden non-dir files matching keep,
+// sorted by name, along with their remote destination paths.
+func readLocalMirror(localDir, remoteDir string, keep func(string) bool) (names, rpaths []string, err error) {
 	entries, err := os.ReadDir(localDir)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	var names []string
 	for _, e := range entries {
 		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
@@ -57,14 +47,15 @@ func (s *Syncer) syncDir(ctx context.Context, c Conn, localDir, remoteDir, mode 
 		names = append(names, e.Name())
 	}
 	slices.Sort(names)
-	rpaths := make([]string, len(names))
+	rpaths = make([]string, len(names))
 	for i := range names {
 		rpaths[i] = path.Join(remoteDir, names[i])
 	}
-	sums, err := remoteSHA256All(ctx, c, rpaths)
-	if err != nil {
-		return err
-	}
+	return names, rpaths, nil
+}
+
+// syncMirrorFiles uploads any file in names whose sha256 differs from sums.
+func syncMirrorFiles(ctx context.Context, c Conn, localDir, remoteDir, mode string, names []string, sums map[string]string) error {
 	for _, name := range names {
 		data, err := os.ReadFile(path.Join(localDir, name))
 		if err != nil {
@@ -82,6 +73,32 @@ func (s *Syncer) syncDir(ctx context.Context, c Conn, localDir, remoteDir, mode 
 		if err := putAtomic(ctx, c, rp, bytes.NewReader(data), m); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// syncDir mirrors every regular file of localDir into remoteDir —
+// sha256-gated, atomic tmp+chmod+mv writes; the remote sums hash in
+// ONE batched session (remoteSHA256All) instead of one SSH
+// round-trip per file. ConfigMap
+// volumes expose keys as symlinks, so "regular" means non-dir,
+// non-hidden entries; ReadFile resolves the ..data links. A non-nil
+// keep filter further restricts which filenames are mirrored. Key
+// material is chmod'd 0600 regardless of mode. Finally, remote files
+// absent from the local set are removed — remoteDir is a dedicated
+// managed dir, and a locally-deleted file would otherwise linger on
+// every target forever.
+func (s *Syncer) syncDir(ctx context.Context, c Conn, localDir, remoteDir, mode string, keep func(string) bool) error {
+	names, rpaths, err := readLocalMirror(localDir, remoteDir, keep)
+	if err != nil {
+		return err
+	}
+	sums, err := remoteSHA256All(ctx, c, rpaths)
+	if err != nil {
+		return err
+	}
+	if err := syncMirrorFiles(ctx, c, localDir, remoteDir, mode, names, sums); err != nil {
+		return err
 	}
 	return s.pruneRemoteDir(ctx, c, remoteDir, names)
 }
@@ -112,11 +129,18 @@ func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, n
 	if err != nil {
 		return fmt.Errorf("ls %s: %w", remoteDir, err)
 	}
+	if err := s.removeStaleEntries(ctx, c, remoteDir, names, strings.Split(out, "\n")); err != nil {
+		return err
+	}
+	return s.sweepTmpOrphans(ctx, c, remoteDir)
+}
+
+func (s *Syncer) removeStaleEntries(ctx context.Context, c Conn, remoteDir string, names, entries []string) error {
 	local := make(map[string]bool, len(names))
 	for _, n := range names {
 		local[n] = true
 	}
-	for rname := range strings.SplitSeq(out, "\n") {
+	for _, rname := range entries {
 		rname = strings.TrimSpace(rname)
 		if rname == "" || local[rname] || strings.HasSuffix(rname, "/") ||
 			strings.HasPrefix(rname, ".") {
@@ -128,7 +152,24 @@ func (s *Syncer) pruneRemoteDir(ctx context.Context, c Conn, remoteDir string, n
 		s.cfg.Log.Info("hubsync: removed stale remote file",
 			"path", path.Join(remoteDir, rname))
 	}
-	return s.sweepTmpOrphans(ctx, c, remoteDir)
+	return nil
+}
+
+func (s *Syncer) removeOrphanEntries(ctx context.Context, c Conn, dir string, entries []string) {
+	for _, name := range entries {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, err := c.Run(ctx, "rm -f "+
+			fsx.ShellQuote(path.Join(dir, name))); err != nil {
+			s.cfg.Log.Warn("hubsync: tmp-orphan rm failed",
+				"path", path.Join(dir, name), "error", err)
+			continue
+		}
+		s.cfg.Log.Info("hubsync: removed orphan staging file",
+			"path", path.Join(dir, name))
+	}
 }
 
 // tmpOrphanMinAge is the in-flight window sweepTmpOrphans honors:
@@ -155,35 +196,49 @@ func (s *Syncer) sweepTmpOrphans(ctx context.Context, c Conn, dir string) error 
 			"dir", dir, "error", err)
 		return nil
 	}
-	for name := range strings.SplitSeq(out, "\n") {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		if _, err := c.Run(ctx, "rm -f "+
-			fsx.ShellQuote(path.Join(dir, name))); err != nil {
-			s.cfg.Log.Warn("hubsync: tmp-orphan rm failed",
-				"path", path.Join(dir, name), "error", err)
-			continue
-		}
-		s.cfg.Log.Info("hubsync: removed orphan staging file",
-			"path", path.Join(dir, name))
-	}
+	s.removeOrphanEntries(ctx, c, dir, strings.Split(out, "\n"))
 	return nil
 }
 
-// putIfChanged writes data to remotePath only when the remote sha256
-// differs — the ansible copy-module checksum gating.
-func (s *Syncer) putIfChanged(ctx context.Context, c Conn, remotePath string, data []byte, mode string) error {
+// putIfChangedWithSum writes data to remotePath only when the pre-fetched
+// remote sha256 differs — the ansible copy-module checksum gating.
+func putIfChangedWithSum(ctx context.Context, c Conn, remotePath string, data []byte, mode, remoteSum string) error {
 	sum := sha256.Sum256(data)
-	remote, err := remoteSHA256(ctx, c, remotePath)
-	if err != nil {
-		return err
-	}
-	if remote == hex.EncodeToString(sum[:]) {
+	if remoteSum == hex.EncodeToString(sum[:]) {
 		return nil
 	}
 	return putAtomic(ctx, c, remotePath, bytes.NewReader(data), mode)
+}
+
+// localBinarySum returns the SHA-256 hex digest of p, caching by
+// (path, fsx.FileStatKey(p)) with post-hash FileStatKey verification
+// to avoid re-hashing unchanged ~15-47MiB binaries every cycle.
+func (s *Syncer) localBinarySum(p string) (string, error) {
+	key, kerr := fsx.FileStatKey(p)
+	if kerr == nil {
+		s.binMu.Lock()
+		if s.binPath == p && s.binStatKey == key && s.binSum != "" {
+			sum := s.binSum
+			s.binMu.Unlock()
+			return sum, nil
+		}
+		s.binMu.Unlock()
+	}
+	sum, err := sha256File(p)
+	if err != nil {
+		s.binMu.Lock()
+		s.binPath, s.binStatKey, s.binSum = "", "", ""
+		s.binMu.Unlock()
+		return "", err
+	}
+	if kerr == nil {
+		if key2, kerr2 := fsx.FileStatKey(p); kerr2 == nil && key2 == key {
+			s.binMu.Lock()
+			s.binPath, s.binStatKey, s.binSum = p, key, sum
+			s.binMu.Unlock()
+		}
+	}
+	return sum, nil
 }
 
 // sha256File hashes a local file without loading it whole — the

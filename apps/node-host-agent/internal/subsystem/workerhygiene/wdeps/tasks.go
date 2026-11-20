@@ -110,6 +110,11 @@ func (d *Deps) ProcAge(pid int) time.Duration {
 func (d *Deps) PidsWithCmdline(sub string, pids []int) []int {
 	var out []int
 	for _, pid := range pids {
+		st, ok := d.Proc.Stat(pid)
+		if !ok || len(st.Fields) == 0 ||
+			st.Fields[0] == "D" || st.Fields[0] == "Z" || st.Fields[0] == "X" || st.Fields[0] == "x" {
+			continue
+		}
 		if strings.Contains(strings.Join(d.Proc.Cmdline(pid), " "), sub) {
 			out = append(out, pid)
 		}
@@ -138,6 +143,16 @@ func (d *Deps) ProcStatStatePPID(pid int) (state string, ppid int, ok bool) {
 func (d *Deps) StateFileExists(name string) bool {
 	_, err := os.Stat(filepath.Join(d.Cfg.WatchdogStateDir, name))
 	return err == nil
+}
+
+// ReadMountinfo reads Cfg.MountinfoFile once per cycle via
+// e.MountinfoOnce when set, falling back to an uncached os.ReadFile
+// when e or MountinfoOnce is nil.
+func (d *Deps) ReadMountinfo(e *CycleEnv) ([]byte, error) {
+	if e != nil && e.MountinfoOnce != nil {
+		return e.MountinfoOnce()
+	}
+	return os.ReadFile(d.Cfg.MountinfoFile)
 }
 
 // CtrTask is one containerd task dir (runtime-v2 task or sandbox
@@ -191,6 +206,14 @@ func (d *Deps) BuildTaskMap() (map[string][]CtrTask, bool) {
 			dir := filepath.Join(root, e.Name())
 			cfgData, err := os.ReadFile(filepath.Join(dir, "config.json"))
 			if err != nil {
+				if !os.IsNotExist(err) {
+					complete = false
+					if d.State != nil {
+						d.State.AppendLog(fmt.Sprintf(
+							"suspect: ctr task %s/config.json unreadable: %v — task map incomplete",
+							dir, err))
+					}
+				}
 				continue
 			}
 			um := PodUIDRe.FindSubmatch(cfgData)
@@ -206,11 +229,47 @@ func (d *Deps) BuildTaskMap() (map[string][]CtrTask, bool) {
 					t.PID = pid
 					t.Live = d.PidLive(pid)
 				}
+			} else if !os.IsNotExist(err) {
+				complete = false
+				if d.State != nil {
+					d.State.AppendLog(fmt.Sprintf(
+						"suspect: ctr task %s/init.pid unreadable: %v — task map incomplete",
+						dir, err))
+				}
 			}
 			m[t.UID] = append(m[t.UID], t)
 		}
 	}
 	return m, complete
+}
+
+// CyclePIDs returns the cycle's /proc PID list via e.PidsOnce when
+// wired, falling back to d.Proc.PIDs() for hand-built CycleEnvs.
+// ok=false when the underlying Proc.PIDs() read failed (distinguished
+// from a genuinely empty /proc via e.PidsOK when wired).
+func (d *Deps) CyclePIDs(e *CycleEnv) ([]int, bool) {
+	if e != nil && e.PidsOnce != nil {
+		pids := e.PidsOnce()
+		if e.PidsOK != nil && !e.PidsOK() {
+			return nil, false
+		}
+		return pids, true
+	}
+	pids, err := d.Proc.PIDs()
+	if err != nil {
+		return nil, false
+	}
+	return pids, true
+}
+
+// CycleTasks returns the cycle's containerd task map via e.TasksOnce
+// when wired, falling back to d.BuildTaskMap() for hand-built
+// CycleEnvs. The second return is the root-reachability complete flag.
+func (d *Deps) CycleTasks(e *CycleEnv) (map[string][]CtrTask, bool) {
+	if e != nil && e.TasksOnce != nil {
+		return e.TasksOnce()
+	}
+	return d.BuildTaskMap()
 }
 
 // CountLive returns how many tasks of a UID still have a live init

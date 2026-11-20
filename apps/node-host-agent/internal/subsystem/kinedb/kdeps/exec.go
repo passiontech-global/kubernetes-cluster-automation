@@ -124,9 +124,11 @@ func (d *Deps) memoizedContainerName(ctx context.Context, key string,
 	d.nameMu.Lock()
 	defer d.nameMu.Unlock()
 	if d.nameCache != nil {
-		if m, ok := d.nameCache[key]; ok &&
-			d.Cfg.Clock.Now().Sub(m.at) < nameMemoTTL {
-			return m.name
+		if m, ok := d.nameCache[key]; ok {
+			age := d.Cfg.Clock.Now().Sub(m.at)
+			if age >= 0 && age < nameMemoTTL {
+				return m.name
+			}
 		}
 	}
 	name := fn(ctx)
@@ -262,7 +264,29 @@ const (
 	// a tiny configured LongCmdTimeout cannot produce a nonsense
 	// (or negative) PGOPTIONS value.
 	maintMinStatementTimeout = 30 * time.Second
+	queryStmtTimeoutMargin   = 15 * time.Second
+	queryMinStmtTimeout      = 10 * time.Second
 )
+
+func (d *Deps) queryPGOptions() string {
+	stmt := d.Cfg.CmdTimeout
+	if stmt > queryMinStmtTimeout {
+		stmt -= queryStmtTimeoutMargin
+		if stmt < queryMinStmtTimeout {
+			stmt = queryMinStmtTimeout
+		}
+	}
+	if stmt <= 0 {
+		stmt = queryMinStmtTimeout
+	}
+	return fmt.Sprintf("-c statement_timeout=%d", stmt.Milliseconds())
+}
+
+// PsqlQueryEnv is PsqlPassEnv plus the query PGOPTIONS statement_timeout
+// bound derived from CmdTimeout.
+func (d *Deps) PsqlQueryEnv(pass, appName string) []string {
+	return append(PsqlPassEnv(pass, appName), "PGOPTIONS="+d.queryPGOptions())
+}
 
 // maintPGOptions renders the PGOPTIONS value every long-budget
 // maintenance psql session carries. Derived from LongCmdTimeout so
@@ -289,9 +313,11 @@ func (d *Deps) PsqlMaintEnv(pass, appName string) []string {
 	return append(PsqlPassEnv(pass, appName), "PGOPTIONS="+d.maintPGOptions())
 }
 
-// PsqlQuery runs one statement with -tAc (unaligned, tuples only).
+// PsqlQuery runs one statement with -tAc (unaligned, tuples only) and
+// forwards PGOPTIONS statement_timeout so a timed-out exec does not
+// leave an unbounded backend query running server-side.
 func (d *Deps) PsqlQuery(ctx context.Context, pg, user, pass, appName, sql string) (string, error) {
-	return d.ExecEnv(ctx, PsqlPassEnv(pass, appName), d.PsqlArgs(pg, user, false, "-tAc", sql), "")
+	return d.ExecEnv(ctx, d.PsqlQueryEnv(pass, appName), d.PsqlMaintArgs(pg, user, false, "-tAc", sql), "")
 }
 
 // PsqlScript runs a multi-statement script in ONE psql session via
@@ -408,6 +434,15 @@ func (d *Deps) holdPGOptions() string {
 // pg_sleep statement_timeout would fire.
 func (d *Deps) HoldAdvisoryLock(ctx context.Context, pg, user, pass,
 	appName string, holdTimeout time.Duration) (release func(), held bool, err error) {
+	return d.holdAdvisoryLock(ctx, pg, user, pass, appName, holdTimeout, nil)
+}
+
+func (d *Deps) holdAdvisoryLock(ctx context.Context, pg, user, pass,
+	appName string, holdTimeout time.Duration,
+	beforePoll func(done <-chan struct{})) (release func(), held bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 
 	holdApp := fmt.Sprintf("%s-hold-%d-%d", appName, os.Getpid(),
 		holdNonce.Add(1))
@@ -418,6 +453,8 @@ func (d *Deps) HoldAdvisoryLock(ctx context.Context, pg, user, pass,
 			"\\else\n\\echo 'advisory-lock-busy'\n\\endif\n",
 		d.Cfg.AdvisoryLockID)
 
+	var holdOut string
+	var holdErr error
 	holdCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -432,12 +469,26 @@ func (d *Deps) HoldAdvisoryLock(ctx context.Context, pg, user, pass,
 			d.Cfg.LongCmdTimeout+holdStmtTimeoutMargin)
 		defer ccancel()
 		cycle.RunWithHeartbeat(cctx, time.Minute, func(hctx context.Context) {
-			_, _ = d.Cfg.Run(hctx,
+			holdOut, holdErr = d.Cfg.Run(hctx,
 				append(PsqlPassEnv(pass, holdApp),
 					"PGOPTIONS="+d.holdPGOptions()),
 				d.PsqlMaintArgs(pg, user, true, "-f", "-"), script)
 		})
 	}()
+
+	// terminateHold terminates our server-side hold backend by its
+	// unique application_name under a non-canceled bounded ctx so an
+	// expired or canceled caller ctx never leaves pg_sleep(86400)
+	// holding the advisory lock on the server.
+	terminateHold := func() {
+		tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), d.Cfg.CmdTimeout)
+		defer tcancel()
+		_, _ = d.PsqlQuery(tctx, pg, user, pass,
+			AppNameMaint, fmt.Sprintf(
+				"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "+
+					"WHERE application_name = '%s' AND pid <> pg_backend_pid()",
+				strings.ReplaceAll(holdApp, "'", "''")))
+	}
 
 	releaseFn := func() {
 		// Terminate OUR hold backend BEFORE cancelling the exec —
@@ -445,33 +496,75 @@ func (d *Deps) HoldAdvisoryLock(ctx context.Context, pg, user, pass,
 		// exec; the server-side psql would keep sleeping until its
 		// statement_timeout and squat on the advisory lock the
 		// whole time, blocking compact and emergency VACUUM.
-		// WithoutCancel keeps the kill working when the caller's
-		// ctx already expired; ExecEnv's own CmdTimeout still
-		// bounds the query.
-		_, _ = d.PsqlQuery(context.WithoutCancel(ctx), pg, user, pass,
-			AppNameMaint, fmt.Sprintf(
-				"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "+
-					"WHERE application_name = '%s' AND pid <> pg_backend_pid()",
-				strings.ReplaceAll(holdApp, "'", "''")))
+		terminateHold()
 		cancel()
 		<-done
 	}
 
+	abortHold := func() {
+		cancel()
+		<-done
+		terminateHold()
+	}
+
 	// lockHeld reports whether OUR nonce-named backend holds the
-	// GRANTED advisory lock — classid=0/objsubid=1 pin the
-	// single-bigint form, granted excludes waiters.
+	// GRANTED advisory lock — pg_locks splits bigint AdvisoryLockID
+	// into unsigned 32-bit classid (upper) and objid (lower) with
+	// objsubid=1; granted excludes waiters.
+	lockKey := uint64(d.Cfg.AdvisoryLockID)
+	classID := uint32(lockKey >> 32)
+	objID := uint32(lockKey)
 	lockHeld := func() bool {
 		out, qerr := d.PsqlQuery(ctx, pg, user, pass, AppNameMaint, fmt.Sprintf(
 			"SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a "+
 				"ON l.pid = a.pid WHERE l.locktype = 'advisory' "+
-				"AND l.classid = 0 AND l.objid = %d AND l.objsubid = 1 "+
+				"AND l.classid = %d AND l.objid = %d AND l.objsubid = 1 "+
 				"AND l.granted AND a.application_name = '%s'",
-			d.Cfg.AdvisoryLockID, strings.ReplaceAll(holdApp, "'", "''")))
+			classID, objID, strings.ReplaceAll(holdApp, "'", "''")))
 		if qerr != nil {
 			return false
 		}
 		n := strings.TrimSpace(FirstLine(out))
 		return n != "" && n != "0"
+	}
+
+	// onDone must only be called after <-done has fired so reading
+	// holdOut/holdErr is race-free.
+	onDone := func() (func(), bool, error) {
+		if err := ctx.Err(); err != nil {
+			cancel()
+			<-done
+			if holdErr != nil || !strings.Contains(holdOut, "advisory-lock-busy") {
+				terminateHold()
+			}
+			return nil, false, err
+		}
+		heldNow := lockHeld()
+		if err := ctx.Err(); err != nil {
+			cancel()
+			<-done
+			if heldNow || holdErr != nil || !strings.Contains(holdOut, "advisory-lock-busy") {
+				terminateHold()
+			}
+			return nil, false, err
+		}
+		if heldNow {
+			return releaseFn, true, nil
+		}
+		cancel()
+		<-done
+		if holdErr == nil && strings.Contains(holdOut, "advisory-lock-busy") {
+			return nil, false, nil
+		}
+		terminateHold()
+		if holdErr != nil {
+			return nil, false, holdErr
+		}
+		return nil, false, nil
+	}
+
+	if beforePoll != nil {
+		beforePoll(done)
 	}
 
 	// The bound is an ITERATION count, not the injected clock: the
@@ -487,31 +580,41 @@ func (d *Deps) HoldAdvisoryLock(ctx context.Context, pg, user, pass,
 		// poll) then bail instead of sleeping out the budget.
 		select {
 		case <-done:
-			if lockHeld() {
-				return releaseFn, true, nil
-			}
-			cancel()
-			<-done
-			return nil, false, nil
+			return onDone()
 		default:
 		}
-		if lockHeld() {
+		if err := ctx.Err(); err != nil {
+			abortHold()
+			return nil, false, err
+		}
+		heldNow := lockHeld()
+		if err := ctx.Err(); err != nil {
+			abortHold()
+			return nil, false, err
+		}
+		if heldNow {
 			return releaseFn, true, nil
 		}
-		if ctx.Err() != nil {
-			cancel()
-			<-done
-			return nil, false, ctx.Err()
-		}
+		timer := time.NewTimer(500 * time.Millisecond)
 		select {
 		case <-ctx.Done():
-			cancel()
-			<-done
+			timer.Stop()
+			abortHold()
 			return nil, false, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-done:
+			timer.Stop()
+			return onDone()
+		case <-timer.C:
 		}
 	}
-	cancel()
-	<-done
+	select {
+	case <-done:
+		return onDone()
+	default:
+	}
+	abortHold()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	return nil, false, nil
 }

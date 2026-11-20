@@ -71,17 +71,18 @@ func (f FS) PIDs() ([]int, error) {
 // mm-backed files: cmdline/environ are backed by mm->mmap_lock, so
 // a read on a D-state (uninterruptible sleep) process wedges the
 // caller forever — the /metrics deadlock this guard exists for —
-// and a zombie already released its mm (the files read empty
-// anyway). An unreadable/missing stat fails OPEN to the file read:
+// and zombie/dead states (Z, X, x) have already released their mm.
+// An unreadable/missing stat fails OPEN to the file read:
 // test fixtures that plant cmdline without stat keep working, and
 // a hidepid race degrades to the pre-guard behavior.
 func (f FS) mmBlocked(pid int) bool {
 	st, ok := f.Stat(pid)
-	return ok && (st.Fields[0] == "D" || st.Fields[0] == "Z")
+	return ok && (st.Fields[0] == "D" || st.Fields[0] == "Z" ||
+		st.Fields[0] == "X" || st.Fields[0] == "x")
 }
 
 // Cmdline returns the argv of pid (NUL-separated in /proc) — nil
-// for a D/Z-state pid without ever touching the mm-backed file.
+// for a D/Z/X/x-state pid without ever touching the mm-backed file.
 func (f FS) Cmdline(pid int) []string {
 	if f.mmBlocked(pid) {
 		return nil
@@ -94,7 +95,7 @@ func (f FS) Cmdline(pid int) []string {
 }
 
 // EnvValue reads KEY=<value> from /proc/<pid>/environ — "" when the
-// file is unreadable, the key is absent, or the pid is D/Z-state.
+// file is unreadable, the key is absent, or the pid is D/Z/X/x-state.
 func (f FS) EnvValue(pid int, key string) string {
 	if f.mmBlocked(pid) {
 		return ""

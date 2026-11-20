@@ -22,11 +22,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // gDeps builds a minimal *wdeps.Deps over the shared fixture — the
@@ -823,5 +825,80 @@ func TestSpegelSocketStale(t *testing.T) {
 	}
 	if spegelSocketStale(os.Stat, sock, podCreated) {
 		t.Fatal("socket at exactly podCreated+margin must report not-stale")
+	}
+}
+
+func TestScopesHoldLocalAction(t *testing.T) {
+	d, f := gDeps(t)
+	coordCalls := 0
+	held := false
+	d.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return f.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			coordCalls++
+			if held {
+				return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+			}
+			return map[string]string{}, nil
+		},
+	}
+
+	c := &ScopesCheck{d: d}
+	ctx := context.Background()
+	ce := &wdeps.CycleEnv{APIOK: true, WorkerActive: true}
+
+	// Clean sweep must not consult Coord.
+	f.SDReply["list-units"] = ""
+	c.Run(ctx, ce)
+	if coordCalls != 0 {
+		t.Fatalf("clean systemd-scopes sweep called Coord %d times, want 0", coordCalls)
+	}
+
+	// Held sweep skips reset-failed, reapDeactivating, and checkAbandoned.
+	held = true
+	f.Now = f.Now.Add(time.Hour)
+	orphanDeact := "cri-containerd-1111111111111111111111111111111111111111111111111111111111111111.scope"
+	orphanAband := "cri-containerd-2222222222222222222222222222222222222222222222222222222222222222.scope"
+	orphanFail := "cri-containerd-3333333333333333333333333333333333333333333333333333333333333333.scope"
+	c.deactStreak = 2
+	c.prevDeact = map[string]bool{orphanDeact: true}
+	f.SDReply["list-units"] = orphanFail + " loaded failed failed\n" +
+		orphanDeact + " deactivating stop-sigterm deactivating\n" +
+		orphanAband + " active abandoned abandoned\n"
+	c.Run(ctx, ce)
+
+	if f.SDRan("reset-failed") || f.SDRan("kill -s SIGKILL") || f.SDRan("stop ") {
+		t.Fatalf("destructive scope actions ran while held; cmds=%v", f.SDCmds)
+	}
+}
+
+func TestCalicoGCOrphanVethsHoldLocalAction(t *testing.T) {
+	d, f := gDeps(t)
+	vethDir := filepath.Join(d.Cfg.SysClassNet, "cali1234")
+	if err := os.MkdirAll(vethDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(vethDir, "carrier"), "0\n")
+	marker := filepath.Join(d.Cfg.WatchdogStateDir, "veth-seen-cali1234")
+	wdepstest.WriteFile(t, marker, strconv.FormatInt(f.Now.Add(-20*time.Minute).Unix(), 10)+"\n")
+
+	var deleted []string
+	d.Cfg.Seams.Host.LinkDelFn = func(name string) error {
+		deleted = append(deleted, name)
+		return nil
+	}
+	d.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return f.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+		},
+	}
+
+	gcCalicoOrphanVeths(d, context.Background())
+	if len(deleted) != 0 {
+		t.Fatalf("LinkDelFn called while held: %v", deleted)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("veth-seen marker dropped while held: %v", err)
 	}
 }

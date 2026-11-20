@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/ctr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
@@ -275,4 +278,187 @@ func TestCtrMetaGatesAndStatlessShim(t *testing.T) {
 	if after := strings.Count(e.LogLines(t), "journal half inconclusive"); after != before {
 		t.Fatalf("nil systemd still probed the journal: %d → %d lines", before, after)
 	}
+}
+
+func TestCtrMetaBenignBBoltIgnored(t *testing.T) {
+	benign := []string{
+		"Nov 10 01:00:00 node containerd: initializing bbolt store",
+		"Nov 10 01:00:00 node containerd: bbolt freelist_type=hashmap",
+		"Nov 10 01:00:00 node containerd: compacting bbolt db in 12ms",
+		"Nov 10 01:00:00 node containerd: opening meta.db",
+		"Nov 10 01:00:00 node containerd: bbolt: checksum verified ok",
+		"Nov 10 01:00:00 node containerd: meta.db integrity check: 0 corrupt pages",
+		"Nov 10 01:00:00 node containerd: invalid config key ignored, using bbolt defaults",
+		"Nov 10 01:00:00 node containerd: bbolt tx stats: 0 invalid pages",
+		"meta.db: 0 invalid pages",
+		"meta.db: no corrupt pages",
+		"bbolt: 00 invalid pages",
+		"containerd: bbolt: 00 corrupt pages",
+		"0 invalid pages in bbolt",
+		"no corrupt pages in meta.db",
+		"containerd: meta.db: 0 invalid checksums",
+	}
+	for _, line := range benign {
+		e := fixture(t)
+		e.H.Cfg.Ctr.MetaJournalFn = func(context.Context) (string, error) { return line, nil }
+		c := wdepstest.Check[*ctr.CtrMetaCheck](e.H, wdeps.CheckCtrMeta)
+		cycle := &wdeps.CycleEnv{PidsOnce: func() []int { return nil }, WorkerActive: true}
+		c.Run(context.Background(), cycle)
+		c.Run(context.Background(), cycle)
+		if e.H.State.Exists("containerd-corrupt") {
+			t.Fatalf("benign line %q falsely latched containerd-corrupt", line)
+		}
+	}
+
+	corrupt := []string{
+		"containerd: bbolt: page 42: already freed",
+		"containerd: bbolt: page ID (10) out of bounds",
+		"panic: bbolt freelist corrupt",
+		"containerd: meta.db checksum mismatch",
+		"containerd: bbolt: checksum error",
+		"containerd: meta.db: 2 corrupt pages",
+		"Nov 10 01:00:00 node containerd: bbolt tx stats: 2 invalid pages",
+		"containerd: corrupt meta.db",
+		"panic: failed to open meta.db",
+		"invalid freelist page",
+		"containerd: bbolt: invalid page 17",
+		"containerd: invalid page in meta.db",
+	}
+	for _, line := range corrupt {
+		e := fixture(t)
+		e.H.Cfg.Ctr.MetaJournalFn = func(context.Context) (string, error) { return line, nil }
+		c := wdepstest.Check[*ctr.CtrMetaCheck](e.H, wdeps.CheckCtrMeta)
+		cycle := &wdeps.CycleEnv{PidsOnce: func() []int { return nil }, WorkerActive: true}
+		c.Run(context.Background(), cycle)
+		c.Run(context.Background(), cycle)
+		if !e.H.State.Exists("containerd-corrupt") {
+			t.Fatalf("real corruption line %q failed to latch containerd-corrupt", line)
+		}
+	}
+}
+
+func TestCtrMetaNilCycleEnvDoesNotPanic(t *testing.T) {
+	e := fixture(t)
+	c := wdepstest.Check[*ctr.CtrMetaCheck](e.H, wdeps.CheckCtrMeta)
+	c.Run(context.Background(), nil)
+	if e.H.State.Exists("containerd-corrupt") {
+		t.Fatal("nil CycleEnv must gate safely without latching")
+	}
+}
+
+func TestCtrMetaNilPidsOnceFallsBackToProcPIDs(t *testing.T) {
+	e := fixture(t)
+	orphanID := strings.Repeat("f", 64)
+	orphanShim(t, e, 9540, orphanID, "/run/k0s/containerd.sock", 16*time.Minute)
+	dir := filepath.Join(filepath.Dir(e.CtrDir), "k8s.io", orphanID)
+	wdepstest.WriteFile(t, filepath.Join(dir, "init.pid"), "99999\n")
+	stale := e.Now.Add(-16 * time.Minute)
+	if err := os.Chtimes(dir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	c := wdepstest.Check[*ctr.CtrMetaCheck](e.H, wdeps.CheckCtrMeta)
+	// PidsOnce is nil (e.g. hand-built CycleEnv): must not panic and must
+	// fall back to Proc.PIDs().
+	c.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true})
+	if !strings.Contains(e.LogLines(t), "1 orphan shim(s) ppid=1") {
+		t.Fatalf("expected Proc.PIDs() fallback to detect orphan shim:\n%s", e.LogLines(t))
+	}
+}
+
+func TestCtrMetaPidsOKFalseAndProcErrorPreserveFailsAndLatch(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("armed-latch-preserved", func(t *testing.T) {
+		e := fixture(t)
+		orphanID := strings.Repeat("c", 64)
+		orphanShim(t, e, 9550, orphanID, "/run/k0s/containerd.sock", 16*time.Minute)
+		dir := filepath.Join(filepath.Dir(e.CtrDir), "k8s.io", orphanID)
+		wdepstest.WriteFile(t, filepath.Join(dir, "init.pid"), "99999\n")
+		stale := e.Now.Add(-16 * time.Minute)
+		if err := os.Chtimes(dir, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+
+		c := wdepstest.Check[*ctr.CtrMetaCheck](e.H, wdeps.CheckCtrMeta)
+		validEnv := &wdeps.CycleEnv{
+			PidsOnce:     func() []int { return []int{9550} },
+			PidsOK:       func() bool { return true },
+			WorkerActive: true,
+		}
+		c.Run(ctx, validEnv)
+		c.Run(ctx, validEnv)
+		if !e.H.State.Exists("containerd-corrupt") {
+			t.Fatal("expected LatchContainerdCorrupt to be armed")
+		}
+
+		// PidsOK() == false with no journal evidence must preserve latch and record "inconclusive".
+		c.Run(ctx, &wdeps.CycleEnv{
+			PidsOnce:     func() []int { return nil },
+			PidsOK:       func() bool { return false },
+			WorkerActive: true,
+		})
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCtrMeta, "inconclusive")); got != 1 {
+			t.Fatalf("inconclusive cycles=%v want 1", got)
+		}
+		if !e.H.State.Exists("containerd-corrupt") {
+			t.Fatal("LatchContainerdCorrupt cleared on PidsOK()=false")
+		}
+
+		// Proc.PIDs() error with PidsOnce == nil must also preserve latch and record "inconclusive".
+		e.H.Deps.Proc = procfs.New(filepath.Join(t.TempDir(), "missing-proc"))
+		c.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCtrMeta, "inconclusive")); got != 2 {
+			t.Fatalf("inconclusive cycles=%v want 2", got)
+		}
+		if !e.H.State.Exists("containerd-corrupt") {
+			t.Fatal("LatchContainerdCorrupt cleared on Proc.PIDs() error")
+		}
+	})
+
+	t.Run("pending-streak-preserved-and-journal-evidence-consistent", func(t *testing.T) {
+		e := fixture(t)
+		orphanID := strings.Repeat("d", 64)
+		orphanShim(t, e, 9551, orphanID, "/run/k0s/containerd.sock", 16*time.Minute)
+		dir := filepath.Join(filepath.Dir(e.CtrDir), "k8s.io", orphanID)
+		wdepstest.WriteFile(t, filepath.Join(dir, "init.pid"), "99999\n")
+		stale := e.Now.Add(-16 * time.Minute)
+		if err := os.Chtimes(dir, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+
+		c := wdepstest.Check[*ctr.CtrMetaCheck](e.H, wdeps.CheckCtrMeta)
+		// Cycle 1: fails=1 (pending).
+		c.Run(ctx, &wdeps.CycleEnv{
+			PidsOnce:     func() []int { return []int{9551} },
+			PidsOK:       func() bool { return true },
+			WorkerActive: true,
+		})
+		if e.H.State.Exists("containerd-corrupt") {
+			t.Fatal("should not latch on cycle 1")
+		}
+
+		// Inconclusive /proc scan must NOT wipe fails=1.
+		c.Run(ctx, &wdeps.CycleEnv{
+			PidsOnce:     func() []int { return nil },
+			PidsOK:       func() bool { return false },
+			WorkerActive: true,
+		})
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCtrMeta, "inconclusive")); got != 1 {
+			t.Fatalf("inconclusive cycles=%v want 1", got)
+		}
+
+		// Next cycle with journal evidence even while PidsOK() == false still latches on fails=2.
+		e.H.Cfg.Ctr.MetaJournalFn = func(context.Context) (string, error) {
+			return "containerd: bbolt: invalid page 17", nil
+		}
+		c.Run(ctx, &wdeps.CycleEnv{
+			PidsOnce:     func() []int { return nil },
+			PidsOK:       func() bool { return false },
+			WorkerActive: true,
+		})
+		if !e.H.State.Exists("containerd-corrupt") {
+			t.Fatal("expected preserved fails=1 + journal evidence to latch containerd-corrupt")
+		}
+	})
 }

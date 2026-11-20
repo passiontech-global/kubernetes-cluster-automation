@@ -7,6 +7,7 @@ package compact
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +47,7 @@ func TestEmitGuardChurn(t *testing.T) {
 
 func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 	rules := []testutil.ExecRule{
+		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump", Out: ""},
 		{Substr: "pg_restore", Out: "; Archive created\n"},
 		{Substr: "cp pg:", Out: ""},
@@ -137,6 +139,7 @@ func TestBackupVerifyFreshDumpSkips(t *testing.T) {
 // age to the next interval — backupVerify recreates immediately.
 func TestBackupVerifyInvalidYoungDumpRecreates(t *testing.T) {
 	rules := []testutil.ExecRule{
+		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump -Fc", Out: "dumped\n"},
 		{Substr: "pg_restore -l", Out: "ok\n"},
 		{Substr: "cp pg:", Out: "copied\n"},
@@ -230,6 +233,7 @@ func TestBackupVerifyLowFreeSkips(t *testing.T) {
 // /tmp file, and publishes nothing.
 func TestBackupVerifyDumpFails(t *testing.T) {
 	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump -Fc", Err: errors.New("out of memory")},
 	})
 	bdir := filepath.Join(dir, "backups")
@@ -259,6 +263,7 @@ func TestBackupVerifyDumpFails(t *testing.T) {
 // A failed pg_restore -l listing rejects the dump — no host copy.
 func TestBackupVerifyValidateFails(t *testing.T) {
 	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump -Fc", Out: "dumped\n"},
 		{Substr: "pg_restore -l", Err: errors.New("invalid header")},
 	})
@@ -287,6 +292,7 @@ func TestBackupVerifyValidateFails(t *testing.T) {
 // nothing — the next cycle re-runs the whole pipeline.
 func TestBackupVerifyCpFails(t *testing.T) {
 	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump -Fc", Out: "dumped\n"},
 		{Substr: "pg_restore -l", Out: "ok\n"},
 		{Substr: "cp pg:", Err: errors.New("disk full")},
@@ -398,4 +404,235 @@ func TestDumpValidMagicShortFile(t *testing.T) {
 	if dumpValidMagic(short) {
 		t.Fatal("two-byte file reported valid")
 	}
+}
+
+func TestBackupVerifyPassesPGAppNameAndReleasesLock(t *testing.T) {
+	k, fr, dir := fixture(t, nil)
+	bdir := filepath.Join(dir, "backups")
+	k.d.Cfg.BackupDir = bdir
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+
+	var dumpMuLocked, restoreMuUnlocked, termBeforeRestore bool
+	var termDone bool
+	var dumpArgs string
+	var dumpEnv []string
+	k.d.Cfg.Run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+		joined := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(stdin, "pg_try_advisory_lock"):
+			<-ctx.Done()
+			return "", ctx.Err()
+		case strings.Contains(joined, "pg_locks"):
+			return "1\n", nil
+		case strings.Contains(joined, "pg_terminate_backend"):
+			termDone = true
+			return "t\n", nil
+		case strings.Contains(joined, "pg_dump"):
+			dumpArgs = joined
+			dumpEnv = append([]string(nil), env...)
+			// MaintMu must be held during pg_dump.
+			if k.d.MaintMu.TryLock() {
+				k.d.MaintMu.Unlock()
+			} else {
+				dumpMuLocked = true
+			}
+			return "", nil
+		case strings.Contains(joined, "pg_restore"):
+			termBeforeRestore = termDone
+			if k.d.MaintMu.TryLock() {
+				restoreMuUnlocked = true
+				k.d.MaintMu.Unlock()
+			}
+			return "; Archive created\n", nil
+		case strings.Contains(joined, "cp pg:"):
+			_ = os.WriteFile(filepath.Join(bdir, "kine-1700000000.dump.tmp"), []byte("PGDMP fake"), 0o600)
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	res := &Result{}
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", res, func(string) {})
+	if !res.backupValid {
+		t.Fatalf("expected valid backup, got %+v", res)
+	}
+	if !strings.Contains(dumpArgs, "-e PGPASSWORD -e PGAPPNAME") {
+		t.Fatalf("pg_dump missing -e PGAPPNAME: %q", dumpArgs)
+	}
+	hasApp := false
+	for _, kv := range dumpEnv {
+		if kv == "PGAPPNAME="+kdeps.AppNameCompact {
+			hasApp = true
+		}
+	}
+	if !hasApp {
+		t.Fatalf("pg_dump env missing PGAPPNAME=%s: %v", kdeps.AppNameCompact, dumpEnv)
+	}
+	if !dumpMuLocked {
+		t.Fatal("MaintMu was not held during pg_dump")
+	}
+	if !restoreMuUnlocked || !termBeforeRestore {
+		t.Fatalf("lock not released before pg_restore: muUnlocked=%v termBeforeRestore=%v\n%s",
+			restoreMuUnlocked, termBeforeRestore, fr.Joined())
+	}
+}
+
+func TestBackupVerifySkipsWhenLockBusy(t *testing.T) {
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_locks", Out: "0\n"},
+		{Substr: "pg_try_advisory_lock", Out: "advisory-lock-busy\n"},
+		{Substr: "pg_dump", Err: errors.New("must not run")},
+	})
+	k.d.Cfg.BackupDir = filepath.Join(dir, "backups")
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+
+	var notes []string
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", &Result{}, func(s string) {
+		notes = append(notes, s)
+	})
+	if strings.Contains(fr.Joined(), "pg_dump") {
+		t.Fatalf("pg_dump ran while advisory lock busy:\n%s", fr.Joined())
+	}
+	if len(notes) != 1 || notes[0] != "backup skipped: advisory lock busy" {
+		t.Fatalf("notes=%v", notes)
+	}
+	// MaintMu must be unlocked after skip.
+	if !k.d.MaintMu.TryLock() {
+		t.Fatal("MaintMu left locked on advisory-lock-busy skip")
+	}
+	k.d.MaintMu.Unlock()
+}
+
+func TestBackupVerifyReleasesLockAndReapsOrphanOnDumpTimeout(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	k, _, dir := fixture(t, nil)
+	k.d.Cfg.BackupDir = filepath.Join(dir, "backups")
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+	k.d.Cfg.LongCmdTimeout = 10 * time.Second
+	k.d.Cfg.Clock.Set(func() time.Time { return now })
+
+	var termSawApp, reapSawPgDump bool
+	k.d.Cfg.Run = func(ctx context.Context, _ []string, argv []string, stdin string) (string, error) {
+		joined := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(stdin, "pg_try_advisory_lock"):
+			<-ctx.Done()
+			return "", ctx.Err()
+		case strings.Contains(joined, "pg_locks"):
+			return "1\n", nil
+		case strings.Contains(joined, "pg_terminate_backend") && strings.Contains(joined, "-hold-"):
+			termSawApp = true
+			return "t\n", nil
+		case strings.Contains(joined, "pg_terminate_backend") && strings.Contains(joined, "'pg_dump'"):
+			reapSawPgDump = true
+			return "t\n", nil
+		case strings.Contains(joined, "pg_dump -Fc"):
+			now = now.Add(11 * time.Second) // trigger LongBudgetExceeded
+			return "", context.DeadlineExceeded
+		default:
+			return "", nil
+		}
+	}
+
+	var notes []string
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", &Result{}, func(s string) {
+		notes = append(notes, s)
+	})
+	if !termSawApp {
+		t.Fatal("advisory hold backend not terminated on pg_dump failure")
+	}
+	if !reapSawPgDump {
+		t.Fatal("orphaned pg_dump not reaped after LongBudgetExceeded")
+	}
+	if !k.d.MaintMu.TryLock() {
+		t.Fatal("MaintMu left locked after pg_dump failure")
+	}
+	k.d.MaintMu.Unlock()
+}
+
+func TestBackupVerifyFutureMtimeSelfHeals(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_locks", Out: "1\n"},
+		{Substr: "pg_dump", Out: ""},
+		{Substr: "pg_restore", Out: "; Archive created\n"},
+		{Substr: "cp pg:", Out: ""},
+	})
+	k.d.Cfg.Clock.Set(func() time.Time { return now })
+	bdir := filepath.Join(dir, "backups")
+	k.d.Cfg.BackupDir = bdir
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+	if err := os.MkdirAll(bdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dump := filepath.Join(bdir, "kine-1.dump")
+	if err := os.WriteFile(dump, []byte("PGDMP fake"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := now.Add(2 * time.Hour)
+	if err := os.Chtimes(dump, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cycle 1: clamps negative age to 0, heals file mtime to now, skips recreation.
+	res := &Result{}
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", res, func(string) {})
+	if !res.backupSeen || !res.backupValid || res.backupAge != 0 {
+		t.Fatalf("res=%+v want seen=true valid=true age=0", res)
+	}
+	if fr.Ran("pg_dump") {
+		t.Fatalf("cycle 1 unexpectedly ran pg_dump:\n%s", fr.Joined())
+	}
+	fi, err := os.Stat(dump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.ModTime().Unix() != now.Unix() {
+		t.Fatalf("future mtime not healed: got %d want %d", fi.ModTime().Unix(), now.Unix())
+	}
+
+	// Advance past BackupInterval + 1s (still before original +2h? No, BackupInterval=6h,
+	// test with BackupInterval=30m so 31m < 2h proves healing bounded the skip).
+	k.d.Cfg.BackupInterval = 30 * time.Minute
+	now = now.Add(31 * time.Minute)
+	if err := os.WriteFile(filepath.Join(bdir, "kine-"+fmt.Sprintf("%d", now.Unix())+".dump.tmp"), []byte("PGDMP new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res2 := &Result{}
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", res2, func(string) {})
+	if !fr.Ran("pg_dump") {
+		t.Fatal("healed dump stayed fresh instead of expiring after BackupInterval")
+	}
+}
+
+func TestBackupVerifyLockHoldFail(t *testing.T) {
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "pg_locks", Out: "0\n"},
+		{Substr: "pg_dump", Err: errors.New("must not run")},
+	})
+	next := k.d.Cfg.Run
+	k.d.Cfg.Run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+		if strings.Contains(stdin, "pg_sleep(86400)") {
+			return "", errors.New("hold session failed")
+		}
+		return next(ctx, env, argv, stdin)
+	}
+	k.d.Cfg.BackupDir = filepath.Join(dir, "backups")
+	k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+
+	var notes []string
+	k.backupVerify(context.Background(), "pg", "postgres", "secret", &Result{}, func(s string) {
+		notes = append(notes, s)
+	})
+	if strings.Contains(fr.Joined(), "pg_dump") {
+		t.Fatalf("pg_dump ran on lock hold failure:\n%s", fr.Joined())
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "backup-lock-hold-fail") {
+		t.Fatalf("notes=%v want backup-lock-hold-fail", notes)
+	}
+	if !k.d.MaintMu.TryLock() {
+		t.Fatal("MaintMu left locked on backup-lock-hold-fail")
+	}
+	k.d.MaintMu.Unlock()
 }

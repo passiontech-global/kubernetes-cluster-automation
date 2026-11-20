@@ -53,7 +53,10 @@ func (c *LocalPVQuotaCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckLocalPVQuota) {
 		return
 	}
-	c.localPVQuota(ctx, e)
+	if !c.localPVQuota(ctx, e) {
+		c.d.CycleResult(wdeps.CheckLocalPVQuota, "abort")
+		return
+	}
 	c.d.CycleResult(wdeps.CheckLocalPVQuota, "ok")
 }
 
@@ -69,9 +72,9 @@ func (c *LocalPVQuotaCheck) localPVScanRoots() []string {
 // localPVQuota runs one localpv-quota round: over-quota pvc-* dirs under
 // disk pressure get their owning pod's tasks deprioritized and a
 // LocalPVQuotaExceeded event emitted.
-func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) {
+func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv) bool {
 	if !e.APIOK || c.d.Cfg.Client == nil {
-		return // PV/PVC resolution needs the apiserver
+		return true // PV/PVC resolution needs the apiserver
 	}
 	if c.localPVThrottled == nil {
 		c.localPVThrottled = map[string]bool{}
@@ -83,6 +86,9 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 	for _, root := range c.localPVScanRoots() {
 		ents, err := os.ReadDir(root)
 		if err != nil {
+			if !os.IsNotExist(err) {
+				return false
+			}
 			continue
 		}
 		for _, ent := range ents {
@@ -92,7 +98,7 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 		}
 	}
 	if len(candidates) == 0 {
-		return // nothing on disk can match a PV — skip the API entirely
+		return true // nothing on disk can match a PV — skip the API entirely
 	}
 	// Disk-pressure gate BEFORE the cluster-wide PV/PVC LISTs: the
 	// quota only bites under real disk pressure (over-request-but-
@@ -112,14 +118,14 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 		}
 	}
 	if !anyPressured {
-		return
+		return true
 	}
 	pvs, err := c.d.Cfg.Client.CoreV1().PersistentVolumes().
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: localpv-quota PV list failed: %v — quota scan inconclusive", err))
-		return
+		return true
 	}
 	pvCap := map[string]int64{}
 	for _, pv := range pvs.Items {
@@ -134,7 +140,7 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: localpv-quota PVC list failed: %v — quota scan inconclusive", err))
-		return
+		return true
 	}
 	claimPV := map[string]string{} // "<ns>/<claim>" -> volumeName
 	for _, pvc := range pvcs.Items {
@@ -152,6 +158,9 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 			}
 		}
 	}
+	holdChecked := false
+	held := false
+	tasksIncomplete := false
 	for _, dir := range candidates {
 		name := filepath.Base(dir)
 		cap, ok := pvCap[name]
@@ -175,8 +184,29 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 				dir, size, c.d.Cfg.Disk.LocalPVQuotaRatio, cap))
 			continue
 		}
-		c.throttlePVTasks(ctx, e, pod, dir, size, cap)
+		if pod.DeletionTimestamp != nil ||
+			wdeps.EvictProtectedNamespaces[pod.Namespace] ||
+			wdeps.CarriesDBQuorumLabel(pod) ||
+			wdeps.IsEvictProtectedPod(pod) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: localpv-quota pod %s/%s protected by eviction rails - skip throttle",
+				pod.Namespace, pod.Name))
+			continue
+		}
+		if !holdChecked {
+			holdChecked = true
+			held = c.d.HoldLocalAction(ctx)
+		}
+		if held {
+			c.d.State.AppendLog(
+				"cleanup: localpv-quota throttle held - cluster maintenance in progress")
+			continue
+		}
+		if !c.throttlePVTasks(ctx, e, pod, dir, size, cap) {
+			tasksIncomplete = true
+		}
 	}
+	return !tasksIncomplete
 }
 
 // throttlePVTasks deprioritizes every live task pid of the pod:
@@ -186,10 +216,16 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 // rate has no safe value without device knowledge; io.weight
 // achieves the same relative starvation (documented deviation).
 func (c *LocalPVQuotaCheck) throttlePVTasks(ctx context.Context,
-	e *wdeps.CycleEnv, pod *corev1.Pod, dir string, size, cap int64) {
+	e *wdeps.CycleEnv, pod *corev1.Pod, dir string, size, cap int64) bool {
 
 	uid := string(pod.UID)
-	tasks, _ := e.TasksOnce()
+	tasks, complete := c.d.CycleTasks(e)
+	if !complete {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: localpv-quota %s pod %s/%s throttle deferred — ctr task map incomplete",
+			dir, pod.Namespace, pod.Name))
+		return false
+	}
 	throttled := 0
 	for _, t := range tasks[uid] {
 		if !t.Live || t.PID <= 0 {
@@ -230,6 +266,7 @@ func (c *LocalPVQuotaCheck) throttlePVTasks(ctx context.Context,
 	c.d.LocalPVQuotaThrottled++
 	c.emitPVQuotaEvent(ctx, pod, dir, size, cap, throttled)
 	c.d.Actions.WithLabelValues(wdeps.CheckLocalPVQuota, "localpv_throttle").Inc()
+	return true
 }
 
 // emitPVQuotaEvent creates the LocalPVQuotaExceeded Warning event

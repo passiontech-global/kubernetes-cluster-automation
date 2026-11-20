@@ -12,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/kubelet"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
@@ -386,5 +388,103 @@ func TestKubeletStallStoppedTaskRecordsNotPhantom(t *testing.T) {
 	e.H.Cycle(context.Background())
 	if e.SDRan("restart k0sworker.service") {
 		t.Fatal("phantom-pods restart with stopped task records")
+	}
+}
+
+func TestKubeletStallAPIDownSkipsRestart(t *testing.T) {
+	e := fixture(t)
+	e.Probes[wdeps.DefaultKubeletHealthzURL] = errors.New("connection refused")
+	e.CS.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver unreachable")
+	})
+
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+
+	if e.SDRan("restart k0sworker.service") {
+		t.Fatalf("k0sworker restarted while API unreachable, cmds=%v", e.SDCmds)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "last-restart")); !os.IsNotExist(err) {
+		t.Fatal("last-restart budget spent while API unreachable")
+	}
+	if !strings.Contains(e.LogLines(t), "API unreachable (isolated?), skip restart k0sworker") {
+		t.Fatalf("missing API unreachable skip log:\n%s", e.LogLines(t))
+	}
+}
+
+func TestKubeletChecksNilCycleEnvAndNilJournalOnceDoNotPanic(t *testing.T) {
+	e := fixture(t)
+	stall := wdepstest.Check[*kubelet.StallCheck](e.H, wdeps.CheckStall)
+	watch := wdepstest.Check[*kubelet.WatchWedgeCheck](e.H, wdeps.CheckWatch)
+	ctx := context.Background()
+
+	// nil CycleEnv must gate safely without panicking.
+	stall.Run(ctx, nil)
+	watch.Run(ctx, nil)
+
+	// Hand-built CycleEnv with JournalOnce == nil must fall back cleanly
+	// to JournalFn without panicking.
+	e.Journal = strings.Repeat("node \"w1\" not found\nnot registered\n", 65)
+	handBuilt := &wdeps.CycleEnv{WorkerActive: true, APIOK: true}
+	stall.Run(ctx, handBuilt)
+	watch.Run(ctx, handBuilt)
+	if !strings.Contains(e.LogLines(t), "informer-zombie") {
+		t.Fatalf("expected JournalFn fallback in StallCheck:\n%s", e.LogLines(t))
+	}
+	if !strings.Contains(e.LogLines(t), "kubelet-watch-wedge early-warn") {
+		t.Fatalf("expected JournalFn fallback in WatchWedgeCheck:\n%s", e.LogLines(t))
+	}
+}
+
+func TestKubeletWatchWedgePodsDir0444AbortsPreservingLatchAndFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0444 does not block root")
+	}
+	e := fixture(t)
+	p := e.AssignedPod("running-pod", wdepstest.UIDA, 20*time.Minute)
+	if _, err := e.CS.CoreV1().Pods("default").Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(e.KubepodsDir, wdepstest.UIDA), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	watch := wdepstest.Check[*kubelet.WatchWedgeCheck](e.H, wdeps.CheckWatch)
+	watch.Fails = 1
+	e.H.State.Enter(latchdefs.LatchKubeletWatchWedge, "prior-wedge")
+
+	// Mode 0o444 allows os.Stat(PodsDir) to succeed, while every child os.Stat fails EACCES.
+	if err := os.Chmod(e.KubepodsDir, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.KubepodsDir, 0o755) })
+
+	e.H.Cycle(context.Background())
+
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckWatch, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1", got)
+	}
+	if e.SDRan("restart k0sworker.service") {
+		t.Fatal("restarted k0sworker when PodsDir was 0o444 (child stat EACCES)")
+	}
+	if watch.Fails != 1 {
+		t.Fatalf("WatchWedgeCheck.Fails=%d want preserved 1", watch.Fails)
+	}
+	if !e.H.State.Exists(latchdefs.LatchKubeletWatchWedge) {
+		t.Fatal("LatchKubeletWatchWedge cleared during PodsDir 0o444")
+	}
+
+	// Restore +x: pod dir is visible again -> exits cleanly.
+	if err := os.Chmod(e.KubepodsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Cycle(context.Background())
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckWatch, "ok")); got != 1 {
+		t.Fatalf("ok cycles=%v want 1 after recovery", got)
+	}
+	if watch.Fails != 0 {
+		t.Fatalf("WatchWedgeCheck.Fails=%d want 0 after recovery", watch.Fails)
+	}
+	if e.H.State.Exists(latchdefs.LatchKubeletWatchWedge) {
+		t.Fatal("LatchKubeletWatchWedge not cleared after recovery")
 	}
 }

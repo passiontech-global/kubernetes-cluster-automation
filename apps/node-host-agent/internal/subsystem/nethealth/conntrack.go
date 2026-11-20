@@ -66,6 +66,9 @@ func (n *NetHealth) checkConntrack(ctx context.Context) {
 				"conntrack-pressure cleared (used=%.0f max=%.0f ratio=%.2f)",
 				used, max, ratio))
 			n.stateExit(latchdefs.LatchConntrackPressure)
+		} else {
+			n.state.Enter(latchdefs.LatchConntrackPressure,
+				fmt.Sprintf("used=%.0f max=%.0f ratio=%.2f", used, max, ratio))
 		}
 	} else if ratio > conntrackEnterRatio {
 		n.state.AppendLog(fmt.Sprintf(
@@ -232,6 +235,10 @@ func (n *NetHealth) flushPeerNebulaConntrack(ctx context.Context, check string, 
 // logs and moves on, it never fails the cycle. check attributes the
 // flush to the calling check.
 func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context, check string) {
+	if n.holdEmergencyHeal(ctx) {
+		logger().Debug("conntrack udp/53 flush skipped — maintenance hold")
+		return
+	}
 	if !n.state.RateTrySpend("last-conntrack-flush", conntrackFlushCooldown) {
 		logger().Debug("conntrack udp/53 flush skipped — cooldown (last-conntrack-flush <" +
 			conntrackFlushCooldown.String() + ")")

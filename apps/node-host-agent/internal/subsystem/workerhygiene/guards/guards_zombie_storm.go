@@ -32,10 +32,19 @@ func (c *ZombieStormCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckZombieStorm) {
 		return
 	}
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		c.d.CycleResult(wdeps.CheckZombieStorm, "inconclusive")
+		return
+	}
 	byPPID := map[int]int{}
-	for _, pid := range e.PidsOnce() {
+	nonENOENT := false
+	for _, pid := range pids {
 		st, ok := statFor(e, c.d, pid)
 		if !ok || len(st.Fields) < 2 {
+			if !ok && statNonENOENT(c.d, pid) {
+				nonENOENT = true
+			}
 			continue
 		}
 		if st.Fields[0] != "Z" {
@@ -46,6 +55,10 @@ func (c *ZombieStormCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 			continue
 		}
 		byPPID[ppid]++
+	}
+	if nonENOENT {
+		c.d.CycleResult(wdeps.CheckZombieStorm, "abort")
+		return
 	}
 	// Resolve each parent once — the starttime read hits the same
 	// StatsOnce snapshot, not a fresh /proc stat.

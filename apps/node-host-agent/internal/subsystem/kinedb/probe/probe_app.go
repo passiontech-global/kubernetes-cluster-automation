@@ -15,9 +15,10 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
 
-// probeAppChecks covers every check that needs containers + creds.
+// probeAppChecks covers every check that needs containers + creds and
+// executes the single batched read-only PsqlQuery shared with pgHygiene.
 func (p *Probe) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
-	res *Result, note func(string)) {
+	res *Result, note func(string)) *probeBatch {
 
 	// (c) e2e auth — psql inside the postgres container THROUGH the
 	// pooler, SCRAM-SHA-256 end to end (client auth + backend auth +
@@ -100,16 +101,32 @@ func (p *Probe) probeAppChecks(ctx context.Context, pg, pgb, user, pass string,
 		note("backend-env-drift user=" + user)
 	}
 
-	// (g) revision horizon — head vs compact_rev + the live-tuple
-	// estimate. No COUNT(*): that seq-scans the very table whose
-	// bloat this probe monitors — the bash only counted rows in the
-	// 10-min guard, which owns the kine_db_rows series. A query
-	// failure only zeroes this check, never the probe.
-	out, err = p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
-		"SELECT COALESCE((SELECT MAX(id) FROM %[1]s),0), "+
-			"COALESCE((SELECT MAX(prev_revision) FROM %[1]s WHERE name='%s'),0), "+
-			"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%s),0)",
-		kdeps.SQLIdent(p.d.Cfg.Table), kdeps.CompactRevKey, kdeps.SQLQuote(p.d.Cfg.Table)))
+	// (g) revision horizon + shared hygiene census — run as ONE
+	// batched read-only PsqlQuery alongside `select 1` above (2
+	// steady-state direct-to-postgres calls total). Falls back to
+	// standalone PsqlQuery per section when CheckBackendEnv == 1
+	// and the batch failed non-timeout or returned untagged output.
+	batch := p.runProbeBatch(ctx, pg, user, pass)
+	p.evalRevision(ctx, pg, user, pass, res, batch, note)
+	return batch
+}
+
+func (p *Probe) evalRevision(ctx context.Context, pg, user, pass string,
+	res *Result, batch *probeBatch, note func(string)) {
+	var out string
+	var err error
+	switch {
+	case batch != nil && batch.err == nil && batch.revSeen:
+		out = batch.revLine
+	case batch == nil || batch.canFallback(ctx, res.Checks[CheckBackendEnv]):
+		out, err = p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
+			"SELECT COALESCE((SELECT MAX(id) FROM %[1]s),0), "+
+				"COALESCE((SELECT MAX(prev_revision) FROM %[1]s WHERE name='%s'),0), "+
+				"COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relname=%s),0)",
+			kdeps.SQLIdent(p.d.Cfg.Table), kdeps.CompactRevKey, kdeps.SQLQuote(p.d.Cfg.Table)))
+	default:
+		err = batch.err
+	}
 	if err == nil {
 		head, crev, live, perr := kdeps.ParseTriple(out)
 		if perr == nil {

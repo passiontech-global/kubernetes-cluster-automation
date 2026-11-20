@@ -29,8 +29,12 @@
 package runtime
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -41,6 +45,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -71,6 +76,8 @@ const (
 	// watches) to be evictable; below it the pressure is diffuse
 	// and no single delete buys the headroom back.
 	inotifyEvictShare = 0.50
+	// inotifyFDTTL matches hostmetrics' shared /proc/*/fd snapshot TTL.
+	inotifyFDTTL = 60 * time.Second
 )
 
 // inotifyTotals is one scope's inotify footprint: instances =
@@ -98,19 +105,18 @@ type inotifyScan struct {
 	byRUIDAndUID map[int64]map[string]inotifyTotals
 }
 
-// inotifyFD is one inotify open file description for a pid.
-type inotifyFD struct {
-	key     string
-	fdNum   int
-	watches int64
-}
-
 // InotifyPressureCheck is the inotify pressure healer as a Check;
 // it owns the tier-2 pending streak (ex-Hygiene.<check>Fails
 // pattern — a plain int on the struct).
 type InotifyPressureCheck struct {
 	d     *wdeps.Deps
 	fails int
+	// lastScanAborted and lastAbortAt force direct ScanFDs(pids) across the
+	// entire inotifyFDTTL (60s) window after any abort, and while building a
+	// pre-arm streak (fails > 0), so a transient EACCES/ENOTDIR snapshot
+	// cached in SharedFDCache cannot poison streak-building or recovery.
+	lastScanAborted bool
+	lastAbortAt     time.Time
 	// instFrozen/watchFrozen mark a sysctl the agent provably
 	// cannot raise (EROFS/EPERM write failure) — the current
 	// value IS the effective ceiling, so tier-2 must not wait
@@ -133,10 +139,42 @@ func (c *InotifyPressureCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckInotifyHygiene, "abort")
 		return
 	}
-	scan := c.scanInotify(e, instCur, watchCur)
+	now := time.Now()
+	if c.d.Cfg.Seams.Host.Clock != nil {
+		now = c.d.Cfg.Seams.Host.Clock.Now()
+	}
+	abortActive := !c.lastAbortAt.IsZero() &&
+		now.Sub(c.lastAbortAt) >= 0 && now.Sub(c.lastAbortAt) < inotifyFDTTL
+	latched := c.d.State.Exists(latchdefs.LatchInotifyPressure)
+	forceDirect := c.lastScanAborted || abortActive || (c.fails > 0 && !latched)
+	scan, usedCache, scanOK := c.scanInotify(e, instCur, watchCur, forceDirect)
+	if !scanOK {
+		c.lastScanAborted = true
+		c.lastAbortAt = now
+		c.d.CycleResult(wdeps.CheckInotifyHygiene, "abort")
+		return
+	}
 	instRatio := worstUIDRatio(scan.byRUID, instCeilAxis, instCur)
 	watchRatio := worstUIDRatio(scan.byRUID, watchAxis, watchCur)
 	maxRatio := max(instRatio, watchRatio)
+
+	// Before releasing or downgrading an armed LatchInotifyPressure from a
+	// cached SharedFDCache snapshot, verify with a direct ScanFDs(pids) walk
+	// so a snapshot populated by hostmetrics during transient EACCES cannot
+	// falsely clear the latch or hide pressure within inotifyFDTTL (60s).
+	if maxRatio < inotifyLatchRatio && usedCache && latched {
+		scan, _, scanOK = c.scanInotify(e, instCur, watchCur, true)
+		if !scanOK {
+			c.lastScanAborted = true
+			c.lastAbortAt = now
+			c.d.CycleResult(wdeps.CheckInotifyHygiene, "abort")
+			return
+		}
+		instRatio = worstUIDRatio(scan.byRUID, instCeilAxis, instCur)
+		watchRatio = worstUIDRatio(scan.byRUID, watchAxis, watchCur)
+		maxRatio = max(instRatio, watchRatio)
+	}
+	c.lastScanAborted = false
 
 	if maxRatio <= inotifyClearRatio {
 		c.fails = 0
@@ -312,13 +350,66 @@ type inotifyRUIDEntry struct {
 	watches int64
 }
 
-func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv, instLimit, watchLimit int64) inotifyScan {
-	var pids []int
-	if e != nil && e.PidsOnce != nil {
-		pids = e.PidsOnce()
-	} else {
-		pids, _ = c.d.Proc.PIDs()
+func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv, instLimit, watchLimit int64, forceDirect bool) (inotifyScan, bool, bool) {
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		return inotifyScan{}, false, false
 	}
+
+	var snap *procfs.FDSnapshot
+	usedCache := false
+	if !forceDirect {
+		var nowFn func() time.Time
+		if c.d.Cfg.Seams.Host.Clock != nil {
+			nowFn = c.d.Cfg.Seams.Host.Clock.Now
+		}
+		snap = procfs.SharedFDCache(c.d.Cfg.ProcRoot, nowFn).Snapshot(inotifyFDTTL)
+		if snap != nil && snap.ProcOK && !snap.Partial {
+			usedCache = true
+		}
+	}
+	if snap == nil || !snap.ProcOK || snap.Partial {
+		// SharedFDCache never caches !ProcOK or Partial snapshots across
+		// inotifyFDTTL; fall back to a direct ScanFDs(pids) walk when
+		// forceDirect was requested, when the shared walk failed or was
+		// partial (e.g. an unrelated PID outside e.PidsOnce caused Partial),
+		// or when /proc was unreadable.
+		usedCache = false
+		snap = c.d.Proc.ScanFDs(pids)
+		if snap == nil || !snap.ProcOK || snap.Partial {
+			return inotifyScan{}, false, false
+		}
+	}
+	if len(pids) > 0 {
+		// SharedFDCache / ScanFDs skips EACCES/ENOTDIR on /proc/<pid>/fd
+		// while still setting ProcOK=true. Inspect ALL pids so a single
+		// readable /proc/1/fd cannot mask EACCES/ENOTDIR on another PID's
+		// /proc/<pid>/fd (still ignoring ENOENT for exited PIDs).
+		for _, pid := range pids {
+			fdDir := c.d.Proc.File(pid, "fd")
+			f, err := os.Open(fdDir)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return inotifyScan{}, false, false
+				}
+				continue
+			}
+			_, rerr := f.Readdirnames(1)
+			_ = f.Close()
+			if rerr != nil && !errors.Is(rerr, io.EOF) && !os.IsNotExist(rerr) {
+				return inotifyScan{}, false, false
+			}
+		}
+	}
+
+	var allowed map[int]bool
+	if e != nil && e.PidsOnce != nil {
+		allowed = make(map[int]bool, len(pids))
+		for _, pid := range pids {
+			allowed[pid] = true
+		}
+	}
+
 	scan := inotifyScan{
 		byRUID:       map[int64]inotifyTotals{},
 		byUID:        map[string]inotifyTotals{},
@@ -331,59 +422,91 @@ func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv, instLimit, watchLi
 	seenExplicitOFD := map[string]bool{}
 	rawEntriesByRUID := map[int64][]inotifyRUIDEntry{}
 
-	for _, pid := range pids {
-		fds, ok := inotifyProcUsage(c.d, pid)
-		if !ok || len(fds) == 0 {
+	type pidMeta struct {
+		ruid      int64
+		podUID    string
+		hasPodUID bool
+	}
+	metaByPID := map[int]pidMeta{}
+
+	for _, entry := range snap.Inotify {
+		if allowed != nil && !allowed[entry.PID] {
 			continue
 		}
-		ruid, _ := procRealUID(c.d, pid) // -1 bucket on unreadable
-		podUID, hasPodUID := wdeps.PodUIDForPID(c.d, pid)
-
-		var u inotifyTotals
-		for _, f := range fds {
-			if strings.HasPrefix(f.key, "ino:") {
-				if seenExplicitOFD[f.key] {
+		// When serving a cached SharedFDCache snapshot within inotifyFDTTL,
+		// verify fdinfo/<fd> readability and refresh Watches==0 entries so
+		// transient fdinfo changes within the TTL window are observed.
+		// Direct ScanFDs(pids) walks (!usedCache) already read every
+		// fdinfo/<fd> to EOF and set snap.Partial on any read error.
+		watches := entry.Watches
+		if usedCache {
+			fdinfoPath := c.d.Proc.File(entry.PID, "fdinfo", strconv.Itoa(entry.FD))
+			if f, err := os.Open(fdinfoPath); err != nil {
+				if !os.IsNotExist(err) {
+					return inotifyScan{}, false, false
+				}
+			} else {
+				var rerr error
+				if watches == 0 {
+					watches, rerr = countInotifyWatchesFromFile(f)
+				} else {
+					var b [1]byte
+					_, rerr = f.Read(b[:])
+				}
+				_ = f.Close()
+				if rerr != nil && !errors.Is(rerr, io.EOF) && !os.IsNotExist(rerr) {
+					return inotifyScan{}, false, false
+				}
+			}
+		}
+		meta, seenMeta := metaByPID[entry.PID]
+		if !seenMeta {
+			ruid, _ := procRealUID(c.d, entry.PID) // -1 bucket on unreadable
+			podUID, hasPodUID := wdeps.PodUIDForPID(c.d, entry.PID)
+			meta = pidMeta{ruid: ruid, podUID: podUID, hasPodUID: hasPodUID}
+			metaByPID[entry.PID] = meta
+		}
+		if c.d.Cfg.Seams.Host.InotifyFDIno != nil {
+			if ino, ok := c.d.Cfg.Seams.Host.InotifyFDIno(entry.PID, strconv.Itoa(entry.FD)); ok {
+				key := "ino:" + strconv.FormatUint(ino, 10)
+				if seenExplicitOFD[key] {
 					continue
 				}
-				seenExplicitOFD[f.key] = true
-			} else {
-				rawEntriesByRUID[ruid] = append(rawEntriesByRUID[ruid], inotifyRUIDEntry{
-					pid:     pid,
-					fdNum:   f.fdNum,
-					podUID:  podUID,
-					watches: f.watches,
-				})
+				seenExplicitOFD[key] = true
 			}
-			u.instances++
-			u.watches += f.watches
+		} else {
+			rawEntriesByRUID[meta.ruid] = append(rawEntriesByRUID[meta.ruid], inotifyRUIDEntry{
+				pid:     entry.PID,
+				fdNum:   entry.FD,
+				podUID:  meta.podUID,
+				watches: watches,
+			})
 		}
-		if u.instances == 0 {
-			continue
-		}
-		scan.total.instances += u.instances
-		scan.total.watches += u.watches
-		a := scan.byRUID[ruid]
-		a.instances += u.instances
-		a.watches += u.watches
-		scan.byRUID[ruid] = a
-		if hasPodUID && podUID != "" {
-			p := scan.byUID[podUID]
-			p.instances += u.instances
-			p.watches += u.watches
-			scan.byUID[podUID] = p
-			if scan.byRUIDAndUID[ruid] == nil {
-				scan.byRUIDAndUID[ruid] = map[string]inotifyTotals{}
+
+		scan.total.instances++
+		scan.total.watches += watches
+		a := scan.byRUID[meta.ruid]
+		a.instances++
+		a.watches += watches
+		scan.byRUID[meta.ruid] = a
+		if meta.hasPodUID && meta.podUID != "" {
+			p := scan.byUID[meta.podUID]
+			p.instances++
+			p.watches += watches
+			scan.byUID[meta.podUID] = p
+			if scan.byRUIDAndUID[meta.ruid] == nil {
+				scan.byRUIDAndUID[meta.ruid] = map[string]inotifyTotals{}
 			}
-			rp := scan.byRUIDAndUID[ruid][podUID]
-			rp.instances += u.instances
-			rp.watches += u.watches
-			scan.byRUIDAndUID[ruid][podUID] = rp
+			rp := scan.byRUIDAndUID[meta.ruid][meta.podUID]
+			rp.instances++
+			rp.watches += watches
+			scan.byRUIDAndUID[meta.ruid][meta.podUID] = rp
 		}
 	}
 
 	sameOFD := c.d.Cfg.Seams.Host.InotifySameOFDFn
 	if sameOFD == nil || c.d.Cfg.Seams.Host.InotifyFDIno != nil {
-		return scan
+		return scan, usedCache, true
 	}
 	// Refine only RUIDs near or past the clear threshold using unix.Kcmp(KCMP_FILE).
 	for ruid, entries := range rawEntriesByRUID {
@@ -430,7 +553,32 @@ func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv, instLimit, watchLi
 			scan.byUID[uid] = cur
 		}
 	}
-	return scan
+	return scan, usedCache, true
+}
+
+func countInotifyWatchesFromFile(f *os.File) (int64, error) {
+	const maxFDInfoBytes = 64 << 20
+	wdPrefix := []byte("inotify wd:")
+	br := bufio.NewReaderSize(io.LimitReader(f, maxFDInfoBytes), 4096)
+	var count int64
+	atLineStart := true
+	for {
+		line, err := br.ReadSlice('\n')
+		if atLineStart && bytes.HasPrefix(line, wdPrefix) {
+			count++
+		}
+		if err == bufio.ErrBufferFull {
+			atLineStart = false
+			continue
+		}
+		atLineStart = true
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return count, nil
+			}
+			return count, err
+		}
+	}
 }
 
 func ruidNeedsKCMP(tot inotifyTotals, instLimit, watchLimit int64) bool {
@@ -523,58 +671,6 @@ func worstUIDRatio(byRUID map[int64]inotifyTotals,
 		}
 	}
 	return worst
-}
-
-// inotifyProcUsage lists one pid's inotify open file descriptions
-// — each entry carries its OFD dedup key (the fd inode via the
-// InotifyFDIno seam; a "pidfd:<pid>/<fd>" fallback that never
-// dedups when the stat can't resolve, so fork-shared evidence is
-// only dropped when the kernel proves the sharing) plus the
-// fdinfo watch count. ok=false when the fd dir is unreadable — a
-// raced exit or a pid we may not inspect; the caller treats it as
-// zero usage, never an error.
-func inotifyProcUsage(d *wdeps.Deps, pid int) ([]inotifyFD, bool) {
-	var out []inotifyFD
-	fdDir := d.Proc.File(pid, "fd")
-	fds, err := os.ReadDir(fdDir)
-	if err != nil {
-		return nil, false
-	}
-	for _, fd := range fds {
-		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
-		if err != nil || target != "anon_inode:inotify" {
-			continue
-		}
-		key := fmt.Sprintf("pidfd:%d/%s", pid, fd.Name())
-		if d.Cfg.Seams.Host.InotifyFDIno != nil {
-			if ino, ok := d.Cfg.Seams.Host.InotifyFDIno(pid, fd.Name()); ok {
-				key = fmt.Sprintf("ino:%d", ino)
-			}
-		}
-		fdNum, _ := strconv.Atoi(fd.Name())
-		out = append(out, inotifyFD{
-			key:     key,
-			fdNum:   fdNum,
-			watches: inotifyFDWatches(d.Proc.File(pid, "fdinfo", fd.Name())),
-		})
-	}
-	return out, true
-}
-
-// inotifyFDWatches counts the `inotify wd:` watch lines in one
-// fdinfo file — one line per watch the descriptor holds.
-func inotifyFDWatches(path string) int64 {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0
-	}
-	var n int64
-	for ln := range strings.SplitSeq(string(data), "\n") {
-		if strings.HasPrefix(ln, "inotify wd:") {
-			n++
-		}
-	}
-	return n
 }
 
 // maybeEvictRunaway deletes the pod dominating the axis that is

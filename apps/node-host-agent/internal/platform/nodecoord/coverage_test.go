@@ -41,3 +41,39 @@ func TestNewKube(t *testing.T) {
 		t.Fatalf("PatchPodAnno: %v", err)
 	}
 }
+
+func TestNewKubeKuredRebootTaint(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-1"},
+		Spec: corev1.NodeSpec{
+			Taints: []corev1.Taint{{
+				Key:    "weave.works/kured-node-reboot",
+				Effect: corev1.TaintEffectNoSchedule,
+			}},
+		},
+	}
+	cs := fake.NewSimpleClientset(node)
+	c := NewKube("node-1", cs)
+
+	v, err := c.Maintenance(context.Background())
+	if err != nil || !v.KuredLocked || !v.Active {
+		t.Fatalf("Maintenance with reboot taint = (%+v,%v), want KuredLocked+Active", v, err)
+	}
+	if !c.HoldEmergencyHeal(context.Background()) {
+		t.Fatal("HoldEmergencyHeal must hold when kured reboot taint is present")
+	}
+
+	// Removing the taint and expiring cache clears KuredLocked.
+	node.Spec.Taints = nil
+	if _, err := cs.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.cachedAt = c.cachedAt.Add(-2 * CacheTTL)
+	c.mu.Unlock()
+
+	v, err = c.Maintenance(context.Background())
+	if err != nil || v.KuredLocked || v.Active {
+		t.Fatalf("Maintenance after taint removal = (%+v,%v), want clear", v, err)
+	}
+}

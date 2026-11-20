@@ -219,19 +219,20 @@ const xactPromFile = "kine-db-xact.prom"
 // RunChecks only after containers+creds pass, so every query
 // here can still assume a live postgres.
 func (p *Probe) pgHygiene(ctx context.Context, pg, user, pass string,
-	res *Result, note func(string)) {
+	res *Result, batch *probeBatch, note func(string)) {
 	h := &hygieneResult{}
 	res.hyg = h
+	backendEnv := res.Checks[CheckBackendEnv]
 	// The merged scalar census runs FIRST — hygieneDeadTuple's
 	// vacuum gate and hygieneWAL's disk-ratio read consume the
-	// fields it fills (was five separate psql execs).
-	p.hygieneScalarStats(ctx, pg, user, pass, h, note)
+	// fields it fills.
+	p.hygieneScalarStatsWithBatch(ctx, pg, user, pass, h, batch, backendEnv, note)
 	p.hygieneDeadTuple(ctx, pg, user, pass, h, note)
-	p.hygieneWAL(ctx, pg, user, pass, h, note)
-	p.hygieneCatalog(ctx, pg, user, pass, h, note)
-	p.hygienePreparedXacts(ctx, pg, user, pass, h, note)
+	p.hygieneWALWithBatch(ctx, pg, user, pass, h, batch, backendEnv, note)
+	p.hygieneCatalogWithBatch(ctx, pg, user, pass, h, batch, backendEnv, note)
+	p.hygienePreparedXactsWithBatch(ctx, pg, user, pass, h, batch, backendEnv, note)
 	p.hygieneSeqScan(ctx, pg, user, pass, h, note)
 	p.hygieneLargeKeys(ctx, pg, user, pass, h, note)
-	p.hygieneBackendXmin(ctx, pg, user, pass, h, note)
+	p.hygieneBackendXmin(ctx, pg, user, pass, h, batch, backendEnv, note)
 	p.emitXactTextfile(h)
 }

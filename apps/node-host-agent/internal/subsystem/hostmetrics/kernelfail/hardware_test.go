@@ -6,11 +6,13 @@ package kernelfail
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
@@ -282,5 +284,51 @@ func TestHardwareEvidenceSurvivesRestart(t *testing.T) {
 	r3.updateHardwareHealth()
 	if hwLatchSet(r3, latchdefs.LatchGPUHardwareError) {
 		t.Fatal("expired persisted evidence held the latch past TTL")
+	}
+}
+
+func TestHardwareAcuteInvalidUTF8AndRuneBoundaryRoundTrip(t *testing.T) {
+	f := kfixture(t)
+	seedHardwareFixture(t, f)
+
+	// >200-byte detail whose 200th byte lands inside a multi-byte UTF-8 rune,
+	// plus raw invalid UTF-8 bytes.
+	longUTF8 := strings.Repeat("a", 198) + "ééé" + "\xff\xfe"
+	f.r.hwNoteAcute("hw", longUTF8)
+	got := f.r.hw.acute["hw"].detail
+	if len(got) > 200 || !utf8.ValidString(got) {
+		t.Fatalf("truncated detail invalid or >200 bytes: len=%d valid=%v %q",
+			len(got), utf8.ValidString(got), got)
+	}
+	if !strings.HasSuffix(got, "é") {
+		t.Fatalf("expected rune-boundary trim at 200 bytes to keep complete 'é': %q", got)
+	}
+
+	// Reload from persisted hw-evidence file — must survive without dropping.
+	r2 := New(f.deps)
+	if r2.hw.acute["hw"].detail != got {
+		t.Fatalf("reloaded acute detail = %q, want %q", r2.hw.acute["hw"].detail, got)
+	}
+
+	// Pre-existing on-disk hw-evidence containing raw invalid UTF-8 bytes
+	// must unmarshal cleanly with jsontext.AllowInvalidUTF8(true) instead of
+	// failing and discarding all evidence (invalid bytes decode as U+FFFD).
+	rawJSON := fmt.Sprintf(`{"acute":{"pcie":{"at":%d,"detail":"bad`+"\xff"+`byte"}},"nvme_resets":[]}`,
+		f.deps.Clock.Now().Unix())
+	if err := os.WriteFile(r2.hwEvidencePath(), []byte(rawJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r3 := New(f.deps)
+	if r3.hw.acute["pcie"].detail != "bad\ufffdbyte" {
+		t.Fatalf("unmarshaled invalid-UTF8 hw-evidence = %q, want %q",
+			r3.hw.acute["pcie"].detail, "bad\ufffdbyte")
+	}
+	// saveHwEvidence with raw invalid UTF-8 in memory must not silently fail.
+	r3.hw.acute["mem"] = hwAcute{at: f.deps.Clock.Now(), detail: "raw\xffbyte"}
+	r3.saveHwEvidence()
+	r4 := New(f.deps)
+	if r4.hw.acute["mem"].detail != "raw\ufffdbyte" {
+		t.Fatalf("re-saved invalid-UTF8 hw-evidence = %q, want %q",
+			r4.hw.acute["mem"].detail, "raw\ufffdbyte")
 	}
 }

@@ -79,9 +79,11 @@ const (
 const maintSessionMaxAge = "45 minutes"
 
 const stuckSessionPredicate = "WHERE datname IN ('postgres', 'kine') " +
-	"AND ((application_name IN ('pg_repack', 'pg_dump', 'nha_probe', 'nha_compact', 'nha_maint') " +
+	"AND (((application_name IN ('pg_repack', 'pg_dump', 'nha_probe', 'nha_compact', 'nha_maint') " +
+	"OR application_name LIKE 'nha_%-hold-%') " +
 	"AND backend_start < now() - interval '" + maintSessionMaxAge + "') OR " +
 	"(application_name NOT IN ('pg_repack', 'pg_dump', 'nha_probe', 'nha_compact', 'nha_maint') " +
+	"AND application_name NOT LIKE 'nha_%-hold-%' " +
 	"AND ((state = 'idle in transaction' " +
 	"AND state_change < now() - interval '5 minutes') OR " +
 	"(state = 'active' AND query_start < now() - interval '10 minutes' " +

@@ -63,14 +63,26 @@ type SubprocOOMCheck struct {
 // Name returns the check label / WD_SIG key.
 func (c *SubprocOOMCheck) Name() string { return wdeps.CheckSubprocOOM }
 
-// containerScopeDirs lists the cri-containerd-*.scope dirs under a
+// containerScopeDirsChecked lists the cri-containerd-*.scope dirs under a
 // pod slice — one per container (the pod-sandbox scope is named
 // the same way; its pid1 is pause, which the same logic covers).
-func containerScopeDirs(podDir string) []string {
-	m, err := filepath.Glob(filepath.Join(podDir, "cri-containerd-*.scope"))
+func containerScopeDirsChecked(podDir string) ([]string, error) {
+	entries, err := os.ReadDir(podDir)
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	var out []string
+	for _, en := range entries {
+		name := en.Name()
+		if strings.HasPrefix(name, "cri-containerd-") && strings.HasSuffix(name, ".scope") {
+			out = append(out, filepath.Join(podDir, name))
+		}
+	}
+	return out, nil
+}
+
+func containerScopeDirs(podDir string) []string {
+	m, _ := containerScopeDirsChecked(podDir)
 	return m
 }
 
@@ -80,9 +92,17 @@ func containerScopeDirs(podDir string) []string {
 // a real PID-1 kill empties the file within the confirm window —
 // but PID 1 specifically is the verdict the event describes).
 func cgroupInitPID(scopeDir string) (int, bool) {
+	pid, ok, _ := cgroupInitPIDChecked(scopeDir)
+	return pid, ok
+}
+
+// cgroupInitPIDChecked distinguishes ENOENT/empty cgroup.procs from
+// non-ENOENT read errors (e.g. EACCES) so transient permission errors
+// never masquerade as a container restart (pid1=0).
+func cgroupInitPIDChecked(scopeDir string) (pid int, ok, readErr bool) {
 	data, err := os.ReadFile(filepath.Join(scopeDir, "cgroup.procs"))
 	if err != nil {
-		return 0, false
+		return 0, false, !os.IsNotExist(err)
 	}
 	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -90,10 +110,10 @@ func cgroupInitPID(scopeDir string) (int, bool) {
 			continue
 		}
 		if pid, err := strconv.Atoi(line); err == nil {
-			return pid, true
+			return pid, true, false
 		}
 	}
-	return 0, false
+	return 0, false, false
 }
 
 // oomMemStatMiB reads memory.stat of the container cgroup at OOM
@@ -141,29 +161,55 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckSubprocOOM, "abort")
 		return
 	}
+	dirs, err := podSliceDirsChecked(kubepods)
+	if err != nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: subproc-oom read %s failed: %v — inconclusive, keeping state",
+			kubepods, err))
+		c.d.CycleResult(wdeps.CheckSubprocOOM, "abort")
+		return
+	}
 	if c.scopes == nil {
 		c.scopes = map[string]*oomScope{}
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	podByUID := e.PodByUID()
 	seen := map[string]bool{}
-	for _, podDir := range podSliceDirs(kubepods) {
+	var unreadablePods []string
+	hadReadErr := false
+	for _, podDir := range dirs {
 		uid := podUIDFromSlice(podDir)
-		for _, scope := range containerScopeDirs(podDir) {
+		scopes, serr := containerScopeDirsChecked(podDir)
+		if serr != nil {
+			if !os.IsNotExist(serr) {
+				unreadablePods = append(unreadablePods, podDir)
+				hadReadErr = true
+			}
+			continue
+		}
+		for _, scope := range scopes {
 			seen[scope] = true
-			kill, ok := cgroupEventsValue(
-				filepath.Join(scope, "memory.events"), "oom_kill")
+			evPath := filepath.Join(scope, "memory.events")
+			kill, ok := cgroupEventsValue(evPath, "oom_kill")
 			if !ok {
+				if _, err := os.ReadFile(evPath); err != nil && !os.IsNotExist(err) {
+					hadReadErr = true
+				}
 				continue
 			}
 			// oom_group_kill rides the same file — a missing key
 			// (pre-5.x kernels, partial cgroupfs) just yields 0 and
 			// the group-kill half stays silent.
-			groupKill, _ := cgroupEventsValue(
-				filepath.Join(scope, "memory.events"), "oom_group_kill")
-			pid1, pidOK := cgroupInitPID(scope)
+			groupKill, _ := cgroupEventsValue(evPath, "oom_group_kill")
+			pid1, pidOK, pidErr := cgroupInitPIDChecked(scope)
+			if pidErr {
+				hadReadErr = true
+			}
 			st := c.scopes[scope]
 			if st == nil {
+				if pidErr {
+					continue // cannot seed pid1 baseline while cgroup.procs is unreadable
+				}
 				st = &oomScope{oomKill: kill, oomGroupKill: groupKill,
 					pid1: pid1}
 				c.scopes[scope] = st
@@ -178,6 +224,19 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				st.oomGroupKill = groupKill
 				c.reportGroupKill(ctx, uid, podByUID[uid], scope,
 					groupKill, delta, oomMemStatMiB(scope))
+			}
+			if pidErr {
+				// cgroup.procs failed for a non-ENOENT reason (e.g. EACCES):
+				// preserve st.pid1 and st.pendingAt instead of treating
+				// pid1=0 as a container restart; record oom_kill advance so
+				// the confirm window starts on the kill cycle.
+				if kill > st.oomKill {
+					st.oomKill = kill
+					if st.pendingAt.IsZero() {
+						st.pendingAt = now
+					}
+				}
+				continue
 			}
 			switch {
 			case kill > st.oomKill:
@@ -225,8 +284,21 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	for dir := range c.scopes {
 		if !seen[dir] {
-			delete(c.scopes, dir)
+			keep := false
+			for _, podDir := range unreadablePods {
+				if strings.HasPrefix(dir, podDir+string(filepath.Separator)) {
+					keep = true
+					break
+				}
+			}
+			if !keep {
+				delete(c.scopes, dir)
+			}
 		}
+	}
+	if hadReadErr {
+		c.d.CycleResult(wdeps.CheckSubprocOOM, "abort")
+		return
 	}
 	c.d.CycleResult(wdeps.CheckSubprocOOM, "ok")
 }

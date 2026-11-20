@@ -25,9 +25,10 @@
 package ctr
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 )
 
@@ -108,22 +110,51 @@ type hungCandidate struct {
 }
 
 func runcCmdlineQualifies(d *wdeps.Deps, pid int, comm string) bool {
+	qualifies, _ := runcCmdlineQualifiesChecked(d, pid, comm)
+	return qualifies
+}
+
+func runcCmdlineQualifiesChecked(d *wdeps.Deps, pid int, comm string) (qualifies, inconclusive bool) {
 	if strings.HasPrefix(comm, "runc:[") || strings.HasPrefix(comm, "crun:[") {
-		return true
+		return true, false
 	}
-	raw, err := os.ReadFile(d.Proc.File(pid, "cmdline"))
-	if err != nil || len(raw) == 0 {
-		// Unreadable/empty cmdline (e.g. kernel/test stat-only fixture):
+	if st, ok := d.Proc.Stat(pid); ok {
+		if len(st.Fields) > 0 &&
+			(st.Fields[0] == "D" || st.Fields[0] == "Z" || st.Fields[0] == "X" || st.Fields[0] == "x") {
+			return false, false
+		}
+	} else if procFileReadNonENOENT(d.Proc.File(pid, "stat")) {
+		return false, true
+	}
+	parts := d.Proc.Cmdline(pid)
+	if len(parts) == 0 {
+		// Distinguish absent cmdline (ENOENT in stat-only test fixtures)
+		// from unreadable cmdline (!ENOENT such as EACCES): never guess
+		// lifecycle and SIGKILL a potentially excluded `runc exec`/`run`.
+		// Re-check stat first so an S->D/Z/X transition never opens cmdline.
+		if st, ok := d.Proc.Stat(pid); ok && len(st.Fields) > 0 {
+			if st.Fields[0] == "D" || st.Fields[0] == "Z" || st.Fields[0] == "X" || st.Fields[0] == "x" {
+				return false, false
+			}
+		} else if procFileReadNonENOENT(d.Proc.File(pid, "stat")) {
+			return false, true
+		}
+		if procFileReadNonENOENT(d.Proc.File(pid, "cmdline")) {
+			return false, true
+		}
+		return true, false
+	}
+	if len(parts) == 1 && parts[0] == "" {
+		// Empty cmdline (e.g. kernel/test stat-only fixture):
 		// match bare runtime comm.
-		return true
+		return true, false
 	}
-	parts := bytes.Split(raw, []byte{0})
 	// Find the first non-empty arg after argv[0] that isn't a flag,
 	// stepping over the space-separated VALUE of a global flag. The
-	// exec/run exclusion and the "bracket comm" shortcut below stay
+	// exec/run exclusion and the "bracket comm" shortcut above stay
 	// untouched — only the subcommand lookup changes.
 	for i := 1; i < len(parts); i++ {
-		arg := strings.TrimSpace(string(parts[i]))
+		arg := strings.TrimSpace(parts[i])
 		if arg == "" {
 			continue
 		}
@@ -134,11 +165,26 @@ func runcCmdlineQualifies(d *wdeps.Deps, pid int, comm string) bool {
 			continue
 		}
 		if runcAllowedSubcmds[arg] {
-			return false
+			return false, false
 		}
-		return runcLifecycleSubcmds[arg]
+		return runcLifecycleSubcmds[arg], false
 	}
-	return false
+	return false, false
+}
+
+// runcDStateQualifies classifies a D-state runtime using stat/comm/PPID
+// and containerd-shim ancestry without touching /proc/<pid>/cmdline
+// (mm->mmap_lock deadlock safety).
+func runcDStateQualifies(d *wdeps.Deps, pid int, st procfs.Stat) bool {
+	if strings.HasPrefix(st.Comm, "runc:[") || strings.HasPrefix(st.Comm, "crun:[") {
+		return true
+	}
+	if len(st.Fields) > 1 {
+		if ppid, err := strconv.Atoi(st.Fields[1]); err == nil && ppid > 1 {
+			return hasContainerdShimAncestor(d, pid)
+		}
+	}
+	return true
 }
 
 func hasContainerdShimAncestor(d *wdeps.Deps, pid int) bool {
@@ -164,44 +210,84 @@ func hasContainerdShimAncestor(d *wdeps.Deps, pid int) bool {
 	return false
 }
 
+func procFileReadNonENOENT(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return !os.IsNotExist(err)
+	}
+	var b [1]byte
+	_, rerr := f.Read(b[:])
+	_ = f.Close()
+	return rerr != nil && !errors.Is(rerr, io.EOF) && !os.IsNotExist(rerr)
+}
+
 // scanHungRuntimes returns the pids currently qualifying as hung:
 // runtime comm/lifecycle subcommand + S/D state + age >= HungRuncAgeSec.
+// unreadable marks PIDs whose stat or cmdline failed with !ENOENT so
+// callers preserve their confirmation streaks and abort.
 func (c *HungRuncCheck) scanHungRuntimes(now time.Time,
-	pids []int) []hungCandidate {
+	pids []int) (out []hungCandidate, unreadable map[int]bool, inconclusive bool) {
 	minAge := time.Duration(c.d.Cfg.Wave2.HungRuncAgeSec) * time.Second
 	if minAge <= 0 {
 		minAge = 3 * time.Minute
 	}
-	var out []hungCandidate
 	for _, pid := range pids {
 		st, ok := c.d.Proc.Stat(pid)
-		if !ok || !st.HasComm || !runtimeComm(st.Comm) {
+		if !ok {
+			if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) {
+				if unreadable == nil {
+					unreadable = map[int]bool{}
+				}
+				unreadable[pid] = true
+				inconclusive = true
+			}
+			continue
+		}
+		if !st.HasComm || !runtimeComm(st.Comm) {
 			continue
 		}
 		// Fields[0] is the stat state char right after ')'.
 		if len(st.Fields) == 0 || (st.Fields[0] != "S" && st.Fields[0] != "D") {
 			continue
 		}
-		if !runcCmdlineQualifies(c.d, pid, st.Comm) {
-			continue
+		if st.Fields[0] == "D" {
+			if !runcDStateQualifies(c.d, pid, st) {
+				continue
+			}
+		} else {
+			qualifies, cmdInc := runcCmdlineQualifiesChecked(c.d, pid, st.Comm)
+			if cmdInc {
+				if unreadable == nil {
+					unreadable = map[int]bool{}
+				}
+				unreadable[pid] = true
+				inconclusive = true
+				continue
+			}
+			if !qualifies {
+				continue
+			}
 		}
 		if age := c.d.Proc.Age(pid, now); age < minAge {
 			continue
 		}
 		// Fields[19] is field 22 (starttime, jiffies) — the
 		// process-instance identity the streak keys on.
-		var start int64 = -1
-		if len(st.Fields) > 19 {
-			if v, err := strconv.ParseInt(st.Fields[19], 10, 64); err == nil {
-				start = v
-			}
-		}
 		out = append(out, hungCandidate{
-			pid: pid, start: start, comm: st.Comm, state: st.Fields[0],
+			pid: pid, start: parseProcStarttime(st), comm: st.Comm, state: st.Fields[0],
 			wchan: c.wchan(pid),
 		})
 	}
-	return out
+	return out, unreadable, inconclusive
+}
+
+func parseProcStarttime(st procfs.Stat) int64 {
+	if len(st.Fields) > 19 {
+		if v, err := strconv.ParseInt(st.Fields[19], 10, 64); err == nil {
+			return v
+		}
+	}
+	return -1
 }
 
 // wchan reads /proc/<pid>/wchan — the kernel wait channel name for
@@ -220,22 +306,18 @@ func (c *HungRuncCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
-	var pids []int
-	var err error
-	if e != nil && e.PidsOnce != nil {
-		pids = e.PidsOnce()
-	} else {
-		pids, err = c.d.Proc.PIDs()
-	}
-	if err != nil {
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
 		c.d.CycleResult(wdeps.CheckHungRunc, "inconclusive")
 		return
 	}
-	cands := c.scanHungRuntimes(now, pids)
+	cands, unreadable, scanInconclusive := c.scanHungRuntimes(now, pids)
 
 	// Consecutive-cycle confirmation keyed on (pid,starttime): a
 	// recycled pid is a NEW process and must re-earn its streak —
-	// pids that didn't qualify this cycle drop out entirely.
+	// pids that didn't qualify this cycle drop out entirely, while
+	// PIDs whose stat/cmdline was unreadable (!ENOENT) keep their
+	// prior streak intact.
 	streak := map[runcPidKey]int{}
 	var confirmed []hungCandidate
 	for _, cd := range cands {
@@ -246,9 +328,20 @@ func (c *HungRuncCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			confirmed = append(confirmed, cd)
 		}
 	}
+	if scanInconclusive {
+		for k, v := range c.seen {
+			if unreadable[k.pid] {
+				streak[k] = v
+			}
+		}
+	}
 	c.seen = streak
 
 	if len(cands) == 0 {
+		if scanInconclusive {
+			c.d.CycleResult(wdeps.CheckHungRunc, "abort")
+			return
+		}
 		c.d.CycleResult(wdeps.CheckHungRunc, "ok")
 		return
 	}
@@ -256,6 +349,10 @@ func (c *HungRuncCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: hung-runc-reaper %d runtime(s) in S/D state past age bound - awaiting %d-cycle confirm",
 			len(cands), c.d.Cfg.Wave2.HungRuncConfirmCycles))
+		if scanInconclusive {
+			c.d.CycleResult(wdeps.CheckHungRunc, "abort")
+			return
+		}
 		c.d.CycleResult(wdeps.CheckHungRunc, "ok")
 		return
 	}
@@ -297,6 +394,31 @@ func (c *HungRuncCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				"cleanup: hung-runc-reaper kill held - cluster upgrade in progress")
 			continue
 		}
+		// Re-verify process identity, state, shim ancestry, and starttime
+		// immediately before SIGKILL to close any mid-cycle TOCTOU window
+		// (e.g. S->D transition or PID reuse during HoldEmergencyHeal).
+		st, ok := c.d.Proc.Stat(cd.pid)
+		if !ok || !st.HasComm || !runtimeComm(st.Comm) || len(st.Fields) == 0 {
+			continue
+		}
+		if st.Fields[0] != "S" {
+			if st.Fields[0] == "D" {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: hung-runc-reaper pid=%d comm=%s wchan=%s uninterruptible D-state (SIGKILL ineffective)",
+					cd.pid, st.Comm, cd.wchan))
+			}
+			continue
+		}
+		if len(st.Fields) > 1 {
+			if ppid, err := strconv.Atoi(st.Fields[1]); err == nil && ppid > 1 {
+				if !hasContainerdShimAncestor(c.d, cd.pid) {
+					continue
+				}
+			}
+		}
+		if cd.start >= 0 && parseProcStarttime(st) != cd.start {
+			continue
+		}
 		if err := c.d.Cfg.Seams.Host.KillFn(cd.pid, syscall.SIGKILL); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: hung-runc-reaper kill pid=%d failed: %v", cd.pid, err))
@@ -309,6 +431,10 @@ func (c *HungRuncCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.emitHungEvent(ctx, cd)
 	}
 	c.d.Actions.WithLabelValues(wdeps.CheckHungRunc, "runtime_kill").Add(float64(killed))
+	if scanInconclusive {
+		c.d.CycleResult(wdeps.CheckHungRunc, "abort")
+		return
+	}
 	c.d.CycleResult(wdeps.CheckHungRunc, "ok")
 }
 

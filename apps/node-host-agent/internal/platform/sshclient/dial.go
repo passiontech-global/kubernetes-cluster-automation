@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -31,6 +32,7 @@ type Link struct {
 	// target. A one-shot Config.Dial clears it — the Link owns the
 	// bastion and Close shuts it like before.
 	JumpShared bool
+	bastion    *Bastion
 }
 
 // DeadlineConn picks the conn a per-op SetDeadline must land on.
@@ -50,11 +52,60 @@ func (l *Link) DeadlineConn() net.Conn {
 // goes first). A borrowed bastion (JumpShared) stays open: the
 // Bastion owner closes it when the last target releases it.
 func (l *Link) Close() error {
-	err := l.Client.Close()
-	if l.Jump != nil && !l.JumpShared {
-		_ = l.Jump.Close()
+	if l == nil {
+		return nil
+	}
+	var err error
+	if l.Client != nil {
+		err = l.Client.Close()
+	}
+	if !l.JumpShared {
+		if l.bastion != nil {
+			_ = l.bastion.Close()
+		} else if l.Jump != nil {
+			_ = l.Jump.Close()
+		}
 	}
 	return err
+}
+
+// ForceClose tears down every transport backing l — including a shared
+// Bastion — closing the underlying TCP sockets first so a blackholed
+// carrier unblocks immediately even when ssh.Client.Close() would hang
+// trying to send SSH_MSG_CHANNEL_CLOSE.
+func (l *Link) ForceClose() error {
+	if l == nil {
+		return nil
+	}
+	var firstErr error
+	record := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if l.bastion != nil {
+		l.bastion.closed.Store(true)
+		if l.bastion.Net != nil {
+			record(l.bastion.Net.Close())
+		}
+		if l.bastion.Client != nil {
+			record(l.bastion.Client.Close())
+		}
+	} else {
+		if l.JumpNet != nil {
+			record(l.JumpNet.Close())
+		}
+		if l.Jump != nil {
+			record(l.Jump.Close())
+		}
+	}
+	if l.Net != nil {
+		record(l.Net.Close())
+	}
+	if l.Client != nil {
+		record(l.Client.Close())
+	}
+	return firstErr
 }
 
 // Bastion is a reusable ProxyJump connection: the bastion's TCP
@@ -67,6 +118,12 @@ type Bastion struct {
 	Spec   string
 	Net    net.Conn
 	Client *ssh.Client
+	closed atomic.Bool
+}
+
+// Closed reports whether Close or ForceClose has torn down this Bastion.
+func (b *Bastion) Closed() bool {
+	return b != nil && b.closed.Load()
 }
 
 // Close shuts the bastion client (which owns Net) — idempotent via
@@ -75,7 +132,14 @@ func (b *Bastion) Close() error {
 	if b == nil {
 		return nil
 	}
-	return b.Client.Close()
+	b.closed.Store(true)
+	if b.Client != nil {
+		return b.Client.Close()
+	}
+	if b.Net != nil {
+		return b.Net.Close()
+	}
+	return nil
 }
 
 // OpenBastion dials only the proxyJump hop — the reusable half of
@@ -107,6 +171,16 @@ func (c Config) OpenBastion(ctx context.Context, proxyJump string) (*Bastion, er
 // instead of one per target.
 func (c Config) DialVia(ctx context.Context, user, host string,
 	b *Bastion) (*Link, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if b == nil || b.Client == nil || b.Closed() {
+		spec := ""
+		if b != nil {
+			spec = b.Spec
+		}
+		return nil, fmt.Errorf("jump %s: bastion closed", spec)
+	}
 	if user == "" {
 		user = "root"
 	}
@@ -118,23 +192,53 @@ func (c Config) DialVia(ctx context.Context, user, host string,
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	cfg := c.ClientConfig(user, signer)
 
-	// Channel-open on the jump has no ctx wiring — bound it on
-	// the jump's conn the same way the handshake is bounded.
-	clear := BoundOp(ctx, c.Log, b.Net, c.Timeout)
-	nc, err := b.Client.Dial("tcp", addr)
-	clear()
-	if err != nil {
-		return nil, fmt.Errorf("jump %s → %s: %w", b.Spec, addr, err)
+	// Channel-open on a shared jump has no ctx wiring — NEVER set a
+	// per-target deadline on b.Net (that would kill the bastion's mux
+	// read loop for every other target). Bound b.Client.Dial with a
+	// goroutine + dialCtx instead, closing any late-returning chanConn
+	// if dialCtx already expired.
+	dialCtx := ctx
+	if c.Timeout > 0 {
+		var cancel context.CancelFunc
+		dialCtx, cancel = context.WithTimeout(ctx, c.Timeout)
+		defer cancel()
 	}
-	// nc here is a chanConn — SetDeadline always errors on it,
-	// so the handshake is bounded on b.Net (the real TCP conn all
-	// muxed traffic rides).
-	client, err := c.Handshake(ctx, nc, b.Net, addr, cfg)
+	type dialResult struct {
+		nc  net.Conn
+		err error
+	}
+	ch := make(chan dialResult)
+	abandoned := make(chan struct{})
+	go func() {
+		nc, derr := b.Client.Dial("tcp", addr)
+		select {
+		case ch <- dialResult{nc: nc, err: derr}:
+		case <-abandoned:
+			if nc != nil {
+				_ = nc.Close()
+			}
+		}
+	}()
+	var nc net.Conn
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return nil, fmt.Errorf("jump %s → %s: %w", b.Spec, addr, res.err)
+		}
+		nc = res.nc
+	case <-dialCtx.Done():
+		close(abandoned)
+		return nil, fmt.Errorf("jump %s → %s: %w", b.Spec, addr, dialCtx.Err())
+	}
+	// nc here is a chanConn over b.Net — handshake bounds it without
+	// arming per-target deadlines on b.Net, only escalating to b.Close
+	// if closing nc stalls (blackholed bastion transport).
+	client, err := c.handshake(ctx, nc, b.Net, b, addr, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("%s via %s: %w", addr, b.Spec, err)
 	}
 	return &Link{Client: client, Net: nc, JumpNet: b.Net,
-		Jump: b.Client, JumpShared: true}, nil
+		Jump: b.Client, JumpShared: true, bastion: b}, nil
 }
 
 // Dial connects to host:Port as user (empty → root), through
@@ -214,35 +318,125 @@ func (c Config) DialTCP(ctx context.Context, addr string,
 
 // Handshake runs NewClientConn under a conn deadline covering the
 // SSH banner + auth exchange, then clears it so sessions get their
-// own deadlines. carrier is the conn SetDeadline actually works on:
-// nc itself for a direct dial, but the JUMP's TCP conn when nc is
-// the chanConn jump.Dial returned — a chanConn's SetDeadline always
-// errors while every muxed channel rides the jump conn. A rejected
-// SetDeadline leaves the handshake effectively unbounded — warn so
-// a silent hang is at least loud in the logs.
+// own deadlines. For direct dials (carrier == nc), SetDeadline bounds
+// nc directly (warning if unsupported). When carrier != nc (proxied
+// chanConn over a shared bastion transport), Handshake NEVER sets
+// per-target deadlines on carrier — instead it bounds NewClientConn
+// with ctx/Timeout, closes nc on expiry/cancel, and only escalates to
+// closing carrier if nc.Close fails to unblock within defaultCancelGrace.
 func (c Config) Handshake(ctx context.Context, nc, carrier net.Conn,
 	addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
-	dl := time.Now().Add(c.Timeout)
-	if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
-		dl = cdl
+	return c.handshake(ctx, nc, carrier, nil, addr, cfg)
+}
+
+func (c Config) handshake(ctx context.Context, nc, carrier net.Conn,
+	b *Bastion, addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	if carrier == nc {
+		dl := time.Now().Add(c.Timeout)
+		if cdl, ok := ctx.Deadline(); ok && cdl.Before(dl) {
+			dl = cdl
+		}
+		if err := carrier.SetDeadline(dl); err != nil {
+			c.log().Warn("sshclient: ssh handshake unbounded — SetDeadline unsupported",
+				"addr", addr, "error", err)
+		} else {
+			defer func() { _ = carrier.SetDeadline(time.Time{}) }()
+		}
+		cbDone := make(chan struct{})
+		stopCancel := context.AfterFunc(ctx, func() {
+			defer close(cbDone)
+			_ = nc.Close()
+			_ = carrier.SetDeadline(time.Now())
+		})
+		conn, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
+		if !stopCancel() {
+			<-cbDone
+		}
+		if err != nil {
+			_ = nc.Close()
+			return nil, err
+		}
+		return ssh.NewClient(conn, chans, reqs), nil
 	}
-	if err := carrier.SetDeadline(dl); err != nil {
-		c.log().Warn("sshclient: ssh handshake unbounded — SetDeadline unsupported",
-			"addr", addr, "error", err)
-	} else {
-		// Clear on EVERY exit path, error ones included: nc is the
-		// failed hop's chanConn (jump case) and gets closed below,
-		// but carrier is the shared bastion conn — a deadline left
-		// armed on it would kill every later channel muxed over the
-		// bastion once the handshake budget expired.
-		defer func() { _ = carrier.SetDeadline(time.Time{}) }()
+
+	hsCtx := ctx
+	if c.Timeout > 0 {
+		var cancel context.CancelFunc
+		hsCtx, cancel = context.WithTimeout(ctx, c.Timeout)
+		defer cancel()
 	}
-	conn, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
-	if err != nil {
-		_ = nc.Close()
-		return nil, err
+	type hsResult struct {
+		conn  ssh.Conn
+		chans <-chan ssh.NewChannel
+		reqs  <-chan *ssh.Request
+		err   error
 	}
-	return ssh.NewClient(conn, chans, reqs), nil
+	ch := make(chan hsResult, 1)
+	go func() {
+		conn, chans, reqs, err := ssh.NewClientConn(nc, addr, cfg)
+		ch <- hsResult{conn: conn, chans: chans, reqs: reqs, err: err}
+	}()
+	escalate := func() {
+		if b != nil {
+			_ = b.Close()
+		}
+		if carrier != nil {
+			_ = carrier.Close()
+		}
+	}
+	closeNC := func() {
+		closeDone := make(chan struct{})
+		go func() {
+			defer close(closeDone)
+			_ = nc.Close()
+		}()
+		t := time.NewTimer(defaultCancelGrace)
+		defer t.Stop()
+		select {
+		case <-closeDone:
+		case <-t.C:
+			escalate()
+			<-closeDone
+		}
+	}
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			closeNC()
+			return nil, res.err
+		}
+		return ssh.NewClient(res.conn, res.chans, res.reqs), nil
+	case <-hsCtx.Done():
+		closeNCDone := make(chan struct{})
+		go func() {
+			defer close(closeNCDone)
+			_ = nc.Close()
+		}()
+		t := time.NewTimer(defaultCancelGrace)
+		defer t.Stop()
+		var res hsResult
+		select {
+		case res = <-ch:
+			select {
+			case <-closeNCDone:
+			case <-t.C:
+				escalate()
+				<-closeNCDone
+			}
+		case <-t.C:
+			escalate()
+			res = <-ch
+			<-closeNCDone
+		}
+		if res.err == nil && res.conn != nil {
+			_ = res.conn.Close()
+			return nil, hsCtx.Err()
+		}
+		if res.err != nil {
+			return nil, res.err
+		}
+		return nil, hsCtx.Err()
+	}
 }
 
 // BoundOp sets a conn deadline covering one blocking channel op —

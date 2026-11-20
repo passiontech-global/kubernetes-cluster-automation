@@ -225,6 +225,28 @@ func TestListRVParseAndTimeout(t *testing.T) {
 		}
 	})
 
+	for _, tc := range []struct {
+		name   string
+		body   string
+		wantFC failClass
+	}{
+		{"empty body", ``, failParse},
+		{"empty object", `{}`, failParse},
+		{"array start", `[1,2]`, failParse},
+		{"empty resourceVersion", `{"metadata":{"resourceVersion":""}}`, failParse},
+		{"truncated metadata key", `{"metadata"`, failBody},
+		{"truncated member key", `{"a"`, failBody},
+		{"truncated mid resourceVersion", `{"metadata":{"resourceVersion":"1`, failBody},
+		{"metadata not an object (SemanticError)", `{"metadata":5}`, failBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, addr := mkProber(t, tc.body)
+			if rv, fc, _ := p.listRV(context.Background(), addr, "/x"); fc != tc.wantFC || rv != 0 {
+				t.Fatalf("listRV(%s) = %d, %v want 0, %v", tc.name, rv, fc, tc.wantFC)
+			}
+		})
+	}
+
 	t.Run("non-200 with injected client", func(t *testing.T) {
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)

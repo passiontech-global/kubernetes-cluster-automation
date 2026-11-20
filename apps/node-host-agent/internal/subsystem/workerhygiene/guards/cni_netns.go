@@ -60,28 +60,48 @@ const (
 // identity /proc/<pid>/ns/net entries share for the same network
 // namespace (bind-mounted copies keep the inode).
 func netnsInode(path string) (uint64, bool) {
+	ino, ok, _ := netnsInodeChecked(path)
+	return ino, ok
+}
+
+// netnsInodeChecked distinguishes ENOENT (ok=false, nonENOENT=false)
+// from permission/IO errors (ok=false, nonENOENT=true) so callers never
+// treat an unreadable /proc/<pid>/ns/net as unreferenced.
+func netnsInodeChecked(path string) (ino uint64, ok, nonENOENT bool) {
 	fi, err := os.Stat(path)
 	if err != nil {
-		return 0, false
+		return 0, false, !os.IsNotExist(err)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, false
+		return 0, false, false
 	}
-	return st.Ino, true
+	return st.Ino, true, false
 }
 
 // liveNetnsInodes collects the nsfs inode of every live process's
 // network namespace. Unreadable entries are skipped — a pid that
 // vanished mid-scan is not a reference.
 func liveNetnsInodes(d *wdeps.Deps, pids []int) map[uint64]bool {
+	out, _ := liveNetnsInodesChecked(d, pids)
+	return out
+}
+
+// liveNetnsInodesChecked collects live /proc/<pid>/ns/net inodes and
+// returns ok=false when any pid returns a non-ENOENT stat error (e.g.
+// EACCES when /proc/<pid>/ns is 0o000).
+func liveNetnsInodesChecked(d *wdeps.Deps, pids []int) (map[uint64]bool, bool) {
 	out := map[uint64]bool{}
 	for _, pid := range pids {
-		if ino, ok := netnsInode(d.Proc.File(pid, "ns", "net")); ok {
+		ino, ok, nonENOENT := netnsInodeChecked(d.Proc.File(pid, "ns", "net"))
+		if nonENOENT {
+			return nil, false
+		}
+		if ok {
 			out[ino] = true
 		}
 	}
-	return out
+	return out, true
 }
 
 // netnsHeldByLiveTask reports whether any containerd task with a
@@ -96,6 +116,12 @@ func liveNetnsInodes(d *wdeps.Deps, pids []int) map[uint64]bool {
 // stat, the pre-StatsOnce behavior.
 func netnsHeldByLiveTask(d *wdeps.Deps, e *wdeps.CycleEnv,
 	tasks map[string][]wdeps.CtrTask, ino uint64) bool {
+	held, _ := netnsHeldByLiveTaskChecked(d, e, tasks, ino)
+	return held
+}
+
+func netnsHeldByLiveTaskChecked(d *wdeps.Deps, e *wdeps.CycleEnv,
+	tasks map[string][]wdeps.CtrTask, ino uint64) (held, readErr bool) {
 
 	for _, ts := range tasks {
 		for _, t := range ts {
@@ -110,13 +136,16 @@ func netnsHeldByLiveTask(d *wdeps.Deps, e *wdeps.CycleEnv,
 					continue
 				}
 			}
-			if tino, ok := netnsInode(d.Proc.File(t.PID, "ns", "net")); ok &&
-				tino == ino {
-				return true
+			tino, ok, nonENOENT := netnsInodeChecked(d.Proc.File(t.PID, "ns", "net"))
+			if nonENOENT {
+				return false, true
+			}
+			if ok && tino == ino {
+				return true, false
 			}
 		}
 	}
-	return false
+	return false, false
 }
 
 // CNINetnsCheck is the orphan /run/netns/cni-* reaper as a Check.
@@ -159,14 +188,29 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckCNINetns, "ok")
 		return
 	}
-	live := liveNetnsInodes(c.d, e.PidsOnce())
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		c.d.State.AppendLog("suspect: cni-netns-gc /proc scan inconclusive — skipped")
+		c.d.CycleResult(wdeps.CheckCNINetns, "inconclusive")
+		return
+	}
+	live, liveOK := liveNetnsInodesChecked(c.d, pids)
+	if !liveOK {
+		c.d.State.AppendLog("suspect: cni-netns-gc /proc/*/ns/net scan unreadable — skipped")
+		c.d.CycleResult(wdeps.CheckCNINetns, "abort")
+		return
+	}
 	seen := map[string]bool{}
+	aborted := false
 	reaped := 0
 	for _, name := range names {
 		seen[name] = true
 		path := filepath.Join(c.d.Cfg.Net.NetnsDir, name)
-		ino, ok := netnsInode(path)
+		ino, ok, nonENOENT := netnsInodeChecked(path)
 		if !ok {
+			if nonENOENT {
+				aborted = true
+			}
 			continue // vanished or unreadable — next cycle re-reads
 		}
 		if live[ino] {
@@ -192,7 +236,11 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// Re-stat before acting: the inode must STILL be
 		// unreferenced (a process may have joined the netns since
 		// the snapshot; `live` is a per-cycle map).
-		ino2, ok2 := netnsInode(path)
+		ino2, ok2, nonENOENT2 := netnsInodeChecked(path)
+		if nonENOENT2 {
+			aborted = true
+			continue
+		}
 		if !ok2 || live[ino2] {
 			continue
 		}
@@ -200,8 +248,14 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// confirm window — a just-created mount point whose sweep
 		// raced the CNI ADD is not an orphan no matter what the
 		// inode check says.
-		if fi, err := os.Stat(path); err != nil ||
-			c.d.Cfg.Seams.Host.Clock.Now().Sub(fi.ModTime()) < cniNetnsMinAge {
+		fi, err := os.Stat(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				aborted = true
+			}
+			continue
+		}
+		if c.d.Cfg.Seams.Host.Clock.Now().Sub(fi.ModTime()) < cniNetnsMinAge {
 			continue
 		}
 		// orphan-sandbox-netns: the containerd task map is the stronger liveness
@@ -210,7 +264,12 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// live task" unverifiable → fail closed, retry next cycle.
 		if e.TasksOnce != nil {
 			tasks, complete := e.TasksOnce()
-			if !complete || netnsHeldByLiveTask(c.d, e, tasks, ino2) {
+			held, taskErr := netnsHeldByLiveTaskChecked(c.d, e, tasks, ino2)
+			if !complete || taskErr {
+				aborted = true
+				continue
+			}
+			if held {
 				continue
 			}
 		}
@@ -218,12 +277,21 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// `live` is the cycle-start snapshot — a process (or a
 		// just-issued CNI ADD) that joined this netns since then
 		// is invisible to it. Re-stat every /proc/*/ns/net NOW so
-		// the umount+rm can never race a fresh bind.
-		if fresh, err := c.d.Proc.PIDs(); err == nil {
-			if ino3, ok3 := netnsInode(path); ok3 &&
-				liveNetnsInodes(c.d, fresh)[ino3] {
-				continue
-			}
+		// the umount+rm can never race a fresh bind. Fail closed if
+		// the fresh /proc read fails.
+		fresh, err := c.d.Proc.PIDs()
+		if err != nil {
+			aborted = true
+			continue
+		}
+		freshLive, freshOK := liveNetnsInodesChecked(c.d, fresh)
+		ino3, ok3, nonENOENT3 := netnsInodeChecked(path)
+		if !freshOK || nonENOENT3 {
+			aborted = true
+			continue
+		}
+		if ok3 && freshLive[ino3] {
+			continue
 		}
 		if reaped >= cniNetnsMaxReapPerCycle {
 			c.d.State.AppendLog(fmt.Sprintf(
@@ -231,10 +299,18 @@ func (c *CNINetnsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				cniNetnsMaxReapPerCycle))
 			break
 		}
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog("cleanup: cni-netns-gc reap held — cluster maintenance in progress")
+			break
+		}
 		reapCNINetns(c.d, ctx, name)
 		reaped++
 	}
 	pruneCNINetnsMarkers(c.d, seen)
+	if aborted {
+		c.d.CycleResult(wdeps.CheckCNINetns, "abort")
+		return
+	}
 	c.d.CycleResult(wdeps.CheckCNINetns, "ok")
 }
 
@@ -284,6 +360,6 @@ func pruneCNINetnsMarkers(d *wdeps.Deps, seen map[string]bool) {
 			return true
 		}
 		_, err := os.Stat(filepath.Join(d.Cfg.Net.NetnsDir, name))
-		return err == nil
+		return err == nil || !os.IsNotExist(err)
 	})
 }

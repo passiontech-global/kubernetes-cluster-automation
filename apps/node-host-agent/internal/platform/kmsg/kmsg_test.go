@@ -197,13 +197,14 @@ func TestDrainHardError(t *testing.T) {
 			data, caughtUp, err)
 	}
 	// Same, but the error arrives with n==0 after earlier reads —
-	// an empty erroring read fails the whole drain (the carry
-	// contract of the hostmetrics session this mirrors).
+	// accumulated bytes from earlier reads are preserved alongside the
+	// sticky error so KeepPartialOnError consumers can still process
+	// records already drained from /dev/kmsg.
 	r = &scriptReader{reads: []readResult{
 		{data: "6,1,5,-;one\n"}, {err: errBoom},
 	}}
 	data, caughtUp, err = Drain(r, 1<<20)
-	if err != errBoom || caughtUp || data != nil {
+	if err != errBoom || caughtUp || string(data) != "6,1,5,-;one\n" {
 		t.Fatalf("mid-drain hard error: data=%q caughtUp=%v err=%v",
 			data, caughtUp, err)
 	}

@@ -215,6 +215,13 @@ func (c *CiliumCheck) CheckBPFMaps(ctx context.Context) {
 		return
 	}
 	maps := ParseCiliumBPFMaps(body)
+	if maps == nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cilium-bpf-maps map query on %s returned unparseable JSON (%d bytes) — inconclusive, keeping state",
+			c.d.Cfg.Cilium.Socket, len(body)))
+		c.d.CycleResult(wdeps.CheckCiliumBPF, "abort")
+		return
+	}
 	var over []string
 	for name, um := range maps {
 		if float64(um[0]) >= c.d.Cfg.Cilium.BPFMapHighRatio*float64(um[1]) {

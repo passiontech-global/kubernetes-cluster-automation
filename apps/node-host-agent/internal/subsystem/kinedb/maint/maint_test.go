@@ -762,14 +762,17 @@ func containsNote(notes []string, substr string) bool {
 func TestReapOrphanedMaint(t *testing.T) {
 	ctx := context.Background()
 
-	// n > 0 notes terminated count.
-	k, _, _ := fixture(t, []testutil.ExecRule{
+	// n > 0 notes terminated count, and never targets pg_dump.
+	k, fr, _ := fixture(t, []testutil.ExecRule{
 		{Substr: "pg_terminate_backend", Out: "t\nt\n"},
 	})
 	var notes []string
 	k.reapOrphanedMaint(ctx, "pg", "postgres", "secret", func(s string) { notes = append(notes, s) })
 	if !containsNote(notes, "terminated 2 orphaned maintenance backend(s)") {
 		t.Fatalf("notes=%v want terminated count", notes)
+	}
+	if strings.Contains(fr.Joined(), "pg_dump") {
+		t.Fatalf("maint reapOrphanedMaint must not target pg_dump:\n%s", fr.Joined())
 	}
 
 	// n == 0 produces no notes.
@@ -791,4 +794,87 @@ func TestReapOrphanedMaint(t *testing.T) {
 	if !containsNote(notes, "orphan-reap-fail") {
 		t.Fatalf("err notes=%v want orphan-reap-fail", notes)
 	}
+}
+
+func TestMaintCooldownBackwardClockSelfHeals(t *testing.T) {
+	t.Run("maintEpochFresh", func(t *testing.T) {
+		now := time.Unix(kdepstest.TestNow, 0)
+		k, fr, dir := fixture(t, []testutil.ExecRule{
+			{Substr: "inspect", Out: "true"},
+			{Substr: "REINDEX TABLE CONCURRENTLY", Out: "REINDEX\n"},
+			{Substr: "pg_indexes_size", Out: "100000000|4857600|10|90\n"},
+		})
+		k.d.Cfg.Clock.Set(func() time.Time { return now })
+		// Epoch sits 48h in the future (backward NTP jump).
+		kdeps.WriteIntFile(epochPath(t, dir), now.Add(48*time.Hour).Unix())
+
+		res := k.Cycle(context.Background())
+		if res.freezeState != "skipped" {
+			t.Fatalf("expected skip while healing future epoch, got %+v", res)
+		}
+		if got, _ := kdeps.ReadIntFile(epochPath(t, dir)); got != now.Unix() {
+			t.Fatalf("future epoch not healed to now: got %d want %d", got, now.Unix())
+		}
+
+		// Advance past maintEpochWindow (22h + 1s, still < 48h): heavy block must run.
+		now = now.Add(maintEpochWindow + time.Second)
+		k.Cycle(context.Background())
+		if !strings.Contains(fr.LastStdin(), `REINDEX TABLE CONCURRENTLY "kine"`) {
+			t.Fatalf("healed epoch stayed starved after maintEpochWindow:\n%s", fr.LastStdin())
+		}
+	})
+
+	t.Run("urgentReindex", func(t *testing.T) {
+		now := time.Unix(kdepstest.TestNow, 0)
+		k, _, dir := fixture(t, []testutil.ExecRule{
+			{Substr: "ON_ERROR_STOP", Out: "REINDEX\n"},
+		})
+		k.d.Cfg.Clock.Set(func() time.Time { return now })
+		ep := filepath.Join(dir, "guard", urgentReindexFile)
+		kdeps.WriteIntFile(ep, now.Add(48*time.Hour).Unix())
+
+		res := &Result{heapBytes: 500 << 20, indexBytes: 2 << 30}
+		k.urgentReindex(context.Background(), "pg", "postgres", "secret", res, func(string) {})
+		if res.urgentState != "cooldown" {
+			t.Fatalf("expected cooldown while healing future stamp, got %+v", res)
+		}
+		if got, _ := kdeps.ReadIntFile(ep); got != now.Unix() {
+			t.Fatalf("future urgent-reindex epoch not healed: got %d want %d", got, now.Unix())
+		}
+
+		// Advance past urgentReindexCooldown (24h + 1s, well before +48h).
+		now = now.Add(urgentReindexCooldown + time.Second)
+		res2 := &Result{heapBytes: 500 << 20, indexBytes: 2 << 30}
+		k.urgentReindex(context.Background(), "pg", "postgres", "secret", res2, func(string) {})
+		if res2.urgentState != "done" {
+			t.Fatalf("expected urgent reindex after healed cooldown elapsed, got %+v", res2)
+		}
+	})
+}
+
+func TestMaintRepackLockHoldFail(t *testing.T) {
+	k, fr, _ := fixture(t, maintBloatRules)
+	fr.On("pg_locks", "0\n")
+	next := k.d.Cfg.Run
+	k.d.Cfg.Run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
+		if strings.Contains(stdin, "pg_sleep(86400)") {
+			return "", errors.New("hold session failed")
+		}
+		return next(ctx, env, argv, stdin)
+	}
+
+	res := k.Cycle(context.Background())
+	if res.okRepack || res.repackState != "fail" {
+		t.Fatalf("res=%+v notes=%v", res, res.notes)
+	}
+	if !containsNote(res.notes, "repack-lock-hold-fail") {
+		t.Fatalf("notes=%v want repack-lock-hold-fail", res.notes)
+	}
+	if strings.Contains(fr.Joined(), "--no-superuser-check") {
+		t.Fatalf("pg_repack ran despite lock hold failure:\n%s", fr.Joined())
+	}
+	if !k.d.MaintMu.TryLock() {
+		t.Fatal("MaintMu left locked on repack-lock-hold-fail")
+	}
+	k.d.MaintMu.Unlock()
 }

@@ -2,10 +2,12 @@ package sweeper
 
 import (
 	"context"
+	json "encoding/json/v2"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -402,7 +404,7 @@ func TestMaxDeleteCap(t *testing.T) {
 // spends its whole budget on the PV object; the orphaned dir waits
 // for next cycle instead of riding past the cap on the same op.
 func TestMaxDeleteCountsPVObjectDelete(t *testing.T) {
-	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
+	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "data")
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
 	cs := nhatestutil.FakeKube(pv, other)
@@ -679,7 +681,7 @@ func TestMountsFileUnreadableSkips(t *testing.T) {
 }
 
 func TestReleasedPVPatchFailsSkips(t *testing.T) {
-	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
+	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "data")
 	pv.Finalizers = []string{"kubernetes.io/pv-protection"}
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
@@ -702,7 +704,7 @@ func TestReleasedPVPatchFailsSkips(t *testing.T) {
 }
 
 func TestReleasedPVDeleteFailsSkips(t *testing.T) {
-	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "", "")
+	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "data")
 	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
 		corev1.PersistentVolumeReclaimDelete, "", "")
 	cs := nhatestutil.FakeKube(pv, other)
@@ -908,4 +910,433 @@ func TestRemoveAllFailureWarns(t *testing.T) {
 	if got := testutil.ToFloat64(s.cycles.WithLabelValues("ok")); got != 1 {
 		t.Fatalf("cycles ok=%v want 1 (rm failure is not an abort)", got)
 	}
+}
+
+func TestPVListUsesResourceVersionZeroAndGetsStayQuorum(t *testing.T) {
+	pv := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "data")
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "", "")
+	cs := nhatestutil.FakeKube(pv, other)
+	s, base, _ := fixture(t, cs)
+	dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+	s.Sweep(context.Background())
+
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("Released+Delete orphan dir still present: %v", err)
+	}
+
+	var pvListOpts []metav1.ListOptions
+	var pvcGetOpts []metav1.GetOptions
+	var pvGetOpts []metav1.GetOptions
+	var pvDeleteOpts []metav1.DeleteOptions
+	for _, act := range cs.Actions() {
+		switch a := act.(type) {
+		case k8stesting.ListActionImpl:
+			if a.GetResource().Resource == "persistentvolumes" {
+				pvListOpts = append(pvListOpts, a.GetListOptions())
+			}
+		case k8stesting.GetActionImpl:
+			switch a.GetResource().Resource {
+			case "persistentvolumeclaims":
+				pvcGetOpts = append(pvcGetOpts, a.GetGetOptions())
+			case "persistentvolumes":
+				pvGetOpts = append(pvGetOpts, a.GetGetOptions())
+			}
+		case k8stesting.DeleteActionImpl:
+			if a.GetResource().Resource == "persistentvolumes" {
+				pvDeleteOpts = append(pvDeleteOpts, a.GetDeleteOptions())
+			}
+		}
+	}
+
+	if len(pvListOpts) != 1 {
+		t.Fatalf("PV list calls = %d, want 1", len(pvListOpts))
+	}
+	if pvListOpts[0].ResourceVersion != "0" || pvListOpts[0].Limit != 0 || pvListOpts[0].Continue != "" {
+		t.Fatalf("PV ListOptions = %+v, want ResourceVersion=\"0\", Limit=0, Continue=\"\"", pvListOpts[0])
+	}
+	if len(pvcGetOpts) != 1 {
+		t.Fatalf("PVC get calls = %d, want 1", len(pvcGetOpts))
+	}
+	if pvcGetOpts[0].ResourceVersion != "" {
+		t.Fatalf("PVC GetOptions.ResourceVersion = %q, want \"\" (quorum)", pvcGetOpts[0].ResourceVersion)
+	}
+	// Two quorum PV Gets: one in releaseStalePV before Patch/Delete,
+	// and one re-GET in pvGoneAndUnmounted before os.RemoveAll.
+	if len(pvGetOpts) != 2 {
+		t.Fatalf("PV get calls = %d, want 2", len(pvGetOpts))
+	}
+	for i, opts := range pvGetOpts {
+		if opts.ResourceVersion != "" {
+			t.Fatalf("PV GetOptions[%d].ResourceVersion = %q, want \"\" (quorum)", i, opts.ResourceVersion)
+		}
+	}
+	if len(pvDeleteOpts) != 1 {
+		t.Fatalf("PV delete calls = %d, want 1", len(pvDeleteOpts))
+	}
+	pre := pvDeleteOpts[0].Preconditions
+	if pre == nil || pre.UID == nil || *pre.UID != pv.UID ||
+		pre.ResourceVersion == nil || *pre.ResourceVersion != pv.ResourceVersion {
+		t.Fatalf("PV Delete Preconditions = %+v, want UID=%q ResourceVersion=%q",
+			pre, pv.UID, pv.ResourceVersion)
+	}
+}
+
+// staleCacheFakeServer emulates a watch-cache (RV="0" List) lagging behind
+// live etcd state while enforcing real Kubernetes JSONPatch test ops and
+// Delete Preconditions (UID + ResourceVersion).
+type staleCacheFakeServer struct {
+	mu          sync.Mutex
+	staleList   []corev1.PersistentVolume
+	livePVs     map[string]*corev1.PersistentVolume
+	livePVCs    map[string]*corev1.PersistentVolumeClaim
+	onPVGet     func(live *corev1.PersistentVolume)
+	deleteCalls []metav1.DeleteOptions
+	patchedToRV string
+}
+
+func (f *staleCacheFakeServer) install(cs *fake.Clientset) {
+	cs.PrependReactor("list", "persistentvolumes",
+		func(act k8stesting.Action) (bool, runtime.Object, error) {
+			la := act.(k8stesting.ListAction)
+			if la.GetListRestrictions().Fields.Empty() && la.GetListRestrictions().Labels.Empty() {
+				f.mu.Lock()
+				items := make([]corev1.PersistentVolume, len(f.staleList))
+				for i := range f.staleList {
+					items[i] = *f.staleList[i].DeepCopy()
+				}
+				f.mu.Unlock()
+				return true, &corev1.PersistentVolumeList{Items: items}, nil
+			}
+			return false, nil, nil
+		})
+	cs.PrependReactor("get", "persistentvolumes",
+		func(act k8stesting.Action) (bool, runtime.Object, error) {
+			ga := act.(k8stesting.GetAction)
+			name := ga.GetName()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			pv, ok := f.livePVs[name]
+			if !ok {
+				return true, nil, apierrors.NewNotFound(corev1.Resource("persistentvolumes"), name)
+			}
+			out := pv.DeepCopy()
+			if f.onPVGet != nil {
+				f.onPVGet(pv)
+			}
+			return true, out, nil
+		})
+	cs.PrependReactor("get", "persistentvolumeclaims",
+		func(act k8stesting.Action) (bool, runtime.Object, error) {
+			ga := act.(k8stesting.GetAction)
+			key := ga.GetNamespace() + "/" + ga.GetName()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			pvc, ok := f.livePVCs[key]
+			if !ok {
+				return true, nil, apierrors.NewNotFound(corev1.Resource("persistentvolumeclaims"), ga.GetName())
+			}
+			return true, pvc.DeepCopy(), nil
+		})
+	cs.PrependReactor("patch", "persistentvolumes",
+		func(act k8stesting.Action) (bool, runtime.Object, error) {
+			pa := act.(k8stesting.PatchAction)
+			name := pa.GetName()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			pv, ok := f.livePVs[name]
+			if !ok {
+				return true, nil, apierrors.NewNotFound(corev1.Resource("persistentvolumes"), name)
+			}
+			var ops []struct {
+				Op    string `json:"op"`
+				Path  string `json:"path"`
+				Value any    `json:"value"`
+			}
+			if err := json.Unmarshal(pa.GetPatch(), &ops); err != nil {
+				return true, nil, apierrors.NewBadRequest(err.Error())
+			}
+			for _, op := range ops {
+				if op.Op == "test" {
+					switch op.Path {
+					case "/metadata/uid":
+						if op.Value != string(pv.UID) {
+							return true, nil, apierrors.NewConflict(corev1.Resource("persistentvolumes"), name, errors.New("uid mismatch"))
+						}
+					case "/metadata/resourceVersion":
+						if op.Value != pv.ResourceVersion {
+							return true, nil, apierrors.NewConflict(corev1.Resource("persistentvolumes"), name, errors.New("rv mismatch"))
+						}
+					}
+				}
+			}
+			pv.Finalizers = nil
+			if f.patchedToRV != "" {
+				pv.ResourceVersion = f.patchedToRV
+			}
+			return true, pv.DeepCopy(), nil
+		})
+	cs.PrependReactor("delete", "persistentvolumes",
+		func(act k8stesting.Action) (bool, runtime.Object, error) {
+			da := act.(k8stesting.DeleteAction)
+			name := da.GetName()
+			opts := da.GetDeleteOptions()
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.deleteCalls = append(f.deleteCalls, opts)
+			pv, ok := f.livePVs[name]
+			if !ok {
+				return true, nil, apierrors.NewNotFound(corev1.Resource("persistentvolumes"), name)
+			}
+			if opts.Preconditions != nil {
+				if opts.Preconditions.UID != nil && *opts.Preconditions.UID != pv.UID {
+					return true, nil, apierrors.NewConflict(corev1.Resource("persistentvolumes"), name, errors.New("uid precondition mismatch"))
+				}
+				if opts.Preconditions.ResourceVersion != nil && *opts.Preconditions.ResourceVersion != pv.ResourceVersion {
+					return true, nil, apierrors.NewConflict(corev1.Resource("persistentvolumes"), name, errors.New("resourceVersion precondition mismatch"))
+				}
+			}
+			delete(f.livePVs, name)
+			return true, nil, nil
+		})
+}
+
+func TestStaleRVZeroSameUIDPVProtected(t *testing.T) {
+	const sameUID = types.UID("same-uid-1234")
+	other := mkPV("pvc-aaaaaaaa-0000-0000-0000-000000000000", "Bound",
+		corev1.PersistentVolumeReclaimDelete, "sys", "keep")
+
+	t.Run("rebound_to_new_PVC_with_same_UID_no_finalizers", func(t *testing.T) {
+		stalePV := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "old-data")
+		stalePV.UID = sameUID
+		stalePV.ResourceVersion = "10"
+		stalePV.Finalizers = nil
+
+		livePV := mkPV(pvcUUID, "Bound", corev1.PersistentVolumeReclaimDelete, "prod", "live-db")
+		livePV.UID = sameUID
+		livePV.ResourceVersion = "25"
+		livePV.Finalizers = nil
+
+		livePVC := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "live-db"},
+		}
+		srv := &staleCacheFakeServer{
+			staleList: []corev1.PersistentVolume{*stalePV, *other},
+			livePVs:   map[string]*corev1.PersistentVolume{pvcUUID: livePV, other.Name: other},
+			livePVCs:  map[string]*corev1.PersistentVolumeClaim{"prod/live-db": livePVC},
+		}
+		cs := nhatestutil.FakeKube()
+		srv.install(cs)
+		s, base, _ := fixture(t, cs)
+		dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+		s.Sweep(context.Background())
+
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("live volume dir deleted despite rebound PV: %v", err)
+		}
+		srv.mu.Lock()
+		_, pvAlive := srv.livePVs[pvcUUID]
+		delCalls := len(srv.deleteCalls)
+		srv.mu.Unlock()
+		if !pvAlive {
+			t.Fatal("live Bound PV was deleted")
+		}
+		if delCalls != 0 {
+			t.Fatalf("PV delete calls = %d, want 0 (quorum PV.Get aborted before Delete)", delCalls)
+		}
+	})
+
+	t.Run("reclaim_policy_changed_to_Retain_same_UID_no_finalizers", func(t *testing.T) {
+		stalePV := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "old-data")
+		stalePV.UID = sameUID
+		stalePV.ResourceVersion = "10"
+		stalePV.Finalizers = nil
+
+		livePV := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimRetain, "app", "old-data")
+		livePV.UID = sameUID
+		livePV.ResourceVersion = "25"
+		livePV.Finalizers = nil
+
+		srv := &staleCacheFakeServer{
+			staleList: []corev1.PersistentVolume{*stalePV, *other},
+			livePVs:   map[string]*corev1.PersistentVolume{pvcUUID: livePV, other.Name: other},
+			livePVCs:  map[string]*corev1.PersistentVolumeClaim{},
+		}
+		cs := nhatestutil.FakeKube()
+		srv.install(cs)
+		s, base, _ := fixture(t, cs)
+		dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+		s.Sweep(context.Background())
+
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("volume dir deleted despite live Retain policy: %v", err)
+		}
+		srv.mu.Lock()
+		_, pvAlive := srv.livePVs[pvcUUID]
+		delCalls := len(srv.deleteCalls)
+		srv.mu.Unlock()
+		if !pvAlive {
+			t.Fatal("live Retain PV was deleted")
+		}
+		if delCalls != 0 {
+			t.Fatalf("PV delete calls = %d, want 0", delCalls)
+		}
+	})
+
+	t.Run("toctou_race_after_quorum_PV_Get_blocked_by_RV_precondition", func(t *testing.T) {
+		stalePV := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "old-data")
+		stalePV.UID = sameUID
+		stalePV.ResourceVersion = "10"
+		stalePV.Finalizers = nil
+
+		livePV := stalePV.DeepCopy()
+		mutated := false
+		srv := &staleCacheFakeServer{
+			staleList: []corev1.PersistentVolume{*stalePV, *other},
+			livePVs:   map[string]*corev1.PersistentVolume{pvcUUID: livePV, other.Name: other},
+			livePVCs:  map[string]*corev1.PersistentVolumeClaim{},
+			onPVGet: func(pv *corev1.PersistentVolume) {
+				// Simulate PV being rebound/updated with the SAME UID immediately
+				// after quorum PV.Get returned Released+Delete RV="10".
+				if !mutated {
+					mutated = true
+					pv.Status.Phase = corev1.VolumeBound
+					pv.ResourceVersion = "25"
+					pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: "prod", Name: "live-db"}
+				}
+			},
+		}
+		cs := nhatestutil.FakeKube()
+		srv.install(cs)
+		s, base, _ := fixture(t, cs)
+		dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+		s.Sweep(context.Background())
+
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("volume dir deleted after post-GET TOCTOU rebind: %v", err)
+		}
+		srv.mu.Lock()
+		_, pvAlive := srv.livePVs[pvcUUID]
+		delCalls := append([]metav1.DeleteOptions(nil), srv.deleteCalls...)
+		srv.mu.Unlock()
+		if !pvAlive {
+			t.Fatal("live rebound PV was deleted despite ResourceVersion precondition")
+		}
+		if len(delCalls) != 1 || delCalls[0].Preconditions == nil ||
+			delCalls[0].Preconditions.ResourceVersion == nil ||
+			*delCalls[0].Preconditions.ResourceVersion != "10" {
+			t.Fatalf("expected Delete with ResourceVersion=10 precondition, got %+v", delCalls)
+		}
+		if got := skipCount(t, s, skipPVDeleteFailed); got != 1 {
+			t.Fatalf("pv_delete_failed skips = %v, want 1", got)
+		}
+	})
+
+	t.Run("claimRef_cleared_or_changed_in_live_PV_skips", func(t *testing.T) {
+		stalePV := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "old-data")
+		stalePV.UID = sameUID
+		stalePV.ResourceVersion = "10"
+		stalePV.Spec.ClaimRef.UID = "pvc-uid-1"
+
+		livePV := stalePV.DeepCopy()
+		livePV.ResourceVersion = "12"
+		livePV.Spec.ClaimRef = nil
+
+		srv := &staleCacheFakeServer{
+			staleList: []corev1.PersistentVolume{*stalePV, *other},
+			livePVs:   map[string]*corev1.PersistentVolume{pvcUUID: livePV, other.Name: other},
+			livePVCs:  map[string]*corev1.PersistentVolumeClaim{},
+		}
+		cs := nhatestutil.FakeKube()
+		srv.install(cs)
+		s, base, _ := fixture(t, cs)
+		dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+		s.Sweep(context.Background())
+
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("dir deleted despite nil ClaimRef in live PV: %v", err)
+		}
+		if got := skipCount(t, s, skipClaimRefUnclear); got != 1 {
+			t.Fatalf("claimref_unclear skips = %v, want 1", got)
+		}
+	})
+
+	t.Run("happy_path_with_finalizers_uses_post_patch_RV", func(t *testing.T) {
+		stalePV := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "old-data")
+		stalePV.UID = sameUID
+		stalePV.ResourceVersion = "10"
+		stalePV.Finalizers = []string{"kubernetes.io/pv-protection"}
+
+		livePV := stalePV.DeepCopy()
+		srv := &staleCacheFakeServer{
+			staleList:   []corev1.PersistentVolume{*stalePV, *other},
+			livePVs:     map[string]*corev1.PersistentVolume{pvcUUID: livePV, other.Name: other},
+			livePVCs:    map[string]*corev1.PersistentVolumeClaim{},
+			patchedToRV: "11",
+		}
+		cs := nhatestutil.FakeKube()
+		srv.install(cs)
+		s, base, _ := fixture(t, cs)
+		dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+		s.Sweep(context.Background())
+
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("orphan dir still present after happy-path cleanup with finalizers: %v", err)
+		}
+		srv.mu.Lock()
+		_, pvAlive := srv.livePVs[pvcUUID]
+		delCalls := append([]metav1.DeleteOptions(nil), srv.deleteCalls...)
+		srv.mu.Unlock()
+		if pvAlive {
+			t.Fatal("PV still present after Delete")
+		}
+		if len(delCalls) != 1 || delCalls[0].Preconditions == nil ||
+			delCalls[0].Preconditions.UID == nil || *delCalls[0].Preconditions.UID != sameUID ||
+			delCalls[0].Preconditions.ResourceVersion == nil || *delCalls[0].Preconditions.ResourceVersion != "11" {
+			t.Fatalf("Delete Preconditions = %+v, want UID=%q and post-patch RV=\"11\"", delCalls, sameUID)
+		}
+	})
+
+	t.Run("happy_path_without_finalizers_uses_live_RV", func(t *testing.T) {
+		stalePV := mkPV(pvcUUID, "Released", corev1.PersistentVolumeReclaimDelete, "app", "old-data")
+		stalePV.UID = sameUID
+		stalePV.ResourceVersion = "10"
+		stalePV.Finalizers = nil
+
+		livePV := stalePV.DeepCopy()
+		livePV.ResourceVersion = "15" // benign live RV bump while still Released+Delete same ClaimRef
+		srv := &staleCacheFakeServer{
+			staleList: []corev1.PersistentVolume{*stalePV, *other},
+			livePVs:   map[string]*corev1.PersistentVolume{pvcUUID: livePV, other.Name: other},
+			livePVCs:  map[string]*corev1.PersistentVolumeClaim{},
+		}
+		cs := nhatestutil.FakeKube()
+		srv.install(cs)
+		s, base, _ := fixture(t, cs)
+		dir := mkPVC(t, base, pvcUUID, 2*time.Hour)
+
+		s.Sweep(context.Background())
+
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("orphan dir still present after happy-path cleanup without finalizers: %v", err)
+		}
+		srv.mu.Lock()
+		_, pvAlive := srv.livePVs[pvcUUID]
+		delCalls := append([]metav1.DeleteOptions(nil), srv.deleteCalls...)
+		srv.mu.Unlock()
+		if pvAlive {
+			t.Fatal("PV still present after Delete")
+		}
+		if len(delCalls) != 1 || delCalls[0].Preconditions == nil ||
+			delCalls[0].Preconditions.UID == nil || *delCalls[0].Preconditions.UID != sameUID ||
+			delCalls[0].Preconditions.ResourceVersion == nil || *delCalls[0].Preconditions.ResourceVersion != "15" {
+			t.Fatalf("Delete Preconditions = %+v, want UID=%q and live RV=\"15\"", delCalls, sameUID)
+		}
+	})
 }

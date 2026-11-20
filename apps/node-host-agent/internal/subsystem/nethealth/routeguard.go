@@ -157,16 +157,19 @@ func (n *NetHealth) spawnRouteGuard(ctx context.Context) {
 		// The routeGuard open-error log line keeps it visible.
 		return
 	}
-	if last := n.routeGuardLastExit.Load(); last != 0 &&
-		n.cfg.Clock.Now().Sub(time.Unix(0, last)) < routeGuardRespawnBackoff {
-		return
+	if last := n.routeGuardLastExit.Load(); last != nil {
+		elapsed := n.cfg.Clock.Now().Sub(*last)
+		if elapsed >= 0 && elapsed < routeGuardRespawnBackoff {
+			return
+		}
 	}
 	if !n.routeGuardRunning.CompareAndSwap(false, true) {
 		return
 	}
 	cycle.Spawn(ctx, "nethealth-route-guard", func(cctx context.Context) {
 		defer func() {
-			n.routeGuardLastExit.Store(n.cfg.Clock.Now().UnixNano())
+			now := n.cfg.Clock.Now()
+			n.routeGuardLastExit.Store(&now)
 			n.routeGuardRunning.Store(false)
 		}()
 		n.routeGuard(cctx)
@@ -235,8 +238,9 @@ func (n *NetHealth) routeGuard(ctx context.Context) {
 			// lost while the guard is down (the script + is-active
 			// gates apply inside; capped to one exec per
 			// minRestore so a hard-down socket can't exec-storm).
-			if n.cfg.Clock.Now().Sub(lastFailRestore) >= minRestore {
-				lastFailRestore = n.cfg.Clock.Now()
+			now := n.cfg.Clock.Now()
+			if lastFailRestore.IsZero() || now.Sub(lastFailRestore) < 0 || now.Sub(lastFailRestore) >= minRestore {
+				lastFailRestore = now
 				n.restoreRouteGuard(ctx)
 			}
 			if !sleepCtx(ctx, routeGuardRetry) {

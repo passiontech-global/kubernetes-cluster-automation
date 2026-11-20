@@ -88,6 +88,11 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// burn the restart cooldown — otherwise the next ungated
 		// window waits a full MinRestartInterval for an action that
 		// never ran. Same ordering the other guarded deletes carry.
+		if c.d.Cfg.Client == nil {
+			c.d.State.AppendLog("suspect: spegel-mirror pod delete skipped — kubernetes client nil")
+			c.d.CycleResult(wdeps.CheckSpegel, "abort")
+			return
+		}
 		if c.d.HoldLocalAction(ctx) {
 			c.d.State.AppendLog("suspect: spegel-mirror pod delete held — " +
 				"cluster maintenance in progress")
@@ -140,6 +145,11 @@ func (c *SpegelCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Hold BEFORE budget spend (same rule as the stale-socket path
 	// above): a maintenance-held delete must not consume the restart
 	// cooldown for an action that never ran.
+	if c.d.Cfg.Client == nil {
+		c.d.State.AppendLog("suspect: spegel-mirror pod delete skipped — kubernetes client nil")
+		c.d.CycleResult(wdeps.CheckSpegel, "abort")
+		return
+	}
 	if c.d.HoldLocalAction(ctx) {
 		c.d.State.AppendLog("suspect: spegel-mirror pod delete held — " +
 			"cluster maintenance in progress")

@@ -650,14 +650,31 @@ func TestEnsureSwapfileFailureArms(t *testing.T) {
 		}
 	})
 	t.Run("fstab_read_fail", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses file read permissions")
+		}
 		r, sr, c := swapFixture(t, "")
 		sr.On("swapon --show", "")
 		swapFileSized(t, r, 64)
 		sr.On("blkid -o value -s TYPE /swapfile", "swap")
-		hostWrite(t, r, "/etc/fstab", "blocker\n")
+		hostWrite(t, r, "/etc/fstab", "UUID=keep-me / ext4 defaults 0 1\n")
+		fstabHostPath := r.hp("/etc/fstab")
+		if err := os.Chmod(fstabHostPath, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(fstabHostPath, 0o644) })
 		c.ensureSwapfile("/swapfile", 64, "10")
-		if c.errs != 0 {
-			t.Fatalf("errs = %d — fstab read failure is a warning only", c.errs)
+		if c.errs != 1 {
+			t.Fatalf("errs = %d, want 1 on unreadable /etc/fstab", c.errs)
+		}
+		if len(sr.CallsMatching("swapon /swapfile")) > 0 {
+			t.Fatal("swapon ran despite unreadable /etc/fstab abort")
+		}
+		if err := os.Chmod(fstabHostPath, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := hostRead(t, r, "/etc/fstab"); got != "UUID=keep-me / ext4 defaults 0 1\n" {
+			t.Fatalf("/etc/fstab was clobbered: %q", got)
 		}
 	})
 	t.Run("swapon_fail", func(t *testing.T) {
@@ -758,10 +775,26 @@ func TestEnsureSwapfileChmodAndFstabReadArms(t *testing.T) {
 		sr.On("swapon --show", "")
 		swapFileSized(t, r, 64) // exists at the pinned size — no create
 		sr.On("blkid -o value -s TYPE /swapfile", "swap")
-		hostWrite(t, r, "/etc/fstab/keep", "blocker\n") // fstab as dir
+		hostWrite(t, r, "/etc/fstab/keep", "blocker\n") // fstab as dir (EISDIR)
 		c.ensureSwapfile("/swapfile", 64, "10")
 		if c.errs != 1 {
-			t.Fatalf("errs = %d, want the failed fstab write counted", c.errs)
+			t.Fatalf("errs = %d, want the failed fstab read counted", c.errs)
+		}
+		if len(sr.CallsMatching("swapon /swapfile")) > 0 {
+			t.Fatal("swapon ran despite unreadable /etc/fstab abort")
+		}
+	})
+	t.Run("fstab_missing_enoent_creates", func(t *testing.T) {
+		r, sr, c := swapFixture(t, "")
+		sr.On("swapon --show", "")
+		swapFileSized(t, r, 64)
+		sr.On("blkid -o value -s TYPE /swapfile", "swap")
+		c.ensureSwapfile("/swapfile", 64, "10")
+		if c.errs != 0 {
+			t.Fatalf("errs = %d, want 0 when /etc/fstab is absent (ENOENT)", c.errs)
+		}
+		if got := hostRead(t, r, "/etc/fstab"); !strings.Contains(got, "/swapfile none swap sw 0 0\n") {
+			t.Fatalf("missing /etc/fstab not created: %q", got)
 		}
 	})
 }

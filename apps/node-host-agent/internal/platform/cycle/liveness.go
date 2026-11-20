@@ -39,17 +39,48 @@ const LivenessFloor = 15 * time.Minute
 // is not reported wedged while legitimately working.
 const DefaultCycleBudget = 15 * time.Minute
 
-// Beat is one loop's last-cycle stamp — unixnano, 0 until the
-// first stamp lands. MaxStaleNanos carries the loop's own
-// staleness bound (0 → the reader's default).
+// Beat is one loop's last-cycle stamp — nil until the first stamp
+// lands, preserving Go's monotonic clock reading across atomic loads.
+// MaxStaleNanos carries the loop's own staleness bound (0 → the
+// reader's default).
 type Beat struct {
-	LastProgress  atomic.Int64
+	lastProgress  atomic.Pointer[time.Time]
 	MaxStaleNanos atomic.Int64
+}
+
+// Stamp records the current time (including monotonic clock reading)
+// as the beat's latest progress timestamp.
+func (b *Beat) Stamp() {
+	b.StampAt(time.Now())
+}
+
+// StampAt records t as the beat's latest progress timestamp.
+func (b *Beat) StampAt(t time.Time) {
+	if b == nil {
+		return
+	}
+	cp := t
+	b.lastProgress.Store(&cp)
+}
+
+// LastBeat returns the beat's latest progress timestamp, or the zero
+// time.Time if never stamped.
+func (b *Beat) LastBeat() time.Time {
+	if b == nil {
+		return time.Time{}
+	}
+	if p := b.lastProgress.Load(); p != nil {
+		return *p
+	}
+	return time.Time{}
 }
 
 // StaleAfter returns the beat's configured staleness bound, or 0
 // when unset (the /healthz reader substitutes its default).
 func (b *Beat) StaleAfter() time.Duration {
+	if b == nil {
+		return 0
+	}
 	if ns := b.MaxStaleNanos.Load(); ns > 0 {
 		return time.Duration(ns)
 	}
@@ -77,11 +108,23 @@ func NewLiveness() *Liveness {
 
 type livenessKey struct{}
 
+type beatKey struct{}
+
+// withBeat attaches b to ctx so Heartbeat/RunWithHeartbeat inside a
+// Runner.Run callback stamp that Runner's registered loop Beat instead
+// of the registry's shared fallback Beat.
+func withBeat(ctx context.Context, b *Beat) context.Context {
+	return context.WithValue(ctx, beatKey{}, b)
+}
+
 // WithLiveness returns a ctx carrying l — the supervisor installs
 // one per subsystem so Runner loops and bare Heartbeat callers
 // stamp beats the /healthz check can find, and RunAll installs one
-// per non-*Runner Looper so sibling loops never share a beat.
+// per non-*Runner Looper so sibling loops never share a beat. Any
+// inherited Runner beatKey{} is cleared so nested custom loopers stamp
+// their own child fallback beat instead of the outer Runner's beat.
 func WithLiveness(ctx context.Context, l *Liveness) context.Context {
+	ctx = context.WithValue(ctx, beatKey{}, (*Beat)(nil))
 	return context.WithValue(ctx, livenessKey{}, l)
 }
 
@@ -256,8 +299,12 @@ func (l *Liveness) IsExempt() bool { return l.exempt.Load() }
 // registry — under RunAll that is the per-looper child, never the
 // subsystem-wide one.
 func Heartbeat(ctx context.Context) {
+	if b, ok := ctx.Value(beatKey{}).(*Beat); ok && b != nil {
+		stampLoop(b)
+		return
+	}
 	if l := LivenessFrom(ctx); l != nil {
-		l.fallback.LastProgress.Store(time.Now().UnixNano())
+		stampLoop(l.fallback)
 	}
 }
 
@@ -306,6 +353,6 @@ func Exempt(ctx context.Context) {
 // registered by this same Run).
 func stampLoop(b *Beat) {
 	if b != nil {
-		b.LastProgress.Store(time.Now().UnixNano())
+		b.Stamp()
 	}
 }

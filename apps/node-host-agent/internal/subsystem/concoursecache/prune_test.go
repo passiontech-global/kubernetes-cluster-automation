@@ -43,15 +43,15 @@ func TestWalkersSkipUnreadable(t *testing.T) {
 	ccFile(t, filepath.Join(root, "ok", "f"), 4, 0)
 	unreadableSub(t, root)
 
-	if du := diskUsage(root); du == 0 {
+	if du := diskUsage(context.Background(), root); du == 0 {
 		t.Fatal("diskUsage returned 0 — the readable tree was skipped")
 	}
-	total, perDir := diskUsageByTopDir(root)
+	total, perDir := diskUsageByTopDir(context.Background(), root)
 	if total == 0 || len(perDir) == 0 {
 		t.Fatalf("diskUsageByTopDir = %d,%v — readable tree skipped",
 			total, perDir)
 	}
-	if files := filesByAge(root); len(files) != 1 {
+	if files := filesByAge(context.Background(), root); len(files) != 1 {
 		t.Fatalf("filesByAge = %v want the one readable file", files)
 	}
 	// makeWritableDirs must survive the same dead dir (its caller
@@ -295,4 +295,67 @@ func TestEnforcePermsUnreadable(t *testing.T) {
 	} else if fi, err := os.Stat(sc); err != nil || fi.Mode().Perm() != 0o000 {
 		t.Fatalf("sc perm = %v — unprivileged run should leave it alone", fi)
 	}
+}
+
+func TestDiskUsageAndFilesByAgeCtxCancel(t *testing.T) {
+	root := t.TempDir()
+	ccFile(t, filepath.Join(root, "a", "f"), 64, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if du := diskUsage(ctx, root); du != 0 {
+		t.Fatalf("diskUsage on cancelled ctx = %d, want 0", du)
+	}
+	if total, perDir := diskUsageByTopDir(ctx, root); total != 0 || len(perDir) != 0 {
+		t.Fatalf("diskUsageByTopDir on cancelled ctx = (%d, %v), want (0, empty)", total, perDir)
+	}
+	if files := filesByAge(ctx, root); len(files) != 0 {
+		t.Fatalf("filesByAge on cancelled ctx = %v, want empty", files)
+	}
+}
+
+func TestPruneGoBuildSingleWalkEquivalence(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("gb1"))
+	dir := filepath.Join(sc, "go-build")
+	expired := ccFile(t, filepath.Join(dir, "expired"), 100, 80*time.Hour)
+	oldestKept := ccFile(t, filepath.Join(dir, "sub", "oldest"), 100, 30*time.Hour)
+	newestKept := ccFile(t, filepath.Join(dir, "sub", "newest"), 100, 10*time.Hour)
+
+	// Compute expected size after expired is removed (mirrors 3-walk accounting,
+	// including directory entryBlocks).
+	fiOldest, err := os.Lstat(oldestKept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perFile := int64(entryBlocks(fiOldest))
+	fiExpired, err := os.Lstat(expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duAll := int64(diskUsage(context.Background(), dir))
+	szAfterAge := duAll - int64(entryBlocks(fiExpired))
+
+	p := ccPruner(t, func(c *Config) {
+		c.GoBuildHighMark = 1
+		c.GoBuildLowMark = szAfterAge - perFile // trim exactly oldestKept
+	})
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+
+	ccMissing(t, expired)
+	ccMissing(t, oldestKept)
+	ccPresent(t, newestKept)
+
+	// Cancelled ctx during pruneGoBuild skips both age-delete and size-trim.
+	root2 := t.TempDir()
+	sc2 := mkSharedCache(t, root2, ccPVCName("gb2"))
+	keepExpired := ccFile(t, filepath.Join(sc2, "go-build", "old"), 100, 80*time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p2 := ccPruner(t, func(c *Config) {
+		c.GoBuildHighMark = 1
+		c.GoBuildLowMark = 1
+	})
+	p2.pruneGoBuild(ctx, sc2, p2.cfg, logger())
+	ccPresent(t, keepExpired)
 }

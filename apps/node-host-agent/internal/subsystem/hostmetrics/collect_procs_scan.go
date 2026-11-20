@@ -127,14 +127,14 @@ func sweepProcs(procRoot string) map[string]procScan {
 			continue
 		}
 		var cmdline string
-		if ps.comm == "k0s" && ps.state != 'D' && ps.state != 'Z' {
+		if ps.comm == "k0s" && ps.state != 'D' && ps.state != 'Z' && ps.state != 'X' && ps.state != 'x' {
 			// Only the k0s daemons need cmdline (worker vs
 			// controller share comm) — nobody else pays the read.
-			// The D/Z gate keeps the sweep off mm->mmap_lock: a
+			// The D/Z/X/x gate keeps the sweep off mm->mmap_lock: a
 			// D-state k0s would wedge this read (and every
 			// collector queued behind the snapshot mutex) forever;
-			// an empty cmdline just fails the daemon match for
-			// this sweep.
+			// Z/X/x already released their mm; an empty cmdline
+			// just fails the daemon match for this sweep.
 			if b, rerr := os.ReadFile(filepath.Join(dir, "cmdline")); rerr == nil {
 				cmdline = string(b)
 			}

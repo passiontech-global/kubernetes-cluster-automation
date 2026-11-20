@@ -157,30 +157,46 @@ func relInside(base, target string) (string, bool) {
 // comms, or no fd evidence — an unverifiable shim is never
 // escalated (fail closed, same posture as ctrShimScope).
 func dzShimScope(d *wdeps.Deps, pid int) (ns, sid string, ok bool) {
+	ns, sid, ok, _ = dzShimScopeChecked(d, pid)
+	return ns, sid, ok
+}
+
+func dzShimScopeChecked(d *wdeps.Deps, pid int) (ns, sid string, ok, inconclusive bool) {
 	st, sok := d.Proc.Stat(pid)
 	if !sok || !st.HasComm ||
 		!strings.HasPrefix(st.Comm, "containerd-shim") ||
 		(st.Fields[0] != "D" && st.Fields[0] != "Z") {
-		return "", "", false
+		return "", "", false, false
+	}
+	if d.Cfg.CtrTaskRoot == "" {
+		return "", "", false, false
+	}
+	hostTaskRoot := fsx.HostSidePath(d.Cfg.CtrTaskRoot)
+	if hostTaskRoot == "" {
+		return "", "", false, false
 	}
 	fdDir := d.Proc.File(pid, "fd")
 	fds, err := os.ReadDir(fdDir)
 	if err != nil {
-		return "", "", false
+		return "", "", false, !os.IsNotExist(err)
 	}
-	taskParent := filepath.Dir(d.Cfg.CtrTaskRoot)
+	taskParent := filepath.Dir(hostTaskRoot)
+	fdReadErr := false
 	for _, fd := range fds {
 		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
 		if err != nil {
+			if !os.IsNotExist(err) {
+				fdReadErr = true
+			}
 			continue
 		}
 		// An orphan's task dir is already unlinked — the readlink
 		// target keeps the path with a " (deleted)" suffix.
 		target = strings.TrimSuffix(target, " (deleted)")
-		// k8s.io task dir: <CtrTaskRoot>/<sid>/…
-		if rel, inside := relInside(d.Cfg.CtrTaskRoot, target); inside {
+		// k8s.io task dir: <hostTaskRoot>/<sid>/…
+		if rel, inside := relInside(hostTaskRoot, target); inside {
 			if parts := strings.Split(rel, string(filepath.Separator)); len(parts) >= 1 && hexTaskIDRe.MatchString(parts[0]) {
-				return "k8s.io", parts[0], true
+				return "k8s.io", parts[0], true, false
 			}
 			continue
 		}
@@ -195,7 +211,7 @@ func dzShimScope(d *wdeps.Deps, pid int) (ns, sid string, ok bool) {
 			!hexTaskIDRe.MatchString(parts[1]) {
 			continue
 		}
-		return parts[0], parts[1], true
+		return parts[0], parts[1], true, false
 	}
-	return "", "", false
+	return "", "", false, fdReadErr
 }

@@ -13,9 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/guards"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // netnsReaperFixture points the reaper at a tempdir netns root inside
@@ -168,5 +170,32 @@ func TestOrphanNetnsFreshMtimeProtected(t *testing.T) {
 	}
 	if _, err := os.Stat(p); err != nil {
 		t.Fatal("fresh netns file removed")
+	}
+}
+
+func TestOrphanNetnsHoldLocalActionPreservesMarker(t *testing.T) {
+	e := fixture(t)
+	dir := netnsReaperFixture(t, e)
+	p := armOrphan(t, e, dir, "cni-held")
+	e.SDReply["umount"] = ""
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+		},
+	}
+	wdepstest.Check[*guards.CNINetnsCheck](e.H, wdeps.CheckCNINetns).Run(
+		context.Background(), &wdeps.CycleEnv{
+			WorkerActive: true,
+			PidsOnce:     wdepstest.PidsOf(),
+		})
+	if e.SDRan("umount") {
+		t.Fatal("umount ran while held by maintenance")
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatal("netns file removed while held")
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "cni-netns-seen-cni-held")); err != nil {
+		t.Fatal("cni-netns-seen marker dropped while held")
 	}
 }

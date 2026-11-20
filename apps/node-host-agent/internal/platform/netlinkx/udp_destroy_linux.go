@@ -91,7 +91,7 @@ func udpBoundPortsDump(out map[uint16]bool) error {
 	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
 		seq++
 		req := diagRequestProto(seq, family, unix.IPPROTO_UDP,
-			0xFFF, nil, unix.SOCK_DIAG_BY_FAMILY,
+			uint32(0xFFF)&^(uint32(1)<<tcpStateEstablished), nil, unix.SOCK_DIAG_BY_FAMILY,
 			unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
 		if err := unix.Sendto(fd, req, 0, sa); err != nil {
 			return fmt.Errorf("udp bound-port sock_diag send %d: %w", family, err)

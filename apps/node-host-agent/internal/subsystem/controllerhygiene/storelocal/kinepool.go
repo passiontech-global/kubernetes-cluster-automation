@@ -108,7 +108,10 @@ func (c *PoolCheck) Run(ctx context.Context) {
 
 	if conns <= c.d.Cfg.KinePool.MaxConns {
 		c.d.State.ResetCounter(cdeps.FileCtrPool)
-		c.d.StateExit(cdeps.StateKinePoolRunaway)
+		if c.d.State.Exists(cdeps.StateKinePoolRunaway) {
+			c.d.StateExit(cdeps.StateKinePoolRunaway)
+			c.d.State.ClearSuspect(cdeps.CheckKinePool + "-hold")
+		}
 		c.d.Cycles.WithLabelValues(cdeps.CheckKinePool, "ok").Inc()
 		return
 	}
@@ -143,6 +146,15 @@ func (c *PoolCheck) Run(ctx context.Context) {
 	// SIGTERM it never delivers.
 	if err := ctx.Err(); err != nil {
 		c.d.Cycles.WithLabelValues(cdeps.CheckKinePool, "aborted").Inc()
+		return
+	}
+
+	if c.d.HoldEmergencyHeal(ctx) {
+		c.d.State.SuspectLog(cdeps.CheckKinePool+"-hold", fmt.Sprintf(
+			"suspect: kine-pool-runaway conns=%d (%dx) but cluster maintenance in progress — holding kill",
+			conns, n), c.d.Cfg.SuspectLogCadence)
+		c.d.Actions.WithLabelValues(cdeps.CheckKinePool, "maint_hold").Inc()
+		c.d.Cycles.WithLabelValues(cdeps.CheckKinePool, "maint_hold").Inc()
 		return
 	}
 

@@ -131,6 +131,11 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 		}
 		return errors.New("refused")
 	}
+	n.cfg.tcpProbeMarked = func(_ context.Context, _, _ string, _ time.Duration) (error, error) {
+		// Unprivileged unit-test default: simulate SO_MARK EPERM so
+		// existing fallback tests exercise the rule-drop + WithoutCancel path.
+		return nil, unix.EPERM
+	}
 	n.cfg.ping = func(_ context.Context, ip string, _, _ int, marked bool) (bool, float64) {
 		return e.pingOK[fmt.Sprintf("%s|%v", ip, marked)],
 			e.pingRTT[fmt.Sprintf("%s|%v", ip, marked)]
@@ -380,6 +385,28 @@ func TestDefaultTCPProbe(t *testing.T) {
 	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 	if err := c.tcpProbe(ctx, "127.0.0.1", port, time.Second); err != nil {
 		t.Fatalf("tcpProbe failed against a live listener: %v", err)
+	}
+}
+
+func TestDefaultTCPProbeMarked(t *testing.T) {
+	c := Config{}
+	c.applyDefaults()
+	ctx := context.Background()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	probeErr, markErr := c.tcpProbeMarked(ctx, "127.0.0.1", port, time.Second)
+	if markErr != nil {
+		if !errors.Is(markErr, unix.EPERM) && !errors.Is(markErr, unix.EACCES) && !errors.Is(markErr, unix.ENOPROTOOPT) {
+			t.Fatalf("unexpected markErr: %v", markErr)
+		}
+		return
+	}
+	if probeErr != nil {
+		t.Fatalf("tcpProbeMarked failed against live listener: %v", probeErr)
 	}
 }
 

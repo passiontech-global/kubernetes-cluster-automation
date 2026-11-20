@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -151,30 +152,44 @@ func (d *sshDialer) dialViaBastion(ctx context.Context,
 
 // bastion returns the cached Bastion for spec, opening it on first
 // use. The open itself runs outside the mutex (a WAN handshake must
-// not serialize unrelated specs); a lost insert race keeps the
-// first opener's conn and closes the duplicate.
+// not serialize unrelated specs); closed bastions are evicted, and a
+// concurrent closeBastions() (jumpGen bump) or cancelled ctx closes
+// the newly opened bastion before returning.
 func (d *sshDialer) bastion(ctx context.Context,
 	cfg *sshclient.Config, spec string) (*sshclient.Bastion, error) {
 	d.mu.Lock()
 	if b := d.jumps[spec]; b != nil {
-		d.mu.Unlock()
-		return b, nil
+		if !b.Closed() {
+			d.mu.Unlock()
+			return b, nil
+		}
+		delete(d.jumps, spec)
 	}
+	gen := d.jumpGen
 	d.mu.Unlock()
 	b, err := cfg.OpenBastion(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	if d.jumpGen != gen || ctx.Err() != nil {
+		d.mu.Unlock()
+		_ = b.Close()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, context.Canceled
+	}
 	if d.jumps == nil {
 		d.jumps = map[string]*sshclient.Bastion{}
 	}
-	if old := d.jumps[spec]; old != nil {
+	if old := d.jumps[spec]; old != nil && !old.Closed() {
+		d.mu.Unlock()
 		_ = b.Close()
 		return old, nil
 	}
 	d.jumps[spec] = b
+	d.mu.Unlock()
 	return b, nil
 }
 
@@ -187,6 +202,30 @@ func (d *sshDialer) dropBastion(spec string, b *sshclient.Bastion) {
 	}
 	d.mu.Unlock()
 	_ = b.Close()
+}
+
+// closeBastions closes and drops all cached bastions (e.g. on ctx
+// cancellation or lease loss) and bumps jumpGen so any in-flight
+// OpenBastion does not repopulate the cache.
+func (d *sshDialer) closeBastions() {
+	d.mu.Lock()
+	d.jumpGen++
+	if len(d.jumps) == 0 {
+		d.jumps = nil
+		d.mu.Unlock()
+		return
+	}
+	toClose := make([]*sshclient.Bastion, 0, len(d.jumps))
+	for _, b := range d.jumps {
+		if b != nil {
+			toClose = append(toClose, b)
+		}
+	}
+	d.jumps = nil
+	d.mu.Unlock()
+	for _, b := range toClose {
+		_ = b.Close()
+	}
 }
 
 // stageNonceSeq hands out per-dial staging suffixes — pid+counter
@@ -311,58 +350,154 @@ func (d *deadlineWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// PrepareHost batches mkdir -p and chmod for all target dirs into one SSH session.
+func (c *sshConn) PrepareHost(ctx context.Context, dirs []remoteDir) error {
+	var mkdirs []string
+	var chmods []string
+	for _, d := range dirs {
+		if d.path == "" {
+			continue
+		}
+		mkdirs = append(mkdirs, fsx.ShellQuote(d.path))
+		if d.mode != "" {
+			chmods = append(chmods, "chmod "+d.mode+" "+fsx.ShellQuote(d.path))
+		}
+	}
+	if len(mkdirs) == 0 {
+		return nil
+	}
+	script := "mkdir -p " + strings.Join(mkdirs, " ")
+	if len(chmods) > 0 {
+		script += " && " + strings.Join(chmods, " && ")
+	}
+	_, err := c.Run(ctx, "sh -c "+fsx.ShellQuote(script))
+	return err
+}
+
+// ProbeDirs batches all mirror ls -1pA and orphan-tmp find listings into one SSH session.
+func (c *sshConn) ProbeDirs(ctx context.Context, lsDirs, orphanDirs []string) (ls, orphans map[string][]string, err error) {
+	ls = make(map[string][]string, len(lsDirs))
+	orphans = make(map[string][]string, len(orphanDirs))
+	if len(lsDirs) == 0 && len(orphanDirs) == 0 {
+		return ls, orphans, nil
+	}
+	tok := "__HS_" + c.nonce + "_" + nextStageNonce() + "__"
+	var sb strings.Builder
+	for i, d := range lsDirs {
+		fmt.Fprintf(&sb, "printf '%%s\\n' %s; ls -1pA %s || exit $?; ",
+			fsx.ShellQuote(fmt.Sprintf("%sLS:%d", tok, i)), fsx.ShellQuote(d))
+	}
+	for i, d := range orphanDirs {
+		fmt.Fprintf(&sb, "printf '%%s\\n' %s; find %s -maxdepth 1 -type f -name '.*.tmp*' -mmin +%d -printf '%%f\\n' 2>/dev/null || true; ",
+			fsx.ShellQuote(fmt.Sprintf("%sFIND:%d", tok, i)), fsx.ShellQuote(d), tmpOrphanMinAge)
+	}
+	out, err := c.Run(ctx, "sh -c "+fsx.ShellQuote(sb.String()))
+	if err != nil {
+		return nil, nil, err
+	}
+	seenLS := make([]bool, len(lsDirs))
+	seenFind := make([]bool, len(orphanDirs))
+	var curMap map[string][]string
+	var curKey string
+	for line := range strings.SplitSeq(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if rest, ok := strings.CutPrefix(line, tok); ok {
+			if idxStr, isLS := strings.CutPrefix(rest, "LS:"); isLS {
+				idx, perr := strconv.Atoi(idxStr)
+				if perr != nil || idx < 0 || idx >= len(lsDirs) {
+					return nil, nil, fmt.Errorf("probeDirs: invalid LS section index %q", idxStr)
+				}
+				seenLS[idx] = true
+				curMap = ls
+				curKey = lsDirs[idx]
+				continue
+			}
+			if idxStr, isFind := strings.CutPrefix(rest, "FIND:"); isFind {
+				idx, perr := strconv.Atoi(idxStr)
+				if perr != nil || idx < 0 || idx >= len(orphanDirs) {
+					return nil, nil, fmt.Errorf("probeDirs: invalid FIND section index %q", idxStr)
+				}
+				seenFind[idx] = true
+				curMap = orphans
+				curKey = orphanDirs[idx]
+				continue
+			}
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && curMap != nil {
+			curMap[curKey] = append(curMap[curKey], trimmed)
+		}
+	}
+	for i, seen := range seenLS {
+		if !seen {
+			return nil, nil, fmt.Errorf("probeDirs: truncated output (missing LS section for %s)", lsDirs[i])
+		}
+	}
+	for i, seen := range seenFind {
+		if !seen {
+			return nil, nil, fmt.Errorf("probeDirs: truncated output (missing FIND section for %s)", orphanDirs[i])
+		}
+	}
+	return ls, orphans, nil
+}
+
 // streamCmd runs cmd on one session with r piped to its stdin —
-// the shared body of Write and PutAtomic. The channel OPEN stays
-// on the dial budget (timeout); the BODY rides a sliding idle
-// deadline instead of the old fixed min(timeout, ctx) bound that
-// killed any upload slower than the 15s dial budget: each
-// successful stdin write re-arms SetDeadline(now+idle), capped at
-// the ctx deadline (the per-target TargetTimeout) or
-// now+opTimeout. A slow-but-progressing WAN upload of the ~15MiB
-// binary survives to the target budget; a blackholed transport
-// still dies on the first idle quantum, and ctx cancel + link
-// Close remain the hard stop. Bastion note: DeadlineConn() is the
-// jump's shared TCP conn — deadlines stay ≤ one idle quantum and
-// clear on return, and the converge loop serializes targets, so no
-// long deadline is ever parked on it for other channels.
+// the shared body of Write and PutAtomic. Direct links bound via
+// Link.NewSession + DeadlineConn sliding deadlines; shared-bastion
+// links NEVER mutate the shared Bastion.Net deadline and instead run
+// a local idle timer + Link.CloseWait (escalating to ForceClose only
+// if the bastion stalls).
 func (c *sshConn) streamCmd(ctx context.Context, cmd string, r io.Reader) error {
-	clear := sshclient.BoundOp(ctx, c.log, c.link.DeadlineConn(), c.timeout)
-	sess, err := c.link.Client.NewSession()
-	clear()
+	sess, unbind, err := c.link.NewSession(ctx, c.log, c.timeout)
 	if err != nil {
 		return err
 	}
+	defer unbind()
 	defer func() { _ = sess.Close() }()
 	stdin, err := sess.StdinPipe()
 	if err != nil {
 		return err
 	}
-	if err := sess.Start(cmd); err != nil {
-		return err
-	}
-	dc := c.link.DeadlineConn()
-	var capDL time.Time
-	if c.opTimeout > 0 {
-		capDL = time.Now().Add(c.opTimeout)
-	}
-	if cdl, ok := ctx.Deadline(); ok && (capDL.IsZero() || cdl.Before(capDL)) {
-		capDL = cdl
-	}
 	idle := c.timeout
 	if idle <= 0 {
 		idle = 15 * time.Second
 	}
-	arm := func() {
-		dl := time.Now().Add(idle)
-		if !capDL.IsZero() && capDL.Before(dl) {
-			dl = capDL
-		}
-		_ = dc.SetDeadline(dl)
+	runCtx := ctx
+	var cancelRun context.CancelFunc
+	if c.opTimeout > 0 {
+		runCtx, cancelRun = context.WithTimeout(ctx, c.opTimeout)
+		defer cancelRun()
 	}
-	arm()
-	defer func() { _ = dc.SetDeadline(time.Time{}) }()
+	var capDL time.Time
+	if dl, ok := runCtx.Deadline(); ok {
+		capDL = dl
+	}
+	var arm func()
+	var lastActive atomic.Pointer[time.Time]
+	if !c.link.JumpShared {
+		dc := c.link.DeadlineConn()
+		arm = func() {
+			dl := time.Now().Add(idle)
+			if !capDL.IsZero() && capDL.Before(dl) {
+				dl = capDL
+			}
+			_ = dc.SetDeadline(dl)
+		}
+		arm()
+	} else {
+		now := time.Now()
+		lastActive.Store(&now)
+		arm = func() {
+			t := time.Now()
+			lastActive.Store(&t)
+		}
+	}
 	done := make(chan error, 1)
 	go func() {
+		if err := sess.Start(cmd); err != nil {
+			done <- err
+			return
+		}
 		_, cerr := io.Copy(&deadlineWriter{w: stdin, arm: arm}, r)
 		_ = stdin.Close()
 		if cerr != nil {
@@ -374,22 +509,60 @@ func (c *sshConn) streamCmd(ctx context.Context, cmd string, r io.Reader) error 
 		arm()
 		done <- sess.Wait()
 	}()
-	select {
-	case <-ctx.Done():
-		// Same dead-transport reasoning as Run: closing the link is
-		// what actually unblocks the copy goroutine — sess.Close's
-		// channel-close can't reach a blackholed peer.
-		_ = c.link.Close()
-		// Wait for the copy goroutine to release r before returning
-		// — the caller closes the file/handle right after Write.
-		// The value is the sess.Wait() result — non-actionable on the
-		// cancel path (ctx.Err() is what the caller gets) but worth a
-		// debug line for post-mortems.
-		if werr := <-done; werr != nil {
-			c.log.Debug("hubsync: ssh write wait failed after cancel", "error", werr)
+	if !c.link.JumpShared {
+		select {
+		case <-runCtx.Done():
+			if werr := c.link.CloseWait(done, 0); werr != nil {
+				c.log.Debug("hubsync: ssh write wait failed after cancel", "error", werr)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return runCtx.Err()
+		case err := <-done:
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if runCtx.Err() != nil {
+					return runCtx.Err()
+				}
+			}
+			return err
 		}
-		return ctx.Err()
-	case err := <-done:
-		return err
+	}
+	idleTimer := time.NewTimer(idle)
+	defer idleTimer.Stop()
+	for {
+		select {
+		case <-runCtx.Done():
+			if werr := c.link.CloseWait(done, 0); werr != nil {
+				c.log.Debug("hubsync: ssh write wait failed after cancel", "error", werr)
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return runCtx.Err()
+		case <-idleTimer.C:
+			elapsed := time.Since(*lastActive.Load())
+			if elapsed < idle {
+				idleTimer.Reset(idle - elapsed)
+				continue
+			}
+			if werr := c.link.CloseWait(done, 0); werr != nil {
+				c.log.Debug("hubsync: ssh write wait failed after idle timeout", "error", werr)
+			}
+			return fmt.Errorf("ssh stream idle timeout after %s: %w", idle, context.DeadlineExceeded)
+		case err := <-done:
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if runCtx.Err() != nil {
+					return runCtx.Err()
+				}
+			}
+			return err
+		}
 	}
 }

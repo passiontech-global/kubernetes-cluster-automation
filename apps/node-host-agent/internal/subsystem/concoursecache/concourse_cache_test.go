@@ -270,7 +270,7 @@ func TestGoBuildSizeCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	perFile := int64(entryBlocks(fi))
-	sz := int64(diskUsage(dir))
+	sz := int64(diskUsage(context.Background(), dir))
 	p := ccPruner(t, func(c *Config) {
 		c.GoBuildHighMark = 1             // always over the cap
 		c.GoBuildLowMark = sz - 2*perFile // need = exactly 2 files
@@ -317,8 +317,8 @@ func TestBuildSizeCap(t *testing.T) {
 	ccDir(t, filepath.Join(dir, "k-mid"), 44*time.Hour)
 	ccDir(t, filepath.Join(dir, "k-new"), 34*time.Hour)
 
-	sz := int64(diskUsage(dir))
-	dszOld := int64(diskUsage(filepath.Join(dir, "k-old")))
+	sz := int64(diskUsage(context.Background(), dir))
+	dszOld := int64(diskUsage(context.Background(), filepath.Join(dir, "k-old")))
 	p := ccPruner(t, func(c *Config) {
 		c.BuildHighMark = 1          // always over
 		c.BuildLowMark = sz - dszOld // need = exactly k-old's du
@@ -498,8 +498,8 @@ func TestNodeDepsSizeCap(t *testing.T) {
 	ccDir(t, filepath.Join(dir, "cksum-mid"), 44*time.Hour)
 	ccDir(t, filepath.Join(dir, "cksum-new"), 34*time.Hour)
 
-	sz := int64(diskUsage(dir))
-	dszOld := int64(diskUsage(oldDir))
+	sz := int64(diskUsage(context.Background(), dir))
+	dszOld := int64(diskUsage(context.Background(), oldDir))
 	p := ccPruner(t, func(c *Config) {
 		c.NodeDepsHighMark = 1
 		c.NodeDepsLowMark = sz - dszOld // need = exactly cksum-old's du

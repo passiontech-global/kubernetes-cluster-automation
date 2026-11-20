@@ -32,6 +32,19 @@ func (n *NetHealth) stateExit(name string) {
 	n.state.ExitClearSuspect(name)
 }
 
+func (n *NetHealth) holdEmergencyHeal(ctx context.Context) bool {
+	if n.cfg.Coord == nil {
+		return false
+	}
+	return n.cfg.Coord.HoldEmergencyHeal(ctx)
+}
+
+func (n *NetHealth) stampLocalRemediation(ctx context.Context) {
+	if n.cfg.Coord != nil {
+		_ = n.cfg.Coord.StampLocalRemediation(ctx)
+	}
+}
+
 // --- shared helpers ---
 
 // ip runs the host `ip` tool through the runner seam. Failures are

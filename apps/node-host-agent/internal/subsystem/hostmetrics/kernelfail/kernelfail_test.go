@@ -845,3 +845,83 @@ func TestKernelPromWritersSurviveBrokenTextfileDir(t *testing.T) {
 	f.r.updatePidFDPressure() // pids ratio parses → textfile install fails
 	f.r.updateStealEntropy()  // entropy parses → textfile install fails
 }
+
+// TestKernelfailPromWritersSkipUnchangedRewrite verifies that consecutive
+// ticks with unchanged inputs preserve inode + ModTime (no needless rewrite),
+// while an input change atomically replaces the file (new inode).
+func TestKernelfailPromWritersSkipUnchangedRewrite(t *testing.T) {
+	f := kfixture(t)
+	td := t.TempDir()
+	f.r.deps.TextfileDir = td
+
+	// Seed deterministic inputs for disk pre-fail, hardware, and pidfd writers.
+	ext4Root := filepath.Join(t.TempDir(), "sys", "fs", "ext4")
+	f.r.deps.Ext4ErrorsGlob = filepath.Join(ext4Root, "*", "errors_count")
+	for _, dev := range []string{"vda1", "vdb1"} {
+		d := filepath.Join(ext4Root, dev)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteFile(t, filepath.Join(d, "errors_count"), "0\n")
+	}
+	testutil.WriteFile(t, filepath.Join(f.deps.ProcRoot, "meminfo"),
+		"MemTotal:       16384000 kB\nHardwareCorrupted:        0 kB\n")
+	for _, mc := range []string{"mc0", "mc1"} {
+		d := filepath.Join(f.deps.HostRoot, "sys", "devices", "system", "edac", "mc", mc)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteFile(t, filepath.Join(d, "ue_count"), "0\n")
+		testutil.WriteFile(t, filepath.Join(d, "ce_count"), "12\n")
+	}
+	testutil.WriteFile(t, f.deps.FileNRFile, "100 900 1000\n")
+
+	runTick := func() {
+		f.r.updateDiskPreFailEvidence(context.Background())
+		f.r.updateHardwareHealth()
+		f.r.updatePidFDPressure()
+	}
+	statProm := func(name string) (uint64, time.Time) {
+		t.Helper()
+		p := filepath.Join(td, name)
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st unix.Stat_t
+		if err := unix.Stat(p, &st); err != nil {
+			t.Fatal(err)
+		}
+		return st.Ino, fi.ModTime()
+	}
+
+	runTick()
+	files := []string{diskPreFailPromName, hardwarePromName, "node-agent-kernel.prom"}
+	inos := make(map[string]uint64, len(files))
+	mtimes := make(map[string]time.Time, len(files))
+	for _, name := range files {
+		inos[name], mtimes[name] = statProm(name)
+	}
+
+	// Second tick with unchanged inputs: inode and ModTime stay identical.
+	runTick()
+	for _, name := range files {
+		ino, mt := statProm(name)
+		if ino != inos[name] || !mt.Equal(mtimes[name]) {
+			t.Fatalf("%s rewritten on unchanged tick: ino %d->%d mtime %v->%v",
+				name, inos[name], ino, mtimes[name], mt)
+		}
+	}
+
+	// Mutate each writer's input and verify atomic replacement (new inode).
+	testutil.WriteFile(t, filepath.Join(ext4Root, "vda1", "errors_count"), "2\n")
+	testutil.WriteFile(t, filepath.Join(f.deps.HostRoot, "sys", "devices", "system", "edac", "mc", "mc0", "ce_count"), "15\n")
+	testutil.WriteFile(t, f.deps.FileNRFile, "250 750 1000\n")
+	runTick()
+	for _, name := range files {
+		ino, _ := statProm(name)
+		if ino == inos[name] {
+			t.Fatalf("%s kept old inode %d after input value changed", name, ino)
+		}
+	}
+}

@@ -352,3 +352,54 @@ func TestNICBondingMasterLatches(t *testing.T) {
 		t.Fatal("bond master with a real carrier flap did not latch")
 	}
 }
+
+func TestNICCleanHoldTouchesHeldMtime(t *testing.T) {
+	f := kfixture(t)
+	nf := seedNICFixture(t, f)
+	nf.now = time.Unix(1760000000, 0)
+	nf.setCounters(t, 100, 0, 0)
+	f.r.updateNICHealth()
+	nf.advance(t, f, 6*time.Minute)
+	nf.setCounters(t, 105, 0, 0)
+	f.r.updateNICHealth()
+	if !nicLatchSet(f.r) {
+		t.Fatal("carrier flap did not arm latch")
+	}
+
+	// Age the latch > LatchTouchMinInterval (and test clean-hold < nicCleanHold
+	// while nic.lastSig is already set, plus !nicCovered / lastSig.IsZero() branches).
+	latchFile := f.r.deps.Store.Path(latchdefs.LatchHostNetworkProblems)
+	old := nf.now.Add(-48 * time.Hour)
+	if err := os.Chtimes(latchFile, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// Clean tick inside nicCleanHold (6m < 10m).
+	nf.advance(t, f, 6*time.Minute)
+	if !nicLatchSet(f.r) {
+		t.Fatal("latch exited early during clean hold")
+	}
+	fi, err := os.Stat(latchFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(nf.now) {
+		t.Fatalf("clean-hold mtime = %v, want %v", fi.ModTime(), nf.now)
+	}
+
+	// Also verify !nicCovered branch after simulated restart (fresh Runner with
+	// held latch aged > LatchTouchMinInterval).
+	r2 := New(f.deps)
+	nf.now = nf.now.Add(2 * time.Hour)
+	old2 := nf.now.Add(-48 * time.Hour)
+	if err := os.Chtimes(latchFile, old2, old2); err != nil {
+		t.Fatal(err)
+	}
+	r2.updateNICHealth()
+	fi2, err := os.Stat(latchFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi2.ModTime().Equal(nf.now) {
+		t.Fatalf("post-restart !nicCovered mtime = %v, want %v", fi2.ModTime(), nf.now)
+	}
+}

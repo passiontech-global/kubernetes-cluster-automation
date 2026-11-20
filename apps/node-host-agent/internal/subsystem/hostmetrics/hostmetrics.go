@@ -112,6 +112,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics/kernelfail"
 )
@@ -221,6 +222,7 @@ func New(cfg Config) *Collector {
 	c.fs.inflight = map[string]*fsFlight{}
 	c.fs.stalledLogged = map[string]bool{}
 	c.state = cfg.Store(logger)
+	c.fdscan.proc = procfs.SharedFDCache(c.cfg.ProcRoot, c.cfg.Clock.Now)
 	c.removedFlagRe = make(map[string]*regexp.Regexp, len(cfg.RemovedFlags))
 	for _, flag := range cfg.RemovedFlags {
 		// Anchored key match (same shape as the canonical

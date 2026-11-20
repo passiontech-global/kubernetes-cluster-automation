@@ -394,14 +394,17 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 	// WatchdogStateDir): a sig13/cp-freeze/pki-drift restart
 	// seconds earlier must cool this remediate down too — one
 	// floor for every k0scontroller restart this subsystem can
-	// fire. The epoch read below only feeds the log line; the
-	// atomic check+spend is RateTrySpend at the G6 spend point
-	// (the old feeder-private last-restart file under
-	// FeederStateDir could not see the other checks' spends).
+	// fire. RateOK checks both the on-disk stamp and the Store's RAM
+	// lastSpent mirror AND self-heals future-skewed stamps (> 60s
+	// ahead of Now) before Epoch is read for the log line.
+	rateOK := f.d.State.RateOK(cdeps.FileRateRestart, fcfg.RemediateMinRestart)
 	lastShared := f.d.State.Epoch(
 		filepath.Join(f.d.State.Dir, cdeps.FileRateRestart))
 	delta := f.d.Cfg.Clock.Now().Unix() - lastShared
-	if delta < int64(fcfg.RemediateMinRestart.Seconds()) {
+	if delta < 0 {
+		delta = 0
+	}
+	if !rateOK {
 		f.d.State.AppendLog(fmt.Sprintf(
 			"G5 PASS: last restart %ds ago (< %ds) — rate-limit, stop",
 			delta, int(fcfg.RemediateMinRestart.Seconds())))

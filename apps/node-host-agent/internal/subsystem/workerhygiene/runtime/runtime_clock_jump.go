@@ -40,6 +40,7 @@ const (
 	// clockJumpMarkerFile is the marker a clock-step remedy leaves
 	// in the watchdog state dir (epoch content, mtime fallback).
 	clockJumpMarkerFile = "clock-stepped-at"
+	clockJumpFutureSkew = time.Minute
 )
 
 // konnClockErrorRe matches the auth-expiry signatures a
@@ -128,7 +129,8 @@ func (c *ClockJumpCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	stepped, ok := clockSteppedAt(c.d)
-	if !ok || c.d.Cfg.Seams.Host.Clock.Now().Sub(stepped) > clockJumpMarkerFresh {
+	age := c.d.Cfg.Seams.Host.Clock.Now().Sub(stepped)
+	if !ok || age < -clockJumpFutureSkew || age > clockJumpMarkerFresh {
 		// No recent step — the signature this check heals can't be
 		// attributed to a clock jump.
 		c.d.CycleResult(wdeps.CheckClockJump, "ok")

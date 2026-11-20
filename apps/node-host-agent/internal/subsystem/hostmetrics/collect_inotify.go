@@ -5,6 +5,8 @@ package hostmetrics
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
@@ -36,13 +39,18 @@ type inotifyConsumer struct {
 	watches   uint64
 }
 
-// inotifyCache now holds ONLY the edge-triggered >80% top-3-holder
-// Warn flags — the sweep payload itself lives in the shared
-// fdLinkCache (collect_fdlinks.go) that also feeds the eBPF census.
+// inotifyCache holds the edge-triggered >80% top-3-holder Warn flags
+// plus the memoized aggregation over the latest *procfs.FDSnapshot
+// pointer from the shared fdCache.
 type inotifyCache struct {
 	mu          sync.Mutex
 	warnedInst  bool // edge-triggered >80% Warn per episode
 	warnedWatch bool
+
+	lastSnap *procfs.FDSnapshot
+	inst     uint64
+	watch    uint64
+	top      []inotifyConsumer
 }
 
 // noteWarned edge-updates the per-kind warn flag (over replaces the
@@ -59,11 +67,6 @@ func (s *inotifyCache) noteWarned(kind string, over bool) (was bool) {
 	*warned = over
 	return was
 }
-
-// inotifyFDTarget is the /proc/<pid>/fd/<fd> symlink target the
-// kernel gives an inotify group fd — the same source
-// node_exporter/procfs uses to count instances.
-const inotifyFDTarget = "anon_inode:inotify"
 
 // inotifyTopN is the holder count the warn report prints.
 const inotifyTopN = 3
@@ -99,13 +102,66 @@ func inotifyTopInsert(top []inotifyConsumer, cc inotifyConsumer) []inotifyConsum
 	return top
 }
 
-// inotifySnapshot returns the inotify half of the shared fd-link
-// sweep (collect_fdlinks.go), re-walking the procfs at most once
-// per InotifyScanInterval — the sweep itself is singleflighted
-// with the eBPF consumer.
-func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer) {
-	res := c.fdLinkSnapshot(c.cfg.InotifyScanInterval)
-	return res.inst, res.watch, res.top
+// inotifySnapshot returns the inotify counts and top-3 holders from the
+// shared procfs.FDCache snapshot, memoized on the snapshot pointer so
+// repeat reads within InotifyScanInterval do not re-aggregate or re-read
+// /proc/<pid>/comm. Returns ok=false on !ProcOK or Partial walks so
+// callers neither emit bogus zero metrics nor falsely reset warn flags.
+func (c *Collector) inotifySnapshot() (uint64, uint64, []inotifyConsumer, bool) {
+	snap := c.fdCache().Snapshot(c.cfg.InotifyScanInterval)
+	if snap == nil || !snap.ProcOK || snap.Partial {
+		return 0, 0, nil, false
+	}
+	c.ino.mu.Lock()
+	if c.ino.lastSnap == snap {
+		inst, watch, top := c.ino.inst, c.ino.watch, c.ino.top
+		c.ino.mu.Unlock()
+		return inst, watch, top, true
+	}
+	c.ino.mu.Unlock()
+
+	var inst, watch uint64
+	cons := map[int]*inotifyConsumer{}
+	for _, fd := range snap.Inotify {
+		var w uint64
+		if fd.Watches > 0 {
+			w = uint64(fd.Watches)
+		}
+		inst++
+		watch += w
+		cc := cons[fd.PID]
+		if cc == nil {
+			cc = &inotifyConsumer{pid: fd.PID}
+			cons[fd.PID] = cc
+		}
+		cc.instances++
+		cc.watches += w
+	}
+	// Bounded top-3 insertion — never retain the full holder set.
+	var top []inotifyConsumer
+	for _, cc := range cons {
+		top = inotifyTopInsert(top, *cc)
+	}
+	// Top-3 inotify holder names — comm reads pay only for the
+	// three pids the warn report prints.
+	for i := range top {
+		if data, err := os.ReadFile(filepath.Join(
+			c.cfg.ProcRoot, strconv.Itoa(top[i].pid), "comm")); err == nil {
+			top[i].name = strings.TrimSpace(string(data))
+		}
+	}
+
+	c.ino.mu.Lock()
+	if c.ino.lastSnap != snap {
+		c.ino.lastSnap = snap
+		c.ino.inst = inst
+		c.ino.watch = watch
+		c.ino.top = top
+	} else {
+		inst, watch, top = c.ino.inst, c.ino.watch, c.ino.top
+	}
+	c.ino.mu.Unlock()
+	return inst, watch, top, true
 }
 
 // warnInotifyTop edge-logs the top-3 holder report once per
@@ -138,10 +194,14 @@ var (
 		[]string{"node"}, nil)
 )
 
-// collectInotify emits the two fill ratios — each only when its own
-// limit file parses (same per-source rule as conntrack).
+// collectInotify emits the two fill ratios — each only when the proc
+// walk succeeded cleanly AND its own limit file parses (same per-source
+// rule as conntrack).
 func (c *Collector) collectInotify(ch chan<- prometheus.Metric) {
-	inst, watch, top := c.inotifySnapshot()
+	inst, watch, top, ok := c.inotifySnapshot()
+	if !ok {
+		return
+	}
 	maxI, instOK := fsx.ReadUintFile(c.cfg.InotifyMaxInstancesFile)
 	maxW, watchOK := fsx.ReadUintFile(c.cfg.InotifyMaxWatchesFile)
 	if instOK && maxI > 0 {

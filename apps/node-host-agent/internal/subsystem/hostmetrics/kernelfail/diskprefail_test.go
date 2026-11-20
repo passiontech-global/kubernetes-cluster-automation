@@ -195,3 +195,39 @@ func TestParseSmartLogCLIPartial(t *testing.T) {
 		t.Fatal("critical_warning=2 + 91% + media 12 must trip the verdict")
 	}
 }
+
+func TestParseSmartLogCLIHexCriticalWarning(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		critRaw  string
+		wantOK   bool
+		wantCrit uint64
+		wantTrip bool
+	}{
+		{"zero", "0", true, 0, false},
+		{"hex zero", "0x00", true, 0, false},
+		{"hex 0x08 (not octal)", "0x08", true, 8, true},
+		{"hex 0x10 (16 not 10)", "0x10", true, 16, true},
+		{"uppercase 0X1F", "0X1F", true, 31, true},
+		{"invalid hex", "0x0g", false, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := "critical_warning                    : " + tc.critRaw + "\n" +
+				"percentage_used                     : 10%\n" +
+				"media_errors                        : 0\n"
+			s, ok := parseSmartLogCLI("nvme0", out)
+			if ok != tc.wantOK {
+				t.Fatalf("parseSmartLogCLI(%q) ok=%v want %v", tc.critRaw, ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if s.criticalWarning != tc.wantCrit {
+				t.Fatalf("criticalWarning=%d want %d", s.criticalWarning, tc.wantCrit)
+			}
+			if s.ok() != tc.wantTrip {
+				t.Fatalf("s.ok()=%v want %v", s.ok(), tc.wantTrip)
+			}
+		})
+	}
+}

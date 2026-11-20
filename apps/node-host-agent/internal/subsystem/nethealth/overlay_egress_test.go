@@ -4,13 +4,16 @@ package nethealth
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
@@ -287,5 +290,65 @@ func TestEgressCommitWriteFailureHealsRuleAnyway(t *testing.T) {
 	}
 	if !strings.Contains(logLines(t, e), "-> overlay relay table 100") {
 		t.Fatalf("missing relay commit log:\n%s", logLines(t, e))
+	}
+}
+
+func TestEgressMarkedTCPProbeSkipsRuleDrop(t *testing.T) {
+	e := overlayEnv(t, nil)
+	e.nlRules = []netlink.Rule{nlRule(1500, 100, "8.8.8.8")}
+	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
+	e.pingOK["8.8.8.8|true"] = false
+
+	markedCalls := 0
+	e.n.cfg.tcpProbeMarked = func(_ context.Context, host, port string, _ time.Duration) (error, error) {
+		markedCalls++
+		if host != "8.8.8.8" || port != "53" {
+			t.Fatalf("unexpected target %s:%s", host, port)
+		}
+		return nil, nil // SO_MARK 0x2000 succeeded and TCP answered
+	}
+	e.n.Cycle(context.Background())
+
+	if markedCalls != 1 {
+		t.Fatalf("tcpProbeMarked calls = %d, want 1", markedCalls)
+	}
+	if e.host.Ran("rule del pref 1500") || e.host.Ran("rule add pref 1500") {
+		t.Fatalf("expected zero rule churn with SO_MARK probe, cmds=%v", e.host.Cmds())
+	}
+	if _, err := os.Stat(filepath.Join(e.state, "egress-icmpblk-8.8.8.8")); err != nil {
+		t.Fatalf("icmpblk marker not written: %v", err)
+	}
+}
+
+func TestEgressEPERMProbeFallbackRestoresRuleOnCancelledCtx(t *testing.T) {
+	e := overlayEnv(t, nil)
+	e.nlRules = []netlink.Rule{nlRule(1500, 100, "8.8.8.8")}
+	testutil.WriteFile(t, filepath.Join(e.state, "egress-state-8.8.8.8"), "relay\n")
+	e.pingOK["8.8.8.8|true"] = false
+	e.n.cfg.tcpProbeMarked = func(_ context.Context, _, _ string, _ time.Duration) (error, error) {
+		return nil, unix.EPERM
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	e.n.cfg.tcpProbe = func(_ context.Context, _, _ string, _ time.Duration) error {
+		cancel() // simulate CycleTimeout / shutdown mid-probe
+		return errors.New("canceled")
+	}
+	// Honor ctx.Err() in runHostCmd like real hostexec so restore fails if
+	// it receives the cancelled ctx instead of context.WithoutCancel(ctx).
+	origRun := e.n.cfg.runHostCmd
+	e.n.cfg.runHostCmd = func(rctx context.Context, argv []string) (string, error) {
+		if err := rctx.Err(); err != nil {
+			return "", err
+		}
+		return origRun(rctx, argv)
+	}
+
+	e.n.checkOverlayEgress(ctx)
+	if !e.host.Ran("rule del pref 1500 to 8.8.8.8/32 lookup 100") {
+		t.Fatalf("rule not dropped on EPERM fallback: %v", e.host.Cmds())
+	}
+	if !e.host.Ran("rule add pref 1500 to 8.8.8.8/32 lookup 100") {
+		t.Fatalf("rule restore did not survive cancelled ctx via WithoutCancel: %v", e.host.Cmds())
 	}
 }

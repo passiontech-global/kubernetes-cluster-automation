@@ -13,8 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/ctr"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
@@ -208,5 +211,145 @@ func TestHungRuncExcludesExecAndRunAndDState(t *testing.T) {
 	}
 	if !strings.Contains(e.LogLines(t), "uninterruptible D-state") {
 		t.Fatalf("expected D-state log entry:\n%s", e.LogLines(t))
+	}
+}
+
+// TestHungRuncDStateSkipsCmdlineAndRequiresShimParent verifies P0-5:
+// D-state runc processes never open /proc/<pid>/cmdline (avoiding
+// mm->mmap_lock deadlock), qualify via containerd-shim ancestry, and
+// ignore D-state runc under non-shim parents.
+func TestHungRuncDStateSkipsCmdlineAndRequiresShimParent(t *testing.T) {
+	e := hungEnv(t, 1)
+	// Parent 7700: containerd-shim-runc-v2.
+	e.MkStatProc(t, 7700, "containerd-shim", "S", "")
+	// Child 7701: D-state runc under shim 7700 with unreadable (chmod 000) cmdline.
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "7701", "stat"),
+		"7701 (runc) D 7700 0 0\n")
+	cmdPath := filepath.Join(e.ProcDir, "7701", "cmdline")
+	wdepstest.WriteFile(t, cmdPath, "runc\x00exec\x00cid\x00")
+	if err := os.Chmod(cmdPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cmdPath, 0o644) })
+	ageProc(t, e, 7701, 10*time.Minute)
+
+	// Child 7702: D-state runc under shim 7700 with missing cmdline.
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "7702", "stat"),
+		"7702 (runc) D 7700 0 0\n")
+	ageProc(t, e, 7702, 10*time.Minute)
+
+	// Parent 7710: non-shim bash; Child 7711: D-state runc under bash -> ignored.
+	e.MkStatProc(t, 7710, "bash", "S", "")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "7711", "stat"),
+		"7711 (runc) D 7710 0 0\n")
+	ageProc(t, e, 7711, 10*time.Minute)
+
+	chk := hungCheck(e)
+	chk.Run(context.Background(), cycleEnv())
+	if len(e.Kills) != 0 {
+		t.Fatalf("kills=%v want none for D-state processes", e.Kills)
+	}
+	logs := e.LogLines(t)
+	if !strings.Contains(logs, "pid=7701") || !strings.Contains(logs, "pid=7702") {
+		t.Fatalf("expected D-state logs for 7701 and 7702:\n%s", logs)
+	}
+	if strings.Contains(logs, "pid=7711") {
+		t.Fatalf("D-state runc under non-shim parent 7710 should be ignored:\n%s", logs)
+	}
+}
+
+func TestHungRuncMidCycleTransitionToDAbortsKill(t *testing.T) {
+	e := hungEnv(t, 1)
+	writeFullStat(t, e, 7801, "runc", "S", 11111)
+	ageProc(t, e, 7801, 10*time.Minute)
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			// Simulate mid-cycle S -> D transition during HoldEmergencyHeal.
+			writeFullStat(t, e, 7801, "runc", "D", 11111)
+			return map[string]string{}, nil
+		},
+	}
+
+	hungCheck(e).Run(context.Background(), cycleEnv())
+	if len(e.Kills) != 0 {
+		t.Fatalf("SIGKILLed PID 7801 after mid-cycle S->D transition: %v", e.Kills)
+	}
+	if !strings.Contains(e.LogLines(t), "uninterruptible D-state") {
+		t.Fatalf("expected uninterruptible D-state log after S->D transition:\n%s", e.LogLines(t))
+	}
+}
+
+func TestHungRuncMidCyclePIDReuseAbortsKill(t *testing.T) {
+	e := hungEnv(t, 1)
+	writeFullStat(t, e, 7802, "runc", "S", 11111)
+	ageProc(t, e, 7802, 10*time.Minute)
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			// Simulate mid-cycle PID reuse (starttime changed) during HoldEmergencyHeal.
+			writeFullStat(t, e, 7802, "runc", "S", 99999)
+			return map[string]string{}, nil
+		},
+	}
+
+	hungCheck(e).Run(context.Background(), cycleEnv())
+	if len(e.Kills) != 0 {
+		t.Fatalf("SIGKILLed PID 7802 after mid-cycle PID reuse: %v", e.Kills)
+	}
+}
+
+func TestHungRuncPidsOKFalseAndProcErrorPreserveStreak(t *testing.T) {
+	e := hungEnv(t, 2)
+	e.MkStatProc(t, 7810, "runc", "S", "do_wait")
+	ageProc(t, e, 7810, 10*time.Minute)
+	chk := hungCheck(e)
+	ctx := context.Background()
+
+	// Cycle 1: builds confirmation streak = 1.
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     func() []int { return []int{7810} },
+		PidsOK:       func() bool { return true },
+	})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckHungRunc, "ok")); got != 1 {
+		t.Fatalf("ok cycles=%v want 1", got)
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("cycle 1 kills=%v want 0", e.Kills)
+	}
+
+	// PidsOnce() == nil + PidsOK() == false must abort "inconclusive" and preserve streak.
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     func() []int { return nil },
+		PidsOK:       func() bool { return false },
+	})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckHungRunc, "inconclusive")); got != 1 {
+		t.Fatalf("inconclusive cycles=%v want 1", got)
+	}
+
+	// PidsOnce == nil + Proc.PIDs() error must also abort "inconclusive" and preserve streak.
+	e.H.Deps.Proc = procfs.New(filepath.Join(t.TempDir(), "missing-proc"))
+	chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckHungRunc, "inconclusive")); got != 2 {
+		t.Fatalf("inconclusive cycles=%v want 2", got)
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("kills during inconclusive cycles=%v want 0", e.Kills)
+	}
+
+	// Recovery cycle: streak=1 was preserved, so this second valid cycle immediately confirms & kills.
+	e.H.Deps.Proc = procfs.New(e.ProcDir)
+	chk.Run(ctx, &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     func() []int { return []int{7810} },
+		PidsOK:       func() bool { return true },
+	})
+	if len(e.Kills) != 1 || e.Kills[0].PID != 7810 {
+		t.Fatalf("kills=%v want SIGKILL on 7810 on preserved streak=2", e.Kills)
 	}
 }

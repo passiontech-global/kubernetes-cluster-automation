@@ -296,7 +296,18 @@ func (w *wiring) descriptors() []Descriptor {
 			EnvFlag: envnames.EnvEnableNethealth,
 			Default: envx.ModeOn,
 			Build: func(w *wiring, _ kubernetes.Interface) ([]agent.Subsystem, error) {
-				return std(w, nethealth.EnvDeps{Deps: w.Deps},
+				// nodecoord is optional: nethealth runs on standalone
+				// hub nodes too where no kube clientset exists, so the
+				// handle is built only when BOTH a node name and a
+				// clientset resolve — either missing leaves Coord nil
+				// and the maintenance hold disabled.
+				var coord *nodecoord.Coord
+				if w.NodeName != "" {
+					if cs, err := w.csOnce(); err == nil {
+						coord = w.coordOnce(cs)
+					}
+				}
+				return std(w, nethealth.EnvDeps{Deps: w.Deps, Coord: coord},
 					nethealth.ConfigFromEnv, nethealth.New)
 			},
 		},

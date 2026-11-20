@@ -13,11 +13,13 @@ package nodereporter
 import (
 	"context"
 	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -140,6 +142,30 @@ var staleConditionDef = conditionDef{
 // order. Latches without a CondDefs entry have no condition surface
 // by design.
 var conditionDefs = buildConditionDefs()
+
+// conditionLatchKeys is the deduplicated set of all latch keys
+// referenced by conditionDefs (primary + alts), used to fold
+// RAM-only ramEpochs latches into latchIndex without per-cycle sorting.
+var conditionLatchKeys = buildConditionLatchKeys()
+
+func buildConditionLatchKeys() []string {
+	seen := make(map[string]bool, len(conditionDefs))
+	var keys []string
+	add := func(k string) {
+		if k == "" || seen[k] {
+			return
+		}
+		seen[k] = true
+		keys = append(keys, k)
+	}
+	for _, d := range conditionDefs {
+		add(d.stateKey)
+		for _, alt := range d.altStateKeys {
+			add(alt)
+		}
+	}
+	return keys
+}
 
 // buildConditionDefs projects latchdefs.CondDefs onto conditionOrder.
 func buildConditionDefs() []conditionDef {
@@ -362,6 +388,13 @@ func (r *Reporter) latchIndex() map[string]bool {
 			out[strings.TrimPrefix(n, latchdefs.LatchFilePrefix)] = true
 		}
 	}
+	if r.state != nil {
+		for _, k := range conditionLatchKeys {
+			if !out[k] && r.state.Exists(k) {
+				out[k] = true
+			}
+		}
+	}
 	return out
 }
 
@@ -388,18 +421,35 @@ func (r *Reporter) firstLatchIdx(present map[string]bool,
 	return "", "", false
 }
 
+func (r *Reporter) latchPath(key string) string {
+	if r.state != nil {
+		return r.state.Path(key)
+	}
+	return filepath.Join(r.cfg.WatchdogStateDir, latchdefs.LatchFilePrefix+key)
+}
+
 // stateFileSince reports whether state-<key> exists, and its content
 // (the epoch state_enter wrote; "unknown" when empty/unreadable —
-// check-watchdog-state.sh's `|| echo unknown` fallback).
+// check-watchdog-state.sh's `|| echo unknown` fallback). When the file
+// is missing on disk (ENOSPC/EROFS ramEpochs fallback), consults the
+// shared stateStore.
 func (r *Reporter) stateFileSince(key string) (string, bool) {
-	data, err := os.ReadFile(r.state.Path(key))
-	if err != nil {
-		return "", false
+	p := r.latchPath(key)
+	data, err := os.ReadFile(p)
+	if err == nil {
+		if s := strings.TrimSpace(strings.ToValidUTF8(string(data), "")); s != "" {
+			return s, true
+		}
+		return "unknown", true
 	}
-	if s := strings.TrimSpace(string(data)); s != "" {
-		return s, true
+	if (errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, os.ErrPermission)) &&
+		r.state != nil && r.state.Exists(key) {
+		if ep := r.state.Epoch(p); ep > 0 {
+			return strconv.FormatInt(ep, 10), true
+		}
+		return "unknown", true
 	}
-	return "unknown", true
+	return "", false
 }
 
 // watchdogStale is check-watchdog-fresh.sh ported: no `installed`

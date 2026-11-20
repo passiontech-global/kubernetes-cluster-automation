@@ -32,13 +32,23 @@ import (
 // query leaves xminSeen false: the series goes absent rather than
 // fabricating a zero over a real horizon (the seen-gating contract).
 func (p *Probe) hygieneBackendXmin(ctx context.Context, pg, user, pass string,
-	h *hygieneResult, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
-		"SELECT 'activity', COALESCE(MAX(age(backend_xmin)), 0) FROM pg_stat_activity "+
-			"UNION ALL SELECT 'replication', COALESCE(MAX(age(backend_xmin)), 0) "+
-			"FROM pg_stat_replication")
-	if err != nil {
-		note(fmt.Sprintf("backend-xmin-fail: %v", err))
+	h *hygieneResult, batch *probeBatch, backendEnv int64, note func(string)) {
+	var out string
+	switch {
+	case batch != nil && batch.err == nil && batch.xminSeen:
+		out = strings.Join(batch.xminLines, "\n")
+	case batch == nil || batch.canFallback(ctx, backendEnv):
+		var err error
+		out, err = p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
+			"SELECT 'activity', COALESCE(MAX(age(backend_xmin)), 0) FROM pg_stat_activity "+
+				"UNION ALL SELECT 'replication', COALESCE(MAX(age(backend_xmin)), 0) "+
+				"FROM pg_stat_replication")
+		if err != nil {
+			note(fmt.Sprintf("backend-xmin-fail: %v", err))
+			return
+		}
+	default:
+		note(fmt.Sprintf("backend-xmin-fail: %v", batch.err))
 		return
 	}
 	h.xminSeen = true // a successful read answers for BOTH views

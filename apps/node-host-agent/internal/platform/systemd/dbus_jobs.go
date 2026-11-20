@@ -47,6 +47,11 @@ func (b *dbusBackend) dbusJob(ctx context.Context, unit, method string) error {
 		return fmt.Errorf("dbus job: unknown method %q", method)
 	}
 	if jobErr != nil {
+		if isTransportDead(jobErr) {
+			b.dropConn(conn)
+			return fmt.Errorf("%w: dbus %s %s: %v",
+				errDBusUnavailable, method, unit, jobErr)
+		}
 		return fmt.Errorf("dbus %s %s: %w", method, unit, jobErr)
 	}
 	// The completion channel is driven by JobRemoved signals on the
@@ -92,7 +97,9 @@ func (b *dbusBackend) dbusJob(ctx context.Context, unit, method string) error {
 			return fmt.Errorf("dbus %s %s: job %s", method, unit, res)
 		}
 	case <-ctx.Done():
-		b.dropConn(conn)
+		// Do not drop the shared conn on a single caller's cancellation:
+		// ch is buffered (cap 1) so jobListener won't block, and other
+		// concurrent callers may have healthy jobs in flight.
 		return ctx.Err()
 	case <-transportDead:
 		b.dropConn(conn)

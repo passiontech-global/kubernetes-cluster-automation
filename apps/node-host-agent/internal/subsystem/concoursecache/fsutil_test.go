@@ -60,7 +60,7 @@ func TestFilesByAgeCarriesBlocks(t *testing.T) {
 	dir := t.TempDir()
 	p := ccSparseFile(t, filepath.Join(dir, "sparse"), 48*time.Hour)
 
-	files := filesByAge(dir)
+	files := filesByAge(context.Background(), dir)
 	if len(files) != 1 {
 		t.Fatalf("files = %d want 1", len(files))
 	}
@@ -76,7 +76,7 @@ func TestFilesByAgeCarriesBlocks(t *testing.T) {
 	// The unit consistency the fix exists for: the candidate's size
 	// never exceeds the tree du it is trimmed against (a sparse file's
 	// apparent size CAN — entryBlocks never does).
-	if du := diskUsage(dir); files[0].size > int64(du) {
+	if du := diskUsage(context.Background(), dir); files[0].size > int64(du) {
 		t.Fatalf("candidate size %d exceeds tree du %d — unit mismatch",
 			files[0].size, du)
 	}

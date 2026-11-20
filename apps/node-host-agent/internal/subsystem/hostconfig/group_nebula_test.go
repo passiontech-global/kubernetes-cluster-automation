@@ -4,11 +4,14 @@
 package hostconfig
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
 // ---------- hub hairpin route prune ----------
@@ -633,6 +636,72 @@ func TestNebulaTestFailureAbortsStart(t *testing.T) {
 		if strings.Contains(call, "systemctl enable nebula@interdc") ||
 			strings.Contains(call, "systemctl start nebula@interdc") {
 			t.Fatalf("nebula started despite -test failure: %v", call)
+		}
+	}
+}
+
+type nebulaTestProbeRunner struct {
+	*testutil.FakeRunner
+	hostRoot       string
+	sawTmpConfig   bool
+	tmpConfigBytes []byte
+}
+
+func (n *nebulaTestProbeRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	if name == "nebula" && len(args) >= 3 && args[0] == "-config" && args[2] == "-test" {
+		if !strings.HasSuffix(args[1], "/config.yaml") {
+			n.sawTmpConfig = true
+			n.tmpConfigBytes, _ = os.ReadFile(filepath.Join(n.hostRoot, args[1]))
+		}
+	}
+	return n.FakeRunner.Run(ctx, name, args...)
+}
+
+// TestNebulaTestFailurePreservesLiveConfigAndCleansTemp verifies that
+// `nebula -test` runs against a temp config file BEFORE touching live
+// config.yaml, preserves the pre-existing config on failure, and removes
+// the temp file afterwards.
+func TestNebulaTestFailurePreservesLiveConfigAndCleansTemp(t *testing.T) {
+	vars, certs, hostRoot, dl := nebulaExtraFixture(t, map[string]string{"nebula": "#!/bin/sh\n"})
+	sr := newScripted(map[string]string{
+		"/usr/local/bin/nebula -version": "Version: 1.11.2",
+	}, nil)
+	sr.FailOn("nebula -config", nil)
+	probe := &nebulaTestProbeRunner{FakeRunner: sr, hostRoot: hostRoot}
+	r, err := New(Config{NodeName: "node-b", HostRoot: hostRoot,
+		VarsDir: vars, NebulaCertsDir: certs, Runner: probe, DownloadDir: dl}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const priorLive = "# previous working nebula config\npki: {}\n"
+	hostWrite(t, r, "/etc/nebula/interdc/config.yaml", priorLive)
+
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupNebula()
+	if c.errs == 0 {
+		t.Fatal("nebula -test failure did not count a cycle error")
+	}
+	if !probe.sawTmpConfig || !strings.Contains(string(probe.tmpConfigBytes), "static_host_map:") {
+		t.Fatalf("nebula -test did not validate rendered temp config (saw=%v len=%d)",
+			probe.sawTmpConfig, len(probe.tmpConfigBytes))
+	}
+	if got := hostRead(t, r, "/etc/nebula/interdc/config.yaml"); got != priorLive {
+		t.Fatalf("live config.yaml was overwritten despite -test failure:\ngot:\n%s", got)
+	}
+	entries, err := os.ReadDir(r.hp("/etc/nebula/interdc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ent := range entries {
+		if strings.HasPrefix(ent.Name(), ".config.yaml.tmp-") {
+			t.Fatalf("temp config file lingered after -test failure: %s", ent.Name())
+		}
+	}
+	for _, call := range sr.Calls() {
+		if strings.Contains(call, "systemctl enable nebula@interdc") ||
+			strings.Contains(call, "systemctl start nebula@interdc") ||
+			strings.Contains(call, "systemctl restart nebula@interdc") {
+			t.Fatalf("service touched despite -test failure: %v", call)
 		}
 	}
 }

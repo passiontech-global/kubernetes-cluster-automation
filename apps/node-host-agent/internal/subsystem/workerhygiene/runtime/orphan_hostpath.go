@@ -63,9 +63,13 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		path, name string
 	}
 	var cands []cand
+	readErr := false
 	for _, root := range c.d.Cfg.Disk.OrphanHostPathDirs {
 		ents, err := os.ReadDir(root)
 		if err != nil {
+			if !os.IsNotExist(err) {
+				readErr = true
+			}
 			continue
 		}
 		for _, e := range ents {
@@ -76,7 +80,15 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				path: filepath.Join(root, e.Name()), name: e.Name()})
 		}
 	}
+	if len(cands) == 0 && readErr {
+		c.d.CycleResult(wdeps.CheckOrphanHP, "abort")
+		return
+	}
 	if len(cands) == 0 || c.d.Cfg.Client == nil {
+		if readErr {
+			c.d.CycleResult(wdeps.CheckOrphanHP, "abort")
+			return
+		}
 		// Nothing to verify — a cluster-scope PV LIST on every
 		// worker every cycle for zero candidates is wasted
 		// apiserver traffic (and a nil client, defensive only —
@@ -103,6 +115,10 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 		if allKnown {
+			if readErr {
+				c.d.CycleResult(wdeps.CheckOrphanHP, "abort")
+				return
+			}
 			c.d.OrphanHostPathBytes = 0
 			c.d.OrphanHostPathDirs = 0
 			c.d.CycleResult(wdeps.CheckOrphanHP, "ok")
@@ -170,7 +186,7 @@ func (c *OrphanHPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				cd.path, why, size))
 		}
 	}
-	if apiOK {
+	if apiOK && !readErr {
 		c.d.OrphanHostPathBytes = totalBytes
 		c.d.OrphanHostPathDirs = orphans
 	}

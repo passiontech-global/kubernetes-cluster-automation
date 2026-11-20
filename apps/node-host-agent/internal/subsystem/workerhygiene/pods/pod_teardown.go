@@ -48,7 +48,7 @@ func (c *PodTeardownCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		if tasks == nil {
 			var complete bool
-			tasks, complete = e.TasksOnce()
+			tasks, complete = c.d.CycleTasks(e)
 			if !complete {
 				// A task root was unreadable — "zero live tasks"
 				// is unverifiable, so a force-delete could reap a

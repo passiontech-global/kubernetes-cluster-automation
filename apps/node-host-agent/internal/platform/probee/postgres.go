@@ -50,13 +50,16 @@ func PGWireProbeWithTimeout(ctx context.Context, hostport string, timeout time.D
 	if err != nil {
 		host, port = hostport, "5432"
 	}
-	d := net.Dialer{Timeout: timeout}
+	dl := probeDeadline(ctx, timeout)
+	d := net.Dialer{Deadline: dl}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
 		return false
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	_ = conn.SetDeadline(dl)
 	if _, err := conn.Write(PGStartupMessage("postgres", "postgres")); err != nil {
 		return false
 	}

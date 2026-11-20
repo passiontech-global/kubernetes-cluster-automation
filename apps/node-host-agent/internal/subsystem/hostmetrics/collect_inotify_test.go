@@ -9,8 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // mkFdLink creates a fake /proc/<pid>/fd/<fd> symlink with the
@@ -156,5 +158,85 @@ func TestInotifyTopWarnOnce(t *testing.T) {
 	// And it re-arms: the next over-threshold scrape warns again.
 	if was := c.ino.noteWarned("instances", true); was {
 		t.Fatal("edge flag did not re-arm after an under-threshold scrape")
+	}
+}
+
+// TestInotifyPartialOrFailedProcSuppressesMetricsAndPreservesWarn verifies that
+// !ProcOK or Partial /proc walks do not emit bogus zero metrics or falsely reset
+// the edge-triggered warnedInst / warnedWatch flags.
+func TestInotifyPartialOrFailedProcSuppressesMetricsAndPreservesWarn(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0000 does not block root")
+	}
+	cfg, _ := fixture(t)
+	now := time.Unix(1760003000, 0)
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
+	testutil.WriteFile(t, cfg.InotifyMaxInstancesFile, "10\n")
+	testutil.WriteFile(t, cfg.InotifyMaxWatchesFile, "10\n")
+	for fd := 3; fd <= 10; fd++ {
+		mkFdinfo(t, cfg.ProcRoot, 111, fd, 1) // 8/10 instances and 8/10 watches -> both >= 80%
+	}
+	c := New(cfg)
+	if got, ok := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"}); !ok || got != 0.8 {
+		t.Fatalf("setup instances ratio=%v ok=%v want 0.8", got, ok)
+	}
+	c.ino.mu.Lock()
+	if !c.ino.warnedInst || !c.ino.warnedWatch {
+		c.ino.mu.Unlock()
+		t.Fatalf("setup warn flags not set: inst=%v watch=%v", c.ino.warnedInst, c.ino.warnedWatch)
+	}
+	c.ino.mu.Unlock()
+
+	// Partial /proc walk (/proc/111/fd 0o000): suppress metrics and preserve warn flags.
+	fdDir := filepath.Join(cfg.ProcRoot, "111", "fd")
+	if err := os.Chmod(fdDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(fdDir, 0o755) })
+	now = now.Add(2 * defaultInotifyScanInterval)
+	if _, ok := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("emitted instances ratio on Partial /proc walk")
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_inotify_watches_used_ratio",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("emitted watches ratio on Partial /proc walk")
+	}
+	c.ino.mu.Lock()
+	if !c.ino.warnedInst || !c.ino.warnedWatch {
+		c.ino.mu.Unlock()
+		t.Fatalf("warn flags falsely reset on Partial walk: inst=%v watch=%v", c.ino.warnedInst, c.ino.warnedWatch)
+	}
+	c.ino.mu.Unlock()
+
+	// !ProcOK (/proc root 0o000): suppress metrics and preserve warn flags.
+	if err := os.Chmod(fdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfg.ProcRoot, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cfg.ProcRoot, 0o755) })
+	now = now.Add(2 * defaultInotifyScanInterval)
+	if _, ok := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("emitted instances ratio on !ProcOK walk")
+	}
+	c.ino.mu.Lock()
+	if !c.ino.warnedInst || !c.ino.warnedWatch {
+		c.ino.mu.Unlock()
+		t.Fatalf("warn flags falsely reset on !ProcOK walk: inst=%v watch=%v", c.ino.warnedInst, c.ino.warnedWatch)
+	}
+	c.ino.mu.Unlock()
+
+	// Recovery -> metrics resume cleanly.
+	if err := os.Chmod(cfg.ProcRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * defaultInotifyScanInterval)
+	if got, ok := metricValue(t, c, "node_host_agent_inotify_instances_used_ratio",
+		map[string]string{"node": "node-a"}); !ok || got != 0.8 {
+		t.Fatalf("recovered instances ratio=%v ok=%v want 0.8", got, ok)
 	}
 }

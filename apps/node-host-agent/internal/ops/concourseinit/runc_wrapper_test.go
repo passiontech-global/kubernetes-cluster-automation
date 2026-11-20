@@ -441,3 +441,52 @@ func TestWrapperCreateTmpWriteFails(t *testing.T) {
 		t.Fatal("config modified despite tmp-write failure")
 	}
 }
+
+func TestWrapperCreateAllowsInvalidUTF8AndDuplicateKeys(t *testing.T) {
+	// Raw invalid UTF-8 byte (0xff) in process.env and untouched mount, plus
+	// duplicate object keys at top-level, inside linux, and inside mounts.
+	raw := []byte("{" +
+		`"ociVersion":"1.0.2",` +
+		`"ociVersion":"1.0.2",` +
+		"\"process\":{\"args\":[\"/bin/sh\"],\"env\":[\"RAW=\xff\"]}," +
+		`"mounts":[` +
+		"{\"destination\":\"/proc\",\"destination\":\"/proc\",\"type\":\"proc\",\"source\":\"proc\",\"note\":\"\xff\"}," +
+		`{"destination":"/scratch","type":"bind","source":"/vol/scratch","options":["bind","rw"]}` +
+		`],` +
+		`"linux":{"uidMappings":[{"containerID":0,"hostID":4294967294,"size":1}],"uidMappings":[{"containerID":0,"hostID":4294967294,"size":1}]}` +
+		"}")
+	bundle := t.TempDir()
+	configPath := filepath.Join(bundle, "config.json")
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []execCall
+	code := runRuncWrapper(
+		[]string{"runc", "--bundle", bundle, "create", "utf8-dup"},
+		nil, "/runc.real", recordingExec(&calls, nil))
+	if code != 0 || len(calls) != 1 {
+		t.Fatalf("code=%d calls=%v", code, calls)
+	}
+
+	out, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec map[string]jsontext.Value
+	if err := json.Unmarshal(out, &spec,
+		jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true)); err != nil {
+		t.Fatalf("rewritten config unmarshal failed: %v\nout=%q", err, out)
+	}
+	var mounts []map[string]any
+	if err := json.Unmarshal(spec["mounts"], &mounts,
+		jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true)); err != nil {
+		t.Fatal(err)
+	}
+	if len(mounts) != 3 || mounts[1]["destination"] != "/shared-cache" || mounts[2]["destination"] != "/scratch" {
+		t.Fatalf("expected /shared-cache injected before /scratch, got mounts=%v", mounts)
+	}
+	if !strings.Contains(string(spec["process"]), "RAW=") {
+		t.Fatalf("process subtree lost: %s", spec["process"])
+	}
+}

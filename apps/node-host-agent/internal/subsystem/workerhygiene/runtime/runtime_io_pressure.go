@@ -312,7 +312,11 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if c.throttled == nil {
 		c.throttled = map[int]string{}
 	}
-	pids := e.PidsOnce()
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		c.d.CycleResult(wdeps.CheckIOPressure, "inconclusive")
+		return
+	}
 	// Prune dead pids from the ledger — and a recycled pid whose
 	// comm changed re-qualifies below (the entry still matches only
 	// the same comm).

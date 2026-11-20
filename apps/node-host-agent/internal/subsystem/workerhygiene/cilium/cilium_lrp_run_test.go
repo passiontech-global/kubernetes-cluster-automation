@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -359,4 +360,85 @@ func TestLRPRunNoReadyNLDResetsStreak(t *testing.T) {
 	if c.Fails != 0 {
 		t.Fatalf("Fails=%d want 0 with no Ready nld pod", c.Fails)
 	}
+}
+
+func TestLRPRunSysClassNetUnreadableAbortsPreservingStreaks(t *testing.T) {
+	t.Run("sysnet-not-dir", func(t *testing.T) {
+		pod := nldPod("node-local-dns-ggg777", wdepstest.UIDA)
+		e := lrpFixture(t, kubeDNSSlice(true), pod)
+		e.SvcBackends = map[string]int{"kube-system/kube-dns": 0}
+		e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return false }
+		e.DNSTCP = false
+		cycle := &wdeps.CycleEnv{Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true}
+
+		// Cycle 1: svcFails reaches 1/2 (desync pending); also set Fails=1.
+		c := lrpRun(t, e, cycle)
+		c.Fails = 1
+
+		origSysNet := e.H.Cfg.SysClassNet
+		notDir := filepath.Join(t.TempDir(), "not-a-dir")
+		wdepstest.WriteFile(t, notDir, "x")
+		e.H.Cfg.SysClassNet = notDir
+
+		lrpRun(t, e, cycle)
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1 on ENOTDIR", got)
+		}
+		if c.Fails != 1 {
+			t.Fatalf("Fails=%d want 1 preserved on ENOTDIR", c.Fails)
+		}
+
+		// Recover SysClassNet: svcFails reaches 2/2 immediately -> kills agent.
+		e.H.Cfg.SysClassNet = origSysNet
+		lrpRun(t, e, cycle)
+		if len(e.Kills) == 0 {
+			t.Fatal("svcFails was wiped during ENOTDIR (agent not killed on recovery)")
+		}
+	})
+
+	t.Run("sysnet-chmod-0000-and-enoent-recovery", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 0000 does not block root")
+		}
+		pod := nldPod("node-local-dns-hhh888", wdepstest.UIDA)
+		e := lrpFixture(t, kubeDNSSlice(true), pod)
+		e.SvcBackends = map[string]int{"kube-system/kube-dns": 0}
+		e.H.Cfg.Seams.Probe.DNSProbe = func(context.Context, string, string, time.Duration) bool { return false }
+		e.DNSTCP = false
+		cycle := &wdeps.CycleEnv{Pods: []corev1.Pod{*pod}, APIOK: true, WorkerActive: true}
+
+		c := lrpRun(t, e, cycle) // svcFails = 1/2
+		c.Fails = 1
+
+		if err := os.Chmod(e.SysNet, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(e.SysNet, 0o755) })
+
+		lrpRun(t, e, cycle)
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumLRP, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1 on SysClassNet 0o000", got)
+		}
+		if c.Fails != 1 {
+			t.Fatalf("Fails=%d want 1 preserved on SysClassNet 0o000", c.Fails)
+		}
+
+		if err := os.Chmod(e.SysNet, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		lrpRun(t, e, cycle) // svcFails hits 2/2 immediately
+		if len(e.Kills) == 0 {
+			t.Fatal("svcFails was wiped during SysClassNet 0o000")
+		}
+
+		// ENOENT (cilium_host removed) clears Fails cleanly.
+		if err := os.RemoveAll(filepath.Join(e.SysNet, "cilium_host")); err != nil {
+			t.Fatal(err)
+		}
+		c.Fails = 4
+		lrpRun(t, e, cycle)
+		if c.Fails != 0 {
+			t.Fatalf("Fails=%d want 0 when cilium_host is absent (ENOENT)", c.Fails)
+		}
+	})
 }

@@ -280,3 +280,44 @@ func TestRefreshLatchesSignalPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestRefreshLatchesTouchesHeldHysteresisLatches(t *testing.T) {
+	cfg, _ := fixture(t)
+	fixed := time.Unix(1760000000, 0)
+	cfg.Clock = timex.NewCell(func() time.Time { return fixed })
+	// Keep kf.Refresh inconclusive for EBPF (missing ProcRoot/BpffsDir) and
+	// Neighbor (NeighFlushGuard=true with missing proc views) so Refresh does
+	// not Exit them before latches.go's mtime touch loop runs.
+	cfg.ProcRoot = filepath.Join(t.TempDir(), "no-proc")
+	cfg.BpffsDir = filepath.Join(t.TempDir(), "no-bpffs")
+	cfg.NeighFlushGuard = true
+	c := New(cfg)
+
+	latches := []string{
+		latchdefs.LatchConntrackPressure,
+		latchdefs.LatchEBPFPressure,
+		latchdefs.LatchNeighborPressure,
+		latchdefs.LatchHostNetworkProblems,
+	}
+	old := fixed.Add(-48 * time.Hour)
+	for _, name := range latches {
+		p := filepath.Join(cfg.WatchdogStateDir, latchdefs.LatchFilePrefix+name)
+		testutil.WriteFile(t, p, "1700000000\n")
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c.Latches().refreshLatches(context.Background())
+
+	for _, name := range latches {
+		p := filepath.Join(cfg.WatchdogStateDir, latchdefs.LatchFilePrefix+name)
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("state-%s vanished during refresh: %v", name, err)
+		}
+		if !fi.ModTime().Equal(fixed) {
+			t.Fatalf("state-%s mtime = %v, want %v", name, fi.ModTime(), fixed)
+		}
+	}
+}

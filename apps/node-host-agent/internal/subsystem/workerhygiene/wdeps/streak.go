@@ -24,7 +24,7 @@ import (
 // Cycles{check,"gated"} counter and the caller must return — the
 // verdict is "skip, not healthy". A false return means run.
 func (d *Deps) Gated(e *CycleEnv, check string) bool {
-	if e.WorkerActive {
+	if e != nil && e.WorkerActive {
 		return false
 	}
 	d.Cycles.WithLabelValues(check, "gated").Inc()

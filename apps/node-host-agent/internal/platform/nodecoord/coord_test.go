@@ -309,3 +309,94 @@ func TestStampNilSeam(t *testing.T) {
 		t.Fatal("expected nil-seam error")
 	}
 }
+
+func TestMaintenanceSingleflightPanicRecovers(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	c := &Coord{
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			calls++
+			if calls == 1 {
+				close(started)
+				<-release
+				panic("boom-fetch")
+			}
+			return map[string]string{nodecond.KuredLockAnno: "ok"}, nil
+		},
+	}
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		defer func() { _ = recover() }()
+		_, _ = c.Maintenance(context.Background())
+	}()
+	<-started
+
+	// Waiter joins the same singleflight.
+	go func() {
+		_, err := c.Maintenance(context.Background())
+		waiterErr <- err
+	}()
+	// Give waiter a moment to block on <-f.done before panicking leader.
+	time.Sleep(15 * time.Millisecond)
+	close(release)
+
+	select {
+	case err := <-waiterErr:
+		if err == nil {
+			t.Fatal("waiter expected error from panicked leader")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter deadlocked after leader panicked")
+	}
+
+	// Subsequent call must start a new flight and succeed (c.flight cleared).
+	v, err := c.Maintenance(context.Background())
+	if err != nil || !v.KuredLocked {
+		t.Fatalf("post-panic Maintenance = (%+v,%v), want KuredLocked=true", v, err)
+	}
+}
+
+func TestMaintenanceSingleflightCaller1CancelDoesNotPoisonWaiter(t *testing.T) {
+	started := make(chan struct{})
+	proceed := make(chan struct{})
+	c := &Coord{
+		GetNode: func(ctx context.Context) (map[string]string, []string, error) {
+			close(started)
+			<-proceed
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			return nil, []string{nodecond.KuredRebootTaintKey}, nil
+		},
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	go func() {
+		_, _ = c.Maintenance(ctx1)
+	}()
+	<-started
+
+	type res struct {
+		v   Verdict
+		err error
+	}
+	ch2 := make(chan res, 1)
+	go func() {
+		v, err := c.Maintenance(context.Background())
+		ch2 <- res{v, err}
+	}()
+	time.Sleep(15 * time.Millisecond)
+	cancel1()
+	close(proceed)
+
+	select {
+	case r := <-ch2:
+		if r.err != nil || !r.v.KuredLocked || !r.v.Active {
+			t.Fatalf("caller 2 = (%+v,%v), want active KuredLocked", r.v, r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller 2 timed out")
+	}
+}

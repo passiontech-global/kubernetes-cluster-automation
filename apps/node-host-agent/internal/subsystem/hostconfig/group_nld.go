@@ -145,6 +145,7 @@ func (c *cyc) allowSources(what string, keys ...string) []string {
 	allow = append(allow, c.registryNodeIPs()...)
 	allow = c.nftAllowFilter(what, allow)
 	slices.Sort(allow)
+	allow = slices.Compact(allow)
 	return allow
 }
 

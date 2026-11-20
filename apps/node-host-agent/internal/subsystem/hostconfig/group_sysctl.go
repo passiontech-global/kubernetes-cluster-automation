@@ -169,7 +169,9 @@ func (c *cyc) t16Pairs() [][2]string {
 				ptyMax = v
 			}
 		}
-		p = append(p, [2]string{"kernel.pty.max", ptyMax})
+		if c.cfgSysctlVal("pty_max", ptyMax) {
+			p = append(p, [2]string{"kernel.pty.max", ptyMax})
+		}
 	}
 	return p
 }

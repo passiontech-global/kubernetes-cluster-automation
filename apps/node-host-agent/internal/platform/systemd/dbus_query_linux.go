@@ -58,8 +58,13 @@ const dbusOpTimeout = 15 * time.Second
 // callers retry once on a fresh conn and the Client layer falls
 // back to the systemctl CLI.
 func isTransportDead(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) ||
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, godbus.ErrClosed) ||
 		errors.Is(err, syscall.EPIPE) ||
 		strings.Contains(err.Error(), "use of closed network connection") ||
 		strings.Contains(err.Error(), "connection reset by peer")
@@ -81,25 +86,37 @@ func opCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 // round trip per property. The returned any is the variant's
 // decoded Go value (string for state words, uint64 for the
 // monotonic timestamp).
-func (b *dbusBackend) unitProp(parentCtx context.Context, unit, prop string) (any, error) {
+func (b *dbusBackend) getProp(parentCtx context.Context, unit, prop string,
+	fetch func(*sdbus.Conn, context.Context, string, string) (*sdbus.Property, error),
+) (any, error) {
 	ctx, cancel := opCtx(parentCtx)
 	conn, err := b.systemConn(ctx)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	p, err := conn.GetUnitPropertyContext(ctx, normalizeUnit(unit), prop)
+	norm := normalizeUnit(unit)
+	p, err := fetch(conn, ctx, norm, prop)
 	cancel()
-	if err != nil && (isTransportDead(err) ||
-		errors.Is(err, context.DeadlineExceeded)) {
-		b.dropConn(conn)
-		retryCtx, retryCancel := opCtx(parentCtx)
-		defer retryCancel()
-		conn, err = b.systemConn(retryCtx)
-		if err != nil {
-			return nil, err
+	if err != nil {
+		if perr := parentCtx.Err(); perr != nil {
+			return nil, perr
 		}
-		p, err = conn.GetUnitPropertyContext(retryCtx, normalizeUnit(unit), prop)
+		if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
+			b.dropConn(conn)
+			retryCtx, retryCancel := opCtx(parentCtx)
+			defer retryCancel()
+			conn, err = b.systemConn(retryCtx)
+			if err != nil {
+				return nil, err
+			}
+			p, err = fetch(conn, retryCtx, norm, prop)
+			if err != nil {
+				if perr := parentCtx.Err(); perr != nil {
+					return nil, perr
+				}
+			}
+		}
 	}
 	if err != nil {
 		if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
@@ -109,6 +126,18 @@ func (b *dbusBackend) unitProp(parentCtx context.Context, unit, prop string) (an
 		return nil, err
 	}
 	return p.Value.Value(), nil
+}
+
+func (b *dbusBackend) unitProp(parentCtx context.Context, unit, prop string) (any, error) {
+	return b.getProp(parentCtx, unit, prop, (*sdbus.Conn).GetUnitPropertyContext)
+}
+
+// serviceProp fetches ONE service property via GetServicePropertyContext
+// (org.freedesktop.DBus.Properties.Get on org.freedesktop.systemd1.Service)
+// for properties such as MainPID that belong on the Service interface rather
+// than Unit.
+func (b *dbusBackend) serviceProp(parentCtx context.Context, unit, prop string) (any, error) {
+	return b.getProp(parentCtx, unit, prop, (*sdbus.Conn).GetServicePropertyContext)
 }
 
 // propString reads a string-typed property value.
@@ -250,7 +279,7 @@ func (b *dbusBackend) dbusActiveEnterUSec(ctx context.Context, unit string) (uin
 // exits 0 with MainPID=0 there), so isNotFound reads as pid 0, not
 // an error.
 func (b *dbusBackend) dbusMainPID(ctx context.Context, unit string) (uint32, error) {
-	v, err := b.unitProp(ctx, unit, "MainPID")
+	v, err := b.serviceProp(ctx, unit, "MainPID")
 	if err != nil {
 		if isNotFoundErr(err) {
 			return 0, nil
@@ -286,16 +315,25 @@ func (b *dbusBackend) dbusListUnitsByPatterns(parentCtx context.Context, pattern
 	}
 	units, err = list(conn, ctx)
 	cancel()
-	if err != nil && (isTransportDead(err) ||
-		errors.Is(err, context.DeadlineExceeded)) {
-		b.dropConn(conn)
-		retryCtx, retryCancel := opCtx(parentCtx)
-		defer retryCancel()
-		conn, err = b.systemConn(retryCtx)
-		if err != nil {
-			return nil, err
+	if err != nil {
+		if perr := parentCtx.Err(); perr != nil {
+			return nil, perr
 		}
-		units, err = list(conn, retryCtx)
+		if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
+			b.dropConn(conn)
+			retryCtx, retryCancel := opCtx(parentCtx)
+			defer retryCancel()
+			conn, err = b.systemConn(retryCtx)
+			if err != nil {
+				return nil, err
+			}
+			units, err = list(conn, retryCtx)
+			if err != nil {
+				if perr := parentCtx.Err(); perr != nil {
+					return nil, perr
+				}
+			}
+		}
 	}
 	if err != nil {
 		if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
@@ -345,12 +383,15 @@ func (b *dbusBackend) dbusEnabled(parentCtx context.Context, unit string) (bool,
 			CallWithContext(ctx, "org.freedesktop.systemd1.Manager.GetUnitFileState", 0, unit)
 		err = call.Store(&state)
 		cancel()
-		if err != nil && attempt == 0 && (isTransportDead(err) ||
-			errors.Is(err, context.DeadlineExceeded)) {
-			b.dropConn(conn)
-			continue
-		}
 		if err != nil {
+			if perr := parentCtx.Err(); perr != nil {
+				return false, perr
+			}
+			if attempt == 0 && (isTransportDead(err) ||
+				errors.Is(err, context.DeadlineExceeded)) {
+				b.dropConn(conn)
+				continue
+			}
 			var derr godbus.Error
 			if errors.As(err, &derr) && strings.HasPrefix(derr.Name, "org.freedesktop.systemd1.") {
 				return false, fmt.Errorf("systemctl is-enabled %s: %w", unit, err)
@@ -395,12 +436,15 @@ func (b *dbusBackend) dbusSystemState(parentCtx context.Context) (string, error)
 				"org.freedesktop.systemd1.Manager", "SystemState")
 		err = call.Store(&v)
 		cancel()
-		if err != nil && attempt == 0 && (isTransportDead(err) ||
-			errors.Is(err, context.DeadlineExceeded)) {
-			b.dropConn(conn)
-			continue
-		}
 		if err != nil {
+			if perr := parentCtx.Err(); perr != nil {
+				return "", perr
+			}
+			if attempt == 0 && (isTransportDead(err) ||
+				errors.Is(err, context.DeadlineExceeded)) {
+				b.dropConn(conn)
+				continue
+			}
 			if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
 				return "", fmt.Errorf("%w: dbus Get SystemState: %v",
 					errDBusUnavailable, err)

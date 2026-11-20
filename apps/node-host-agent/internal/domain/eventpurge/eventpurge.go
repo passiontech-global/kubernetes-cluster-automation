@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"fmt"
 	"io"
@@ -229,10 +230,13 @@ func Run(ctx context.Context, cfg Config, cutoff time.Time, out io.Writer) error
 // status 0 when the request never reached a response (dial/ctx
 // error). The header rides along so the DELETE retry policy can
 // honor a server-sent Retry-After.
-func doReq(ctx context.Context, client *http.Client, method, u string) (int, http.Header, []byte, error) {
+func doReq(ctx context.Context, client *http.Client, method, u, accept string) (int, http.Header, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
 		return 0, nil, nil, err
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -260,13 +264,15 @@ func doReq(ctx context.Context, client *http.Client, method, u string) (int, htt
 // under the 8 MiB cap. A freshly missed event simply survives to
 // the next run) and returns the delete path of every item older
 // than cutoff.
+const eventListAccept = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+
 func listStale(ctx context.Context, client *http.Client,
 	base string, cutoff time.Time) ([]string, error) {
 	var paths []string
 	cont := ""
 	for {
 		code, _, body, err := doReq(ctx, client, http.MethodGet,
-			base+"/api/v1/events?limit=500"+cont)
+			base+"/api/v1/events?limit=500"+cont, eventListAccept)
 		if err != nil {
 			return nil, fmt.Errorf("list events: %w", err)
 		}
@@ -275,7 +281,9 @@ func listStale(ctx context.Context, client *http.Client,
 				truncate(string(body), 200))
 		}
 		var d eventList
-		if err := json.Unmarshal(body, &d); err != nil {
+		if err := json.Unmarshal(body, &d,
+			jsontext.AllowInvalidUTF8(true),
+			jsontext.AllowDuplicateNames(true)); err != nil {
 			return nil, fmt.Errorf("list events: %w", err)
 		}
 		for _, it := range d.Items {
@@ -324,7 +332,7 @@ const (
 // summary line.
 func deleteOne(ctx context.Context, client *http.Client, base, p string) (ok bool, detail string) {
 	for attempt := 0; ; attempt++ {
-		code, hdr, _, err := doReq(ctx, client, http.MethodDelete, base+p)
+		code, hdr, _, err := doReq(ctx, client, http.MethodDelete, base+p, "")
 		if err != nil {
 			// Transport-level (dial, TLS, client timeout, dead ctx):
 			// retrying into a dying run would only burn the budget.

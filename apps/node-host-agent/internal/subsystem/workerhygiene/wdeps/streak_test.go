@@ -32,8 +32,11 @@ func TestGated(t *testing.T) {
 	if !e.D.Gated(down, wdeps.CheckTeardown) {
 		t.Fatal("second down cycle must gate again")
 	}
-	if got := promtestutil.ToFloat64(e.D.Cycles.WithLabelValues(wdeps.CheckTeardown, "gated")); got != 2 {
-		t.Fatalf("gated counter=%d want 2", int(got))
+	if !e.D.Gated(nil, wdeps.CheckTeardown) {
+		t.Fatal("nil CycleEnv must gate safely without panicking")
+	}
+	if got := promtestutil.ToFloat64(e.D.Cycles.WithLabelValues(wdeps.CheckTeardown, "gated")); got != 3 {
+		t.Fatalf("gated counter=%d want 3", int(got))
 	}
 	// The counter is per check — another check's verdicts stay put.
 	if got := promtestutil.ToFloat64(e.D.Cycles.WithLabelValues(wdeps.CheckDNS, "gated")); got != 0 {

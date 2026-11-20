@@ -53,6 +53,19 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nodereporter/npd"
 )
 
+// stateStore captures the hoststate.Store surface Reporter uses —
+// implemented by *hoststate.Store in production and stubbed in unit
+// tests to exercise RAM-only latches (ENOSPC/EROFS ramEpochs).
+type stateStore interface {
+	Path(name string) string
+	Exists(name string) bool
+	Epoch(path string) int64
+	Enter(name, extra string)
+	InitHeartbeatFiles() error
+}
+
+var _ stateStore = (*hoststate.Store)(nil)
+
 // Reporter implements agent.Subsystem.
 type Reporter struct {
 	cfg Config
@@ -63,7 +76,7 @@ type Reporter struct {
 	// tails WatchdogLogFile for events) so LogFile stays "". Now is
 	// r.cfg.Clock.Now — the method value binds the shared timex.Cell,
 	// so a post-New Clock.Set lands here.
-	state *hoststate.Store
+	state stateStore
 
 	// NPD-compatible metric names — PrometheusRules query these exact
 	// series (problem_gauge{type=...} == 1, increase(problem_counter{reason=...})).
@@ -189,7 +202,9 @@ func (s npdSink) BumpCounter(reason string) {
 // carries an empty LogFile, so the STATE-ENTER never circles back
 // into the filelog rules this same reporter tails.
 func (s npdSink) EnterLatch(name, evidence string) {
-	s.r.state.Enter(name, evidence)
+	if s.r.state != nil {
+		s.r.state.Enter(name, evidence)
+	}
 }
 
 // Run syncs immediately, then every Interval until ctx is cancelled.
@@ -253,7 +268,9 @@ func (r *Reporter) Cycle(ctx context.Context) {
 		// baseline epoch used when last-run doesn't exist yet);
 		// `last-run` is likewise created only when absent, atomically
 		// via tmp+rename so a reader never observes a truncated epoch.
-		if err := r.state.InitHeartbeatFiles(); err != nil {
+		if r.state == nil {
+			r.heartbeatInit = true
+		} else if err := r.state.InitHeartbeatFiles(); err != nil {
 			logger().Error("nodereporter: watchdog heartbeat init failed",
 				"node", r.cfg.NodeName, "dir", r.cfg.WatchdogStateDir, "error", err)
 			ok = false

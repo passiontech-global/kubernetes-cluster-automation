@@ -360,12 +360,22 @@ func (c *PSIThrashCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
 		return
 	}
-	victim, mem := highestRSSPod(c.d, e.Pods, e.PidsOnce())
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		c.d.CycleResult(wdeps.CheckPSIThrash, "inconclusive")
+		return
+	}
+	victim, mem := highestRSSPod(c.d, e.Pods, pids)
 	if victim == nil {
 		// No eligible victim above the memory floor — latch only;
 		// the kernel OOM verdict then stands (nothing ours worth
 		// giving it).
 		c.d.CycleResult(wdeps.CheckPSIThrash, "ok")
+		return
+	}
+	if c.d.Cfg.Client == nil {
+		c.d.State.AppendLog("suspect: psi-memory-thrash pod evict skipped — kubernetes client nil")
+		c.d.CycleResult(wdeps.CheckPSIThrash, "abort")
 		return
 	}
 	// L1↔L3 hold: check maintenance BEFORE spending the cooldown

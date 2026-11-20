@@ -80,6 +80,12 @@ func (c *ScopesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
 		return
 	}
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"cleanup: systemd-scopes reset-failed held (count=%d) — cluster maintenance in progress", n))
+		c.d.CycleResult(wdeps.CheckSysScopes, "ok")
+		return
+	}
 	// NPD contract line (reset-failed evidence in the watchdog log).
 	c.d.State.AppendLog(fmt.Sprintf("ACTION: systemd-scopes reset-failed count=%d", n))
 	// The old `reset-failed cri-containerd-*.scope` glob reset every
@@ -190,6 +196,10 @@ func (c *ScopesCheck) reapDeactivating(ctx context.Context,
 		if !c.prevDeact[unit] || containerIDLive(scopeContainerID(unit), live) {
 			continue
 		}
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog("cleanup: systemd-scopes deactivating reap held — cluster maintenance in progress")
+			return
+		}
 		if err := c.d.Cfg.Systemd.Signal(ctx, unit, "SIGKILL"); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: systemd-scopes deactivating kill %s failed: %v",
@@ -246,6 +256,10 @@ func (c *ScopesCheck) checkAbandoned(ctx context.Context,
 		}
 		if containerIDLive(scopeContainerID(unit), live) {
 			continue // still owned by a Running pod — diagnose only
+		}
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog("cleanup: systemd-scopes abandoned reap held — cluster maintenance in progress")
+			return
 		}
 		if err := c.d.Cfg.Systemd.Stop(ctx, unit); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(

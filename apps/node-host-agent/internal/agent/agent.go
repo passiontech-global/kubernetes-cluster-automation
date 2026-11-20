@@ -63,7 +63,7 @@ type Config struct {
 type Agent struct {
 	cfg     Config
 	reg     *prometheus.Registry
-	started atomic.Int64 // unixnano — read by the scrape-time GaugeFunc
+	started atomic.Pointer[time.Time] // monotonic start time — read by scrape-time GaugeFunc
 	ready   atomic.Bool
 	// maxBackoffSubs counts subsystems pinned at the supervisor's
 	// 5m restart-backoff cap (selfheal-alert-coverage) — supervisor.go maintains it.
@@ -142,8 +142,8 @@ func New(cfg Config) *Agent {
 		Name: "node_host_agent_uptime_seconds",
 		Help: "Seconds since the agent started.",
 	}, func() float64 {
-		if t := a.started.Load(); t > 0 {
-			return time.Since(time.Unix(0, t)).Seconds()
+		if t := a.started.Load(); t != nil && !t.IsZero() {
+			return time.Since(*t).Seconds()
 		}
 		return 0
 	}))

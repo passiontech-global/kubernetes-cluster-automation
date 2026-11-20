@@ -66,6 +66,26 @@ func (r *Runner) ensureStateLatch(path, name, evidence string) {
 		strings.TrimPrefix(name, latchdefs.LatchFilePrefix), evidence))
 }
 
+// touchHeldLatch refreshes an existing latch's mtime (if aged past
+// LatchTouchMinInterval) so janitor's 24h reap cannot retire an
+// active episode during hysteresis/clean-hold ticks. Never creates a
+// latch when absent.
+func (r *Runner) touchHeldLatch(name string) {
+	var p string
+	if r.deps.Store != nil {
+		p = r.deps.Store.Path(name)
+	} else {
+		p = r.statePath(latchdefs.LatchFilePrefix + name)
+	}
+	if fi, err := os.Stat(p); err == nil {
+		if cerr := fsx.TouchIfDue(p, fi, r.deps.Clock.Now(),
+			latchdefs.LatchTouchMinInterval); cerr != nil {
+			logger().Debug("hostmetrics: latch touch failed",
+				"path", p, "error", cerr)
+		}
+	}
+}
+
 // --- small shared helpers (uniquely named per file rules) ---
 //
 // The last-* rate budgets (conntrackBumpBudgetFile,

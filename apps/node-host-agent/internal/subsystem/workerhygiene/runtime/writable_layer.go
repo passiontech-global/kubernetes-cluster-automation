@@ -28,20 +28,24 @@ func (c *WritableLayerCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckWritableLayer) {
 		return
 	}
-	c.writableLayerScan(ctx, e)
+	if !c.writableLayerScan(ctx, e) {
+		c.d.CycleResult(wdeps.CheckWritableLayer, "abort")
+		return
+	}
 	c.d.CycleResult(wdeps.CheckWritableLayer, "ok")
 }
 
-func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.CycleEnv) {
-	if !e.APIOK || c.d.Cfg.Client == nil {
-		return // pod attribution needs the apiserver
+func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.CycleEnv) bool {
+	if e == nil || !e.APIOK || c.d.Cfg.Client == nil {
+		return false // pod attribution needs the apiserver
 	}
-	if !c.d.State.RateTrySpend("last-wlayer-scan",
+	if !c.d.State.RateOK("last-wlayer-scan",
 		c.d.Cfg.Disk.BloatScanInterval) {
-		return
+		return true
 	}
 	threshold := c.d.Cfg.Disk.WLayerBloatThresholdBytes
 	podByUID := e.PodByUID()
+	scanErr := false
 	// (a) overlayfs snapshot upperdirs — snapshot dir names are
 	// numeric on containerd; snapshotMountIDs binds each to its
 	// task id through the live rootfs mount's upperdir=, and
@@ -61,21 +65,27 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 	// emptyDir trees are pod-scoped and small.
 	snapRoot := c.d.Cfg.Disk.WLayerSnapshotsDir
 	if c.d.DiskUsageAboveWatermark(snapRoot) {
-		mountIDs := snapshotMountIDs(c.d)
-		for _, snap := range readDirNames(snapRoot) {
-			fsDir := filepath.Join(snap, "fs")
-			size, _ := c.d.WalkBudgeted(e, fsDir)
-			if size <= threshold {
-				continue
+		snaps, sErr := readDirNamesChecked(snapRoot)
+		if sErr {
+			scanErr = true
+		}
+		if len(snaps) > 0 {
+			mountIDs := snapshotMountIDs(c.d, e)
+			for _, snap := range snaps {
+				fsDir := filepath.Join(snap, "fs")
+				size, _ := c.d.WalkBudgeted(e, fsDir)
+				if size <= threshold {
+					continue
+				}
+				var pod *corev1.Pod
+				if uid := snapshotPodUID(c.d, filepath.Base(snap), mountIDs); uid != "" {
+					pod = podByUID[uid]
+				}
+				if podDeclaresEphemeralStorage(pod) {
+					continue
+				}
+				c.emitWLayerBloatEvent(ctx, pod, fsDir, size)
 			}
-			var pod *corev1.Pod
-			if uid := snapshotPodUID(c.d, filepath.Base(snap), mountIDs); uid != "" {
-				pod = podByUID[uid]
-			}
-			if podDeclaresEphemeralStorage(pod) {
-				continue
-			}
-			c.emitWLayerBloatEvent(ctx, pod, fsDir, size)
 		}
 	}
 	// (b) kubelet pod emptyDir volumes of pods without the limit —
@@ -85,13 +95,21 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 	// medium=Memory emptyDir is tmpfs-backed — it fills RAM, never
 	// the data disk (scanBloat's emptyDir walk applies the same
 	// statfs gate).
-	for _, uidDir := range readDirNames(c.d.Cfg.PodsDir) {
+	uidDirs, uErr := readDirNamesChecked(c.d.Cfg.PodsDir)
+	if uErr {
+		scanErr = true
+	}
+	for _, uidDir := range uidDirs {
 		pod := podByUID[filepath.Base(uidDir)]
 		if podDeclaresEphemeralStorage(pod) {
 			continue
 		}
-		for _, vol := range readDirNames(filepath.Join(
-			uidDir, "volumes", "kubernetes.io~empty-dir")) {
+		vols, vErr := readDirNamesChecked(filepath.Join(
+			uidDir, "volumes", "kubernetes.io~empty-dir"))
+		if vErr {
+			scanErr = true
+		}
+		for _, vol := range vols {
 			var vst unix.Statfs_t
 			if err := c.d.Cfg.Seams.Host.StatfsFn(vol, &vst); err == nil &&
 				vst.Type == int64(unix.TMPFS_MAGIC) {
@@ -104,6 +122,11 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 			c.emitWLayerBloatEvent(ctx, pod, vol, size)
 		}
 	}
+	if scanErr {
+		return false
+	}
+	c.d.State.RateSpend("last-wlayer-scan")
+	return true
 }
 
 // emitWLayerBloatEvent raises the ContainerWritableLayerBloat

@@ -172,12 +172,9 @@ func (m *Maint) Cycle(ctx context.Context) *Result {
 // failing on a missing epoch file reads as "never ran", so a fresh
 // install always runs the heavy block.
 func (m *Maint) maintEpochFresh() bool {
-	epoch, err := kdeps.ReadIntFile(
-		filepath.Join(m.d.Cfg.GuardStateDir, lastMaintFile))
-	if err != nil {
-		return false
-	}
-	return m.d.Cfg.Clock.Now().Sub(time.Unix(epoch, 0)) < maintEpochWindow
+	return kdeps.CooldownActive(
+		filepath.Join(m.d.Cfg.GuardStateDir, lastMaintFile),
+		m.d.Cfg.Clock.Now(), maintEpochWindow, m.d.Cfg.ReadOnly)
 }
 
 // stampMaintEpoch records the heavy block's completion under
@@ -199,7 +196,7 @@ func (m *Maint) stampMaintEpoch() {
 // effort — a failed reap only notes.
 func (m *Maint) reapOrphanedMaint(ctx context.Context, pg, user, pass string,
 	note func(string)) {
-	n, err := m.d.ReapOrphanedMaintSessions(ctx, pg, user, pass, kdeps.AppNameMaint, "pg_repack", "pg_dump")
+	n, err := m.d.ReapOrphanedMaintSessions(ctx, pg, user, pass, kdeps.AppNameMaint, "pg_repack")
 	switch {
 	case err != nil:
 		note(fmt.Sprintf("orphan-reap-fail: %v", err))

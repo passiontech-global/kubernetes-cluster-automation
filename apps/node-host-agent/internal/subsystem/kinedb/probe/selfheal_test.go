@@ -271,7 +271,9 @@ func TestPGBStarveHalfOpenSvActive(t *testing.T) {
 // be terminated, or the bloat remediation reaps itself.
 func TestStuckSessionPredicateExemptions(t *testing.T) {
 	for _, want := range []string{
+		"OR application_name LIKE 'nha_%-hold-%'",
 		"application_name NOT IN ('pg_repack', 'pg_dump', 'nha_probe', 'nha_compact', 'nha_maint')",
+		"AND application_name NOT LIKE 'nha_%-hold-%'",
 		"query NOT ILIKE '%VACUUM%'",
 		"query NOT ILIKE '%REINDEX%'",
 		"query NOT ILIKE '%pg_repack%'",
@@ -283,6 +285,10 @@ func TestStuckSessionPredicateExemptions(t *testing.T) {
 			t.Fatalf("stuckSessionPredicate missing %q:\n%s", want,
 				stuckSessionPredicate)
 		}
+	}
+	if strings.Contains(stuckSessionPredicate, "pg_sleep") {
+		t.Fatalf("stuckSessionPredicate must not globally exempt pg_sleep:\n%s",
+			stuckSessionPredicate)
 	}
 }
 

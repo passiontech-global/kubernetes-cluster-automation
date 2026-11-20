@@ -290,3 +290,27 @@ func TestCachedProcs(t *testing.T) {
 		t.Fatalf("cachedProcs after getProcs = (%d, %v), want (1, true)", len(cached), ok)
 	}
 }
+
+func TestWalkSystemdScopesSkipsScopeInternals(t *testing.T) {
+	cfg, _ := fixture(t)
+	slice := filepath.Join(cfg.CgroupRoot, "kubepods.slice")
+	// Scope A with a nested decoy .scope dir (must be skipped via fs.SkipDir)
+	// and a sibling scope B in the same pod slice + scope C in another slice.
+	scopeA := filepath.Join(slice, "kubepods-burstable.slice", "pod1.slice", "cri-containerd-a.scope")
+	nestedDecoy := filepath.Join(scopeA, "sub", "cri-containerd-nested.scope")
+	scopeB := filepath.Join(slice, "kubepods-burstable.slice", "pod1.slice", "cri-containerd-b.scope")
+	scopeC := filepath.Join(slice, "kubepods-besteffort.slice", "cri-containerd-c.scope")
+	for _, d := range []string{nestedDecoy, scopeB, scopeC} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	testutil.WriteFile(t, filepath.Join(scopeA, "memory.current"), "1234\n")
+
+	c := New(cfg)
+	v, ok := metricValue(t, c, "node_host_agent_systemd_scopes_count",
+		map[string]string{"node": "node-a"})
+	if !ok || v != 3 {
+		t.Fatalf("systemd_scopes_count=%v ok=%v want 3 (decoy inside scopeA skipped; siblings counted)", v, ok)
+	}
+}

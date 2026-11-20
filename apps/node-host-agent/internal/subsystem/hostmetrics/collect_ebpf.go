@@ -6,8 +6,6 @@
 package hostmetrics
 
 import (
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,47 +29,26 @@ var (
 		[]string{"node"}, nil)
 )
 
-// scanBPFIDLines harvests prog_id:/map_id: lines from one fdinfo
-// blob into the dedup sets — a link fd can list several prog_ids.
-func scanBPFIDLines(data []byte, progs, maps map[uint64]bool) {
-	for line := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) != 2 {
-			continue
-		}
-		id, err := strconv.ParseUint(f[1], 10, 64)
-		if err != nil {
-			continue
-		}
-		switch strings.TrimSuffix(f[0], ":") {
-		case "prog_id":
-			progs[id] = true
-		case "map_id":
-			maps[id] = true
-		}
-	}
-}
-
-// ebpfFDTarget is the /proc/<pid>/fd/<fd> symlink-target prefix the
-// kernel gives a bpf object fd (anon_inode:bpf-prog / bpf-map /
-// bpf-link) — the cheap pre-filter that keeps the sweep from
-// opening every fdinfo file on the host (inotify sweep parity).
-const ebpfFDTarget = "anon_inode:bpf-"
-
-// ebpfSnapshotAt returns the eBPF half of the shared fd-link sweep
-// (collect_fdlinks.go), re-walking at most once per
+// ebpfSnapshotAt returns the eBPF half of the shared procfs.FDCache
+// snapshot plus the cached bpffs pin count, re-walking at most once per
 // EBPFScanInterval. Unresolved pins fold into the maps count — the
 // leak-audit headline (a cilium map-pin leak grows that series even
-// when bpffs refuses the opens an id harvest would need). scanned
-// mirrors the old sweep's verdict: the proc root OR the bpffs dir
-// listed. at is the cache stamp: a latch ticker running faster than
-// the sweep must not count the same snapshot as fresh evidence N
-// times (Wave-5 P0 — a 30s ticker re-reading a 60s cache latched
-// after 3 ticks instead of 3 real scans).
+// when bpffs refuses the opens an id harvest would need). A missing or
+// partial proc walk (!snap.ProcOK || snap.Partial) returns scanned=false
+// even when bpffsOK is true so neither collectEBPF emits bogus zero
+// gauges nor kernelfail/updateEBPFPressure falsely resets ebpfStreak or
+// clears LatchEBPFPressure. at is snap.At (the proc snapshot's stamp):
+// a latch ticker running faster than the sweep must not count the same
+// snapshot as fresh evidence N times (Wave-5 P0 — a 30s ticker
+// re-reading a 60s cache latched after 3 ticks instead of 3 real scans).
 func (c *Collector) ebpfSnapshotAt() (progs, maps int, scanned bool, at time.Time) {
-	res := c.fdLinkSnapshot(c.cfg.EBPFScanInterval)
-	return len(res.progs), len(res.maps) + res.pins,
-		res.procOK || res.bpffsOK, res.at
+	snap := c.fdCache().Snapshot(c.cfg.EBPFScanInterval)
+	if snap == nil || !snap.ProcOK || snap.Partial {
+		return 0, 0, false, time.Time{}
+	}
+	pins, _ := c.bpffsPins(c.cfg.EBPFScanInterval)
+	return len(snap.BPFProgs), len(snap.BPFMaps) + pins,
+		true, snap.At
 }
 
 // ebpfSnapshot is the metric-side wrapper — the collector emits every

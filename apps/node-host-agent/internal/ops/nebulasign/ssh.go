@@ -41,6 +41,11 @@ import (
 // `cat /etc/nebula/<net>/host.pub` command — vars are operator input.
 var nebulaNetRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+type hostPortAddr string
+
+func (a hostPortAddr) Network() string { return "tcp" }
+func (a hostPortAddr) String() string  { return string(a) }
+
 // knownHostsVerify resolves the operator known_hosts file next to the
 // SSH client key — the documented trust source for converge-family
 // SSH traffic (ENV: NODE_HOST_AGENT_CONVERGE_SSH_KEY sits in a dir
@@ -75,10 +80,13 @@ func knownHostsVerify(keyPath string, insecure bool) (func(hostname string, key 
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", p, err)
 	}
-	// knownhosts matches entries port-exactly in host:port form (port 22).
+	// knownhosts matches entries port-exactly in host:port form.
 	return func(hostname string, key ssh.PublicKey) error {
-		return cb(net.JoinHostPort(hostname, "22"),
-			&net.TCPAddr{Port: 22}, key)
+		addr := hostname
+		if _, _, err := net.SplitHostPort(hostname); err != nil {
+			addr = net.JoinHostPort(hostname, "22")
+		}
+		return cb(addr, hostPortAddr(addr), key)
 	}, nil
 }
 

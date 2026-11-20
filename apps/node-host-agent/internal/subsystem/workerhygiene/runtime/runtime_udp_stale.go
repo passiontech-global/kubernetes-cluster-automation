@@ -113,11 +113,11 @@ type udpCandidate struct {
 // the once-per-cycle containerd task map — i.e. only K8s pod netns.
 // The old code used every host PID (or PidsOnce), which swept host and
 // Concourse container netns and could destroy unrelated sockets.
-func (c *UDPStaleCheck) pausePIDs(e *wdeps.CycleEnv) []int {
-	if e == nil || e.TasksOnce == nil {
-		return nil
+func (c *UDPStaleCheck) pausePIDs(e *wdeps.CycleEnv) ([]int, bool) {
+	tasks, complete := c.d.CycleTasks(e)
+	if !complete {
+		return nil, false
 	}
-	tasks, _ := e.TasksOnce()
 	seen := map[int]bool{}
 	var pids []int
 	for _, ts := range tasks {
@@ -132,28 +132,35 @@ func (c *UDPStaleCheck) pausePIDs(e *wdeps.CycleEnv) []int {
 			pids = append(pids, t.PID)
 		}
 	}
-	return pids
+	return pids, true
 }
 
-func (c *UDPStaleCheck) podNetnsReps(pids []int) []udpNetnsRep {
+func (c *UDPStaleCheck) podNetnsReps(pids []int) ([]udpNetnsRep, bool) {
 	hostLink, _ := os.Readlink(c.d.Proc.File(1, "ns", "net"))
 	seen := map[string]bool{}
 	if hostLink != "" {
 		seen[hostLink] = true
 	}
 	var reps []udpNetnsRep
+	readErr := false
 	for _, pid := range pids {
 		if pid == 1 {
 			continue
 		}
 		link, err := os.Readlink(c.d.Proc.File(pid, "ns", "net"))
-		if err != nil || seen[link] {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				readErr = true
+			}
+			continue
+		}
+		if seen[link] {
 			continue
 		}
 		seen[link] = true
 		reps = append(reps, udpNetnsRep{pid: pid, link: link})
 	}
-	return reps
+	return reps, readErr
 }
 
 // resolvePodCIDRs merges every Node's PodCIDR/PodCIDRs (one cached
@@ -280,7 +287,11 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 
 	// Only K8s pause PIDs — never the host or a Concourse container.
-	pids := c.pausePIDs(e)
+	pids, complete := c.pausePIDs(e)
+	if !complete {
+		c.d.CycleResult(wdeps.CheckUDPStale, "abort")
+		return
+	}
 	if len(pids) == 0 {
 		c.streaks.Prune(func(string) bool { return false })
 		c.d.CycleResult(wdeps.CheckUDPStale, "ok")
@@ -312,9 +323,11 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 
 	var rawCandidates []udpCandidate
-	for _, rep := range c.podNetnsReps(pids) {
+	reps, dumpErr := c.podNetnsReps(pids)
+	for _, rep := range reps {
 		socks, err := c.d.Cfg.Seams.Host.DumpConnectedUDPFn(rep.pid)
 		if err != nil {
+			dumpErr = true
 			continue
 		}
 		for _, s := range socks {
@@ -333,6 +346,10 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	if len(rawCandidates) == 0 {
+		if dumpErr {
+			c.d.CycleResult(wdeps.CheckUDPStale, "abort")
+			return
+		}
 		c.streaks.Prune(func(string) bool { return false })
 		c.d.CycleResult(wdeps.CheckUDPStale, "ok")
 		return
@@ -347,6 +364,10 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 
 	if len(candidates) == 0 {
+		if dumpErr {
+			c.d.CycleResult(wdeps.CheckUDPStale, "abort")
+			return
+		}
 		c.streaks.Prune(func(string) bool { return false })
 		c.d.CycleResult(wdeps.CheckUDPStale, "ok")
 		return
@@ -385,14 +406,24 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// the ledger but no longer live — that is a dead Service backend,
 	// not a direct Pod-to-Pod flow reusing the port.
 	udpPorts := make(map[uint16]map[string]bool)
-	// liveByAddr distinguishes a genuinely serving endpoint from one
-	// that merely still appears in a slice while Terminating /
-	// Serving=false. The latter must stay in the ever-seen ledger but
-	// must NOT count as live, or a stale socket is held hostage for the
-	// whole grace window.
-	liveByAddr := map[string]bool{}
+	sliceEndpoints := map[string]bool{}
 	for i := range sliceList.Items {
 		sl := &sliceList.Items[i]
+		hasUDPPort := false
+		for _, p := range sl.Ports {
+			if p.Port != nil && *p.Port > 0 && *p.Port <= 65535 &&
+				p.Protocol != nil && *p.Protocol == corev1.ProtocolUDP {
+				hasUDPPort = true
+				break
+			}
+		}
+		if !hasUDPPort {
+			continue
+		}
+		// liveByAddr distinguishes a genuinely serving endpoint from one
+		// that merely still appears in a slice while Terminating /
+		// Serving=false, scoped strictly to this slice.
+		liveByAddr := map[string]bool{}
 		for _, ep := range sl.Endpoints {
 			serving := ep.Conditions.Serving != nil && *ep.Conditions.Serving
 			if ep.Conditions.Serving == nil &&
@@ -424,7 +455,9 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				udpPorts[port] = active
 			}
 			for s, serving := range liveByAddr {
-				c.everSeenUDP.Add(ipPort{ip: s, port: port}.key())
+				epKey := ipPort{ip: s, port: port}.key()
+				c.everSeenUDP.Add(epKey)
+				sliceEndpoints[epKey] = true
 				if serving {
 					active[s] = true // liveUDPSet — only serving endpoints
 				}
@@ -435,7 +468,9 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// blackhole to it could not be recognised (P0 F.1.2).
 			if !c.everSeenSeeded {
 				for ip := range localPodIPs {
-					c.everSeenUDP.Add(ipPort{ip: ip, port: port}.key())
+					epKey := ipPort{ip: ip, port: port}.key()
+					c.everSeenUDP.Add(epKey)
+					sliceEndpoints[epKey] = true
 				}
 			}
 		}
@@ -463,11 +498,16 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 
 	seenKeys := make(map[string]bool, len(candidates))
+	candKeys := make(map[string]bool, len(candidates))
 	var confirmed []udpCandidate
 	for _, cand := range candidates {
 		active, managed := udpPorts[cand.sock.DstPort]
+		epKey := ipPort{ip: cand.dstIPStr, port: cand.sock.DstPort}.key()
+		if managed && c.everSeenUDP.Has(epKey) {
+			candKeys[epKey] = true
+		}
 		if !managed || active[cand.dstIPStr] ||
-			!c.everSeenUDP.Has(ipPort{ip: cand.dstIPStr, port: cand.sock.DstPort}.key()) {
+			!c.everSeenUDP.Has(epKey) {
 			// Unmanaged port (a nil protocol is Kubernetes' TCP
 			// default, never UDP), a still-live endpoint, or an
 			// IP:port that was never a Service endpoint (direct
@@ -487,7 +527,12 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			confirmed = append(confirmed, cand)
 		}
 	}
-	c.streaks.Prune(func(k string) bool { return seenKeys[k] })
+	if !dumpErr {
+		c.streaks.Prune(func(k string) bool { return seenKeys[k] })
+		c.everSeenUDP.Prune(func(k string) bool {
+			return sliceEndpoints[k] || candKeys[k]
+		})
+	}
 
 	if len(confirmed) > 0 && c.d.Cfg.Wave3.UDPStaleDestroyEnabled {
 		if c.d.HoldLocalAction(ctx) {

@@ -70,10 +70,29 @@ func roleProfileFor(cfg Config, t Target) roleProfile {
 	return p
 }
 
+// hostPreparer is an optional fast path implemented by sshConn: one
+// SSH session creates and chmods all required remote directories.
+type hostPreparer interface {
+	PrepareHost(ctx context.Context, dirs []remoteDir) error
+}
+
 // prepareHost runs the converge preamble every target needs: the
 // passwordless-sudo gate, the shared vars dir, then the role's extra
 // dirs in profile order.
 func prepareHost(ctx context.Context, c Conn, cfg Config, t Target, p roleProfile) error {
+	if hp, ok := c.(hostPreparer); ok {
+		dirs := make([]remoteDir, 0, 1+len(p.dirs))
+		dirs = append(dirs, remoteDir{path: cfg.RemoteVarsDir})
+		dirs = append(dirs, p.dirs...)
+		if err := hp.PrepareHost(ctx, dirs); err != nil {
+			if needsSudo(t.SSHUser) && strings.Contains(err.Error(), "sudo:") {
+				return fmt.Errorf("ssh user %q: sudo -n (passwordless sudo) required "+
+					"but unavailable: %w", t.SSHUser, err)
+			}
+			return err
+		}
+		return nil
+	}
 	// Passwordless-sudo gate first: hub_converge ran become:true, so
 	// a non-root ssh_user needs `sudo -n` for EVERY remote op (the
 	// conn wraps them) — fail fast with a clear error instead of a

@@ -4,11 +4,16 @@ package cycle
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestBeatStaleAfter(t *testing.T) {
+	var nilBeat *Beat
+	if got := nilBeat.StaleAfter(); got != 0 {
+		t.Fatalf("nil Beat.StaleAfter() = %v, want 0", got)
+	}
 	var b Beat
 	if got := b.StaleAfter(); got != 0 {
 		t.Fatalf("unset StaleAfter() = %v, want 0", got)
@@ -164,4 +169,133 @@ func TestEveryExemptAndRunWithHeartbeat(t *testing.T) {
 	if !l.IsExempt() {
 		t.Fatal("EveryExempt.Run did not exempt ctx liveness")
 	}
+}
+
+func TestBeatStampRetainsMonotonicClock(t *testing.T) {
+	var b Beat
+	if !b.LastBeat().IsZero() {
+		t.Fatalf("zero Beat.LastBeat() = %v, want zero", b.LastBeat())
+	}
+	b.Stamp()
+	got := b.LastBeat()
+	if got.IsZero() {
+		t.Fatal("Beat.LastBeat() after Stamp() is zero")
+	}
+	if !strings.Contains(got.String(), " m=") {
+		t.Fatalf("Beat.LastBeat() = %q lost monotonic clock reading", got.String())
+	}
+	fixed := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	b.StampAt(fixed)
+	if !b.LastBeat().Equal(fixed) {
+		t.Fatalf("Beat.LastBeat() = %v, want %v", b.LastBeat(), fixed)
+	}
+	// Nil safety.
+	var nilBeat *Beat
+	nilBeat.Stamp()
+	if !nilBeat.LastBeat().IsZero() {
+		t.Fatal("nil Beat.LastBeat() must be zero")
+	}
+}
+
+func TestRunnerAttachesBeatForHeartbeatAndRunWithHeartbeat(t *testing.T) {
+	l := NewLiveness()
+	ctx, cancel := context.WithCancel(WithLiveness(context.Background(), l))
+	defer cancel()
+
+	var initialBeat, afterHeartbeat, afterRunWithHB time.Time
+	r := Every("long-op", time.Hour, func(c context.Context) {
+		beats := l.LoopBeats()
+		if len(beats) != 1 {
+			t.Fatalf("LoopBeats() len = %d, want 1", len(beats))
+		}
+		// Force beat to an old time to observe Heartbeat and RunWithHeartbeat advancing it.
+		old := time.Now().Add(-time.Hour)
+		beats[0].StampAt(old)
+		initialBeat = beats[0].LastBeat()
+
+		Heartbeat(c)
+		afterHeartbeat = beats[0].LastBeat()
+
+		beats[0].StampAt(old)
+		RunWithHeartbeat(c, 5*time.Millisecond, func(context.Context) {
+			deadline := time.Now().Add(time.Second)
+			for !beats[0].LastBeat().After(old) {
+				if time.Now().After(deadline) {
+					t.Fatal("RunWithHeartbeat did not advance Runner loop beat")
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+			afterRunWithHB = beats[0].LastBeat()
+		})
+		cancel()
+	})
+	r.Run(ctx)
+
+	if !afterHeartbeat.After(initialBeat) {
+		t.Fatalf("Heartbeat(ctx) inside Runner.Run did not update loop beat: initial=%v after=%v", initialBeat, afterHeartbeat)
+	}
+	if afterRunWithHB.IsZero() {
+		t.Fatal("RunWithHeartbeat did not stamp loop beat")
+	}
+	if !l.Fallback().LastBeat().IsZero() {
+		t.Fatalf("l.Fallback().LastBeat() = %v, want zero (Runner must stamp loop beat, not fallback)", l.Fallback().LastBeat())
+	}
+}
+
+type funcLooper struct {
+	name string
+	fn   func(context.Context)
+}
+
+func (f funcLooper) Name() string            { return f.name }
+func (f funcLooper) Run(ctx context.Context) { f.fn(ctx) }
+
+func TestWithLivenessClearsOuterRunnerBeat(t *testing.T) {
+	parent := NewLiveness()
+	ctx, cancel := context.WithCancel(WithLiveness(context.Background(), parent))
+	defer cancel()
+
+	old := time.Now().Add(-time.Hour)
+
+	r := Every("outer", time.Hour, func(outerCtx context.Context) {
+		beats := parent.LoopBeats()
+		if len(beats) != 1 {
+			t.Fatalf("outer LoopBeats() len = %d, want 1", len(beats))
+		}
+		outerBeat := beats[0]
+
+		// Direct WithLiveness inside Runner must stamp child fallback, not outerBeat.
+		child := NewLiveness()
+		child.Fallback().StampAt(old)
+		outerBeat.StampAt(old)
+		Heartbeat(WithLiveness(outerCtx, child))
+		if !child.Fallback().LastBeat().After(old) {
+			t.Fatal("WithLiveness child fallback was not stamped by Heartbeat")
+		}
+		if !outerBeat.LastBeat().Equal(old) {
+			t.Fatal("Heartbeat on WithLiveness child misrouted to outer Runner Beat")
+		}
+
+		// Nested RunAll custom Looper inside Runner must stamp its own child Liveness, not outerBeat.
+		outerBeat.StampAt(old)
+		RunAll(outerCtx, funcLooper{
+			name: "nested-custom",
+			fn: func(cctx context.Context) {
+				cl := LivenessFrom(cctx)
+				if cl == nil {
+					t.Fatal("RunAll child missing LivenessFrom(ctx)")
+				}
+				cl.Fallback().StampAt(old)
+				Heartbeat(cctx)
+				if !cl.Fallback().LastBeat().After(old) {
+					t.Fatal("nested RunAll custom looper Heartbeat did not stamp its own child fallback")
+				}
+				cancel()
+			},
+		})
+		if !outerBeat.LastBeat().Equal(old) {
+			t.Fatal("nested RunAll custom looper Heartbeat misrouted to outer Runner Beat")
+		}
+	})
+	r.Run(ctx)
 }

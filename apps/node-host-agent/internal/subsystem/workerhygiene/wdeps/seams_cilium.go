@@ -89,6 +89,30 @@ func (s *Cilium) EncryptPeers(ctx context.Context, socket string) (int, error) {
 	return n, nil
 }
 
+// CiliumHealthz fetches /v1/healthz from the cilium agent socket,
+// using e.CiliumHealthzOnce when set (one probe per cycle) and falling
+// back to an uncached UnixGet when nil.
+func (d *Deps) CiliumHealthz(ctx context.Context, e *CycleEnv) ([]byte, error) {
+	if e != nil && e.CiliumHealthzOnce != nil {
+		return e.CiliumHealthzOnce(ctx)
+	}
+	return d.Cfg.Seams.Cilium.UnixGet(ctx, d.Cfg.Cilium.Socket, "/v1/healthz")
+}
+
+// CiliumEncryptPeers returns the expected WG peer count from
+// /v1/healthz, reusing the per-cycle CiliumHealthz cache when set.
+func (d *Deps) CiliumEncryptPeers(ctx context.Context, e *CycleEnv) (int, error) {
+	body, err := d.CiliumHealthz(ctx, e)
+	if err != nil {
+		return 0, err
+	}
+	n, ok := ParseCiliumHealthNodes(body)
+	if !ok {
+		return 0, errors.New("no cluster.nodes in cilium healthz")
+	}
+	return n, nil
+}
+
 // ServiceBackends returns the local BPF service map's backend
 // counts keyed "<namespace>/<name>" — the cilium-lrp desync
 // evidence source. GET /v1/service off the agent socket through

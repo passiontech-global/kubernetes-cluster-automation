@@ -60,6 +60,16 @@ func (n *Deps) hasIPv4Addr(_ context.Context, dev string) bool {
 	return false
 }
 
+func (n *Deps) holdEmergencyHeal(ctx context.Context) bool {
+	return n.HoldEmergencyHeal != nil && n.HoldEmergencyHeal(ctx)
+}
+
+func (n *Deps) stampLocalRemediation(ctx context.Context) {
+	if n.StampLocalRemediation != nil {
+		n.StampLocalRemediation(ctx)
+	}
+}
+
 // NebulaRestart restarts nebula@<net> through the shared
 // last-nebula-restart budget.
 func (n *Deps) NebulaRestart(ctx context.Context) {
@@ -69,6 +79,13 @@ func (n *Deps) NebulaRestart(ctx context.Context) {
 			"nebula restart skipped — no systemd client", suspectLogCadence)
 		return
 	}
+	if n.holdEmergencyHeal(ctx) {
+		n.State.SuspectLog(latchdefs.LatchNebulaIsolated,
+			"suspect: nebula unhealthy but cluster maintenance in progress — holding restart",
+			suspectLogCadence)
+		return
+	}
+	n.stampLocalRemediation(ctx)
 	if err := n.Systemd().Restart(ctx, "nebula@"+net); err != nil {
 		n.State.AppendLog(fmt.Sprintf("nebula@%s restart failed: %v", net, err))
 		return
@@ -79,14 +96,6 @@ func (n *Deps) NebulaRestart(ctx context.Context) {
 	n.FlushStaleUDPConntrack(ctx, checkNebula)
 }
 
-// rmFiles removes every state-dir file matching glob — the module's
-// `rm -f $STATE_DIR/<pattern>` cleanup when its unit is inactive.
-func (n *Deps) rmFiles(pattern string) {
-	for _, f := range n.EgressFiles(pattern) {
-		_ = os.Remove(f)
-	}
-}
-
 // CheckNebulaHealth — module 13: socket bound, tun addressed, stats
 // answering, dataplane probes (only while nebula is the ACTIVE
 // overlay — probing over tinc rules would misjudge the warm standby).
@@ -94,10 +103,16 @@ func (n *Deps) CheckNebulaHealth(ctx context.Context) {
 	wd := n.Watchdog()
 	net := wd.NebulaNet
 	if !n.UnitEnabledActive(ctx, "nebula@"+net) {
-		// Nebula disabled/left mesh → drop this module's states
-		// (stale files feed phantom gauges). Egress state is module
-		// 12's own business.
-		n.rmFiles(latchdefs.LatchFilePrefix + "nebula-")
+		// Nebula disabled/left mesh → drop ONLY this module's 5 states
+		// via State.Exit (logs STATE-EXIT:, clears last-suspect-* and
+		// ramEpochs, and avoids clobbering hostmetrics's
+		// state-nebula-cert-expiring or mtu_blackhole's
+		// state-nebula-mtu-blackhole).
+		n.StateExit(latchdefs.LatchNebulaIsolated)
+		n.StateExit(latchdefs.LatchNebulaDegraded)
+		n.StateExit(latchdefs.LatchNebulaSlowpath)
+		n.StateExit(latchdefs.LatchNebulaSiteedge)
+		n.StateExit(latchdefs.LatchNebulaPMTUBlackhole)
 		n.NebulaFails, n.NebulaDpFail, n.NebulaDeg = 0, 0, 0
 		n.PMTUFails = 0
 		n.SiteedgeRun = 0
@@ -164,11 +179,17 @@ func (n *Deps) CheckNebulaHealth(ctx context.Context) {
 		return
 	}
 	if n.State.RateOK("last-nebula-restart", n.MinRestart()) {
-		n.State.AppendLog(fmt.Sprintf(latchdefs.ActionNebulaRestart+
-			"%s - %s (persisted %dx)", net, reason, *fails))
-		n.State.RateSpend("last-nebula-restart")
-		n.NebulaFails, n.NebulaDpFail = 0, 0
-		n.NebulaRestart(ctx)
+		if n.holdEmergencyHeal(ctx) {
+			n.State.SuspectLog(latchdefs.LatchNebulaIsolated,
+				"suspect: nebula unhealthy but cluster maintenance in progress — holding restart",
+				suspectLogCadence)
+		} else {
+			n.State.AppendLog(fmt.Sprintf(latchdefs.ActionNebulaRestart+
+				"%s - %s (persisted %dx)", net, reason, *fails))
+			n.State.RateSpend("last-nebula-restart")
+			n.NebulaFails, n.NebulaDpFail = 0, 0
+			n.NebulaRestart(ctx)
+		}
 	} else {
 		// Confirmed streak but the restart budget is spent — the
 		// suspect line still re-reminds at cadence.
@@ -203,9 +224,16 @@ func (n *Deps) RestartTimesyncdOnClockLatch(ctx context.Context) {
 		!n.Systemd().IsActive(ctx, "systemd-timesyncd.service") {
 		return
 	}
+	if n.holdEmergencyHeal(ctx) {
+		n.State.SuspectLog("nebula-ntp-hold",
+			"suspect: clock latch while nebula unhealthy but cluster maintenance in progress — holding timesyncd restart",
+			suspectLogCadence)
+		return
+	}
 	if !n.State.RateTrySpend("last-ntp-restart", nebulaNTPRestartInterval) {
 		return
 	}
+	n.stampLocalRemediation(ctx)
 	n.State.AppendLog("ACTION: restarting " + latchdefs.ClockRestartUnits[0] +
 		" — clock latch active while nebula unhealthy")
 	if err := n.Systemd().Restart(ctx, latchdefs.ClockRestartUnits[0]); err != nil {

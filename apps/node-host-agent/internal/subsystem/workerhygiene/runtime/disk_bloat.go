@@ -49,12 +49,12 @@ type bloatHit struct {
 	bytes int64
 }
 
-// readDirNames lists the immediate subdirectories of dir (an
-// unreadable/absent root yields nil — the scan just sees no dirs).
-func readDirNames(dir string) []string {
+// readDirNamesChecked lists immediate subdirectories of dir and reports
+// readErr=true when ReadDir fails for a non-ENOENT reason (e.g. EACCES/ENOTDIR).
+func readDirNamesChecked(dir string) ([]string, bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return nil, !os.IsNotExist(err)
 	}
 	var out []string
 	for _, e := range entries {
@@ -62,7 +62,7 @@ func readDirNames(dir string) []string {
 			out = append(out, filepath.Join(dir, e.Name()))
 		}
 	}
-	return out
+	return out, false
 }
 
 // podLogDirUID extracts the pod uid from a /var/log/pods dir name
@@ -90,6 +90,12 @@ func podLogDirUID(base string) string {
 
 func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits []bloatHit,
 	podTotals map[string]int64, podByUID map[string]*corev1.Pod) {
+	hits, podTotals, podByUID, _ = c.scanBloatChecked(e, pods)
+	return hits, podTotals, podByUID
+}
+
+func (c *DiskBloatCheck) scanBloatChecked(e *wdeps.CycleEnv, pods []corev1.Pod) (hits []bloatHit,
+	podTotals map[string]int64, podByUID map[string]*corev1.Pod, scanErr bool) {
 	podByUID = map[string]*corev1.Pod{}
 	podTotals = map[string]int64{}
 	for i := range pods {
@@ -97,10 +103,18 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 	}
 	threshold := c.d.Cfg.Disk.BloatPodThresholdBytes
 	// (1) emptyDir volumes: pods/<uid>/volumes/kubernetes.io~empty-dir/<vol>.
-	for _, uidDir := range readDirNames(c.d.Cfg.PodsDir) {
+	uidDirs, uErr := readDirNamesChecked(c.d.Cfg.PodsDir)
+	if uErr {
+		scanErr = true
+	}
+	for _, uidDir := range uidDirs {
 		uid := filepath.Base(uidDir)
-		for _, vol := range readDirNames(filepath.Join(
-			uidDir, "volumes", "kubernetes.io~empty-dir")) {
+		vols, vErr := readDirNamesChecked(filepath.Join(
+			uidDir, "volumes", "kubernetes.io~empty-dir"))
+		if vErr {
+			scanErr = true
+		}
+		for _, vol := range vols {
 			var vst unix.Statfs_t
 			if err := c.d.Cfg.Seams.Host.StatfsFn(vol, &vst); err == nil &&
 				vst.Type == int64(unix.TMPFS_MAGIC) {
@@ -128,8 +142,12 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 	// snapshotter (WLayerSnapshotsDir) — the same knob the
 	// writable-layer scan walks, not a second hardcoded derivation.
 	snapRoot := c.d.Cfg.Disk.WLayerSnapshotsDir
-	mountIDs := snapshotMountIDs(c.d)
-	for _, snap := range readDirNames(snapRoot) {
+	mountIDs := snapshotMountIDs(c.d, e)
+	snaps, sErr := readDirNamesChecked(snapRoot)
+	if sErr {
+		scanErr = true
+	}
+	for _, snap := range snaps {
 		id := filepath.Base(snap)
 		size, _ := c.d.WalkBudgeted(e, filepath.Join(snap, "fs"))
 		if size <= 0 {
@@ -147,7 +165,11 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 	// containerd CRI writes container logs here (rotated at 10MiB ×
 	// 5 by kubelet, but a chatty container under a stuck rotation —
 	// or a pod with hundreds of short-lived restarts — outruns it).
-	for _, logDir := range readDirNames(c.d.Cfg.Disk.PodLogsDir) {
+	logDirs, lErr := readDirNamesChecked(c.d.Cfg.Disk.PodLogsDir)
+	if lErr {
+		scanErr = true
+	}
+	for _, logDir := range logDirs {
 		base := filepath.Base(logDir)
 		uid := podLogDirUID(base)
 		size, _ := c.d.WalkBudgeted(e, logDir)
@@ -162,7 +184,7 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 			hits = append(hits, bloatHit{label: label, bytes: size})
 		}
 	}
-	return hits, podTotals, podByUID
+	return hits, podTotals, podByUID, scanErr
 }
 
 // snapshotMountIDs parses the host /proc/1/mountinfo once and maps
@@ -173,8 +195,8 @@ func (c *DiskBloatCheck) scanBloat(e *wdeps.CycleEnv, pods []corev1.Pod) (hits [
 // task dir; the live mount is the only snapshot→container binding.
 // "" map on an unreadable mountinfo (callers fall back to the
 // name-keyed lookup).
-func snapshotMountIDs(d *wdeps.Deps) map[string]string {
-	data, err := os.ReadFile(d.Cfg.MountinfoFile)
+func snapshotMountIDs(d *wdeps.Deps, e *wdeps.CycleEnv) map[string]string {
+	data, err := d.ReadMountinfo(e)
 	if err != nil {
 		return nil
 	}
@@ -287,13 +309,18 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
-	hits, podTotals, podByUID := c.scanBloat(e, e.Pods)
+	hits, podTotals, podByUID, scanErr := c.scanBloatChecked(e, e.Pods)
 	if len(hits) == 0 {
+		if scanErr {
+			c.d.CycleResult(wdeps.CheckDiskBloat, "abort")
+			return
+		}
+		c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 		c.d.State.Exit(latchdefs.LatchDiskBloat, nil)
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
+	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 	c.d.State.Enter(latchdefs.LatchDiskBloat, fmt.Sprintf("targets=%d", len(hits)))
 	for _, hit := range hits {
 		// NPD contract: the ACTION entry line feeds DiskBloatRunaway
@@ -327,6 +354,11 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if victim == nil {
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
+		return
+	}
+	if c.d.Cfg.Client == nil {
+		c.d.State.AppendLog("suspect: disk-bloat pod evict skipped — kubernetes client nil")
+		c.d.CycleResult(wdeps.CheckDiskBloat, "abort")
 		return
 	}
 	// L1↔L3 hold: check maintenance BEFORE spending the cooldown

@@ -11,6 +11,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -159,5 +161,140 @@ func TestVMAPressureRaisesMaxMapCountAndEmitsEvent(t *testing.T) {
 	evList, err := e.CS.EventsV1().Events("default").List(context.Background(), metav1.ListOptions{})
 	if err != nil || len(evList.Items) != 1 || evList.Items[0].Reason != "PodVMAMapCountPressure" {
 		t.Fatalf("expected 1 PodVMAMapCountPressure event, got %+v (err=%v)", evList.Items, err)
+	}
+}
+
+func TestVMAPressureSkipsDAndZState(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "vma-dz-pod", UID: "11111111-2222-3333-4444-555555555556"},
+	}
+	e := fixture(t, pod)
+	if err := os.MkdirAll(filepath.Join(e.H.Cfg.Runtime.CgroupRoot, "kubepods.slice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sysVM := filepath.Join(e.ProcDir, "sys", "vm")
+	if err := os.MkdirAll(sysVM, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sysVM, "max_map_count"), "100\n")
+
+	mkProcMaps := func(pid int, state string, vsize string, lines int) {
+		pidDir := filepath.Join(e.ProcDir, fmt.Sprint(pid))
+		if err := os.MkdirAll(pidDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fields := make([]string, 21)
+		fields[0] = state
+		for i := 1; i < 20; i++ {
+			fields[i] = "0"
+		}
+		fields[20] = vsize
+		wdepstest.WriteFile(t, filepath.Join(pidDir, "stat"),
+			fmt.Sprintf("%d (app) %s\n", pid, strings.Join(fields, " ")))
+		var mb strings.Builder
+		for i := 0; i < lines; i++ {
+			fmt.Fprintf(&mb, "%08x-%08x r--p 00000000 00:00 0\n", i*4096, (i+1)*4096)
+		}
+		wdepstest.WriteFile(t, filepath.Join(pidDir, "maps"), mb.String())
+	}
+
+	// Top-VmSize D-state and Z-state procs with 95 VMAs (>=0.85) must be skipped.
+	mkProcMaps(501, "D", "2147483648", 95)
+	mkProcMaps(502, "Z", "2147483648", 95)
+	// Smaller S-state proc with 10 VMAs (0.10 < 0.85).
+	mkProcMaps(503, "S", "1048576", 10)
+
+	chk := e.H.Check(wdeps.CheckCgroupThrottle)
+	chk.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}})
+
+	gotMax, err := os.ReadFile(filepath.Join(sysVM, "max_map_count"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(gotMax)) != "100" {
+		t.Fatalf("vm.max_map_count=%q, want 100 (D/Z state should be skipped)", string(gotMax))
+	}
+	if e.H.Series.VMAMaxUtilRatio < 0.09 || e.H.Series.VMAMaxUtilRatio > 0.11 {
+		t.Fatalf("VMAMaxUtilRatio=%v, want 0.10 from S-state PID 503", e.H.Series.VMAMaxUtilRatio)
+	}
+	evList, _ := e.CS.EventsV1().Events("default").List(context.Background(), metav1.ListOptions{})
+	for _, ev := range evList.Items {
+		if ev.Reason == "PodVMAMapCountPressure" {
+			t.Fatalf("unexpected PodVMAMapCountPressure event from D/Z-state PIDs: %+v", ev)
+		}
+	}
+}
+
+func TestVMAPressureAtCeilingSkipsHoldLocalAction(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "vma-ceil-pod", UID: "11111111-2222-3333-4444-555555555557"},
+	}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	e := fixture(t, pod, node)
+	e.H.Cfg.Coord = nodecoord.NewKube("node-a", e.CS)
+	e.H.Cfg.Wave3.VMAMaxCeiling = 100
+	if err := os.MkdirAll(filepath.Join(e.H.Cfg.Runtime.CgroupRoot, "kubepods.slice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sysVM := filepath.Join(e.ProcDir, "sys", "vm")
+	if err := os.MkdirAll(sysVM, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sysVM, "max_map_count"), "100\n")
+
+	pidDir := filepath.Join(e.ProcDir, "510")
+	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fields := make([]string, 21)
+	fields[0] = "S"
+	for i := 1; i < 20; i++ {
+		fields[i] = "0"
+	}
+	fields[20] = "1073741824"
+	wdepstest.WriteFile(t, filepath.Join(pidDir, "stat"), "510 (java) "+strings.Join(fields, " ")+"\n")
+	wdepstest.WriteFile(t, filepath.Join(pidDir, "cgroup"),
+		"0::/kubepods.slice/kubepods-pod11111111_2222_3333_4444_555555555557.slice/cri-containerd-abc.scope\n")
+	var mapsBuf strings.Builder
+	for i := 0; i < 90; i++ {
+		fmt.Fprintf(&mapsBuf, "%08x-%08x r--p 00000000 00:00 0\n", i*4096, (i+1)*4096)
+	}
+	wdepstest.WriteFile(t, filepath.Join(pidDir, "maps"), mapsBuf.String())
+
+	chk := e.H.Check(wdeps.CheckCgroupThrottle)
+	chk.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}})
+
+	for _, a := range e.CS.Actions() {
+		if a.GetVerb() == "get" && a.GetResource().Resource == "nodes" {
+			t.Fatalf("unexpected Nodes().Get call when vm.max_map_count is already at ceiling: %+v", a)
+		}
+	}
+	evList, err := e.CS.EventsV1().Events("default").List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(evList.Items) != 1 || evList.Items[0].Reason != "PodVMAMapCountPressure" {
+		t.Fatalf("expected 1 PodVMAMapCountPressure event, got %+v (err=%v)", evList.Items, err)
+	}
+}
+
+func TestVMAPressurePidsOKFalsePreservesRatio(t *testing.T) {
+	e := fixture(t)
+	if err := os.MkdirAll(filepath.Join(e.H.Cfg.Runtime.CgroupRoot, "kubepods.slice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sysVM := filepath.Join(e.ProcDir, "sys", "vm")
+	if err := os.MkdirAll(sysVM, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sysVM, "max_map_count"), "100\n")
+
+	e.H.Series.VMAMaxUtilRatio = 0.90
+	chk := e.H.Check(wdeps.CheckCgroupThrottle)
+	chk.Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		StatsOnce:    func() map[int]procfs.Stat { return map[int]procfs.Stat{} },
+		PidsOK:       func() bool { return false },
+	})
+	if e.H.Series.VMAMaxUtilRatio != 0.90 {
+		t.Fatalf("PidsOK=false clobbered VMAMaxUtilRatio=%v want 0.90", e.H.Series.VMAMaxUtilRatio)
 	}
 }

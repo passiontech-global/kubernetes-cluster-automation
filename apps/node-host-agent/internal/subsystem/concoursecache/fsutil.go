@@ -5,6 +5,7 @@ package concoursecache
 
 import (
 	"cmp"
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -53,9 +54,12 @@ func entryBlocks(info os.FileInfo) uint64 {
 // diskUsage is du -sk×1024: allocated blocks (st_blocks×512) summed
 // over the tree INCLUDING the directories themselves — never apparent
 // size, so sparse files measure like du does.
-func diskUsage(root string) uint64 {
+func diskUsage(ctx context.Context, root string) uint64 {
 	var total uint64
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		if err != nil {
 			logger().Debug("du: unreadable entry skipped",
 				"path", path, "error", err)
@@ -77,9 +81,12 @@ func diskUsage(root string) uint64 {
 // split the size caps need — one tree walk instead of a du per
 // <key>/<cksum> dir. perDir is keyed by the component NAME under
 // root (dirs AND loose files count; the caps only look up dirs).
-func diskUsageByTopDir(root string) (total uint64, perDir map[string]uint64) {
+func diskUsageByTopDir(ctx context.Context, root string) (total uint64, perDir map[string]uint64) {
 	perDir = map[string]uint64{}
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		if err != nil {
 			logger().Debug("du: unreadable entry skipped",
 				"path", path, "error", err)
@@ -110,9 +117,12 @@ func diskUsageByTopDir(root string) (total uint64, perDir map[string]uint64) {
 // it against diskUsage totals and the size marks, which are all du-style
 // st_blocks×512 — mixing units would let sparse files (huge apparent
 // size, tiny footprint) blow the cap math and misreport bytesFreed.
-func filesByAge(root string) []cacheFile {
+func filesByAge(ctx context.Context, root string) []cacheFile {
 	var out []cacheFile
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		if err != nil {
 			logger().Debug("find: unreadable entry skipped",
 				"path", path, "error", err)

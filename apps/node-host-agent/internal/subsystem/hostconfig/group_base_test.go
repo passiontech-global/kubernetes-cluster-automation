@@ -533,16 +533,26 @@ func TestGroupResolvedTimesyncdRestartGatedOnActive(t *testing.T) {
 
 	c, sr, r := newCyc(t, "inactive\n")
 	c.groupResolved()
-	if !r.fileExists("/etc/systemd/timesyncd.conf.d/99-fallback.conf") {
+	if !r.fileExists("/etc/systemd/timesyncd.conf.d/10-fallback.conf") {
 		t.Fatal("timesyncd fallback conf not written for an installed unit")
+	}
+	if !("10-fallback.conf" < "50-node-config-agent.conf") {
+		t.Fatal("timesyncd fallback drop-in must sort before 50-node-config-agent.conf")
 	}
 	if len(sr.CallsMatching("systemctl restart systemd-timesyncd.service")) > 0 {
 		t.Fatalf("inactive timesyncd restarted: %v",
 			sr.CallsMatching("systemctl restart systemd-timesyncd.service"))
 	}
 
-	c2, sr2, _ := newCyc(t, "active\n")
+	c2, sr2, r2 := newCyc(t, "active\n")
+	hostWrite(t, r2, "/etc/systemd/timesyncd.conf.d/99-fallback.conf", "[Time]\nFallbackNTP=old\n")
 	c2.groupResolved()
+	if r2.fileExists("/etc/systemd/timesyncd.conf.d/99-fallback.conf") {
+		t.Fatal("stale 99-fallback.conf not removed")
+	}
+	if !r2.fileExists("/etc/systemd/timesyncd.conf.d/10-fallback.conf") {
+		t.Fatal("10-fallback.conf not written")
+	}
 	if len(sr2.CallsMatching("systemctl restart systemd-timesyncd.service")) == 0 {
 		t.Fatal("active timesyncd not restarted after conf change")
 	}
@@ -808,5 +818,16 @@ func TestSysctlPtyMaxOverride(t *testing.T) {
 	c2.groupBase()
 	if f := hostRead(t, r2, "/etc/sysctl.d/99-k8s-network-tuning.conf"); !strings.Contains(f, "kernel.pty.max = 16384") {
 		t.Fatalf("pty default missing:\n%s", f)
+	}
+
+	// Refused pty_max (newline injection) counts cycle error and omits kernel.pty.max.
+	r3, _, c3 := baseFixture(t, "pty_max: \"4096\\nkernel.sysrq = 1\"\n")
+	hostWrite(t, r3, "/proc/sys/kernel/pty/max", "16384\n")
+	c3.groupBase()
+	if c3.errs != 1 {
+		t.Fatalf("errs = %d, want 1 for refused pty_max", c3.errs)
+	}
+	if f := hostRead(t, r3, "/etc/sysctl.d/99-k8s-network-tuning.conf"); strings.Contains(f, "kernel.pty.max") || strings.Contains(f, "kernel.sysrq") {
+		t.Fatalf("refused pty_max rendered into sysctl drop-in:\n%s", f)
 	}
 }

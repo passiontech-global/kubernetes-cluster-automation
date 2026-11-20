@@ -92,7 +92,7 @@ func (c *CiliumEnvoyCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// 2.5: subsystem/datapath health off the agent socket is
 	// evidence only — an unreadable socket must not block the envoy
 	// verdict (the admin port is the primary signal).
-	if body, err := c.d.Cfg.Seams.Cilium.UnixGet(ctx, c.d.Cfg.Cilium.Socket, "/v1/healthz"); err == nil {
+	if body, err := c.d.CiliumHealthz(ctx, e); err == nil {
 		if bad := ciliumUnhealthySubsystems(body); len(bad) > 0 {
 			c.d.State.AppendLog(
 				"suspect: cilium subsystem health degraded: " +

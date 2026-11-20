@@ -107,7 +107,8 @@ type Deps struct {
 	StateExit                func(name string)
 	UnitEnabledActive        func(ctx context.Context, unit string) bool
 	NebulaUpExists           func(wd *watchdogconf.Config) bool
-	EgressFiles              func(prefixes ...string) []string
+	HoldEmergencyHeal        func(ctx context.Context) bool
+	StampLocalRemediation    func(ctx context.Context)
 	FlushStaleUDPConntrack   func(ctx context.Context, check string)
 	FlushPeerNebulaConntrack func(ctx context.Context, check string, peers ...string)
 	TrimRunErr               func(out string) string

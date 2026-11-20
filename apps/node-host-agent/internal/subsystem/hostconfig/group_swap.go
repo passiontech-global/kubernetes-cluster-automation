@@ -194,10 +194,9 @@ func (c *cyc) ensureSwapfile(path string, mb int64, sw string) {
 	want := path + " none swap sw 0 0"
 	fstab, fstabErr := os.ReadFile(r.hp("/etc/fstab"))
 	if fstabErr != nil && !os.IsNotExist(fstabErr) {
-		// Best-effort pre-warning — a failed fstab write is counted
-		// by writeManaged's noteErr below.
-		logger().Warn("swap: cannot read /etc/fstab — swap fstab entry will fail",
-			"error", fstabErr)
+		c.err("swap: cannot read /etc/fstab — fstab entry not updated",
+			"path", path, "error", fstabErr)
+		return
 	}
 	re := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(path) + `\s.*$`)
 	var nf []byte

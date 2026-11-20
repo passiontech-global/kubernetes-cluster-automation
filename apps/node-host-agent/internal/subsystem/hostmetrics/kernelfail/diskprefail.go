@@ -160,7 +160,9 @@ func parseSmartLogCLI(ctrl, out string) (nvmeSmart, bool) {
 	if cw == nil || pct == nil || med == nil {
 		return nvmeSmart{}, false
 	}
-	critical, errC := strconv.ParseUint(strings.TrimPrefix(cw[1], "0x"), 0, 64)
+	rawCrit := strings.TrimSpace(cw[1])
+	rawCrit = strings.TrimPrefix(strings.TrimPrefix(rawCrit, "0x"), "0X")
+	critical, errC := strconv.ParseUint(rawCrit, 16, 64)
 	percentage, errP := strconv.ParseUint(pct[1], 10, 64)
 	media, errM := strconv.ParseUint(med[1], 10, 64)
 	if errC != nil || errP != nil || errM != nil {

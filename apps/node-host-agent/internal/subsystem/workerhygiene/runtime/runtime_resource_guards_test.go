@@ -484,6 +484,31 @@ func TestClockJumpSessionHealerNeedsFreshMarker(t *testing.T) {
 	}
 }
 
+func TestClockJumpFutureMarkerIgnored(t *testing.T) {
+	e := fixture(t)
+	h := e.H
+	ctx := context.Background()
+	konn := konnPodOnNode(wdepstest.UIDC)
+	if _, err := e.CS.CoreV1().Pods("kube-system").Create(ctx, konn, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	logs := t.TempDir()
+	h.Cfg.Disk.PodLogsDir = logs
+	wdepstest.WriteFile(t, filepath.Join(logs,
+		"kube-system_konnectivity-agent-abc12_"+wdepstest.UIDC,
+		"konnectivity-agent", "0.log"),
+		"x509: certificate has expired\n")
+	// Future marker > 1m ahead -> must be ignored as non-fresh.
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "clock-stepped-at"),
+		fmt.Sprintf("%d\n", e.Now.Add(2*time.Hour).Unix()))
+	wdepstest.Check[*runtime.ClockJumpCheck](h, wdeps.CheckClockJump).Run(ctx, &wdeps.CycleEnv{
+		Pods: []corev1.Pod{*konn}, APIOK: true, WorkerActive: true,
+	})
+	if n := len(wdepstest.DeleteActions(e.CS)); n != 0 {
+		t.Fatalf("deletes=%d want 0 on future-skewed marker", n)
+	}
+}
+
 // --- orphan-hostpath early return ---
 
 func TestOrphanHostPathEarlyReturnSkipsPVList(t *testing.T) {

@@ -160,8 +160,9 @@ func (m *Multiplexer) Poll(ctx context.Context, id string) ([]Entry, error) {
 		m.mu.Unlock()
 		return nil, errors.New("journalwatch: nil Exec")
 	}
+	now := m.now()
 	needFetch := m.lastFetch.IsZero() || m.pollEvery() == 0 ||
-		m.now().Sub(m.lastFetch) >= m.pollEvery()
+		now.Before(m.lastFetch) || now.Sub(m.lastFetch) >= m.pollEvery()
 	m.mu.Unlock()
 
 	if needFetch {
@@ -190,13 +191,13 @@ func (m *Multiplexer) maybeFetch(ctx context.Context) error {
 	defer m.fetchMu.Unlock()
 
 	m.mu.Lock()
+	now := m.now()
 	if !m.lastFetch.IsZero() && m.pollEvery() != 0 &&
-		m.now().Sub(m.lastFetch) < m.pollEvery() {
+		!now.Before(m.lastFetch) && now.Sub(m.lastFetch) < m.pollEvery() {
 		m.mu.Unlock()
 		return nil // another fetcher refreshed the window
 	}
 	var cursor = m.cursor
-	now := m.now()
 	m.mu.Unlock()
 
 	entries, err := Fetch(ctx, m.Exec, now, m.lookback(), &cursor, m.Args...)
@@ -214,20 +215,22 @@ func (m *Multiplexer) maybeFetch(ctx context.Context) error {
 	m.cursor = cursor
 	m.lastFetch = m.now()
 	m.fetchCount++
-	for _, e := range entries {
-		for _, sub := range m.subs {
+	for _, sub := range m.subs {
+		for _, e := range entries {
 			if sub.match != nil && !sub.match(e) {
 				continue
 			}
 			sub.pending = append(sub.pending, e)
-			if len(sub.pending) > sub.cap {
-				// Drop oldest — copy within the same backing array
-				// region is fine; the dropped prefix is dead.
-				n := len(sub.pending) - sub.cap
-				copy(sub.pending, sub.pending[n:])
-				sub.pending = sub.pending[:sub.cap]
-				sub.dropped += n
-			}
+		}
+		if len(sub.pending) > sub.cap {
+			// Drop oldest in one pass per subscriber — copy within the
+			// same backing array region, then clear the vacated tail so
+			// dropped entries do not pin strings on the heap.
+			n := len(sub.pending) - sub.cap
+			copy(sub.pending, sub.pending[n:])
+			clear(sub.pending[sub.cap:])
+			sub.pending = sub.pending[:sub.cap]
+			sub.dropped += n
 		}
 	}
 	return nil

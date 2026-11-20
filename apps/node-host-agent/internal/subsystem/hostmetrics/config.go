@@ -228,6 +228,13 @@ type Config struct {
 	maxUserNSFile   string
 	runHostCmd      func(ctx context.Context, argv ...string) (string, error)
 	kmsgDevicePaths func(hostRoot string) []string
+	// latchExistsFn overrides c.state.Exists in collectWatchdog for
+	// hermetic ramEpochs testing (nil in production → c.state.Exists).
+	latchExistsFn func(name string) bool
+	// ramLatchesFn overrides c.state.RAMLatches in collectWatchdog for
+	// hermetic ramEpochs enumeration testing (nil in production →
+	// c.state.RAMLatches when latchExistsFn is nil).
+	ramLatchesFn func() []string
 }
 
 func (c *Config) applyDefaults() {

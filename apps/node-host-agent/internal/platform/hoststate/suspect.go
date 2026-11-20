@@ -56,12 +56,15 @@ func (s *Store) ExitClearAllSuspects(name string) {
 func (s *Store) ClearSuspect(name string) {
 	s.shared.mu.Lock()
 	defer s.shared.mu.Unlock()
-	if err := os.Remove(filepath.Join(s.Dir,
-		SuspectBudgetPrefix+name)); err != nil && !os.IsNotExist(err) {
+	p := filepath.Join(s.Dir, SuspectBudgetPrefix+name)
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 		s.log().Debug("hoststate: failed to clear suspect budget",
 			"key", name, "error", err)
 	}
 	delete(s.shared.lastSpent, rateSpendKey(filepath.Clean(s.Dir), SuspectBudgetPrefix+name))
+	s.shared.ramMu.Lock()
+	delete(s.shared.ramEpochs, filepath.Clean(p))
+	s.shared.ramMu.Unlock()
 }
 
 // ClearAllSuspects drops every last-suspect-* dedupe budget in the
@@ -83,12 +86,20 @@ func (s *Store) ClearAllSuspects() {
 		}
 	}
 	// Drop the matching RAM mirrors — see ClearSuspect.
-	prefix := rateSpendKey(filepath.Clean(s.Dir), SuspectBudgetPrefix)
+	cleanDir := filepath.Clean(s.Dir)
+	prefix := rateSpendKey(cleanDir, SuspectBudgetPrefix)
 	for k := range s.shared.lastSpent {
 		if strings.HasPrefix(k, prefix) {
 			delete(s.shared.lastSpent, k)
 		}
 	}
+	s.shared.ramMu.Lock()
+	for k := range s.shared.ramEpochs {
+		if filepath.Dir(k) == cleanDir && strings.HasPrefix(filepath.Base(k), SuspectBudgetPrefix) {
+			delete(s.shared.ramEpochs, k)
+		}
+	}
+	s.shared.ramMu.Unlock()
 }
 
 // SuspectLog emits msg at most once per cadence per key — a

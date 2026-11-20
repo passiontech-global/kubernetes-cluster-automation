@@ -37,6 +37,8 @@ type fakeEtcd struct {
 	failDel           bool
 	failStart         bool // systemctl start errors
 	failStop          bool // systemctl stop errors
+	failMemberList    bool // member list errors
+	memberCount       int  // <=0 defaults to 1 member
 
 	// onCall fires before responding — tests use it e.g. to remove
 	// the fake /proc/<pid> dir when `systemctl stop` lands.
@@ -108,6 +110,24 @@ func (f *fakeEtcd) run(_ context.Context, name string,
 			return nil, errors.New("fake: del failed")
 		}
 		return []byte("1\n"), nil
+	case strings.Contains(joined, "member list"):
+		if f.failMemberList {
+			return nil, errors.New("fake: member list failed")
+		}
+		n := f.memberCount
+		if n <= 0 {
+			n = 1
+		}
+		var b strings.Builder
+		b.WriteString(`{"members":[`)
+		for i := range n {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"name":"m%d"}`, i)
+		}
+		b.WriteString(`]}`)
+		return []byte(b.String()), nil
 	}
 	return nil, fmt.Errorf("fake: unexpected call: %s %s", name, joined)
 }
@@ -1011,5 +1031,44 @@ func TestRunOfflineUnhealthyAfterRestart(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unhealthy after") {
 		t.Fatalf("err=%v want the post-restart health failure", err)
+	}
+}
+
+func TestRunOfflineRejectsMultiMemberCluster(t *testing.T) {
+	f := &fakeEtcd{
+		healthy:     true,
+		memberCount: 3,
+		statusJSON:  []string{statusJSON(100, 5000, 1000), statusJSON(100, 5000, 1000)},
+	}
+	procRoot := fakeProc(t, map[int]string{4242: etcdProcCmdline})
+	starter := &fakeStarter{calls: &f.calls}
+	var out strings.Builder
+	err := Run(context.Background(), testRig(f, starter, procRoot), &out)
+	if err == nil || !strings.Contains(err.Error(), "3 members") {
+		t.Fatalf("err=%v, want multi-member refusal", err)
+	}
+	if i := callIndex(f.calls, "systemctl"); i >= 0 {
+		t.Fatalf("systemctl ran on multi-member cluster:\n%v", f.calls)
+	}
+	if i := callIndex(f.calls, "temp-etcd"); i >= 0 {
+		t.Fatalf("temp-etcd ran on multi-member cluster:\n%v", f.calls)
+	}
+}
+
+func TestRunOfflineRejectsMemberListError(t *testing.T) {
+	f := &fakeEtcd{
+		healthy:        true,
+		failMemberList: true,
+		statusJSON:     []string{statusJSON(100, 5000, 1000), statusJSON(100, 5000, 1000)},
+	}
+	procRoot := fakeProc(t, map[int]string{4242: etcdProcCmdline})
+	starter := &fakeStarter{calls: &f.calls}
+	var out strings.Builder
+	err := Run(context.Background(), testRig(f, starter, procRoot), &out)
+	if err == nil || !strings.Contains(err.Error(), "member list") {
+		t.Fatalf("err=%v, want member list failure", err)
+	}
+	if i := callIndex(f.calls, "systemctl"); i >= 0 {
+		t.Fatalf("systemctl ran despite member list error:\n%v", f.calls)
 	}
 }

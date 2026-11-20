@@ -5,12 +5,33 @@
 package controllerhygiene
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
 )
+
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestHygieneName(t *testing.T) {
 	e := fixture(t)
@@ -104,6 +125,11 @@ func TestRunFeedsAndCyclesUntilCancel(t *testing.T) {
 // the agent stays alive, and Run's own cycle loop keeps running until
 // ctx is cancelled.
 func TestRunFeederPanicContained(t *testing.T) {
+	var logs syncLogBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
 	e := fixture(t)
 	e.Props["k0scontroller.service:MainPID"] = "123"
 	e.H.Cfg.Feeder.Enabled = true
@@ -123,6 +149,12 @@ func TestRunFeederPanicContained(t *testing.T) {
 	}
 	if e.CountLogLines("feeder: PANIC") == 0 {
 		t.Fatalf("feeder panic not logged to the watchdog tail:\n%s", e.LogLines())
+	}
+	for time.Now().Before(deadline) && !strings.Contains(logs.String(), "feeder panicked") {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if out := logs.String(); !strings.Contains(out, "feeder panicked") || !strings.Contains(out, "stack=") {
+		t.Fatalf("feeder panic slog missing stack trace:\n%s", out)
 	}
 
 	// The dispatcher loop itself must survive the feeder's death.

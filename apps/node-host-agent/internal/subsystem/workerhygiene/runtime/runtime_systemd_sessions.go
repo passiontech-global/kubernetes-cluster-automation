@@ -85,34 +85,48 @@ func sessionState(data []byte) string {
 // scanSessions counts session state files and collects the ids of
 // sessions stuck closing/abandoned longer than the stale-age bar.
 // .ref companions and non-regular entries are skipped — they are
-// bookkeeping, not sessions. An unreadable dir yields zeroes (a
-// host without logind is a dormant check, not an error).
-func (c *SystemdSessionCheck) scanSessions() (total int, stale []string) {
+// bookkeeping, not sessions. An absent dir (ENOENT) yields zeroes (a
+// host without logind is a dormant check, not an error); non-ENOENT
+// read errors propagate so the caller aborts without clearing latches.
+func (c *SystemdSessionCheck) scanSessions() (total int, stale []string, err error) {
 	dir := c.d.Cfg.Runtime.SessionsDir
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return 0, nil
+		if os.IsNotExist(err) {
+			return 0, nil, nil
+		}
+		return 0, nil, err
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 	for _, en := range ents {
 		if en.IsDir() || strings.HasSuffix(en.Name(), ".ref") {
 			continue
 		}
-		total++
-		st := ""
-		if data, err := os.ReadFile(filepath.Join(dir, en.Name())); err == nil {
-			st = sessionState(data)
+		data, err := os.ReadFile(filepath.Join(dir, en.Name()))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return 0, nil, err
 		}
+		total++
+		st := sessionState(data)
 		if st != "closing" && st != "abandoned" {
 			continue
 		}
 		info, err := en.Info()
-		if err != nil || now.Sub(info.ModTime()) < systemdSessionStaleAge {
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return 0, nil, err
+		}
+		if now.Sub(info.ModTime()) < systemdSessionStaleAge {
 			continue
 		}
 		stale = append(stale, en.Name())
 	}
-	return total, stale
+	return total, stale, nil
 }
 
 // Run executes one systemd-session round.
@@ -131,7 +145,14 @@ func (c *SystemdSessionCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// dispatch) — NOT by workerActive. A D-Bus probe failure or an
 	// intentionally inactive k0sworker is exactly when the PID 1
 	// unresponsive detector is needed most, so it must still run.
-	total, stale := c.scanSessions()
+	total, stale, scanErr := c.scanSessions()
+	if scanErr != nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: systemd-session-hygiene read %s failed: %v — inconclusive, keeping state",
+			c.d.Cfg.Runtime.SessionsDir, scanErr))
+		c.d.CycleResult(wdeps.CheckSystemdSessions, "abort")
+		return
+	}
 	c.d.SystemdSessionsTotal = int64(total)
 	c.d.SystemdSessionsStale = int64(len(stale))
 	sd := c.d.Cfg.Systemd

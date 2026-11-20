@@ -973,3 +973,69 @@ func TestSpegelRunDeleteFailure(t *testing.T) {
 		t.Fatalf("want delete-failure suspect line, log=%q", log)
 	}
 }
+
+func TestCalicoSysClassNetEACCESAbortsPreservingLatch(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0111 does not block root")
+	}
+	ctx := context.Background()
+	d, _ := gDeps(t)
+	c := &CalicoCheck{d: d, VethFails: 1}
+	mkCalicoIface(t, d, "cali1", "1")
+	d.State.Enter(latchdefs.LatchCalicoVethLeak, "prior-leak")
+
+	if err := os.Chmod(d.Cfg.SysClassNet, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(d.Cfg.SysClassNet, 0o755) })
+
+	c.Run(ctx, runEnv())
+	if c.VethFails != 1 {
+		t.Fatalf("VethFails=%d want preserved 1 on SysClassNet 0o111", c.VethFails)
+	}
+	requireLatch(t, d, latchdefs.LatchCalicoVethLeak, true)
+}
+
+func TestCalicoWireguardCaliUnreadablePreservesWGFails(t *testing.T) {
+	ctx := context.Background()
+	d, _ := gDeps(t)
+	c := &CalicoCheck{d: d, wgFails: 1}
+	mkCalicoIface(t, d, "cali1", "1")
+
+	notDir := filepath.Join(t.TempDir(), "not-a-dir")
+	wdepstest.WriteFile(t, notDir, "x")
+	d.Cfg.SysClassNet = notDir
+	c.checkWireguardCali(ctx, nil)
+	if c.wgFails != 1 {
+		t.Fatalf("wgFails=%d want 1 preserved on ENOTDIR", c.wgFails)
+	}
+}
+
+func TestCNINetnsPruneMarkersPreservesOnNonENOENTStat(t *testing.T) {
+	d, f := gDeps(t)
+	notDir := filepath.Join(t.TempDir(), "not-a-dir")
+	wdepstest.WriteFile(t, notDir, "x")
+	d.Cfg.Net.NetnsDir = notDir
+
+	marker := filepath.Join(f.StateDir, "cni-netns-seen-cni-1")
+	wdepstest.WriteFile(t, marker, "100\n")
+	pruneCNINetnsMarkers(d, nil)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("cni-netns-seen marker pruned on ENOTDIR stat: %v", err)
+	}
+}
+
+func TestNetfilterLegacyNamesUnreadablePreservesGauge(t *testing.T) {
+	ctx := context.Background()
+	d, _ := gDeps(t)
+	d.Series.IPTablesLegacyLeakedRules = 7
+	notDir := filepath.Join(t.TempDir(), "not-a-dir")
+	wdepstest.WriteFile(t, notDir, "x")
+	d.Cfg.ProcRoot = notDir
+
+	c := NewNetfilterGuard(d)
+	c.probeLegacyRules(ctx)
+	if d.Series.IPTablesLegacyLeakedRules != 7 {
+		t.Fatalf("IPTablesLegacyLeakedRules=%d want 7 preserved on ENOTDIR", d.Series.IPTablesLegacyLeakedRules)
+	}
+}

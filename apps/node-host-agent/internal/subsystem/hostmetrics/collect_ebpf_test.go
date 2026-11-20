@@ -2,12 +2,17 @@
 package hostmetrics
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 func TestCollectEBPFCounts(t *testing.T) {
@@ -105,10 +110,12 @@ func TestEBPFPinsWalkedWithoutOpen(t *testing.T) {
 
 func TestEBPFScanCache(t *testing.T) {
 	cfg, _ := fixture(t)
+	now := time.Unix(1760000000, 0)
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
 	cfg.BpffsDir = filepath.Join(t.TempDir(), "nope")
 	c := New(cfg)
 	// First snapshot sweeps (empty proc → counts 0, scanned ok).
-	_, _, ok := c.ebpfSnapshot()
+	_, _, ok, at1 := c.ebpfSnapshotAt()
 	if !ok {
 		t.Fatal("sweep not scanned with readable proc root")
 	}
@@ -120,16 +127,20 @@ func TestEBPFScanCache(t *testing.T) {
 	}
 	testutil.WriteFile(t, filepath.Join(dir, "3"), "prog_id:\t99\n")
 	mkFdLink(t, cfg.ProcRoot, 10, 3, "anon_inode:bpf-map")
-	progs, _, _ := c.ebpfSnapshot()
+	progs, _, _, at2 := c.ebpfSnapshotAt()
 	if progs != 0 {
 		t.Fatalf("cache missed: progs=%d want 0", progs)
 	}
-	c.fdscan.mu.Lock()
-	c.fdscan.res.at = c.cfg.Clock.Now().Add(-2 * defaultEBPFScanInterval)
-	c.fdscan.mu.Unlock()
-	progs, _, _ = c.ebpfSnapshot()
+	if !at2.Equal(at1) {
+		t.Fatalf("cached snapshot stamp changed: %v -> %v", at1, at2)
+	}
+	now = now.Add(2 * defaultEBPFScanInterval)
+	progs, _, _, at3 := c.ebpfSnapshotAt()
 	if progs != 1 {
 		t.Fatalf("post-expiry progs=%d want 1", progs)
+	}
+	if !at3.After(at1) {
+		t.Fatalf("post-expiry stamp %v did not advance past %v", at3, at1)
 	}
 }
 
@@ -137,22 +148,149 @@ func TestEBPFScanCache(t *testing.T) {
 // "<name> <id>" (headers, truncated rows, non-numeric ids, unknown
 // object names) are skipped — only prog_id:/map_id: count.
 func TestScanBPFIDLinesJunk(t *testing.T) {
-	progs, maps := map[uint64]bool{}, map[uint64]bool{}
-	scanBPFIDLines([]byte(
+	cfg, _ := fixture(t)
+	cfg.BpffsDir = filepath.Join(t.TempDir(), "nope")
+	dir := filepath.Join(cfg.ProcRoot, "10", "fdinfo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(dir, "3"),
 		"pos:\t0\n"+ // single field
 			"prog_id: notanumber\n"+ // non-numeric id
 			"prog_id:\t42 extra\n"+ // three fields
 			"link_id:\t9\n"+ // unknown object name
 			"map_id:\t7\n"+
-			"prog_id:\t42\n"), progs, maps) // dup — dedup must hold
-	if len(progs) != 1 || !progs[42] {
-		t.Fatalf("progs=%v want {42}", progs)
+			"prog_id:\t42\n")
+	mkFdLink(t, cfg.ProcRoot, 10, 3, "anon_inode:bpf-prog")
+	// Empty fdinfo file alongside must be a clean no-op.
+	testutil.WriteFile(t, filepath.Join(dir, "4"), "")
+	mkFdLink(t, cfg.ProcRoot, 10, 4, "anon_inode:bpf-map")
+
+	c := New(cfg)
+	progs, maps, ok := c.ebpfSnapshot()
+	if !ok || progs != 1 || maps != 1 {
+		t.Fatalf("ebpfSnapshot = (%d, %d, %v), want (1, 1, true)", progs, maps, ok)
 	}
-	if len(maps) != 1 || !maps[7] {
-		t.Fatalf("maps=%v want {7}", maps)
+}
+
+func TestSharedFDCacheReuse(t *testing.T) {
+	cfg, _ := fixture(t)
+	now := time.Unix(1760001000, 0)
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
+	cfg.BpffsDir = filepath.Join(t.TempDir(), "nope")
+
+	// Seed an initial fd under ProcRoot and warm procfs.SharedFDCache directly
+	// (simulating workerhygiene populating the shared cache first).
+	mkFdinfo(t, cfg.ProcRoot, 11, 3, 4)
+	shared := procfs.SharedFDCache(cfg.ProcRoot, cfg.Clock.Now)
+	snap := shared.Snapshot(time.Minute)
+	if len(snap.Inotify) != 1 || snap.Inotify[0].Watches != 4 {
+		t.Fatalf("seed snap Inotify = %+v", snap.Inotify)
 	}
-	scanBPFIDLines(nil, progs, maps) // empty input is a no-op
-	if len(progs) != 1 || len(maps) != 1 {
-		t.Fatal("empty input mutated the sets")
+
+	// Mutate ProcRoot within TTL: add another inotify fd and an eBPF fd.
+	mkFdinfo(t, cfg.ProcRoot, 22, 5, 10)
+	dir := filepath.Join(cfg.ProcRoot, "22", "fdinfo")
+	testutil.WriteFile(t, filepath.Join(dir, "6"), "prog_id:\t77\n")
+	mkFdLink(t, cfg.ProcRoot, 22, 6, "anon_inode:bpf-prog")
+
+	// hostmetrics.Collector shares the exact same procfs.FDCache and must serve
+	// the warmed snapshot without re-walking /proc/*/fd within TTL.
+	c := New(cfg)
+	if c.fdCache() != shared {
+		t.Fatal("hostmetrics did not reuse procfs.SharedFDCache instance")
+	}
+	inst, watch, _, ok := c.inotifySnapshot()
+	if !ok || inst != 1 || watch != 4 {
+		t.Fatalf("shared cache miss on inotify: inst=%d watch=%d ok=%v want 1, 4, true", inst, watch, ok)
+	}
+	progs, _, ok, scanAt := c.ebpfSnapshotAt()
+	if !ok || progs != 0 || !scanAt.Equal(snap.At) {
+		t.Fatalf("shared cache miss on ebpf: progs=%d ok=%v scanAt=%v want 0, true, %v",
+			progs, ok, scanAt, snap.At)
+	}
+
+	// Advance clock past TTL: fresh walk picks up PID 22's inotify + eBPF fds.
+	now = now.Add(2 * time.Minute)
+	inst, watch, _, ok = c.inotifySnapshot()
+	if !ok || inst != 2 || watch != 14 {
+		t.Fatalf("post-TTL inotify: inst=%d watch=%d ok=%v want 2, 14, true", inst, watch, ok)
+	}
+	progs, _, _, scanAt2 := c.ebpfSnapshotAt()
+	if progs != 1 || !scanAt2.After(snap.At) {
+		t.Fatalf("post-TTL ebpf: progs=%d scanAt=%v want 1, >%v", progs, scanAt2, snap.At)
+	}
+}
+
+// TestEBPFPartialProcFD0000PreservesLatch verifies that a partial /proc walk
+// (e.g. /proc/<pid>/fd 0o000 -> snap.Partial=true) makes ebpfSnapshotAt return
+// scanned=false even when bpffsDir is readable, suppressing bogus zero metrics
+// and preserving LatchEBPFPressure across refreshLatches.
+func TestEBPFPartialProcFD0000PreservesLatch(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0000 does not block root")
+	}
+	cfg, _ := fixture(t)
+	now := time.Unix(1760002000, 0)
+	cfg.Clock = timex.NewCell(func() time.Time { return now })
+	cfg.EBPFProgsMax = 2
+	// Readable bpffs dir (0 pins): bpffsOK=true must NOT override snap.Partial=true.
+	bpf := filepath.Join(t.TempDir(), "bpf")
+	if err := os.MkdirAll(bpf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg.BpffsDir = bpf
+
+	fdDir := filepath.Join(cfg.ProcRoot, "10", "fd")
+	fdinfoDir := filepath.Join(cfg.ProcRoot, "10", "fdinfo")
+	if err := os.MkdirAll(fdinfoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.WriteFile(t, filepath.Join(fdinfoDir, "3"), "prog_id:\t101\n")
+	testutil.WriteFile(t, filepath.Join(fdinfoDir, "4"), "prog_id:\t102\n")
+	mkFdLink(t, cfg.ProcRoot, 10, 3, "anon_inode:bpf-prog")
+	mkFdLink(t, cfg.ProcRoot, 10, 4, "anon_inode:bpf-prog")
+
+	c := New(cfg)
+	l := c.Latches()
+	for range 3 {
+		now = now.Add(2 * defaultEBPFScanInterval)
+		l.refreshLatches(context.Background())
+	}
+	latchPath := filepath.Join(cfg.WatchdogStateDir,
+		latchdefs.LatchFilePrefix+latchdefs.LatchEBPFPressure)
+	if _, err := os.Stat(latchPath); err != nil {
+		t.Fatalf("setup: LatchEBPFPressure not armed: %v", err)
+	}
+
+	// Make /proc/10/fd unreadable (0o000) -> ScanFDs returns ProcOK=true, Partial=true.
+	if err := os.Chmod(fdDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(fdDir, 0o755) })
+
+	now = now.Add(2 * defaultEBPFScanInterval)
+	_, _, scanned, _ := c.ebpfSnapshotAt()
+	if scanned {
+		t.Fatal("ebpfSnapshotAt returned scanned=true on Partial /proc walk")
+	}
+	if _, ok := metricValue(t, c, "node_host_agent_ebpf_programs_count",
+		map[string]string{"node": "node-a"}); ok {
+		t.Fatal("collectEBPF emitted metric on Partial /proc walk")
+	}
+	l.refreshLatches(context.Background())
+	if _, err := os.Stat(latchPath); err != nil {
+		t.Fatalf("LatchEBPFPressure falsely exited on Partial /proc walk: %v", err)
+	}
+
+	// Restore permissions and clear progs -> next fresh scan clears the latch.
+	if err := os.Chmod(fdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.RemoveAll(filepath.Join(cfg.ProcRoot, "10"))
+	now = now.Add(2 * defaultEBPFScanInterval)
+	l.refreshLatches(context.Background())
+	if _, err := os.Stat(latchPath); !os.IsNotExist(err) {
+		t.Fatalf("LatchEBPFPressure did not exit after recovery: err=%v", err)
 	}
 }

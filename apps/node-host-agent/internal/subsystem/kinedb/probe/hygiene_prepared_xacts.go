@@ -6,6 +6,7 @@ package probe
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
@@ -20,12 +21,27 @@ import (
 // rollback is noted and retried next round, never fatal.
 func (p *Probe) hygienePreparedXacts(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
-		"SELECT gid FROM pg_prepared_xacts "+
-			"WHERE database IN ('postgres','kine') "+
-			"AND prepared < now() - interval '%s'", preparedXactOrphanAge))
-	if err != nil {
-		note(fmt.Sprintf("prepared-xacts-fail: %v", err))
+	p.hygienePreparedXactsWithBatch(ctx, pg, user, pass, h, nil, 1, note)
+}
+
+func (p *Probe) hygienePreparedXactsWithBatch(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, batch *probeBatch, backendEnv int64, note func(string)) {
+	var out string
+	switch {
+	case batch != nil && batch.err == nil && batch.pxSeen:
+		out = strings.Join(batch.pxLines, "\n")
+	case batch == nil || batch.canFallback(ctx, backendEnv):
+		var err error
+		out, err = p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
+			"SELECT gid FROM pg_prepared_xacts "+
+				"WHERE database IN ('postgres','kine') "+
+				"AND prepared < now() - interval '%s'", preparedXactOrphanAge))
+		if err != nil {
+			note(fmt.Sprintf("prepared-xacts-fail: %v", err))
+			return
+		}
+	default:
+		note(fmt.Sprintf("prepared-xacts-fail: %v", batch.err))
 		return
 	}
 	h.preparedSeen = true // a successful empty read = no orphans

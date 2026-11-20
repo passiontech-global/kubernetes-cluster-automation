@@ -43,8 +43,8 @@ func TestIsFatalDialErr(t *testing.T) {
 	if !isFatalDialErr(os.ErrPermission) {
 		t.Fatal("os.ErrPermission must latch disabled")
 	}
-	if !isFatalDialErr(os.ErrNotExist) {
-		t.Fatal("os.ErrNotExist must latch disabled")
+	if isFatalDialErr(os.ErrNotExist) {
+		t.Fatal("os.ErrNotExist must NOT latch disabled (transient during daemon-reexec)")
 	}
 	if !isFatalDialErr(fmt.Errorf("wrap: %w", syscall.EACCES)) {
 		t.Fatal("EACCES must latch disabled")
@@ -150,8 +150,12 @@ func TestDBusHelpersAndDisabledPaths(t *testing.T) {
 		t.Fatal("transient error disabled backend")
 	}
 	b.maybeDisable(os.ErrNotExist)
+	if b.disabled.Load() {
+		t.Fatal("ErrNotExist must not permanently disable backend")
+	}
+	b.maybeDisable(os.ErrPermission)
 	if !b.disabled.Load() {
-		t.Fatal("ErrNotExist did not disable backend")
+		t.Fatal("ErrPermission did not disable backend")
 	}
 	b.close()
 	b.dropConn(&sdbus.Conn{})

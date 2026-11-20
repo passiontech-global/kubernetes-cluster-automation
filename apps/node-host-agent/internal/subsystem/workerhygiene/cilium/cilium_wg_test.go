@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -389,4 +390,116 @@ func TestWGHealthyCountClearsLatch(t *testing.T) {
 		t.Fatalf("Fails=%d latch=%v want both cleared at the expected count",
 			wg.Fails, e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe))
 	}
+}
+
+func TestWGSysClassNetUnreadableAbortsPreservingState(t *testing.T) {
+	t.Run("sysnet-not-dir", func(t *testing.T) {
+		e, env, dump, now := wgFixture(t)
+		stale := now.Unix() - 11*60
+		// Seed 3 cycles for pubB (stalledCycles=2, one cycle away from zombie)
+		// plus Fails=1 and LatchCiliumWGPeerWipe armed.
+		for i := range 3 {
+			*now = now.Add(time.Minute)
+			*dump = wgPeer("pubA", "10.0.0.2/32", now.Unix()-30, 1000+int64(i)*100, 2000) +
+				wgPeer("pubB", "10.0.0.3/32", stale, 5000, 1000+int64(i)*1000)
+			wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Run(context.Background(), env)
+		}
+		wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
+		wg.Fails = 1
+		e.H.State.Enter(latchdefs.LatchCiliumWGPeerWipe, "armed")
+
+		origSysNet := e.H.Cfg.SysClassNet
+		notDir := filepath.Join(t.TempDir(), "not-a-dir")
+		wdepstest.WriteFile(t, notDir, "x")
+		e.H.Cfg.SysClassNet = notDir
+
+		*now = now.Add(time.Minute)
+		wg.Run(context.Background(), env)
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1 on ENOTDIR", got)
+		}
+		if wg.Fails != 1 {
+			t.Fatalf("Fails=%d want 1 preserved on ENOTDIR", wg.Fails)
+		}
+		if !e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+			t.Fatal("LatchCiliumWGPeerWipe exited on ENOTDIR")
+		}
+		if strings.Contains(wgLog(t, e), "STATE-EXIT: cilium-wg-peer-wipe") {
+			t.Fatalf("unexpected STATE-EXIT in log:\n%s", wgLog(t, e))
+		}
+
+		// Recover SysClassNet: pubB's 3rd stalled cycle must classify immediately (peerStats preserved),
+		// driving Fails from 1 -> 2 and triggering kill.
+		e.H.Cfg.SysClassNet = origSysNet
+		*now = now.Add(time.Minute)
+		*dump = wgPeer("pubA", "10.0.0.2/32", now.Unix()-30, 1400, 2000) +
+			wgPeer("pubB", "10.0.0.3/32", stale, 5000, 4000)
+		wg.Run(context.Background(), env)
+		if !strings.Contains(wgLog(t, e), "zombie peer") {
+			t.Fatalf("peerStats wiped during ENOTDIR (zombie did not classify on recovery):\n%s", wgLog(t, e))
+		}
+		if len(e.Kills) == 0 {
+			t.Fatalf("expected kill after recovery when Fails was preserved at 1: log=\n%s", wgLog(t, e))
+		}
+	})
+
+	t.Run("sysnet-chmod-0000-and-enoent-recovery", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 0000 does not block root")
+		}
+		e, env, dump, now := wgFixture(t)
+		stale := now.Unix() - 11*60
+		for i := range 3 {
+			*now = now.Add(time.Minute)
+			*dump = wgPeer("pubA", "10.0.0.2/32", now.Unix()-30, 1000+int64(i)*100, 2000) +
+				wgPeer("pubB", "10.0.0.3/32", stale, 5000, 1000+int64(i)*1000)
+			wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG).Run(context.Background(), env)
+		}
+		wg := wdepstest.Check[*cilium.CiliumWGCheck](e.H, wdeps.CheckCiliumWG)
+		wg.Fails = 1
+		e.H.State.Enter(latchdefs.LatchCiliumWGPeerWipe, "armed")
+
+		if err := os.Chmod(e.SysNet, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(e.SysNet, 0o755) })
+
+		*now = now.Add(time.Minute)
+		wg.Run(context.Background(), env)
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumWG, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1 on EACCES", got)
+		}
+		if wg.Fails != 1 {
+			t.Fatalf("Fails=%d want 1 preserved on EACCES", wg.Fails)
+		}
+		if !e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+			t.Fatal("LatchCiliumWGPeerWipe falsely exited on SysClassNet 0o000")
+		}
+
+		// Restore and verify peerStats + Fails survive, then verify ENOENT still clears cleanly.
+		if err := os.Chmod(e.SysNet, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		*now = now.Add(time.Minute)
+		*dump = wgPeer("pubA", "10.0.0.2/32", now.Unix()-30, 1400, 2000) +
+			wgPeer("pubB", "10.0.0.3/32", stale, 5000, 4000)
+		wg.Run(context.Background(), env)
+		if !strings.Contains(wgLog(t, e), "zombie peer") {
+			t.Fatalf("peerStats wiped during 0o000:\n%s", wgLog(t, e))
+		}
+		if len(e.Kills) == 0 {
+			t.Fatalf("Fails wiped during 0o000 (no kill on recovery)")
+		}
+
+		// ENOENT (cilium_wg0 removed) must clear Fails and exit LatchCiliumWGPeerWipe.
+		if err := os.RemoveAll(filepath.Join(e.SysNet, "cilium_wg0")); err != nil {
+			t.Fatal(err)
+		}
+		wg.Fails = 3
+		wg.Run(context.Background(), env)
+		if wg.Fails != 0 || e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+			t.Fatalf("ENOENT failed to clear state: Fails=%d latch=%v",
+				wg.Fails, e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe))
+		}
+	})
 }

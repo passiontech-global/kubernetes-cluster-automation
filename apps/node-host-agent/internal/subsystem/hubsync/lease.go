@@ -6,6 +6,8 @@ package hubsync
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
+	"sync"
 	"time"
 
 	coordv1 "k8s.io/api/coordination/v1"
@@ -28,6 +30,13 @@ type lease struct {
 	identity string
 	duration time.Duration
 	now      timex.Clock
+
+	mu              sync.Mutex
+	observedHolder  string
+	observedRenew   time.Time
+	observedDur     time.Duration
+	peerDeadline    time.Time
+	observedLastNow time.Time
 }
 
 // leaseOpTimeout bounds every single Lease API call. Without it a
@@ -59,23 +68,96 @@ func (l *lease) leaseUpdate(ctx context.Context, lease *coordv1.Lease) error {
 	return err
 }
 
+func (l *lease) clearObservation() {
+	l.mu.Lock()
+	l.observedHolder = ""
+	l.observedRenew = time.Time{}
+	l.observedDur = 0
+	l.peerDeadline = time.Time{}
+	l.observedLastNow = time.Time{}
+	l.mu.Unlock()
+}
+
+func (l *lease) peerExpired(holder string, cur *coordv1.Lease, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if cur.Spec.RenewTime == nil || cur.Spec.LeaseDurationSeconds == nil {
+		l.observedHolder = holder
+		l.observedRenew = time.Time{}
+		l.observedDur = 0
+		l.peerDeadline = time.Time{}
+		l.observedLastNow = now
+		return true
+	}
+	dur := time.Duration(*cur.Spec.LeaseDurationSeconds) * time.Second
+	if dur < 0 {
+		dur = 0
+	}
+	curRenew := cur.Spec.RenewTime.Time
+	if !l.observedLastNow.IsZero() && now.Before(l.observedLastNow) {
+		// Wall-only clock stepped backward: shift peerDeadline back so a
+		// dead peer's remaining window does not stretch.
+		l.peerDeadline = l.peerDeadline.Add(-l.observedLastNow.Sub(now))
+	}
+	switch {
+	case holder != l.observedHolder || l.observedRenew.IsZero():
+		rem := curRenew.Add(dur).Sub(now)
+		if rem < 0 {
+			rem = 0
+		} else if rem > dur {
+			rem = dur
+		}
+		l.observedHolder = holder
+		l.observedRenew = curRenew
+		l.observedDur = dur
+		l.peerDeadline = now.Add(rem)
+	case curRenew.After(l.observedRenew):
+		// Peer actively renewed since last observation — grant full local dur
+		// regardless of wall-clock skew between nodes.
+		l.observedRenew = curRenew
+		l.observedDur = dur
+		l.peerDeadline = now.Add(dur)
+	case curRenew.Before(l.observedRenew):
+		rem := curRenew.Add(dur).Sub(now)
+		if rem < 0 {
+			rem = 0
+		} else if rem > dur {
+			rem = dur
+		}
+		l.observedRenew = curRenew
+		l.observedDur = dur
+		l.peerDeadline = now.Add(rem)
+	default:
+		if dur != l.observedDur {
+			l.peerDeadline = l.peerDeadline.Add(dur - l.observedDur)
+			l.observedDur = dur
+		}
+	}
+	l.observedLastNow = now
+	return !now.Before(l.peerDeadline)
+}
+
 // renew performs one acquire/renew step and reports whether the
 // caller holds the lease after it, plus the moment the claim lapses
-// (our fresh RenewTime + the advertised duration — the same window a
-// competing pod waits before takeover). API errors and Update
-// conflicts are logged by the caller and simply yield "not held" —
-// the next RenewInterval tick retries.
+// (captured BEFORE the API call with monotonic readings intact so API
+// latency and NTP steps cannot extend our local hold past the server's
+// RenewTime + dur). API errors and Update conflicts are logged by the
+// caller and simply yield "not held" — the next RenewInterval tick retries.
 func (l *lease) renew(ctx context.Context) (bool, time.Time, error) {
-	now := l.now()
+	reqStart := l.now()
 	durSec := int32(l.duration.Round(time.Second).Seconds())
 	if durSec <= 0 {
 		durSec = 1
 	}
+	dur := time.Duration(durSec) * time.Second
+	// Preserve Go monotonic readings from reqStart (do NOT derive from mt.Time).
+	expiresAt := reqStart.Add(dur)
 
 	cur, err := l.leaseGet(ctx)
 	switch {
 	case apierrors.IsNotFound(err):
-		mt := metav1.NewMicroTime(now)
+		l.clearObservation()
+		mt := metav1.NewMicroTime(reqStart)
 		err = l.leaseCreate(ctx, &coordv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{Name: l.name},
 			Spec: coordv1.LeaseSpec{
@@ -89,7 +171,7 @@ func (l *lease) renew(ctx context.Context) (bool, time.Time, error) {
 			// Another pod won the create race — we're not the holder.
 			return false, time.Time{}, err
 		}
-		return true, mt.Time.Add(time.Duration(durSec) * time.Second), nil
+		return true, expiresAt, nil
 	case err != nil:
 		return false, time.Time{}, err
 	}
@@ -99,13 +181,13 @@ func (l *lease) renew(ctx context.Context) (bool, time.Time, error) {
 		holder = *cur.Spec.HolderIdentity
 	}
 	expired := true
-	if cur.Spec.RenewTime != nil && cur.Spec.LeaseDurationSeconds != nil {
-		expired = now.After(cur.Spec.RenewTime.Time.Add(
-			time.Duration(*cur.Spec.LeaseDurationSeconds) * time.Second))
+	if holder != "" && holder != l.identity {
+		expired = l.peerExpired(holder, cur, reqStart)
+	} else {
+		l.clearObservation()
 	}
 
-	mt := metav1.NewMicroTime(now)
-	expiresAt := mt.Time.Add(time.Duration(durSec) * time.Second)
+	mt := metav1.NewMicroTime(reqStart)
 	switch {
 	case holder == l.identity:
 		// Heartbeat — also adopt a changed configured duration,
@@ -134,6 +216,7 @@ func (l *lease) renew(ctx context.Context) (bool, time.Time, error) {
 		if err := l.leaseUpdate(ctx, cur); err != nil {
 			return false, time.Time{}, fmt.Errorf("acquire lease: %w", err)
 		}
+		l.clearObservation()
 		return true, expiresAt, nil
 	default:
 		return false, time.Time{}, nil
@@ -152,7 +235,7 @@ func (s *Syncer) leaseLoop(ctx context.Context) {
 		// rather than two pods holding it).
 		if r := recover(); r != nil {
 			s.cfg.Log.Error("hubsync: lease loop panicked — heartbeats stop, lease will lapse",
-				"panic", r)
+				"panic", r, "stack", string(debug.Stack()))
 		}
 	}()
 	for {
@@ -166,6 +249,7 @@ func (s *Syncer) leaseLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			t.Stop()
+			s.closeBastions()
 			return
 		case <-t.C:
 		}
@@ -182,7 +266,19 @@ func (s *Syncer) leaseLoop(ctx context.Context) {
 func (s *Syncer) leaseHeld() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.held && s.cfg.Clock.Now().Before(s.leaseExpiresAt)
+	if !s.held {
+		return false
+	}
+	now := s.cfg.Clock.Now()
+	if !s.leaseLastNow.IsZero() {
+		if now.Before(s.leaseLastNow) {
+			// Wall-only fake clock stepped backward: shift expiry back by the
+			// jump so the remaining local hold never expands.
+			s.leaseExpiresAt = s.leaseExpiresAt.Add(-s.leaseLastNow.Sub(now))
+		}
+		s.leaseLastNow = now
+	}
+	return now.Before(s.leaseExpiresAt)
 }
 
 // freshHold reports whether the lease is held but no cycle ran yet
@@ -209,7 +305,6 @@ func (s *Syncer) renewLease(ctx context.Context) bool {
 			"lease", s.cfg.LeaseNamespace+"/"+s.cfg.LeaseName, "error", err)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.held && held {
 		s.cfg.Log.Info("hubsync: lease acquired",
 			"lease", s.cfg.LeaseNamespace+"/"+s.cfg.LeaseName)
@@ -221,6 +316,7 @@ func (s *Syncer) renewLease(ctx context.Context) bool {
 	if !held {
 		s.syncedWhileHeld = false
 		s.leaseExpiresAt = time.Time{}
+		s.leaseLastNow = time.Time{}
 		// Any !held — genuine loss OR a renew error (we can't
 		// distinguish; leaseHeld() treats both as not-held) —
 		// kills the in-flight converge, not just the next target.
@@ -230,7 +326,12 @@ func (s *Syncer) renewLease(ctx context.Context) bool {
 		}
 	} else {
 		s.leaseExpiresAt = expiresAt
+		s.leaseLastNow = s.cfg.Clock.Now()
 	}
 	s.held = held
+	s.mu.Unlock()
+	if !held {
+		s.closeBastions()
+	}
 	return held
 }

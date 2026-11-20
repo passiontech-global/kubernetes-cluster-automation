@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
@@ -198,4 +199,25 @@ func WriteIntFile(path string, v int64) {
 		[]byte(strconv.FormatInt(v, 10)+"\n")); err != nil {
 		logger().Warn("kinedb state file write failed", "file", path, "error", err)
 	}
+}
+
+const cooldownFutureSkew = time.Minute
+
+// CooldownActive reports whether epochPath holds a timestamp within window of
+// now. A timestamp more than cooldownFutureSkew in the future (backward NTP
+// jump / corrupt RTC) is self-healed to now (unless readOnly) so the gate
+// stays closed for at most one window instead of hours/years.
+func CooldownActive(epochPath string, now time.Time, window time.Duration, readOnly bool) bool {
+	epoch, err := ReadIntFile(epochPath)
+	if err != nil {
+		return false
+	}
+	delta := now.Sub(time.Unix(epoch, 0))
+	if delta < -cooldownFutureSkew {
+		if !readOnly {
+			WriteIntFile(epochPath, now.Unix())
+		}
+		return true
+	}
+	return delta < window
 }

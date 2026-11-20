@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -93,6 +95,9 @@ type Config struct {
 	// derived dir the MTU blackhole gauge used before the env
 	// override existed.
 	TextfileDir string
+	// Coord is the L1↔L3 node coordination handle (optional; nil in
+	// standalone/minimal tests).
+	Coord *nodecoord.Coord
 
 	// Seams — nil gets production defaults.
 	// runHostCmd executes a host binary (ip, ping): hostexec NSNet —
@@ -111,6 +116,11 @@ type Config struct {
 	dnsProbe func(ctx context.Context, nameserver, name string) (string, error)
 	// tcpProbe is tcp_ok host port timeout parity.
 	tcpProbe func(ctx context.Context, host, port string, timeout time.Duration) error
+	// tcpProbeMarked dials host:port with SO_MARK = 0x2000 so packets hit
+	// pref 1390 fwmark 0x2000 lookup main without dropping live pref-1500
+	// rules. markErr is non-nil only when setsockopt(SO_MARK) itself fails
+	// (e.g. EPERM without CAP_NET_ADMIN).
+	tcpProbeMarked func(ctx context.Context, host, port string, timeout time.Duration) (probeErr, markErr error)
 	// ping probes one IP: marked=true → SO_MARK 0x2000 underlay pin
 	// (ping -m 8192); returns reachability + min RTT ms.
 	ping func(ctx context.Context, ip string, count, waitSec int, marked bool) (bool, float64)
@@ -269,6 +279,9 @@ func (c *Config) applyDefaults() {
 			return conn.Close()
 		}
 	}
+	if c.tcpProbeMarked == nil {
+		c.tcpProbeMarked = defaultTCPProbeMarked
+	}
 	if c.ping == nil {
 		run := c.runHostCmd
 		c.ping = func(ctx context.Context, ip string, count, waitSec int, marked bool) (bool, float64) {
@@ -310,4 +323,34 @@ func (c *Config) applyDefaults() {
 	if c.adjtimexFn == nil {
 		c.adjtimexFn = unix.Adjtimex
 	}
+}
+
+func defaultTCPProbeMarked(ctx context.Context, host, port string, timeout time.Duration) (probeErr, markErr error) {
+	dctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var sockMarkErr error
+	d := net.Dialer{
+		Control: func(_, _ string, rc syscall.RawConn) error {
+			var sErr error
+			if cerr := rc.Control(func(fd uintptr) {
+				sErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, 0x2000)
+			}); cerr != nil {
+				sockMarkErr = cerr
+				return cerr
+			}
+			if sErr != nil {
+				sockMarkErr = sErr
+				return sErr
+			}
+			return nil
+		},
+	}
+	conn, err := d.DialContext(dctx, "tcp", net.JoinHostPort(host, port))
+	if sockMarkErr != nil {
+		return nil, sockMarkErr
+	}
+	if err != nil {
+		return err, nil
+	}
+	return conn.Close(), nil
 }

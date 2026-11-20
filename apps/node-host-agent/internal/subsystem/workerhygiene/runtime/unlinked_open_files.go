@@ -72,7 +72,7 @@ type UnlinkedOpenFilesCheck struct {
 func (c *UnlinkedOpenFilesCheck) Name() string { return wdeps.CheckUnlinkedOpenFiles }
 
 // Run executes one unlinked-open-files round.
-func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
+func (c *UnlinkedOpenFilesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckUnlinkedOpenFiles) {
 		return
 	}
@@ -92,12 +92,17 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	// The fd walk is IO on the disk that is already full — at most
 	// once per BloatScanInterval while over the watermark; the last
 	// exported series values persist meanwhile.
-	if c.d.Cfg.Seams.Host.Clock.Now().Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
+	now := c.d.Cfg.Seams.Host.Clock.Now()
+	if now.Sub(c.lastScan) < c.d.Cfg.Disk.BloatScanInterval {
 		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
 		return
 	}
-	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
-	total, count, holderBytes, holderPids := c.sweep(e)
+	total, count, holderBytes, holderPids, sweepOK := c.sweep(e)
+	if !sweepOK {
+		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "inconclusive")
+		return
+	}
+	c.lastScan = now
 	c.d.UnlinkedOpenFileBytes = total
 	c.d.UnlinkedOpenFileCount = int64(count)
 	if len(holderPids) == 0 {
@@ -112,6 +117,12 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: unlinked-open-files shipper-held=%d below %d — no SIGHUP (total=%d files=%d)",
 			shipperBytes, unlinkedSighupBytes, total, count))
+		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
+		return
+	}
+	if c.d.HoldLocalAction(ctx) {
+		c.d.State.AppendLog(
+			"cleanup: unlinked-open-files SIGHUP held - cluster maintenance in progress")
 		c.d.CycleResult(wdeps.CheckUnlinkedOpenFiles, "ok")
 		return
 	}
@@ -144,27 +155,35 @@ func (c *UnlinkedOpenFilesCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 // log-shipper comms (holderBytes/holderPids — only comms in
 // unlinkedSighupComms appear, sorted pid list for the caller).
 func (c *UnlinkedOpenFilesCheck) sweep(e *wdeps.CycleEnv) (total int64,
-	count int, holderBytes map[int]int64, holderPids []int) {
-	pids := []int(nil)
-	if e != nil && e.PidsOnce != nil {
-		pids = e.PidsOnce()
-	} else {
-		pids, _ = c.d.Proc.PIDs()
+	count int, holderBytes map[int]int64, holderPids []int, sweepOK bool) {
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		return 0, 0, nil, nil, false
 	}
 	type inodeKey struct{ dev, ino uint64 }
 	seen := map[inodeKey]bool{}
 	shipperSeen := map[int]map[inodeKey]bool{}
 	holderBytes = map[int]int64{}
+	nonENOENT := 0
 	for _, pid := range pids {
 		fdDir := c.d.Proc.File(pid, "fd")
 		fds, err := os.ReadDir(fdDir)
 		if err != nil {
+			if !os.IsNotExist(err) {
+				nonENOENT++
+			}
 			continue
 		}
 		for _, fd := range fds {
 			link := filepath.Join(fdDir, fd.Name())
 			target, err := os.Readlink(link)
-			if err != nil || !strings.HasSuffix(target, " (deleted)") {
+			if err != nil {
+				if !os.IsNotExist(err) {
+					nonENOENT++
+				}
+				continue
+			}
+			if !strings.HasSuffix(target, " (deleted)") {
 				continue
 			}
 			// memfd/shm deleted files pin anonymous memory or tmpfs,
@@ -200,10 +219,13 @@ func (c *UnlinkedOpenFilesCheck) sweep(e *wdeps.CycleEnv) (total int64,
 			}
 		}
 	}
+	if nonENOENT > 0 {
+		return 0, 0, nil, nil, false
+	}
 	for pid := range holderBytes {
 		holderPids = append(holderPids, pid)
 	}
-	return total, count, holderBytes, holderPids
+	return total, count, holderBytes, holderPids, true
 }
 
 // procComm reads /proc/<pid>/comm trimmed — "" on a raced exit.

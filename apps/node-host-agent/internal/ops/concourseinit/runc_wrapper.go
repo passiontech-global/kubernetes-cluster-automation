@@ -155,7 +155,8 @@ func injectSharedCacheMount(configPath, source string) {
 	// whitespace is compacted; byte-parity of the whole file was
 	// never the contract (the awk rewrite changed formatting too).
 	var spec map[string]jsontext.Value
-	if err := json.Unmarshal(data, &spec); err != nil {
+	if err := json.Unmarshal(data, &spec,
+		jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true)); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"concourse-runc-wrapper: parse %s: %v — passthrough\n",
 			configPath, err)
@@ -169,7 +170,8 @@ func injectSharedCacheMount(configPath, source string) {
 		} `json:"uidMappings"`
 	}
 	if raw, ok := spec["linux"]; ok {
-		_ = json.Unmarshal(raw, &linux) // parse error → treated absent
+		_ = json.Unmarshal(raw, &linux,
+			jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true)) // parse error → treated absent
 	}
 	host := false
 	for _, m := range linux.UIDMappings {
@@ -182,7 +184,8 @@ func injectSharedCacheMount(configPath, source string) {
 	// Conditions 2+3: /scratch present, /shared-cache absent.
 	var mounts []jsontext.Value
 	if raw, ok := spec["mounts"]; ok {
-		if err := json.Unmarshal(raw, &mounts); err != nil {
+		if err := json.Unmarshal(raw, &mounts,
+			jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true)); err != nil {
 			fmt.Fprintf(os.Stderr,
 				"concourse-runc-wrapper: parse mounts in %s: %v — passthrough\n",
 				configPath, err)
@@ -195,7 +198,8 @@ func injectSharedCacheMount(configPath, source string) {
 		var md struct {
 			Destination string `json:"destination"`
 		}
-		if err := json.Unmarshal(m, &md); err != nil {
+		if err := json.Unmarshal(m, &md,
+			jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true)); err != nil {
 			continue // unparseable entry is not a mount we match
 		}
 		switch md.Destination {
@@ -219,7 +223,8 @@ func injectSharedCacheMount(configPath, source string) {
 		Type        string   `json:"type"`
 		Source      string   `json:"source"`
 		Options     []string `json:"options"`
-	}{"/shared-cache", "bind", source, []string{"bind", "rw"}})
+	}{"/shared-cache", "bind", source, []string{"bind", "rw"}},
+		jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
 			"concourse-runc-wrapper: marshal injected mount: %v — passthrough\n",
@@ -227,7 +232,8 @@ func injectSharedCacheMount(configPath, source string) {
 		return
 	}
 	mounts = slices.Insert(mounts, scratch, jsontext.Value(entry))
-	newMounts, err := json.Marshal(mounts)
+	newMounts, err := json.Marshal(mounts,
+		jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
 			"concourse-runc-wrapper: marshal mounts for %s: %v — passthrough\n",
@@ -235,7 +241,9 @@ func injectSharedCacheMount(configPath, source string) {
 		return
 	}
 	spec["mounts"] = newMounts
-	out, err := json.Marshal(spec, json.Deterministic(true))
+	out, err := json.Marshal(spec,
+		jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true),
+		json.Deterministic(true))
 	if err != nil {
 		fmt.Fprintf(os.Stderr,
 			"concourse-runc-wrapper: marshal %s: %v — passthrough\n",

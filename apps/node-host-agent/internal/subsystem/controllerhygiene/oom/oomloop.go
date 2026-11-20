@@ -224,6 +224,7 @@ func (c *LoopCheck) pruneKills(killsPath string, now int64) int {
 		return 0
 	}
 	cutoff := now - int64(c.d.Cfg.OOMLoop.Window.Seconds())
+	const futureSkewSec = 60
 	var kept []string
 	for rest := string(data); rest != ""; {
 		line, after, _ := strings.Cut(rest, "\n")
@@ -231,6 +232,9 @@ func (c *LoopCheck) pruneKills(killsPath string, now int64) int {
 		ts, err := strconv.ParseInt(strings.TrimSpace(line), 10, 64)
 		if err != nil || ts < cutoff {
 			continue
+		}
+		if ts > now+futureSkewSec {
+			ts = now
 		}
 		kept = append(kept, strconv.FormatInt(ts, 10))
 	}

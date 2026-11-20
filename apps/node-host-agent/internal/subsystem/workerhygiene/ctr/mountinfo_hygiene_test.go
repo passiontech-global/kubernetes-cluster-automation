@@ -264,9 +264,20 @@ func TestMountinfoPodVolumeOrphanReaped(t *testing.T) {
 	writeMountinfo(t, e, []string{miLine(mount)})
 	e.SDReply["umount"] = ""
 
-	miCycle(e) // apiserver has no such pod (empty CS), no ctr tasks
+	miCycle(e) // first sighting: marker only, no umount
+	if e.SDRan("umount") {
+		t.Fatal("umount ran on first sighting of pod volume")
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "mi-vol-seen-"+uid)); err != nil {
+		t.Fatalf("mi-vol-seen marker not created: %v", err)
+	}
+	e.Now = e.Now.Add(31 * time.Minute)
+	miCycle(e) // confirmed past 30m → umount + prune marker
 	if !e.SDRan("umount -l " + mount) {
 		t.Fatalf("no umount of the orphan pod volume; sdcmds=%v", e.SDCmds)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "mi-vol-seen-"+uid)); !os.IsNotExist(err) {
+		t.Fatal("mi-vol-seen marker not pruned after reap")
 	}
 }
 
@@ -428,6 +439,11 @@ func TestMountinfoEscapedMountPoints(t *testing.T) {
 	writeMountinfo(t, e, []string{miLine(escaped)})
 	e.SDReply["umount"] = ""
 	miCycle(e)
+	if e.SDRan("umount") {
+		t.Fatal("umount ran on first sighting")
+	}
+	e.Now = e.Now.Add(31 * time.Minute)
+	miCycle(e)
 	if !e.SDRan("umount -l " + vol) {
 		t.Fatalf("escaped mount point not decoded for the reaper; sdcmds=%v", e.SDCmds)
 	}
@@ -491,7 +507,9 @@ func TestMountinfoPodVolumeCapBoundsThePass(t *testing.T) {
 	}
 	writeMountinfo(t, e, lines)
 	e.SDReply["umount"] = ""
-	miCycle(e)
+	miCycle(e) // confirm markers
+	e.Now = e.Now.Add(31 * time.Minute)
+	miCycle(e) // reap up to cap
 	umounts := 0
 	for _, c := range e.SDCmds {
 		if strings.Contains(strings.Join(c, " "), "umount -l") {
@@ -503,5 +521,112 @@ func TestMountinfoPodVolumeCapBoundsThePass(t *testing.T) {
 	}
 	if n := strings.Count(e.LogLines(t), "reap cap"); n != 1 {
 		t.Fatalf("reap-cap lines=%d want 1", n)
+	}
+}
+
+func TestMountinfoPodVolumeMultiVolumeAllReapedAfterConfirm(t *testing.T) {
+	e := fixture(t)
+	uid := strings.Repeat("f", 36)
+	podDir := filepath.Join(e.KubepodsDir, uid)
+	vol1 := filepath.Join(podDir, "volumes", "kubernetes.io~empty-dir", "v1")
+	vol2 := filepath.Join(podDir, "volumes", "kubernetes.io~empty-dir", "v2")
+	wdepstest.WriteFile(t, filepath.Join(vol1, "a"), "x")
+	wdepstest.WriteFile(t, filepath.Join(vol2, "b"), "y")
+	stale := e.Now.Add(-time.Hour)
+	if err := os.Chtimes(podDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	writeMountinfo(t, e, []string{miLine(vol1), miLine(vol2)})
+	e.SDReply["umount"] = ""
+
+	miCycle(e)
+	if e.SDRan("umount") {
+		t.Fatal("umount ran before 30m confirm")
+	}
+	e.Now = e.Now.Add(31 * time.Minute)
+	miCycle(e)
+	if !e.SDRan("umount -l "+vol1) || !e.SDRan("umount -l "+vol2) {
+		t.Fatalf("both volumes should be unmounted after confirm; sdcmds=%v", e.SDCmds)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "mi-vol-seen-"+uid)); !os.IsNotExist(err) {
+		t.Fatal("mi-vol-seen marker not pruned after all volumes unmounted")
+	}
+}
+
+func TestMountinfoOrphanUmountHeldByKuredTaintAndAPIDown(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Spec: corev1.NodeSpec{
+			Taints: []corev1.Taint{{Key: "weave.works/kured-node-reboot", Effect: corev1.TaintEffectNoSchedule}},
+		},
+	}
+	e := fixture(t, node)
+	e.H.Cfg.Coord = nodecoord.NewKube("node-a", e.CS)
+
+	// Confirmed Group 1 task rootfs orphan.
+	id := strings.Repeat("1", 64)
+	taskMount := filepath.Join(e.CtrDir, id, "rootfs")
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "mi-task-seen-"+id),
+		fmt.Sprintf("%d\n", e.Now.Add(-31*time.Minute).Unix()))
+
+	// Confirmed Group 2 pod volume orphan.
+	uid := strings.Repeat("2", 36)
+	podDir := filepath.Join(e.KubepodsDir, uid)
+	volMount := filepath.Join(podDir, "volumes", "kubernetes.io~empty-dir", "cache")
+	wdepstest.WriteFile(t, filepath.Join(volMount, "junk"), "x")
+	stale := e.Now.Add(-time.Hour)
+	if err := os.Chtimes(podDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "mi-vol-seen-"+uid),
+		fmt.Sprintf("%d\n", e.Now.Add(-31*time.Minute).Unix()))
+
+	writeMountinfo(t, e, []string{miLine(taskMount), miLine(volMount)})
+	e.SDReply["umount"] = ""
+
+	miCycle(e)
+	if e.SDRan("umount") {
+		t.Fatalf("umount ran while kured-node-reboot taint held local actions; sdcmds=%v", e.SDCmds)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "mi-task-seen-"+id)); err != nil {
+		t.Fatal("mi-task-seen marker dropped while held")
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "mi-vol-seen-"+uid)); err != nil {
+		t.Fatal("mi-vol-seen marker dropped while held")
+	}
+
+	// API outage (APIOK=false) must also preserve mi-vol-seen-* markers.
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(), &wdeps.CycleEnv{
+		APIOK:        false,
+		WorkerActive: true,
+	})
+	if _, err := os.Stat(filepath.Join(e.StateDir, "mi-vol-seen-"+uid)); err != nil {
+		t.Fatal("mi-vol-seen marker pruned during API outage")
+	}
+}
+
+func TestMountinfoCtrTaskRootUnreadablePreservesTaskSeenMarker(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0000 does not block root")
+	}
+	e := fixture(t)
+	id := strings.Repeat("5", 64)
+	taskMount := filepath.Join(e.CtrDir, id, "rootfs")
+	marker := filepath.Join(e.StateDir, "mi-task-seen-"+id)
+	wdepstest.WriteFile(t, marker, fmt.Sprintf("%d\n", e.Now.Add(-31*time.Minute).Unix()))
+	writeMountinfo(t, e, []string{miLine(taskMount)})
+	e.SDReply["umount"] = ""
+
+	if err := os.Chmod(e.CtrDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.CtrDir, 0o755) })
+
+	miCycle(e)
+	if e.SDRan("umount") {
+		t.Fatalf("umount ran while CtrTaskRoot was unreadable: %v", e.SDCmds)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("mi-task-seen marker dropped while CtrTaskRoot was unreadable: %v", err)
 	}
 }

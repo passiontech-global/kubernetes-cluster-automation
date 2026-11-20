@@ -123,7 +123,7 @@ func (s *Sweeper) loadCycleInputs(ctx context.Context, log *slog.Logger) ([]os.D
 	}
 	apiCtx, cancel := s.apiCtx(ctx)
 	pvList, err := s.cfg.Client.CoreV1().PersistentVolumes().
-		List(apiCtx, metav1.ListOptions{})
+		List(apiCtx, metav1.ListOptions{ResourceVersion: "0"})
 	cancel()
 	if err != nil {
 		log.Error("ABORT: cannot list PVs", "error", err)
@@ -247,72 +247,118 @@ func (s *Sweeper) releaseStalePV(
 		s.skips.WithLabelValues(skipPVInUse).Inc()
 		return false
 	}
+	// The cluster-wide PV List uses ResourceVersion="0" (watch-cache),
+	// so it can lag behind live etcd. Before taking ANY mutating action
+	// (Patch/Delete), re-fetch the live PV via a consistent quorum
+	// GET (RV="") and re-verify UID, Released+Delete state, and ClaimRef.
+	apiCtx, cancel := s.apiCtx(ctx)
+	livePV, err := s.cfg.Client.CoreV1().PersistentVolumes().
+		Get(apiCtx, name, metav1.GetOptions{})
+	cancel()
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("SKIP: PV disappeared before release check",
+				"dir", name, "pv", name)
+		} else {
+			log.Info("SKIP: quorum get pv failed",
+				"dir", name, "pv", name, "error", err)
+		}
+		s.skips.WithLabelValues(skipPVGetError).Inc()
+		return false
+	}
+	if livePV.UID != pv.UID {
+		log.Info("SKIP: live PV UID changed since list",
+			"dir", name, "pv", name,
+			"listUID", pv.UID, "liveUID", livePV.UID)
+		s.skips.WithLabelValues(skipPVInUse).Inc()
+		return false
+	}
+	if livePV.Status.Phase != corev1.VolumeReleased ||
+		livePV.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimDelete {
+		log.Info("SKIP: live PV no longer Released+Delete — dir kept",
+			"dir", name, "pv", name,
+			"phase", livePV.Status.Phase,
+			"reclaimPolicy", livePV.Spec.PersistentVolumeReclaimPolicy)
+		s.skips.WithLabelValues(skipPVInUse).Inc()
+		return false
+	}
+	if livePV.Spec.ClaimRef == nil ||
+		livePV.Spec.ClaimRef.Namespace == "" ||
+		livePV.Spec.ClaimRef.Name == "" ||
+		!claimRefEqual(pv.Spec.ClaimRef, livePV.Spec.ClaimRef) {
+		log.Info("SKIP: live PV claimRef missing or changed since list",
+			"dir", name, "pv", name)
+		s.skips.WithLabelValues(skipClaimRefUnclear).Inc()
+		return false
+	}
+
 	// Released = PVC deleted — verify claimRef PVC is
 	// explicitly NotFound before acting (any API error → skip).
-	var cns, cname string
-	if pv.Spec.ClaimRef != nil {
-		cns = pv.Spec.ClaimRef.Namespace
-		cname = pv.Spec.ClaimRef.Name
-	}
-	if cns != "" && cname != "" {
-		apiCtx, cancel := s.apiCtx(ctx)
-		_, err := s.cfg.Client.CoreV1().PersistentVolumeClaims(cns).
-			Get(apiCtx, cname, metav1.GetOptions{})
-		cancel()
-		switch {
-		case apierrors.IsNotFound(err):
-			// claimRef clearly gone — proceed.
-		case err == nil:
-			log.Info("SKIP: PV Released but claimRef PVC still exists",
-				"dir", name, "pvc", cns+"/"+cname)
-			s.skips.WithLabelValues(skipClaimRefUnclear).Inc()
-			return false
-		default:
-			log.Info("SKIP: PV Released but claimRef PVC not clearly gone",
-				"dir", name, "pvc", cns+"/"+cname, "error", err)
-			s.skips.WithLabelValues(skipClaimRefUnclear).Inc()
-			return false
-		}
+	cns := livePV.Spec.ClaimRef.Namespace
+	cname := livePV.Spec.ClaimRef.Name
+	apiCtx, cancel = s.apiCtx(ctx)
+	_, err = s.cfg.Client.CoreV1().PersistentVolumeClaims(cns).
+		Get(apiCtx, cname, metav1.GetOptions{})
+	cancel()
+	switch {
+	case apierrors.IsNotFound(err):
+		// claimRef clearly gone — proceed.
+	case err == nil:
+		log.Info("SKIP: PV Released but claimRef PVC still exists",
+			"dir", name, "pvc", cns+"/"+cname)
+		s.skips.WithLabelValues(skipClaimRefUnclear).Inc()
+		return false
+	default:
+		log.Info("SKIP: PV Released but claimRef PVC not clearly gone",
+			"dir", name, "pvc", cns+"/"+cname, "error", err)
+		s.skips.WithLabelValues(skipClaimRefUnclear).Inc()
+		return false
 	}
 	// A Released PV can hold the pv-protection finalizer when
 	// the provisioner was evicted at the wrong moment — strip,
 	// then delete; the re-GET below returns NotFound → rm dir.
 	// The strip is UID+resourceVersion-preconditioned: between
-	// the vetting GET and this patch the PV could be deleted and
-	// RECREATED under the same pvc-<uuid> name — an
+	// the quorum GET and this patch the PV could be mutated,
+	// rebound, or RECREATED under the same pvc-<uuid> name — an
 	// unconditional merge patch would strip the replacement's
 	// finalizers too. A stale object fails the test op with 409.
 	log.Info("PV Released+Delete, claimRef gone — deleting PV object",
 		"pv", name, "pvc", orDash(cns)+"/"+orDash(cname))
-	var err error
-	if len(pv.Finalizers) > 0 {
+	rv := livePV.ResourceVersion
+	if len(livePV.Finalizers) > 0 {
 		fpatch, _ := json.Marshal([]map[string]any{
 			{"op": "test", "path": "/metadata/uid",
-				"value": string(pv.UID)},
+				"value": string(livePV.UID)},
 			{"op": "test", "path": "/metadata/resourceVersion",
-				"value": pv.ResourceVersion},
+				"value": livePV.ResourceVersion},
 			{"op": "replace", "path": "/metadata/finalizers",
 				"value": []any{}},
 		})
 		apiCtx, cancel := s.apiCtx(ctx)
-		_, err = s.cfg.Client.CoreV1().PersistentVolumes().Patch(apiCtx, name,
+		patchedPV, patchErr := s.cfg.Client.CoreV1().PersistentVolumes().Patch(apiCtx, name,
 			types.JSONPatchType, fpatch,
 			metav1.PatchOptions{})
 		cancel()
-		if err != nil {
-			log.Info("SKIP: patch finalizers failed", "dir", name, "error", err)
+		if patchErr != nil {
+			log.Info("SKIP: patch finalizers failed", "dir", name, "error", patchErr)
 			s.skips.WithLabelValues(skipPVPatchFailed).Inc()
 			return false
 		}
+		if patchedPV != nil && patchedPV.ResourceVersion != "" {
+			rv = patchedPV.ResourceVersion
+		}
 	}
-	apiCtx, cancel := s.apiCtx(ctx)
-	// UID precondition: between the vetting GET and this
-	// delete the PV could be recreated under the same
-	// pvc-<uuid> name — the precondition refuses to kill
-	// the replacement (kubeutil parity with every other
-	// delete site).
+	apiCtx, cancel = s.apiCtx(ctx)
+	// UID + ResourceVersion precondition: between the quorum GET
+	// (or finalizer Patch) and this delete the PV could be
+	// recreated or rebound/updated with the same UID — the
+	// preconditions refuse to kill the changed object.
+	delOpts := kubeutil.UIDDeleteOptions(livePV.UID, "")
+	if rv != "" {
+		delOpts.Preconditions.ResourceVersion = &rv
+	}
 	err = s.cfg.Client.CoreV1().PersistentVolumes().
-		Delete(apiCtx, name, kubeutil.UIDDeleteOptions(pv.UID, ""))
+		Delete(apiCtx, name, delOpts)
 	cancel()
 	if err != nil {
 		log.Info("SKIP: delete pv failed", "dir", name, "error", err)
@@ -320,6 +366,13 @@ func (s *Sweeper) releaseStalePV(
 		return false
 	}
 	return true
+}
+
+func claimRefEqual(a, b *corev1.ObjectReference) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Namespace == b.Namespace && a.Name == b.Name && a.UID == b.UID
 }
 
 func (s *Sweeper) pvGoneAndUnmounted(

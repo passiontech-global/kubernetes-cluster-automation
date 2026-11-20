@@ -286,3 +286,199 @@ func TestOrphanLoopDetachViaPID1Dev(t *testing.T) {
 		t.Fatalf("missing no-hostdev suspect line for loop9:\n%s", e.LogLines(t))
 	}
 }
+
+func TestOrphanLoopProcUnreadableFailsClosedForAllCandidates(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.MountinfoFile = filepath.Join(t.TempDir(), "mountinfo")
+	wdepstest.WriteFile(t, e.H.Cfg.MountinfoFile, "1 1 7:1 / / rw - ext4 /dev/vda1 rw\n")
+	for _, dev := range []string{"loop0", "loop1"} {
+		plantOrphanLoop(t, e, dev)
+		wdepstest.WriteFile(t, filepath.Join(e.H.Cfg.Wave3.HostDevDir, dev), "")
+		wdepstest.WriteFile(t, filepath.Join(e.StateDir, "loop-seen-"+dev),
+			fmt.Sprintf("%d\n", e.Now.Add(-31*time.Minute).Unix()))
+	}
+	if err := os.RemoveAll(e.ProcDir); err != nil {
+		t.Fatal(err)
+	}
+
+	var detached []string
+	e.H.Cfg.Seams.Host.DetachLoopFn = func(_ context.Context, devPath string) error {
+		detached = append(detached, devPath)
+		return nil
+	}
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+	if len(detached) != 0 {
+		t.Fatalf("detached=%v want none when /proc unreadable (all candidates must fail closed)", detached)
+	}
+	for _, dev := range []string{"loop0", "loop1"} {
+		if _, err := os.Stat(filepath.Join(e.StateDir, "loop-seen-"+dev)); err != nil {
+			t.Fatalf("loop-seen-%s marker was pruned on /proc unreadable: %v", dev, err)
+		}
+	}
+}
+
+func TestOrphanLoopNsMntDeduplicatesMountinfoReads(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.MountinfoFile = filepath.Join(t.TempDir(), "mountinfo")
+	wdepstest.WriteFile(t, e.H.Cfg.MountinfoFile, "1 1 7:1 / / rw - ext4 /dev/vda1 rw\n")
+
+	// PID 10 and PID 11 share ns/mnt "mnt:[111]". PID 10 has empty mountinfo;
+	// PID 11 has /dev/loop0. Because PID 10 succeeds first, PID 11 is skipped
+	// by seenNS dedup (proving mountinfo is read at most once per unique ns/mnt).
+	for _, pid := range []string{"10", "11"} {
+		nsDir := filepath.Join(e.ProcDir, pid, "ns")
+		if err := os.MkdirAll(nsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("mnt:[111]", filepath.Join(nsDir, "mnt")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "10", "mountinfo"), "1 1 7:1 / / rw - ext4 /dev/vda1 rw\n")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "11", "mountinfo"), "30 20 7:0 / /d rw - ext4 /dev/loop0 rw\n")
+
+	// PID 20 and PID 21 share ns/mnt "mnt:[222]". PID 20 lacks mountinfo (ReadFile
+	// fails), so seenNS["mnt:[222]"] must NOT be set; PID 21 IS read and protects loop1.
+	for _, pid := range []string{"20", "21"} {
+		nsDir := filepath.Join(e.ProcDir, pid, "ns")
+		if err := os.MkdirAll(nsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("mnt:[222]", filepath.Join(nsDir, "mnt")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "21", "mountinfo"), "30 20 7:1 / /d1 rw - ext4 /dev/loop1 rw\n")
+
+	// PID 30 has no ns/mnt symlink -> fallback still reads mountinfo and protects loop2.
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "30", "mountinfo"), "30 20 7:2 / /d2 rw - ext4 /dev/loop2 rw\n")
+
+	for _, dev := range []string{"loop0", "loop1", "loop2"} {
+		plantOrphanLoop(t, e, dev)
+		wdepstest.WriteFile(t, filepath.Join(e.H.Cfg.Wave3.HostDevDir, dev), "")
+		wdepstest.WriteFile(t, filepath.Join(e.StateDir, "loop-seen-"+dev),
+			fmt.Sprintf("%d\n", e.Now.Add(-31*time.Minute).Unix()))
+	}
+
+	var detached []string
+	e.H.Cfg.Seams.Host.DetachLoopFn = func(_ context.Context, devPath string) error {
+		detached = append(detached, devPath)
+		return nil
+	}
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+
+	// Only loop0 should be detached (PID 11 skipped via seenNS["mnt:[111]"]);
+	// loop1 (sibling fallback) and loop2 (missing ns/mnt fallback) stay protected.
+	if len(detached) != 1 || detached[0] != "/dev/loop0" {
+		t.Fatalf("detached=%v, want [/dev/loop0]", detached)
+	}
+}
+
+func TestOrphanLoopPodBackedAPIOKFalsePreservesMarkers(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.MountinfoFile = filepath.Join(t.TempDir(), "mountinfo")
+	wdepstest.WriteFile(t, e.H.Cfg.MountinfoFile, "1 1 7:1 / / rw - ext4 /dev/vda1 rw\n")
+
+	sysBlock := e.H.Cfg.Wave3.SysBlockDir
+	if err := os.MkdirAll(filepath.Join(sysBlock, "loop0", "loop"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sysBlock, "loop0", "holders"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sysBlock, "loop0", "loop", "backing_file"),
+		filepath.Join(e.KubepodsDir, wdepstest.UIDA, "disk.img")+"\n")
+	wdepstest.WriteFile(t, filepath.Join(e.H.Cfg.Wave3.HostDevDir, "loop0"), "")
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "loop-seen-loop0"),
+		fmt.Sprintf("%d\n", e.Now.Add(-31*time.Minute).Unix()))
+
+	var detached []string
+	e.H.Cfg.Seams.Host.DetachLoopFn = func(_ context.Context, devPath string) error {
+		detached = append(detached, devPath)
+		return nil
+	}
+
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        false,
+	})
+	if len(detached) != 0 {
+		t.Fatalf("detached=%v want none when APIOK=false", detached)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "loop-seen-loop0")); err != nil {
+		t.Fatalf("loop-seen-loop0 marker was pruned on APIOK=false: %v", err)
+	}
+}
+
+func TestLoopHygieneSysBlockUnreadablePreservesMarkers(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.MountinfoFile = filepath.Join(t.TempDir(), "mountinfo")
+	wdepstest.WriteFile(t, e.H.Cfg.MountinfoFile, "1 1 7:1 / / rw - ext4 /dev/vda1 rw\n")
+
+	marker := filepath.Join(e.StateDir, "loop-seen-loop0")
+	wdepstest.WriteFile(t, marker, fmt.Sprintf("%d\n", e.Now.Add(-31*time.Minute).Unix()))
+
+	notDir := filepath.Join(t.TempDir(), "not-a-dir")
+	wdepstest.WriteFile(t, notDir, "x")
+	e.H.Cfg.Wave3.SysBlockDir = notDir
+
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+	})
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("loop-seen-loop0 marker pruned when SysBlockDir unreadable (ENOTDIR): %v", err)
+	}
+}
+
+func TestLoopHygieneBackingFileUnreadablePreservesMarkers(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0000 does not block root")
+	}
+	e := fixture(t)
+	e.H.Cfg.MountinfoFile = filepath.Join(t.TempDir(), "mountinfo")
+	wdepstest.WriteFile(t, e.H.Cfg.MountinfoFile, "1 1 7:1 / / rw - ext4 /dev/vda1 rw\n")
+
+	plantOrphanLoop(t, e, "loop0")
+	wdepstest.WriteFile(t, filepath.Join(e.H.Cfg.Wave3.HostDevDir, "loop0"), "")
+	marker := filepath.Join(e.StateDir, "loop-seen-loop0")
+	wdepstest.WriteFile(t, marker, fmt.Sprintf("%d\n", e.Now.Add(-31*time.Minute).Unix()))
+
+	bf := filepath.Join(e.H.Cfg.Wave3.SysBlockDir, "loop0", "loop", "backing_file")
+	if err := os.Chmod(bf, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(bf, 0o644) })
+
+	var detached []string
+	e.H.Cfg.Seams.Host.DetachLoopFn = func(_ context.Context, devPath string) error {
+		detached = append(detached, devPath)
+		return nil
+	}
+
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+	})
+	if len(detached) != 0 {
+		t.Fatalf("detached=%v want none when backing_file unreadable", detached)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("loop-seen-loop0 marker pruned on backing_file EACCES: %v", err)
+	}
+
+	// Contrast with ENOENT (unattached loop): marker IS pruned.
+	if err := os.Chmod(bf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(bf); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Check(wdeps.CheckMountinfo).Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+	})
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("loop-seen-loop0 marker should be pruned when backing_file is ENOENT, got err=%v", err)
+	}
+}

@@ -27,6 +27,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
@@ -467,5 +469,509 @@ func TestFeederAccessorReturnsWiredFeeder(t *testing.T) {
 	e := fixture(t)
 	if e.H.Feeder() == nil {
 		t.Fatal("Feeder() must return the wired kubelet watchdog feeder")
+	}
+}
+
+func TestMountinfoOnceCachesPerCycleAndAllCallersConsumeIt(t *testing.T) {
+	e := fixture(t)
+	miPath := filepath.Join(t.TempDir(), "mountinfo")
+	wdepstest.WriteFile(t, miPath, "1 1 0:1 / / rw - ext4 /dev/vda1 rw\n")
+	e.H.Cfg.MountinfoFile = miPath
+
+	// Cycle 1: MountinfoOnce caches the read even if the file changes mid-cycle.
+	e.H.Cycle(context.Background())
+	wdepstest.WriteFile(t, miPath, "1 1 0:1 / /other rw - ext4 /dev/vda2 rw\n")
+	got1, err := e.H.envCell.MountinfoOnce()
+	if err != nil || !strings.Contains(string(got1), "/dev/vda1") {
+		t.Fatalf("Cycle 1 MountinfoOnce=%q err=%v, want cached /dev/vda1", got1, err)
+	}
+
+	// Cycle 2: MountinfoOnce resets and reads the updated file.
+	e.H.Cycle(context.Background())
+	got2, err := e.H.envCell.MountinfoOnce()
+	if err != nil || !strings.Contains(string(got2), "/dev/vda2") {
+		t.Fatalf("Cycle 2 MountinfoOnce=%q err=%v, want fresh /dev/vda2", got2, err)
+	}
+
+	// Verify all 4 mountinfo callers consume CycleEnv.MountinfoOnce (never raw MountinfoFile).
+	e.H.Cfg.MountinfoFile = filepath.Join(t.TempDir(), "missing-on-disk")
+	e.DiskUsed = 0.90
+	e.H.Cfg.Disk.WLayerSnapshotsDir = filepath.Join(t.TempDir(), "snapshots")
+	snapDir := filepath.Join(e.H.Cfg.Disk.WLayerSnapshotsDir, "1", "fs")
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(snapDir, "f"), "data")
+	orphanDir := filepath.Join(e.KubepodsDir, wdepstest.UIDA)
+	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := e.Now.Add(-2 * time.Hour)
+	_ = os.Chtimes(orphanDir, stale, stale)
+
+	onceCalls := 0
+	var once sync.Once
+	ce := &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		TasksOnce: func() (map[string][]wdeps.CtrTask, bool) {
+			return map[string][]wdeps.CtrTask{}, true
+		},
+		MountinfoOnce: func() ([]byte, error) {
+			once.Do(func() { onceCalls++ })
+			return []byte("1 1 0:1 / / rw - ext4 /dev/vda1 rw\n"), nil
+		},
+	}
+	for _, name := range []string{
+		wdeps.CheckMountinfo,
+		wdeps.CheckWritableLayer,
+		wdeps.CheckDiskBloat,
+		wdeps.CheckOrphanPodVols,
+	} {
+		e.H.Check(name).Run(context.Background(), ce)
+	}
+	if onceCalls != 1 {
+		t.Fatalf("MountinfoOnce underlying read=%d want 1 across 4 callers", onceCalls)
+	}
+	if strings.Contains(e.LogLines(t), "missing-on-disk") {
+		t.Fatalf("a check bypassed MountinfoOnce and read MountinfoFile directly:\n%s", e.LogLines(t))
+	}
+}
+
+func TestCiliumHealthzOnceCallsUnixGetOncePerCycleAndResets(t *testing.T) {
+	e := fixture(t)
+	e.MkCiliumTask(t, 4242)
+	e.MkProc(t, 4243, "S", "", "")
+	e.MkTask(t, wdepstest.UIDB, "cilium-envoy", 4243)
+	if err := os.MkdirAll(filepath.Join(e.SysNet, "cilium_wg0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Cfg.Seams.Cilium.WGDump = func(context.Context, *systemd.Client) (string, error) {
+		return "pub1\tpsk\t12.0.0.9:51820\t10.0.0.2/32\t1800000000\t100\t200\t25\n", nil
+	}
+	e.UnixBody = []byte(`{"ipam":{"ipv4":{"used":2,"available":10}},"cluster":{"nodes":[{}]}}`)
+
+	origGet := e.H.Cfg.Seams.Cilium.UnixGet
+	healthzCalls := 0
+	e.H.Cfg.Seams.Cilium.UnixGet = func(ctx context.Context, sock, path string) ([]byte, error) {
+		if path == "/v1/healthz" {
+			healthzCalls++
+		}
+		return origGet(ctx, sock, path)
+	}
+
+	e.H.Cycle(context.Background())
+	if healthzCalls != 1 {
+		t.Fatalf("Cycle 1 /v1/healthz calls=%d want 1 across ipam+envoy+wg", healthzCalls)
+	}
+
+	e.H.Cycle(context.Background())
+	if healthzCalls != 2 {
+		t.Fatalf("Cycle 2 /v1/healthz calls=%d want 2 (cache must reset per cycle)", healthzCalls)
+	}
+}
+
+// TestInotifyCycleWarmSharedFDCacheProcChmod0111KeepsLatch verifies that
+// a transient /proc ReadDir failure (0o111 traverse-only) inside the 60s
+// SharedFDCache TTL aborts inotify-pressure-hygiene instead of filtering
+// snap.Inotify down to an empty allowed map and clearing LatchInotifyPressure.
+func TestInotifyCycleWarmSharedFDCacheProcChmod0111KeepsLatch(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0o111 does not restrict ReadDir under UID 0")
+	}
+	e := fixture(t)
+	e.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 100
+	e.H.Cfg.Pressure.InotifyEvictRunawayPod = false
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "sys", "fs", "inotify", "max_user_instances"), "100\n")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "sys", "fs", "inotify", "max_user_watches"), "8192\n")
+
+	plantInotify := func(instances int) {
+		pidDir := filepath.Join(e.ProcDir, "100")
+		_ = os.RemoveAll(pidDir)
+		fdDir := filepath.Join(pidDir, "fd")
+		fiDir := filepath.Join(pidDir, "fdinfo")
+		if err := os.MkdirAll(fdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(fiDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for i := 1; i <= instances; i++ {
+			name := fmt.Sprintf("%d", i)
+			if err := os.Symlink("anon_inode:inotify", filepath.Join(fdDir, name)); err != nil {
+				t.Fatal(err)
+			}
+			wdepstest.WriteFile(t, filepath.Join(fiDir, name), "")
+		}
+		wdepstest.WriteFile(t, filepath.Join(pidDir, "cgroup"), "0::/user.slice/session-1.scope\n")
+	}
+
+	plantInotify(96)
+	ctx := context.Background()
+	e.H.Cycle(ctx) // cycle 1 — pending
+	e.H.Cycle(ctx) // cycle 2 — arms LatchInotifyPressure
+	if !e.H.Deps.State.Exists(latchdefs.LatchInotifyPressure) {
+		t.Fatal("expected LatchInotifyPressure to be armed after 2 cycles")
+	}
+
+	// Within the 60s SharedFDCache TTL, make /proc ReadDir fail while
+	// keeping sysctls and uptime traversable (0o111).
+	e.Now = e.Now.Add(10 * time.Second)
+	if err := os.Chmod(e.ProcDir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.ProcDir, 0o755) })
+
+	e.H.Cycle(ctx)
+	if !e.H.Deps.State.Exists(latchdefs.LatchInotifyPressure) {
+		t.Fatalf("transient /proc ReadDir failure inside SharedFDCache TTL cleared LatchInotifyPressure:\n%s",
+			e.LogLines(t))
+	}
+	if strings.Contains(e.LogLines(t), "STATE-EXIT: inotify-pressure") {
+		t.Fatalf("unexpected STATE-EXIT: inotify-pressure on /proc ReadDir failure:\n%s",
+			e.LogLines(t))
+	}
+
+	// Restore /proc, drop usage below clear ratio, advance past 60s TTL -> exits cleanly.
+	if err := os.Chmod(e.ProcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plantInotify(4)
+	e.Now = e.Now.Add(61 * time.Second)
+	e.H.Cycle(ctx)
+	if e.H.Deps.State.Exists(latchdefs.LatchInotifyPressure) {
+		t.Fatal("expected LatchInotifyPressure to clear once /proc recovered and usage dropped")
+	}
+}
+
+func TestAllChecksNilAndHandBuiltCycleEnvDoNotPanic(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+	for _, chk := range e.H.checks {
+		t.Run(chk.Name(), func(t *testing.T) {
+			chk.Run(ctx, nil)
+			chk.Run(ctx, &wdeps.CycleEnv{})
+			chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true})
+			chk.Run(ctx, &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
+		})
+	}
+}
+
+func TestCycleProcChmod0111InconclusiveAcrossFiveChecks(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0o111 does not restrict ReadDir under UID 0")
+	}
+	e := fixture(t)
+	e.H.Cfg.Wave2.HungRuncAgeSec = 180
+	e.H.Cfg.Wave2.HungRuncConfirmCycles = 3
+	e.H.Cfg.Wave2.HungRuncKillEnabled = true
+	e.H.Cfg.Wave2.NetfilterGuardIntervalSec = 0
+	e.H.Cfg.Wave2.NetfilterGuardHungCmdSec = 60
+	e.H.Cfg.Wave2.NetfilterGuardStuckCycles = 3
+	e.H.Cfg.Wave2.NetfilterGuardKillEnabled = true
+	e.H.Cfg.Wave2.NetfilterGuardLegacyProbe = false
+	e.DiskUsed = 0.90
+
+	// 1. EphemeralPorts: pod netns pid 500 pressured, pid 1 healthy.
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "sys", "net", "ipv4", "ip_local_port_range"),
+		"32768 60999\n")
+	for _, pair := range []struct {
+		pid int
+		ns  string
+	}{
+		{1, "net:[1001]"},
+		{500, "net:[5000]"},
+	} {
+		nsDir := filepath.Join(e.ProcDir, fmt.Sprintf("%d", pair.pid), "ns")
+		if err := os.MkdirAll(nsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(pair.ns, filepath.Join(nsDir, "net")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.H.Cfg.Seams.Host.TCPTablesFn = func(pid int) (netlinkx.TCPCensus, error) {
+		if pid == 500 {
+			return netlinkx.TCPCensus{States: map[uint8]int{8: 6000}}, nil
+		}
+		return netlinkx.TCPCensus{States: map[uint8]int{1: 10}}, nil
+	}
+
+	// 2. CtrMeta: orphan shim pid 9550 (ppid=1, aged 16m, dead init).
+	e.H.Cfg.CtrTaskRoot = filepath.Join(filepath.Dir(e.CtrDir), "k8s.io")
+	orphanID := strings.Repeat("a", 64)
+	e.MkStatProc(t, 9550, "containerd-shim", "S", "")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "9550", "cmdline"),
+		"containerd-shim-runc-v2\x00-id\x00"+orphanID+"\x00-namespace\x00k8s.io\x00-address\x00/run/k0s/containerd.sock\x00")
+	old16m := e.Now.Add(-16 * time.Minute)
+	_ = os.Chtimes(filepath.Join(e.ProcDir, "9550"), old16m, old16m)
+	taskDir := filepath.Join(e.H.Cfg.CtrTaskRoot, orphanID)
+	wdepstest.WriteFile(t, filepath.Join(taskDir, "init.pid"), "99999\n")
+	_ = os.Chtimes(taskDir, old16m, old16m)
+
+	// 3. UnlinkedOpenFiles: 256MiB deleted regular file on pid 4242.
+	e.MkStatProc(t, 4242, "app", "S", "")
+	fdDir := filepath.Join(e.ProcDir, "4242", "fd")
+	if err := os.MkdirAll(fdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/var/log/leaked.log (deleted)", filepath.Join(fdDir, "3")); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Cfg.Seams.Host.DeletedFDStatFn = func(path string) (uint64, uint64, int64, bool) {
+		if strings.HasSuffix(path, filepath.Join("4242", "fd", "3")) {
+			return 100, 11, int64(256) << 20, true
+		}
+		return 0, 0, 0, false
+	}
+
+	// 4. HungRunc (pid 7100) + 5. NetfilterGuard (pid 6101) with 3-cycle confirm.
+	e.MkStatProc(t, 7100, "runc", "S", "do_wait")
+	_ = os.Chtimes(filepath.Join(e.ProcDir, "7100"), old16m, old16m)
+	e.MkStatProc(t, 6101, "iptables", "S", "")
+	_ = os.Chtimes(filepath.Join(e.ProcDir, "6101"), old16m, old16m)
+
+	ctx := context.Background()
+	e.H.Cycle(ctx) // cycle 1
+	e.H.Cycle(ctx) // cycle 2 -> latches armed, streaks at 2/3
+
+	if !e.H.Deps.State.Exists(latchdefs.LatchEphemeralPortPressure) {
+		t.Fatal("setup: LatchEphemeralPortPressure not armed")
+	}
+	if !e.H.Deps.State.Exists(latchdefs.LatchContainerdCorrupt) {
+		t.Fatal("setup: LatchContainerdCorrupt not armed")
+	}
+	if e.H.UnlinkedOpenFileBytes != int64(256)<<20 || e.H.UnlinkedOpenFileCount != 1 {
+		t.Fatalf("setup: unlinked gauges=%d/%d want 256MiB/1",
+			e.H.UnlinkedOpenFileBytes, e.H.UnlinkedOpenFileCount)
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("setup: unexpected kills before confirm cycle 3: %v", e.Kills)
+	}
+
+	// Advance past BloatScanInterval and break /proc ReadDir with 0o111.
+	e.Now = e.Now.Add(16 * time.Minute)
+	if err := os.Chmod(e.ProcDir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.ProcDir, 0o755) })
+
+	e.H.Cycle(ctx)
+
+	for _, name := range []string{
+		wdeps.CheckHungRunc,
+		wdeps.CheckNetfilterGuard,
+		wdeps.CheckCtrMeta,
+		wdeps.CheckEphemeralPorts,
+		wdeps.CheckUnlinkedOpenFiles,
+	} {
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(name, "inconclusive")); got != 1 {
+			t.Fatalf("%s inconclusive cycles=%v want 1", name, got)
+		}
+	}
+	if !e.H.Deps.State.Exists(latchdefs.LatchEphemeralPortPressure) {
+		t.Fatal("LatchEphemeralPortPressure cleared during /proc 0o111 cycle")
+	}
+	if !e.H.Deps.State.Exists(latchdefs.LatchContainerdCorrupt) {
+		t.Fatal("LatchContainerdCorrupt cleared during /proc 0o111 cycle")
+	}
+	if e.H.UnlinkedOpenFileBytes != int64(256)<<20 || e.H.UnlinkedOpenFileCount != 1 {
+		t.Fatalf("unlinked gauges clobbered during /proc 0o111 cycle: %d/%d",
+			e.H.UnlinkedOpenFileBytes, e.H.UnlinkedOpenFileCount)
+	}
+
+	// Restore /proc: cycle 3 confirms HungRunc (7100) and NetfilterGuard (6101)
+	// immediately, proving both streaks were preserved across the 0o111 cycle.
+	if err := os.Chmod(e.ProcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Cycle(ctx)
+	killedPIDs := map[int]bool{}
+	for _, k := range e.Kills {
+		killedPIDs[k.PID] = true
+	}
+	if !killedPIDs[7100] || !killedPIDs[6101] {
+		t.Fatalf("streaks lost across 0o111 cycle: kills=%v want pids 7100 and 6101", e.Kills)
+	}
+}
+
+func TestCycleVMAPressureAndInotifyColdFDCacheProcChmod0111Recovery(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0111 does not block root")
+	}
+	e := fixture(t)
+	ctx := context.Background()
+
+	// Seed VMA pressure fixture (90/100 = 0.90) with ceiling=100 so max_map_count stays 100.
+	e.H.Cfg.Wave3.VMAMaxCeiling = 100
+	if err := os.MkdirAll(filepath.Join(e.H.Cfg.Runtime.CgroupRoot, "kubepods.slice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sysVM := filepath.Join(e.ProcDir, "sys", "vm")
+	if err := os.MkdirAll(sysVM, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sysVM, "max_map_count"), "100\n")
+
+	// Seed Inotify sysctls as well so InotifyPressureCheck reaches scanInotify.
+	sysInotify := filepath.Join(e.ProcDir, "sys", "fs", "inotify")
+	if err := os.MkdirAll(sysInotify, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sysInotify, "max_user_instances"), "128\n")
+	wdepstest.WriteFile(t, filepath.Join(sysInotify, "max_user_watches"), "8192\n")
+
+	pidDir := filepath.Join(e.ProcDir, "400")
+	if err := os.MkdirAll(filepath.Join(pidDir, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fields := make([]string, 21)
+	fields[0] = "S"
+	for i := 1; i < 20; i++ {
+		fields[i] = "0"
+	}
+	fields[20] = "1048576"
+	wdepstest.WriteFile(t, filepath.Join(pidDir, "stat"), "400 (app) "+strings.Join(fields, " ")+"\n")
+	var mapsBuf strings.Builder
+	for i := range 90 {
+		fmt.Fprintf(&mapsBuf, "%08x-%08x r--p 00000000 00:00 0\n", i*4096, (i+1)*4096)
+	}
+	wdepstest.WriteFile(t, filepath.Join(pidDir, "maps"), mapsBuf.String())
+
+	// Cycle 1: warm VMA ratio to 0.90, then make /proc 0o111 BEFORE InotifyPressureCheck runs?
+	// Run a separate fresh ProcRoot for cold SharedFDCache, or test VMA preservation here and
+	// cold SharedFDCache recovery on a dedicated Cycle!
+	e.H.Cycle(ctx)
+	if e.H.Series.VMAMaxUtilRatio != 0.90 {
+		t.Fatalf("Cycle 1 VMAMaxUtilRatio=%v want 0.90", e.H.Series.VMAMaxUtilRatio)
+	}
+
+	// Cycle 2: /proc 0o111 -> VMAMaxUtilRatio must remain 0.90 (not clobbered to 0).
+	if err := os.Chmod(e.ProcDir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.ProcDir, 0o755) })
+	e.H.Cycle(ctx)
+	if e.H.Series.VMAMaxUtilRatio != 0.90 {
+		t.Fatalf("Cycle 2 (/proc 0o111) clobbered VMAMaxUtilRatio=%v want 0.90", e.H.Series.VMAMaxUtilRatio)
+	}
+
+	// Separate fixture so SharedFDCache starts genuinely cold on 0o111 /proc.
+	e2 := fixture(t)
+	sysInotify2 := filepath.Join(e2.ProcDir, "sys", "fs", "inotify")
+	if err := os.MkdirAll(sysInotify2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(sysInotify2, "max_user_instances"), "128\n")
+	wdepstest.WriteFile(t, filepath.Join(sysInotify2, "max_user_watches"), "8192\n")
+	if err := os.MkdirAll(filepath.Join(e2.ProcDir, "400", "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(e2.ProcDir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e2.ProcDir, 0o755) })
+	e2.H.Cycle(ctx) // cold SharedFDCache caches ProcOK=false
+	if got := testutil.ToFloat64(e2.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "abort")); got != 1 {
+		t.Fatalf("Inotify abort cycles=%v want 1", got)
+	}
+
+	// Restore /proc to 0o755 and advance +10s (< 60s TTL): Inotify must recover immediately to "ok".
+	if err := os.Chmod(e2.ProcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e2.Now = e2.Now.Add(10 * time.Second)
+	e2.H.Cycle(ctx)
+	if got := testutil.ToFloat64(e2.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "ok")); got != 1 {
+		t.Fatalf("Inotify ok cycles=%v want 1 at +10s recovery", got)
+	}
+
+	// Verify statsOnce retry semantics when /proc recovers mid-cycle.
+	if err := os.Chmod(e2.ProcDir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	e2.H.Cycle(ctx)
+	e2.H.envCell.StatsOnce()
+	if e2.H.envCell.PidsOK() {
+		t.Fatal("expected PidsOK=false on 0o111 /proc")
+	}
+	if err := os.Chmod(e2.ProcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(e2.ProcDir, "400", "stat"), "400 (app) "+strings.Join(fields, " ")+"\n")
+	gotStats := e2.H.envCell.StatsOnce()
+	if !e2.H.envCell.PidsOK() || len(gotStats) == 0 {
+		t.Fatalf("statsOnce did not retry after /proc recovery: pidsOK=%v stats=%v", e2.H.envCell.PidsOK(), gotStats)
+	}
+}
+
+func TestCycleCiliumSysClassNetChmod0000AndENOENTRecovery(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0000 does not block root")
+	}
+	e := fixture(t)
+	ctx := context.Background()
+
+	// Seed cilium-mtu drift latch (neb1=1300, cilium_net=1500),
+	// cilium_wg0 peer wipe latch, and cilium_host for LRP.
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "neb1", "mtu"), "1300\n")
+	wdepstest.WriteFile(t, filepath.Join(e.SysNet, "cilium_net", "mtu"), "1500\n")
+	if err := os.MkdirAll(filepath.Join(e.SysNet, "cilium_wg0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(e.SysNet, "cilium_host"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.MkStatProc(t, 4242, "cilium-agent", "S", "")
+	e.MkTask(t, wdepstest.UIDB, "cilium-agent", 4242)
+	e.UnixBody = []byte(`{"cluster":{"nodes":[{},{}]}}`)
+	e.H.Cfg.Seams.Cilium.WGDump = func(_ context.Context, _ *systemd.Client) (string, error) {
+		return "pubA\tpsk\t12.0.0.9:51820\t(none)\t0\t0\t0\t25\n", nil
+	}
+
+	e.H.Cycle(ctx)
+	e.H.Cycle(ctx) // arms LatchCiliumMTUDrift and LatchCiliumWGPeerWipe
+	if !e.H.State.Exists(latchdefs.LatchCiliumMTUDrift) {
+		t.Fatal("setup: LatchCiliumMTUDrift not armed")
+	}
+	if !e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+		t.Fatal("setup: LatchCiliumWGPeerWipe not armed")
+	}
+
+	// SysClassNet 0o000 -> all 3 cilium checks must abort without clearing latches.
+	if err := os.Chmod(e.SysNet, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.SysNet, 0o755) })
+	e.H.Cycle(ctx)
+
+	for _, chkName := range []string{wdeps.CheckCiliumWG, wdeps.CheckCiliumMTU, wdeps.CheckCiliumLRP} {
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(chkName, "abort")); got != 1 {
+			t.Fatalf("%s abort cycles=%v want 1 on SysClassNet 0o000", chkName, got)
+		}
+	}
+	if !e.H.State.Exists(latchdefs.LatchCiliumMTUDrift) {
+		t.Fatal("LatchCiliumMTUDrift exited during SysClassNet 0o000")
+	}
+	if !e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+		t.Fatal("LatchCiliumWGPeerWipe exited during SysClassNet 0o000")
+	}
+
+	// Restore SysClassNet and remove interfaces (ENOENT) -> latches clear cleanly.
+	if err := os.Chmod(e.SysNet, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"neb1", "cilium_wg0", "cilium_host"} {
+		if err := os.RemoveAll(filepath.Join(e.SysNet, dir)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.H.Cycle(ctx)
+	if e.H.State.Exists(latchdefs.LatchCiliumMTUDrift) {
+		t.Fatal("LatchCiliumMTUDrift should exit on ENOENT")
+	}
+	if e.H.State.Exists(latchdefs.LatchCiliumWGPeerWipe) {
+		t.Fatal("LatchCiliumWGPeerWipe should exit on ENOENT")
 	}
 }

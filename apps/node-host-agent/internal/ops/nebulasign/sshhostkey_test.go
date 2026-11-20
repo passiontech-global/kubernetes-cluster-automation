@@ -44,19 +44,36 @@ func TestKnownHostsVerifyPinsListedHost(t *testing.T) {
 	hostKey := genHostKey(t)
 	otherKey := genHostKey(t)
 	line := string(ssh.MarshalAuthorizedKey(hostKey))
-	writeKnownHosts(t, keyPath, "127.0.0.1 "+line, "hub-b "+line)
+	writeKnownHosts(t, keyPath,
+		"127.0.0.1 "+line,
+		"[::1]:22 "+line,
+		"[bastion]:2222 "+line,
+		"hub-b "+line,
+	)
 
 	verify, err := knownHostsVerify(keyPath, false)
 	if err != nil || verify == nil {
 		t.Fatalf("verify==nil:%v err=%v — want verifier", verify == nil, err)
 	}
 	if err := verify("127.0.0.1", hostKey); err != nil {
-		t.Fatalf("pinned key rejected: %v", err)
+		t.Fatalf("pinned bare host rejected: %v", err)
+	}
+	if err := verify("127.0.0.1:22", hostKey); err != nil {
+		t.Fatalf("pinned host:22 rejected: %v", err)
+	}
+	if err := verify("[::1]:22", hostKey); err != nil {
+		t.Fatalf("pinned [::1]:22 rejected: %v", err)
+	}
+	if err := verify("bastion:2222", hostKey); err != nil {
+		t.Fatalf("pinned bastion:2222 rejected: %v", err)
+	}
+	if err := verify("127.0.0.1:22", otherKey); err == nil {
+		t.Fatal("mismatched key accepted for host:22")
 	}
 	if err := verify("127.0.0.1", otherKey); err == nil {
 		t.Fatal("mismatched key accepted")
 	}
-	if err := verify("hub-unlisted", hostKey); err == nil {
+	if err := verify("hub-unlisted:22", hostKey); err == nil {
 		t.Fatal("unlisted host accepted")
 	}
 }

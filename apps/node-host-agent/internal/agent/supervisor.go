@@ -8,6 +8,7 @@ package agent
 import (
 	"context"
 	"math/rand/v2"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -206,7 +207,9 @@ func runSubsystemAttempt(
 		defer func() {
 			if r := recover(); r != nil {
 				logger().Error("subsystem panicked — restarting",
-					"subsystem", name, "panic", r)
+					"subsystem", name,
+					"panic", r,
+					"stack", string(debug.Stack()))
 			}
 		}()
 		// Registered last so it runs FIRST on exit — children cancel before

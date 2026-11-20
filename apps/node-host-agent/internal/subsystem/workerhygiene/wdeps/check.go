@@ -104,7 +104,18 @@ type CycleEnv struct {
 	SystemdProbeErr bool
 	TasksOnce       func() (map[string][]CtrTask, bool)
 	PidsOnce        func() []int
-	JournalOnce     func() string
+	// PidsOK reports whether the preceding PidsOnce call's underlying
+	// Proc.PIDs() succeeded (false = Proc.PIDs() returned an error,
+	// distinct from a genuinely empty /proc returning nil, nil). Callers
+	// must invoke PidsOnce() before reading PidsOK(). Nil in hand-built
+	// envs → callers treat PidsOnce as error-free.
+	PidsOK      func() bool
+	JournalOnce func() string
+	// JournalOK reports whether the preceding JournalOnce call's
+	// underlying JournalFn succeeded (false on ClassFailed or
+	// ClassFilesGone; true on ClassOK or ClassEmpty). Nil in
+	// hand-built envs → callers treat JournalOnce as error-free.
+	JournalOK func() bool
 	// StatsOnce memoizes the per-pid /proc/<pid>/stat parse for the
 	// whole cycle — ZombieStormCheck and DstateCheck each used to
 	// read+parse every pid's stat back-to-back. The map holds only
@@ -112,6 +123,16 @@ type CycleEnv struct {
 	// ok=false the direct Stat call gave. Nil in hand-built envs →
 	// checks fall back to per-pid d.Proc.Stat.
 	StatsOnce func() map[int]procfs.Stat
+	// MountinfoOnce memoizes reading Cfg.MountinfoFile per cycle so
+	// mountinfo-hygiene, writable-layer-scan, disk-bloat, and
+	// orphan-pod-volumes share one read. Nil in hand-built envs →
+	// Deps.ReadMountinfo falls back to an uncached os.ReadFile.
+	MountinfoOnce func() ([]byte, error)
+	// CiliumHealthzOnce memoizes GET /v1/healthz over the cilium
+	// socket per cycle so cilium-ipam, cilium-envoy, and
+	// cilium-wg-peers share one socket probe. Nil in hand-built envs →
+	// Deps.CiliumHealthz falls back to an uncached UnixGet.
+	CiliumHealthzOnce func(context.Context) ([]byte, error)
 	// WalkOnce memoizes WalkBytes per cycle — the disk-bloat scan
 	// and the writable-layer scan walk the same snapshot/pod-volume
 	// dirs in one cycle; the cache makes the IO-bounded walk run at

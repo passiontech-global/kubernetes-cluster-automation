@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
@@ -77,8 +76,7 @@ func (m *Maint) urgentReindex(ctx context.Context, pg, user, pass string,
 		"out-of-band REINDEX TABLE CONCURRENTLY",
 		"heap", res.heapBytes, "indexes", res.indexBytes)
 	epochPath := filepath.Join(m.d.Cfg.GuardStateDir, urgentReindexFile)
-	if epoch, err := kdeps.ReadIntFile(epochPath); err == nil &&
-		m.d.Cfg.Clock.Now().Sub(time.Unix(epoch, 0)) < urgentReindexCooldown {
+	if kdeps.CooldownActive(epochPath, m.d.Cfg.Clock.Now(), urgentReindexCooldown, m.d.Cfg.ReadOnly) {
 		res.urgentState = "cooldown"
 		note("urgent reindex skipped: last-urgent-reindex inside the cooldown")
 		return

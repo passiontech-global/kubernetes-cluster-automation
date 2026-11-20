@@ -30,6 +30,7 @@
 package kernelfail
 
 import (
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"fmt"
 	"os"
@@ -38,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
@@ -93,8 +95,13 @@ func (r *Runner) hwNoteAcute(class, detail string) {
 		r.hw.acute = map[string]hwAcute{}
 	}
 	if len(detail) > 200 {
-		detail = detail[:200]
+		i := 200
+		for i > 0 && !utf8.RuneStart(detail[i]) {
+			i--
+		}
+		detail = detail[:i]
 	}
+	detail = strings.ToValidUTF8(detail, "")
 	r.hw.acute[class] = hwAcute{at: r.deps.Clock.Now(), detail: detail}
 	r.saveHwEvidence()
 }
@@ -197,7 +204,7 @@ func (r *Runner) saveHwEvidence() {
 	for _, t := range r.hw.nvmeResets {
 		d.NVMeResets = append(d.NVMeResets, t.Unix())
 	}
-	data, err := json.Marshal(d)
+	data, err := json.Marshal(d, jsontext.AllowInvalidUTF8(true))
 	if err != nil {
 		return
 	}
@@ -222,7 +229,7 @@ func (r *Runner) loadHwEvidence() {
 		return
 	}
 	var d hwEvidenceDisk
-	if err := json.Unmarshal(data, &d); err != nil {
+	if err := json.Unmarshal(data, &d, jsontext.AllowInvalidUTF8(true)); err != nil {
 		logger().Warn("hostmetrics: hw-evidence state unreadable — starting clean",
 			"path", p, "error", err)
 		return

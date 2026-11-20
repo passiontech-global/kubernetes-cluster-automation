@@ -6,10 +6,12 @@
 package hubsync
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -203,7 +205,10 @@ func TestLeaseLoopRecoversPanic(t *testing.T) {
 		func(k8stesting.Action) (bool, runtime.Object, error) {
 			panic("apiserver exploded")
 		})
-	s, err := New(testConfig(t, cs, newFakeDialer(), []byte("bin")), nil)
+	var buf bytes.Buffer
+	cfg := testConfig(t, cs, newFakeDialer(), []byte("bin"))
+	cfg.Log = slog.New(slog.NewTextHandler(&buf, nil))
+	s, err := New(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,6 +219,9 @@ func TestLeaseLoopRecoversPanic(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("leaseLoop did not return after panic")
+	}
+	if out := buf.String(); !strings.Contains(out, "lease loop panicked") || !strings.Contains(out, "stack=") {
+		t.Fatalf("expected panic log with stack trace, got:\n%s", out)
 	}
 }
 

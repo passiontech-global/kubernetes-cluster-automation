@@ -45,6 +45,23 @@ import (
 // (probe_test.go) airtight.
 func (p *Probe) hygieneCatalog(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
+	p.hygieneCatalogWithBatch(ctx, pg, user, pass, h, nil, 1, note)
+}
+
+func (p *Probe) hygieneCatalogWithBatch(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, batch *probeBatch, backendEnv int64, note func(string)) {
+	if batch != nil && batch.err == nil &&
+		(batch.mxidSeen || batch.invidxSeen || batch.seqSeen || batch.idtypeSeen || batch.seqcliffSeen) {
+		p.parseCatalogLines(batch.mxidLine, batch.invidxLine, batch.seqLine, batch.idtypeLine, batch.seqcliffLine, h, note)
+		return
+	}
+	if batch != nil && !batch.canFallback(ctx, backendEnv) {
+		note(fmt.Sprintf("mxid-age-fail: %v", batch.err))
+		note(fmt.Sprintf("invalid-indexes-fail: %v", batch.err))
+		note(fmt.Sprintf("seq-scan-fail: %v", batch.err))
+		note(fmt.Sprintf("seq-cliff-fail: %v", batch.err))
+		return
+	}
 	tblQ := kdeps.SQLQuote(p.d.Cfg.Table)
 	// Resolve the sequence by OID rather than string-parsing
 	// pg_get_serial_sequence — quoted/dotted names survive the regclass
@@ -89,17 +106,22 @@ func (p *Probe) hygieneCatalog(ctx context.Context, pg, user, pass string,
 		}
 		return ""
 	}
-	if v, perr := strconv.ParseInt(line(0), 10, 64); perr != nil {
+	p.parseCatalogLines(line(0), line(1), line(2), line(3), line(4), h, note)
+}
+
+func (p *Probe) parseCatalogLines(mxidLine, invidxLine, seqLine, idtypeLine, seqcliffLine string,
+	h *hygieneResult, note func(string)) {
+	if v, perr := strconv.ParseInt(mxidLine, 10, 64); perr != nil {
 		note(fmt.Sprintf("mxid-age-unparsed: %v", perr))
 	} else {
 		h.mxidAge, h.mxidSeen = v, true
 	}
-	if v, perr := strconv.ParseInt(line(1), 10, 64); perr != nil {
+	if v, perr := strconv.ParseInt(invidxLine, 10, 64); perr != nil {
 		note(fmt.Sprintf("invalid-indexes-unparsed: %v", perr))
 	} else {
 		h.invalidIdx, h.invalidSeen = v, true
 	}
-	scans, tupRead, perr := kdeps.ParsePair(line(2))
+	scans, tupRead, perr := kdeps.ParsePair(seqLine)
 	if perr != nil {
 		// An empty result means the stats view has no row for the
 		// table yet — inconclusive, like a parse failure.
@@ -107,7 +129,7 @@ func (p *Probe) hygieneCatalog(ctx context.Context, pg, user, pass string,
 	} else {
 		h.seqScans, h.seqTupRead, h.seqSeen = scans, tupRead, true
 	}
-	p.parseSeqCliffLines(line(3), line(4), h, note)
+	p.parseSeqCliffLines(idtypeLine, seqcliffLine, h, note)
 }
 
 const (

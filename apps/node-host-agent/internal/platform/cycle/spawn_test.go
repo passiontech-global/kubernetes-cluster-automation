@@ -3,7 +3,10 @@
 package cycle
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -123,5 +126,22 @@ func TestSpawnStopWithoutCancel(t *testing.T) {
 	}
 	if parent.Err() != nil {
 		t.Fatal("stop cancelled the parent ctx")
+	}
+}
+
+func TestSpawnLogsStackOnPanic(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	stop := Spawn(context.Background(), "stack-spawn", func(context.Context) {
+		panic("boom-spawn")
+	})
+	stop()
+
+	out := buf.String()
+	if !strings.Contains(out, "stack=") || !strings.Contains(out, "TestSpawnLogsStackOnPanic") {
+		t.Fatalf("Spawn panic log missing stack trace:\n%s", out)
 	}
 }

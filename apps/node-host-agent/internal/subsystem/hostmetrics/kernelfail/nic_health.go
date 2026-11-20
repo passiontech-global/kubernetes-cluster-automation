@@ -384,13 +384,17 @@ func (r *Runner) updateNICHealth() {
 	// first-seen latch (post-restart) gets the same hold measured
 	// from now rather than an instant release.
 	if !r.nicCovered(now, nicCarrierWindow) {
+		r.touchHeldLatch(latchdefs.LatchHostNetworkProblems)
 		return
 	}
 	if r.nic.lastSig.IsZero() {
 		r.nic.lastSig = now
+		r.touchHeldLatch(latchdefs.LatchHostNetworkProblems)
 		return
 	}
 	if now.Sub(r.nic.lastSig) >= nicCleanHold {
 		r.deps.Store.Exit(latchdefs.LatchHostNetworkProblems, nil)
+		return
 	}
+	r.touchHeldLatch(latchdefs.LatchHostNetworkProblems)
 }

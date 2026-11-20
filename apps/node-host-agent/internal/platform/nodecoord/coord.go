@@ -103,15 +103,17 @@ type StatusCondition struct {
 // direction a no-op error, never a panic.
 type Coord struct {
 	GetAnnos        func(ctx context.Context) (map[string]string, error)
+	GetNode         func(ctx context.Context) (annos map[string]string, taintKeys []string, err error)
 	PatchNodeStatus func(ctx context.Context, cond StatusCondition) error
 	PatchPodAnno    func(ctx context.Context, ns, name string, annos map[string]string) error
 	// Now is the clock seam; nil → time.Now.
 	Now func() time.Time
 
-	mu        sync.Mutex
-	cached    map[string]string
-	cachedAt  time.Time
-	cacheGood bool
+	mu           sync.Mutex
+	cached       map[string]string
+	cachedTaints []string
+	cachedAt     time.Time
+	cacheGood    bool
 	// lastMaintUntil is the furthest MaintenanceUntil any SUCCESSFUL
 	// verdict confirmed — the fail-open escape hatch: when the API
 	// becomes unreachable, HoldLocalAction keeps holding only while
@@ -180,11 +182,11 @@ type Verdict struct {
 func (c *Coord) Maintenance(ctx context.Context) (Verdict, error) {
 	c.mu.Lock()
 	if c.cacheGood && c.now().Sub(c.cachedAt) < CacheTTL {
-		v := c.verdictLocked(c.cached, c.cachedAt)
+		v := c.verdictLocked(c.cached, c.cachedTaints, c.cachedAt)
 		c.mu.Unlock()
 		return v, nil
 	}
-	if c.GetAnnos == nil {
+	if c.GetNode == nil && c.GetAnnos == nil {
 		c.mu.Unlock()
 		return Verdict{}, errors.New("nodecoord: nil GetAnnos")
 	}
@@ -200,18 +202,62 @@ func (c *Coord) Maintenance(ctx context.Context) (Verdict, error) {
 			return Verdict{}, ctx.Err()
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		return Verdict{}, err
+	}
 	f := &annoFlight{done: make(chan struct{})}
 	c.flight = f
 	c.mu.Unlock()
 
-	annos, err := c.GetAnnos(ctx)
+	var (
+		annos     map[string]string
+		taintKeys []string
+		err       error
+		v         Verdict
+		settled   bool
+		locked    bool
+	)
+	defer func() {
+		if !settled {
+			if !locked {
+				c.mu.Lock()
+				locked = true
+			}
+			if c.flight == f {
+				c.flight = nil
+			}
+			if f.err == nil {
+				f.err = errors.New("nodecoord: fetch panicked")
+			}
+			close(f.done)
+			c.mu.Unlock()
+			locked = false
+		} else if locked {
+			c.mu.Unlock()
+			locked = false
+		}
+	}()
+
+	// Detach from caller 1's cancellation so an early abort by one
+	// waiter does not fail the shared singleflight fetch for sibling
+	// callers; StampTimeout still bounds the apiserver GET.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), StampTimeout)
+	defer cancel()
+	if c.GetNode != nil {
+		annos, taintKeys, err = c.GetNode(fetchCtx)
+	} else {
+		annos, err = c.GetAnnos(fetchCtx)
+	}
 
 	c.mu.Lock()
-	c.flight = nil
-	var v Verdict
+	locked = true
+	if c.flight == f {
+		c.flight = nil
+	}
 	if err != nil {
 		if c.cacheGood {
-			v = c.verdictLocked(c.cached, c.cachedAt)
+			v = c.verdictLocked(c.cached, c.cachedTaints, c.cachedAt)
 			// Fresh evidence wins over the error — a cached TRUE
 			// verdict keeps holding through the flap, but a cached
 			// FALSE is NOT overwritten: an API error is not
@@ -227,9 +273,10 @@ func (c *Coord) Maintenance(ctx context.Context) (Verdict, error) {
 		}
 	} else {
 		c.cached = annos
+		c.cachedTaints = taintKeys
 		c.cachedAt = c.now()
 		c.cacheGood = true
-		v = c.verdictLocked(annos, c.cachedAt)
+		v = c.verdictLocked(annos, taintKeys, c.cachedAt)
 		c.lastKuredLocked = v.KuredLocked
 		c.lastKuredAt = c.cachedAt
 		if v.MaintenanceUntil.After(c.now()) &&
@@ -262,15 +309,17 @@ func (c *Coord) Maintenance(ctx context.Context) (Verdict, error) {
 	}
 	f.v, f.err = v, err
 	close(f.done)
+	settled = true
 	c.mu.Unlock()
+	locked = false
 	return v, err
 }
 
-// verdictLocked decodes the annotation map through the shared
-// nodecond.EvaluateCoordAnnos — the same fold the cluster side
+// verdictLocked decodes the annotation map and taint keys through the
+// shared nodecond.EvaluateCoord — the same fold the cluster side
 // applies, so L1 and L3 can never drift on the maintenance verdict.
-func (c *Coord) verdictLocked(annos map[string]string, at time.Time) Verdict {
-	cv := nodecond.EvaluateCoordAnnos(annos, c.now())
+func (c *Coord) verdictLocked(annos map[string]string, taintKeys []string, at time.Time) Verdict {
+	cv := nodecond.EvaluateCoord(annos, taintKeys, c.now())
 	return Verdict{
 		MaintenanceUntil: cv.MaintenanceUntil,
 		KuredLocked:      cv.KuredLocked,
@@ -415,30 +464,42 @@ func (c *Coord) stampCondition(ctx context.Context, cond StatusCondition) error 
 // keys survive. Every write stays inside the ClusterRole grants:
 // nodes/status patch + pods patch — never nodes metadata patch.
 func NewKube(nodeName string, cs kubernetes.Interface) *Coord {
+	getNode := func(ctx context.Context) (map[string]string, []string, error) {
+		// Bound the node read like every other apiserver touch —
+		// an unbounded Get can park Maintenance (and every heal
+		// gate behind it) for the client's full retry budget
+		// during an apiserver flap.
+		gctx, cancel := context.WithTimeout(ctx, StampTimeout)
+		defer cancel()
+		// ResourceVersion "0": serve the node read from the
+		// apiserver's watch cache — the annotation/taint view is a
+		// read-only best-effort input re-read every cycle
+		// (heal/remedy decisions ride latch budgets, so
+		// watch-cache lag moves nothing on its own) and the
+		// per-cycle quorum read + etcd fan-out is skipped.
+		n, err := cs.CoreV1().Nodes().Get(gctx, nodeName,
+			metav1.GetOptions{ResourceVersion: "0"})
+		if err != nil {
+			return nil, nil, err
+		}
+		out := make(map[string]string, len(n.Annotations))
+		for k, v := range n.Annotations {
+			out[k] = v
+		}
+		var taintKeys []string
+		if len(n.Spec.Taints) > 0 {
+			taintKeys = make([]string, 0, len(n.Spec.Taints))
+			for _, t := range n.Spec.Taints {
+				taintKeys = append(taintKeys, t.Key)
+			}
+		}
+		return out, taintKeys, nil
+	}
 	return &Coord{
+		GetNode: getNode,
 		GetAnnos: func(ctx context.Context) (map[string]string, error) {
-			// Bound the node read like every other apiserver touch —
-			// an unbounded Get can park Maintenance (and every heal
-			// gate behind it) for the client's full retry budget
-			// during an apiserver flap.
-			gctx, cancel := context.WithTimeout(ctx, StampTimeout)
-			defer cancel()
-			// ResourceVersion "0": serve the node read from the
-			// apiserver's watch cache — the annotation view is a
-			// read-only best-effort input re-read every cycle
-			// (heal/remedy decisions ride latch budgets, so
-			// watch-cache lag moves nothing on its own) and the
-			// per-cycle quorum read + etcd fan-out is skipped.
-			n, err := cs.CoreV1().Nodes().Get(gctx, nodeName,
-				metav1.GetOptions{ResourceVersion: "0"})
-			if err != nil {
-				return nil, err
-			}
-			out := make(map[string]string, len(n.Annotations))
-			for k, v := range n.Annotations {
-				out[k] = v
-			}
-			return out, nil
+			annos, _, err := getNode(ctx)
+			return annos, err
 		},
 		PatchNodeStatus: func(ctx context.Context, cond StatusCondition) error {
 			now := metav1.Now()

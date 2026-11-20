@@ -72,6 +72,13 @@ func (c *CiliumLRPCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	if _, err := os.Stat(filepath.Join(c.d.Cfg.SysClassNet, "cilium_host")); err != nil {
+		if !os.IsNotExist(err) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: cilium-lrp-dns stat %s/cilium_host failed: %v — inconclusive, keeping state",
+				c.d.Cfg.SysClassNet, err))
+			c.d.CycleResult(wdeps.CheckCiliumLRP, "abort")
+			return
+		}
 		// No cilium datapath — the LRP wedge can't exist here.
 		c.Fails = 0
 		c.svcFails = 0
@@ -214,17 +221,21 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 		return false
 	}
 	var desynced []string
+	readable := 0
 	for _, sv := range desyncServices {
 		ready, ok := c.serviceReadyEndpoints(ctx, sv.ns, sv.name)
 		if !ok {
 			continue // apiserver verdict unreadable — keep, don't count
 		}
+		readable++
 		if ready > 0 && backends[sv.ns+"/"+sv.name] == 0 {
 			desynced = append(desynced, sv.ns+"/"+sv.name)
 		}
 	}
 	if len(desynced) == 0 {
-		c.svcFails = 0
+		if readable == len(desyncServices) {
+			c.svcFails = 0
+		}
 		return false
 	}
 	if c.d.StreakPending(&c.svcFails, fmt.Sprintf(
@@ -280,6 +291,9 @@ func (c *CiliumLRPCheck) serviceDesync(ctx context.Context,
 // legitimately reports 0; that's a real verdict, not a missing one.
 func (c *CiliumLRPCheck) serviceReadyEndpoints(ctx context.Context,
 	ns, name string) (ready int, ok bool) {
+	if c.d == nil || c.d.Cfg.Client == nil {
+		return 0, false
+	}
 	// ResourceVersion "0": serve the LIST from the apiserver's watch
 	// cache — a read-only best-effort scan re-run every cycle, so
 	// watch-cache lag cannot move a verdict on its own and the

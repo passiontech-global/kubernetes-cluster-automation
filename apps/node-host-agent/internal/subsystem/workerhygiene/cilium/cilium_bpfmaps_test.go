@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -238,5 +240,71 @@ func TestCiliumAgentKillFailureLogged(t *testing.T) {
 	if !strings.Contains(log, "kill cilium-agent pid=9315 failed: permission denied") ||
 		!strings.Contains(log, "no running task to kill") {
 		t.Fatalf("missing kill-failure evidence:\n%s", log)
+	}
+}
+
+// TestCiliumCheckBPFMapsCorruptJSONAbortsPreservingLatch verifies that
+// unparseable/truncated /v1/map JSON aborts without clearing
+// LatchCiliumBPFMapPressure, while valid empty payloads ("[]"/"{}")
+// still exit the latch cleanly.
+func TestCiliumCheckBPFMapsCorruptJSONAbortsPreservingLatch(t *testing.T) {
+	e := fixture(t)
+	e.MkCiliumTask(t, 9316)
+	c := wdepstest.Check[*cilium.CiliumCheck](e.H, wdeps.CheckCilium)
+	cycle := &wdeps.CycleEnv{WorkerActive: true}
+	ctx := context.Background()
+
+	over := []byte(`[{"name":"cilium_ct4_global","used":9500,"max":10000}]`)
+	e.UnixBody = over
+	c.Run(ctx, cycle)
+	if !e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
+		t.Fatal("setup: LatchCiliumBPFMapPressure not armed")
+	}
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "ok")); got != 1 {
+		t.Fatalf("setup ok cycles=%v want 1", got)
+	}
+
+	// Truncated/corrupt JSON -> abort, keep latch, no STATE-EXIT.
+	e.UnixBody = []byte(`[{"name":"cilium_ct4_global",`)
+	c.Run(ctx, cycle)
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1 on corrupt /v1/map JSON", got)
+	}
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "ok")); got != 1 {
+		t.Fatalf("ok cycles=%v want 1 (corrupt JSON must not emit ok)", got)
+	}
+	if !e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
+		t.Fatal("LatchCiliumBPFMapPressure falsely exited on corrupt /v1/map JSON")
+	}
+	if strings.Contains(e.LogLines(t), "STATE-EXIT: cilium-bpf-map-pressure") {
+		t.Fatalf("unexpected STATE-EXIT on corrupt JSON:\n%s", e.LogLines(t))
+	}
+	if !strings.Contains(e.LogLines(t), "unparseable JSON") {
+		t.Fatalf("missing inconclusive log line:\n%s", e.LogLines(t))
+	}
+
+	// Valid empty array "[]" -> exits latch cleanly.
+	e.UnixBody = []byte(`[]`)
+	c.Run(ctx, cycle)
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "ok")); got != 2 {
+		t.Fatalf("ok cycles=%v want 2 on []", got)
+	}
+	if e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
+		t.Fatal("valid [] /v1/map payload should exit LatchCiliumBPFMapPressure")
+	}
+
+	// Re-arm and verify valid empty object "{}" also exits latch cleanly.
+	e.UnixBody = over
+	c.Run(ctx, cycle)
+	if !e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
+		t.Fatal("re-arm failed")
+	}
+	e.UnixBody = []byte(`{}`)
+	c.Run(ctx, cycle)
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "ok")); got != 4 {
+		t.Fatalf("ok cycles=%v want 4 on {}", got)
+	}
+	if e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
+		t.Fatal("valid {} /v1/map payload should exit LatchCiliumBPFMapPressure")
 	}
 }

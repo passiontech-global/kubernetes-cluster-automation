@@ -49,11 +49,11 @@ func validDNSReply(buf, q []byte) bool {
 		buf[0] == q[0] && buf[1] == q[1] && buf[2]&0x80 != 0
 }
 
-// dnsDeadline is the earlier of ctx's deadline and now+timeout. The
+// probeDeadline is the earlier of ctx's deadline and now+timeout. The
 // conn deadline must never outlive the caller: with timeout=5s and
-// a ctx cancelled at 100ms, a wedged resolver used to hold the
+// a ctx cancelled at 100ms, a wedged resolver/server used to hold the
 // read until 5s even though the caller had long given up.
-func dnsDeadline(ctx context.Context, timeout time.Duration) time.Time {
+func probeDeadline(ctx context.Context, timeout time.Duration) time.Time {
 	deadline := time.Now().Add(timeout)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
@@ -73,7 +73,7 @@ func dnsDeadline(ctx context.Context, timeout time.Duration) time.Time {
 // Mirrors workerhygiene.probeDNSUDP (cilium.go).
 func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) bool {
 	q := buildDNSAQuery(name, nextDNSQueryID())
-	deadline := dnsDeadline(ctx, timeout)
+	deadline := probeDeadline(ctx, timeout)
 	d := net.Dialer{Deadline: deadline}
 	conn, err := d.DialContext(ctx, "udp", addr)
 	if err != nil {
@@ -102,7 +102,7 @@ func DNSQuery(ctx context.Context, addr, name string, timeout time.Duration) boo
 // earlier of ctx's deadline and now+timeout.
 func DNSQueryTCP(ctx context.Context, addr, name string, timeout time.Duration) bool {
 	q := buildDNSAQuery(name, nextDNSQueryID())
-	deadline := dnsDeadline(ctx, timeout)
+	deadline := probeDeadline(ctx, timeout)
 	// TCP framing: 2-byte big-endian length prefix on both directions.
 	frame := make([]byte, 2+len(q))
 	frame[0], frame[1] = byte(len(q)>>8), byte(len(q))

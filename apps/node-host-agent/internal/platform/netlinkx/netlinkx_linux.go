@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 
 	"github.com/vishvananda/netlink"
@@ -102,13 +103,15 @@ func InNetNS(pid int, fn func() error) error {
 		dirty := false
 		defer func() {
 			if dirty {
-				select {} // quarantine: park the goroutine+M forever
+				// Return without UnlockOSThread: Go terminates the locked OS
+				// thread cleanly instead of leaking both goroutine and M.
+				return
 			}
 			runtime.UnlockOSThread()
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				done <- outcome{err: fmt.Errorf("netns fn panic: %v", r)}
+				done <- outcome{err: fmt.Errorf("netns fn panic: %v\n%s", r, debug.Stack())}
 			}
 		}()
 

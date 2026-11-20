@@ -45,14 +45,26 @@ func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckDState) {
 		return
 	}
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		c.d.CycleResult(wdeps.CheckDState, "inconclusive")
+		return
+	}
 	total, runtime := 0, 0
+	nonENOENT := false
 	// A small comm=wchan sample for the ACTION line — the kernel
 	// function holding the tasks is the triage hint (umount_tree /
 	// wait_transaction_locked / blk_mq_get_tag).
 	wchans := make([]string, 0, 4)
-	for _, pid := range e.PidsOnce() {
+	for _, pid := range pids {
 		comm, state, ok := procStatCommState(e, c.d, pid)
-		if !ok || state != "D" {
+		if !ok {
+			if statNonENOENT(c.d, pid) {
+				nonENOENT = true
+			}
+			continue
+		}
+		if state != "D" {
 			continue
 		}
 		total++
@@ -66,6 +78,10 @@ func (c *DstateCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	if total < c.d.Cfg.Pressure.DStateStormThreshold && runtime < dStateRuntimeMin {
+		if nonENOENT {
+			c.d.CycleResult(wdeps.CheckDState, "abort")
+			return
+		}
 		c.fails = 0
 		c.d.State.Exit(latchdefs.LatchDStateStorm, nil)
 		c.d.CycleResult(wdeps.CheckDState, "ok")

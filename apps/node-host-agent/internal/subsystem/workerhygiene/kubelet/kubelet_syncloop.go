@@ -143,9 +143,13 @@ func (c *SyncloopCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"kubelet-syncloop-down suppressed-overloaded - pleg-frozen last_err=%v", lastErr))
 	}
-	if restartK0sWorkerGated(c.d, ctx, wdeps.CheckSyncloop,
-		"kubelet-syncloop-down", "kubelet-syncloop-down", false, true, overloaded,
-		fmt.Sprintf("kubelet-syncloop-down pleg-frozen (persisted %dx)", c.fails)) {
+	if restartK0sWorkerGated(c.d, ctx, k0sWorkerRestartGate{
+		check:        wdeps.CheckSyncloop,
+		suspectTag:   "kubelet-syncloop-down",
+		overloadTag:  "kubelet-syncloop-down",
+		overloaded:   overloaded,
+		actionDetail: fmt.Sprintf("kubelet-syncloop-down pleg-frozen (persisted %dx)", c.fails),
+	}) {
 		c.fails = 0
 	}
 	c.d.CycleResult(wdeps.CheckSyncloop, "ok")
@@ -385,11 +389,19 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckCtrSock) {
 		return
 	}
+	if ctx.Err() != nil {
+		c.d.CycleResult(wdeps.CheckCtrSock, "abort")
+		return
+	}
 	err := c.d.Cfg.Seams.Probe.ProbeUnixSock(ctx, c.d.Cfg.CtrSocket, unixSockProbeTimeout)
 	if err == nil {
 		c.fails = 0
 		c.d.State.Exit(latchdefs.LatchContainerdSockDown, nil)
 		c.d.CycleResult(wdeps.CheckCtrSock, "ok")
+		return
+	}
+	if ctx.Err() != nil {
+		c.d.CycleResult(wdeps.CheckCtrSock, "abort")
 		return
 	}
 	if c.d.StreakPending(&c.fails, fmt.Sprintf(
@@ -410,9 +422,13 @@ func (c *CtrsockCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"containerd-sock-down suppressed-overloaded - probe_err=%v", err))
 	}
-	if restartK0sWorkerGated(c.d, ctx, wdeps.CheckCtrSock,
-		"containerd-sock-down", "containerd-sock-down", false, true, overloaded,
-		fmt.Sprintf("containerd-sock-down %s (persisted %dx)", c.d.Cfg.CtrSocket, c.fails)) {
+	if restartK0sWorkerGated(c.d, ctx, k0sWorkerRestartGate{
+		check:        wdeps.CheckCtrSock,
+		suspectTag:   "containerd-sock-down",
+		overloadTag:  "containerd-sock-down",
+		overloaded:   overloaded,
+		actionDetail: fmt.Sprintf("containerd-sock-down %s (persisted %dx)", c.d.Cfg.CtrSocket, c.fails),
+	}) {
 		c.fails = 0
 	}
 	c.d.CycleResult(wdeps.CheckCtrSock, "ok")

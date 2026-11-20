@@ -4,6 +4,7 @@
 package concoursecache
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
 	"os"
@@ -13,26 +14,82 @@ import (
 	"time"
 )
 
-// pruneGoBuild is the go-build bucket: files older than GoBuildMaxAge
-// deleted, then oldest files trimmed until du <= GoBuildLowMark when
-// the bucket exceeds GoBuildHighMark.
+// pruneGoBuild is the go-build bucket: in a single WalkDir pass, files
+// older than GoBuildMaxAge are deleted while surviving entries accumulate
+// block disk usage (including directories) and size-trim candidates; then
+// if total usage exceeds GoBuildHighMark, oldest files are trimmed until
+// <= GoBuildLowMark.
 func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *slog.Logger) {
 	dir := filepath.Join(sc, "go-build")
 	if !isDir(dir) {
 		return
 	}
-	p.deleteOldFiles(ctx, dir, "go-build", cfg.GoBuildMaxAge, log)
+	now := p.cfg.Clock.Now()
+	var ageDeleted, ageFailed int
+	var ageFreed int64
+	var ageErr error
+	var sz uint64
+	var candidates []cacheFile
 
-	sz := int64(diskUsage(dir))
-	if sz <= cfg.GoBuildHighMark {
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if err != nil {
+			log.Debug("go-build prune: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			log.Debug("go-build prune: unreadable entry skipped",
+				"path", path, "error", err)
+			return nil
+		}
+		blocks := entryBlocks(info)
+		if !d.IsDir() && d.Type().IsRegular() {
+			if now.Sub(info.ModTime()) > cfg.GoBuildMaxAge {
+				if rerr := os.Remove(path); rerr == nil {
+					ageDeleted++
+					ageFreed += int64(blocks)
+					return nil
+				} else {
+					ageFailed++
+					ageErr = rerr
+				}
+			}
+			candidates = append(candidates, cacheFile{
+				path:    path,
+				size:    int64(blocks),
+				modTime: info.ModTime(),
+			})
+		}
+		sz += blocks
+		return nil
+	})
+
+	if ageDeleted > 0 {
+		p.filesDeleted.WithLabelValues("go-build").Add(float64(ageDeleted))
+		p.bytesFreed.Add(float64(ageFreed))
+		log.Info("age prune", "bucket", "go-build",
+			"files", ageDeleted, "freedGiB", float64(ageFreed)/(1<<30))
+	}
+	if ageFailed > 0 {
+		log.Warn("age prune removals failed",
+			"bucket", "go-build", "files", ageFailed, "error", ageErr)
+	}
+	if ctx.Err() != nil || int64(sz) <= cfg.GoBuildHighMark {
 		return
 	}
-	need := sz - cfg.GoBuildLowMark
+	slices.SortFunc(candidates, func(a, b cacheFile) int {
+		return cmp.Compare(a.modTime.UnixNano(), b.modTime.UnixNano())
+	})
+	need := int64(sz) - cfg.GoBuildLowMark
 	var acc int64
 	var freed int64
 	var failed int
 	var lastErr error
-	for _, f := range filesByAge(dir) {
+	for _, f := range candidates {
 		if ctx.Err() != nil || acc >= need {
 			break
 		}
@@ -169,8 +226,8 @@ func (p *Pruner) capTopLevelDirs(ctx context.Context, sc, bucket string, high, l
 	// ONE walk gives the bucket du AND every first-level dir's share
 	// — the per-candidate diskUsage calls below used to re-walk each
 	// <key>/<cksum> subtree on top of the bucket walk.
-	sz, perDir := diskUsageByTopDir(dir)
-	if int64(sz) <= high {
+	sz, perDir := diskUsageByTopDir(ctx, dir)
+	if ctx.Err() != nil || int64(sz) <= high {
 		return
 	}
 	need := int64(sz) - low

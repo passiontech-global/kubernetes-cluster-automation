@@ -177,7 +177,7 @@ func TestSyncTargetErrorLadder(t *testing.T) {
 			name:   "guard token failure",
 			target: Target{APILB: true},
 			fail: map[string]string{
-				"sha256sum '/etc/api-backend-guard/token'": "boom:378",
+				"'/etc/api-backend-guard/token'": "boom:378",
 			},
 			wantErr: "boom:378",
 		},
@@ -185,7 +185,7 @@ func TestSyncTargetErrorLadder(t *testing.T) {
 			name:   "guard ca.crt failure",
 			target: Target{APILB: true},
 			fail: map[string]string{
-				"sha256sum '/etc/api-backend-guard/ca.crt'": "boom:381",
+				"'/etc/api-backend-guard/ca.crt'": "boom:381",
 			},
 			wantErr: "boom:381",
 		},

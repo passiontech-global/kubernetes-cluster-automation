@@ -89,14 +89,16 @@ func TestFetchCursor(t *testing.T) {
 	// --no-pager, then --after-cursor=<opaque> --lines=10000 -o json
 	// --no-pager. --after-cursor (not --cursor) keeps the boundary
 	// entry from being served twice; --lines bounds each read.
-	if calls[0][len(calls[0])-6] != "--since" ||
+	if calls[0][len(calls[0])-7] != "--output-fields=MESSAGE,_SYSTEMD_UNIT,_TRANSPORT" ||
+		calls[0][len(calls[0])-6] != "--since" ||
 		calls[0][len(calls[0])-5] != "@"+strconv.FormatInt(now.Add(-lookback).Unix(), 10) ||
 		calls[0][len(calls[0])-4] != "--lines=10000" {
 		t.Fatalf("fetch-1 argv tail = %q", calls[0][len(calls[0])-7:])
 	}
-	if !strings.HasPrefix(calls[1][len(calls[1])-5], "--after-cursor=cur-") ||
+	if calls[1][len(calls[1])-6] != "--output-fields=MESSAGE,_SYSTEMD_UNIT,_TRANSPORT" ||
+		!strings.HasPrefix(calls[1][len(calls[1])-5], "--after-cursor=cur-") ||
 		calls[1][len(calls[1])-4] != "--lines=10000" {
-		t.Fatalf("fetch-2 argv tail = %q, want --after-cursor= --lines=",
+		t.Fatalf("fetch-2 argv tail = %q, want --output-fields= --after-cursor= --lines=",
 			calls[1][len(calls[1])-6:])
 	}
 	if cursor != "cur-"+strconv.FormatInt(ts2, 10) {
@@ -204,5 +206,19 @@ func TestMessageFieldEdges(t *testing.T) {
 		if e.Msg != "" {
 			t.Fatalf("entry %d Msg=%q want \"\"", i, e.Msg)
 		}
+	}
+}
+
+func TestParseJSONAllowsInvalidUTF8AndDuplicateNames(t *testing.T) {
+	line := `{"__REALTIME_TIMESTAMP":"42","__CURSOR":"c42","_SYSTEMD_UNIT":"kubelet.service","_TRANSPORT":"journal","dup":"a","dup":"b","MESSAGE":"bad \uD83D surrogate"}`
+	got := ParseJSON(line)
+	if len(got) != 1 {
+		t.Fatalf("ParseJSON dropped lenient line: got %d entries", len(got))
+	}
+	if got[0].Cursor != "c42" || got[0].Unit != "kubelet.service" || got[0].Transport != "journal" {
+		t.Fatalf("unexpected decoded metadata: %+v", got[0])
+	}
+	if !strings.Contains(got[0].Msg, "surrogate") {
+		t.Fatalf("MESSAGE lost on lone surrogate: %q", got[0].Msg)
 	}
 }

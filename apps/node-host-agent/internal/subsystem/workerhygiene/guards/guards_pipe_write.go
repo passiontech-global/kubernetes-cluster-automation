@@ -70,25 +70,54 @@ func (c *PipeWriteCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckPipeWrite) {
 		return
 	}
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		c.d.CycleResult(wdeps.CheckPipeWrite, "inconclusive")
+		return
+	}
 	podByUID := e.PodByUID()
 	blocked := map[pipeWriteKey]bool{}
-	for _, pid := range e.PidsOnce() {
+	var unreadablePIDs map[int]bool
+	inconclusive := false
+	markUnreadable := func(pid int) {
+		if unreadablePIDs == nil {
+			unreadablePIDs = map[int]bool{}
+		}
+		unreadablePIDs[pid] = true
+		inconclusive = true
+	}
+	for _, pid := range pids {
 		// TASK_INTERRUPTIBLE is the frozen writer's state — a
 		// full pipe parks write(2) on an interruptible wait, so
 		// state "D" (the DstateCheck signal) never appears.
 		// Cheap snapshot checks first: the cgroup read below runs
 		// only for pids already parked in pipe_write.
-		if _, state, ok := procStatCommState(e, c.d, pid); !ok || state != "S" {
+		st, ok := statFor(e, c.d, pid)
+		if !ok || !st.HasComm {
+			if statNonENOENT(c.d, pid) {
+				markUnreadable(pid)
+			}
 			continue
 		}
-		if procWchan(c.d, pid) != "pipe_write" {
+		if st.Fields[0] != "S" {
 			continue
 		}
-		uid := podUIDForPID(c.d, pid)
+		wchan, wchanErr := procWchanChecked(c.d, pid)
+		if wchanErr {
+			markUnreadable(pid)
+			continue
+		}
+		if wchan != "pipe_write" {
+			continue
+		}
+		uid, cgroupErr := podUIDForPIDChecked(c.d, pid)
+		if cgroupErr {
+			markUnreadable(pid)
+			continue
+		}
 		if uid == "unknown" {
 			continue // host process, shim, kubelet — outside pod cgroups
 		}
-		st, ok := statFor(e, c.d, pid)
 		key := pipeWriteKey{uid: uid, pid: pid, start: procStartTime(st, ok)}
 		blocked[key] = true
 		c.streak[key]++
@@ -96,8 +125,10 @@ func (c *PipeWriteCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// Clear streaks for processes that left the pipe — a freed
 	// writer must not carry a half-built window into its next
 	// freeze, and the ledger must not pin exited pids forever.
+	// Unreadable PIDs (non-ENOENT errors on stat/wchan/cgroup) keep
+	// their streaks so transient EACCES cannot wipe the persist window.
 	for key := range c.streak {
-		if !blocked[key] {
+		if !blocked[key] && !unreadablePIDs[key.pid] {
 			delete(c.streak, key)
 		}
 	}
@@ -109,19 +140,29 @@ func (c *PipeWriteCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		count++
 		stuckPods[key.uid] = true
-		if !c.evented[key.uid] && c.pipeBlockedEvent(ctx, key, podByUID[key.uid]) {
+		if !c.evented[key.uid] && c.pipeBlockedEvent(ctx, e, key, podByUID[key.uid]) {
 			c.evented[key.uid] = true
 		}
 	}
 	// Re-arm the event markers of pods with nothing past the
 	// persist window — the throttle check's conclusive-cycle rule:
 	// a recovered pod must page again on its NEXT freeze.
-	for uid := range c.evented {
-		if !stuckPods[uid] {
-			delete(c.evented, uid)
+	// Preserve evented markers when the sweep is inconclusive so
+	// unreadable PIDs never trigger duplicate Warning Events on recovery.
+	if !inconclusive {
+		for uid := range c.evented {
+			if !stuckPods[uid] {
+				delete(c.evented, uid)
+			}
 		}
 	}
-	c.d.PipeBlockedProcs = int64(count)
+	if !inconclusive || int64(count) > c.d.PipeBlockedProcs {
+		c.d.PipeBlockedProcs = int64(count)
+	}
+	if inconclusive {
+		c.d.CycleResult(wdeps.CheckPipeWrite, "abort")
+		return
+	}
 	c.d.CycleResult(wdeps.CheckPipeWrite, "ok")
 }
 
@@ -132,11 +173,23 @@ func (c *PipeWriteCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 // cgroup-pod-throttle parity). A create failure returns false so
 // the dedup marker does not advance and the next cycle retries.
 func (c *PipeWriteCheck) pipeBlockedEvent(ctx context.Context,
-	key pipeWriteKey, pod *corev1.Pod) bool {
+	e *wdeps.CycleEnv, key pipeWriteKey, pod *corev1.Pod) bool {
 	c.d.State.AppendLog(fmt.Sprintf(
 		"suspect: pipe-write-freeze pod uid=%s pid=%d stuck in state-S pipe_write %d cycles — stdout/stderr pipe freeze (containerd 64KB pipe deadlock)",
 		key.uid, key.pid, c.streak[key]))
-	if pod == nil || c.d.Cfg.Client == nil {
+	if pod == nil {
+		if e == nil || !e.APIOK {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: pipe-write-freeze pod uid=%s — pod list inconclusive, event deferred",
+				key.uid))
+			return false
+		}
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: pipe-write-freeze pod uid=%s — pod unresolvable, event skipped",
+			key.uid))
+		return true
+	}
+	if c.d.Cfg.Client == nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: pipe-write-freeze pod uid=%s — pod unresolvable, event skipped",
 			key.uid))

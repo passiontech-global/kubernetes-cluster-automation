@@ -10,6 +10,7 @@ package cycle
 
 import (
 	"context"
+	"runtime/debug"
 	"time"
 )
 
@@ -48,7 +49,9 @@ func EverySafe(name string, interval time.Duration,
 			defer func() {
 				if r := recover(); r != nil {
 					logger().Error(name+" tick panicked — cycle "+
-						"skipped, loop keeps ticking", "panic", r)
+						"skipped, loop keeps ticking",
+						"panic", r,
+						"stack", string(debug.Stack()))
 					if onPanic != nil {
 						onPanic(name, r)
 					}
@@ -114,8 +117,12 @@ func (r *Runner) Run(ctx context.Context) {
 		// hung INSIDE fn never reaches this defer.
 		defer l.Unregister(beat)
 	}
+	runCtx := ctx
+	if beat != nil {
+		runCtx = withBeat(ctx, beat)
+	}
 	stampLoop(beat)
-	r.fn(ctx)
+	r.fn(runCtx)
 	stampLoop(beat)
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
@@ -125,7 +132,7 @@ func (r *Runner) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			stampLoop(beat)
-			r.fn(ctx)
+			r.fn(runCtx)
 			stampLoop(beat)
 		}
 	}

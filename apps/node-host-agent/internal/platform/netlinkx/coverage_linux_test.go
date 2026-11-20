@@ -1,10 +1,12 @@
 package netlinkx
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -123,5 +125,49 @@ func TestV6StringAndNoInet6Family(t *testing.T) {
 	}
 	if noInet6Family(errors.New("other")) {
 		t.Fatal("unrelated error classified as noInet6Family")
+	}
+}
+
+func TestDiagRequestProtoFilters(t *testing.T) {
+	tcpReq := diagRequestProto(1, unix.AF_INET, unix.IPPROTO_TCP,
+		uint32(1)<<tcpStateListen, nil,
+		unix.SOCK_DIAG_BY_FAMILY, unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
+	if tcpReq[17] != unix.IPPROTO_TCP {
+		t.Fatalf("tcp proto = %d", tcpReq[17])
+	}
+	if got := binary.LittleEndian.Uint32(tcpReq[20:24]); got != 1<<tcpStateListen {
+		t.Fatalf("tcp idiag_states = %#x, want %#x", got, 1<<tcpStateListen)
+	}
+
+	wantUDP := uint32(0xFFF) &^ (uint32(1) << tcpStateEstablished)
+	udpReq := diagRequestProto(2, unix.AF_INET, unix.IPPROTO_UDP,
+		wantUDP, nil,
+		unix.SOCK_DIAG_BY_FAMILY, unix.NLM_F_REQUEST|unix.NLM_F_DUMP)
+	if udpReq[17] != unix.IPPROTO_UDP {
+		t.Fatalf("udp proto = %d", udpReq[17])
+	}
+	if got := binary.LittleEndian.Uint32(udpReq[20:24]); got != wantUDP {
+		t.Fatalf("udp idiag_states = %#x, want %#x", got, wantUDP)
+	}
+}
+
+func TestInNetNSRecoveryIncludesStack(t *testing.T) {
+	// Exercise InNetNS's goroutine/recover path directly if pid 1 differs or via
+	// same-netns path — either way a panic in fn must not crash, and InNetNS
+	// returns a descriptive error with stack when running in a separate netns.
+	// Here we test same-netns behavior & verify InNetNS handles missing pid cleanly.
+	if err := InNetNS(-1, func() error { return nil }); err == nil {
+		t.Fatal("InNetNS(-1) expected error")
+	}
+	// Verify recover formatting when invoked inside InNetNS on a foreign netns
+	// (if sameNetNSFor(1) is false) or directly check same-netns call succeeds.
+	same, err := SameNetNS(1)
+	if err == nil && !same {
+		err = InNetNS(1, func() error {
+			panic("probe-panic")
+		})
+		if err == nil || !strings.Contains(err.Error(), "netns fn panic") || !strings.Contains(err.Error(), "TestInNetNSRecoveryIncludesStack") {
+			t.Fatalf("InNetNS panic err = %v, want stack trace", err)
+		}
 	}
 }

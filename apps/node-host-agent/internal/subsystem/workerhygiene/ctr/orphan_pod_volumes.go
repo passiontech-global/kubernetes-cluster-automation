@@ -114,7 +114,7 @@ func (c *OrphanPodVolsCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	mountsOnce := func() ([]string, bool) {
 		if !mountsFetched {
 			mountsFetched = true
-			mountsOK = c.loadHostMounts(&mounts)
+			mountsOK = c.loadHostMounts(e, &mounts)
 		}
 		return mounts, mountsOK
 	}
@@ -255,8 +255,8 @@ func isPodUIDDirName(name string) bool {
 // ok=false on a read failure OR an empty parse: "no mounts found"
 // is not positive evidence that the pod dir is unmounted, so the
 // caller must fail closed rather than detach on it.
-func (c *OrphanPodVolsCheck) loadHostMounts(out *[]string) bool {
-	data, err := os.ReadFile(c.d.Cfg.MountinfoFile)
+func (c *OrphanPodVolsCheck) loadHostMounts(e *wdeps.CycleEnv, out *[]string) bool {
+	data, err := c.d.ReadMountinfo(e)
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: orphan-pod-volumes read %s failed: %v — mount gate unverifiable",

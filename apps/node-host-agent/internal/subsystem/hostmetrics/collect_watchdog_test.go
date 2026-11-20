@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -280,5 +281,105 @@ func TestWatchdogUnreadableDirServesPrevious(t *testing.T) {
 			t.Fatalf("seen[%q] mutated by the unreadable scrape: %v → %v,%v",
 				k, ts, got, ok)
 		}
+	}
+}
+
+func TestWatchdogRAMEpochsVisibilityAndClear(t *testing.T) {
+	cfg, dirs := fixture(t)
+	// Seed a previously-seen dynamic parameterized latch on disk first so
+	// c.seen tracks it, then delete the disk file while keeping it in RAM.
+	dynLatch := latchdefs.LatchAPIServerBackendStalePrefix + "10-0-0-1"
+	dynPath := filepath.Join(dirs["state"], latchdefs.LatchFilePrefix+dynLatch)
+	testutil.WriteFile(t, dynPath, "1730000000\n")
+
+	ram := map[string]bool{
+		latchdefs.LatchFilesystemReadonly: true,
+		dynLatch:                          true,
+	}
+	cfg.latchExistsFn = func(name string) bool { return ram[name] }
+	c := New(cfg)
+
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": dynLatch}); !ok || v != 1 {
+		t.Fatalf("initial dynamic latch=%v ok=%v want 1", v, ok)
+	}
+	if err := os.Remove(dynPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fixed latch (absent from disk) + previously-seen dynamic latch (removed
+	// from disk) must both emit 1 on primary and legacy series.
+	for _, st := range []string{latchdefs.LatchFilesystemReadonly, dynLatch} {
+		if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+			map[string]string{"node": "node-a", "state": st}); !ok || v != 1 {
+			t.Fatalf("RAM-held watchdog_state{%s}=%v ok=%v want 1", st, v, ok)
+		}
+		if v, ok := metricValue(t, c, "node_watchdog_state",
+			map[string]string{"signal": st}); !ok || v != 1 {
+			t.Fatalf("RAM-held node_watchdog_state{%s}=%v ok=%v want 1", st, v, ok)
+		}
+	}
+
+	// Even if WatchdogStateDir does not exist on disk, RAM latches still emit 1.
+	if err := os.RemoveAll(dirs["state"]); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": latchdefs.LatchFilesystemReadonly}); !ok || v != 1 {
+		t.Fatalf("RAM-held latch with absent state dir=%v ok=%v want 1", v, ok)
+	}
+
+	// Once cleared from RAM, emit-0 semantics take over cleanly.
+	ram[latchdefs.LatchFilesystemReadonly] = false
+	ram[dynLatch] = false
+	for _, st := range []string{latchdefs.LatchFilesystemReadonly, dynLatch} {
+		if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+			map[string]string{"node": "node-a", "state": st}); !ok || v != 0 {
+			t.Fatalf("cleared RAM latch watchdog_state{%s}=%v ok=%v want 0", st, v, ok)
+		}
+		if v, ok := metricValue(t, c, "node_watchdog_state",
+			map[string]string{"signal": st}); !ok || v != 0 {
+			t.Fatalf("cleared RAM latch node_watchdog_state{%s}=%v ok=%v want 0", st, v, ok)
+		}
+	}
+}
+
+func TestWatchdogPrefixRAMEpochsNeverOnDisk(t *testing.T) {
+	cfg, _ := fixture(t)
+	prefixLatch := latchdefs.LatchCiliumIPAMPrefix + "10-0-0-9"
+	ram := map[string]bool{
+		prefixLatch: true,
+	}
+	cfg.ramLatchesFn = func() []string {
+		var out []string
+		for k, v := range ram {
+			if v {
+				out = append(out, k)
+			}
+		}
+		return out
+	}
+	c := New(cfg)
+
+	// Prefix: true RAM-only latch never seen on disk must still emit 1 on
+	// both primary and legacy series.
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": prefixLatch}); !ok || v != 1 {
+		t.Fatalf("unseen RAM prefix latch watchdog_state=%v ok=%v want 1", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_watchdog_state",
+		map[string]string{"signal": prefixLatch}); !ok || v != 1 {
+		t.Fatalf("unseen RAM prefix latch node_watchdog_state=%v ok=%v want 1", v, ok)
+	}
+
+	// Clearing from RAM transitions cleanly to emit-0.
+	ram[prefixLatch] = false
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": prefixLatch}); !ok || v != 0 {
+		t.Fatalf("cleared RAM prefix latch watchdog_state=%v ok=%v want 0", v, ok)
+	}
+	if v, ok := metricValue(t, c, "node_watchdog_state",
+		map[string]string{"signal": prefixLatch}); !ok || v != 0 {
+		t.Fatalf("cleared RAM prefix latch node_watchdog_state=%v ok=%v want 0", v, ok)
 	}
 }

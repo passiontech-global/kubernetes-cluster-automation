@@ -40,22 +40,22 @@ var descK0sChildrenRSS = prometheus.NewDesc(
 // procMMBlocked reports whether the pid dir's stat state forbids
 // reading mm-backed files: cmdline/environ sit behind
 // mm->mmap_lock, so a read on a D-state child wedges the collect
-// (and every scrape queued behind it) forever; a zombie already
-// released its mm. An unreadable stat fails OPEN — the file read
-// then decides, same as before the guard.
+// (and every scrape queued behind it) forever; zombie/dead states
+// (Z, X, x) already released their mm. An unreadable stat fails OPEN —
+// the file read then decides, same as before the guard.
 func procMMBlocked(procDir string) bool {
 	b, err := os.ReadFile(filepath.Join(procDir, "stat"))
 	if err != nil {
 		return false
 	}
 	state, _ := parseStatHead(b)
-	return state == 'D' || state == 'Z'
+	return state == 'D' || state == 'Z' || state == 'X' || state == 'x'
 }
 
 // k0sChildLabel resolves a pid's {child} label from argv0's
 // basename, falling back to comm — comm is TASK_COMM_LEN-truncated
 // ("kube-controller-manager" reads "kube-controller"), so argv0 is
-// the precise source. A D/Z-state pid skips the cmdline read
+// the precise source. A D/Z/X/x-state pid skips the cmdline read
 // entirely (mm->mmap_lock) and resolves via comm.
 func k0sChildLabel(procDir string) string {
 	if !procMMBlocked(procDir) {

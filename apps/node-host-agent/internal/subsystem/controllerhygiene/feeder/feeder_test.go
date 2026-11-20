@@ -554,3 +554,61 @@ func TestParseSystemdTimestampLocalAbbrevExact(t *testing.T) {
 		t.Fatalf("local-abbrev instant=%v want 09:00Z", got)
 	}
 }
+
+func TestRemediateG5FutureSkewSelfHeals(t *testing.T) {
+	e := fixture(t)
+	e.Active["k0scontroller.service"] = "active"
+	e.SetUnitStart("k0scontroller.service", time.Hour)
+	e.Alive[e.H.Cfg.Feeder.ProbeURL] = false
+
+	// Simulate a clock that jumped backward by 2h after an earlier spend:
+	// FileRateRestart sits 2h in the future relative to e.Now.
+	futureEpoch := e.Now.Add(2 * time.Hour).Unix()
+	e.H.State.WriteEpochFile(filepath.Join(e.State, cdeps.FileRateRestart), futureEpoch)
+
+	e.H.Feeder().RunRemediate(context.Background())
+	if e.RstN() != 0 {
+		t.Fatalf("G5 allowed restart while future-skewed cooldown active: %d", e.RstN())
+	}
+	// RateOK must have self-healed the future-skewed stamp back to e.Now.Unix()
+	// and logged a non-negative delta (0s ago, never -7200s ago).
+	if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateRestart)); got != e.Now.Unix() {
+		t.Fatalf("future-skewed FileRateRestart not healed: got %d want %d", got, e.Now.Unix())
+	}
+	if e.CountLogLines("G5 PASS: last restart 0s ago") == 0 {
+		t.Fatalf("expected non-negative healed G5 log:\n%s", e.LogLines())
+	}
+
+	// Advance by RemediateMinRestart + 1s (well before the original +2h stamp):
+	// remediation must now proceed instead of starving for 2h.
+	e.Now = e.Now.Add(e.H.Cfg.Feeder.RemediateMinRestart + time.Second)
+	e.SetUnitStart("k0scontroller.service", 2*time.Hour)
+	e.H.Feeder().RunRemediate(context.Background())
+	if e.RstN() != 1 {
+		t.Fatalf("remediation remained starved after healed window elapsed: rst=%d\n%s",
+			e.RstN(), e.LogLines())
+	}
+}
+
+func TestRemediateG5SubMinuteClockStepBack(t *testing.T) {
+	e := fixture(t)
+	e.Active["k0scontroller.service"] = "active"
+	e.SetUnitStart("k0scontroller.service", time.Hour)
+	e.Alive[e.H.Cfg.Feeder.ProbeURL] = false
+
+	// Sub-minute skew (30s in the future): benign NTP jitter keeps G5 closed
+	// without rewriting the timestamp, and clamps negative delta in log to 0s.
+	skewed := e.Now.Add(30 * time.Second).Unix()
+	e.H.State.WriteEpochFile(filepath.Join(e.State, cdeps.FileRateRestart), skewed)
+
+	e.H.Feeder().RunRemediate(context.Background())
+	if e.RstN() != 0 {
+		t.Fatalf("G5 allowed restart on sub-minute skew: %d", e.RstN())
+	}
+	if e.CountLogLines("G5 PASS: last restart 0s ago") == 0 {
+		t.Fatalf("expected clamped 0s ago G5 log:\n%s", e.LogLines())
+	}
+	if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateRestart)); got != skewed {
+		t.Fatalf("sub-minute skew rewrote epoch: got %d want %d", got, skewed)
+	}
+}

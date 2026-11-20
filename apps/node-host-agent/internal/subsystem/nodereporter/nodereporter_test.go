@@ -22,6 +22,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	nhatestutil "github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
@@ -1020,5 +1021,228 @@ func TestReadTailBytesUnreadableFile(t *testing.T) {
 	dir := t.TempDir()
 	if got := readTailBytes(dir, 0, 1024); got != nil {
 		t.Fatalf("directory tail = %q, want nil", got)
+	}
+}
+
+type fakeRAMStateStore struct {
+	dir    string
+	epochs map[string]int64
+}
+
+func (f *fakeRAMStateStore) Path(name string) string {
+	return filepath.Join(f.dir, latchdefs.LatchFilePrefix+name)
+}
+
+func (f *fakeRAMStateStore) Exists(name string) bool {
+	if _, err := os.Stat(f.Path(name)); err == nil {
+		return true
+	}
+	_, ok := f.epochs[name]
+	return ok
+}
+
+func (f *fakeRAMStateStore) Epoch(path string) int64 {
+	name := strings.TrimPrefix(filepath.Base(path), latchdefs.LatchFilePrefix)
+	return f.epochs[name]
+}
+
+func (f *fakeRAMStateStore) Enter(name, _ string) {
+	if f.epochs == nil {
+		f.epochs = map[string]int64{}
+	}
+	f.epochs[name] = 1700000999
+}
+
+func (f *fakeRAMStateStore) InitHeartbeatFiles() error { return nil }
+
+func TestRAMEpochsLatchSetsAndClearsCondition(t *testing.T) {
+	e := fixture(t)
+	ram := &fakeRAMStateStore{
+		dir: e.dir,
+		epochs: map[string]int64{
+			latchdefs.LatchFilesystemReadonly: 1700000123,
+			latchdefs.LatchKubeletHealthzDown: 1700000456, // altStateKey for KubeletRuntimeStall
+			latchdefs.LatchKernelKeysPressure: 0,          // held in RAM with epoch 0 -> "unknown"
+		},
+	}
+	e.r.state = ram
+
+	e.cycle()
+
+	fsCond := e.cond(t, corev1.NodeConditionType(nodecond.FilesystemReadOnly))
+	if fsCond.Status != corev1.ConditionTrue {
+		t.Fatalf("FilesystemReadOnly status=%v want True", fsCond.Status)
+	}
+	wantFS := "watchdog state filesystem-readonly active since 1700000123"
+	if fsCond.Message != wantFS {
+		t.Fatalf("FilesystemReadOnly message=%q want %q", fsCond.Message, wantFS)
+	}
+	if g := e.gauge(nodecond.FilesystemReadOnly, fsCond.Reason); g != 1 {
+		t.Fatalf("problem_gauge(FilesystemReadOnly)=%v want 1", g)
+	}
+
+	kCond := e.cond(t, corev1.NodeConditionType(nodecond.KubeletRuntimeStall))
+	if kCond.Status != corev1.ConditionTrue {
+		t.Fatalf("KubeletRuntimeStall (altStateKey) status=%v want True", kCond.Status)
+	}
+	wantK := "watchdog state kubelet-healthz-down active since 1700000456"
+	if kCond.Message != wantK {
+		t.Fatalf("KubeletRuntimeStall message=%q want %q", kCond.Message, wantK)
+	}
+
+	kkCond := e.cond(t, corev1.NodeConditionType(nodecond.KernelKeysPressure))
+	if kkCond.Status != corev1.ConditionTrue {
+		t.Fatalf("KernelKeysPressure (epoch 0) status=%v want True", kkCond.Status)
+	}
+	wantKK := "watchdog state kernel-keys-pressure active since unknown"
+	if kkCond.Message != wantKK {
+		t.Fatalf("KernelKeysPressure message=%q want %q", kkCond.Message, wantKK)
+	}
+
+	// Clearing from RAM flips the conditions back to False and gauge to 0.
+	ram.epochs = map[string]int64{}
+	e.cycle()
+
+	fsCond = e.cond(t, corev1.NodeConditionType(nodecond.FilesystemReadOnly))
+	if fsCond.Status != corev1.ConditionFalse {
+		t.Fatalf("FilesystemReadOnly after clear status=%v want False", fsCond.Status)
+	}
+	if g := e.gauge(nodecond.FilesystemReadOnly, fsCond.Reason); g != 0 {
+		t.Fatalf("problem_gauge(FilesystemReadOnly) after clear=%v want 0", g)
+	}
+	if c := e.cond(t, corev1.NodeConditionType(nodecond.KubeletRuntimeStall)); c.Status != corev1.ConditionFalse {
+		t.Fatalf("KubeletRuntimeStall after clear status=%v want False", c.Status)
+	}
+	if c := e.cond(t, corev1.NodeConditionType(nodecond.KernelKeysPressure)); c.Status != corev1.ConditionFalse {
+		t.Fatalf("KernelKeysPressure after clear status=%v want False", c.Status)
+	}
+}
+
+func TestRAMEpochsLatchSurvivesReadDirFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — permission bits are not enforced")
+	}
+	e := fixture(t)
+	e.r.state = &fakeRAMStateStore{
+		dir: e.dir,
+		epochs: map[string]int64{
+			latchdefs.LatchFilesystemReadonly: 1700000789,
+		},
+	}
+	if err := os.Chmod(e.dir, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(e.dir, 0o755) })
+
+	if idx := e.r.latchIndex(); idx != nil {
+		t.Fatalf("latchIndex on 0o111 dir = %v, want nil", idx)
+	}
+	for _, ce := range e.r.evalConditions() {
+		if ce.def.stateKey == latchdefs.LatchFilesystemReadonly {
+			if ce.status != corev1.ConditionTrue {
+				t.Fatalf("status=%v want True under ReadDir failure", ce.status)
+			}
+			want := "watchdog state filesystem-readonly active since 1700000789"
+			if ce.message != want {
+				t.Fatalf("message=%q want %q", ce.message, want)
+			}
+			return
+		}
+	}
+	t.Fatal("FilesystemReadonly condition def not found")
+}
+
+func TestNilStateFallsBackToWatchdogStateDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "state-"+latchdefs.LatchNodeOverloaded),
+		[]byte("1700000222\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e := fixture(t)
+	r := &Reporter{
+		cfg: Config{
+			NodeName:         "n1",
+			Client:           e.cs,
+			WatchdogStateDir: dir,
+			WatchdogLogFile:  e.log,
+			Clock:            timex.NewCell(func() time.Time { return e.now }),
+		},
+		problemGauge:   e.r.problemGauge,
+		problemCounter: e.r.problemCounter,
+		cycles:         e.r.cycles,
+		monitors:       e.r.monitors,
+		emittedEvts:    map[string]*emittedEvent{},
+	}
+	// Must not panic when r.state == nil across npdSink.EnterLatch and Cycle.
+	npdSink{r}.EnterLatch(latchdefs.LatchKernelSoftLockup, "evidence")
+	r.Cycle(context.Background())
+
+	c := e.cond(t, corev1.NodeConditionType(nodecond.NodeOverloaded))
+	if c.Status != corev1.ConditionTrue {
+		t.Fatalf("NodeOverloaded status=%v want True", c.Status)
+	}
+	want := "watchdog state node-overloaded active since 1700000222"
+	if c.Message != want {
+		t.Fatalf("NodeOverloaded message=%q want %q", c.Message, want)
+	}
+}
+
+func TestStateFileSinceDiskAndRegressionEdges(t *testing.T) {
+	e := fixture(t)
+	// Non-numeric disk content is preserved verbatim; invalid UTF-8 bytes are scrubbed.
+	e.writeFile("state-nonnum", "abc\xffdef\n")
+	if got, ok := e.r.stateFileSince("nonnum"); !ok || got != "abcdef" {
+		t.Fatalf("non-numeric sanitized since=%q ok=%v want abcdef,true", got, ok)
+	}
+	// Empty disk file resolves to "unknown" even if ramEpochs would otherwise have an epoch.
+	e.writeFile("state-"+latchdefs.LatchDiskPreFail, "\n")
+	if got, ok := e.r.stateFileSince(latchdefs.LatchDiskPreFail); !ok || got != "unknown" {
+		t.Fatalf("empty disk file since=%q ok=%v want unknown,true", got, ok)
+	}
+	// A squatting directory (EISDIR, not ErrNotExist) must NOT trigger ramEpochs fallback.
+	if err := os.Mkdir(filepath.Join(e.dir, "state-"+latchdefs.LatchFilesystemReadonly), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.r.state = &fakeRAMStateStore{
+		dir:    e.dir,
+		epochs: map[string]int64{latchdefs.LatchFilesystemReadonly: 1700000555},
+	}
+	if got, ok := e.r.stateFileSince(latchdefs.LatchFilesystemReadonly); ok {
+		t.Fatalf("EISDIR squatting dir falsely fell back to ramEpochs: since=%q ok=%v", got, ok)
+	}
+
+	// ENOTDIR on both WatchdogStateDir and state.Dir still falls back to ramEpochs.
+	blocker := filepath.Join(e.root, "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notDir := filepath.Join(blocker, "wd")
+	e.r.cfg.WatchdogStateDir = notDir
+	e.r.state = &fakeRAMStateStore{
+		dir:    notDir,
+		epochs: map[string]int64{latchdefs.LatchFilesystemReadonly: 1700000666},
+	}
+	if got, ok := e.r.stateFileSince(latchdefs.LatchFilesystemReadonly); !ok || got != "1700000666" {
+		t.Fatalf("ENOTDIR fallback since=%q ok=%v want 1700000666,true", got, ok)
+	}
+
+	// EACCES (chmod 0o000) on state dir still falls back to ramEpochs when non-root.
+	if os.Geteuid() != 0 {
+		permDir := filepath.Join(e.root, "perm0000")
+		if err := os.MkdirAll(permDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(permDir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(permDir, 0o755) })
+		e.r.cfg.WatchdogStateDir = permDir
+		e.r.state = &fakeRAMStateStore{
+			dir:    permDir,
+			epochs: map[string]int64{latchdefs.LatchFilesystemReadonly: 1700000777},
+		}
+		if got, ok := e.r.stateFileSince(latchdefs.LatchFilesystemReadonly); !ok || got != "1700000777" {
+			t.Fatalf("EACCES fallback since=%q ok=%v want 1700000777,true", got, ok)
+		}
 	}
 }

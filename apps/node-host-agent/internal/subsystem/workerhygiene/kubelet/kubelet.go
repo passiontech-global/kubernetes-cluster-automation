@@ -85,34 +85,37 @@ func kubelet10250Alive(d *wdeps.Deps, ctx context.Context) bool {
 		d.Cfg.ProbeGap, func(int) (bool, error) { return true, nil }) == nil
 }
 
-// podDirCount counts kubelet pod dirs — the shell's
+// podDirCountChecked counts kubelet pod dirs — the shell's
 // `find $KUBELET_PODS_DIR -mindepth 1 -maxdepth 1 -type d | wc -l`.
-// ok=false means the dir is unreadable (treated like missing).
-func podDirCount(d *wdeps.Deps) (n int, ok bool) {
+// ok=false means the dir is unreadable (treated like missing);
+// nonENOENT=true distinguishes permission/IO errors from an absent dir.
+func podDirCountChecked(d *wdeps.Deps) (n int, ok, nonENOENT bool) {
 	entries, err := os.ReadDir(d.Cfg.PodsDir)
 	if err != nil {
-		return 0, false
+		return 0, false, !os.IsNotExist(err)
 	}
 	for _, e := range entries {
 		if e.IsDir() {
 			n++
 		}
 	}
-	return n, true
+	return n, true, false
 }
 
-// taskRecordCount counts containerd task records — `ctr tasks ls |
+// taskRecordCountChecked counts containerd task records — `ctr tasks ls |
 // wc -l` parity for the phantom-pods signal: every task dir under the
-// runtime + sandbox roots is a record, RUNNING or STOPPED alike (the
-// shell counted output lines, never filtered on task state). A
-// drained/evicted node holding stopped task dirs is NOT phantom —
-// counting only live init pids would false-positive a k0sworker
-// restart every MinRestartInterval.
-func taskRecordCount(d *wdeps.Deps) int {
+// runtime + sandbox roots is a record, RUNNING or STOPPED alike.
+// nonENOENT=true reports non-ENOENT read errors on either root so a
+// permission/IO error cannot masquerade as tasks=0.
+func taskRecordCountChecked(d *wdeps.Deps) (int, bool) {
 	n := 0
+	nonENOENT := false
 	for _, root := range []string{d.Cfg.CtrTaskRoot, d.Cfg.SandboxCtlRoot} {
 		entries, err := os.ReadDir(root)
 		if err != nil {
+			if !os.IsNotExist(err) {
+				nonENOENT = true
+			}
 			continue
 		}
 		for _, e := range entries {
@@ -121,7 +124,7 @@ func taskRecordCount(d *wdeps.Deps) int {
 			}
 		}
 	}
-	return n
+	return n, nonENOENT
 }
 
 // k0sWorkerSettled gates k0sworker restarts: the unit must have been
@@ -168,21 +171,52 @@ type StallCheck struct {
 // Name returns the check label / WD_SIG key.
 func (c *StallCheck) Name() string { return wdeps.CheckStall }
 
+// k0sworkerJournal returns the cycle-shared k0sworker journal snapshot
+// when present, falling back to the direct JournalFn seam for
+// hand-built CycleEnvs where JournalOnce is nil.
+func k0sworkerJournal(ctx context.Context, d *wdeps.Deps, e *wdeps.CycleEnv) string {
+	if e != nil && e.JournalOnce != nil {
+		return e.JournalOnce()
+	}
+	if d.Cfg.Seams.Host.JournalFn != nil {
+		out, _ := d.Cfg.Seams.Host.JournalFn(ctx)
+		return out
+	}
+	return ""
+}
+
 // Run executes one kubelet-stall round.
 func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckStall) {
 		return
 	}
+	if ctx.Err() != nil {
+		c.d.CycleResult(wdeps.CheckStall, "abort")
+		return
+	}
 	reason := ""
-	if hits := countMatchingLines(stallJournalRe, e.JournalOnce()); hits > journalHitsThresh {
+	if hits := countMatchingLines(stallJournalRe, k0sworkerJournal(ctx, c.d, e)); hits > journalHitsThresh {
 		reason = fmt.Sprintf(latchdefs.ReasonInformerZombie+" hits=%d/10min", hits)
 	}
+	if reason == "" && ctx.Err() != nil {
+		c.d.CycleResult(wdeps.CheckStall, "abort")
+		return
+	}
+	podsDirErr := false
 	if reason == "" {
-		if poddirs, ok := podDirCount(c.d); ok && poddirs >= PoddirThreshold {
+		poddirs, ok, pdErr := podDirCountChecked(c.d)
+		podsDirErr = pdErr
+		if ok && poddirs >= PoddirThreshold {
 			if _, err := os.ReadDir(c.d.Cfg.CtrTaskRoot); err != nil {
-				reason = fmt.Sprintf(latchdefs.ReasonPhantomPods+" poddirs=%d ctr=unreachable", poddirs)
-			} else if taskRecordCount(c.d) == 0 {
+				if os.IsNotExist(err) {
+					reason = fmt.Sprintf(latchdefs.ReasonPhantomPods+" poddirs=%d ctr=unreachable", poddirs)
+				} else {
+					podsDirErr = true
+				}
+			} else if nTasks, tErr := taskRecordCountChecked(c.d); !tErr && nTasks == 0 {
 				reason = fmt.Sprintf(latchdefs.ReasonPhantomPods+" poddirs=%d tasks=0", poddirs)
+			} else if tErr {
+				podsDirErr = true
 			}
 		}
 	}
@@ -192,13 +226,25 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// ANY HTTP response, even 401/403, means the listener is
 		// alive).
 		if !kubelet10250Alive(c.d, ctx) {
+			if ctx.Err() != nil {
+				c.d.CycleResult(wdeps.CheckStall, "abort")
+				return
+			}
 			reason = "kubelet-10250-down"
 		}
 	}
 	if reason == "" {
+		if podsDirErr {
+			c.d.CycleResult(wdeps.CheckStall, "abort")
+			return
+		}
 		c.Fails = 0
 		c.d.State.Exit(latchdefs.LatchKubeletRuntimeStall, nil)
 		c.d.CycleResult(wdeps.CheckStall, "ok")
+		return
+	}
+	if ctx.Err() != nil {
+		c.d.CycleResult(wdeps.CheckStall, "abort")
 		return
 	}
 	if c.d.StreakPending(&c.Fails, "suspect: "+reason) {
@@ -218,48 +264,62 @@ func (c *StallCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	} else {
 		c.d.State.Exit(latchdefs.LatchKubeletRuntimeStall, nil)
 	}
-	if restartK0sWorkerGated(c.d, ctx, wdeps.CheckStall,
-		reason, reason, e.APIOK, true, overloaded,
-		fmt.Sprintf("%s (persisted %dx)", reason, c.Fails)) {
+	if restartK0sWorkerGated(c.d, ctx, k0sWorkerRestartGate{
+		check:        wdeps.CheckStall,
+		suspectTag:   reason,
+		overloadTag:  reason,
+		checkAPI:     true,
+		apiOK:        e.APIOK,
+		overloaded:   overloaded,
+		actionDetail: fmt.Sprintf("%s (persisted %dx)", reason, c.Fails),
+	}) {
 		c.Fails = 0
 	}
 	c.d.CycleResult(wdeps.CheckStall, "ok")
+}
+
+type k0sWorkerRestartGate struct {
+	check        string
+	suspectTag   string
+	overloadTag  string
+	actionDetail string
+	checkAPI     bool
+	apiOK        bool
+	overloaded   bool
 }
 
 // restartK0sWorkerGated enforces the shared overload / API / settle /
 // maintenance-hold / last-restart-budget gate ladder before restarting
 // k0sworker. Returns true when the restart attempt was triggered (so
 // callers reset their streak counter).
-func restartK0sWorkerGated(d *wdeps.Deps, ctx context.Context,
-	check, suspectTag, overloadTag string,
-	checkAPI, apiOK, overloaded bool, actionDetail string) bool {
+func restartK0sWorkerGated(d *wdeps.Deps, ctx context.Context, g k0sWorkerRestartGate) bool {
 	switch {
-	case overloaded:
+	case g.overloaded:
 		d.State.AppendLog(fmt.Sprintf(
-			"suspect: %s - node overloaded, skip restart k0sworker", overloadTag))
+			"suspect: %s - node overloaded, skip restart k0sworker", g.overloadTag))
 		return false
-	case checkAPI && !apiOK:
+	case g.checkAPI && !g.apiOK:
 		d.State.AppendLog(fmt.Sprintf(
-			"suspect: %s - API unreachable (isolated?), skip restart k0sworker", suspectTag))
+			"suspect: %s - API unreachable (isolated?), skip restart k0sworker", g.suspectTag))
 		return false
 	case !k0sWorkerSettled(d, ctx):
 		d.State.AppendLog(fmt.Sprintf(
-			"suspect: %s - k0sworker not settled (<180s), skip restart", suspectTag))
+			"suspect: %s - k0sworker not settled (<180s), skip restart", g.suspectTag))
 		return false
 	case d.HoldEmergencyHeal(ctx):
 		d.State.AppendLog(fmt.Sprintf(
-			"suspect: %s - emergency k0sworker restart held by maintenance window, skip", suspectTag))
+			"suspect: %s - emergency k0sworker restart held by maintenance window, skip", g.suspectTag))
 		return false
 	case !d.State.RateTrySpend("last-restart", d.Cfg.MinRestartInterval):
 		d.State.AppendLog(fmt.Sprintf(
-			"suspect: %s - in restart cooldown (<30m), skip", suspectTag))
+			"suspect: %s - in restart cooldown (<30m), skip", g.suspectTag))
 		return false
 	default:
-		d.State.AppendLog(latchdefs.ActionK0sworkerRestart + " - " + actionDetail)
+		d.State.AppendLog(latchdefs.ActionK0sworkerRestart + " - " + g.actionDetail)
 		if err := restartK0sWorker(d, ctx); err != nil {
 			d.State.AppendLog(fmt.Sprintf("k0sworker restart failed: %v", err))
 		} else {
-			d.Actions.WithLabelValues(check, "restart").Inc()
+			d.Actions.WithLabelValues(g.check, "restart").Inc()
 		}
 		return true
 	}
@@ -288,7 +348,7 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckWatch) {
 		return
 	}
-	if spam := countMatchingLines(watchJournalRe, e.JournalOnce()); spam > journalHitsThresh {
+	if spam := countMatchingLines(watchJournalRe, k0sworkerJournal(ctx, c.d, e)); spam > journalHitsThresh {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: kubelet-watch-wedge early-warn spam=%d/10min (not-registered/no-relationship)", spam))
 	}
@@ -331,8 +391,19 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if ct.IsZero() || now.Sub(ct) < c.d.Cfg.Kubelet.WatchMinAge {
 			continue
 		}
-		if st, err := os.Stat(filepath.Join(c.d.Cfg.PodsDir,
-			string(p.UID))); err != nil || !st.IsDir() {
+		st, err := os.Stat(filepath.Join(c.d.Cfg.PodsDir, string(p.UID)))
+		if err != nil {
+			if os.IsNotExist(err) {
+				missing++
+				continue
+			}
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: kubelet pod dir %s/%s unstatable: %v — watch-wedge inconclusive, keeping state",
+				c.d.Cfg.PodsDir, p.UID, err))
+			c.d.CycleResult(wdeps.CheckWatch, "abort")
+			return
+		}
+		if !st.IsDir() {
 			missing++
 		}
 	}
@@ -368,9 +439,13 @@ func (c *WatchWedgeCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	tag := fmt.Sprintf("kubelet-watch-wedge unseen=%d", missing)
-	if restartK0sWorkerGated(c.d, ctx, wdeps.CheckWatch,
-		tag, tag, false, true, c.d.State.Exists(latchdefs.LatchNodeOverloaded),
-		fmt.Sprintf("kubelet-watch-wedge unseen-pods=%d (persisted %dx)", missing, c.Fails)) {
+	if restartK0sWorkerGated(c.d, ctx, k0sWorkerRestartGate{
+		check:        wdeps.CheckWatch,
+		suspectTag:   tag,
+		overloadTag:  tag,
+		overloaded:   c.d.State.Exists(latchdefs.LatchNodeOverloaded),
+		actionDetail: fmt.Sprintf("kubelet-watch-wedge unseen-pods=%d (persisted %dx)", missing, c.Fails),
+	}) {
 		c.Fails = 0
 	}
 	c.d.CycleResult(wdeps.CheckWatch, "ok")

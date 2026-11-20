@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestParsePairHappyPath(t *testing.T) {
@@ -65,5 +66,57 @@ func TestWriteIntFileFailureIsQuiet(t *testing.T) {
 	WriteIntFile(target, 42) // must not panic
 	if fi, err := os.Stat(target); err != nil || !fi.IsDir() {
 		t.Fatal("the directory target was clobbered")
+	}
+}
+
+func TestCooldownActive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "last-test")
+	now := time.Unix(1700000000, 0)
+	window := 22 * time.Hour
+
+	if CooldownActive(path, now, window, false) {
+		t.Fatal("missing epoch file must not be active")
+	}
+
+	WriteIntFile(path, now.Add(-1*time.Hour).Unix())
+	if !CooldownActive(path, now, window, false) {
+		t.Fatal("1h ago must be active inside 22h window")
+	}
+
+	WriteIntFile(path, now.Add(-23*time.Hour).Unix())
+	if CooldownActive(path, now, window, false) {
+		t.Fatal("23h ago must be expired outside 22h window")
+	}
+
+	// Sub-minute future skew (-30s): active, no rewrite.
+	skew30 := now.Add(30 * time.Second).Unix()
+	WriteIntFile(path, skew30)
+	if !CooldownActive(path, now, window, false) {
+		t.Fatal("sub-minute future skew should stay active")
+	}
+	if got, _ := ReadIntFile(path); got != skew30 {
+		t.Fatalf("sub-minute skew rewrote file: got %d want %d", got, skew30)
+	}
+
+	// Large future skew (+5h) in readOnly: active, no file rewrite.
+	skew5h := now.Add(5 * time.Hour).Unix()
+	WriteIntFile(path, skew5h)
+	if !CooldownActive(path, now, window, true) {
+		t.Fatal("large future skew in readOnly should stay active")
+	}
+	if got, _ := ReadIntFile(path); got != skew5h {
+		t.Fatalf("readOnly rewrote epoch file: got %d want %d", got, skew5h)
+	}
+
+	// Large future skew (+5h) writable: active and self-healed to now.
+	if !CooldownActive(path, now, window, false) {
+		t.Fatal("large future skew should stay active while healing")
+	}
+	if got, _ := ReadIntFile(path); got != now.Unix() {
+		t.Fatalf("future skew not self-healed to now: got %d want %d", got, now.Unix())
+	}
+	if CooldownActive(path, now.Add(window+time.Second), window, false) {
+		t.Fatal("self-healed cooldown must expire after one window")
 	}
 }

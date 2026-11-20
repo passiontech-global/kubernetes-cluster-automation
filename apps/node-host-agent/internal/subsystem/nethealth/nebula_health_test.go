@@ -11,13 +11,16 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/vishvananda/netlink"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth/nebula"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 func TestNebulaHealthy(t *testing.T) {
@@ -669,5 +672,92 @@ func TestTimesyncdClockLatchGates(t *testing.T) {
 	e2.n.restartTimesyncdOnClockLatch(ctx)
 	if e2.sd.Ran("restart") {
 		t.Fatalf("dormant timesyncd restarted, cmds=%v", e2.sd.Cmds())
+	}
+}
+
+func TestNebulaInactivePreservesForeignLatchesAndExitsOwn(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	e.sd.On("is-active nebula@interdc", "inactive\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "state-nebula-isolated"), "1\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "state-nebula-degraded"), "1\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "state-nebula-cert-expiring"), "1\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "state-nebula-mtu-blackhole"), "1\n")
+
+	e.n.Cycle(context.Background())
+
+	if stateExists(e, "nebula-isolated") || stateExists(e, "nebula-degraded") {
+		t.Fatal("owned nebula latches not exited when nebula inactive")
+	}
+	if !stateExists(e, "nebula-cert-expiring") {
+		t.Fatal("hostmetrics-owned state-nebula-cert-expiring was clobbered")
+	}
+	if !stateExists(e, "nebula-mtu-blackhole") {
+		t.Fatal("mtu_blackhole-owned state-nebula-mtu-blackhole was clobbered")
+	}
+	if logs := logLines(t, e); !strings.Contains(logs, "STATE-EXIT: nebula-isolated") {
+		t.Fatalf("expected STATE-EXIT log via State.Exit, got:\n%s", logs)
+	}
+}
+
+func TestNebulaCoordHoldsEmergencyHealAndStampsRemediation(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	held := true
+	stamped := 0
+	coord := &nodecoord.Coord{
+		GetNode: func(context.Context) (map[string]string, []string, error) {
+			if held {
+				return nil, []string{nodecond.KuredRebootTaintKey}, nil
+			}
+			return nil, nil, nil
+		},
+		PatchNodeStatus: func(_ context.Context, cond nodecoord.StatusCondition) error {
+			if cond.Type == nodecond.CondLocalRemediation && cond.Status == "True" {
+				stamped++
+			}
+			return nil
+		},
+		Now: func() time.Time { return e.now },
+	}
+	e.n.cfg.Coord = coord
+	e.sd.On("is-enabled systemd-timesyncd.service", "enabled\n")
+	e.sd.On("restart systemd-timesyncd.service", "")
+	e.sd.On("restart nebula@interdc", "")
+	testutil.WriteFile(t, e.procudp, "  sl  local_address rem_address   st\n")
+	testutil.WriteFile(t, filepath.Join(e.state, "state-clock-skew"), "1\n")
+
+	// Under maintenance hold: CheckNebulaHealth, NebulaRestart, RestartTimesyncdOnClockLatch,
+	// and flushStaleUDPConntrack must NOT restart/flush or spend cooldown budgets.
+	e.n.Cycle(context.Background())
+	e.n.Cycle(context.Background())
+	e.n.nebulaRestart(context.Background())
+	e.n.flushStaleUDPConntrack(context.Background(), checkNebula)
+
+	if e.sd.Ran("restart nebula") || e.sd.Ran("restart systemd-timesyncd") {
+		t.Fatalf("restarted services under nodecoord hold: %v", e.sd.Cmds())
+	}
+	if e.host.Ran("conntrack -D") {
+		t.Fatalf("flushed conntrack under nodecoord hold: %v", e.host.Cmds())
+	}
+	for _, budget := range []string{"last-nebula-restart", "last-ntp-restart", "last-conntrack-flush"} {
+		if _, err := os.Stat(filepath.Join(e.state, budget)); err == nil {
+			t.Fatalf("cooldown budget %s spent while held", budget)
+		}
+	}
+
+	// Lift hold and advance clock past CacheTTL: restart + flush + stamp fire.
+	held = false
+	e.now = e.now.Add(nodecoord.CacheTTL + time.Second)
+	e.n.Cycle(context.Background())
+	if !e.sd.Ran("restart nebula@interdc") {
+		t.Fatalf("nebula not restarted after hold lifted: %v", e.sd.Cmds())
+	}
+	if !e.sd.Ran("restart systemd-timesyncd.service") {
+		t.Fatalf("timesyncd not restarted after hold lifted: %v", e.sd.Cmds())
+	}
+	if !e.host.Ran("conntrack -D -p udp --dport 53") {
+		t.Fatalf("udp/53 conntrack not flushed after hold lifted: %v", e.host.Cmds())
+	}
+	if stamped < 2 {
+		t.Fatalf("expected StampLocalRemediation for both timesyncd and nebula restarts, got %d", stamped)
 	}
 }

@@ -406,17 +406,13 @@ func (c *HubCheck) deadFallback(ctx context.Context) {
 		}
 		c.d.Actions.WithLabelValues(cdeps.CheckHub, "restart_controller").Inc()
 	case cdeps.ModeDryRun:
-		if !c.d.State.RateTrySpend(cdeps.FileRateRestart, c.d.Cfg.Sig13.MinRestart) {
-			c.d.State.SuspectLog(cdeps.LogKeyDeadFallbkCool, fmt.Sprintf(
-				"suspect: apiserver dead + kine db ok but in restart cooldown (<%dm), skip",
-				int(c.d.Cfg.Sig13.MinRestart.Minutes())), c.d.Cfg.SuspectLogCadence)
-			return
-		}
 		c.d.State.AppendLog(fmt.Sprintf(
 			"DRY-RUN: would restart k0scontroller - apiserver dead, kine db ok (dead-fallback %dx)", dn))
-		// Spend the same budget enforce would — a dry-run that
-		// ignores the restart cooldown logs an action every cycle
-		// and misrepresents what enforce would actually do.
+		// Dry-run never spends the shared FileRateRestart budget
+		// (spending it here would suppress genuine feeder/other
+		// restarts in enforce mode); read-only RateOK above already
+		// skips dry-run during real cooldown, and ResetCounter avoids
+		// spamming every cycle by firing once per SoloCycles.
 		c.d.State.ResetCounter(cdeps.FileCtrDead)
 		c.d.Actions.WithLabelValues(cdeps.CheckHub, "dryrun_restart").Inc()
 	}

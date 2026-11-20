@@ -107,7 +107,8 @@ func TestReadyzDegradedOnMaxBackoff(t *testing.T) {
 
 func TestMetricsEndpoint(t *testing.T) {
 	a := New(Config{NodeName: "node-a", PodName: "pod-1", Namespace: "node-ops", Version: "test"})
-	a.started.Store(time.Now().UnixNano())
+	now := time.Now()
+	a.started.Store(&now)
 	srv := httptest.NewServer(a.metricsMux())
 	defer srv.Close()
 
@@ -196,7 +197,8 @@ func TestSubsystemMetricsOnSharedRegistry(t *testing.T) {
 		Help: "test",
 	}))
 	a := New(Config{Registry: reg})
-	a.started.Store(time.Now().UnixNano())
+	now := time.Now()
+	a.started.Store(&now)
 	srv := httptest.NewServer(a.metricsMux())
 	defer srv.Close()
 
@@ -303,6 +305,33 @@ restarted:
 		}
 	case <-deadline:
 		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+func TestSupervisorLogsStackOnPanic(t *testing.T) {
+	buf := captureSlog(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	sub := &panicOnceSubsystem{second: make(chan struct{})}
+	a := New(Config{
+		MetricsAddr: "127.0.0.1:0",
+		ProbeAddr:   "127.0.0.1:0",
+		Subsystems:  []Subsystem{sub},
+	})
+	a.backoffInitial = 50 * time.Millisecond
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	select {
+	case <-sub.second:
+	case <-time.After(10 * time.Second):
+		t.Fatal("subsystem did not restart after panic")
+	}
+	cancel()
+	<-done
+
+	out := buf.String()
+	if !strings.Contains(out, "stack=") || !strings.Contains(out, "panicOnceSubsystem") {
+		t.Fatalf("supervisor panic log missing stack trace:\n%s", out)
 	}
 }
 

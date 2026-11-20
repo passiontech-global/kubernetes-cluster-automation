@@ -439,8 +439,8 @@ func TestDeadFallbackRestartFailureWarns(t *testing.T) {
 	}
 }
 
-// Dry-run mode logs the dead-fallback action and burns the budget
-// without touching systemd.
+// Dry-run mode logs the dead-fallback action without touching systemd
+// or spending the shared FileRateRestart budget.
 func TestDeadFallbackDryRun(t *testing.T) {
 	e := fixture(t)
 	e.H.Cfg.Sig13.Mode = cdeps.ModeDryRun
@@ -458,8 +458,32 @@ func TestDeadFallbackDryRun(t *testing.T) {
 		cdeps.CheckHub, "dryrun_restart")); v != 1 {
 		t.Fatalf("dryrun_restart counter=%v want 1", v)
 	}
+	if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateRestart)); got != 0 {
+		t.Fatalf("dry-run spent FileRateRestart: epoch=%d want 0", got)
+	}
 	if !strings.Contains(e.LogLines(),
 		"DRY-RUN: would restart k0scontroller - apiserver dead, kine db ok") {
 		t.Fatalf("dead-fallback dry-run not logged:\n%s", e.LogLines())
+	}
+}
+
+func TestDeadFallbackDryRunRespectsExistingCooldown(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Sig13.Mode = cdeps.ModeDryRun
+	e.H.Cfg.Hub.PeerAPI = ""
+	e.H.Cfg.TotalControllers = 2
+	e.H.Cfg.Hub.KineDBProbe = "10.0.0.9:6432"
+	e.Journal = "x required revision has been compacted\n"
+	// Pre-spend the shared restart budget (e.g. from an earlier enforce action).
+	e.H.State.RateSpend(cdeps.FileRateRestart)
+	for range 8 {
+		e.H.Cycle(context.Background())
+	}
+	if v := promtest.ToFloat64(e.H.Actions.WithLabelValues(
+		cdeps.CheckHub, "dryrun_restart")); v != 0 {
+		t.Fatalf("dryrun_restart counter=%v want 0 while in cooldown", v)
+	}
+	if !strings.Contains(e.LogLines(), "in restart cooldown") {
+		t.Fatalf("expected cooldown skip log:\n%s", e.LogLines())
 	}
 }

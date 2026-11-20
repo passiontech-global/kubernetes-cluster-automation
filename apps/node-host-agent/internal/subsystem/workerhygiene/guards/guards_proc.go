@@ -4,6 +4,8 @@
 package guards
 
 import (
+	"errors"
+	"io"
 	"os"
 	"strings"
 
@@ -24,6 +26,20 @@ func podUIDForPID(d *wdeps.Deps, pid int) string {
 		return uid
 	}
 	return "unknown"
+}
+
+// podUIDForPIDChecked extracts the pod UID owning a pid via
+// /proc/<pid>/cgroup and reports nonENOENT=true when reading the
+// cgroup file failed for a reason other than ENOENT (e.g. EACCES /
+// ENOTDIR / EISDIR) rather than being a non-pod cgroup or exited PID.
+func podUIDForPIDChecked(d *wdeps.Deps, pid int) (uid string, nonENOENT bool) {
+	if u, ok := wdeps.PodUIDForPID(d, pid); ok {
+		return u, false
+	}
+	if procFileNonENOENT(d, pid, "cgroup") {
+		return "unknown", true
+	}
+	return "unknown", false
 }
 
 // ZombieParent keys one storm streak: pid alone lies after PID
@@ -80,13 +96,41 @@ func procStatCommState(e *wdeps.CycleEnv, d *wdeps.Deps, pid int) (comm, state s
 // unreadable files report "". Read live (wchan is not part of the
 // stat snapshot) — it feeds only the small ACTION-line sample.
 func procWchan(d *wdeps.Deps, pid int) string {
+	w, _ := procWchanChecked(d, pid)
+	return w
+}
+
+// procWchanChecked reads /proc/<pid>/wchan and reports nonENOENT=true
+// when the read failed for a reason other than ENOENT (e.g. EACCES /
+// ENOTDIR / EISDIR).
+func procWchanChecked(d *wdeps.Deps, pid int) (wchan string, nonENOENT bool) {
 	data, err := os.ReadFile(d.Proc.File(pid, "wchan"))
 	if err != nil {
-		return ""
+		return "", !os.IsNotExist(err)
 	}
 	w := strings.TrimSpace(string(data))
 	if w == "0" {
-		return ""
+		return "", false
 	}
-	return w
+	return w, false
+}
+
+// statNonENOENT reports whether /proc/<pid>/stat failed for a reason
+// other than ENOENT (e.g. EACCES / ENOTDIR / EISDIR) when statFor
+// returned ok=false. An exited PID (ENOENT) returns false.
+func statNonENOENT(d *wdeps.Deps, pid int) bool {
+	return procFileNonENOENT(d, pid, "stat")
+}
+
+// procFileNonENOENT reports whether /proc/<pid>/<elem> failed to open
+// or read for a reason other than ENOENT (e.g. EACCES / ENOTDIR / EISDIR).
+func procFileNonENOENT(d *wdeps.Deps, pid int, elem string) bool {
+	f, err := os.Open(d.Proc.File(pid, elem))
+	if err != nil {
+		return !os.IsNotExist(err)
+	}
+	var b [1]byte
+	_, rerr := f.Read(b[:])
+	_ = f.Close()
+	return rerr != nil && !errors.Is(rerr, io.EOF) && !os.IsNotExist(rerr)
 }

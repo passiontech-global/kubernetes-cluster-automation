@@ -45,6 +45,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
@@ -293,6 +294,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	// dir. Lazy like the task map: most cycles never need it.
 	var pids []int
 	pidsLogged := false
+	pidsErr := false
 	pidsOnce := func() []int {
 		if pids == nil {
 			// ReadDir-order pids. Same retry shape as the old
@@ -303,23 +305,27 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 			// code swept zero pids silently (indistinguishable
 			// from a genuinely empty /proc).
 			if p, err := h.Proc.PIDs(); err != nil {
+				pidsErr = true
 				if !pidsLogged {
 					h.State.AppendLogWarn(fmt.Sprintf(
 						"proc pid listing failed — process scans skipped this pass: %v", err))
 					pidsLogged = true
 				}
 			} else {
+				pidsErr = false
 				pids = p
 			}
 		}
 		return pids
 	}
+	pidsOK := func() bool { return !pidsErr }
 	// The k0sworker journal snapshot is shared between 05/06 — the
 	// runner dumped it once per run for the same reason (journald is
 	// slow on CPU-starved nodes; two windows could disagree). Lazy:
 	// an idle cycle never touches journald.
 	journal := ""
 	journalSet := false
+	journalFailed := false
 	journalOnce := func() string {
 		if !journalSet {
 			journalSet = true
@@ -328,10 +334,12 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 			// the detail strings stay this check's own spelling.
 			switch class, _ := journalwatch.ClassifyRead(j, err); class {
 			case journalwatch.ClassFailed:
+				journalFailed = true
 				h.State.AppendLog(fmt.Sprintf("k0sworker journal snapshot failed: %v", err))
 				h.NoteJournalRead(false,
 					fmt.Sprintf("snapshot failed: %v", err))
 			case journalwatch.ClassFilesGone:
+				journalFailed = true
 				h.NoteJournalRead(false,
 					"journalctl reports no journal files")
 			case journalwatch.ClassOK:
@@ -344,6 +352,7 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 		}
 		return journal
 	}
+	journalOK := func() bool { return !journalFailed }
 	// Refresh the conf every cycle when a source is wired — hostconfig
 	// rewrites /etc/node-watchdog.conf mid-run (WD_SIG_* kill switches,
 	// API_BACKENDS); the runner re-sourced it every run.
@@ -408,24 +417,54 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 	statsSet := false
 	statsOnce := func() map[int]procfs.Stat {
 		if !statsSet {
-			statsSet = true
-			for _, pid := range pidsOnce() {
-				if st, ok := h.Proc.Stat(pid); ok {
-					stats[pid] = st
+			pids := pidsOnce()
+			if pidsOK() {
+				for _, pid := range pids {
+					if st, ok := h.Proc.Stat(pid); ok {
+						stats[pid] = st
+					}
 				}
+				statsSet = true
 			}
 		}
 		return stats
 	}
+	var (
+		mountinfoOnceGuard sync.Once
+		mountinfoData      []byte
+		mountinfoErr       error
+	)
+	mountinfoOnce := func() ([]byte, error) {
+		mountinfoOnceGuard.Do(func() {
+			mountinfoData, mountinfoErr = os.ReadFile(h.Cfg.MountinfoFile)
+		})
+		return mountinfoData, mountinfoErr
+	}
+	var (
+		ciliumHealthzOnceGuard sync.Once
+		ciliumHealthzBody      []byte
+		ciliumHealthzErr       error
+	)
+	ciliumHealthzOnce := func(c context.Context) ([]byte, error) {
+		ciliumHealthzOnceGuard.Do(func() {
+			ciliumHealthzBody, ciliumHealthzErr = h.Cfg.Seams.Cilium.UnixGet(
+				c, h.Cfg.Cilium.Socket, "/v1/healthz")
+		})
+		return ciliumHealthzBody, ciliumHealthzErr
+	}
 	*h.envCell = wdeps.CycleEnv{
-		Pods:            pods,
-		APIOK:           apiOK,
-		WorkerActive:    workerActive,
-		SystemdProbeErr: systemdProbeErr,
-		TasksOnce:       tasksOnce,
-		PidsOnce:        pidsOnce,
-		JournalOnce:     journalOnce,
-		StatsOnce:       statsOnce,
+		Pods:              pods,
+		APIOK:             apiOK,
+		WorkerActive:      workerActive,
+		SystemdProbeErr:   systemdProbeErr,
+		TasksOnce:         tasksOnce,
+		PidsOnce:          pidsOnce,
+		PidsOK:            pidsOK,
+		JournalOnce:       journalOnce,
+		JournalOK:         journalOK,
+		StatsOnce:         statsOnce,
+		MountinfoOnce:     mountinfoOnce,
+		CiliumHealthzOnce: ciliumHealthzOnce,
 	}
 	subframe.Dispatch(ctx, sigOn, h.Cycles, h.groups)
 	// node_agent_* gauges — one textfile per cycle carrying the
@@ -445,6 +484,9 @@ func (h *Hygiene) Cycle(ctx context.Context) {
 // the LIST failed — checks treat it as "apiserver unreachable"
 // (inconclusive: keep counters/latches, never act).
 func (h *Hygiene) listNodePods(ctx context.Context) ([]corev1.Pod, bool) {
+	if h.Cfg.Client == nil {
+		return nil, false
+	}
 	// ResourceVersion "0": serve the LIST from the apiserver's
 	// watch cache — a possibly-stale read is fine (each cycle
 	// re-lists; guards act only on latched multi-cycle evidence)

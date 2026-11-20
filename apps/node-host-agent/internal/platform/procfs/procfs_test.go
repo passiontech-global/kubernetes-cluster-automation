@@ -127,6 +127,51 @@ func TestEnvValueSkipsDAndZState(t *testing.T) {
 	}
 }
 
+func TestMMBlockedSkipsDZXxWithFIFONonBlocking(t *testing.T) {
+	fs := New(t.TempDir())
+	for i, state := range []string{"D", "Z", "X", "x"} {
+		pid := 400 + i
+		mkDir(t, fs.File(pid))
+		testutil.WriteFile(t, fs.File(pid, "stat"), "400 (k0s) "+state+" 1 2 3")
+
+		cmdFIFO := fs.File(pid, "cmdline")
+		if err := syscall.Mkfifo(cmdFIFO, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		envFIFO := fs.File(pid, "environ")
+		if err := syscall.Mkfifo(envFIFO, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			for _, p := range []string{cmdFIFO, envFIFO} {
+				if f, err := os.OpenFile(p, os.O_RDWR, 0); err == nil {
+					_ = f.Close()
+				}
+			}
+		})
+
+		done := make(chan struct{})
+		var gotCmd []string
+		var gotEnv string
+		go func() {
+			defer close(done)
+			gotCmd = fs.Cmdline(pid)
+			gotEnv = fs.EnvValue(pid, "KEY")
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("state %q blocked opening FIFO cmdline/environ (violates mmBlocked safety)", state)
+		}
+		if gotCmd != nil {
+			t.Fatalf("Cmdline on %s-state pid = %v, want nil", state, gotCmd)
+		}
+		if gotEnv != "" {
+			t.Fatalf("EnvValue on %s-state pid = %q, want \"\"", state, gotEnv)
+		}
+	}
+}
+
 func TestCgroupContains(t *testing.T) {
 	fs := New(t.TempDir())
 	testutil.WriteFile(t, fs.File(1, "cgroup"),

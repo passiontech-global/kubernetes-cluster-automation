@@ -26,6 +26,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -40,7 +41,10 @@ const saTokenResyncAnnotation = "passiontech.dev/token-resync-at"
 // saTokenNudgeCooldown is the per-pod re-nudge budget — the
 // annotation's own timestamp is the dedupe (a resync that landed
 // already carries a fresh stamp), so no last-* file is needed.
-const saTokenNudgeCooldown = 15 * time.Minute
+const (
+	saTokenNudgeCooldown = 15 * time.Minute
+	saTokenFutureSkew    = time.Minute
+)
 
 // SATokenTTLCheck is the sa-token-ttl projected-token expiry guard as a
 // Check — stateless: the nudge dedupe rides the pod annotation.
@@ -70,21 +74,37 @@ func jwtExpUnix(tok string) (int64, bool) {
 	return claims.Exp, true
 }
 
-// projectedTokenFiles lists the token paths under one pod's
-// kubernetes.io~projected volume dirs — kubelet mounts each
-// projected volume under volumes/kubernetes.io~projected/<vol>/.
 func projectedTokenFiles(podDir string) []string {
-	m, err := filepath.Glob(filepath.Join(podDir, "volumes",
-		"kubernetes.io~projected", "*", "token"))
+	files, _ := projectedTokenFilesChecked(podDir)
+	return files
+}
+
+// projectedTokenFilesChecked lists the token paths under one pod's
+// kubernetes.io~projected volume dirs and reports nonENOENT=true if
+// reading the projected dir failed for a non-ENOENT reason.
+func projectedTokenFilesChecked(podDir string) ([]string, bool) {
+	projDir := filepath.Join(podDir, "volumes", "kubernetes.io~projected")
+	ents, err := os.ReadDir(projDir)
 	if err != nil {
-		return nil
+		return nil, !os.IsNotExist(err)
 	}
-	return m
+	var out []string
+	for _, en := range ents {
+		if !en.IsDir() {
+			continue
+		}
+		out = append(out, filepath.Join(projDir, en.Name(), "token"))
+	}
+	return out, false
 }
 
 // Run executes one sa-token-ttl round.
 func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckSATokenTTL) {
+		return
+	}
+	if e == nil || !e.APIOK {
+		c.d.CycleResult(wdeps.CheckSATokenTTL, "abort")
 		return
 	}
 	podDirs, err := os.ReadDir(c.d.Cfg.PodsDir)
@@ -94,17 +114,32 @@ func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	podByUID := e.PodByUID()
 	now := c.d.Cfg.Seams.Host.Clock.Now()
-	minTTL := -1.0
+	var minTTL float64
+	hasMin := false
+	tokenReadErr := false
 	for _, ent := range podDirs {
 		if !ent.IsDir() {
 			continue
 		}
 		uid := ent.Name()
 		pod := podByUID[uid]
-		for _, tf := range projectedTokenFiles(
-			filepath.Join(c.d.Cfg.PodsDir, uid)) {
+		// Only a Running pod's near-expiry token is an
+		// incident — a Terminating/Succeeded/orphan pod's stale token
+		// is cleanup debt, not a stalled rotation.
+		if pod == nil || pod.Status.Phase != corev1.PodRunning ||
+			pod.DeletionTimestamp != nil {
+			continue
+		}
+		files, dirErr := projectedTokenFilesChecked(filepath.Join(c.d.Cfg.PodsDir, uid))
+		if dirErr {
+			tokenReadErr = true
+		}
+		for _, tf := range files {
 			data, err := os.ReadFile(tf)
 			if err != nil {
+				if !os.IsNotExist(err) {
+					tokenReadErr = true
+				}
 				continue
 			}
 			exp, ok := jwtExpUnix(strings.TrimSpace(string(data)))
@@ -112,21 +147,25 @@ func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				continue
 			}
 			ttl := float64(exp - now.Unix())
-			if minTTL < 0 || ttl < minTTL {
+			if !hasMin || ttl < minTTL {
 				minTTL = ttl
+				hasMin = true
 			}
-			// Only a Running pod's near-expiry token is an
-			// incident — a Terminating/Succeeded pod's stale token
-			// is cleanup debt, not a stalled rotation.
-			if pod == nil || pod.Status.Phase != corev1.PodRunning ||
-				pod.DeletionTimestamp != nil ||
-				ttl >= float64(c.d.Cfg.Runtime.SATokenMinTTLSec) {
+			if ttl >= float64(c.d.Cfg.Runtime.SATokenMinTTLSec) {
 				continue
 			}
 			c.stall(ctx, pod, tf, int64(ttl))
 		}
 	}
-	c.d.SATokenMinTTLSec = minTTL
+	if tokenReadErr {
+		c.d.CycleResult(wdeps.CheckSATokenTTL, "abort")
+		return
+	}
+	if !hasMin {
+		c.d.SATokenMinTTLSec = -1
+	} else {
+		c.d.SATokenMinTTLSec = minTTL
+	}
 	c.d.CycleResult(wdeps.CheckSATokenTTL, "ok")
 }
 
@@ -146,13 +185,21 @@ func (c *SATokenTTLCheck) stall(ctx context.Context, pod *corev1.Pod,
 	// visible on a fresh read.
 	live, err := c.d.Cfg.Client.CoreV1().Pods(pod.Namespace).
 		Get(ctx, pod.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return
+	}
 	if err == nil && live != nil {
+		if live.UID != pod.UID || live.Status.Phase != corev1.PodRunning || live.DeletionTimestamp != nil {
+			return
+		}
 		pod = live
 	}
 	if prev := pod.Annotations[saTokenResyncAnnotation]; prev != "" {
-		if t, err := strconv.ParseInt(prev, 10, 64); err == nil &&
-			now.Unix()-t < int64(saTokenNudgeCooldown.Seconds()) {
-			return // nudged recently — let the in-flight resync land
+		if t, err := strconv.ParseInt(prev, 10, 64); err == nil {
+			age := now.Sub(time.Unix(t, 0))
+			if age >= -saTokenFutureSkew && age < saTokenNudgeCooldown {
+				return // nudged recently — let the in-flight resync land
+			}
 		}
 	}
 	// Past the cooldown — report once per nudge window.

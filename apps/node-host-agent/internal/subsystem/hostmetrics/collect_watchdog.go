@@ -51,6 +51,16 @@ func (b *latchSeenBook) prev() map[string]bool {
 	return prev
 }
 
+func (b *latchSeenBook) keys() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, 0, len(b.m))
+	for k := range b.m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // update folds this scrape's present set into the bookkeeping —
 // first-cleared stamps, TTL drops, the cert-owned series (certOK
 // counts nebula-cert-expiring as active) and the maxSeenStates
@@ -176,6 +186,37 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, sc scrapeCtx) {
 	}
 	if sc.certOK && sc.certDays < nebulaCertWarnDays {
 		present[latchdefs.LatchNebulaCertExpiring] = true
+	}
+	// Fold RAM-only ramEpochs latches (ENOSPC/EROFS fallback in hoststate.Store)
+	// into present so Prometheus watchdog metrics reflect active latches even
+	// when no state-* file could be written to WatchdogStateDir.
+	existsFn := c.cfg.latchExistsFn
+	if existsFn == nil && c.state != nil && c.state.Dir == c.cfg.WatchdogStateDir {
+		existsFn = c.state.Exists
+	}
+	if existsFn != nil {
+		for _, d := range latchdefs.LatchDefs {
+			if !d.Prefix && !present[d.Name] && existsFn(d.Name) {
+				present[d.Name] = true
+			}
+		}
+		for _, name := range c.seen.keys() {
+			if !present[name] && existsFn(name) {
+				present[name] = true
+			}
+		}
+	}
+	// Enumerate ALL RAM-only latches from hoststate.Store.ramEpochs —
+	// including Prefix: true parameterized families (cilium-ipam-*,
+	// apiserver-backend-stale-*) never yet seen on disk.
+	ramLatchesFn := c.cfg.ramLatchesFn
+	if ramLatchesFn == nil && c.cfg.latchExistsFn == nil && c.state != nil && c.state.Dir == c.cfg.WatchdogStateDir {
+		ramLatchesFn = c.state.RAMLatches
+	}
+	if ramLatchesFn != nil {
+		for _, name := range ramLatchesFn() {
+			present[name] = true
+		}
 	}
 	for _, name := range c.seen.update(present, sc.certOK, c.cfg.Clock.Now()) {
 		v := 0.0

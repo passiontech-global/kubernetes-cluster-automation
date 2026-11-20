@@ -425,14 +425,14 @@ func TestKernelShimHelpers(t *testing.T) {
 		t.Fatal("missing proc must not classify")
 	}
 
-	// shimRSSBytes: VmRSS kB → bytes; unreadable → 0.
+	// shimRSSBytes: VmRSS kB → bytes; unreadable → 0, false.
 	wdepstest.WriteFile(t, filepath.Join(d.Cfg.ProcRoot, "700", "status"),
 		"Name:\tx\nVmRSS:\t2048 kB\n")
-	if got := shimRSSBytes(d, 700); got != 2048<<10 {
-		t.Fatalf("shimRSSBytes=%d want 2MiB", got)
+	if got, ok, readErr := shimRSSBytes(d, 700); !ok || readErr || got != 2048<<10 {
+		t.Fatalf("shimRSSBytes=(%d,%v,%v) want (2MiB,true,false)", got, ok, readErr)
 	}
-	if got := shimRSSBytes(d, 702); got != 0 {
-		t.Fatalf("missing pid shimRSSBytes=%d want 0", got)
+	if got, ok, readErr := shimRSSBytes(d, 702); ok || readErr || got != 0 {
+		t.Fatalf("missing pid shimRSSBytes=(%d,%v,%v) want (0,false,false)", got, ok, readErr)
 	}
 
 	// shimTaskID: the -id argv pair; absent → "unknown".

@@ -7,6 +7,8 @@ package etcdmaint
 
 import (
 	"context"
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"fmt"
 	"os"
 	"os/exec"
@@ -48,6 +50,29 @@ func (r *rescuer) waitHealthyVia(ctx context.Context, tries int,
 	return fmt.Errorf("%s still unhealthy after %ds", what, tries)
 }
 
+// verifySingleMember refuses offline defrag (which runs etcd with
+// --force-new-cluster=true) unless the live cluster has exactly 1 member.
+// Calling --force-new-cluster on a multi-member HA cluster would drop peers
+// and split-brain the cluster.
+func (r *rescuer) verifySingleMember(ctx context.Context) error {
+	out, err := r.etcdctl(ctx, healthProbeTimeout, "member", "list", "-w", "json")
+	if err != nil {
+		return fmt.Errorf("etcdctl member list: %w", err)
+	}
+	var ml struct {
+		Members []jsontext.Value `json:"members"`
+	}
+	if err := json.Unmarshal(out, &ml,
+		jsontext.AllowInvalidUTF8(true),
+		jsontext.AllowDuplicateNames(true)); err != nil {
+		return fmt.Errorf("parse etcd member list: %w", err)
+	}
+	if len(ml.Members) != 1 {
+		return fmt.Errorf("offline defrag refused: cluster has %d members (only single-member clusters are safe with --force-new-cluster)", len(ml.Members))
+	}
+	return nil
+}
+
 // offlineDefrag is the script's `systemctl stop -> standalone etcd ->
 // defrag -> kill -> systemctl start` block. Once the service is
 // stopped the deferred restart ALWAYS runs — the script under set -e
@@ -56,6 +81,9 @@ func (r *rescuer) offlineDefrag(ctx context.Context) (err error) {
 	pid, flags, err := r.findEtcdProcess()
 	if err != nil {
 		return err // service never stopped — nothing to restore
+	}
+	if err := r.verifySingleMember(ctx); err != nil {
+		return err // refuse before stopping etcd on multi-member or unverified clusters
 	}
 	_, _ = fmt.Fprintf(r.out,
 		">>> etcd pid=%d data-dir=%s quota-backend-bytes=%s\n",

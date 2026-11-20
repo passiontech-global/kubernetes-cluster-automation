@@ -8,13 +8,17 @@ package pods_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -193,4 +197,116 @@ func TestDNSResolvCacheKeyedByPausePID(t *testing.T) {
 	if e.H.Series.PodDNSResolvOverflow != 0 {
 		t.Fatalf("overflow=%d want 0 after sandbox recreate", e.H.Series.PodDNSResolvOverflow)
 	}
+}
+
+func TestDNSResolvCtrTaskRootUnreadableAbortsPreservingLatchAndCache(t *testing.T) {
+	t.Run("tasks-incomplete-flag", func(t *testing.T) {
+		dnsPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "coredns-abc12-xyz34", UID: wdepstest.UIDA},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		ovPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "ov-pod", UID: wdepstest.UIDB},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		e := fixture(t, dnsPod, ovPod)
+		wdepstest.WriteFile(t, e.ResolvConf, "nameserver 1.1.1.1\n")
+		e.Live[300] = true
+		e.Live[301] = true
+		wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "300", "root", "etc", "resolv.conf"), "nameserver 8.8.8.8\n")
+		wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "301", "root", "etc", "resolv.conf"),
+			"nameserver 10.96.0.10\nnameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\n")
+
+		chk := e.H.Check(wdeps.CheckDNS)
+		healthyTasks := func() (map[string][]wdeps.CtrTask, bool) {
+			return map[string][]wdeps.CtrTask{
+				wdepstest.UIDA: {{Name: "pause", PID: 300, Live: true}},
+				wdepstest.UIDB: {{Name: "pause", PID: 301, Live: true}},
+			}, true
+		}
+		// Cycle 1: arms LatchDNSResolvStale (fails=1), sets PodDNSResolvOverflow=1, caches ovPod.
+		chk.Run(context.Background(), &wdeps.CycleEnv{
+			WorkerActive: true, APIOK: true,
+			Pods:      []corev1.Pod{*dnsPod, *ovPod},
+			TasksOnce: healthyTasks,
+		})
+		if !e.H.State.Exists(latchdefs.LatchDNSResolvStale) {
+			t.Fatal("LatchDNSResolvStale did not arm on cycle 1")
+		}
+		if e.H.Series.PodDNSResolvOverflow != 1 {
+			t.Fatalf("PodDNSResolvOverflow=%d want 1", e.H.Series.PodDNSResolvOverflow)
+		}
+
+		// Cycle 2: TasksOnce reports complete=false -> must abort without clearing latch, overflow, or cache.
+		chk.Run(context.Background(), &wdeps.CycleEnv{
+			WorkerActive: true, APIOK: true,
+			Pods:      []corev1.Pod{*dnsPod, *ovPod},
+			TasksOnce: func() (map[string][]wdeps.CtrTask, bool) { return nil, false },
+		})
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckDNS, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1", got)
+		}
+		if !e.H.State.Exists(latchdefs.LatchDNSResolvStale) {
+			t.Fatal("incomplete task map falsely exited LatchDNSResolvStale")
+		}
+		if e.H.Series.PodDNSResolvOverflow != 1 {
+			t.Fatalf("incomplete task map clobbered PodDNSResolvOverflow=%d want 1", e.H.Series.PodDNSResolvOverflow)
+		}
+		if strings.Contains(e.LogLines(t), "STATE-EXIT: dns-resolv-stale") {
+			t.Fatalf("unexpected STATE-EXIT: dns-resolv-stale:\n%s", e.LogLines(t))
+		}
+
+		// Cycle 3: recovery with same ovPod -> resolvCache must still dedup PodDNSResolvOverflow event (total 1),
+		// and preserved fails=1 reaches ConsecNeeded=2 to kill drifted pause PID 300.
+		chk.Run(context.Background(), &wdeps.CycleEnv{
+			WorkerActive: true, APIOK: true,
+			Pods:      []corev1.Pod{*dnsPod, *ovPod},
+			TasksOnce: healthyTasks,
+		})
+		evs, err := e.CS.EventsV1().Events("app").List(context.Background(), metav1.ListOptions{})
+		if err != nil || len(evs.Items) != 1 {
+			t.Fatalf("expected 1 deduped PodDNSResolvOverflow event across abort, got %d (err=%v)", len(evs.Items), err)
+		}
+		if len(e.Kills) != 1 || e.Kills[0].PID != 300 {
+			t.Fatalf("fails streak lost across abort: kills=%v want pid 300", e.Kills)
+		}
+	})
+
+	t.Run("cycle-ctr-task-root-0000", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 0000 does not block root")
+		}
+		dnsPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "coredns-abc12-xyz34", UID: wdepstest.UIDA},
+			Spec:       corev1.PodSpec{NodeName: "node-a"},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		e := fixture(t, dnsPod)
+		wdepstest.WriteFile(t, e.ResolvConf, "nameserver 1.1.1.1\n")
+		e.Live[310] = true
+		e.MkTask(t, wdepstest.UIDA, "pause", 310)
+		wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "310", "root", "etc", "resolv.conf"), "nameserver 8.8.8.8\n")
+		// Keep Cycle below ConsecNeeded after 1st cycle so LatchDNSResolvStale stays armed.
+		e.H.Cfg.ConsecNeeded = 3
+
+		e.H.Cycle(context.Background())
+		if !e.H.State.Exists(latchdefs.LatchDNSResolvStale) {
+			t.Fatal("LatchDNSResolvStale did not arm on cycle 1")
+		}
+
+		// Break CtrTaskRoot permissions -> Hygiene.Cycle must abort DNSResolvCheck without exiting latch.
+		if err := os.Chmod(e.CtrDir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(e.CtrDir, 0o755) })
+		e.Now = e.Now.Add(time.Minute)
+		e.H.Cycle(context.Background())
+
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckDNS, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1", got)
+		}
+		if !e.H.State.Exists(latchdefs.LatchDNSResolvStale) {
+			t.Fatal("CtrTaskRoot 0o000 cleared LatchDNSResolvStale")
+		}
+	})
 }

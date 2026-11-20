@@ -268,9 +268,11 @@ func (n *Deps) CheckNebulaMTUBlackhole(ctx context.Context,
 func (n *Deps) MaybeClampNebulaMSS(ctx context.Context,
 	wd *watchdogconf.Config, st *MTUProbeState) {
 	st.Mu.Lock()
-	if n.Clock().Now().Sub(st.LastClamp) < mtuClampEvery {
-		st.Mu.Unlock()
-		return
+	if !st.LastClamp.IsZero() {
+		if elapsed := n.Clock().Now().Sub(st.LastClamp); elapsed >= 0 && elapsed < mtuClampEvery {
+			st.Mu.Unlock()
+			return
+		}
 	}
 	st.Mu.Unlock()
 	dev := wd.NebulaDev

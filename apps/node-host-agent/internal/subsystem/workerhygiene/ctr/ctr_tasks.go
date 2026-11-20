@@ -59,6 +59,20 @@ func (c *CtrTasksCheck) commKillable(pid int) bool {
 	return ok && st.HasComm && runtimeKillComm(st.Comm)
 }
 
+// shimReadInconclusive reports whether a /proc/<pid> stat or cmdline read
+// failed for a non-ENOENT reason without touching mm-backed cmdline on D/Z
+// processes.
+func (c *CtrTasksCheck) shimReadInconclusive(pid int) bool {
+	st, sok := c.d.Proc.Stat(pid)
+	if !sok || len(st.Fields) == 0 {
+		return procFileReadNonENOENT(c.d.Proc.File(pid, "stat"))
+	}
+	if st.Fields[0] == "D" || st.Fields[0] == "Z" || st.Fields[0] == "X" || st.Fields[0] == "x" {
+		return false
+	}
+	return procFileReadNonENOENT(c.d.Proc.File(pid, "cmdline"))
+}
+
 // CtrTasksCheck cleans wedged containerd task dirs and orphan shims —
 // the filesystem port of the shell's ctr-based checks (no ctr socket
 // needed in the agent pod):
@@ -99,7 +113,15 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 	sbDirs := map[string]bool{}
-	if es, err := os.ReadDir(c.d.Cfg.SandboxCtlRoot); err == nil {
+	if es, err := os.ReadDir(c.d.Cfg.SandboxCtlRoot); err != nil {
+		if !os.IsNotExist(err) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: sandbox ctl root %s unreadable: %v — ctr-tasks check skipped",
+				c.d.Cfg.SandboxCtlRoot, err))
+			c.d.CycleResult(wdeps.CheckCtrTasks, "abort")
+			return
+		}
+	} else {
 		for _, e := range es {
 			if e.IsDir() {
 				sbDirs[e.Name()] = true
@@ -124,11 +146,18 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// must be kept (inconclusive, never a flap).
 	shimEscalated := false
 	killCapHit := false
+	shimScanInconclusive := false
+	taskReadErr := false
 	// cri-sandbox-reaper: every shim id scoped to OUR containerd this round —
 	// a sandbox dir whose id a live shim holds is not an orphan,
 	// whatever the task-dir scan says.
 	shimIDs := map[string]bool{}
-	pids := e.PidsOnce()
+	pids, pidsOK := c.d.CyclePIDs(e)
+	if !pidsOK {
+		c.d.State.AppendLog("suspect: ctr-tasks /proc scan inconclusive — skipped")
+		c.d.CycleResult(wdeps.CheckCtrTasks, "inconclusive")
+		return
+	}
 	for _, pid := range pids {
 		if nShim >= c.d.Cfg.Ctr.MaxShimKill {
 			killCapHit = true
@@ -143,7 +172,22 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			!strings.HasPrefix(comm, "containerd-shim") {
 			continue
 		}
-		argv := c.d.Proc.Cmdline(pid)
+		var argv []string
+		if st, ok := c.d.Proc.Stat(pid); !ok || len(st.Fields) == 0 {
+			if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) {
+				shimScanInconclusive = true
+			}
+			continue
+		} else {
+			switch st.Fields[0] {
+			case "X", "x":
+				continue
+			case "D", "Z":
+				// Skip mm-backed Cmdline entirely on D/Z tasks.
+			default:
+				argv = c.d.Proc.Cmdline(pid)
+			}
+		}
 		joined := strings.Join(argv, " ")
 		var ns, sid string
 		var inScope bool
@@ -156,7 +200,13 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// mmap_lock. A wedged orphan shim is exactly the case
 			// this reaper must still see: comm + the shim's own
 			// fd table replace the unreadable cmdline.
-			ns, sid, inScope = dzShimScope(c.d, pid)
+			var dzInc bool
+			ns, sid, inScope, dzInc = dzShimScopeChecked(c.d, pid)
+			if dzInc {
+				shimScanInconclusive = true
+			} else if !inScope && c.shimReadInconclusive(pid) {
+				shimScanInconclusive = true
+			}
 		}
 		if !inScope {
 			continue
@@ -171,7 +221,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// task): resolve the dir under the sibling namespace
 			// root — only a genuinely missing dir is an orphan.
 			if _, err := os.Stat(shimTaskDir(c.d, ns, sid)); err == nil ||
-				sbDirs[sid] {
+				!os.IsNotExist(err) || sbDirs[sid] {
 				continue
 			}
 		}
@@ -202,15 +252,21 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.Actions.WithLabelValues(wdeps.CheckCtrTasks, "shim_escalate").Inc()
 			continue
 		}
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: kill orphan shim pid=%d id=%.12s ns=%s - task dir missing",
-			pid, sid, ns))
 		if !c.commKillable(pid) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: orphan shim candidate pid=%d comm not a runtime process — kill refused",
 				pid))
 			continue
 		}
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"cleanup: ctr-tasks orphan shim kill pid=%d held — cluster maintenance in progress",
+				pid))
+			continue
+		}
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: kill orphan shim pid=%d id=%.12s ns=%s - task dir missing",
+			pid, sid, ns))
 		if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: kill orphan shim pid=%d failed: %v", pid, err))
@@ -240,22 +296,46 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		marker := "wedged-seen-" + id
 		dead := false
 		pidData, err := os.ReadFile(filepath.Join(d, "init.pid"))
-		ipid, _ := strconv.Atoi(strings.TrimSpace(string(pidData)))
-		if err != nil || ipid <= 0 || !c.d.PidLive(ipid) {
-			// Unreadable init.pid = half-written dir (containerd
-			// restart mid-create) or an exited init — both are
-			// wedge-shaped, but a task STARTING writes init.pid a
-			// few seconds after the dir: the 5m marker window absorbs
-			// that race.
+		if err != nil {
+			if !os.IsNotExist(err) {
+				taskReadErr = true
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: ctr task %.12s init.pid unreadable: %v — skipped (marker preserved)",
+					id, err))
+				continue
+			}
+			// ENOENT init.pid = half-written dir (containerd restart
+			// mid-create) — confirmed after the 5m marker window.
 			dead = true
-		} else if _, err := os.Stat(filepath.Join(d, "log.json")); err != nil {
-			// init alive but log.json gone: runc kill fails with
-			// ENOENT forever on non-sandbox tasks (pause tasks have
-			// no log.json legitimately); unreadable config.json =
-			// wreckage → dead too (grep miss parity).
-			if cfg, err := os.ReadFile(filepath.Join(d, "config.json")); err != nil ||
-				!sandboxTypeRe.Match(cfg) {
+		} else {
+			ipid, _ := strconv.Atoi(strings.TrimSpace(string(pidData)))
+			if ipid <= 0 || !c.d.PidLive(ipid) {
 				dead = true
+			} else if _, lerr := os.Stat(filepath.Join(d, "log.json")); lerr != nil {
+				if !os.IsNotExist(lerr) {
+					taskReadErr = true
+					c.d.State.AppendLog(fmt.Sprintf(
+						"suspect: ctr task %.12s log.json unreadable: %v — skipped (marker preserved)",
+						id, lerr))
+					continue
+				}
+				// init alive but log.json gone: runc kill fails with
+				// ENOENT forever on non-sandbox tasks (pause tasks have
+				// no log.json legitimately); missing config.json =
+				// wreckage, but non-ENOENT config.json error must abort.
+				cfg, cerr := os.ReadFile(filepath.Join(d, "config.json"))
+				if cerr != nil {
+					if !os.IsNotExist(cerr) {
+						taskReadErr = true
+						c.d.State.AppendLog(fmt.Sprintf(
+							"suspect: ctr task %.12s config.json unreadable: %v — skipped (marker preserved)",
+							id, cerr))
+						continue
+					}
+					dead = true
+				} else if !sandboxTypeRe.Match(cfg) {
+					dead = true
+				}
 			}
 		}
 		if !dead {
@@ -282,30 +362,38 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				c.d.Cfg.Ctr.MaxTaskClean))
 			break
 		}
-		// Marker removal only once the dir is actually being
-		// cleaned: a dir dropped by the cap must KEEP its
-		// confirmed marker — removing it first made over-cap
-		// dirs re-confirm for another 5m forever.
-		c.d.State.ClearBudget("wedged-seen-" + id)
-		// Live init with missing log.json → SIGKILL it first so the
-		// shim can drain and exit (shell's kill -9 init). The
-		// cgroup check proves the pid still IS a pod container
-		// init: init.pid is written once at task create, so a
-		// recycled pid could name an unrelated host process —
-		// signalling it would be a false-positive kill.
-		if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err == nil {
-			if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil &&
-				pid > 0 && c.d.PidLive(pid) {
-				if !c.d.Proc.CgroupContains(pid, podCgroupSubstr) {
-					c.d.State.AppendLog(fmt.Sprintf(
-						"suspect: init pid=%d of %.12s not in a pod cgroup — kill refused (recycled pid?)",
-						pid, id))
-				} else {
-					c.d.State.AppendLog(fmt.Sprintf(
-						"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
-					if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
+		if c.d.HoldLocalAction(ctx) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"cleanup: ctr-tasks wedged task cleanup %.12s held — cluster maintenance in progress",
+				id))
+			break
+		}
+		if pidData, err := os.ReadFile(filepath.Join(d, "init.pid")); err != nil && !os.IsNotExist(err) {
+			taskReadErr = true
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: ctr task %.12s init.pid unreadable before cleanup: %v — skipped",
+				id, err))
+			continue
+		} else {
+			// Marker removal only once the dir is actually being
+			// cleaned: a dir dropped by the cap must KEEP its
+			// confirmed marker — removing it first made over-cap
+			// dirs re-confirm for another 5m forever.
+			c.d.State.ClearBudget("wedged-seen-" + id)
+			if err == nil {
+				if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil &&
+					pid > 0 && c.d.PidLive(pid) {
+					if !c.d.Proc.CgroupContains(pid, podCgroupSubstr) {
 						c.d.State.AppendLog(fmt.Sprintf(
-							"suspect: kill init %d of %.12s failed: %v", pid, id, err))
+							"suspect: init pid=%d of %.12s not in a pod cgroup — kill refused (recycled pid?)",
+							pid, id))
+					} else {
+						c.d.State.AppendLog(fmt.Sprintf(
+							"ACTION: kill -9 init %d of %.12s - log.json missing", pid, id))
+						if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
+							c.d.State.AppendLog(fmt.Sprintf(
+								"suspect: kill init %d of %.12s failed: %v", pid, id, err))
+						}
 					}
 				}
 			}
@@ -348,7 +436,7 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// mid-creation has a fresh ModTime; the marker alone can't tell
 	// creation from abandonment). A capped shim phase skips the
 	// whole sweep: an unexamined shim may still hold a candidate id.
-	if !killCapHit {
+	if !killCapHit && !shimScanInconclusive {
 		const orphanSandboxAge = 30 * time.Minute
 		now := c.d.Cfg.Seams.Host.Clock.Now()
 		for id := range sbDirs {
@@ -378,6 +466,12 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 					c.d.Cfg.Ctr.MaxTaskClean))
 				break
 			}
+			if c.d.HoldLocalAction(ctx) {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"cleanup: ctr-tasks orphan sandbox cleanup %.12s held — cluster maintenance in progress",
+					id))
+				break
+			}
 			c.d.State.ClearBudget(marker)
 			if err := os.RemoveAll(d); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
@@ -397,10 +491,14 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	})
 	// Full scan with no D/Z orphan shim left → release our hold on
 	// the shared latch (pod-teardown's own hold, if any, is
-	// untouched). A capped or escalated scan keeps it.
-	if !shimEscalated && !killCapHit {
+	// untouched). A capped, escalated, or inconclusive scan keeps it.
+	if !shimEscalated && !killCapHit && !shimScanInconclusive {
 		c.d.State.ExitFrom(latchdefs.LatchPodTeardownWedged,
 			wdeps.CheckCtrTasks, nil)
+	}
+	if shimScanInconclusive || taskReadErr {
+		c.d.CycleResult(wdeps.CheckCtrTasks, "abort")
+		return
 	}
 	c.d.CycleResult(wdeps.CheckCtrTasks, "ok")
 }

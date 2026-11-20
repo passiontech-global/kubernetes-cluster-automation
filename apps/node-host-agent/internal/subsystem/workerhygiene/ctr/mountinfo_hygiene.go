@@ -82,7 +82,7 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckMountinfo) {
 		return
 	}
-	data, err := os.ReadFile(c.d.Cfg.MountinfoFile)
+	data, err := c.d.ReadMountinfo(e)
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: mountinfo-hygiene read %s failed: %v — scan skipped",
@@ -122,9 +122,22 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return tasks, tasksComplete
 	}
 
-	seen := map[string]bool{} // marker ids still candidates
-	reaped := 0               // per-cycle umount blast radius
-	capLogged := false        // the reap-cap suspect line logs once per cycle
+	seen := map[string]bool{}       // marker ids still candidates
+	pendingVol := map[string]bool{} // pod-vol UIDs needing marker retention
+	sawIncompleteTasks := false
+	sawTaskStatErr := false
+	sawVolScanErr := false
+	reaped := 0        // per-cycle umount blast radius
+	capLogged := false // the reap-cap suspect line logs once per cycle
+	umountHoldChecked := false
+	umountHeld := false
+	holdUmount := func() bool {
+		if !umountHoldChecked {
+			umountHoldChecked = true
+			umountHeld = c.d.HoldLocalAction(ctx)
+		}
+		return umountHeld
+	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 
 	for ln := range strings.SplitSeq(string(data), "\n") {
@@ -143,8 +156,16 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// from BOTH the runtime-v2 task root and the sandbox
 			// controller root. A dir still present means the task
 			// record exists (ctr-tasks owns the wedged-dir case).
-			if taskDirListed(c.d.Cfg.CtrTaskRoot, id) ||
-				taskDirListed(c.d.Cfg.SandboxCtlRoot, id) {
+			// A non-ENOENT stat failure is unverifiable — fail closed
+			// and keep the confirmation marker intact.
+			taskListed, taskOK := taskDirStatus(c.d.Cfg.CtrTaskRoot, id)
+			sbListed, sbOK := taskDirStatus(c.d.Cfg.SandboxCtlRoot, id)
+			if !taskOK || !sbOK {
+				sawTaskStatErr = true
+				seen["mi-task-seen-"+id] = true
+				continue
+			}
+			if taskListed || sbListed {
 				// Recovered → drop any pending confirmation —
 				// ClearBudget removes file AND the RAM lastSpent
 				// mirror so the 30m window truly resets.
@@ -171,7 +192,14 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 						mountinfoMaxReapPerCycle))
 				}
 				continue // skip the pointless stat/glob/marker work
-			} else if c.umountOrphan(ctx, mount) {
+			}
+			if holdUmount() {
+				c.d.State.SuspectLog("mountinfo-umount-held",
+					"suspect: mountinfo-hygiene orphan umount held — cluster maintenance in progress",
+					mountPressureLogCadence)
+				continue
+			}
+			if c.umountOrphan(ctx, mount) {
 				reaped++
 				c.d.State.ClearBudget(marker)
 			}
@@ -202,16 +230,36 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			// An incomplete map makes the pod-volume group
 			// unverifiable → fail closed.
 			if !tasksComplete {
+				sawIncompleteTasks = true
 				continue
 			}
 			// Staleness evidence is the pod dir's own mtime — the
 			// spec's "pod dir stale > 30m" gate.
 			podDir := filepath.Join(c.d.Cfg.PodsDir, uid)
 			fi, err := os.Stat(podDir)
-			if err != nil || now.Sub(fi.ModTime()) < mountinfoOrphanAge {
+			if err != nil {
+				if !os.IsNotExist(err) {
+					sawVolScanErr = true
+					pendingVol[uid] = true
+				}
+				continue
+			}
+			if now.Sub(fi.ModTime()) < mountinfoOrphanAge {
+				continue
+			}
+			marker := "mi-vol-seen-" + uid
+			first, confirmed := c.d.State.ConfirmMarker(marker, mountinfoOrphanAge)
+			if first || !confirmed {
+				pendingVol[uid] = true
+				if first {
+					c.d.State.AppendLog(fmt.Sprintf(
+						"mountinfo-hygiene: orphan pod volume candidate %.8s - confirm in %dm",
+						uid, int(mountinfoOrphanAge.Minutes())))
+				}
 				continue
 			}
 			if reaped >= mountinfoMaxReapPerCycle {
+				pendingVol[uid] = true
 				if !capLogged {
 					capLogged = true
 					c.d.State.AppendLog(fmt.Sprintf(
@@ -220,25 +268,45 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				}
 				continue
 			}
+			if holdUmount() {
+				pendingVol[uid] = true
+				c.d.State.SuspectLog("mountinfo-umount-held",
+					"suspect: mountinfo-hygiene orphan umount held — cluster maintenance in progress",
+					mountPressureLogCadence)
+				continue
+			}
 			if c.umountOrphan(ctx, mount) {
 				reaped++
+			} else {
+				pendingVol[uid] = true
 			}
 		}
 	}
 	pruneMountinfoMarkers(c.d, seen)
+	if !sawVolScanErr && c.d.Cfg.PodsDir != "" {
+		if _, rerr := os.ReadDir(c.d.Cfg.PodsDir); rerr != nil && !os.IsNotExist(rerr) {
+			sawVolScanErr = true
+		}
+	}
+	if podVolEligible && !sawIncompleteTasks && !sawVolScanErr {
+		c.d.State.PruneMarkers("mi-vol-seen-", func(id string) bool { return pendingVol[id] })
+	}
 
 	if n := countLines(data); n > mountinfoBloatLines {
 		c.emitBloatEvent(ctx, n)
 	}
-	c.checkMountPressure(ctx, data)
-	c.reapOrphanLoops(ctx, e, data, hostPodsDir, podLive, tasksOnce)
+	pressureOK := c.checkMountPressure(ctx, data)
+	loopOK := c.reapOrphanLoops(ctx, e, data, hostPodsDir, podLive, tasksOnce)
+	if !pressureOK || !loopOK || sawTaskStatErr || sawVolScanErr || sawIncompleteTasks {
+		c.d.CycleResult(wdeps.CheckMountinfo, "abort")
+		return
+	}
 	c.d.CycleResult(wdeps.CheckMountinfo, "ok")
 }
 
-func (c *MountinfoCheck) checkMountPressure(ctx context.Context, data []byte) {
+func (c *MountinfoCheck) checkMountPressure(ctx context.Context, data []byte) bool {
 	totalMounts := countLines(data)
 	maxShared, maxGroup, maxMount := maxSharedPeerGroup(data)
-	c.d.Series.MountMaxSharedPeers = int64(maxShared)
 
 	enterRatio := c.d.Cfg.Wave3.MountTableEnterRatio
 	sharedMax := c.d.Cfg.Wave3.MountSharedStormMax
@@ -250,12 +318,27 @@ func (c *MountinfoCheck) checkMountPressure(ctx context.Context, data []byte) {
 	mountMaxPath := filepath.Join(c.d.Cfg.ProcRoot, "sys", "fs", "mount-max")
 	mountMax := mountMaxDefaultCeiling
 	mountMaxReadable := false
-	if raw, err := os.ReadFile(mountMaxPath); err == nil {
-		if v, perr := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64); perr == nil && v > 0 {
-			mountMax = v
-			mountMaxReadable = true
+	raw, err := os.ReadFile(mountMaxPath)
+	switch {
+	case err == nil:
+		v, perr := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+		if perr != nil || v <= 0 {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: mountinfo-hygiene parse %s failed: %q (%v) — mount pressure inconclusive, keeping state",
+				mountMaxPath, strings.TrimSpace(string(raw)), perr))
+			return false
 		}
+		mountMax = v
+		mountMaxReadable = true
+	case os.IsNotExist(err):
+		// Older kernels lack fs.mount-max — fall back to default ceiling.
+	default:
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: mountinfo-hygiene read %s failed: %v — mount pressure inconclusive, keeping state",
+			mountMaxPath, err))
+		return false
 	}
+	c.d.Series.MountMaxSharedPeers = int64(maxShared)
 
 	ratio := float64(totalMounts) / float64(mountMax)
 	ceiling := c.d.Cfg.Wave3.MountMaxCeiling
@@ -302,7 +385,7 @@ func (c *MountinfoCheck) checkMountPressure(ctx context.Context, data []byte) {
 		if c.d.StreakPending(&c.fails, fmt.Sprintf(
 			"suspect: mountinfo-hygiene mount pressure entries=%d/%d (%.2f) max_shared=%d",
 			totalMounts, mountMax, ratio, maxShared)) {
-			return
+			return true
 		}
 		c.d.State.Enter(latchdefs.LatchMountTablePressure, fmt.Sprintf(
 			"entries=%d/%d (%.2f) max_shared=%d (group=%s mount=%s)",
@@ -315,6 +398,7 @@ func (c *MountinfoCheck) checkMountPressure(ctx context.Context, data []byte) {
 		// stale streak so a re-trip needs a fresh confirmation window.
 		c.fails = 0
 	}
+	return true
 }
 
 func maxSharedPeerGroup(data []byte) (maxCount int, maxGroup, maxMount string) {
@@ -347,15 +431,29 @@ func maxSharedPeerGroup(data []byte) (maxCount int, maxGroup, maxMount string) {
 	return maxCount, maxGroup, maxMount
 }
 
-// taskDirListed reports whether <root>/<id> still exists — the ctr
+// taskDirStatus reports whether <root>/<id> still exists — the ctr
 // task/container listing's filesystem port (the CRI plugin keeps a
 // task dir per live container; a dir present means the record lives).
-func taskDirListed(root, id string) bool {
+// ok=false on non-ENOENT stat errors so callers fail closed without
+// clearing pending markers or unmounting mounts.
+func taskDirStatus(root, id string) (listed, ok bool) {
 	if root == "" {
-		return false
+		return false, true
 	}
 	_, err := os.Stat(filepath.Join(root, id))
-	return err == nil
+	if err == nil {
+		return true, true
+	}
+	if os.IsNotExist(err) {
+		return false, true
+	}
+	return false, false
+}
+
+// taskDirListed reports whether <root>/<id> exists (used by unit tests).
+func taskDirListed(root, id string) bool {
+	listed, _ := taskDirStatus(root, id)
+	return listed
 }
 
 // countLines counts non-empty mountinfo lines.

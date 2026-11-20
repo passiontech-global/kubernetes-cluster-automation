@@ -20,6 +20,11 @@ import (
 // census with the orphan-slot drop.
 func (p *Probe) hygieneWAL(ctx context.Context, pg, user, pass string,
 	h *hygieneResult, note func(string)) {
+	p.hygieneWALWithBatch(ctx, pg, user, pass, h, nil, 1, note)
+}
+
+func (p *Probe) hygieneWALWithBatch(ctx context.Context, pg, user, pass string,
+	h *hygieneResult, batch *probeBatch, backendEnv int64, note func(string)) {
 
 	// (b) WAL as a fraction of the data filesystem capacity —
 	// --output=size (total, not avail: the ratio measures retention
@@ -53,12 +58,22 @@ func (p *Probe) hygieneWAL(ctx context.Context, pg, user, pass string,
 	// statements (h.archiveStale/h.archiveSeen already filled).
 
 	// (d) inactive replication slots — retained WAL since restart_lsn.
-	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
-		"SELECT slot_name, "+
-			"COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn),0)::bigint "+
-			"FROM pg_replication_slots WHERE NOT active")
-	if err != nil {
-		note(fmt.Sprintf("slots-fail: %v", err))
+	var out string
+	switch {
+	case batch != nil && batch.err == nil && batch.slotsSeen:
+		out = strings.Join(batch.slotLines, "\n")
+	case batch == nil || batch.canFallback(ctx, backendEnv):
+		var err error
+		out, err = p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe,
+			"SELECT slot_name, "+
+				"COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn),0)::bigint "+
+				"FROM pg_replication_slots WHERE NOT active")
+		if err != nil {
+			note(fmt.Sprintf("slots-fail: %v", err))
+			return
+		}
+	default:
+		note(fmt.Sprintf("slots-fail: %v", batch.err))
 		return
 	}
 	h.slotSeen = true // a successful empty read = no inactive slots

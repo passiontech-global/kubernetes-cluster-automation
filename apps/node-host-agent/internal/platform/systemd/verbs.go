@@ -12,13 +12,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 func (c *Client) runVerb(ctx context.Context, dbusFn func(context.Context) error, args ...string) error {
 	if c.dbus != nil {
 		dbusCtx := ctx
 		var cancel context.CancelFunc
-		if c.cfg.Timeout > 0 {
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline && c.cfg.Timeout > 0 {
 			dbusCtx, cancel = context.WithTimeout(ctx, c.cfg.Timeout)
 		}
 		err := dbusFn(dbusCtx)
@@ -32,7 +33,19 @@ func (c *Client) runVerb(ctx context.Context, dbusFn func(context.Context) error
 			return err
 		}
 	}
-	out, err := c.systemctl(ctx, args...)
+	var (
+		out string
+		err error
+	)
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem > c.cfg.Timeout {
+			out, err = c.ExecBounded(ctx, rem, "systemctl", args...)
+		} else {
+			out, err = c.systemctl(ctx, args...)
+		}
+	} else {
+		out, err = c.systemctl(ctx, args...)
+	}
 	if err != nil {
 		return fmt.Errorf("systemctl %s: %w (%s)",
 			strings.Join(args, " "), err, strings.TrimSpace(out))

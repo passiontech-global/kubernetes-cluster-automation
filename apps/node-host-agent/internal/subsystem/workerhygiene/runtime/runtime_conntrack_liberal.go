@@ -30,6 +30,13 @@ func (c *ConntrackLiberalCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	}
 	if _, err := os.Stat(filepath.Join(
 		c.d.Cfg.SysClassNet, c.d.Cfg.NebulaIface)); err != nil {
+		if !os.IsNotExist(err) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: conntrack-tcp-liberal-guard stat %s/%s failed: %v — inconclusive",
+				c.d.Cfg.SysClassNet, c.d.Cfg.NebulaIface, err))
+			c.d.CycleResult(wdeps.CheckConntrackLiberal, "abort")
+			return
+		}
 		// No nebula iface — the asymmetric-path problem this guard
 		// exists for can't occur; leave the kernel default alone.
 		c.d.CycleResult(wdeps.CheckConntrackLiberal, "ok")

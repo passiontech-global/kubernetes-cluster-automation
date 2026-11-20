@@ -10,7 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // --- check 6: ctr-tasks (31) ---
@@ -326,4 +331,146 @@ func TestCtrTasksOverCapKeepsMarker(t *testing.T) {
 			t.Fatalf("over-cap marker %s dropped — dir would re-confirm forever", id)
 		}
 	}
+}
+
+func TestCtrTasksHoldLocalActionPreservesMarkersAndSkipsKills(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+		},
+	}
+
+	// 1. Orphan shim aged >5m.
+	sid := strings.Repeat("1", 64)
+	e.MkProc(t, 9210, "S",
+		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
+			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	oldShim := e.Now.Add(-10 * time.Minute)
+	if err := os.Chtimes(filepath.Join(e.ProcDir, "9210"), oldShim, oldShim); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Confirmed wedged task dir (>5m marker).
+	wid := "deadc0de" + strings.Repeat("2", 56)
+	wDir := filepath.Join(e.CtrDir, wid)
+	wdepstest.WriteFile(t, filepath.Join(wDir, "init.pid"), "77777")
+	wdepstest.WriteFile(t, filepath.Join(wDir, "config.json"), `{"annotations":{}}`)
+	wdepstest.WriteFile(t, filepath.Join(wDir, "log.json"), "{}\n")
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "wedged-seen-"+wid),
+		fmt.Sprintf("%d\n", e.Now.Add(-10*time.Minute).Unix()))
+
+	// 3. Confirmed orphan sandbox dir (>30m mtime + >30m marker).
+	sbid := strings.Repeat("3", 64)
+	sbDir := filepath.Join(e.H.Cfg.SandboxCtlRoot, sbid)
+	if err := os.MkdirAll(sbDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldSB := e.Now.Add(-35 * time.Minute)
+	if err := os.Chtimes(sbDir, oldSB, oldSB); err != nil {
+		t.Fatal(err)
+	}
+	wdepstest.WriteFile(t, filepath.Join(e.StateDir, "sandbox-orphan-seen-"+sbid),
+		fmt.Sprintf("%d\n", e.Now.Add(-35*time.Minute).Unix()))
+
+	e.H.Cycle(context.Background())
+
+	if len(e.Kills) != 0 {
+		t.Fatalf("kills=%v want none while held", e.Kills)
+	}
+	if _, err := os.Stat(wDir); err != nil {
+		t.Fatalf("wedged task dir removed while held: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "wedged-seen-"+wid)); err != nil {
+		t.Fatalf("wedged-seen marker dropped while held: %v", err)
+	}
+	if _, err := os.Stat(sbDir); err != nil {
+		t.Fatalf("orphan sandbox dir removed while held: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "sandbox-orphan-seen-"+sbid)); err != nil {
+		t.Fatalf("sandbox-orphan-seen marker dropped while held: %v", err)
+	}
+}
+
+func TestCtrTasksSandboxCtlRootUnreadableAbortsWithoutKillingShims(t *testing.T) {
+	t.Run("sandboxctlroot-not-dir", func(t *testing.T) {
+		e := fixture(t)
+		sid := strings.Repeat("7", 64)
+		e.MkProc(t, 9701, "S",
+			"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
+				"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+		old := e.Now.Add(-10 * time.Minute)
+		if err := os.Chtimes(filepath.Join(e.ProcDir, "9701"), old, old); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(e.StateDir, "sandbox-orphan-seen-"+sid)
+		wdepstest.WriteFile(t, marker, fmt.Sprintf("%d\n", e.Now.Add(-10*time.Minute).Unix()))
+
+		// Replace SandboxCtlRoot with a regular file -> non-ENOENT ENOTDIR on ReadDir.
+		if err := os.RemoveAll(e.SbDir); err != nil {
+			t.Fatal(err)
+		}
+		wdepstest.WriteFile(t, e.SbDir, "not-a-dir\n")
+
+		e.H.Cycle(context.Background())
+
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCtrTasks, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1", got)
+		}
+		if len(e.Kills) != 0 {
+			t.Fatalf("killed live shims despite unreadable SandboxCtlRoot: %v", e.Kills)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("sandbox-orphan-seen marker pruned despite unreadable SandboxCtlRoot: %v", err)
+		}
+	})
+
+	t.Run("sandboxctlroot-chmod-0111", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 0111 does not block root")
+		}
+		e := fixture(t)
+		sid := strings.Repeat("8", 64)
+		if err := os.MkdirAll(filepath.Join(e.SbDir, sid), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		e.MkProc(t, 9702, "S",
+			"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
+				"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+		old := e.Now.Add(-10 * time.Minute)
+		if err := os.Chtimes(filepath.Join(e.ProcDir, "9702"), old, old); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(e.StateDir, "sandbox-orphan-seen-"+sid)
+		wdepstest.WriteFile(t, marker, fmt.Sprintf("%d\n", e.Now.Add(-10*time.Minute).Unix()))
+
+		if err := os.Chmod(e.SbDir, 0o111); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(e.SbDir, 0o755) })
+
+		e.H.Cycle(context.Background())
+
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCtrTasks, "abort")); got != 1 {
+			t.Fatalf("abort cycles=%v want 1", got)
+		}
+		if len(e.Kills) != 0 {
+			t.Fatalf("killed sandbox shim despite SandboxCtlRoot EACCES: %v", e.Kills)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("sandbox-orphan-seen marker pruned despite SandboxCtlRoot EACCES: %v", err)
+		}
+
+		if err := os.Chmod(e.SbDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		e.H.Cycle(context.Background())
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCtrTasks, "ok")); got != 1 {
+			t.Fatalf("ok cycles=%v want 1 after SandboxCtlRoot recovery", got)
+		}
+		if len(e.Kills) != 0 {
+			t.Fatalf("healthy sandbox shim killed after recovery: %v", e.Kills)
+		}
+	})
 }

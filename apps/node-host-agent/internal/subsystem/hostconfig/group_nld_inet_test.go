@@ -305,3 +305,33 @@ func TestSplitAddrFamilies(t *testing.T) {
 		t.Fatalf("splitAddrFamilies = %v, %v; want %v, %v", v4, v6, wantV4, wantV6)
 	}
 }
+
+func TestNLDAllowSourcesDeduplicates(t *testing.T) {
+	nldNFT, portsNFT := convergeNLDWithVars(t, `
+nodelocaldns_guard_allow_private: [10.0.0.0/8, 10.0.0.0/8, "fd00::/64"]
+nodelocaldns_guard_allow_extra: [10.0.1.10, 10.0.0.0/8, "fd00::/64", 203.0.113.5, 203.0.113.5]
+host_internal_ports_guard_allow_extra: [10.0.1.10, 203.0.113.5, 203.0.113.5, "fd00::9", "fd00::9"]
+`)
+	checkSetLines := func(label, nft, lineSub string, items ...string) {
+		t.Helper()
+		found := 0
+		for line := range strings.SplitSeq(nft, "\n") {
+			if !strings.Contains(line, lineSub) {
+				continue
+			}
+			found++
+			for _, item := range items {
+				if got := strings.Count(line, item); got != 1 {
+					t.Fatalf("%s (%s): expected %q once in line %q, got %d", label, lineSub, item, line, got)
+				}
+			}
+		}
+		if found == 0 {
+			t.Fatalf("%s: no line matching %q in:\n%s", label, lineSub, nft)
+		}
+	}
+	checkSetLines("nld v4 tcp", nldNFT, "ip saddr {", "10.0.0.0/8", "10.0.1.10", "203.0.113.5")
+	checkSetLines("nld v6 tcp", nldNFT, "ip6 saddr {", "fd00::/64")
+	checkSetLines("ports v4", portsNFT, "ip saddr {", "10.0.1.10", "203.0.113.5")
+	checkSetLines("ports v6", portsNFT, "ip6 saddr {", "fd00::9")
+}

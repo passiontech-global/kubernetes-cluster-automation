@@ -10,12 +10,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/storelocal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // --- Guard a tail: kine TTL ---
@@ -414,5 +421,382 @@ func TestTTLDryRunSparesKine(t *testing.T) {
 	}
 	if len(e.Kills) != 0 {
 		t.Fatalf("dry-run killed kine: %v", e.Kills)
+	}
+}
+
+func TestEmbeddedEtcdProcessSparesAndClearsKineDown(t *testing.T) {
+	e := fixture(t)
+	// First latch StateKineDown when neither kine nor etcd is present.
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateKineDown) {
+		t.Fatal("precondition: kine-down not latched")
+	}
+	// Live etcd process under k0scontroller.service clears StateKineDown.
+	e.MkProc(t, 3400, "etcd", []string{"etcd"}, 1000)
+	e.H.Cycle(context.Background())
+	if e.HasState(cdeps.StateKineDown) {
+		t.Fatal("kine-down latched/retained on embedded etcd host")
+	}
+}
+
+func TestEmbeddedEtcdDiskMarkersSpareKineDown(t *testing.T) {
+	t.Run("etcd_dir", func(t *testing.T) {
+		e := fixture(t)
+		k0sDir := filepath.Join(filepath.Dir(e.State), "k0s-etcd")
+		if err := os.MkdirAll(filepath.Join(k0sDir, "etcd"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		e.H.Cfg.K0sDir = k0sDir
+		e.H.Cycle(context.Background())
+		if e.HasState(cdeps.StateKineDown) {
+			t.Fatal("kine-down latched with <K0sDir>/etcd directory present")
+		}
+	})
+	t.Run("etcdctl_and_ca", func(t *testing.T) {
+		e := fixture(t)
+		e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+		e.H.Cycle(context.Background())
+		if e.HasState(cdeps.StateKineDown) {
+			t.Fatal("kine-down latched with bin/etcdctl + pki/etcd/ca.crt present")
+		}
+	})
+}
+
+func TestExplicitKineMarkersStillLatchKineDown(t *testing.T) {
+	t.Run("kine_db_probe", func(t *testing.T) {
+		e := fixture(t)
+		e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+		e.H.Cfg.Hub.KineDBProbe = "10.0.0.9:6432"
+		e.H.Cycle(context.Background())
+		if !e.HasState(cdeps.StateKineDown) {
+			t.Fatal("kine-down suppressed despite explicit KineDBProbe")
+		}
+	})
+	t.Run("state_db", func(t *testing.T) {
+		e := fixture(t)
+		k0sDir := e.MkEtcdHost(t)
+		testutil.WriteFile(t, filepath.Join(k0sDir, "db", "state.db"), "sqlite")
+		e.H.Cfg.K0sDir = k0sDir
+		e.H.Cycle(context.Background())
+		if !e.HasState(cdeps.StateKineDown) {
+			t.Fatal("kine-down suppressed despite <K0sDir>/db/state.db present")
+		}
+	})
+	t.Run("kine_service_unit", func(t *testing.T) {
+		e := fixture(t)
+		e.H.Cfg.K0sDir = e.MkEtcdHost(t)
+		unitDir := filepath.Dir(e.H.Cfg.K0sControllerUnitFile)
+		testutil.WriteFile(t, filepath.Join(unitDir, "kine.service"), "[Service]\n")
+		e.H.Cycle(context.Background())
+		if !e.HasState(cdeps.StateKineDown) {
+			t.Fatal("kine-down suppressed despite kine.service unit file present")
+		}
+	})
+}
+
+func TestKineTTLDeadHoldEmergencyHeal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		annos  map[string]string
+		taints []string
+	}{
+		{
+			name:  "cluster_maintenance_anno",
+			annos: map[string]string{nodecond.AnnoClusterMaintenanceUntil: "2099-01-01T00:00:00Z"},
+		},
+		{
+			name:   "kured_reboot_taint",
+			taints: []string{nodecond.KuredRebootTaintKey},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			var active atomic.Bool
+			active.Store(true)
+			e.H.Cfg.Coord = &nodecoord.Coord{
+				Now: func() time.Time { return e.Now },
+				GetNode: func(context.Context) (map[string]string, []string, error) {
+					if active.Load() {
+						return tc.annos, tc.taints, nil
+					}
+					return nil, nil, nil
+				},
+			}
+			e.MkProc(t, 3020, "kine", []string{"kine"}, 1000)
+			e.Journal = "E TTL initial list failed\n"
+
+			e.H.Cycle(context.Background())
+			if !e.HasState(cdeps.StateKineTTLDead) {
+				t.Fatal("kine-ttl-dead not latched under maintenance hold")
+			}
+			if len(e.Kills) != 0 {
+				t.Fatalf("killed kine while maintenance held: %v", e.Kills)
+			}
+			if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateTTLKill)); got != 0 {
+				t.Fatalf("FileRateTTLKill spent while held: %d", got)
+			}
+			if v := promtest.ToFloat64(e.H.Actions.WithLabelValues(cdeps.CheckKineTTL, "maint_hold")); v != 1 {
+				t.Fatalf("maint_hold actions=%v want 1", v)
+			}
+
+			// Maintenance clears -> advance past nodecoord.CacheTTL so Coord refreshes.
+			active.Store(false)
+			e.Now = e.Now.Add(nodecoord.CacheTTL + time.Second)
+			e.H.Cycle(context.Background())
+			if len(e.Kills) != 1 || e.Kills[0].PID != 3020 {
+				t.Fatalf("expected kill after maintenance cleared, got %v", e.Kills)
+			}
+		})
+	}
+}
+
+func TestKineTTLLoopHoldEmergencyHeal(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.KineTTL.RewedgeCycles = 1
+	var active atomic.Bool
+	active.Store(true)
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetNode: func(context.Context) (map[string]string, []string, error) {
+			if active.Load() {
+				return map[string]string{nodecond.AnnoClusterMaintenanceUntil: "2099-01-01T00:00:00Z"}, nil, nil
+			}
+			return nil, nil, nil
+		},
+	}
+	e.MkProc(t, 3021, "kine", []string{"kine"}, 1000)
+	e.Journal = "E TTL event watch failed\n"
+
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateKineTTLLoop) {
+		t.Fatal("kine-ttl-loop not latched under maintenance hold")
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("loop path killed kine while maintenance held: %v", e.Kills)
+	}
+	if e.CountLogLines("suspect: kine-ttl-loop — cluster maintenance in progress") != 1 {
+		t.Fatalf("expected distinct kine-ttl-loop hold suspect log:\n%s", e.LogLines())
+	}
+	if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateTTLKill)); got != 0 {
+		t.Fatalf("FileRateTTLKill spent while held: %d", got)
+	}
+	if v := promtest.ToFloat64(e.H.Actions.WithLabelValues(cdeps.CheckKineTTL, "maint_hold")); v != 1 {
+		t.Fatalf("maint_hold actions=%v want 1", v)
+	}
+
+	active.Store(false)
+	e.Now = e.Now.Add(nodecoord.CacheTTL + time.Second)
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 || e.Kills[0].PID != 3021 {
+		t.Fatalf("expected loop recovery kill after maintenance cleared, got %v", e.Kills)
+	}
+}
+
+func TestKineTTLFailOpenOnCoordError(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetNode: func(context.Context) (map[string]string, []string, error) {
+			return nil, nil, errors.New("apiserver unreachable")
+		},
+	}
+	e.MkProc(t, 3022, "kine", []string{"kine"}, 1000)
+	e.Journal = "E TTL initial list failed\n"
+
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 || e.Kills[0].PID != 3022 {
+		t.Fatalf("HoldEmergencyHeal failed closed on transient Coord error: kills=%v", e.Kills)
+	}
+}
+
+func TestKineTTLCtxErrAbortsCachedWedgedDead(t *testing.T) {
+	e := fixture(t)
+	var coordCalls atomic.Int32
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetNode: func(context.Context) (map[string]string, []string, error) {
+			coordCalls.Add(1)
+			return map[string]string{nodecond.AnnoClusterMaintenanceUntil: "2099-01-01T00:00:00Z"}, nil, nil
+		},
+	}
+	// Cycle 1: young pid records FileTTLWedgedPID + StateKineTTLDead without killing.
+	e.MkProc(t, 3050, "kine", []string{"kine"}, 60)
+	e.Journal = "E TTL initial list failed\n"
+	ttl := cdepstest.Check[*storelocal.TTLCheck](e.H, cdeps.CheckKineTTL)
+	ttl.Run(context.Background())
+	if !e.HasState(cdeps.StateKineTTLDead) {
+		t.Fatal("precondition: kine-ttl-dead not latched")
+	}
+	if got := e.H.ReadState(cdeps.FileTTLWedgedPID); got != "3050" {
+		t.Fatalf("precondition: FileTTLWedgedPID=%q want 3050", got)
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("precondition: young pid killed: %v", e.Kills)
+	}
+
+	// Cycle 2: pid survived past MinProcAge with cached ttlDead + cancelled ctx.
+	if err := os.RemoveAll(filepath.Join(e.Proc, "3050")); err != nil {
+		t.Fatal(err)
+	}
+	e.MkProc(t, 3050, "kine", []string{"kine"}, 400)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ttl.Run(ctx)
+
+	if got := coordCalls.Load(); got != 0 {
+		t.Fatalf("cancelled ctx called Coord %d times, want 0", got)
+	}
+	if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateTTLKill)); got != 0 {
+		t.Fatalf("cancelled ctx spent FileRateTTLKill: %d", got)
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("cancelled ctx killed kine: %v", e.Kills)
+	}
+	if v := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckKineTTL, "aborted")); v != 1 {
+		t.Fatalf("cycles{kine-ttl,aborted}=%v want 1", v)
+	}
+}
+
+func TestKineTTLCtxErrAbortsLoopAfterCooldown(t *testing.T) {
+	t.Run("after_cooldown", func(t *testing.T) {
+		e := fixture(t)
+		e.H.Cfg.KineTTL.RewedgeCycles = 1
+		var coordCalls atomic.Int32
+		e.H.Cfg.Coord = &nodecoord.Coord{
+			Now: func() time.Time { return e.Now },
+			GetNode: func(context.Context) (map[string]string, []string, error) {
+				coordCalls.Add(1)
+				return nil, nil, nil
+			},
+		}
+		e.H.State.RateSpend(cdeps.FileRateTTLKill)
+		spentBefore := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateTTLKill))
+		e.MkProc(t, 3052, "kine", []string{"kine"}, 400)
+		e.Journal = "E TTL event watch failed\n"
+
+		ttl := cdepstest.Check[*storelocal.TTLCheck](e.H, cdeps.CheckKineTTL)
+		ttl.Run(context.Background())
+		if !e.HasState(cdeps.StateKineTTLLoop) {
+			t.Fatal("precondition: kine-ttl-loop not latched")
+		}
+		if len(e.Kills) != 0 {
+			t.Fatalf("precondition: cooldown did not spare kine: %v", e.Kills)
+		}
+
+		e.Now = e.Now.Add(e.H.Cfg.KineTTL.CtlRestart + time.Second)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		ttl.Run(ctx)
+
+		if got := coordCalls.Load(); got != 0 {
+			t.Fatalf("cancelled ctx called Coord %d times, want 0", got)
+		}
+		if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateTTLKill)); got != spentBefore {
+			t.Fatalf("cancelled ctx changed FileRateTTLKill: got %d want %d", got, spentBefore)
+		}
+		if len(e.Kills) != 0 {
+			t.Fatalf("cancelled ctx killed kine: %v", e.Kills)
+		}
+		if v := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckKineTTL, "aborted")); v != 1 {
+			t.Fatalf("cycles{kine-ttl,aborted}=%v want 1", v)
+		}
+	})
+
+	t.Run("unspent_budget", func(t *testing.T) {
+		e := fixture(t)
+		e.H.Cfg.KineTTL.RewedgeCycles = 1
+		e.H.Cfg.KineTTL.Mode = cdeps.ModeDryRun
+		var coordCalls atomic.Int32
+		e.H.Cfg.Coord = &nodecoord.Coord{
+			Now: func() time.Time { return e.Now },
+			GetNode: func(context.Context) (map[string]string, []string, error) {
+				coordCalls.Add(1)
+				return nil, nil, nil
+			},
+		}
+		e.MkProc(t, 3053, "kine", []string{"kine"}, 400)
+		e.Journal = "E TTL event watch failed\n"
+
+		ttl := cdepstest.Check[*storelocal.TTLCheck](e.H, cdeps.CheckKineTTL)
+		ttl.Run(context.Background())
+		if !e.HasState(cdeps.StateKineTTLLoop) {
+			t.Fatal("precondition: kine-ttl-loop not latched")
+		}
+
+		e.H.Cfg.KineTTL.Mode = cdeps.ModeEnforce
+		coordCalls.Store(0)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		ttl.Run(ctx)
+
+		if got := coordCalls.Load(); got != 0 {
+			t.Fatalf("cancelled ctx called Coord %d times, want 0", got)
+		}
+		if got := e.H.State.Epoch(filepath.Join(e.State, cdeps.FileRateTTLKill)); got != 0 {
+			t.Fatalf("cancelled ctx spent FileRateTTLKill: %d", got)
+		}
+		if len(e.Kills) != 0 {
+			t.Fatalf("cancelled ctx killed kine: %v", e.Kills)
+		}
+		if v := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckKineTTL, "aborted")); v != 1 {
+			t.Fatalf("cycles{kine-ttl,aborted}=%v want 1", v)
+		}
+	})
+}
+
+func TestKineTTLDeadHoldSuspectLogAfterCooldownAndExitClear(t *testing.T) {
+	e := fixture(t)
+	var holdActive atomic.Bool
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetNode: func(context.Context) (map[string]string, []string, error) {
+			if holdActive.Load() {
+				return map[string]string{nodecond.AnnoClusterMaintenanceUntil: "2099-01-01T00:00:00Z"}, nil, nil
+			}
+			return nil, nil, nil
+		},
+	}
+	e.MkProc(t, 3055, "kine", []string{"kine"}, 1000)
+	e.Journal = "E TTL initial list failed\n"
+
+	// Cycle 1: kill + spend MinRestart budget.
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 {
+		t.Fatalf("precondition: expected 1 kill, got %v", e.Kills)
+	}
+	// Cycle 2: cooldown suspect log uses StateKineTTLDead.
+	e.H.Cycle(context.Background())
+	if n := e.CountLogLines("in restart cooldown"); n != 1 {
+		t.Fatalf("cooldown suspect lines=%d want 1", n)
+	}
+
+	// +31m (> 30m MinRestart, < 1h SuspectLogCadence) with maintenance active ->
+	// must NOT collide with cooldown SuspectLog key.
+	e.Now = e.Now.Add(e.H.Cfg.KineTTL.MinRestart + time.Minute)
+	holdActive.Store(true)
+	e.H.Cycle(context.Background())
+	if n := e.CountLogLines("holding kill"); n != 1 {
+		t.Fatalf("expected holding kill log after cooldown within SuspectLogCadence, got %d:\n%s", n, e.LogLines())
+	}
+	if len(e.Kills) != 1 {
+		t.Fatalf("killed kine during maintenance hold: %v", e.Kills)
+	}
+
+	// Clean respawn exits StateKineTTLDead and clears the -hold suspect budget;
+	// a new episode within SuspectLogCadence must emit a fresh holding kill log.
+	e.Journal = ""
+	if err := os.RemoveAll(filepath.Join(e.Proc, "3055")); err != nil {
+		t.Fatal(err)
+	}
+	e.MkProc(t, 3056, "kine", []string{"kine"}, 1000)
+	e.H.Cycle(context.Background())
+	if e.HasState(cdeps.StateKineTTLDead) {
+		t.Fatal("StateKineTTLDead did not exit on clean kine respawn")
+	}
+
+	e.Journal = "E TTL initial list failed\n"
+	e.H.Cycle(context.Background())
+	if n := e.CountLogLines("holding kill"); n != 2 {
+		t.Fatalf("expected fresh holding kill log on new episode, got %d:\n%s", n, e.LogLines())
 	}
 }

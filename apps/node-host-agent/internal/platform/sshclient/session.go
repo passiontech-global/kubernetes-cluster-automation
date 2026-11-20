@@ -20,17 +20,104 @@ import (
 // stdout+stderr (1 MiB) so a noisy remote command cannot exhaust agent RAM.
 const DefaultMaxOutputBytes = 1 << 20
 
-// NewSession opens a session channel on l bounded by BoundOp on the channel
-// open, and returns it paired with a body-deadline release callback armed via
-// BoundOpCtx (which callers MUST defer).
+// defaultCancelGrace bounds how long CloseWait lets a clean Link.Close
+// drain an in-flight session before escalating to Link.ForceClose.
+const defaultCancelGrace = 100 * time.Millisecond
+
+// NewSession opens a session channel on l bounded by BoundOp on direct
+// connections, or by goroutine+ctx/timeout without touching b.Net when
+// l.JumpShared is true. It returns the session paired with a body-deadline
+// release callback (which callers MUST defer).
 func (l *Link) NewSession(ctx context.Context, log *slog.Logger, timeout time.Duration) (*ssh.Session, func(), error) {
-	clear := BoundOp(ctx, log, l.DeadlineConn(), timeout)
-	sess, err := l.Client.NewSession()
-	clear()
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	return sess, BoundOpCtx(ctx, log, l.DeadlineConn(), timeout), nil
+	if !l.JumpShared {
+		dc := l.DeadlineConn()
+		clear := BoundOp(ctx, log, dc, timeout)
+		cbDone := make(chan struct{})
+		stopCancel := context.AfterFunc(ctx, func() {
+			defer close(cbDone)
+			_ = dc.SetDeadline(time.Now())
+		})
+		sess, err := l.Client.NewSession()
+		if !stopCancel() {
+			<-cbDone
+		}
+		clear()
+		if err != nil {
+			return nil, nil, err
+		}
+		return sess, BoundOpCtx(ctx, log, dc, timeout), nil
+	}
+
+	sessCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		sessCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	type sessResult struct {
+		sess *ssh.Session
+		err  error
+	}
+	ch := make(chan sessResult, 1)
+	go func() {
+		s, err := l.Client.NewSession()
+		ch <- sessResult{sess: s, err: err}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return nil, nil, res.err
+		}
+		return res.sess, func() {}, nil
+	case <-sessCtx.Done():
+		done := make(chan error, 1)
+		go func() {
+			res := <-ch
+			if res.sess != nil {
+				_ = res.sess.Close()
+			}
+			done <- res.err
+		}()
+		_ = l.CloseWait(done, defaultCancelGrace)
+		return nil, nil, sessCtx.Err()
+	}
+}
+
+// CloseWait closes l cleanly (preserving any shared Bastion for grace)
+// while waiting for done to report that the in-flight operation has
+// unwound. If done or l.Close does not complete within grace (e.g. a
+// blackholed shared bastion where SSH_MSG_CHANNEL_CLOSE cannot drain),
+// CloseWait escalates to l.ForceClose() and waits for <-done and <-closeDone.
+func (l *Link) CloseWait(done <-chan error, grace time.Duration) error {
+	if grace <= 0 {
+		grace = defaultCancelGrace
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		_ = l.Close()
+	}()
+	t := time.NewTimer(grace)
+	defer t.Stop()
+	var err error
+	select {
+	case err = <-done:
+		select {
+		case <-closeDone:
+		case <-t.C:
+			_ = l.ForceClose()
+			<-closeDone
+		}
+		return err
+	case <-t.C:
+		_ = l.ForceClose()
+		err = <-done
+		<-closeDone
+		return err
+	}
 }
 
 type cappedOut struct {
@@ -68,6 +155,12 @@ func (l *Link) CombinedOutputCapped(ctx context.Context, log *slog.Logger,
 	defer unbind()
 	defer func() { _ = sess.Close() }()
 
+	runCtx := ctx
+	if l.JumpShared && timeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	out := cappedOut{max: maxBytes}
 	sess.Stdout = &out
 	sess.Stderr = &out
@@ -76,15 +169,15 @@ func (l *Link) CombinedOutputCapped(ctx context.Context, log *slog.Logger,
 		done <- sess.Run(cmd)
 	}()
 	select {
-	case <-ctx.Done():
+	case <-runCtx.Done():
 		// sess.Close only sends an SSH channel-close, which a blackholed
-		// transport never drains. Closing l tears down the carrier conn so
-		// sess.Run returns promptly and the goroutine does not leak.
-		_ = l.Close()
-		if rerr := <-done; rerr != nil && log != nil {
+		// transport never drains. CloseWait tries Link.Close first (so a
+		// healthy shared bastion survives target-only timeouts) and
+		// escalates to ForceClose if done stalls past grace.
+		if rerr := l.CloseWait(done, defaultCancelGrace); rerr != nil && log != nil {
 			log.Debug("sshclient: ssh session failed after cancel", "error", rerr)
 		}
-		return nil, ctx.Err()
+		return nil, runCtx.Err()
 	case rerr := <-done:
 		return []byte(out.buf.String()), rerr
 	}

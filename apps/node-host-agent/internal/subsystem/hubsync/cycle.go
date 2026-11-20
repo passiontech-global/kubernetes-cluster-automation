@@ -94,7 +94,7 @@ func (s *Syncer) Cycle(ctx context.Context) {
 	// same pages anyway). A hash failure aborts the whole cycle:
 	// every target's binary compare needs it, same blast radius as
 	// the parse error above.
-	localSum, err := sha256File(s.cfg.LocalBinary)
+	localSum, err := s.localBinarySum(s.cfg.LocalBinary)
 	if err != nil {
 		s.cfg.Log.Error("hubsync: local binary hash failed — cycle aborted",
 			"path", s.cfg.LocalBinary, "error", err)

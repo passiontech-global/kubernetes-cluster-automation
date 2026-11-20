@@ -52,6 +52,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -128,7 +129,7 @@ type NetHealth struct {
 	// routeGuardLastExit adds a small respawn backoff so a
 	// crash-looping guard can't spawn-storm.
 	routeGuardRunning  atomic.Bool
-	routeGuardLastExit atomic.Int64 // unixnano of last guard exit
+	routeGuardLastExit atomic.Pointer[time.Time] // monotonic-preserving last guard exit
 	// routeGuardSetnsDead latches a terminal setns failure: the
 	// environment cannot enter the host netns, and every respawn
 	// would lock an OS thread + open two ns fds just to fail again —

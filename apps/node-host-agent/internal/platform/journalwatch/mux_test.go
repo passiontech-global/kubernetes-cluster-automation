@@ -200,3 +200,92 @@ func TestMuxRequeueOverflowDropsOldest(t *testing.T) {
 		t.Fatalf("dropped = %d, want 2", mux.Dropped("s"))
 	}
 }
+
+func TestMuxBatchOverflowDropsOldestInOrder(t *testing.T) {
+	var batch strings.Builder
+	for i := 1; i <= 10; i++ {
+		batch.WriteString(muxEntryJSON(int64(i*100), "u", "m"+strconv.Itoa(i)))
+	}
+	mux := New(func(context.Context, ...string) (string, error) {
+		return batch.String(), nil
+	})
+	mux.PollEvery = time.Minute
+	if err := mux.Subscribe("s", nil); err != nil {
+		t.Fatal(err)
+	}
+	sub := mux.subs["s"]
+	sub.cap = 3
+	sub.pending = []Entry{{Msg: "pre"}}
+
+	got, err := mux.Poll(context.Background(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3", len(got))
+	}
+	if got[0].Msg != "m8" || got[1].Msg != "m9" || got[2].Msg != "m10" {
+		t.Fatalf("got = %+v, want [m8 m9 m10]", got)
+	}
+	if mux.Dropped("s") != 8 {
+		t.Fatalf("dropped = %d, want 8 (1 pre + 7 oldest batch entries)", mux.Dropped("s"))
+	}
+}
+
+func TestMuxBackwardClockJumpSelfHeals(t *testing.T) {
+	var calls int
+	mux := New(func(context.Context, ...string) (string, error) {
+		calls++
+		return muxEntryJSON(int64(100+calls), "u", "msg-"+strconv.Itoa(calls)), nil
+	})
+	now := time.Unix(1700000000, 0)
+	mux.Now = func() time.Time { return now }
+	mux.PollEvery = time.Minute
+	if err := mux.Subscribe("s", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial fetch at base time.
+	if got, err := mux.Poll(context.Background(), "s"); err != nil || len(got) != 1 {
+		t.Fatalf("initial poll: %+v err=%v", got, err)
+	}
+	if mux.Fetches() != 1 {
+		t.Fatalf("fetches = %d, want 1", mux.Fetches())
+	}
+
+	// Inside window: no fetch.
+	now = now.Add(30 * time.Second)
+	if _, err := mux.Poll(context.Background(), "s"); err != nil {
+		t.Fatal(err)
+	}
+	if mux.Fetches() != 1 {
+		t.Fatalf("in-window fetches = %d, want 1", mux.Fetches())
+	}
+
+	// Backward clock jump: must self-heal (fetch immediately and re-anchor lastFetch).
+	now = now.Add(-time.Hour)
+	if got, err := mux.Poll(context.Background(), "s"); err != nil || len(got) != 1 {
+		t.Fatalf("post-jump poll: %+v err=%v", got, err)
+	}
+	if mux.Fetches() != 2 {
+		t.Fatalf("post-jump fetches = %d, want 2", mux.Fetches())
+	}
+
+	// Inside the newly-anchored window: no fetch.
+	now = now.Add(30 * time.Second)
+	if _, err := mux.Poll(context.Background(), "s"); err != nil {
+		t.Fatal(err)
+	}
+	if mux.Fetches() != 2 {
+		t.Fatalf("healed-window fetches = %d, want 2", mux.Fetches())
+	}
+
+	// Direct maybeFetch call across a backward clock jump also fetches.
+	now = now.Add(-10 * time.Minute)
+	if err := mux.maybeFetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if mux.Fetches() != 3 {
+		t.Fatalf("direct maybeFetch post-jump fetches = %d, want 3", mux.Fetches())
+	}
+}

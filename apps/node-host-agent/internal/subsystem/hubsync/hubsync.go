@@ -71,13 +71,18 @@ type Syncer struct {
 	held            bool // lease currently held
 	syncedWhileHeld bool // a cycle already ran since the lease was acquired
 	keyReady        bool // converge SSH key observed at least once (latched)
-	// leaseExpiresAt is the wall-clock moment our claim lapses —
-	// renew stamps it from the fresh RenewTime + the advertised
-	// LeaseDurationSeconds. A bare `held` flag goes stale when the
-	// renew path breaks (hung apiserver conn, crashed renewer):
-	// the real Lease then lapses, a second pod takes over, and this
-	// pod keeps converging — split-brain. leaseHeld() requires BOTH.
+	// leaseExpiresAt is the claim expiry moment — renew stamps it from
+	// reqStart + dur preserving Go's monotonic clock reading whenever
+	// Clock.Now() carries one. leaseLastNow tracks the last observed clock
+	// value to detect backward jumps on wall-only (fake) clocks.
 	leaseExpiresAt time.Time
+	leaseLastNow   time.Time
+
+	// LocalBinary SHA-256 cache keyed by (binPath, fsx.FileStatKey).
+	binMu      sync.Mutex
+	binPath    string
+	binStatKey string
+	binSum     string
 	// cycleCh signals "lease freshly held — converge now" from the
 	// renew loop to the cycle driver (buffered 1, drop-when-full).
 	cycleCh chan struct{}
@@ -163,6 +168,12 @@ func New(cfg Config, reg prometheus.Registerer) (*Syncer, error) {
 // Name identifies the subsystem for logging.
 func (s *Syncer) Name() string { return "hubsync" }
 
+func (s *Syncer) closeBastions() {
+	if closer, ok := s.dialer.(interface{ closeBastions() }); ok {
+		closer.closeBastions()
+	}
+}
+
 // Run is the agent.Subsystem entrypoint: acquire/renew the lease on
 // RenewInterval, converge immediately when the lease is first held,
 // then every SyncInterval and on every watcher change edge. A lost
@@ -170,6 +181,7 @@ func (s *Syncer) Name() string { return "hubsync" }
 // re-acquire so a dead holder's lease expiry promotes a live pod
 // without a restart.
 func (s *Syncer) Run(ctx context.Context) {
+	defer s.closeBastions()
 	// Seed the watcher baseline: the first Changed() against an empty
 	// fingerprint always reports an edge, and the startup cycle below
 	// already covers it — swallow it so a steady holder doesn't

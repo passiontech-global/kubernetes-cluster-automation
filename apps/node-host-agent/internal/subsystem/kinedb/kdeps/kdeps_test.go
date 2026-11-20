@@ -437,10 +437,14 @@ func TestPsqlQueryAndScript(t *testing.T) {
 	if !strings.Contains(joined, "-tAc select 1") {
 		t.Fatalf("query argv missing -tAc: %s", joined)
 	}
+	if !strings.Contains(joined, "-e PGOPTIONS") {
+		t.Fatalf("query argv missing -e PGOPTIONS: %s", joined)
+	}
 	envs := fr.Envs()
 	lastEnv := envs[len(envs)-1]
-	if len(envs) == 0 || len(lastEnv) != 2 ||
-		lastEnv[0] != "PGPASSWORD=pw" || lastEnv[1] != "PGAPPNAME="+AppNameMaint {
+	if len(envs) == 0 || len(lastEnv) != 3 ||
+		lastEnv[0] != "PGPASSWORD=pw" || lastEnv[1] != "PGAPPNAME="+AppNameMaint ||
+		!strings.HasPrefix(lastEnv[2], "PGOPTIONS=-c statement_timeout=") {
 		t.Fatalf("query child env=%v", lastEnv)
 	}
 	out, err = d.PsqlScript(context.Background(), "kine-postgres", "postgres", "pw2", AppNameMaint, "LOCK; VACUUM;")
@@ -657,5 +661,46 @@ func TestReapOrphanedMaintSessions(t *testing.T) {
 	})
 	if n, err := d.ReapOrphanedMaintSessions(ctx, "pg", "postgres", "secret", AppNameMaint, "pg_repack"); err == nil || n != 0 {
 		t.Fatalf("ReapOrphanedMaintSessions on err = %d, %v; want 0, err", n, err)
+	}
+}
+
+func TestQueryPGOptions(t *testing.T) {
+	d, _, _ := fixture(t, nil)
+	if got := d.queryPGOptions(); got != "-c statement_timeout=105000" {
+		t.Fatalf("default 2m CmdTimeout queryPGOptions=%q want -c statement_timeout=105000", got)
+	}
+	d.Cfg.CmdTimeout = 20 * time.Second
+	if got := d.queryPGOptions(); got != "-c statement_timeout=10000" {
+		t.Fatalf("20s CmdTimeout floored queryPGOptions=%q want -c statement_timeout=10000", got)
+	}
+	d.Cfg.CmdTimeout = 5 * time.Second
+	if got := d.queryPGOptions(); got != "-c statement_timeout=5000" {
+		t.Fatalf("5s CmdTimeout queryPGOptions=%q want -c statement_timeout=5000", got)
+	}
+	d.Cfg.CmdTimeout = 0
+	if got := d.queryPGOptions(); got != "-c statement_timeout=10000" {
+		t.Fatalf("0 CmdTimeout queryPGOptions=%q want -c statement_timeout=10000", got)
+	}
+}
+
+func TestMemoizedContainerNameBackwardClockStep(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	d, _, _ := fixture(t, nil)
+	d.Cfg.Clock = timex.NewCell(func() time.Time { return now })
+	calls := 0
+	fn := func(context.Context) string {
+		calls++
+		if calls == 1 {
+			return "pg-old"
+		}
+		return "pg-new"
+	}
+	if got := d.memoizedContainerName(context.Background(), "pg", fn); got != "pg-old" {
+		t.Fatalf("first resolve=%q", got)
+	}
+	// Step clock backward before memoized timestamp: must immediately invalidate.
+	now = now.Add(-5 * time.Second)
+	if got := d.memoizedContainerName(context.Background(), "pg", fn); got != "pg-new" || calls != 2 {
+		t.Fatalf("backward clock step kept stale memo: got=%q calls=%d", got, calls)
 	}
 }

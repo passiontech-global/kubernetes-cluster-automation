@@ -207,8 +207,14 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 	}
 	dec := jsontext.NewDecoder(io.LimitReader(resp.Body, maxProbeBody))
 	if err := decodeListRV(dec, &list.Metadata.ResourceVersion); err != nil {
+		// Check ErrUnexpectedEOF before SyntacticError: jsontext wraps
+		// truncated-stream ErrUnexpectedEOF inside *jsontext.SyntacticError,
+		// and a truncated body stream is a body-read fault, not bad syntax.
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return 0, failBody, err
+		}
 		// A syntax/EOF fault is a parse; anything else inside the
-		// token walk is the body stream itself failing.
+		// token walk (e.g. *json.SemanticError) is body_read.
 		var syn *jsontext.SyntacticError
 		if errors.As(err, &syn) || errors.Is(err, io.EOF) ||
 			errors.Is(err, errBadPayload) {

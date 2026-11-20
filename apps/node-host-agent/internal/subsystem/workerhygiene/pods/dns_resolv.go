@@ -58,34 +58,50 @@ const (
 // so io.ReadAll on a FIFO (an untrusted container can bind-mount one
 // over resolv.conf) parks until CycleTimeout instead of returning.
 func readResolvLimited(path string) ([]byte, bool) {
+	data, ok, _ := readResolvLimitedErr(path)
+	return data, ok
+}
+
+func readResolvLimitedErr(path string) ([]byte, bool, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 	defer func() { _ = f.Close() }()
 	fi, err := f.Stat()
-	if err != nil || !fi.Mode().IsRegular() {
-		return nil, false
+	if err != nil {
+		return nil, false, err
+	}
+	if !fi.Mode().IsRegular() {
+		if fi.IsDir() {
+			return nil, false, syscall.EISDIR
+		}
+		return nil, false, nil
 	}
 	data, err := io.ReadAll(io.LimitReader(f, resolvReadLimit))
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
-	return data, true
+	return data, true, nil
 }
 
 // nameserverSet returns the sorted-unique nameserver IPs of a
-// resolv.conf file. ok=false when the file contains
+// resolv.conf file. clusterLocal=true when the file contains
 // "svc.cluster.local" — a ClusterFirst resolv.conf is NOT a host
 // snapshot and must be skipped (killing those pauses killed innocent
 // job pods — incident 2026-09-26).
 func nameserverSet(path string) (ns []string, clusterLocal bool) {
-	data, ok := readResolvLimited(path)
+	ns, clusterLocal, _ = nameserverSetErr(path)
+	return ns, clusterLocal
+}
+
+func nameserverSetErr(path string) (ns []string, clusterLocal bool, err error) {
+	data, ok, err := readResolvLimitedErr(path)
 	if !ok {
-		return nil, false
+		return nil, false, err
 	}
 	if strings.Contains(string(data), "svc.cluster.local") {
-		return nil, true
+		return nil, true, nil
 	}
 	seen := map[string]bool{}
 	for line := range strings.SplitSeq(string(data), "\n") {
@@ -96,7 +112,7 @@ func nameserverSet(path string) (ns []string, clusterLocal bool) {
 		}
 	}
 	slices.Sort(ns)
-	return ns, false
+	return ns, false, nil
 }
 
 func equalNS(a, b []string) bool {
@@ -290,33 +306,47 @@ func (c *DNSResolvCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.loopbackEvented = map[string]bool{}
 	}
 
-	hostNS, _ := nameserverSet(c.d.Cfg.HostResolvConf)
+	hostNS, _, hostErr := nameserverSetErr(c.d.Cfg.HostResolvConf)
+	if hostErr != nil && !os.IsNotExist(hostErr) {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: dns-resolv aborted — host %s unreadable: %v",
+			c.d.Cfg.HostResolvConf, hostErr))
+		c.d.CycleResult(wdeps.CheckDNS, "abort")
+		return
+	}
 	hostStub := slices.Contains(hostNS, systemdStubNS)
 	hostExt := nonLoopbackNS(hostNS)
 	hostHasExternal := len(hostExt) > 0
 
 	var tasks map[string][]wdeps.CtrTask
 	tasksLoaded := false
-	loadTasks := func() map[string][]wdeps.CtrTask {
+	tasksComplete := true
+	loadTasks := func() (map[string][]wdeps.CtrTask, bool) {
 		if !tasksLoaded {
 			tasksLoaded = true
-			if e.TasksOnce != nil {
-				tasks, _ = e.TasksOnce()
-			}
+			tasks, tasksComplete = c.d.CycleTasks(e)
 		}
-		return tasks
+		return tasks, tasksComplete
 	}
 
 	liveUIDs := make(map[string]bool, len(e.Pods))
 	liveCacheKeys := make(map[resolvCacheKey]bool, len(e.Pods))
 	var overflowCount int64
 	var stale []dnsStale
+	podReadErr := false
 
 	for i := range e.Pods {
 		p := &e.Pods[i]
 		uid := string(p.UID)
 		liveUIDs[uid] = true
-		pid := pausePIDOf(loadTasks()[uid])
+		taskMap, ok := loadTasks()
+		if !ok {
+			c.d.State.AppendLog(
+				"suspect: dns-resolv aborted — ctr task map incomplete, pause pids unverifiable")
+			c.d.CycleResult(wdeps.CheckDNS, "abort")
+			return
+		}
+		pid := pausePIDOf(taskMap[uid])
 
 		// 1. Wave-3 #12a: inspect resolv.conf limits for every Running
 		// pod (cached by UID + pausePID so a recreated sandbox is
@@ -368,8 +398,12 @@ func (c *DNSResolvCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		// Read the POD's resolv.conf through the pause mount ns —
 		// ProcRoot/<pid>/root is the task's filesystem view.
-		podNS, clusterLocal := nameserverSet(
+		podNS, clusterLocal, podErr := nameserverSetErr(
 			c.d.Proc.File(pid, "root/etc/resolv.conf"))
+		if podErr != nil && !os.IsNotExist(podErr) {
+			podReadErr = true
+			continue
+		}
 		if clusterLocal || len(podNS) == 0 {
 			continue
 		}
@@ -431,6 +465,11 @@ func (c *DNSResolvCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 	}
 
+	if tasksLoaded && !tasksComplete {
+		c.d.CycleResult(wdeps.CheckDNS, "abort")
+		return
+	}
+
 	c.d.Series.PodDNSResolvOverflow = overflowCount
 	for key := range c.resolvCache {
 		if !liveUIDs[key.uid] || !liveCacheKeys[key] {
@@ -444,6 +483,10 @@ func (c *DNSResolvCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 
 	if len(stale) == 0 {
+		if podReadErr {
+			c.d.CycleResult(wdeps.CheckDNS, "abort")
+			return
+		}
 		c.fails = 0
 		c.d.State.Exit(latchdefs.LatchDNSResolvStale, nil)
 		c.d.CycleResult(wdeps.CheckDNS, "ok")

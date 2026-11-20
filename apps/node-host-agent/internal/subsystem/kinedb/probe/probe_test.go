@@ -456,3 +456,137 @@ func TestUserlistPassword(t *testing.T) {
 		t.Fatalf("absent=%q want empty", got)
 	}
 }
+
+func countDirectReadOnlyPsqlCalls(cmds [][]string) int {
+	n := 0
+	for _, argv := range cmds {
+		joined := strings.Join(argv, " ")
+		if strings.Contains(joined, "psql -h 127.0.0.1 -U postgres -d postgres -tAc ") &&
+			!strings.Contains(joined, "pg_terminate_backend") &&
+			!strings.Contains(joined, "FROM pg_stat_activity WHERE datname IN ('postgres', 'kine') AND ((application_name") &&
+			!strings.Contains(joined, "FROM pg_stat_activity WHERE datname IN ('postgres', 'kine') AND (((") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestProbeCycleBatchesReadOnlyPsqlCalls(t *testing.T) {
+	t.Run("steady_state_daemon", func(t *testing.T) {
+		k, fr, _ := fixture(t, hygieneRules)
+		// Round 1 seeds the 5m churn watermark and 15m large-keys budget.
+		res1 := k.Cycle(context.Background())
+		if !res1.succeeded {
+			t.Fatalf("round 1 failed: %v", res1.notes)
+		}
+		fr.ClearLog()
+
+		// Round 2 is steady-state: exactly 2 direct read-only PsqlQuery calls
+		// (`select 1` + `probeBatchSQL`).
+		res := k.Cycle(context.Background())
+		if !res.succeeded {
+			t.Fatalf("steady-state cycle failed: %v", res.notes)
+		}
+		if got := countDirectReadOnlyPsqlCalls(fr.Cmds()); got != 2 {
+			t.Fatalf("steady-state direct read-only PsqlQuery calls=%d want 2:\n%s", got, fr.Joined())
+		}
+		if strings.Contains(fr.Joined(), "COUNT(*)") {
+			t.Fatalf("2m probe unexpectedly ran COUNT(*):\n%s", fr.Joined())
+		}
+		h := res.hyg
+		if !res.RevSeen || res.Head != 1000 || res.Compact != 200 || res.LiveTup != 290 ||
+			!h.idleSeen || !h.deadSeen || !h.xidSeen || !h.walSeen || !h.archiveSeen ||
+			!h.slotSeen || !h.mxidSeen || !h.invalidSeen || !h.seqSeen || !h.seqCliffSeen ||
+			!h.preparedSeen || !h.xminSeen {
+			t.Fatalf("expected all batched fields seen, got rev=%v hyg=%+v", res.RevSeen, h)
+		}
+	})
+
+	t.Run("read_only_cli", func(t *testing.T) {
+		k, fr, _ := fixture(t, hygieneRules)
+		k.d.Cfg.ReadOnly = true
+		res := k.Cycle(context.Background())
+		if !res.succeeded {
+			t.Fatalf("read-only cycle failed: %v", res.notes)
+		}
+		if got := countDirectReadOnlyPsqlCalls(fr.Cmds()); got != 2 {
+			t.Fatalf("read-only direct read-only PsqlQuery calls=%d want 2:\n%s", got, fr.Joined())
+		}
+	})
+}
+
+func TestProbeBatchPartialFailureFallbackAndNoBackendEnvRetry(t *testing.T) {
+	t.Run("partial_failure_falls_back_when_backend_env_ok", func(t *testing.T) {
+		rules := append(append([]testutil.ExecRule{}, kdepstest.ProbeOKRules...),
+			testutil.ExecRule{Substr: "pg_ls_waldir", Err: errors.New("permission denied")},
+			testutil.ExecRule{Substr: "pg_sequences", Out: "100000\n0\n0|0\n20\n1000|9223372036854775807|bigint\n"},
+			testutil.ExecRule{Substr: "pg_stat_replication", Out: "activity|10\nreplication|0\n"},
+		)
+		k, fr, _ := fixture(t, rules)
+		k.d.Cfg.ReadOnly = true
+		res := k.Cycle(context.Background())
+		if !res.succeeded {
+			t.Fatalf("probe failed on partial hygiene error: %v", res.notes)
+		}
+		// Batch failed -> lazy per-section fallback kept healthy sections seen while
+		// degrading only scalar stats (which includes pg_ls_waldir).
+		if !res.RevSeen || !res.hyg.slotSeen || !res.hyg.mxidSeen ||
+			!res.hyg.invalidSeen || !res.hyg.seqSeen || !res.hyg.seqCliffSeen ||
+			!res.hyg.preparedSeen || !res.hyg.xminSeen {
+			t.Fatalf("healthy fallback sections missing: rev=%v hyg=%+v", res.RevSeen, res.hyg)
+		}
+		if res.hyg.walSeen || res.hyg.archiveSeen || res.hyg.idleSeen {
+			t.Fatalf("failing scalar section unexpectedly seen: %+v", res.hyg)
+		}
+		if got := countDirectReadOnlyPsqlCalls(fr.Cmds()); got <= 2 {
+			t.Fatalf("expected per-section fallback calls > 2, got %d", got)
+		}
+	})
+
+	t.Run("no_fallback_when_backend_env_zero", func(t *testing.T) {
+		k, fr, _ := fixture(t, hygieneRules)
+		fr.FailOn("select 1", errors.New("auth failed"))
+		fr.FailOn(kdepstest.ProbeBatchSubstr, errors.New("auth failed"))
+		k.d.Cfg.ReadOnly = true
+		res := k.Cycle(context.Background())
+		if res.Checks[CheckBackendEnv] != 0 {
+			t.Fatalf("expected backend_env=0, got %d", res.Checks[CheckBackendEnv])
+		}
+		// Must not spawn 6 doomed retries when backend_env failed.
+		if got := countDirectReadOnlyPsqlCalls(fr.Cmds()); got != 2 {
+			t.Fatalf("expected exactly 2 calls (select 1 + batch) with no fallback retries, got %d:\n%s",
+				got, fr.Joined())
+		}
+		if res.RevSeen || res.hyg.idleSeen || res.hyg.slotSeen || res.hyg.mxidSeen ||
+			res.hyg.preparedSeen || res.hyg.xminSeen {
+			t.Fatalf("unexpectedly saw sections on failed batch: rev=%v hyg=%+v", res.RevSeen, res.hyg)
+		}
+	})
+
+	t.Run("no_fallback_on_deadline_exceeded", func(t *testing.T) {
+		k, fr, _ := fixture(t, hygieneRules)
+		fr.FailOn(kdepstest.ProbeBatchSubstr, context.DeadlineExceeded)
+		k.d.Cfg.ReadOnly = true
+		res := k.Cycle(context.Background())
+		if res.Checks[CheckBackendEnv] != 1 {
+			t.Fatalf("expected backend_env=1, got %d", res.Checks[CheckBackendEnv])
+		}
+		if got := countDirectReadOnlyPsqlCalls(fr.Cmds()); got != 2 {
+			t.Fatalf("expected no fallback retries on DeadlineExceeded, got %d:\n%s", got, fr.Joined())
+		}
+	})
+}
+
+func TestParseProbeBatchEdgeCases(t *testing.T) {
+	b := parseProbeBatch("rev|100|50|90\npx|gid|with|pipes\n")
+	if !b.hasTags || !b.slotsSeen || !b.pxSeen {
+		t.Fatalf("expected tagged empty-slot/px flags set: %+v", b)
+	}
+	if len(b.pxLines) != 1 || b.pxLines[0] != "gid|with|pipes" {
+		t.Fatalf("Strings.Cut failed to preserve pipe in GID: %v", b.pxLines)
+	}
+	untagged := parseProbeBatch("1000|200|290\n")
+	if untagged.hasTags || untagged.revSeen || untagged.slotsSeen || untagged.pxSeen {
+		t.Fatalf("untagged output falsely marked tagged: %+v", untagged)
+	}
+}

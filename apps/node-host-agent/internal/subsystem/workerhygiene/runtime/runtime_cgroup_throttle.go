@@ -127,19 +127,36 @@ func cgroupEventsValue(path, key string) (int64, bool) {
 // cgroupPidsLimit parses pids.max — the literal "max" sentinel
 // means unlimited and yields ok=false (no ratio to compute).
 func cgroupPidsLimit(path string) (int64, bool) {
+	v, ok, _ := cgroupPidsLimitChecked(path)
+	return v, ok
+}
+
+func cgroupPidsLimitChecked(path string) (v int64, ok, readErr bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, false
+		return 0, false, !os.IsNotExist(err)
 	}
 	s := strings.TrimSpace(string(data))
 	if s == "" || s == "max" {
-		return 0, false
+		return 0, false, false
 	}
-	v, err := strconv.ParseInt(s, 10, 64)
+	v, err = strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
-	return v, true
+	return v, true, false
+}
+
+func readCgroupIntChecked(path string) (v int64, ok, readErr bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false, !os.IsNotExist(err)
+	}
+	v, err = strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, false, false
+	}
+	return v, true, false
 }
 
 // podUIDFromSlice extracts the pod uid out of a pod slice dir
@@ -154,39 +171,55 @@ func podUIDFromSlice(dir string) string {
 	return strings.ReplaceAll(base[i+len("-pod"):], "_", "-")
 }
 
-// podSliceDirs lists the pod cgroup dirs under kubepods.slice:
+// podSliceDirsChecked lists the pod cgroup dirs under kubepods.slice:
 // Guaranteed pods nest directly (kubepods-pod<uid>.slice),
 // Burstable/BestEffort nest under their QoS slice. The sibling
 // flat fallbacks cover runtimes that don't nest the QoS slices —
 // resolveSwapSliceDir's two-layout rule.
-func podSliceDirs(kubepods string) []string {
+// Absent QoS subdirs (ENOENT) are normal; non-ENOENT read errors on
+// kubepods.slice or any existing QoS subdir return an error so callers
+// abort instead of clobbering gauges and state maps.
+func podSliceDirsChecked(kubepods string) ([]string, error) {
 	root := filepath.Dir(kubepods)
-	pats := []string{
-		filepath.Join(kubepods, "kubepods-pod*.slice"),
-		filepath.Join(kubepods, "kubepods-burstable.slice",
-			"kubepods-burstable-pod*.slice"),
-		filepath.Join(kubepods, "kubepods-besteffort.slice",
-			"kubepods-besteffort-pod*.slice"),
-		filepath.Join(root, "kubepods-burstable.slice",
-			"kubepods-burstable-pod*.slice"),
-		filepath.Join(root, "kubepods-besteffort.slice",
-			"kubepods-besteffort-pod*.slice"),
+	specs := []struct {
+		dir      string
+		prefix   string
+		required bool
+	}{
+		{kubepods, "kubepods-pod", true},
+		{filepath.Join(kubepods, "kubepods-burstable.slice"), "kubepods-burstable-pod", false},
+		{filepath.Join(kubepods, "kubepods-besteffort.slice"), "kubepods-besteffort-pod", false},
+		{filepath.Join(root, "kubepods-burstable.slice"), "kubepods-burstable-pod", false},
+		{filepath.Join(root, "kubepods-besteffort.slice"), "kubepods-besteffort-pod", false},
 	}
 	seen := map[string]bool{}
 	var out []string
-	for _, p := range pats {
-		m, err := filepath.Glob(p)
+	for _, sp := range specs {
+		entries, err := os.ReadDir(sp.dir)
 		if err != nil {
-			continue
+			if !sp.required && os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
 		}
-		for _, d := range m {
+		for _, en := range entries {
+			name := en.Name()
+			if !strings.HasPrefix(name, sp.prefix) || !strings.HasSuffix(name, ".slice") {
+				continue
+			}
+			d := filepath.Join(sp.dir, name)
 			if !seen[d] {
 				seen[d] = true
 				out = append(out, d)
 			}
 		}
 	}
-	return out
+	return out, nil
+}
+
+func podSliceDirs(kubepods string) []string {
+	dirs, _ := podSliceDirsChecked(kubepods)
+	return dirs
 }
 
 // Run executes one cgroup-pod-throttle round.
@@ -224,12 +257,30 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.cpuEvented == nil {
 		c.cpuEvented = map[string]bool{}
 	}
+	dirs, err := podSliceDirsChecked(kubepods)
+	if err != nil {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cgroup-pod-throttle read %s failed: %v — inconclusive, keeping state",
+			kubepods, err))
+		c.d.CycleResult(wdeps.CheckCgroupThrottle, "abort")
+		return
+	}
 	hostIdleRatio, hostIdleOK := c.readHostCPUIdleRatio()
 	podByUID := e.PodByUID()
-	dirs := podSliceDirs(kubepods)
 	seen := map[string]bool{}
 	var maxRatio float64
+	pidsInconclusive := false
+	anyInconclusive := false
 	for _, dir := range dirs {
+		if _, derr := os.ReadDir(dir); derr != nil {
+			if os.IsNotExist(derr) {
+				continue // pod slice vanished mid-sweep — prune ledgers below
+			}
+			seen[dir] = true
+			pidsInconclusive = true
+			anyInconclusive = true
+			continue
+		}
 		seen[dir] = true
 		// --- memory.high throttle half ---
 		avg60, psiOK := psiFullAvg60File(filepath.Join(dir, "memory.pressure"))
@@ -248,7 +299,7 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: cgroup-pod-throttle pod uid=%s memory.pressure full avg60=%.1f high_delta=+%d — memory.high throttle stall without node PSI pressure (cgroup-pod-throttle)",
 				uid, avg60, highDelta))
-			if !c.evented[dir] && c.throttledEvent(ctx, uid,
+			if !c.evented[dir] && c.throttledEvent(ctx, e, uid,
 				avg60, highDelta, podByUID[uid]) {
 				c.evented[dir] = true
 			}
@@ -260,8 +311,12 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			delete(c.evented, dir)
 		}
 		// --- pids.max utilization half ---
-		cur, curOK := readCgroupInt(filepath.Join(dir, "pids.current"))
-		lim, limOK := cgroupPidsLimit(filepath.Join(dir, "pids.max"))
+		cur, curOK, curReadErr := readCgroupIntChecked(filepath.Join(dir, "pids.current"))
+		lim, limOK, limReadErr := cgroupPidsLimitChecked(filepath.Join(dir, "pids.max"))
+		if curReadErr || limReadErr {
+			pidsInconclusive = true
+			anyInconclusive = true
+		}
 		if curOK && limOK && lim > 0 {
 			if r := float64(cur) / float64(lim); r > maxRatio {
 				maxRatio = r
@@ -278,7 +333,9 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			c.prevPidsDenial[dir] = denied
 		}
 		// --- CPU CFS bandwidth throttling half (Wave-3 #9a) ---
-		c.evalCPUCFSThrottle(ctx, dir, hostIdleRatio, hostIdleOK, podByUID)
+		if !c.evalCPUCFSThrottle(ctx, e, dir, hostIdleRatio, hostIdleOK, podByUID) {
+			anyInconclusive = true
+		}
 	}
 	// Drop delta ledgers for vanished pod slices — a deleted pod's
 	// counter must not carry into a recycled slice name.
@@ -314,8 +371,14 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			delete(c.cpuEvented, dir)
 		}
 	}
-	c.d.PodCgroupPIDsMaxUtilRatio = maxRatio
-	c.checkVMAPressure(ctx, e, podByUID)
+	if !pidsInconclusive {
+		c.d.PodCgroupPIDsMaxUtilRatio = maxRatio
+	}
+	vmaOK := c.checkVMAPressure(ctx, e, podByUID)
+	if anyInconclusive || !vmaOK {
+		c.d.CycleResult(wdeps.CheckCgroupThrottle, "abort")
+		return
+	}
 	c.d.CycleResult(wdeps.CheckCgroupThrottle, "ok")
 }
 
@@ -364,10 +427,10 @@ func (c *CgroupThrottleCheck) readHostCPUIdleRatio() (float64, bool) {
 	return 0, false
 }
 
-func readCPUStat(path string) (cpuStatSample, bool) {
+func readCPUStatChecked(path string) (cpuStatSample, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return cpuStatSample{}, false
+		return cpuStatSample{}, false, err
 	}
 	var s cpuStatSample
 	var gotPeriods, gotThrottled bool
@@ -389,18 +452,32 @@ func readCPUStat(path string) (cpuStatSample, bool) {
 			gotThrottled = true
 		}
 	}
-	return s, gotPeriods && gotThrottled
+	return s, gotPeriods && gotThrottled, nil
 }
 
-// cpuStatPathsForSlice returns the pod-level cpu.stat plus every child
-// *.scope/cpu.stat. Burstable pods carry their CPU quota on the container
-// scopes, so a pod-slice-only read would see zero throttling there.
-func cpuStatPathsForSlice(dir string) []string {
+// cpuStatPathsForSliceChecked returns the pod-level cpu.stat plus every child
+// *.scope/cpu.stat, and reports nonENOENT=true if listing dir fails with a
+// non-ENOENT error. Using os.ReadDir directly instead of filepath.Glob also
+// ensures an unreadable *.scope subdir surfaces when readCPUStatChecked opens
+// its cpu.stat.
+func cpuStatPathsForSliceChecked(dir string) ([]string, bool) {
 	paths := []string{filepath.Join(dir, "cpu.stat")}
-	if m, err := filepath.Glob(filepath.Join(dir, "*.scope", "cpu.stat")); err == nil {
-		paths = append(paths, m...)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return paths, true
+		}
+		return nil, false
 	}
-	return paths
+	for _, en := range ents {
+		if !strings.HasSuffix(en.Name(), ".scope") {
+			continue
+		}
+		if en.IsDir() {
+			paths = append(paths, filepath.Join(dir, en.Name(), "cpu.stat"))
+		}
+	}
+	return paths, false
 }
 
 // cpuStatSliceOf maps a path-keyed CPU CFS ledger entry back to its pod slice.
@@ -412,15 +489,22 @@ func cpuStatSliceOf(key string) string {
 	return d
 }
 
-func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, dir string,
-	hostIdleRatio float64, hostIdleOK bool, podByUID map[string]*corev1.Pod) {
+func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, e *wdeps.CycleEnv, dir string,
+	hostIdleRatio float64, hostIdleOK bool, podByUID map[string]*corev1.Pod) bool {
 	var worstPath string
 	var worstDP, worstDT int64
 	var worstRatio float64
 	var worstStreak int
 	fired := false
-	for _, path := range cpuStatPathsForSlice(dir) {
-		cur, ok := readCPUStat(path)
+	paths, nonENOENT := cpuStatPathsForSliceChecked(dir)
+	for _, path := range paths {
+		cur, ok, rerr := readCPUStatChecked(path)
+		if rerr != nil {
+			if !os.IsNotExist(rerr) {
+				nonENOENT = true
+			}
+			continue
+		}
 		if !ok {
 			continue
 		}
@@ -453,8 +537,11 @@ func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, dir string
 		}
 	}
 	if !fired {
+		if nonENOENT {
+			return false
+		}
 		delete(c.cpuEvented, dir)
-		return
+		return true
 	}
 	c.d.Series.PodCgroupCPUThrottled++
 	uid := podUIDFromSlice(dir)
@@ -464,9 +551,16 @@ func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, dir string
 		hostIdleRatio*100, worstStreak), cgroupSuspectLogCadence)
 	if !c.cpuEvented[dir] {
 		pod := podByUID[uid]
-		if pod == nil || c.d.Cfg.Client == nil {
+		if pod == nil {
+			if e == nil || !e.APIOK {
+				return !nonENOENT
+			}
 			c.cpuEvented[dir] = true
-			return
+			return !nonENOENT
+		}
+		if c.d.Cfg.Client == nil {
+			c.cpuEvented[dir] = true
+			return !nonENOENT
 		}
 		if err := c.d.EmitPodEvent(ctx, pod, "cpu-cfs", "PodCPUCFSThrottled",
 			fmt.Sprintf("pod cgroup CPU CFS throttled %d/%d periods (%.1f%%) while host CPU idle=%.1f%% — CPU limit is starving pod despite ample host capacity",
@@ -475,6 +569,7 @@ func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, dir string
 			c.d.Actions.WithLabelValues(wdeps.CheckCgroupThrottle, "cpu_event").Inc()
 		}
 	}
+	return !nonENOENT
 }
 
 // throttledEvent creates the PodMemoryHighThrottled Warning Event on
@@ -482,14 +577,27 @@ func (c *CgroupThrottleCheck) evalCPUCFSThrottle(ctx context.Context, dir string
 // the cgroup throttle stall is invisible in pod status (Running,
 // probes green), so the event is the operator-facing surface.
 // Returns true when the episode counts as handled — the event was
-// created, the pod is unresolvable (a dead pod's cgroup can't take
-// an event anyway), or no events client exists (standalone/test
-// posture). A create failure returns false so the caller's dedup
-// marker does not advance and the next cycle retries.
+// created, the pod is unresolvable on a healthy API list (a dead pod's
+// cgroup can't take an event anyway), or no events client exists
+// (standalone/test posture). A create failure or inconclusive pod list
+// (!e.APIOK) returns false so the caller's dedup marker does not
+// advance and the next cycle retries.
 func (c *CgroupThrottleCheck) throttledEvent(ctx context.Context,
-	uid string, avg60 float64, highDelta int64, pod *corev1.Pod) bool {
+	e *wdeps.CycleEnv, uid string, avg60 float64, highDelta int64, pod *corev1.Pod) bool {
 
-	if pod == nil || c.d.Cfg.Client == nil {
+	if pod == nil {
+		if e == nil || !e.APIOK {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: cgroup-pod-throttle pod uid=%s memory.high throttle — pod list inconclusive, event deferred",
+				uid))
+			return false
+		}
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: cgroup-pod-throttle pod uid=%s memory.high throttle — pod unresolvable, event skipped",
+			uid))
+		return true
+	}
+	if c.d.Cfg.Client == nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: cgroup-pod-throttle pod uid=%s memory.high throttle — pod unresolvable, event skipped",
 			uid))

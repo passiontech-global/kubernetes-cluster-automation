@@ -42,11 +42,15 @@ Cache=yes
 		c.r.fileExists("/usr/lib/systemd/system/systemd-timesyncd.service") ||
 		c.r.fileExists("/lib/systemd/system/systemd-timesyncd.service") {
 		_ = c.r.ensureDir("/etc/systemd/timesyncd.conf.d", 0o755)
-		if ch, _ := c.r.writeManaged("/etc/systemd/timesyncd.conf.d/99-fallback.conf",
+		// Sorts below 50-node-config-agent.conf (group_timesync.go) so
+		// cluster-pinned NTP=/FallbackNTP= overrides the public fallback.
+		ch, _ := c.r.writeManaged("/etc/systemd/timesyncd.conf.d/10-fallback.conf",
 			[]byte(`# Managed by node-config-agent - public NTP fallbacks
 [Time]
 FallbackNTP=time.cloudflare.com time.google.com 0.pool.ntp.org 1.pool.ntp.org
-`), 0o644); ch {
+`), 0o644)
+		rmCh, _ := c.r.removeManaged("/etc/systemd/timesyncd.conf.d/99-fallback.conf")
+		if ch || rmCh {
 			// Restart only a RUNNING timesyncd — installed ≠ in
 			// use. On chrony hosts the unit sits disabled/inactive
 			// and a restart would start a second NTP daemon

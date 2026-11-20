@@ -51,11 +51,15 @@ var (
 // The check is dormant everywhere cilium_host exists (cilium nodes)
 // and on hosts with no cali* ifaces at all (non-calico, hub nodes).
 
-// calicoIfaceCount counts cali* interfaces under SysClassNet; -1
-// when the sysfs root is unreadable (inconclusive).
+// calicoIfaceCount counts cali* interfaces under SysClassNet; 0 when
+// SysClassNet does not exist (non-Calico/absent sysfs), -1 when the
+// sysfs root fails with a non-ENOENT error (inconclusive).
 func calicoIfaceCount(d *wdeps.Deps) int {
 	entries, err := os.ReadDir(d.Cfg.SysClassNet)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
 		return -1
 	}
 	n := 0
@@ -97,9 +101,15 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	cali := calicoIfaceCount(c.d)
-	if cali <= 0 {
-		// No cali* veth at all — not a calico node (unreadable
-		// sysfs reports -1 the same way: nothing to verify).
+	if cali < 0 {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"suspect: calico-hygiene read %s failed — scan inconclusive, keeping state",
+			c.d.Cfg.SysClassNet))
+		c.d.CycleResult(wdeps.CheckCalico, "abort")
+		return
+	}
+	if cali == 0 {
+		// No cali* veth at all — not a calico node.
 		c.VethFails = 0
 		c.felixFails = 0
 		c.wgFails = 0
@@ -178,6 +188,9 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		// the DaemonSet rebuilds it (last-calico-restart budget).
 		if c.felixFails >= CalicoFelixRestartFails {
 			switch {
+			case c.d.Cfg.Client == nil:
+				c.d.State.AppendLog(
+					"suspect: calico-felix-down pod delete skipped — kubernetes client nil")
 			case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: calico-felix-down %dx but node overloaded — skip pod restart", c.felixFails))
@@ -227,6 +240,9 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod) {
 	wgDir := filepath.Join(c.d.Cfg.SysClassNet, "wireguard.cali")
 	if _, err := os.Stat(wgDir); err != nil {
+		if !os.IsNotExist(err) {
+			return
+		}
 		c.wgFails = 0
 		return
 	}
@@ -262,6 +278,9 @@ func (c *CalicoCheck) checkWireguardCali(ctx context.Context, felix *corev1.Pod)
 		return
 	}
 	switch {
+	case c.d.Cfg.Client == nil:
+		c.d.State.AppendLog(
+			"suspect: calico-hygiene wireguard.cali pod delete skipped — kubernetes client nil")
 	case c.d.HoldEmergencyHeal(ctx):
 		c.d.State.AppendLog(
 			"suspect: calico-hygiene wireguard.cali pod delete held — cluster maintenance in progress")
@@ -331,6 +350,10 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 				name, int(calicoVethGCMinAge.Minutes())))
 			continue
 		}
+		if d.HoldLocalAction(ctx) {
+			d.State.AppendLog("cleanup: calico-hygiene orphan veth delete held — cluster maintenance in progress")
+			break
+		}
 		// netlinkx.LinkDel replaces the old `ip link delete` systemd
 		// exec — same host-netns target (pid 1), no fork per delete.
 		if derr := d.Cfg.Seams.Host.LinkDelFn(name); derr != nil {
@@ -348,6 +371,6 @@ func gcCalicoOrphanVeths(d *wdeps.Deps, ctx context.Context) {
 	// Prune markers for ifaces that no longer exist.
 	d.State.PruneMarkers("veth-seen-", func(name string) bool {
 		_, err := os.Stat(filepath.Join(d.Cfg.SysClassNet, name))
-		return err == nil
+		return err == nil || !os.IsNotExist(err)
 	})
 }

@@ -14,7 +14,7 @@ func TestLivenessWedgedScenarios(t *testing.T) {
 	// 1. Inactive subBeat with stale fallback -> not wedged.
 	inactive := &subBeat{}
 	liveInactive := cycle.NewLiveness()
-	liveInactive.Fallback().LastProgress.Store(time.Now().Add(-time.Hour).UnixNano())
+	liveInactive.Fallback().StampAt(time.Now().Add(-time.Hour))
 	inactive.live.Store(liveInactive)
 	a.beats.Store("inactive", inactive)
 	if a.livenessWedged() {
@@ -26,7 +26,7 @@ func TestLivenessWedgedScenarios(t *testing.T) {
 	exempt.active.Store(true)
 	liveExempt := cycle.NewLiveness()
 	cycle.Exempt(cycle.WithLiveness(context.Background(), liveExempt))
-	liveExempt.Fallback().LastProgress.Store(time.Now().Add(-time.Hour).UnixNano())
+	liveExempt.Fallback().StampAt(time.Now().Add(-time.Hour))
 	exempt.live.Store(liveExempt)
 	a.beats.Store("exempt", exempt)
 	if a.livenessWedged() {
@@ -38,7 +38,7 @@ func TestLivenessWedgedScenarios(t *testing.T) {
 	fresh.active.Store(true)
 	liveFresh := cycle.NewLiveness()
 	lb := liveFresh.RegisterLoop("fast", time.Minute, time.Minute)
-	lb.LastProgress.Store(time.Now().UnixNano())
+	lb.Stamp()
 	fresh.live.Store(liveFresh)
 	a.beats.Store("fresh", fresh)
 	if a.livenessWedged() {
@@ -46,7 +46,7 @@ func TestLivenessWedgedScenarios(t *testing.T) {
 	}
 
 	// 4. Active stale loop beat -> wedged.
-	lb.LastProgress.Store(time.Now().Add(-time.Hour).UnixNano())
+	lb.StampAt(time.Now().Add(-time.Hour))
 	if !a.livenessWedged() {
 		t.Fatal("stale loop beat should be reported wedged")
 	}
@@ -56,7 +56,7 @@ func TestLivenessWedgedScenarios(t *testing.T) {
 	fb := &subBeat{}
 	fb.active.Store(true)
 	liveFB := cycle.NewLiveness()
-	liveFB.Fallback().LastProgress.Store(time.Now().Add(-time.Hour).UnixNano())
+	liveFB.Fallback().StampAt(time.Now().Add(-time.Hour))
 	fb.live.Store(liveFB)
 	a.beats.Store("fallback", fb)
 	if !a.livenessWedged() {

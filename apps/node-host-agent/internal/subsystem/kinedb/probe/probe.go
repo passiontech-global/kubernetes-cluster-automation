@@ -258,11 +258,11 @@ func (p *Probe) RunChecks(ctx context.Context) *Result {
 			// idle-in-transaction >5m or a non-maintenance active
 			// query >10m holds locks the compact guard needs.
 			p.reapStuckSessions(ctx, pg, user, pass, note)
-			p.probeAppChecks(ctx, pg, pgb, user, pass, res, note)
+			batch := p.probeAppChecks(ctx, pg, pgb, user, pass, res, note)
 			// kine-pg-hygiene + WAL archive guard: cheap pg_stat
 			// census each round (idle-in-tx, dead tuples, XID age,
 			// pg_wal/archiver/slots) plus the gated remediations.
-			p.pgHygiene(ctx, pg, user, pass, res, note)
+			p.pgHygiene(ctx, pg, user, pass, res, batch, note)
 			// kinedb-maintenance: pgbouncer saturation/auth wedge — deep
 			// client queue, or e2e auth failing while the raw
 			// backend still logs in, means the pooler itself is

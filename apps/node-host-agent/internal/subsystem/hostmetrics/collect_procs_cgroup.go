@@ -232,6 +232,7 @@ func walkSystemdScopes(root string) (float64, bool) {
 		if d.IsDir() && strings.HasPrefix(d.Name(), "cri-containerd-") &&
 			strings.HasSuffix(d.Name(), ".scope") {
 			n++
+			return fs.SkipDir
 		}
 		return nil
 	})

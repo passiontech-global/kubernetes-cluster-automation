@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,7 +102,7 @@ func TestHoldAdvisoryLock(t *testing.T) {
 	cctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, held3, err3 := d2.HoldAdvisoryLock(cctx, "pg", "u", "p", "app", 50*time.Millisecond)
-	if held3 || (err3 != nil && !errors.Is(err3, context.Canceled)) {
+	if held3 || !errors.Is(err3, context.Canceled) {
 		t.Fatalf("HoldAdvisoryLock canceled = (%v, %v)", held3, err3)
 	}
 }
@@ -146,4 +148,243 @@ func TestPsqlHelpers(t *testing.T) {
 	if _, err := dErr.QueryXidAge(context.Background(), "pg", "u", "p", "app"); err == nil {
 		t.Fatal("expected error when PsqlQuery fails")
 	}
+}
+
+func TestHoldAdvisoryLockClassObjSplitAndCleanup(t *testing.T) {
+	t.Run("64bit_lock_id_classid_objid", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			id      int64
+			wantSQL string
+		}{
+			{
+				name:    "high_word_set",
+				id:      (1 << 32) | 42,
+				wantSQL: "AND l.classid = 1 AND l.objid = 42 AND l.objsubid = 1",
+			},
+			{
+				name:    "bit31_set_unsigned_oid",
+				id:      int64(-2147483647<<32 | 0x80000002),
+				wantSQL: "AND l.classid = 2147483649 AND l.objid = 2147483650 AND l.objsubid = 1",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				d, _, _ := fixture(t, nil)
+				d.Cfg.AdvisoryLockID = tc.id
+				var sawSQL string
+				d.Cfg.Run = func(ctx context.Context, _ []string, argv []string, stdin string) (string, error) {
+					if strings.Contains(stdin, "pg_try_advisory_lock") {
+						<-ctx.Done()
+						return "", ctx.Err()
+					}
+					joined := strings.Join(argv, " ")
+					if strings.Contains(joined, "pg_locks") {
+						sawSQL = joined
+						return "1\n", nil
+					}
+					return "t\n", nil
+				}
+				rel, held, err := d.HoldAdvisoryLock(context.Background(), "pg", "u", "p", "app", 50*time.Millisecond)
+				if err != nil || !held || rel == nil {
+					t.Fatalf("HoldAdvisoryLock=(%v,%v,%v)", rel != nil, held, err)
+				}
+				rel()
+				if !strings.Contains(sawSQL, tc.wantSQL) {
+					t.Fatalf("pg_locks query=%q missing %q", sawSQL, tc.wantSQL)
+				}
+			})
+		}
+	})
+
+	t.Run("terminates_backend_on_ctx_cancel", func(t *testing.T) {
+		d, _, _ := fixture(t, nil)
+		var termRan atomic.Bool
+		var termCtxActive atomic.Bool
+		started := make(chan struct{})
+		d.Cfg.Run = func(ctx context.Context, _ []string, argv []string, stdin string) (string, error) {
+			if strings.Contains(stdin, "pg_try_advisory_lock") {
+				close(started)
+				<-ctx.Done()
+				return "", ctx.Err()
+			}
+			joined := strings.Join(argv, " ")
+			if strings.Contains(joined, "pg_locks") {
+				return "0\n", nil
+			}
+			if strings.Contains(joined, "pg_terminate_backend") {
+				termRan.Store(true)
+				termCtxActive.Store(ctx.Err() == nil)
+				return "t\n", nil
+			}
+			return "", nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-started
+			cancel()
+		}()
+		rel, held, err := d.HoldAdvisoryLock(ctx, "pg", "u", "p", AppNameMaint, 5*time.Second)
+		if rel != nil || held || !errors.Is(err, context.Canceled) {
+			t.Fatalf("got (%v, %v, %v), want (nil, false, Canceled)", rel != nil, held, err)
+		}
+		if !termRan.Load() || !termCtxActive.Load() {
+			t.Fatalf("terminate on cancel: ran=%v ctxActive=%v", termRan.Load(), termCtxActive.Load())
+		}
+	})
+
+	t.Run("terminates_backend_on_poll_exhaustion", func(t *testing.T) {
+		d, _, _ := fixture(t, nil)
+		var termRan atomic.Bool
+		d.Cfg.Run = func(ctx context.Context, _ []string, argv []string, stdin string) (string, error) {
+			if strings.Contains(stdin, "pg_try_advisory_lock") {
+				<-ctx.Done()
+				return "", ctx.Err()
+			}
+			joined := strings.Join(argv, " ")
+			if strings.Contains(joined, "pg_locks") {
+				return "0\n", nil
+			}
+			if strings.Contains(joined, "pg_terminate_backend") {
+				termRan.Store(true)
+				return "t\n", nil
+			}
+			return "", nil
+		}
+		rel, held, err := d.HoldAdvisoryLock(context.Background(), "pg", "u", "p", AppNameMaint, 10*time.Millisecond)
+		if rel != nil || held || err != nil {
+			t.Fatalf("got (%v, %v, %v), want (nil, false, nil)", rel != nil, held, err)
+		}
+		if !termRan.Load() {
+			t.Fatal("expected pg_terminate_backend on poll exhaustion")
+		}
+	})
+
+	t.Run("busy_skips_pg_terminate_backend", func(t *testing.T) {
+		d, _, _ := fixture(t, nil)
+		var termRan atomic.Bool
+		d.Cfg.Run = func(_ context.Context, _ []string, argv []string, stdin string) (string, error) {
+			joined := strings.Join(argv, " ")
+			if strings.Contains(joined, "pg_locks") {
+				return "0\n", nil
+			}
+			if strings.Contains(joined, "pg_terminate_backend") {
+				termRan.Store(true)
+				return "t\n", nil
+			}
+			if strings.Contains(stdin, "pg_try_advisory_lock") {
+				return "advisory-lock-busy\n", nil
+			}
+			return "", nil
+		}
+		rel, held, err := d.HoldAdvisoryLock(context.Background(), "pg", "u", "p", AppNameMaint, 50*time.Millisecond)
+		if rel != nil || held || err != nil {
+			t.Fatalf("got (%v, %v, %v), want (nil, false, nil)", rel != nil, held, err)
+		}
+		if termRan.Load() {
+			t.Fatal("busy exit unexpectedly ran pg_terminate_backend")
+		}
+	})
+
+	t.Run("done_closed_before_poll_on_ctx_cancel", func(t *testing.T) {
+		d, _, _ := fixture(t, nil)
+		var termRan atomic.Bool
+		var termCtxActive atomic.Bool
+		started := make(chan struct{})
+		d.Cfg.Run = func(ctx context.Context, _ []string, argv []string, stdin string) (string, error) {
+			if strings.Contains(stdin, "pg_try_advisory_lock") {
+				close(started)
+				<-ctx.Done()
+				return "", ctx.Err()
+			}
+			joined := strings.Join(argv, " ")
+			if strings.Contains(joined, "pg_locks") {
+				return "0\n", nil
+			}
+			if strings.Contains(joined, "pg_terminate_backend") {
+				termRan.Store(true)
+				termCtxActive.Store(ctx.Err() == nil)
+				return "t\n", nil
+			}
+			return "", nil
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		rel, held, err := d.holdAdvisoryLock(ctx, "pg", "u", "p", AppNameMaint, 5*time.Second,
+			func(done <-chan struct{}) {
+				<-started
+				cancel()
+				<-done
+			})
+		if rel != nil || held || !errors.Is(err, context.Canceled) {
+			t.Fatalf("got (%v, %v, %v), want (nil, false, Canceled)", rel != nil, held, err)
+		}
+		if !termRan.Load() || !termCtxActive.Load() {
+			t.Fatalf("terminate on cancel: ran=%v ctxActive=%v", termRan.Load(), termCtxActive.Load())
+		}
+	})
+
+	t.Run("returns_non_busy_hold_error", func(t *testing.T) {
+		d, _, _ := fixture(t, nil)
+		wantErr := errors.New("container down")
+		polled := make(chan struct{})
+		var polledOnce sync.Once
+		var termRan atomic.Bool
+		d.Cfg.Run = func(_ context.Context, _ []string, argv []string, stdin string) (string, error) {
+			if strings.Contains(stdin, "pg_try_advisory_lock") {
+				<-polled
+				return "", wantErr
+			}
+			joined := strings.Join(argv, " ")
+			if strings.Contains(joined, "pg_locks") {
+				polledOnce.Do(func() { close(polled) })
+				return "0\n", nil
+			}
+			if strings.Contains(joined, "pg_terminate_backend") {
+				termRan.Store(true)
+				return "t\n", nil
+			}
+			return "", nil
+		}
+		rel, held, err := d.HoldAdvisoryLock(context.Background(), "pg", "u", "p", AppNameMaint, 50*time.Millisecond)
+		if rel != nil || held || !errors.Is(err, wantErr) {
+			t.Fatalf("got (%v, %v, %v), want (nil, false, %v)", rel != nil, held, err, wantErr)
+		}
+		if !termRan.Load() {
+			t.Fatal("expected pg_terminate_backend on non-busy hold error")
+		}
+	})
+
+	t.Run("busy_after_first_poll_skips_terminate", func(t *testing.T) {
+		d, _, _ := fixture(t, nil)
+		polled := make(chan struct{})
+		var polledOnce sync.Once
+		var termRan atomic.Bool
+		d.Cfg.Run = func(_ context.Context, _ []string, argv []string, stdin string) (string, error) {
+			if strings.Contains(stdin, "pg_try_advisory_lock") {
+				<-polled
+				return "advisory-lock-busy\n", nil
+			}
+			joined := strings.Join(argv, " ")
+			if strings.Contains(joined, "pg_locks") {
+				polledOnce.Do(func() { close(polled) })
+				return "0\n", nil
+			}
+			if strings.Contains(joined, "pg_terminate_backend") {
+				termRan.Store(true)
+				return "t\n", nil
+			}
+			return "", nil
+		}
+		start := time.Now()
+		rel, held, err := d.HoldAdvisoryLock(context.Background(), "pg", "u", "p", AppNameMaint, 50*time.Millisecond)
+		elapsed := time.Since(start)
+		if rel != nil || held || err != nil {
+			t.Fatalf("got (%v, %v, %v), want (nil, false, nil)", rel != nil, held, err)
+		}
+		if termRan.Load() {
+			t.Fatal("busy exit unexpectedly ran pg_terminate_backend")
+		}
+		if elapsed >= 250*time.Millisecond {
+			t.Fatalf("busy exit took %v, expected <250ms (no 500ms sleep fall-through)", elapsed)
+		}
+	})
 }

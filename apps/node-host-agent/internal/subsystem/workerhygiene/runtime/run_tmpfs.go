@@ -228,10 +228,14 @@ func (c *RunTmpfsCheck) runTmpfsOpenFDs() (map[fdID]struct{}, bool) {
 	}
 	set := make(map[fdID]struct{})
 	readOK := 0
+	nonENOENT := false
 	for _, pid := range pids {
 		fdDir := c.d.Proc.File(pid, "fd")
 		fds, rerr := os.ReadDir(fdDir)
 		if rerr != nil {
+			if !os.IsNotExist(rerr) {
+				nonENOENT = true
+			}
 			continue // raced exit — normal, never fatal
 		}
 		readOK++
@@ -242,6 +246,9 @@ func (c *RunTmpfsCheck) runTmpfsOpenFDs() (map[fdID]struct{}, bool) {
 			// exists (the exact case this guard exists for).
 			tfi, serr := os.Stat(filepath.Join(fdDir, fd.Name()))
 			if serr != nil {
+				if !os.IsNotExist(serr) {
+					nonENOENT = true
+				}
 				continue
 			}
 			if tst, tok := tfi.Sys().(*syscall.Stat_t); tok { // os stat results expose syscall.Stat_t, not unix.Stat_t
@@ -249,11 +256,10 @@ func (c *RunTmpfsCheck) runTmpfsOpenFDs() (map[fdID]struct{}, bool) {
 			}
 		}
 	}
-	// Every fd dir unreadable (hidepid=2, EACCES storm) yields an
-	// EMPTY set that would read as "no process holds anything" —
-	// the sweep would then delete every .tmp as orphaned. A census
-	// that read nothing proves nothing: fail closed.
-	if len(pids) > 0 && readOK == 0 {
+	// Any non-ENOENT fd read error (or every fd dir unreadable) yields an
+	// incomplete open-fd set that could falsely unlink a live spool file:
+	// fail closed.
+	if nonENOENT || (len(pids) > 0 && readOK == 0) {
 		return nil, false
 	}
 	return set, true

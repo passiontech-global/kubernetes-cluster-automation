@@ -19,6 +19,7 @@ package storelocal
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -66,8 +67,13 @@ func (c *TTLCheck) Run(ctx context.Context) {
 		// a controllerhygiene config change.
 		if c.d.Proc.FindByCommInCgroup("kine", cdeps.KineServiceCgroupSubstr) != 0 {
 			c.d.StateExit(cdeps.StateKineDown)
-			c.d.StateExit(cdeps.StateKineTTLDead)
-			c.d.StateExit(cdeps.StateKineTTLLoop)
+			c.exitTTLLatches()
+			c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "ok").Inc()
+			return
+		}
+		if c.isEmbeddedEtcd() {
+			c.d.StateExit(cdeps.StateKineDown)
+			c.exitTTLLatches()
 			c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "ok").Inc()
 			return
 		}
@@ -180,8 +186,7 @@ func (c *TTLCheck) Run(ctx context.Context) {
 		// reset the counter and clear both latches.
 		c.d.State.ResetCounter(cdeps.FileCtrTTLRewedge)
 		c.d.State.ResetCounter(cdeps.FileTTLWedgedPID)
-		c.d.StateExit(cdeps.StateKineTTLDead)
-		c.d.StateExit(cdeps.StateKineTTLLoop)
+		c.exitTTLLatches()
 		c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "ok").Inc()
 		return
 	}
@@ -216,6 +221,17 @@ func (c *TTLCheck) Run(ctx context.Context) {
 		if !c.d.State.RateOK(cdeps.FileRateTTLKill, c.d.Cfg.KineTTL.CtlRestart) {
 			break // low cadence not reached — stay silent
 		}
+		if err := ctx.Err(); err != nil {
+			c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "aborted").Inc()
+			return
+		}
+		if c.d.HoldEmergencyHeal(ctx) {
+			c.d.State.SuspectLog(cdeps.CheckKineTTL+"-hold",
+				"suspect: kine-ttl-loop — cluster maintenance in progress — holding kill",
+				c.d.Cfg.SuspectLogCadence)
+			c.d.Actions.WithLabelValues(cdeps.CheckKineTTL, "maint_hold").Inc()
+			break
+		}
 		switch c.d.Cfg.KineTTL.Mode {
 		case cdeps.ModeEnforce:
 			c.d.State.AppendLog(fmt.Sprintf(
@@ -241,6 +257,17 @@ func (c *TTLCheck) Run(ctx context.Context) {
 				int(c.d.Cfg.KineTTL.MinRestart.Minutes())), c.d.Cfg.SuspectLogCadence)
 			break
 		}
+		if err := ctx.Err(); err != nil {
+			c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "aborted").Inc()
+			return
+		}
+		if c.d.HoldEmergencyHeal(ctx) {
+			c.d.State.SuspectLog(cdeps.StateKineTTLDead+"-hold",
+				"suspect: kine-ttl-dead — cluster maintenance in progress — holding kill",
+				c.d.Cfg.SuspectLogCadence)
+			c.d.Actions.WithLabelValues(cdeps.CheckKineTTL, "maint_hold").Inc()
+			break
+		}
 		switch c.d.Cfg.KineTTL.Mode {
 		case cdeps.ModeEnforce:
 			c.d.State.AppendLog(fmt.Sprintf(
@@ -259,4 +286,54 @@ func (c *TTLCheck) Run(ctx context.Context) {
 		}
 	}
 	c.d.Cycles.WithLabelValues(cdeps.CheckKineTTL, "ok").Inc()
+}
+
+// exitTTLLatches clears both TTL latches along with their separate
+// maintenance-hold suspect dedupe keys so a subsequent episode emits
+// fresh hold logs.
+func (c *TTLCheck) exitTTLLatches() {
+	if c.d.State.Exists(cdeps.StateKineTTLDead) {
+		c.d.StateExit(cdeps.StateKineTTLDead)
+		c.d.State.ClearSuspect(cdeps.StateKineTTLDead + "-hold")
+	}
+	if c.d.State.Exists(cdeps.StateKineTTLLoop) {
+		c.d.StateExit(cdeps.StateKineTTLLoop)
+		c.d.State.ClearSuspect(cdeps.CheckKineTTL + "-hold")
+	}
+}
+
+// isEmbeddedEtcd reports whether this controller host runs embedded
+// etcd rather than kine, so an absent kine PID does not false-latch
+// StateKineDown. Explicit kine expectation markers (KineDBProbe,
+// state.db, split kine.service) take precedence over on-disk etcd
+// artifacts when no live etcd PID is found, so a crashed kine on a
+// kine host still latches StateKineDown.
+func (c *TTLCheck) isEmbeddedEtcd() bool {
+	if c.d.Proc.FindByCommInCgroup("etcd", cdeps.K0sControllerCgroupSubstr) != 0 {
+		return true
+	}
+	if c.d.Cfg.Hub.KineDBProbe != "" {
+		return false
+	}
+	if c.d.Cfg.K0sDir != "" {
+		if _, err := os.Stat(filepath.Join(c.d.Cfg.K0sDir, "db", "state.db")); err == nil {
+			return false
+		}
+	}
+	if c.d.Cfg.K0sControllerUnitFile != "" {
+		if _, err := os.Stat(filepath.Join(filepath.Dir(c.d.Cfg.K0sControllerUnitFile), "kine.service")); err == nil {
+			return false
+		}
+	}
+	if c.d.Cfg.K0sDir != "" {
+		if fi, err := os.Stat(filepath.Join(c.d.Cfg.K0sDir, "etcd")); err == nil && fi.IsDir() {
+			return true
+		}
+		_, err1 := os.Stat(filepath.Join(c.d.Cfg.K0sDir, "bin", "etcdctl"))
+		_, err2 := os.Stat(filepath.Join(c.d.Cfg.K0sDir, "pki", "etcd", "ca.crt"))
+		if err1 == nil && err2 == nil {
+			return true
+		}
+	}
+	return false
 }

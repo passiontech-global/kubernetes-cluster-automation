@@ -697,3 +697,53 @@ func TestDeleteAllStopsFeedingOnCancel(t *testing.T) {
 		t.Fatalf("deleteAll = %d,%d,%q want 0,0,\"\"", ok, errs, firstErr)
 	}
 }
+
+func TestListStaleSendsPartialObjectMetadataAcceptAndPermitsLenientJSON(t *testing.T) {
+	var gotAccept string
+	var gotDeleteAccept string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/events" && r.Method == http.MethodGet:
+			gotAccept = r.Header.Get("Accept")
+			w.Header().Set("Content-Type", "application/json")
+			// Raw PartialObjectMetadataList payload containing a lone surrogate
+			// (\uD83D) and duplicate JSON keys ("message") in skipped fields.
+			_, _ = w.Write([]byte(`{
+				"kind": "PartialObjectMetadataList",
+				"apiVersion": "meta.k8s.io/v1",
+				"metadata": {"continue": ""},
+				"items": [{
+					"metadata": {
+						"namespace": "default",
+						"name": "bad-utf8",
+						"creationTimestamp": "2020-01-01T00:00:00Z",
+						"annotations": {"dup": "a", "dup": "b", "surrogate": "\uD83D"}
+					}
+				}]
+			}`))
+		case r.URL.Path == "/api/v1/namespaces/default/events/bad-utf8" && r.Method == http.MethodDelete:
+			gotDeleteAccept = r.Header.Get("Accept")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	var out bytes.Buffer
+	cutoff, _ := time.Parse(time.RFC3339, "2026-01-01T00:00:00Z")
+	if err := Run(context.Background(), Config{
+		API: srv.URL, Client: srv.Client(), Workers: 1,
+	}, cutoff, &out); err != nil {
+		t.Fatalf("Run failed on PartialObjectMetadataList/lenient JSON: %v", err)
+	}
+	if gotAccept != eventListAccept {
+		t.Fatalf("GET Accept = %q, want %q", gotAccept, eventListAccept)
+	}
+	if gotDeleteAccept != "" {
+		t.Fatalf("DELETE Accept = %q, want empty", gotDeleteAccept)
+	}
+	if !strings.Contains(out.String(), "deleted=1 errors=0") {
+		t.Fatalf("unexpected Run output:\n%s", out.String())
+	}
+}

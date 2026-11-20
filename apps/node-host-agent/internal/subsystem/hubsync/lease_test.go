@@ -353,3 +353,118 @@ func TestRenewLeaseLogsTransientError(t *testing.T) {
 		t.Fatalf("held=%v expiry=%v want cleared", s.held, s.leaseExpiresAt)
 	}
 }
+
+func TestLeaseHeldMonotonicAndBackwardStep(t *testing.T) {
+	// 1. Real time.Now() preserves monotonic clock reading on s.leaseExpiresAt.
+	cs := testutil.FakeKube()
+	s := newTestSyncer(cs, time.Now)
+	if !s.renewLease(context.Background()) {
+		t.Fatal("expected acquire")
+	}
+	// Go's monotonic bit makes t.Round(0) differ from t.String() or Strip via Round(0).
+	// Specifically, time.Unix(0, s.leaseExpiresAt.UnixNano()) has no monotonic reading,
+	// whereas s.leaseExpiresAt preserves it when time.Now() is used.
+	wallOnly := time.Unix(0, s.leaseExpiresAt.UnixNano())
+	if s.leaseExpiresAt.Sub(wallOnly) != 0 && s.leaseExpiresAt.String() == wallOnly.String() {
+		t.Fatalf("expected monotonic reading on leaseExpiresAt: %s", s.leaseExpiresAt.String())
+	}
+	if !s.leaseHeld() {
+		t.Fatal("expected leaseHeld true")
+	}
+
+	// 2. Wall-only fake clock stepping backward shrinks leaseExpiresAt so remaining
+	// hold never expands past the original lease duration.
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	clock := &now
+	s2 := newTestSyncer(testutil.FakeKube(), func() time.Time { return *clock })
+	if !s2.renewLease(context.Background()) {
+		t.Fatal("expected acquire on s2")
+	}
+	// Advance 40s (20s remaining out of 60s), then jump backward 5m.
+	*clock = now.Add(40 * time.Second)
+	if !s2.leaseHeld() {
+		t.Fatal("expected held at +40s")
+	}
+	*clock = clock.Add(-5 * time.Minute)
+	if !s2.leaseHeld() {
+		t.Fatal("expected held immediately after backward jump (still 20s remaining)")
+	}
+	// Advance 21s from jumped clock -> 20s remaining expires!
+	*clock = clock.Add(21 * time.Second)
+	if s2.leaseHeld() {
+		t.Fatal("backward clock step extended local lease hold beyond remaining 20s")
+	}
+}
+
+func TestLeasePeerClockSkew(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("peer clock far ahead caps lockout at LeaseDuration", func(t *testing.T) {
+		now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+		clock := &now
+		cs := testutil.FakeKube()
+		dur := int32(60)
+		// Seed pod-b with RenewTime 10 minutes in the future (skewed clock).
+		seedLease(t, cs, "pod-b", now.Add(10*time.Minute), 0, &dur, nil)
+		s := newTestSyncer(cs, func() time.Time { return *clock })
+
+		if s.renewLease(ctx) {
+			t.Fatal("must not steal fresh foreign lease on first sight")
+		}
+		// Advance 61s: pod-b never renewed, so local observation expires after 60s
+		// instead of locking out for 11 minutes!
+		*clock = now.Add(61 * time.Second)
+		if !s.renewLease(ctx) {
+			t.Fatal("expected takeover after 60s despite peer's +10m wall clock skew")
+		}
+	})
+
+	t.Run("active peer with lagging wall clock is not stolen when renewing", func(t *testing.T) {
+		now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+		clock := &now
+		dur := int32(60)
+		// Seed initially within window so we observe pod-b, then jump local
+		// wall clock +10m while pod-b renews by +30s (still behind local wall clock!).
+		cs2 := testutil.FakeKube()
+		seedLease(t, cs2, "pod-b", now, 0, &dur, nil)
+		l := leaseWith(cs2, func() time.Time { return *clock }, 60*time.Second)
+		held, _, err := l.renew(ctx)
+		if err != nil || held {
+			t.Fatalf("expected held=false err=nil on initial observation, got held=%v err=%v", held, err)
+		}
+		// Local clock jumps forward +10m, while pod-b renews with its own clock (+30s).
+		*clock = now.Add(10 * time.Minute)
+		cur, _ := cs2.CoordinationV1().Leases("node-ops").Get(ctx, "node-host-agent-hubsync", metav1.GetOptions{})
+		rt := metav1.NewMicroTime(now.Add(30 * time.Second))
+		cur.Spec.RenewTime = &rt
+		if _, err := cs2.CoordinationV1().Leases("node-ops").Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		held, _, err = l.renew(ctx)
+		if err != nil || held {
+			t.Fatalf("stole active peer whose RenewTime advanced: held=%v err=%v", held, err)
+		}
+	})
+
+	t.Run("local backward clock jump does not delay takeover of dead peer", func(t *testing.T) {
+		now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+		clock := &now
+		cs := testutil.FakeKube()
+		dur := int32(60)
+		seedLease(t, cs, "pod-b", now, 0, &dur, nil)
+		s := newTestSyncer(cs, func() time.Time { return *clock })
+
+		if s.renewLease(ctx) {
+			t.Fatal("initial sight must not steal")
+		}
+		// Jump local wall clock backward by 5 minutes, then advance 61s from jumped time.
+		*clock = now.Add(-5 * time.Minute)
+		if s.renewLease(ctx) {
+			t.Fatal("must not steal immediately on backward jump")
+		}
+		*clock = clock.Add(61 * time.Second)
+		if !s.renewLease(ctx) {
+			t.Fatal("backward clock jump delayed takeover of dead peer")
+		}
+	})
+}

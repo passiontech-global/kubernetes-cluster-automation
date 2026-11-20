@@ -4,7 +4,10 @@
 package cycle
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -177,5 +180,24 @@ func TestEverySafeRecoversTickPanic(t *testing.T) {
 	}
 	if panics.Load() != 1 {
 		t.Fatalf("onPanic fired %d times, want 1", panics.Load())
+	}
+}
+
+func TestEverySafeLogsStackOnPanic(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r := EverySafe("stack-safe", time.Hour, func(context.Context) {
+		cancel()
+		panic("boom-safe")
+	}, nil)
+	r.Run(ctx)
+
+	out := buf.String()
+	if !strings.Contains(out, "stack=") || !strings.Contains(out, "TestEverySafeLogsStackOnPanic") {
+		t.Fatalf("EverySafe panic log missing stack trace:\n%s", out)
 	}
 }

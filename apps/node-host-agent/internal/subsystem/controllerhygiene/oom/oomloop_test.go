@@ -307,3 +307,30 @@ func TestOOMShieldWriteFailLogged(t *testing.T) {
 		t.Fatalf("apiserver adj mutated on a failed write: %s", v)
 	}
 }
+
+func TestOOMFutureSkewKillsClamped(t *testing.T) {
+	e := fixture(t)
+	// Seed baseline + 3 kills stamped 2 hours in the future (backward clock jump).
+	testutil.WriteFile(t, filepath.Join(e.State, cdeps.FileOOMSeen), "3\n")
+	futureTS := e.Now.Add(2 * time.Hour).Unix()
+	var kills strings.Builder
+	for range cdeps.DefaultOOMMinKills {
+		fmt.Fprintf(&kills, "%d\n", futureTS)
+	}
+	testutil.WriteFile(t, filepath.Join(e.State, cdeps.FileOOMKills), kills.String())
+	writeEvents(t, e, 3)
+
+	// Cycle 1: clamps future timestamps > now+60 back to e.Now.Unix().
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateControllerOOMLop) {
+		t.Fatal("expected oom-loop latched while clamped kills are in window")
+	}
+
+	// Advance past Window + 1s (still well before the original +2h stamp):
+	// clamped timestamps must now prune out and clear the latch.
+	e.Now = e.Now.Add(e.H.Cfg.OOMLoop.Window + time.Second)
+	e.H.Cycle(context.Background())
+	if e.HasState(cdeps.StateControllerOOMLop) {
+		t.Fatal("future-skewed kills outlived Window instead of pruning after clamp")
+	}
+}

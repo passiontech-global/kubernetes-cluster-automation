@@ -9,12 +9,15 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -291,6 +294,100 @@ func TestHubsyncGating(t *testing.T) {
 			if n == "hubsync" {
 				t.Fatal("hubsync ran in standalone mode")
 			}
+		}
+	})
+}
+
+func nethealthSubsystem(t *testing.T, subs []agent.Subsystem) *nethealth.NetHealth {
+	t.Helper()
+	for _, s := range subs {
+		if s.Name() == "nethealth" {
+			nh, ok := s.(*nethealth.NetHealth)
+			if !ok {
+				t.Fatalf("nethealth subsystem has unexpected type %T", s)
+			}
+			return nh
+		}
+	}
+	t.Fatalf("nethealth subsystem not wired (got %v)", subs)
+	return nil
+}
+
+func nethealthCoordPtr(t *testing.T, nh *nethealth.NetHealth) (isNil bool, ptr uintptr) {
+	t.Helper()
+	v := reflect.ValueOf(nh).Elem().FieldByName("cfg").FieldByName("Coord")
+	if !v.IsValid() || v.Kind() != reflect.Pointer {
+		t.Fatalf("nethealth.cfg.Coord missing or not a pointer: %v", v)
+	}
+	return v.IsNil(), v.Pointer()
+}
+
+func TestNethealthCoordWiring(t *testing.T) {
+	sandbox := func(t *testing.T) {
+		t.Helper()
+		disableAllSubsystems(t)
+		dir := t.TempDir()
+		t.Setenv(envnames.EnvWatchdogConf, filepath.Join(dir, "no.conf"))
+		t.Setenv(envnames.EnvAPIGuardConf, filepath.Join(dir, "no-guard.conf"))
+		t.Setenv(envnames.EnvHostconfigVarsDir, dir)
+		t.Setenv(envnames.EnvConvergeSSHKey, filepath.Join(dir, "no-key"))
+		t.Setenv("KUBERNETES_SERVICE_HOST", "")
+		t.Setenv("KUBERNETES_SERVICE_PORT", "")
+		t.Setenv("KUBECONFIG", "")
+		t.Setenv(envnames.EnvEnableNethealth, "true")
+	}
+
+	t.Run("node name and kube client -> non-nil Coord", func(t *testing.T) {
+		sandbox(t)
+		calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return testutil.FakeKube(), nil
+		})
+		t.Setenv(envnames.EnvEnableSweeper, "true")
+
+		cfg, _ := testBuildAgentConfig("node-a", "pod-a", false)
+		nh := nethealthSubsystem(t, cfg.Subsystems)
+		isNil, ptr := nethealthCoordPtr(t, nh)
+		if isNil || ptr == 0 {
+			t.Fatal("expected nethealth Coord to be non-nil when NodeName != \"\" and csOnce succeeds")
+		}
+		if *calls != 1 {
+			t.Fatalf("kubeClient calls=%d want 1 (shared across sweeper and nethealth)", *calls)
+		}
+	})
+
+	t.Run("empty node name -> nil Coord without kube client call", func(t *testing.T) {
+		sandbox(t)
+		t.Setenv(envnames.EnvNodeName, "")
+		t.Setenv("NODE_NAME", "")
+		calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return testutil.FakeKube(), nil
+		})
+
+		cfg, _ := testBuildAgentConfig("", "", true)
+		nh := nethealthSubsystem(t, cfg.Subsystems)
+		isNil, _ := nethealthCoordPtr(t, nh)
+		if !isNil {
+			t.Fatal("expected nethealth Coord to be nil when NodeName == \"\"")
+		}
+		if *calls != 0 {
+			t.Fatalf("kubeClient calls=%d want 0 when NodeName == \"\"", *calls)
+		}
+	})
+
+	t.Run("standalone with no clientset -> built cleanly with nil Coord", func(t *testing.T) {
+		sandbox(t)
+		calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return nil, errors.New("no kubeconfig")
+		})
+
+		cfg, _ := testBuildAgentConfig("hub-a", "", true)
+		nh := nethealthSubsystem(t, cfg.Subsystems)
+		isNil, _ := nethealthCoordPtr(t, nh)
+		if !isNil {
+			t.Fatal("expected nethealth Coord to be nil when csOnce fails")
+		}
+		if *calls != 1 {
+			t.Fatalf("kubeClient calls=%d want 1", *calls)
 		}
 	})
 }

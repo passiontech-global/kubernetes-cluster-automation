@@ -101,7 +101,7 @@ func TestSuperviseRenewsLivenessPerRestart(t *testing.T) {
 		return first != nil
 	})
 	waitFor(t, "first entry stamp", func() bool {
-		return first.Fallback().LastProgress.Load() > 0
+		return !first.Fallback().LastBeat().IsZero()
 	})
 
 	// Run returned while ctx is live → restart counted → attempt 2
@@ -123,9 +123,51 @@ func TestSuperviseRenewsLivenessPerRestart(t *testing.T) {
 	// The renewed registry carries no dead beats and gets a fresh
 	// run-entry stamp on the new attempt.
 	waitFor(t, "renewed entry stamp", func() bool {
-		return second.Fallback().LastProgress.Load() > 0
+		return !second.Fallback().LastBeat().IsZero()
 	})
 	if got := len(second.LoopBeats()); got != 0 {
 		t.Fatalf("renewed registry carries %d loop beats want 0", got)
 	}
+}
+
+func TestRunnerRunWithHeartbeatKeepsLivenessHealthy(t *testing.T) {
+	a := &Agent{}
+	sb := &subBeat{}
+	sb.active.Store(true)
+	live := cycle.NewLiveness()
+	sb.live.Store(live)
+	a.beats.Store("kinedb", sb)
+
+	ctx, cancel := context.WithCancel(cycle.WithLiveness(context.Background(), live))
+	defer cancel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	r := cycle.Every("repack", time.Hour, func(c context.Context) {
+		cycle.RunWithHeartbeat(c, 5*time.Millisecond, func(context.Context) {
+			close(entered)
+			<-release
+		})
+	})
+	go func() {
+		r.Run(ctx)
+		close(done)
+	}()
+
+	<-entered
+	beats := live.LoopBeats()
+	if len(beats) != 1 {
+		t.Fatalf("LoopBeats() len = %d, want 1", len(beats))
+	}
+	// Backdate the loop beat; RunWithHeartbeat inside Runner.Run must stamp
+	// THIS loop beat (not l.fallback) so livenessWedged recovers to false.
+	beats[0].StampAt(time.Now().Add(-24 * time.Hour))
+	waitFor(t, "RunWithHeartbeat refreshes loop beat", func() bool {
+		return !a.livenessWedged()
+	})
+
+	cancel()
+	close(release)
+	<-done
 }

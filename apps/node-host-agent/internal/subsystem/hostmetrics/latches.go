@@ -144,6 +144,13 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 		latchdefs.LatchPageAllocFailure,
 		latchdefs.LatchClocksourceUnstable,
 		latchdefs.LatchCiliumMTUDrift,
+		// Hysteresis latches — mtime must stay fresh across quiet ticks
+		// in the hysteresis/clean-hold band or when cached scans skip
+		// the kernelfail updater.
+		latchdefs.LatchConntrackPressure,
+		latchdefs.LatchEBPFPressure,
+		latchdefs.LatchNeighborPressure,
+		latchdefs.LatchHostNetworkProblems,
 	} {
 		p := c.state.Path(name)
 		if fi, err := os.Stat(p); err == nil {

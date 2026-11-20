@@ -782,3 +782,38 @@ func TestExitFromRunsCleanup(t *testing.T) {
 		t.Fatal("STATE-EXIT missing after the last owner released")
 	}
 }
+
+func TestRAMLatchesEnumeratesPrefixAndFixedUnderDir(t *testing.T) {
+	s, _, _ := newTestStore(t)
+	otherDir := t.TempDir()
+
+	prefixLatch := latchdefs.LatchCiliumIPAMPrefix + "10-0-0-5"
+	fixedLatch := latchdefs.LatchFilesystemReadonly
+	nowEpoch := s.Now().Unix()
+
+	s.shared.ramMu.Lock()
+	s.shared.ramEpochs = map[string]int64{
+		filepath.Clean(s.Path(prefixLatch)):                      nowEpoch,
+		filepath.Clean(s.Path(fixedLatch)):                       nowEpoch,
+		filepath.Clean(filepath.Join(s.Dir, "last-restart")):     nowEpoch,
+		filepath.Clean(filepath.Join(otherDir, "state-sibling")): nowEpoch,
+		filepath.Clean(filepath.Join(s.Dir, "sub", "state-sub")): nowEpoch,
+	}
+	s.shared.ramMu.Unlock()
+
+	got := map[string]bool{}
+	for _, name := range s.RAMLatches() {
+		got[name] = true
+	}
+	if len(got) != 2 || !got[prefixLatch] || !got[fixedLatch] {
+		t.Fatalf("RAMLatches = %v, want {%q, %q}", got, prefixLatch, fixedLatch)
+	}
+
+	if !s.Exit(prefixLatch, nil) {
+		t.Fatal("Exit on RAM-only prefix latch returned false")
+	}
+	gotAfter := s.RAMLatches()
+	if len(gotAfter) != 1 || gotAfter[0] != fixedLatch {
+		t.Fatalf("RAMLatches after Exit = %v, want [%q]", gotAfter, fixedLatch)
+	}
+}

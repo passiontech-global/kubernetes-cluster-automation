@@ -50,6 +50,52 @@ func TestConntrackPressureHysteresis(t *testing.T) {
 	}
 }
 
+func TestConntrackPressureTouchesLatchInHysteresisAndHoldBands(t *testing.T) {
+	e := fixture(t, nil)
+	testutil.WriteFile(t, e.ctmax, "1000\n")
+
+	// Enter latch at 0.95.
+	testutil.WriteFile(t, e.ctcount, "950\n")
+	e.n.Cycle(context.Background())
+	latchPath := filepath.Join(e.state, "state-conntrack-pressure")
+	oldTime := e.now.Add(-20 * time.Minute)
+	if err := os.Chtimes(latchPath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	beforeLog := logLines(t, e)
+	enterCountBefore := strings.Count(beforeLog, "STATE-ENTER: conntrack-pressure")
+
+	// Advance clock past LatchTouchMinInterval (15m) and stay in [0.80, 0.90] hysteresis.
+	e.now = e.now.Add(16 * time.Minute)
+	testutil.WriteFile(t, e.ctcount, "850\n")
+	e.n.Cycle(context.Background())
+	fi1, err := os.Stat(latchPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi1.ModTime().After(oldTime) {
+		t.Fatalf("latch mtime not refreshed in hysteresis band: got %v, old %v", fi1.ModTime(), oldTime)
+	}
+
+	// Rewind mtime and test sustained >0.90 hold band as well.
+	if err := os.Chtimes(latchPath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	e.now = e.now.Add(16 * time.Minute)
+	testutil.WriteFile(t, e.ctcount, "950\n")
+	e.n.Cycle(context.Background())
+	fi2, err := os.Stat(latchPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi2.ModTime().After(oldTime) {
+		t.Fatalf("latch mtime not refreshed in sustained hold band: got %v, old %v", fi2.ModTime(), oldTime)
+	}
+	if got := strings.Count(logLines(t, e), "STATE-ENTER: conntrack-pressure"); got != enterCountBefore {
+		t.Fatalf("expected no duplicate STATE-ENTER log lines, got %d want %d", got, enterCountBefore)
+	}
+}
+
 func TestConntrackMissingFilesDropsLatch(t *testing.T) {
 	e := fixture(t, nil)
 	testutil.WriteFile(t, filepath.Join(e.state, "state-conntrack-pressure"), "1\n")

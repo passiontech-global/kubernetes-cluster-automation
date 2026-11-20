@@ -112,6 +112,44 @@ func (c *cyc) groupNebula() {
 		c.err("T5b: render nebula config", "error", err)
 		return
 	}
+	if certOK {
+		// Validate rendered config via `nebula -test` on a temp file in the
+		// live host directory BEFORE overwriting /etc/nebula/<net>/config.yaml,
+		// so an invalid config never replaces a working one on disk.
+		liveDir := r.hp("/etc/nebula/" + net)
+		tmpFile, tmpErr := os.CreateTemp(liveDir, ".config.yaml.tmp-*")
+		if tmpErr != nil {
+			c.err("T5b: create temp nebula config for -test",
+				"dir", "/etc/nebula/"+net, "error", tmpErr)
+			return
+		}
+		tmpHostPath := tmpFile.Name()
+		defer func() { _ = os.Remove(tmpHostPath) }()
+		if _, werr := tmpFile.Write(rendered); werr != nil {
+			_ = tmpFile.Close()
+			c.err("T5b: write temp nebula config for -test",
+				"config", tmpHostPath, "error", werr)
+			return
+		}
+		if cerr := tmpFile.Chmod(0o644); cerr != nil {
+			_ = tmpFile.Close()
+			c.err("T5b: chmod temp nebula config for -test",
+				"config", tmpHostPath, "error", cerr)
+			return
+		}
+		if cerr := tmpFile.Close(); cerr != nil {
+			c.err("T5b: close temp nebula config for -test",
+				"config", tmpHostPath, "error", cerr)
+			return
+		}
+		tmpTargetPath := "/etc/nebula/" + net + "/" + filepath.Base(tmpHostPath)
+		if out, terr := r.run(ctx, "nebula", "-config", tmpTargetPath, "-test"); terr != nil {
+			c.err("T5b: nebula -test failed — not writing config or starting/reloading",
+				"config", "/etc/nebula/"+net+"/config.yaml", "unit", unit,
+				"out", out, "error", terr)
+			return
+		}
+	}
 	oldCfg, _ := os.ReadFile(r.hp("/etc/nebula/" + net + "/config.yaml"))
 	ch, _ := r.writeManaged("/etc/nebula/"+net+"/config.yaml", rendered, 0o644)
 	cfgChanged = ch
@@ -164,14 +202,6 @@ WantedBy=multi-user.target
 		return
 	}
 	wasActive := r.isActive(ctx, unit)
-	// ansible: `nebula -test` validates before start — failure aborts,
-	// so the broken config must not reach a (re)start.
-	if out, err := r.run(ctx, "nebula", "-config", "/etc/nebula/"+net+"/config.yaml", "-test"); err != nil {
-		c.err("T5b: nebula -test failed — not starting/reloading",
-			"config", "/etc/nebula/"+net+"/config.yaml", "unit", unit,
-			"out", out, "error", err)
-		return
-	}
 	r.ensureService(ctx, unit, true, true)
 	// binStale catches skew onInstalled cannot see: a binary written
 	// by an earlier converge that never restarted the unit

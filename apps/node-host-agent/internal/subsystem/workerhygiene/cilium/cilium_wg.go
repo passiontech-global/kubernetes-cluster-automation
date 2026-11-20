@@ -68,6 +68,9 @@ func ParseCiliumEncryptPeers(out string) (int, bool) {
 // fail-safe direction (it can only blunt a partial-drift signal,
 // never produce the repeated false kill an overcount causes).
 func readyNodeCount(d *wdeps.Deps, ctx context.Context) int {
+	if d == nil || d.Cfg.Client == nil {
+		return 0
+	}
 	// ResourceVersion "0": serve the LIST from the apiserver's watch
 	// cache — expected-peer counting is a best-effort scan the drift
 	// guard re-evaluates every cycle (verdicts ride confirm windows,
@@ -208,6 +211,13 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	if _, err := os.Stat(filepath.Join(c.d.Cfg.SysClassNet, "cilium_wg0")); err != nil {
+		if !os.IsNotExist(err) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: cilium-wg-peers stat %s/cilium_wg0 failed: %v — inconclusive, keeping state",
+				c.d.Cfg.SysClassNet, err))
+			c.d.CycleResult(wdeps.CheckCiliumWG, "abort")
+			return
+		}
 		// No WireGuard datapath on this node (calico, tunnel mode,
 		// hub) — nothing to heal; drop stale evidence (incl. the
 		// per-peer zombie state).
@@ -275,7 +285,7 @@ func (c *CiliumWGCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckCiliumWG, "abort")
 		return
 	}
-	expected, err := c.d.Cfg.Seams.Cilium.EncryptPeers(ctx, c.d.Cfg.Cilium.Socket)
+	expected, err := c.d.CiliumEncryptPeers(ctx, e)
 	if err != nil || expected <= 0 {
 		// encrypt status unreadable or carries no count — fall back
 		// to ReadyNodes-1 (every OTHER Ready node is a peer).

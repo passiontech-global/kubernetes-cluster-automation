@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -618,5 +619,25 @@ func TestCfgGatesRefuseUnsafe(t *testing.T) {
 		if c.errs != refused {
 			t.Fatalf("%s: errs=%d want %d (one per refused value)", name, c.errs, refused)
 		}
+	}
+}
+
+func TestHostconfigGroupPanicLogsStack(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	r, _, c := baseFixture(t, "")
+	c.group("boom-group", func() { panic("boom-panic") })
+	if c.errs != 1 {
+		t.Fatalf("errs = %d, want 1", c.errs)
+	}
+	if v := promtestutil.ToFloat64(r.cycles.WithLabelValues("boom-group", "panic")); v != 1 {
+		t.Fatalf("panic metric = %v, want 1", v)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "hostconfig group panicked") || !strings.Contains(out, "stack=") {
+		t.Fatalf("expected panic log with stack attribute, got:\n%s", out)
 	}
 }
