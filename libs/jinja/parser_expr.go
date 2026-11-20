@@ -10,14 +10,27 @@ import (
 // Pratt/recursive-descent expression grammar, split from parser.go
 // (which owns the {{ }}/{% %} tag splitter and statement AST). The
 // precedence chain, loosest to tightest: ternary → or → and → not →
-// compare (==/!=/</<=/>/>=, in, not in, is [not] test) → ~ concat →
-// additive → multiplicative → unary → postfix (filter |, .attr,
-// [idx], call) → primary.
+// compare (==/!=/</<=/>/>=, in, not in) → test (is [not] test) →
+// ~ concat → additive → multiplicative → unary → postfix (filter |,
+// .attr, [idx], call) → primary.
+
+const exprMaxDepth = 100
 
 type parser struct {
-	toks []tok
-	pos  int
+	toks  []tok
+	pos   int
+	depth int
 }
+
+func (p *parser) enter() error {
+	p.depth++
+	if p.depth > exprMaxDepth {
+		return fmt.Errorf("expression nesting exceeds %d levels", exprMaxDepth)
+	}
+	return nil
+}
+
+func (p *parser) leave() { p.depth-- }
 
 // tok returns toks[pos+off], or a synthetic eof past the slice end —
 // a grammar path that consumed past the terminator must degrade to
@@ -66,6 +79,10 @@ func parseExpr(src string) (expr, error) {
 }
 
 func (p *parser) parseTernary() (expr, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	t, err := p.parseOr()
 	if err != nil {
 		return nil, err
@@ -123,6 +140,10 @@ func (p *parser) parseAnd() (expr, error) {
 
 func (p *parser) parseNot() (expr, error) {
 	if p.atName("not") {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		p.next()
 		e, err := p.parseNot()
 		if err != nil {
@@ -134,81 +155,90 @@ func (p *parser) parseNot() (expr, error) {
 }
 
 func (p *parser) parseCompare() (expr, error) {
-	l, err := p.parseConcat()
+	first, err := p.parseTest()
 	if err != nil {
 		return nil, err
 	}
+	var ops []compareOp
 	for {
 		t := p.peek()
-		if t.kind == tokOp && (t.val == "==" || t.val == "!=" || t.val == "<" || t.val == "<=" || t.val == ">" || t.val == ">=") {
+		var op string
+		switch {
+		case t.kind == tokOp && (t.val == "==" || t.val == "!=" || t.val == "<" || t.val == "<=" || t.val == ">" || t.val == ">="):
+			op = t.val
 			p.next()
-			r, err := p.parseConcat()
-			if err != nil {
-				return nil, err
-			}
-			l = binExpr{t.val, l, r}
-			continue
+		case t.kind == tokName && t.val == "in":
+			op = "in"
+			p.next()
+		case t.kind == tokName && t.val == "not" && p.tok(1).kind == tokName && p.tok(1).val == "in":
+			op = "not in"
+			p.next()
+			p.next()
 		}
-		if t.kind == tokName && t.val == "in" {
-			p.next()
-			r, err := p.parseConcat()
-			if err != nil {
-				return nil, err
-			}
-			l = binExpr{"in", l, r}
-			continue
+		if op == "" {
+			break
 		}
-		if t.kind == tokName && t.val == "not" && p.tok(1).kind == tokName && p.tok(1).val == "in" {
-			p.next()
-			p.next()
-			r, err := p.parseConcat()
-			if err != nil {
-				return nil, err
-			}
-			l = unExpr{"not", binExpr{"in", l, r}}
-			continue
+		rhs, err := p.parseTest()
+		if err != nil {
+			return nil, err
 		}
-		if t.kind == tokName && t.val == "is" {
-			p.next()
-			neg := false
-			if p.atName("not") {
-				p.next()
-				neg = true
-			}
-			// `x is` / `x is not` at eof: without this guard next()
-			// eats the terminator and the at("(") probe indexes out
-			// of range — a panic, not a parse error.
-			if !p.atKind(tokName) {
-				return nil, fmt.Errorf("is: expected test name, got %q", p.peek().val)
-			}
-			name := p.next().val
-			var args []expr
-			if p.at("(") {
-				p.next()
-				for !p.at(")") {
-					a, err := p.parseTernary()
-					if err != nil {
-						return nil, err
-					}
-					args = append(args, a)
-					if p.at(",") {
-						p.next()
-					} else if !p.at(")") {
-						// `default('n/a' 0)` must not silently
-						// bind 0 as the second argument — a
-						// missing comma changes which
-						// positional slot each value lands in.
-						return nil, fmt.Errorf("is: expected ',' or ')' between arguments, got %q", p.peek().val)
-					}
-				}
-				p.next()
-			}
-			l = testExpr{in: l, name: name, args: args, neg: neg}
-			continue
-		}
-		break
+		ops = append(ops, compareOp{op: op, rhs: rhs})
 	}
-	return l, nil
+	if len(ops) == 0 {
+		return first, nil
+	}
+	if len(ops) == 1 {
+		if ops[0].op == "not in" {
+			return unExpr{"not", binExpr{"in", first, ops[0].rhs}}, nil
+		}
+		return binExpr{ops[0].op, first, ops[0].rhs}, nil
+	}
+	return compareExpr{first: first, ops: ops}, nil
+}
+
+func (p *parser) parseTest() (expr, error) {
+	e, err := p.parseConcat()
+	if err != nil {
+		return nil, err
+	}
+	for p.atName("is") {
+		p.next()
+		neg := false
+		if p.atName("not") {
+			p.next()
+			neg = true
+		}
+		// `x is` / `x is not` at eof: without this guard next()
+		// eats the terminator and the at("(") probe indexes out
+		// of range — a panic, not a parse error.
+		if !p.atKind(tokName) {
+			return nil, fmt.Errorf("is: expected test name, got %q", p.peek().val)
+		}
+		name := p.next().val
+		var args []expr
+		if p.at("(") {
+			p.next()
+			for !p.at(")") {
+				a, err := p.parseTernary()
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, a)
+				if p.at(",") {
+					p.next()
+				} else if !p.at(")") {
+					// `default('n/a' 0)` must not silently
+					// bind 0 as the second argument — a
+					// missing comma changes which
+					// positional slot each value lands in.
+					return nil, fmt.Errorf("is: expected ',' or ')' between arguments, got %q", p.peek().val)
+				}
+			}
+			p.next()
+		}
+		e = testExpr{in: e, name: name, args: args, neg: neg}
+	}
+	return e, nil
 }
 
 // parseConcat handles `~` string concatenation at LOWER precedence
@@ -266,6 +296,10 @@ func (p *parser) parseMul() (expr, error) {
 
 func (p *parser) parseUnary() (expr, error) {
 	if p.at("-") {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		p.next()
 		e, err := p.parseUnary()
 		if err != nil {
@@ -274,6 +308,10 @@ func (p *parser) parseUnary() (expr, error) {
 		return unExpr{"-", e}, nil
 	}
 	if p.at("+") {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
 		p.next()
 		return p.parseUnary()
 	}

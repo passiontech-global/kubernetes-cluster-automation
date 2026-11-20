@@ -10,6 +10,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"unicode/utf8"
 )
 
 // boundMethod wraps obj.method calls (items/append/endswith/...).
@@ -222,9 +223,17 @@ func (m boundMethod) call(args []any, _ *scope) (any, error) {
 	case "split":
 		str := Stringify(m.obj)
 		if len(args) == 0 {
-			return &List{splitWS(str)}, nil
+			parts, err := splitWSBounded(str)
+			if err != nil {
+				return nil, err
+			}
+			return &List{parts}, nil
 		}
-		return &List{splitAny(str, Stringify(args[0]))}, nil
+		parts, err := splitAnyBounded(str, Stringify(args[0]))
+		if err != nil {
+			return nil, err
+		}
+		return &List{parts}, nil
 	case "strip":
 		return strings.TrimSpace(Stringify(m.obj)), nil
 	case "index":
@@ -276,6 +285,17 @@ func splitWS(s string) []any {
 	return out
 }
 
+func splitWSBounded(s string) ([]any, error) {
+	var out []any
+	for f := range strings.FieldsSeq(s) {
+		if len(out) >= maxSeqElems {
+			return nil, fmt.Errorf("split: output exceeds %d elements", maxSeqElems)
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
 func splitAny(s, sep string) []any {
 	parts := strings.Split(s, sep)
 	out := make([]any, 0, len(parts))
@@ -283,6 +303,19 @@ func splitAny(s, sep string) []any {
 		out = append(out, p)
 	}
 	return out
+}
+
+func splitAnyBounded(s, sep string) ([]any, error) {
+	var n int
+	if sep == "" {
+		n = utf8.RuneCountInString(s)
+	} else {
+		n = strings.Count(s, sep) + 1
+	}
+	if n > maxSeqElems {
+		return nil, fmt.Errorf("split: output exceeds %d elements", maxSeqElems)
+	}
+	return splitAny(s, sep), nil
 }
 
 // ---------------- deep equality ----------------
@@ -390,12 +423,8 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 		}
 		return true
 	}
-	if l == nil || r == nil {
+	if IsNilOrUndef(l) || IsNilOrUndef(r) {
 		return IsNilOrUndef(l) && IsNilOrUndef(r)
-	}
-	if _, ok := l.(Undefined); ok {
-		_, uok := r.(Undefined)
-		return uok
 	}
 	return numEq(l, r)
 }

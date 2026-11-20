@@ -167,6 +167,49 @@ func (e binExpr) eval(s *scope) (any, error) {
 	return binOp(e.op, l, r)
 }
 
+type compareOp struct {
+	op  string
+	rhs expr
+}
+
+type compareExpr struct {
+	first expr
+	ops   []compareOp
+}
+
+func (e compareExpr) eval(s *scope) (any, error) {
+	left, err := e.first.eval(s)
+	if err != nil {
+		return nil, err
+	}
+	for _, link := range e.ops {
+		right, err := link.rhs.eval(s)
+		if err != nil {
+			return nil, err
+		}
+		var ok any
+		if link.op == "not in" {
+			ok, err = binOp("in", left, right)
+			if err != nil {
+				return nil, err
+			}
+			if Truthy(ok) {
+				return false, nil
+			}
+		} else {
+			ok, err = binOp(link.op, left, right)
+			if err != nil {
+				return nil, err
+			}
+			if !Truthy(ok) {
+				return false, nil
+			}
+		}
+		left = right
+	}
+	return true, nil
+}
+
 type testExpr struct {
 	in   expr
 	name string

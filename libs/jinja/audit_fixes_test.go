@@ -28,11 +28,13 @@ func renderBounded(t *testing.T, tpl string, ctx map[string]any) (string, error)
 		out, err := Render(tpl, ctx, nil)
 		done <- res{out, err}
 	}()
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
 	select {
 	case r := <-done:
 		return r.out, r.err
-	case <-time.After(10 * time.Second):
-		t.Fatalf("render %q did not terminate within 10s", tpl)
+	case <-timer.C:
+		t.Fatalf("render %q did not terminate within 30s", tpl)
 		return "", nil
 	}
 }

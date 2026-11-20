@@ -8,6 +8,10 @@ import (
 
 // ---------------- template parsing ----------------
 
+// templateMaxDepth bounds nested {% if %} / {% for %} blocks so a
+// hostile template cannot overflow the render stack.
+const templateMaxDepth = 100
+
 type frame struct {
 	kind string // "for" | "if"
 	n    tnode
@@ -20,9 +24,13 @@ func parseTemplate(text string) ([]tnode, error) {
 	nodes := []tnode{}
 	containers = append(containers, &nodes)
 	cur := func() *[]tnode { return containers[len(containers)-1] }
-	pushFrame := func(f frame, c *[]tnode) {
+	pushFrame := func(f frame, c *[]tnode) error {
+		if len(frames) >= templateMaxDepth {
+			return fmt.Errorf("template nesting exceeds %d levels", templateMaxDepth)
+		}
 		frames = append(frames, f)
 		containers = append(containers, c)
+		return nil
 	}
 	pop := func(kind string) error {
 		if len(frames) == 0 || frames[len(frames)-1].kind != kind {
@@ -37,20 +45,28 @@ func parseTemplate(text string) ([]tnode, error) {
 	for i < len(text) {
 		j := len(text)
 		tag := ""
-		for _, t := range []string{"{{", "{%", "{#"} {
-			if k := strings.Index(text[i:], t); k >= 0 && i+k < j {
-				j = i + k
-				tag = t
-			}
-		}
 		end := ""
-		switch tag {
-		case "{{":
-			end = "}}"
-		case "{%":
-			end = "%}"
-		case "{#":
-			end = "#}"
+		for search := i; search < len(text); {
+			k := strings.IndexByte(text[search:], '{')
+			if k < 0 {
+				break
+			}
+			pos := search + k
+			if pos+1 >= len(text) {
+				break
+			}
+			switch text[pos+1] {
+			case '{':
+				j, tag, end = pos, "{{", "}}"
+			case '%':
+				j, tag, end = pos, "{%", "%}"
+			case '#':
+				j, tag, end = pos, "{#", "#}"
+			default:
+				search = pos + 2
+				continue
+			}
+			break
 		}
 		if j == len(text) {
 			*cur() = append(*cur(), textNode(text[i:]))
@@ -135,7 +151,9 @@ func parseTemplate(text string) ([]tnode, error) {
 				return nil, err
 			}
 			*cur() = append(*cur(), fn)
-			pushFrame(frame{"for", fn}, &fn.body)
+			if err := pushFrame(frame{"for", fn}, &fn.body); err != nil {
+				return nil, err
+			}
 		case "endfor":
 			if err := pop("for"); err != nil {
 				return nil, err
@@ -147,7 +165,9 @@ func parseTemplate(text string) ([]tnode, error) {
 			}
 			in := &ifNode{arms: []ifArm{{cond: e}}}
 			*cur() = append(*cur(), in)
-			pushFrame(frame{"if", in}, &in.arms[0].body)
+			if err := pushFrame(frame{"if", in}, &in.arms[0].body); err != nil {
+				return nil, err
+			}
 		case "elif", "else":
 			if len(frames) == 0 || frames[len(frames)-1].kind != "if" {
 				return nil, fmt.Errorf("%s without if", kw)

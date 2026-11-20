@@ -26,10 +26,10 @@
 //
 // Both caches are CLOCK (second-chance) rings behind sync.RWMutex:
 // a hit takes only RLock, reads the payload, and sets the slot's
-// atomic used-bit — no shared-memory write when the bit is already
-// 1, no list.Element allocation, and a full cache still evicts (the
-// clock hand sweeps) instead of degrading to never-cache like the
-// old regex map did at its cap.
+// atomic used-bit with a non-RMW Load before Store(1) — no shared-memory
+// write when the bit is already 1, no list.Element allocation, and a
+// full cache still evicts (the clock hand sweeps) instead of degrading
+// to never-cache like the old regex map did at its cap.
 package jinja
 
 import (
@@ -91,9 +91,10 @@ func newClockCache[V any](cap int) *clockCache[V] {
 }
 
 // get returns the cached value for key. A hit marks the slot used
-// (its second chance): the CompareAndSwap writes NOTHING when the
-// bit is already 1, so the hot path is RLock + map lookup + slice
-// read + one atomic RMW — no allocation, no exclusive lock.
+// (its second chance): checking Load() == 0 before Store(1) avoids
+// any atomic RMW or cache-line write when the bit is already 1, so
+// the hot path is RLock + map lookup + slice read + atomic Load — no
+// allocation, no exclusive lock.
 func (c *clockCache[V]) get(key string) (V, bool) {
 	c.mu.RLock()
 	idx, ok := c.byKey[key]
@@ -104,7 +105,9 @@ func (c *clockCache[V]) get(key string) (V, bool) {
 	}
 	e := &c.slots[idx]
 	v := e.val
-	e.used.CompareAndSwap(0, 1)
+	if e.used.Load() == 0 {
+		e.used.Store(1)
+	}
 	c.mu.RUnlock()
 	return v, true
 }

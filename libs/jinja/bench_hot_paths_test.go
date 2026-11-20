@@ -131,3 +131,22 @@ func BenchmarkRenderTemplateEval(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkFromJSON(b *testing.B) {
+	doc := benchDoc(50)
+	rawBytes, err := toJSON(doc)
+	if err != nil {
+		b.Fatal(err)
+	}
+	raw := string(rawBytes)
+	b.ReportAllocs()
+	for b.Loop() {
+		v, err := decodeJSON(raw)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if m, ok := v.(*OMap); !ok || m.Len() != doc.Len() {
+			b.Fatalf("unexpected decoded map: %T len=%v", v, doc.Len())
+		}
+	}
+}

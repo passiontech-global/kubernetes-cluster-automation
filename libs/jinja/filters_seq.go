@@ -249,8 +249,12 @@ func filterItems2Dict(v any, args []any, kw map[string]any) (any, error) {
 // filterFlatten recursively expands nested lists into one flat list.
 func filterFlatten(v any) (any, error) {
 	var out []any
+	steps := 0
 	var rec func(x any, depth int) error
 	rec = func(x any, depth int) error {
+		if stepBudgetExhausted(&steps) {
+			return fmt.Errorf("flatten: walk exceeds %d steps (branching cycle or DAG?)", walkMaxSteps)
+		}
 		// Only real lists nest. ToIter char-splits strings and
 		// dumps map keys, so routing everything through it
 		// turned ["ab","cd"] into [a b c d]; a dict is an atom.
@@ -277,6 +281,9 @@ func filterFlatten(v any) (any, error) {
 		if depth >= flattenMaxDepth {
 			// Depth cap keeps a self-referential list from
 			// recursing forever — keep the tail unexpanded.
+			if len(out)+len(items) > flattenMaxOut {
+				return fmt.Errorf("flatten: output exceeds %d elements", flattenMaxOut)
+			}
 			out = append(out, items...)
 			return nil
 		}

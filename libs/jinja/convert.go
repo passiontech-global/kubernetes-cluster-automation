@@ -7,7 +7,10 @@
 package jinja
 
 import (
+	"encoding/json/jsontext"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
 	"strings"
@@ -144,54 +147,95 @@ func yamlLeafNode(v any) (*yaml3.Node, error) {
 
 // ---------------- from_json ----------------
 
-// fromJSONMaxDepth bounds the re-boxing walk — json.Unmarshal
-// already rejects documents nested past its own limit, but the
-// decoded tree still deserves an explicit recursion budget so a
-// hostile-but-parseable document can't stack the re-boxer.
+// fromJSONMaxDepth bounds JSON container nesting so a hostile
+// deeply nested document fails before overflowing the Go call stack.
 const fromJSONMaxDepth = 64
 
-// fromJSONChecked re-boxes a json.Unmarshal tree into OMap/List
-// values. Unlike the old silent fromJSON it returns an explicit
-// error when the document nests past fromJSONMaxDepth — a truncated
-// nil would render as a WRONG value downstream (a vars file quietly
-// losing a subtree), which is worse than a loud filter failure.
-func fromJSONChecked(v any) (any, error) {
-	return fromJSONAt(v, 0)
+// decodeJSON parses raw JSON directly into jinja values (*OMap in
+// document key order, *List, int64/uint64/float64, bool, string, nil)
+// via jsontext.NewDecoder, tolerating invalid UTF-8 and duplicate
+// object keys (last-write-wins at first-insert position via OMap.Set).
+func decodeJSON(raw string) (any, error) {
+	dec := jsontext.NewDecoder(
+		strings.NewReader(raw),
+		jsontext.AllowInvalidUTF8(true),
+		jsontext.AllowDuplicateNames(true),
+	)
+	v, err := decodeJSONValue(dec, 0)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := dec.ReadToken(); err != io.EOF {
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("from_json: unexpected trailing data")
+	}
+	return v, nil
 }
 
-func fromJSONAt(v any, depth int) (any, error) {
+func decodeJSONValue(dec *jsontext.Decoder, depth int) (any, error) {
 	if depth > fromJSONMaxDepth {
 		return nil, fmt.Errorf("from_json: document nests past %d levels", fromJSONMaxDepth)
 	}
-	switch t := v.(type) {
-	case map[string]any:
-		m := NewOMapCap(len(t))
-		for _, k := range slices.Sorted(maps.Keys(t)) {
-			cv, err := fromJSONAt(t[k], depth+1)
-			if err != nil {
-				return nil, err
-			}
-			m.Set(k, cv)
-		}
-		return m, nil
-	case []any:
-		out := make([]any, len(t))
-		for i, x := range t {
-			cv, err := fromJSONAt(x, depth+1)
-			if err != nil {
-				return nil, err
-			}
-			out[i] = cv
-		}
-		return &List{out}, nil
-	case float64:
-		// floatToInt64, not int64(t): NaN/±Inf/out-of-range floats
-		// truncate into platform garbage (usually MinInt64).
-		if i, ok := floatToInt64(t); ok && t == float64(i) {
+	tok, err := dec.ReadToken()
+	if err != nil {
+		return nil, err
+	}
+	switch tok.Kind() {
+	case 'n':
+		return nil, nil
+	case 't', 'f':
+		return tok.Bool(), nil
+	case '"':
+		return tok.String(), nil
+	case '0':
+		if i, err := tok.Int(); err == nil {
 			return i, nil
 		}
-		return t, nil
+		if u, err := tok.Uint(); err == nil {
+			return u, nil
+		}
+		f, err := tok.Float()
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	case '{':
+		m := NewOMap()
+		for dec.PeekKind() != '}' {
+			ktok, err := dec.ReadToken()
+			if err != nil {
+				return nil, err
+			}
+			if ktok.Kind() != '"' {
+				return nil, fmt.Errorf("from_json: expected object key string, got %v", ktok.Kind())
+			}
+			k := ktok.String()
+			val, err := decodeJSONValue(dec, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			m.Set(k, val)
+		}
+		if _, err := dec.ReadToken(); err != nil {
+			return nil, err
+		}
+		return m, nil
+	case '[':
+		var out []any
+		for dec.PeekKind() != ']' {
+			elem, err := decodeJSONValue(dec, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, elem)
+		}
+		if _, err := dec.ReadToken(); err != nil {
+			return nil, err
+		}
+		return &List{out}, nil
 	default:
-		return v, nil
+		return nil, fmt.Errorf("from_json: unexpected token %v", tok.Kind())
 	}
 }

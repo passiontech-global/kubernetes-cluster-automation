@@ -61,3 +61,48 @@ func TestRangeUniqueLargeBounded(t *testing.T) {
 		t.Fatalf("range|unique took %v — quadratic dedup regression?", elapsed)
 	}
 }
+
+func TestRegexFastPathsSemanticsAndCaps(t *testing.T) {
+	cases := []struct {
+		name string
+		tpl  string
+		ctx  map[string]any
+		want string
+	}{
+		{"line_prefix_no_match", `{{ s | regex_replace('(?m)^zzz', 'X') }}`, map[string]any{"s": "a\nb\n"}, "a\nb\n"},
+		{"line_prefix_matches", `{{ s | regex_replace('(?m)^a', 'X') }}`, map[string]any{"s": "\na\nba\na"}, "\nX\nba\nX"},
+		{"line_prefix_crlf", `{{ s | regex_replace('(?m)^a', 'X') }}`, map[string]any{"s": "a\r\na\r\n"}, "X\r\nX\r\n"},
+		{"empty_pat_with_expand", `{{ 'ab' | regex_replace('', '$$') }}`, nil, "$a$b$"},
+		{"findall_batch_seam_empty", `{{ s | regex_findall('a*') | length }}`, map[string]any{"s": strings.Repeat("b", 5000)}, "5001"},
+		{"findall_batch_capture_opt", `{{ s | regex_findall('(a)(b)?') | length }}`, map[string]any{"s": strings.Repeat("a", 5000)}, "5000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := renderBounded(t, tc.tpl, tc.ctx)
+			if err != nil {
+				t.Fatalf("render failed: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("line_prefix_output_cap", func(t *testing.T) {
+		s := strings.Repeat("a\n", 1024)
+		repl := strings.Repeat("b", 32768)
+		if _, err := renderBounded(t, `{{ s | regex_replace('(?m)^a', r) | length }}`, map[string]any{"s": s, "r": repl}); err == nil {
+			t.Fatal("expected line-prefix regex_replace output cap error")
+		}
+	})
+
+	t.Run("findall_non_literal_batch_cap", func(t *testing.T) {
+		s := strings.Repeat("a", maxSeqElems+1)
+		for _, pat := range []string{`[ab]`, `([ab])`} {
+			tpl := `{{ s | regex_findall('` + pat + `') | length }}`
+			if _, err := renderBounded(t, tpl, map[string]any{"s": s}); err == nil {
+				t.Fatalf("expected regex_findall(%q) > maxSeqElems to fail", pat)
+			}
+		}
+	})
+}

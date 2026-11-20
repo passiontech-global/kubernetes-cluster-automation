@@ -112,11 +112,14 @@ func Render(text string, ctx map[string]any, env *Env) (string, error) {
 	return b.String(), nil
 }
 
-// RenderScoped renders template text where template names resolve
-// through lookup BEFORE the builtins (unlike Render, whose names come
-// from a fixed ctx map) — the lazy vars-file resolution path, where a
-// var's {{ }} sees every other var through the same resolver.
-// lookup returning nil or an Undefined falls through to the builtins.
+// RenderScoped renders template text where local scope bindings
+// ({% set %}, {% for %}, loop) take precedence over lookup, and missing
+// local names resolve through lookup BEFORE builtins (unlike Render,
+// whose names come from a fixed ctx map) — the lazy vars-file
+// resolution path, where a var's {{ }} sees every other var through the
+// same resolver. A nil return from lookup is preserved as None (YAML
+// null) for non-builtin names; Undefined (and nil on builtin names
+// lookup/range) falls through to the builtins.
 func RenderScoped(text string, env *Env, lookup func(name string) any) (string, error) {
 	nodes, err := parsedTemplate(text)
 	if err != nil {

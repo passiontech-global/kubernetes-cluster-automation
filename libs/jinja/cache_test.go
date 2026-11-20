@@ -88,6 +88,7 @@ func TestTemplateCacheConcurrent(t *testing.T) {
 		"{% for x in xs %}{{ x }}-{{ loop.index }};{% endfor %}",
 		"{{ d.k }}|{{ d | dict2items | sort(attribute='key') | map(attribute='value') | join(',') }}",
 		"{% if flag %}yes{% else %}no{% endif %}{{ missing | default('dv') }}",
+		"{{ 0 < d.a < d.b }}|{{ 5 < 10 < 3 }}",
 	}
 	want := make([]string, len(shared))
 	for i, tpl := range shared {

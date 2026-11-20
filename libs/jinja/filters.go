@@ -9,11 +9,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"math"
 	"regexp"
+	"regexp/syntax"
 	"slices"
 	"strconv"
 	"strings"
@@ -60,6 +60,75 @@ func outputSizeCap(n int, filter string) error {
 func hexish(s string) bool {
 	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(s), "+"), "-"))
 	return len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')
+}
+
+// parseIntBase parses s in the given base with Python 3 int(s, base)
+// semantics: optional +/- followed by 0x/0X (base 16), 0o/0O (base 8),
+// or 0b/0B (base 2), rejecting empty bodies ("0x"), inner signs
+// ("0x-10", "0x+10"), and underscores ("1_000", "0x_10"). For base == 0,
+// all-zero strings ("0", "000") parse as 0 while other leading-zero
+// numbers without a base prefix ("010") are rejected.
+func parseIntBase(s string, base int) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || base < 0 || base == 1 || base > 36 {
+		return 0, strconv.ErrSyntax
+	}
+	if strings.ContainsRune(s, '_') {
+		return 0, strconv.ErrSyntax
+	}
+	sign := ""
+	rest := s
+	if rest[0] == '+' || rest[0] == '-' {
+		sign = rest[:1]
+		rest = rest[1:]
+		if rest == "" {
+			return 0, strconv.ErrSyntax
+		}
+	}
+	if base == 0 {
+		switch {
+		case len(rest) >= 2 && rest[0] == '0' && (rest[1] == 'x' || rest[1] == 'X'):
+			base = 16
+			rest = rest[2:]
+		case len(rest) >= 2 && rest[0] == '0' && (rest[1] == 'o' || rest[1] == 'O'):
+			base = 8
+			rest = rest[2:]
+		case len(rest) >= 2 && rest[0] == '0' && (rest[1] == 'b' || rest[1] == 'B'):
+			base = 2
+			rest = rest[2:]
+		case rest[0] == '0':
+			for i := 1; i < len(rest); i++ {
+				if rest[i] != '0' {
+					return 0, strconv.ErrSyntax
+				}
+			}
+			return 0, nil
+		default:
+			base = 10
+		}
+		if rest == "" || rest[0] == '+' || rest[0] == '-' {
+			return 0, strconv.ErrSyntax
+		}
+		return strconv.ParseInt(sign+rest, base, 64)
+	}
+	if base == 2 || base == 8 || base == 16 {
+		var p0, p1 byte
+		switch base {
+		case 2:
+			p0, p1 = 'b', 'B'
+		case 8:
+			p0, p1 = 'o', 'O'
+		case 16:
+			p0, p1 = 'x', 'X'
+		}
+		if len(rest) >= 2 && rest[0] == '0' && (rest[1] == p0 || rest[1] == p1) {
+			rest = rest[2:]
+			if rest == "" || rest[0] == '+' || rest[0] == '-' {
+				return 0, strconv.ErrSyntax
+			}
+		}
+	}
+	return strconv.ParseInt(sign+rest, base, 64)
 }
 
 // floatToInt64 converts NaN/±Inf-free floats into int64: Go's
@@ -222,11 +291,18 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			def = dv
 		}
 		base := int64(10)
-		if len(args) > 1 {
-			base, _ = ToInt(args[1])
-		}
 		if bv, ok := kw["base"]; ok {
-			base, _ = ToInt(bv)
+			b, ok := ToInt(bv)
+			if !ok {
+				return def, nil
+			}
+			base = b
+		} else if len(args) > 1 {
+			b, ok := ToInt(args[1])
+			if !ok {
+				return def, nil
+			}
+			base = b
 		}
 		switch t := v.(type) {
 		case int64:
@@ -241,17 +317,19 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 			}
 			return int64(0), nil
 		case string:
-			i, err := strconv.ParseInt(strings.TrimSpace(t), int(base), 64)
+			if base < 0 || base == 1 || base > 36 {
+				return def, nil
+			}
+			i, err := parseIntBase(t, int(base))
 			if err == nil {
 				return i, nil
 			}
 			// The float fallback is a base-10 decimal convenience:
 			// int("1.5") → 1. With base != 10 (int("1.5", 16) is a
-			// ValueError in python), and never for a hex string —
-			// Go's ParseFloat accepts "0x1p-2"-style hex floats
-			// python's float() rejects, and int("0x10", 16) parses
-			// the digits via ParseInt above anyway.
-			if base == 10 && !hexish(t) {
+			// ValueError in python), and never for a hex string or
+			// underscore-separated string — Go's ParseFloat accepts
+			// "0x1p-2" and "1_000", which must not bypass base rules.
+			if base == 10 && !hexish(t) && !strings.ContainsRune(t, '_') {
 				// TrimSpace like the ParseInt above — " 1.5 " | int
 				// must not fail the decimal fallback on padding
 				// python's float() tolerates.
@@ -296,15 +374,43 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 	case "split":
 		str := Stringify(v)
 		if len(args) == 0 {
-			return &List{splitWS(str)}, nil
+			parts, err := splitWSBounded(str)
+			if err != nil {
+				return nil, err
+			}
+			return &List{parts}, nil
 		}
-		return &List{splitAny(str, Stringify(args[0]))}, nil
+		parts, err := splitAnyBounded(str, Stringify(args[0]))
+		if err != nil {
+			return nil, err
+		}
+		return &List{parts}, nil
 	case "lower":
 		return strings.ToLower(Stringify(v)), nil
 	case "upper":
 		return strings.ToUpper(Stringify(v)), nil
 	case "regex_escape":
-		return regexp.QuoteMeta(Stringify(v)), nil
+		s := Stringify(v)
+		if err := outputSizeCap(len(s), "regex_escape"); err != nil {
+			return nil, err
+		}
+		if len(s) > maxStringBytes/2 {
+			extra := 0
+			for i := 0; i < len(s); i++ {
+				switch s[i] {
+				case '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$':
+					extra++
+				}
+			}
+			if err := outputSizeCap(len(s)+extra, "regex_escape"); err != nil {
+				return nil, err
+			}
+		}
+		out := regexp.QuoteMeta(s)
+		if err := outputSizeCap(len(out), "regex_escape"); err != nil {
+			return nil, err
+		}
+		return out, nil
 	case "regex_replace":
 		if len(args) < 2 {
 			return v, nil
@@ -318,28 +424,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if len(s) > maxStringBytes {
 			return nil, fmt.Errorf("regex_replace: input exceeds %d bytes", maxStringBytes)
 		}
-		// Expand match-by-match so the output cap fires mid-stream —
-		// ReplaceAllString would allocate the whole multiplied
-		// result before any bound could reject it. ExpandString gives
-		// byte-identical $N/${name} expansion to ReplaceAllString.
-		var b strings.Builder
-		b.Grow(len(s) + len(repl) + 64)
-		last := 0
-		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
-			b.WriteString(s[last:m[0]])
-			exp := re.ExpandString(nil, repl, s, m)
-			if b.Len()+len(exp) > maxStringBytes {
-				return nil, fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
-			}
-			b.Write(exp)
-			last = m[1]
-		}
-		b.WriteString(s[last:])
-		out := b.String()
-		if len(out) > maxStringBytes {
-			return nil, fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
-		}
-		return out, nil
+		return regexReplaceBounded(re, s, repl)
 	case "regex_findall":
 		if len(args) == 0 {
 			return &List{}, nil
@@ -348,25 +433,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if err != nil {
 			return nil, err
 		}
-		matches := re.FindAllStringSubmatch(Stringify(v), -1)
-		out := make([]any, 0, len(matches))
-		for _, m := range matches {
-			switch {
-			case len(m) > 2:
-				// Multiple capture groups — python findall yields a
-				// tuple of ALL groups per match, not just group 1.
-				grps := make([]any, 0, len(m)-1)
-				for _, g := range m[1:] {
-					grps = append(grps, g)
-				}
-				out = append(out, &List{grps})
-			case len(m) == 2:
-				out = append(out, m[1])
-			default:
-				out = append(out, m[0])
-			}
-		}
-		return &List{out}, nil
+		return regexFindallBounded(re, Stringify(v))
 	case "regex_search":
 		if len(args) == 0 {
 			return Undefined{"regex_search"}, nil
@@ -406,11 +473,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if len(raw) > parseMaxBytes {
 			return nil, fmt.Errorf("from_json: input exceeds %d bytes", parseMaxBytes)
 		}
-		var out any
-		if err := json.Unmarshal([]byte(raw), &out); err != nil {
-			return nil, err
-		}
-		return fromJSONChecked(out)
+		return decodeJSON(raw)
 	case "from_yaml":
 		// Same input cap as |from_json — a hostile multi-MB YAML
 		// string is the same unbounded decode sink.
@@ -437,13 +500,40 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		return string(b), nil
 	case "b64decode":
-		b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(Stringify(v)))
+		raw := strings.TrimSpace(Stringify(v))
+		maxEnc := base64.StdEncoding.EncodedLen(maxStringBytes)
+		if len(raw) > maxEnc*2 || (len(raw) > maxEnc && !strings.ContainsAny(raw, "\r\n")) {
+			return nil, fmt.Errorf("b64decode: output exceeds %d bytes", maxStringBytes)
+		}
+		b, err := base64.StdEncoding.DecodeString(raw)
 		if err != nil {
+			return nil, err
+		}
+		if err := outputSizeCap(len(b), "b64decode"); err != nil {
 			return nil, err
 		}
 		return string(b), nil
 	case "b64encode":
-		return base64.StdEncoding.EncodeToString([]byte(Stringify(v))), nil
+		s := Stringify(v)
+		if len(s) > maxStringBytes {
+			return nil, fmt.Errorf("b64encode: output exceeds %d bytes", maxStringBytes)
+		}
+		encLen := base64.StdEncoding.EncodedLen(len(s))
+		if err := outputSizeCap(encLen, "b64encode"); err != nil {
+			return nil, err
+		}
+		var sb strings.Builder
+		sb.Grow(encLen)
+		var inBuf [49152]byte // multiple of 3 -> no mid-stream padding
+		var outBuf [65536]byte
+		for off := 0; off < len(s); {
+			n := copy(inBuf[:], s[off:])
+			m := base64.StdEncoding.EncodedLen(n)
+			base64.StdEncoding.Encode(outBuf[:m], inBuf[:n])
+			sb.Write(outBuf[:m])
+			off += n
+		}
+		return sb.String(), nil
 	case "hash":
 		h := sha256.Sum256([]byte(Stringify(v)))
 		return hex.EncodeToString(h[:]), nil
@@ -535,4 +625,529 @@ func boolArg(args []any, kw map[string]any, name string, pos int, def bool) bool
 		return Truthy(args[pos])
 	}
 	return def
+}
+
+const (
+	regexLeftFree  = 0 // no ^ / \A / (?m)^ / \b / \B anywhere: safe for incremental s[pos:]
+	regexLeftBegin = 1 // must start at text begin (pos == 0): at most one match via FindStringSubmatchIndex(s)
+	regexLeftFull  = 2 // general left-context assertion ((?m)^, \b, \B, a|^b): bounded FindAll
+)
+
+func hasLeftAnchor(r *syntax.Regexp) bool {
+	switch r.Op {
+	case syntax.OpBeginText, syntax.OpBeginLine, syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+		return true
+	}
+	for _, sub := range r.Sub {
+		if hasLeftAnchor(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func mustStartAtTextBegin(r *syntax.Regexp) bool {
+	switch r.Op {
+	case syntax.OpBeginText:
+		return true
+	case syntax.OpCapture, syntax.OpPlus:
+		return len(r.Sub) > 0 && mustStartAtTextBegin(r.Sub[0])
+	case syntax.OpRepeat:
+		return r.Min >= 1 && len(r.Sub) > 0 && mustStartAtTextBegin(r.Sub[0])
+	case syntax.OpConcat:
+		return len(r.Sub) > 0 && mustStartAtTextBegin(r.Sub[0])
+	case syntax.OpAlternate:
+		if len(r.Sub) == 0 {
+			return false
+		}
+		for _, sub := range r.Sub {
+			if !mustStartAtTextBegin(sub) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func classifyRegexReplace(pat string, hasExpand bool) (mode int, lit string, isLit, isEmpty, isLinePrefix bool) {
+	if !hasExpand && !strings.ContainsAny(pat, `^$\.*+?()[]{}|`) {
+		if !strings.ContainsRune(pat, utf8.RuneError) && pat != "" {
+			return regexLeftFree, pat, true, false, false
+		}
+	}
+	ast, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil {
+		return regexLeftFull, "", false, false, false
+	}
+	if ast.Op == syntax.OpEmptyMatch {
+		return regexLeftFree, "", false, true, false
+	}
+	if !hasExpand {
+		litNode := ast
+		if litNode.Op == syntax.OpCapture && len(litNode.Sub) == 1 {
+			litNode = litNode.Sub[0]
+		}
+		if litNode.Op == syntax.OpLiteral && (litNode.Flags&syntax.FoldCase) == 0 && len(litNode.Rune) > 0 {
+			s := string(litNode.Rune)
+			if !strings.ContainsRune(s, utf8.RuneError) {
+				return regexLeftFree, s, true, false, false
+			}
+		}
+		if ast.Op == syntax.OpConcat && len(ast.Sub) == 2 && ast.Sub[0].Op == syntax.OpBeginLine {
+			sub := ast.Sub[1]
+			if sub.Op == syntax.OpCapture && len(sub.Sub) == 1 {
+				sub = sub.Sub[0]
+			}
+			if sub.Op == syntax.OpLiteral && (sub.Flags&syntax.FoldCase) == 0 && len(sub.Rune) > 0 {
+				s := string(sub.Rune)
+				if !strings.ContainsRune(s, utf8.RuneError) && !strings.ContainsRune(s, '\n') {
+					return regexLeftFull, s, false, false, true
+				}
+			}
+		}
+	}
+	if !hasLeftAnchor(ast) {
+		return regexLeftFree, "", false, false, false
+	}
+	if mustStartAtTextBegin(ast) {
+		return regexLeftBegin, "", false, false, false
+	}
+	return regexLeftFull, "", false, false, false
+}
+
+func singleLiteralCapture(pat string) (string, bool) {
+	ast, err := syntax.Parse(pat, syntax.Perl)
+	if err != nil || ast.Op != syntax.OpCapture || len(ast.Sub) != 1 {
+		return "", false
+	}
+	sub := ast.Sub[0]
+	if sub.Op != syntax.OpLiteral || (sub.Flags&syntax.FoldCase) != 0 || len(sub.Rune) == 0 {
+		return "", false
+	}
+	s := string(sub.Rune)
+	if strings.ContainsRune(s, utf8.RuneError) {
+		return "", false
+	}
+	return s, true
+}
+
+func replaceLiteralBounded(s, lit, repl string) (string, error) {
+	n := strings.Count(s, lit)
+	if n == 0 {
+		return s, nil
+	}
+	diff := len(repl) - len(lit)
+	if diff > 0 {
+		if n > (maxStringBytes-len(s))/diff {
+			return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+		}
+	} else if len(s)+n*diff > maxStringBytes {
+		return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+	}
+	return strings.ReplaceAll(s, lit, repl), nil
+}
+
+func replaceEmptyBounded(s, repl string) (string, error) {
+	nMatches := utf8.RuneCountInString(s) + 1
+	if nMatches > maxSeqElems {
+		return "", fmt.Errorf("regex_replace: match count exceeds %d", maxSeqElems)
+	}
+	if len(repl) > 0 && nMatches > (maxStringBytes-len(s))/len(repl) {
+		return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+	}
+	var b strings.Builder
+	b.Grow(len(s) + nMatches*len(repl))
+	for i := 0; i < len(s); {
+		b.WriteString(repl)
+		_, w := utf8.DecodeRuneInString(s[i:])
+		if w <= 0 {
+			w = 1
+		}
+		b.WriteString(s[i : i+w])
+		i += w
+	}
+	b.WriteString(repl)
+	return b.String(), nil
+}
+
+func replaceLinePrefixLiteralBounded(s, lit, repl string) (string, error) {
+	var b strings.Builder
+	last := 0
+	pos := 0
+	matches := 0
+	for pos <= len(s) {
+		if strings.HasPrefix(s[pos:], lit) {
+			matches++
+			if matches > maxSeqElems {
+				return "", fmt.Errorf("regex_replace: match count exceeds %d", maxSeqElems)
+			}
+			if b.Len()+(pos-last)+len(repl) > maxStringBytes {
+				return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+			}
+			if matches == 1 {
+				b.Grow(min(len(s)+64, maxStringBytes))
+			}
+			b.WriteString(s[last:pos])
+			b.WriteString(repl)
+			last = pos + len(lit)
+			pos = last
+		}
+		nl := strings.IndexByte(s[pos:], '\n')
+		if nl < 0 {
+			break
+		}
+		pos += nl + 1
+	}
+	if matches == 0 {
+		return s, nil
+	}
+	if b.Len()+(len(s)-last) > maxStringBytes {
+		return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+	}
+	b.WriteString(s[last:])
+	return b.String(), nil
+}
+
+// regexReplaceBounded replaces matches incrementally without materializing an
+// unbounded [][]int match slice, enforcing maxStringBytes before writes.
+func regexReplaceBounded(re *regexp.Regexp, s, repl string) (string, error) {
+	hasExpand := strings.ContainsRune(repl, '$')
+	mode, lit, isLit, isEmpty, isLinePrefix := classifyRegexReplace(re.String(), hasExpand)
+	if isLit {
+		return replaceLiteralBounded(s, lit, repl)
+	}
+	if isEmpty && !hasExpand {
+		return replaceEmptyBounded(s, repl)
+	}
+	if isLinePrefix {
+		return replaceLinePrefixLiteralBounded(s, lit, repl)
+	}
+
+	const batchSize = 4096
+	var b strings.Builder
+	last := 0
+	var exp []byte
+	totalMatches := 0
+
+	switch mode {
+	case regexLeftFree:
+		b.Grow(min(len(s)+64, 64<<10))
+		pos := 0
+		prevMatchEnd := -1
+		for pos <= len(s) {
+			var batch [][]int
+			if hasExpand {
+				batch = re.FindAllStringSubmatchIndex(s[pos:], batchSize)
+			} else {
+				batch = re.FindAllStringIndex(s[pos:], batchSize)
+			}
+			if len(batch) == 0 {
+				break
+			}
+			startPos := pos
+			for i, m := range batch {
+				for k := range m {
+					if m[k] >= 0 {
+						m[k] += startPos
+					}
+				}
+				if i == 0 && m[1] == startPos && m[0] == prevMatchEnd {
+					continue
+				}
+				totalMatches++
+				if totalMatches > maxSeqElems {
+					return "", fmt.Errorf("regex_replace: match count exceeds %d", maxSeqElems)
+				}
+				if b.Len()+(m[0]-last) > maxStringBytes {
+					return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+				}
+				b.WriteString(s[last:m[0]])
+				if !hasExpand {
+					if b.Len()+len(repl) > maxStringBytes {
+						return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+					}
+					b.WriteString(repl)
+				} else {
+					exp = re.ExpandString(exp[:0], repl, s, m)
+					if b.Len()+len(exp) > maxStringBytes {
+						return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+					}
+					b.Write(exp)
+				}
+				last = m[1]
+			}
+			if len(batch) < batchSize {
+				break
+			}
+			lastM := batch[len(batch)-1]
+			prevMatchEnd = lastM[1]
+			if lastM[0] == lastM[1] {
+				if lastM[1] == len(s) {
+					pos = len(s) + 1
+				} else {
+					_, w := utf8.DecodeRuneInString(s[lastM[1]:])
+					if w <= 0 {
+						w = 1
+					}
+					pos = lastM[1] + w
+				}
+			} else {
+				pos = lastM[1]
+			}
+		}
+	case regexLeftBegin:
+		b.Grow(min(len(s)+64, maxStringBytes))
+		var m []int
+		if hasExpand {
+			m = re.FindStringSubmatchIndex(s)
+		} else {
+			m = re.FindStringIndex(s)
+		}
+		if m != nil {
+			if b.Len()+(m[0]-last) > maxStringBytes {
+				return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+			}
+			b.WriteString(s[last:m[0]])
+			if !hasExpand {
+				if b.Len()+len(repl) > maxStringBytes {
+					return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+				}
+				b.WriteString(repl)
+			} else {
+				exp = re.ExpandString(exp[:0], repl, s, m)
+				if b.Len()+len(exp) > maxStringBytes {
+					return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+				}
+				b.Write(exp)
+			}
+			last = m[1]
+		}
+	default:
+		var matches [][]int
+		if hasExpand {
+			matches = re.FindAllStringSubmatchIndex(s, maxSeqElems+1)
+		} else {
+			matches = re.FindAllStringIndex(s, maxSeqElems+1)
+		}
+		if len(matches) > maxSeqElems {
+			return "", fmt.Errorf("regex_replace: match count exceeds %d", maxSeqElems)
+		}
+		b.Grow(min(len(s)+64, maxStringBytes))
+		for _, m := range matches {
+			if b.Len()+(m[0]-last) > maxStringBytes {
+				return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+			}
+			b.WriteString(s[last:m[0]])
+			if !hasExpand {
+				if b.Len()+len(repl) > maxStringBytes {
+					return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+				}
+				b.WriteString(repl)
+			} else {
+				exp = re.ExpandString(exp[:0], repl, s, m)
+				if b.Len()+len(exp) > maxStringBytes {
+					return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+				}
+				b.Write(exp)
+			}
+			last = m[1]
+		}
+	}
+
+	if b.Len()+(len(s)-last) > maxStringBytes {
+		return "", fmt.Errorf("regex_replace: output exceeds %d bytes", maxStringBytes)
+	}
+	b.WriteString(s[last:])
+	return b.String(), nil
+}
+
+// regexFindallBounded evaluates |regex_findall while rejecting match counts >
+// maxSeqElems without allocating 1,000,001 per-match []string submatch slices.
+func regexFindallBounded(re *regexp.Regexp, s string) (*List, error) {
+	mode, lit, isLit, isEmpty, _ := classifyRegexReplace(re.String(), false)
+	if re.NumSubexp() == 0 {
+		if isLit {
+			n := strings.Count(s, lit)
+			if n > maxSeqElems {
+				return nil, fmt.Errorf("regex_findall: match count exceeds %d", maxSeqElems)
+			}
+			if n == 0 {
+				return &List{}, nil
+			}
+			out := make([]any, n)
+			for i := range out {
+				out[i] = lit
+			}
+			return &List{out}, nil
+		}
+		if mode == regexLeftFree && !isEmpty {
+			const batchSize = 4096
+			var out []any
+			pos := 0
+			prevMatchEnd := -1
+			for pos <= len(s) {
+				batch := re.FindAllStringIndex(s[pos:], batchSize)
+				if len(batch) == 0 {
+					break
+				}
+				startPos := pos
+				for i, m := range batch {
+					m0, m1 := m[0]+startPos, m[1]+startPos
+					if i == 0 && m1 == startPos && m0 == prevMatchEnd {
+						continue
+					}
+					if len(out) >= maxSeqElems {
+						return nil, fmt.Errorf("regex_findall: match count exceeds %d", maxSeqElems)
+					}
+					out = append(out, s[m0:m1])
+				}
+				if len(batch) < batchSize {
+					break
+				}
+				lastM := batch[len(batch)-1]
+				prevMatchEnd = lastM[1] + startPos
+				if lastM[0] == lastM[1] {
+					if prevMatchEnd == len(s) {
+						pos = len(s) + 1
+					} else {
+						_, w := utf8.DecodeRuneInString(s[prevMatchEnd:])
+						if w <= 0 {
+							w = 1
+						}
+						pos = prevMatchEnd + w
+					}
+				} else {
+					pos = prevMatchEnd
+				}
+			}
+			if len(out) == 0 {
+				return &List{}, nil
+			}
+			return &List{out}, nil
+		}
+		strs := re.FindAllString(s, maxSeqElems+1)
+		if len(strs) > maxSeqElems {
+			return nil, fmt.Errorf("regex_findall: match count exceeds %d", maxSeqElems)
+		}
+		if len(strs) == 0 {
+			return &List{}, nil
+		}
+		out := make([]any, len(strs))
+		for i, m := range strs {
+			out[i] = m
+		}
+		return &List{out}, nil
+	}
+
+	if re.NumSubexp() == 1 {
+		if lit, ok := singleLiteralCapture(re.String()); ok {
+			n := strings.Count(s, lit)
+			if n > maxSeqElems {
+				return nil, fmt.Errorf("regex_findall: match count exceeds %d", maxSeqElems)
+			}
+			if n == 0 {
+				return &List{}, nil
+			}
+			out := make([]any, n)
+			for i := range out {
+				out[i] = lit
+			}
+			return &List{out}, nil
+		}
+	}
+
+	if mode == regexLeftFree && !isEmpty {
+		const batchSize = 4096
+		var out []any
+		pos := 0
+		prevMatchEnd := -1
+		for pos <= len(s) {
+			batch := re.FindAllStringSubmatchIndex(s[pos:], batchSize)
+			if len(batch) == 0 {
+				break
+			}
+			startPos := pos
+			for i, m := range batch {
+				m0, m1 := m[0]+startPos, m[1]+startPos
+				if i == 0 && m1 == startPos && m0 == prevMatchEnd {
+					continue
+				}
+				if len(out) >= maxSeqElems {
+					return nil, fmt.Errorf("regex_findall: match count exceeds %d", maxSeqElems)
+				}
+				switch {
+				case len(m) > 4:
+					grps := make([]any, 0, len(m)/2-1)
+					for k := 2; k < len(m); k += 2 {
+						if m[k] >= 0 {
+							grps = append(grps, s[m[k]+startPos:m[k+1]+startPos])
+						} else {
+							grps = append(grps, "")
+						}
+					}
+					out = append(out, &List{grps})
+				case len(m) == 4:
+					if m[2] >= 0 {
+						out = append(out, s[m[2]+startPos:m[3]+startPos])
+					} else {
+						out = append(out, "")
+					}
+				default:
+					out = append(out, s[m0:m1])
+				}
+			}
+			if len(batch) < batchSize {
+				break
+			}
+			lastM := batch[len(batch)-1]
+			prevMatchEnd = lastM[1] + startPos
+			if lastM[0] == lastM[1] {
+				if prevMatchEnd == len(s) {
+					pos = len(s) + 1
+				} else {
+					_, w := utf8.DecodeRuneInString(s[prevMatchEnd:])
+					if w <= 0 {
+						w = 1
+					}
+					pos = prevMatchEnd + w
+				}
+			} else {
+				pos = prevMatchEnd
+			}
+		}
+		if len(out) == 0 {
+			return &List{}, nil
+		}
+		return &List{out}, nil
+	}
+
+	// Capture groups present with left anchor: count matches with FindAllString first
+	// so inputs exceeding maxSeqElems fail without allocating 1,000,001 []string slices.
+	strs := re.FindAllString(s, maxSeqElems+1)
+	if len(strs) > maxSeqElems {
+		return nil, fmt.Errorf("regex_findall: match count exceeds %d", maxSeqElems)
+	}
+	if len(strs) == 0 {
+		return &List{}, nil
+	}
+	matches := re.FindAllStringSubmatch(s, len(strs))
+	out := make([]any, 0, len(matches))
+	for _, m := range matches {
+		switch {
+		case len(m) > 2:
+			// Multiple capture groups — python findall yields a
+			// tuple of ALL groups per match, not just group 1.
+			grps := make([]any, 0, len(m)-1)
+			for _, g := range m[1:] {
+				grps = append(grps, g)
+			}
+			out = append(out, &List{grps})
+		case len(m) == 2:
+			out = append(out, m[1])
+		default:
+			out = append(out, m[0])
+		}
+	}
+	return &List{out}, nil
 }

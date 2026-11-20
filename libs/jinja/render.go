@@ -3,15 +3,15 @@ package jinja
 import (
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 )
 
 type scope struct {
 	vars   map[string]any
+	parent *scope
 	env    *Env
-	lookup func(name string) any // external var resolver (checked first)
+	lookup func(name string) any // external var resolver (checked after local scope chain)
 }
 
 // builtinLookup/builtinRange are the two name-bound builtins
@@ -77,15 +77,20 @@ var builtinRange = builtinFunc(func(args []any, kw map[string]any, _ *scope) (an
 })
 
 func (s *scope) get(name string) any {
-	if s.lookup != nil {
-		if v := s.lookup(name); v != nil {
-			if _, u := v.(Undefined); !u {
+	var root *scope
+	for cur := s; cur != nil; cur = cur.parent {
+		if v, ok := cur.vars[name]; ok {
+			return v
+		}
+		root = cur
+	}
+	if root != nil && root.lookup != nil {
+		v := root.lookup(name)
+		if _, u := v.(Undefined); !u {
+			if v != nil || (name != "lookup" && name != "ansible.builtin.lookup" && name != "range") {
 				return v
 			}
 		}
-	}
-	if v, ok := s.vars[name]; ok {
-		return v
 	}
 	switch name {
 	case "lookup", "ansible.builtin.lookup":
@@ -132,6 +137,9 @@ func (n setNode) render(s *scope, _ *strings.Builder) error {
 	v, err := n.e.eval(s)
 	if err != nil {
 		return err
+	}
+	if s.vars == nil {
+		s.vars = make(map[string]any)
 	}
 	s.vars[n.name] = v
 	return nil
@@ -189,21 +197,19 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 		return errors.New("for: cannot unpack mapping keys — use .items() or dict2items")
 	}
 	// Jinja scopes a for body: the loop var(s) and any {% set %}
-	// inside do NOT leak past {% endfor %}. Run the loop on a copy
-	// of the bindings — shared *List/*OMap values still mutate
+	// inside do NOT leak past {% endfor %}. Run the loop in a child
+	// scope linked via parent — shared *List/*OMap values still mutate
 	// through (append-in-loop keeps working), only rebindings are
-	// block-local.
-	saved := s.vars
-	defer func() { s.vars = saved }()
-	// maps.Clone is the same shallow copy the manual loop made;
-	// the nil guard keeps a nil vars map non-nil (Clone(nil) is
-	// nil and setNode would panic writing it).
-	inner := maps.Clone(saved)
-	if inner == nil {
-		inner = make(map[string]any)
-	}
-	s.vars = inner
+	// block-local, without cloning the outer map.
 	items := ToIter(v)
+	if len(items) == 0 {
+		return nil
+	}
+	inner := &scope{
+		vars:   make(map[string]any, len(n.names)+2),
+		parent: s,
+		env:    s.env,
+	}
 	// Apply the `if` filters first: the loop var is bound for each
 	// candidate and every condition must be Truthy for the item to
 	// iterate — loop.index/count then track the FILTERED sequence
@@ -220,12 +226,12 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 		kept = slices.Clone(items)
 	} else {
 		for _, it := range items {
-			if err := n.bind(s, it); err != nil {
+			if err := n.bind(inner, it); err != nil {
 				return err
 			}
 			ok := true
 			for _, ce := range n.conds {
-				cv, err := ce.eval(s)
+				cv, err := ce.eval(inner)
 				if err != nil {
 					return err
 				}
@@ -238,19 +244,22 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 				kept = append(kept, it)
 			}
 		}
+		if len(kept) == 0 {
+			return nil
+		}
 	}
 	ln := len(kept)
 	// One loop OMap is allocated per for-render and its seven keys
 	// re-Set (overwrite-in-place, insertion order preserved) per
 	// iteration — a fresh OMap per iteration allocated identical
-	// content every round. The s.vars["loop"] assignment must STAY
+	// content every round. The inner.vars["loop"] assignment must STAY
 	// inside the loop: a {% set loop = x %} inside the body writes
 	// this map slot, and the next iteration must re-install the
 	// shared loop OMap. NewOMapCap(7): the seven loop.* keys are
 	// known up front — no grow-realloc on first Set.
 	loop := NewOMapCap(7)
 	for i, it := range kept {
-		if err := n.bind(s, it); err != nil {
+		if err := n.bind(inner, it); err != nil {
 			return err
 		}
 		loop.Set("index", int64(i+1))
@@ -260,8 +269,8 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 		loop.Set("first", i == 0)
 		loop.Set("last", i == ln-1)
 		loop.Set("length", int64(ln))
-		s.vars["loop"] = loop
-		if err := renderNodes(n.body, s, b); err != nil {
+		inner.vars["loop"] = loop
+		if err := renderNodes(n.body, inner, b); err != nil {
 			return err
 		}
 	}

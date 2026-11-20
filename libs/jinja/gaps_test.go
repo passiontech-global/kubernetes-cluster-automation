@@ -29,26 +29,28 @@ func TestUndefinedValue(t *testing.T) {
 	}
 }
 
-// RenderScoped resolves names through the lookup BEFORE the scope
-// vars; a lookup hit shadows a {% set %}, and a nil/Undefined miss
-// falls through to the vars the template set itself.
+// RenderScoped gives local scope ({% set %}, {% for %}, loop)
+// precedence over lookup, preserves a nil return from lookup as None
+// (YAML null), and falls through to builtins only on Undefined.
 func TestRenderScopedLookupResolver(t *testing.T) {
 	lookup := func(name string) any {
 		switch name {
 		case "a":
 			return "A"
 		case "b":
-			return NewUndefined("b") // miss → scope var
+			return "EXT_B"
+		case "nilval":
+			return nil
 		}
-		return nil // miss → scope var
+		return NewUndefined(name) // miss → scope var / builtin
 	}
-	tpl := `{% set b = 9 %}{% set c = 8 %}{{ a }}{{ b }}{{ c }}`
+	tpl := `{% set b = 9 %}{% set c = 8 %}{{ a }}{{ b }}{{ c }}|{% for i in [1] %}{{ b }}{% endfor %}|{{ nilval is none }}:{{ nilval is undefined }}:{{ nilval }}`
 	got, err := RenderScoped(tpl, nil, lookup)
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if got != "A98" {
-		t.Fatalf("RenderScoped = %q want %q", got, "A98")
+	if want := "A98|9|True:False:None"; got != want {
+		t.Fatalf("RenderScoped = %q want %q", got, want)
 	}
 }
 
@@ -56,10 +58,10 @@ func TestRenderScopedLookupResolver(t *testing.T) {
 // render instead of emitting partial output — and so does an eval
 // failure (lookup() with no env hook fails loud).
 func TestRenderScopedParseError(t *testing.T) {
-	if _, err := RenderScoped("{{ oops", nil, func(string) any { return nil }); err == nil {
+	if _, err := RenderScoped("{{ oops", nil, func(name string) any { return NewUndefined(name) }); err == nil {
 		t.Fatalf("unparseable template must error")
 	}
-	_, err := RenderScoped("{{ lookup('file', 'x') }}", nil, func(string) any { return nil })
+	_, err := RenderScoped("{{ lookup('file', 'x') }}", nil, func(name string) any { return NewUndefined(name) })
 	if err == nil || !strings.Contains(err.Error(), "no file lookup configured") {
 		t.Fatalf("eval failure must error, got %v", err)
 	}
@@ -178,30 +180,26 @@ func TestIfStatementRender(t *testing.T) {
 	}
 }
 
-// fromJSON re-boxes decoded JSON for the evaluator: maps become
-// insertion-ordered *OMap with SORTED keys (Go map order), lists
-// become *List, integral floats collapse to int64 — non-integral
-// floats, strings and bools pass through.
+// decodeJSON decodes JSON directly into jinja values: maps become
+// insertion-ordered *OMap preserving document key order, lists become
+// *List, integers decode as int64 (or uint64 past MaxInt64), floats
+// stay float64, strings/bools/nil pass through.
 func TestFromJSONReboxing(t *testing.T) {
-	mustJSON := func(v any) any {
+	mustJSON := func(raw string) any {
 		t.Helper()
-		out, err := fromJSONChecked(v)
+		out, err := decodeJSON(raw)
 		if err != nil {
-			t.Fatalf("fromJSONChecked: %v", err)
+			t.Fatalf("decodeJSON(%q): %v", raw, err)
 		}
 		return out
 	}
-	out := mustJSON(map[string]any{
-		"zeta":  2.0,
-		"alpha": []any{1.5, "s", true},
-		"mid":   map[string]any{"k": nil},
-	})
+	out := mustJSON(`{"zeta":2,"alpha":[1.5,"s",true],"mid":{"k":null},"flt":2.0}`)
 	m, ok := out.(*OMap)
 	if !ok {
-		t.Fatalf("fromJSONChecked(map) = %T want *OMap", out)
+		t.Fatalf("decodeJSON(object) = %T want *OMap", out)
 	}
-	if got := strings.Join(m.Keys(), ","); got != "alpha,mid,zeta" {
-		t.Fatalf("keys = %q want alpha,mid,zeta", got)
+	if got := strings.Join(m.Keys(), ","); got != "zeta,alpha,mid,flt" {
+		t.Fatalf("keys = %q want zeta,alpha,mid,flt", got)
 	}
 	lst, ok := m.Get("alpha")
 	if !ok {
@@ -225,15 +223,18 @@ func TestFromJSONReboxing(t *testing.T) {
 	if zeta, _ := m.Get("zeta"); zeta != int64(2) {
 		t.Fatalf("zeta = %#v want int64(2)", zeta)
 	}
+	if flt, _ := m.Get("flt"); flt != float64(2.0) {
+		t.Fatalf("flt = %#v want float64(2.0)", flt)
+	}
 
-	if got := mustJSON(3.5); got != 3.5 {
-		t.Fatalf("fromJSONChecked(3.5) = %v want 3.5", got)
+	if got := mustJSON(`3.5`); got != 3.5 {
+		t.Fatalf("decodeJSON(3.5) = %v want 3.5", got)
 	}
-	if got := mustJSON("x"); got != "x" {
-		t.Fatalf("fromJSON scalar = %v want x", got)
+	if got := mustJSON(`"x"`); got != "x" {
+		t.Fatalf("decodeJSON(\"x\") = %v want x", got)
 	}
-	if got := mustJSON(nil); got != nil {
-		t.Fatalf("fromJSONChecked(nil) = %v want nil", got)
+	if got := mustJSON(`null`); got != nil {
+		t.Fatalf("decodeJSON(null) = %v want nil", got)
 	}
 }
 

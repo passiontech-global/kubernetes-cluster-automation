@@ -2,7 +2,7 @@
 // Go integer type, numMag/magCmp give integer-typed pairs an exact
 // compare that never degrades through float64 (past 2^53, and
 // uint64 > MaxInt64), numNeg/addInt64/subInt64/mulInt64/
-// exactUint64Sum/numAsFloat feed binOp's arithmetic, and
+// exactIntAdd/exactIntSub/numAsFloat feed binOp's arithmetic, and
 // numEq/numCmp/minMaxLess are the equality/ordering core the
 // filters and tests share. The coercions (ToInt/toFloat) stay in
 // value.go — this file is exact-number machinery only.
@@ -110,30 +110,14 @@ func magCmp(aneg bool, amag uint64, bneg bool, bmag uint64) int {
 }
 
 func numNeg(v any) (any, error) {
-	switch t := v.(type) {
-	case int64:
-		// -MinInt64 wraps to itself in int64 — promote to float64
-		// (exact: 2^63 is a power of two) like python's bignum.
-		if t == math.MinInt64 {
-			return -float64(t), nil
-		}
-		return -t, nil
-	case float64:
-		return -t, nil
+	if f, ok := v.(float64); ok {
+		return -f, nil
 	}
-	if i, ok := asInt64(v); ok {
-		if i == math.MinInt64 {
-			return -float64(i), nil
+	if neg, mag, ok := numMag(v); ok {
+		if res, ok := magToInt(!neg, mag); ok {
+			return res, nil
 		}
-		return -i, nil
-	}
-	if u, ok := asUint64(v); ok {
-		// -u for u past MaxInt64 has no int64 form — the float64
-		// negation is the best representable answer.
-		if u > math.MaxInt64 {
-			return -float64(u), nil
-		}
-		return -int64(u), nil
+		return -float64(mag), nil
 	}
 	return nil, fmt.Errorf("cannot negate %v", v)
 }
@@ -181,12 +165,6 @@ func mulInt64(a, b int64) (int64, bool) {
 	return p, true
 }
 
-// intFit reports whether v has an exact int64 form.
-func intFit(v any) bool {
-	_, ok := asInt64(v)
-	return ok
-}
-
 // magToInt renders a sign-magnitude result (neg, mag) in the
 // engine's numeric types: int64 whenever it fits — either sign —
 // uint64 for a non-negative value past MaxInt64, and ok=false when
@@ -210,23 +188,17 @@ func magToInt(neg bool, mag uint64) (any, bool) {
 		return nil, false
 	}
 	if mag == uint64(math.MaxInt64)+1 {
-		return math.MinInt64, true
+		return int64(math.MinInt64), true
 	}
 	return -int64(mag), true
 }
 
-// exactIntSub computes l - r for integer-typed operands (per
-// numMag) whose int64 fast path overflowed or never applied — a
-// uint64 past MaxInt64 has no int64 form, and the DIFFERENCE of two
-// such operands can be negative even though both are unsigned
-// ((MaxInt64+3) - (MaxInt64+5) is -2). The old exactUint64Sum
-// rejected negative results outright, so float64 math answered 0.0
-// for operands that round to the same float. ok=false means the
-// true result fits neither int64 nor uint64 — the caller falls
-// back to float64.
-func exactIntSub(lneg bool, lm uint64, rneg bool, rm uint64) (any, bool) {
-	// l - r == l + (-r): flip r's sign, then combine magnitudes.
-	rneg = !rneg
+// exactIntAdd computes l + r for integer-typed operands (per numMag)
+// whose int64 fast path overflowed or never applied — an int64 sum past
+// MaxInt64 promotes to uint64, and mixed uint64 + (-int64) normalizes
+// back to int64 when in range. ok=false means the true result fits
+// neither int64 nor uint64 — the caller falls back to float64.
+func exactIntAdd(lneg bool, lm uint64, rneg bool, rm uint64) (any, bool) {
 	var neg bool
 	var mag uint64
 	switch {
@@ -244,6 +216,13 @@ func exactIntSub(lneg bool, lm uint64, rneg bool, rm uint64) (any, bool) {
 		mag, neg = rm-lm, rneg
 	}
 	return magToInt(neg, mag)
+}
+
+// exactIntSub computes l - r for integer-typed operands (per
+// numMag) whose int64 fast path overflowed or never applied.
+func exactIntSub(lneg bool, lm uint64, rneg bool, rm uint64) (any, bool) {
+	// l - r == l + (-r): flip r's sign, then combine magnitudes.
+	return exactIntAdd(lneg, lm, !rneg, rm)
 }
 
 // exactFloorDivMod computes python's // (floor toward -inf) and %
@@ -275,29 +254,6 @@ func exactFloorDivMod(op string, lneg bool, lm uint64,
 		q++
 	}
 	return magToInt(qneg, q)
-}
-
-// exactUint64Sum computes a + (bneg ? -b : b) exactly for
-// integer-typed operands (per numMag) when the result is
-// non-negative and fits uint64 — the continuation binOp uses when
-// the int64 fast paths report overflow (e.g. a uint64 past MaxInt64
-// plus one). ok=false falls back to float64 math.
-func exactUint64Sum(aneg bool, am uint64, bneg bool, bm uint64) (uint64, bool) {
-	if aneg == bneg {
-		if aneg {
-			return 0, false // negative result has no uint64 form
-		}
-		s := am + bm
-		if s < am {
-			return 0, false // unsigned overflow
-		}
-		return s, true
-	}
-	// Signs differ: subtract the smaller magnitude from the larger.
-	if am >= bm {
-		return am - bm, true
-	}
-	return 0, false // negative result
 }
 
 // magFloatCmp orders an exact integer magnitude (neg, mag) against
@@ -364,6 +320,9 @@ func numAsFloat(v any) (float64, bool) {
 //     nothing, not even itself (IEEE-754) — the Stringify
 //     fallback must not resurrect NaN == NaN as "NaN" == "NaN".
 func numEq(l, r any) bool {
+	if IsNilOrUndef(l) || IsNilOrUndef(r) {
+		return IsNilOrUndef(l) && IsNilOrUndef(r)
+	}
 	lb, lIsBool := l.(bool)
 	rb, rIsBool := r.(bool)
 	switch {

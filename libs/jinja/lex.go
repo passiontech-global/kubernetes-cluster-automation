@@ -80,7 +80,10 @@ func lex(src string) ([]tok, error) {
 							sb.WriteByte('\r')
 						case 't':
 							sb.WriteByte('\t')
+						case '\\', '\'', '"':
+							sb.WriteByte(src[k+1])
 						default:
+							sb.WriteByte('\\')
 							sb.WriteByte(src[k+1])
 						}
 						k += 2

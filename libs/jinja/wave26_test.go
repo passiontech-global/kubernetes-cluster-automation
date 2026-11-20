@@ -168,14 +168,15 @@ func TestTypedNilContainers(t *testing.T) {
 	}
 }
 
-// int64 arithmetic that would wrap must promote to float64 (python
-// bignum parity) — a silent wrap flips the sign.
+// int64 arithmetic that would wrap must promote to exact uint64 when
+// representable (and float64 past [-2^63, 2^64-1]) — a silent wrap
+// flips the sign.
 func TestInt64OverflowPromotes(t *testing.T) {
 	out, err := renderBounded(t, `{{ 9223372036854775807 + 1 }}`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "9.223372036854776e+18"; out != want {
+	if want := "9223372036854775808"; out != want {
 		t.Fatalf("max+1 = %q, want %q", out, want)
 	}
 
@@ -184,11 +185,9 @@ func TestInt64OverflowPromotes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// All three are -2^63, +2^63 (float), +2^63 (float) — none may
-	// wrap back to a wrong value or panic on MinInt64/-1. -2^63 is
-	// exactly representable so it renders through the int64 fast
-	// path; +2^63 overflows int64 and renders as float.
-	if want := "-9223372036854775808|9.223372036854776e+18|9.223372036854776e+18"; out != want {
+	// x - 1 is -(2^63 + 1), which falls back to float64 (-9223372036854775808);
+	// -x and x * -1 are exact +2^63 (uint64 9223372036854775808).
+	if want := "-9223372036854775808|9223372036854775808|9223372036854775808"; out != want {
 		t.Fatalf("min-int64 ops = %q, want %q", out, want)
 	}
 }

@@ -73,14 +73,13 @@ func binOp(op string, l, r any) (any, error) {
 						return s, nil
 					}
 				}
-				// An operand genuinely past int64 (uint64 > MaxInt64)
-				// has no int64 fast path — while the exact sum fits
-				// uint64 it must not degrade to float64 rounding.
-				if isNum(l) && isNum(r) && !isFloatNum(l) && !isFloatNum(r) &&
-					(!intFit(l) || !intFit(r)) {
+				// When the int64 fast path overflows or an operand is past
+				// int64 (uint64 > MaxInt64), keep exact integer precision
+				// while the result fits int64 or uint64.
+				if isNum(l) && isNum(r) && !isFloatNum(l) && !isFloatNum(r) {
 					if lneg, lm, lok := numMag(l); lok {
 						if rneg, rm, rok := numMag(r); rok {
-							if s, ok := exactUint64Sum(lneg, lm, rneg, rm); ok {
+							if s, ok := exactIntAdd(lneg, lm, rneg, rm); ok {
 								return s, nil
 							}
 						}
@@ -156,13 +155,10 @@ func binOp(op string, l, r any) (any, error) {
 				return m, nil
 			}
 		}
-		// An operand genuinely past int64 (uint64 > MaxInt64) has no
-		// int64 fast path — while the exact result fits int64 or
-		// uint64 it must not degrade to float64 rounding (which
-		// collapses distinct uint64s to the same float and answers
-		// 0 for their difference/remainder).
-		if isNum(l) && isNum(r) && !isFloatNum(l) && !isFloatNum(r) &&
-			(!intFit(l) || !intFit(r)) {
+		// When the int64 fast path overflows or an operand is past
+		// int64 (uint64 > MaxInt64), keep exact integer precision
+		// while the true result fits int64 or uint64.
+		if isNum(l) && isNum(r) && !isFloatNum(l) && !isFloatNum(r) {
 			if lneg, lm, lok := numMag(l); lok {
 				if rneg, rm, rok := numMag(r); rok {
 					switch op {
@@ -263,6 +259,11 @@ func binOp(op string, l, r any) (any, error) {
 	case "in":
 		switch rt := r.(type) {
 		case string:
+			// Undefined stringifies to "", which must never match as a
+			// substring in strings (matching undef == "" being false).
+			if _, isUndef := l.(Undefined); isUndef {
+				return false, nil
+			}
 			return strings.Contains(rt, Stringify(l)), nil
 		case *List:
 			var rv []any
@@ -285,6 +286,10 @@ func binOp(op string, l, r any) (any, error) {
 			}
 			return false, nil
 		case *OMap:
+			// Undefined must never match an empty-string map key "".
+			if _, isUndef := l.(Undefined); isUndef {
+				return false, nil
+			}
 			_, ok := rt.Get(Stringify(l))
 			return ok, nil
 		}
@@ -293,6 +298,9 @@ func binOp(op string, l, r any) (any, error) {
 		// already treats all three mapping shapes equivalently.
 		// mapLookup keeps the hit case O(1): asMapping's sorted-key
 		// view bought nothing for a single membership probe.
+		if _, isUndef := l.(Undefined); isUndef {
+			return false, nil
+		}
 		if _, found := mapLookup(r, Stringify(l)); found {
 			return true, nil
 		}

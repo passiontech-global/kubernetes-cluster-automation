@@ -260,8 +260,19 @@ func isYAMLMergeKey(kn *yaml3.Node) bool {
 // YAML spec). Keys already explicit in the enclosing mapping — or
 // already merged from an earlier source — are skipped.
 func yamlMergeInto(m *OMap, n *yaml3.Node, explicit map[string]bool, depth int, steps *int) error {
+	if stepBudgetExhausted(steps) {
+		return fmt.Errorf("yaml: decode exceeds %d node steps (billion-laughs alias expansion?)", walkMaxSteps)
+	}
+	if depth > yamlMaxDepth {
+		return fmt.Errorf("yaml: nesting exceeds %d levels (anchor cycle?)", yamlMaxDepth)
+	}
+	if n == nil {
+		return errors.New("yaml: merge source is nil")
+	}
 	switch n.Kind {
-	case yaml3.AliasNode, yaml3.MappingNode:
+	case yaml3.AliasNode:
+		return yamlMergeInto(m, n.Alias, explicit, depth+1, steps)
+	case yaml3.MappingNode:
 		v, err := yamlNodeAt(n, depth+1, steps)
 		if err != nil {
 			return err
