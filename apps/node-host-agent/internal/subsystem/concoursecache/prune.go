@@ -6,6 +6,7 @@ package concoursecache
 import (
 	"cmp"
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,13 +15,103 @@ import (
 	"time"
 )
 
-// pruneGoBuild is the go-build bucket: in a single WalkDir pass, files
-// older than GoBuildMaxAge are deleted while surviving entries accumulate
-// block disk usage (including directories) and size-trim candidates; then
-// if total usage exceeds GoBuildHighMark, oldest files are trimmed until
-// <= GoBuildLowMark.
+// goBuildIndexLen is the exact record size of a Go build-cache index
+// ("-a") entry — cmd/go/internal/cache writes
+// "v1 <64-hex actionID> <64-hex outputID> <20-wide size> <20-wide mtime>\n"
+// (entrySize = 175). Anything else is a miss to the go command too.
+const goBuildIndexLen = 175
+
+// pruneGoBuild bounds every Go build cache under shared-cache: the
+// shared "go-build" bucket plus per-job siblings ("go-build-<tag>" —
+// ci-tool points phase-isolated GOCACHEs at siblings like
+// "go-build-lint-<job>", same layout, same hazards, previously never
+// pruned). Each dir gets the same age+size-cap pass.
 func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *slog.Logger) {
-	dir := filepath.Join(sc, "go-build")
+	entries, err := os.ReadDir(sc)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if cerr := ctx.Err(); cerr != nil {
+			return
+		}
+		name := e.Name()
+		if name != "go-build" && !strings.HasPrefix(name, "go-build-") {
+			continue
+		}
+		// DirEntry.IsDir is type-bit only — a "go-build*" symlink to a
+		// dir is not a dir here, same as the old isDir(Lstat) guard.
+		if !e.IsDir() {
+			continue
+		}
+		p.pruneGoBuildDir(ctx, filepath.Join(sc, name), name, cfg, log)
+	}
+}
+
+// goBuildEntryKind classifies a cache file by suffix: "-a" action
+// index entries and "-d" output files are the only records whose
+// deletion can corrupt a live lookup; everything else (trim.txt,
+// README, strays) prunes like an ordinary file.
+func goBuildEntryKind(name string) byte {
+	if strings.HasSuffix(name, "-a") {
+		return 'a'
+	}
+	if strings.HasSuffix(name, "-d") {
+		return 'd'
+	}
+	return 0
+}
+
+// goBuildReferencedOutput parses a "-a" index record and returns the
+// "-d" output path it references inside dir. ok=false for anything
+// that is not a well-formed index entry — Go's own get() treats those
+// as misses, so they protect nothing.
+func goBuildReferencedOutput(dir, indexPath string) (string, bool) {
+	f, err := os.Open(indexPath)
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = f.Close() }()
+	rec := make([]byte, goBuildIndexLen)
+	if _, err := io.ReadFull(f, rec); err != nil {
+		return "", false
+	}
+	// A record longer than entrySize is "too long" — a miss in Go too.
+	var extra [1]byte
+	if n, _ := f.Read(extra[:]); n > 0 {
+		return "", false
+	}
+	if rec[0] != 'v' || rec[1] != '1' || rec[2] != ' ' ||
+		rec[67] != ' ' || rec[132] != ' ' || rec[153] != ' ' ||
+		rec[174] != '\n' {
+		return "", false
+	}
+	oid := rec[68:132]
+	for _, c := range oid {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return "", false
+		}
+	}
+	return filepath.Join(dir, string(oid[0:2]), string(oid)+"-d"), true
+}
+
+// pruneGoBuildDir runs one pass over a single Go build cache dir:
+// files older than GoBuildMaxAge are deleted while surviving entries
+// accumulate block disk usage (including directories) and size-trim
+// candidates; then if total usage exceeds GoBuildHighMark, oldest
+// files are trimmed until <= GoBuildLowMark.
+//
+// The cache is LIVE: once an action's "-a" index entry resolves an
+// output ID, Go's contract is that the "-d" file exists until the go
+// command exits — `go vet`, `go list -export` consumers (golangci-lint)
+// and friends open those paths directly. Deleting a "-d" a surviving
+// "-a" still references leaves a dangling index entry and fails builds
+// with "open ...-d: no such file or directory" (golang-monorepo
+// ci-main builds 87/88). So "-d" outputs are pruned only when no index
+// entry seen this pass references them; "-a" indexes and every other
+// file prune exactly as before — a missing index is a plain cache
+// miss Go rebuilds, never a dangling reference.
+func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Config, log *slog.Logger) {
 	if !isDir(dir) {
 		return
 	}
@@ -30,6 +121,8 @@ func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *s
 	var ageErr error
 	var sz uint64
 	var candidates []cacheFile
+	var dataFiles []cacheFile // "-d" outputs — deferred until index refs are known
+	var indexFiles []string   // "-a" indexes that survived the age prune
 
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
@@ -48,35 +141,90 @@ func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *s
 		}
 		blocks := entryBlocks(info)
 		if !d.IsDir() && d.Type().IsRegular() {
-			if now.Sub(info.ModTime()) > cfg.GoBuildMaxAge {
-				if rerr := os.Remove(path); rerr == nil {
-					ageDeleted++
-					ageFreed += int64(blocks)
-					return nil
-				} else {
-					ageFailed++
-					ageErr = rerr
+			cf := cacheFile{path: path, size: int64(blocks), modTime: info.ModTime()}
+			switch goBuildEntryKind(d.Name()) {
+			case 'a':
+				// Index entries prune like any other file — but only
+				// survivors may shield their "-d" outputs this pass.
+				if now.Sub(info.ModTime()) > cfg.GoBuildMaxAge {
+					if rerr := os.Remove(path); rerr == nil {
+						ageDeleted++
+						ageFreed += int64(blocks)
+						return nil
+					} else {
+						ageFailed++
+						ageErr = rerr
+					}
 				}
+				indexFiles = append(indexFiles, path)
+				candidates = append(candidates, cf)
+			case 'd':
+				// Defer: protection depends on surviving index
+				// entries, known only after the walk + parse.
+				dataFiles = append(dataFiles, cf)
+			default:
+				if now.Sub(info.ModTime()) > cfg.GoBuildMaxAge {
+					if rerr := os.Remove(path); rerr == nil {
+						ageDeleted++
+						ageFreed += int64(blocks)
+						return nil
+					} else {
+						ageFailed++
+						ageErr = rerr
+					}
+				}
+				candidates = append(candidates, cf)
 			}
-			candidates = append(candidates, cacheFile{
-				path:    path,
-				size:    int64(blocks),
-				modTime: info.ModTime(),
-			})
 		}
 		sz += blocks
 		return nil
 	})
 
+	// Parse surviving index entries -> the set of "-d" outputs still
+	// referenced. Only "-a" files that survived the inline age prune
+	// protect: a doomed index is already gone, so its outputs are
+	// orphans this same pass.
+	protected := make(map[string]struct{}, len(indexFiles))
+	for _, ip := range indexFiles {
+		if cerr := ctx.Err(); cerr != nil {
+			return
+		}
+		if dpath, ok := goBuildReferencedOutput(dir, ip); ok {
+			protected[dpath] = struct{}{}
+		}
+	}
+
+	var protectedBytes int64
+	for _, df := range dataFiles {
+		if cerr := ctx.Err(); cerr != nil {
+			return
+		}
+		if _, ok := protected[df.path]; ok {
+			protectedBytes += df.size
+			continue
+		}
+		if now.Sub(df.modTime) > cfg.GoBuildMaxAge {
+			if rerr := os.Remove(df.path); rerr == nil {
+				ageDeleted++
+				ageFreed += df.size
+			} else {
+				ageFailed++
+				ageErr = rerr
+			}
+			continue
+		}
+		candidates = append(candidates, df)
+	}
+
 	if ageDeleted > 0 {
-		p.filesDeleted.WithLabelValues("go-build").Add(float64(ageDeleted))
+		p.filesDeleted.WithLabelValues(bucket).Add(float64(ageDeleted))
 		p.bytesFreed.Add(float64(ageFreed))
-		log.Info("age prune", "bucket", "go-build",
+		log.Info("age prune", "bucket", bucket,
 			"files", ageDeleted, "freedGiB", float64(ageFreed)/(1<<30))
 	}
 	if ageFailed > 0 {
 		log.Warn("age prune removals failed",
-			"bucket", "go-build", "files", ageFailed, "error", ageErr)
+			"bucket", bucket, "files", ageFailed, "error", ageErr)
 	}
 	if ctx.Err() != nil || int64(sz) <= cfg.GoBuildHighMark {
 		return
@@ -99,7 +247,7 @@ func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *s
 		acc += f.size
 		if err := os.Remove(f.path); err == nil {
 			freed += f.size
-			p.filesDeleted.WithLabelValues("go-build").Inc()
+			p.filesDeleted.WithLabelValues(bucket).Inc()
 			p.bytesFreed.Add(float64(f.size))
 		} else {
 			failed++
@@ -110,9 +258,14 @@ func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *s
 		log.Warn("go-build trim removals failed",
 			"files", failed, "error", lastErr)
 	}
+	if acc < need && protectedBytes > 0 {
+		log.Warn("go-build size cap unsatisfiable — outputs still referenced by live index entries",
+			"bucket", bucket, "protectedGiB", float64(protectedBytes)/(1<<30))
+	}
 	// freed is the successful-remove total — logging it avoids a
 	// second full-tree du just for the "after" number.
 	log.Info("go-build trimmed",
+		"bucket", bucket,
 		"beforeGiB", float64(sz)/(1<<30),
 		"freedGiB", float64(freed)/(1<<30))
 }

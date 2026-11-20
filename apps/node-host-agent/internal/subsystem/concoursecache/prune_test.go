@@ -6,8 +6,10 @@ package concoursecache
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -358,4 +360,156 @@ func TestPruneGoBuildSingleWalkEquivalence(t *testing.T) {
 	})
 	p2.pruneGoBuild(ctx, sc2, p2.cfg, logger())
 	ccPresent(t, keepExpired)
+}
+
+// ---------------------------------------------------------------------------
+// go-build reference-aware pruning — a "-d" output a surviving "-a" index
+// entry still references must never be deleted (dangling index entries
+// fail in-flight go/vet/golangci-lint builds with "-d: no such file").
+// ---------------------------------------------------------------------------
+
+// ccGoIndexPair writes a well-formed Go build-cache index+output pair:
+// <dir>/<aid[0:2]>/<aid>-a holding the fixed-width v1 record that
+// references oid, plus the <oid>-d output file — both aged by age.
+// aid/oid must be 64 lowercase-hex chars (strings.Repeat("a",64) etc.).
+func ccGoIndexPair(t *testing.T, dir, aid, oid string, age time.Duration) (string, string) {
+	t.Helper()
+	indexPath := filepath.Join(dir, aid[:2], aid+"-a")
+	outputPath := filepath.Join(dir, oid[:2], oid+"-d")
+	rec := fmt.Sprintf("v1 %s %s %20d %20d\n", aid, oid, 0, time.Now().UnixNano())
+	if len(rec) != goBuildIndexLen {
+		t.Fatalf("index record len %d, want %d", len(rec), goBuildIndexLen)
+	}
+	for _, p := range []string{indexPath, outputPath} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(indexPath, []byte(rec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-age)
+	for _, p := range []string{indexPath, outputPath} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return indexPath, outputPath
+}
+
+// The size cap sorts candidates oldest-first — a referenced "-d" that
+// is the OLDEST file in the cache must still survive while every
+// unprotected file is trimmed away.
+func TestGoBuildCapPreservesReferencedOutput(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("gbp"))
+	dir := filepath.Join(sc, "go-build")
+	aid := strings.Repeat("a", 64)
+	oid := strings.Repeat("b", 64)
+	indexPath, outputPath := ccGoIndexPair(t, dir, aid, oid, time.Hour)
+
+	// Make the protected output the oldest file in the cache — the
+	// cap would kill it first without reference awareness.
+	old := time.Now().Add(-50 * time.Hour)
+	if err := os.Chtimes(outputPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	stray1 := ccFile(t, filepath.Join(dir, "11", strings.Repeat("1", 64)+"-d"), 100, 30*time.Hour)
+	stray2 := ccFile(t, filepath.Join(dir, "22", strings.Repeat("2", 64)+"-a"), 100, 20*time.Hour)
+	plain := ccFile(t, filepath.Join(dir, "plain"), 100, 10*time.Hour)
+
+	p := ccPruner(t, func(c *Config) {
+		c.GoBuildHighMark = 1 // always over
+		// LowMark must stay >0 (applyDefaults treats <=0 as unset):
+		// need = sz-1 exceeds every candidate's footprint, so the trim
+		// walks the whole candidate list.
+		c.GoBuildLowMark = 1
+	})
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+
+	ccPresent(t, outputPath) // referenced by the surviving "-a" — survives
+	ccMissing(t, stray1)     // unreferenced "-d" — cap fodder
+	ccMissing(t, stray2)     // "-a" — cap fodder (a missing index is a miss)
+	ccMissing(t, plain)
+	// indexPath itself is cap fodder too — deleting an index is a
+	// plain cache miss; only its "-d" was protected this pass.
+	ccMissing(t, indexPath)
+}
+
+// Age prune: a fresh "-a" shields an over-age "-d" for this pass; once
+// the index is gone the orphaned output is pruned normally.
+func TestGoBuildAgeProtectsThenOrphansOutput(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("gba"))
+	dir := filepath.Join(sc, "go-build")
+	aid := strings.Repeat("c", 64)
+	oid := strings.Repeat("d", 64)
+	indexPath, outputPath := ccGoIndexPair(t, dir, aid, oid, time.Hour)
+	// Age ONLY the output past the 72h limit — the index stays fresh.
+	old := time.Now().Add(-80 * time.Hour)
+	if err := os.Chtimes(outputPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	p := ccPruner(t, nil)
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+	ccPresent(t, indexPath)
+	ccPresent(t, outputPath) // protected despite >72h mtime
+
+	// Remove the index — next pass the output is an orphan and its
+	// stale mtime makes it age-prune fodder.
+	if err := os.Remove(indexPath); err != nil {
+		t.Fatal(err)
+	}
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+	ccMissing(t, outputPath)
+}
+
+// An unreferenced "-d" (no index points at it) prunes by the ordinary
+// age rule — the deferred path must not make outputs immortal.
+func TestGoBuildOrphanOutputAgePruned(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("gbo"))
+	dir := filepath.Join(sc, "go-build")
+	old := ccFile(t, filepath.Join(dir, "aa", strings.Repeat("e", 64)+"-d"), 4, 80*time.Hour)
+	fresh := ccFile(t, filepath.Join(dir, "bb", strings.Repeat("f", 64)+"-d"), 4, time.Hour)
+
+	p := ccPruner(t, nil)
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+	ccMissing(t, old)
+	ccPresent(t, fresh)
+}
+
+// A corrupt "-a" record protects nothing — Go treats it as a miss,
+// so its would-be output is just another unreferenced file.
+func TestGoBuildCorruptIndexProtectsNothing(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("gbc"))
+	dir := filepath.Join(sc, "go-build")
+	badIndex := ccFile(t, filepath.Join(dir, "aa", strings.Repeat("0", 64)+"-a"), 100, time.Hour)
+	orphan := ccFile(t, filepath.Join(dir, "bb", strings.Repeat("1", 64)+"-d"), 4, 80*time.Hour)
+
+	p := ccPruner(t, nil)
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+	ccPresent(t, badIndex) // fresh index survives the age rule
+	ccMissing(t, orphan)   // unreferenced output still age-pruned
+}
+
+// Sibling caches ("go-build-<tag>", e.g. ci-tool's per-phase isolated
+// GOCACHEs) get the same pass; unrelated dirs are untouched.
+func TestGoBuildSiblingCachesPruned(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("gbs"))
+	sharedOld := ccFile(t, filepath.Join(sc, "go-build", "old"), 4, 80*time.Hour)
+	siblingOld := ccFile(t, filepath.Join(sc, "go-build-lint-ci-main", "old"), 4, 80*time.Hour)
+	otherOld := ccFile(t, filepath.Join(sc, "other-cache", "old"), 4, 80*time.Hour)
+
+	p := ccPruner(t, nil)
+	p.pruneGoBuild(context.Background(), sc, p.cfg, logger())
+	ccMissing(t, sharedOld)
+	ccMissing(t, siblingOld)
+	ccPresent(t, otherOld)
 }

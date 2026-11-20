@@ -13,7 +13,11 @@
 // the prune had inside the janitor run).
 //
 // The bucket rules are the script's 1:1 — same ages, same size caps,
-// same dir-first ordering (see pruneSharedCache). Safety notes kept
+// same dir-first ordering (see pruneSharedCache) — with one deliberate
+// deviation: go-build (and its "go-build-*" sibling caches) never
+// deletes a "-d" output a surviving "-a" index entry still references,
+// because file-level deletion of a live Go build cache leaves dangling
+// index entries that fail in-flight builds. Safety notes kept
 // from the script:
 //   - The ownership/perm invariant is enforced on shared-cache + ONE
 //     level only. Files deeper in the tree are always created by uid
