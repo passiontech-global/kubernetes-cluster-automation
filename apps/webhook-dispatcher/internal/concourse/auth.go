@@ -25,6 +25,7 @@ package concourse
 import (
 	"context"
 	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,6 +57,10 @@ const tokenDefaultTTL = time.Hour
 // multi-day token claim from a misbehaving endpoint.
 const tokenMaxTTL = 24 * time.Hour
 
+// basicRecoveryBackoff bounds how often an API 401 in authModeBasic
+// resets the client to authModeAuto to probe token endpoints again.
+const basicRecoveryBackoff = time.Minute
+
 // authMode selects how authorize() credentials a request.
 type authMode int
 
@@ -73,24 +78,34 @@ const (
 // constructing Client literals) work unchanged and invalidateToken's
 // compare-and-clear never contends with the index mutex.
 type atcAuth struct {
-	client  *http.Client // token-endpoint transport (same as API calls)
-	baseURL string       // trimmed BaseURL — token paths are root-relative
-	user    string
-	pass    string
+	client      *http.Client // token-endpoint transport (same as API calls)
+	baseURL     string       // trimmed BaseURL — token paths are root-relative
+	safeBaseURL string       // userinfo-stripped URL for logs
+	user        string
+	pass        string
 	// form is the OAuth2 password-grant body, url-encoded ONCE at
 	// build time — mint used to re-encode the same five fields on
 	// every token request (and every /sky/token fallback retry).
 	form string
+	now  func() time.Time // nil -> time.Now
 
-	mu    sync.Mutex
-	mode  authMode
-	token string
+	mu           sync.Mutex
+	mode         authMode
+	token        string
+	basicRetryAt time.Time
 	// refreshAt is expiresAt minus the effective refresh margin —
 	// the fast path treats the token as stale once now passes it.
 	refreshAt time.Time
 	// flight is the in-flight token mint — done closes when it
 	// settles; waiters read the result fields after <-done.
 	flight *tokenFlight
+}
+
+func (a *atcAuth) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 
 type tokenFlight struct {
@@ -109,10 +124,12 @@ type tokenFlight struct {
 func (c *Client) ensureAuth() *atcAuth {
 	c.authOnce.Do(func() {
 		c.authPtr.Store(&atcAuth{
-			client:  c.httpClient(),
-			baseURL: strings.TrimSuffix(c.BaseURL, "/"),
-			user:    c.User,
-			pass:    c.Password,
+			client:      c.httpClient(),
+			baseURL:     strings.TrimSuffix(c.BaseURL, "/"),
+			safeBaseURL: strings.TrimSuffix(c.safeBaseURL(), "/"),
+			user:        c.User,
+			pass:        c.Password,
+			now:         c.now,
 			form: url.Values{
 				"grant_type": {"password"},
 				"username":   {c.User},
@@ -155,6 +172,35 @@ func (c *Client) invalidateToken(badToken string) {
 	a.mu.Unlock()
 }
 
+// recoverBasicOn401 resets authModeBasic -> authModeAuto when the ATC
+// API returns 401 in basic-auth mode (e.g., an upgraded web node that
+// now requires OIDC bearer tokens), rate-limited by basicRecoveryBackoff.
+func (c *Client) recoverBasicOn401() bool {
+	a := c.authPtr.Load()
+	if a == nil {
+		return false
+	}
+	return a.recoverBasicOn401()
+}
+
+func (a *atcAuth) recoverBasicOn401() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.mode != authModeBasic {
+		// Another worker already transitioned Basic -> Auto/Bearer.
+		return true
+	}
+	now := a.clock()
+	if !a.basicRetryAt.IsZero() && now.Before(a.basicRetryAt) {
+		return false
+	}
+	a.mode = authModeAuto
+	a.basicRetryAt = now.Add(basicRecoveryBackoff)
+	logger().Warn("concourse API returned 401 in basic-auth mode — resetting to auto to probe token endpoints",
+		"concourse_url", a.safeBaseURL)
+	return true
+}
+
 func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, error) {
 	a.mu.Lock()
 	if a.mode == authModeBasic {
@@ -164,7 +210,7 @@ func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, err
 	}
 	// Fast path: cached token still fresh (refreshAt already folds
 	// in the min(margin, ttl/2) cap computed at store time).
-	if a.token != "" && time.Now().Before(a.refreshAt) {
+	if a.token != "" && a.clock().Before(a.refreshAt) {
 		tok := a.token
 		a.mu.Unlock()
 		req.Header.Set("Authorization", "Bearer "+tok)
@@ -190,24 +236,35 @@ func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, err
 			if a.flight == f {
 				a.flight = nil
 			}
-			f.token, f.expires, f.basic, f.err = token, expires, basic, err
 			if err == nil {
 				if basic {
-					a.mode = authModeBasic
+					if a.mode == authModeBearer {
+						// Bearer succeeded earlier; 404/405 on both token
+						// endpoints during an ATC rollout is transient —
+						// never downgrade to Basic.
+						basic = false
+						err = errors.New("concourse token endpoints unavailable (404/405) in bearer mode")
+						logger().Warn("token endpoints returned 404/405 in bearer mode — keeping bearer auth",
+							"concourse_url", a.safeBaseURL)
+					} else {
+						a.mode = authModeBasic
+					}
 				} else {
 					a.mode = authModeBearer
 					a.token = token
+					a.basicRetryAt = time.Time{}
 					// Refresh margin: early enough to absorb clock
 					// skew + flight time, but never wider than half
 					// the TTL — a 90s token with a 60s margin would
 					// be stale before it was ever used.
 					margin := tokenRefreshMargin
-					if half := time.Until(expires) / 2; half < margin {
+					if half := expires.Sub(a.clock()) / 2; half < margin {
 						margin = half
 					}
 					a.refreshAt = expires.Add(-margin)
 				}
 			}
+			f.token, f.expires, f.basic, f.err = token, expires, basic, err
 			close(f.done)
 		}()
 	}
@@ -289,7 +346,7 @@ func (a *atcAuth) mint(ctx context.Context) (string, time.Time, bool, error) {
 		default:
 			ttl = time.Duration(tr.ExpiresIn) * time.Second
 		}
-		return tr.AccessToken, time.Now().Add(ttl), false, nil
+		return tr.AccessToken, a.clock().Add(ttl), false, nil
 	}
 	// Both token endpoints are absent — this web node predates OIDC
 	// tokens; latch basic auth permanently.

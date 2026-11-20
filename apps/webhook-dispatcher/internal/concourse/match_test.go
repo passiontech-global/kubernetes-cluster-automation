@@ -6,6 +6,7 @@ package concourse
 
 import (
 	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -85,6 +86,14 @@ func TestNormalizeRepo(t *testing.T) {
 		{"github.com/org/repo", "org/repo"},
 		{"ssh://github.com:owner/repo", "owner/repo"},
 		{"GIT@GitHub.COM:Owner/Repo.Git", "owner/repo"},
+		// Query, fragment, and path-embedded "://" authority smuggling
+		// must never collapse to "org/repo".
+		{"https://evil.com?x=@github.com/org/repo", "https://evil.com?x=@github.com/org/repo"},
+		{"https://evil.com#x=@github.com/org/repo", "https://evil.com#x=@github.com/org/repo"},
+		{"evil.com?x=@github.com:org/repo", "evil.com?x=@github.com:org/repo"},
+		{"https://evil.com/http://github.com/org/repo", "https://evil.com/http://github.com/org/repo"},
+		{"https://evil.com?next=https://github.com/org/repo", "https://evil.com?next=https://github.com/org/repo"},
+		{"https://evil.com#https://github.com/org/repo", "https://evil.com#https://github.com/org/repo"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
@@ -119,6 +128,65 @@ func TestSourceRepo(t *testing.T) {
 	}
 	if s.URI != "git@github.com:org/repo.git" || s.Repository != "org/repo" {
 		t.Fatalf("decoded=%+v want the uri/repository strings", s)
+	}
+
+	// Non-string uri/repository values (object, array, number, bool, null)
+	// and null source must decode cleanly without failing with SemanticError.
+	for _, tc := range []struct {
+		name string
+		json string
+		want source
+	}{
+		{"object_uri_string_repo", `{"uri":{"url":"x"},"repository":"org/repo"}`, source{Repository: "org/repo"}},
+		{"array_uri_bool_repo", `{"uri":["a"],"repository":true}`, source{}},
+		{"number_uri_null_repo", `{"uri":123,"repository":null}`, source{}},
+		{"bool_uri_object_repo", `{"uri":false,"repository":{"owner":"org"}}`, source{}},
+		{"null_uri_string_repo", `{"uri":null,"repository":"org/pr"}`, source{Repository: "org/pr"}},
+		{"null_source", `null`, source{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got source
+			if err := json.Unmarshal([]byte(tc.json), &got); err != nil {
+				t.Fatalf("Unmarshal(%s): %v", tc.json, err)
+			}
+			if got != tc.want {
+				t.Fatalf("got=%+v want %+v", got, tc.want)
+			}
+		})
+	}
+
+	// Non-object JSON value returns *json.SemanticError.
+	var badType source
+	var semErr *json.SemanticError
+	if err := json.Unmarshal([]byte(`[]`), &badType); !errors.As(err, &semErr) {
+		t.Fatalf("Unmarshal([]) err=%v want *json.SemanticError", err)
+	}
+	// Truncated/invalid JSON surfaces syntactic/IO error rather than SemanticError.
+	if err := json.Unmarshal([]byte(`{"uri":`), &badType); err == nil {
+		t.Fatal("Unmarshal truncated JSON want error")
+	} else if errors.As(err, &semErr) {
+		t.Fatalf("Unmarshal truncated JSON returned SemanticError %v, want syntactic/EOF error", err)
+	}
+}
+
+func TestFetchIndexToleratesNonStringSourceFields(t *testing.T) {
+	stub := newATCStub(t, map[string]string{
+		"/api/v1/teams/main/pipelines": `[{"name":"p1"}]`,
+		"/api/v1/teams/main/pipelines/p1/resources": `[
+			{"name":"custom-obj-uri","type":"custom","source":{"uri":{"nested":1},"repository":"org/repo"}},
+			{"name":"custom-num-repo","type":"custom","source":{"repository":42}},
+			{"name":"null-source","type":"time","source":null},
+			{"name":"real-git","type":"git","source":{"uri":"https://github.com/org/repo"}}
+		]`,
+	})
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", User: "u", Password: "p"}
+
+	index, err := c.Resources(t.Context())
+	if err != nil {
+		t.Fatalf("Resources failed on non-string source fields: %v", err)
+	}
+	if len(index) != 2 {
+		t.Fatalf("index=%+v want 2 resources", index)
 	}
 }
 
@@ -166,13 +234,13 @@ func TestSourceDecodeToleratesUnknownFields(t *testing.T) {
 // linearScan is the reference implementation the O(1) lookup is
 // checked against — the per-delivery scan Match replaced.
 func linearScan(resources []Resource, wantType string,
-	repos map[string]struct{}) []Resource {
+	repos []string) []Resource {
 	var out []Resource
 	for _, r := range resources {
 		if r.Type != wantType {
 			continue
 		}
-		if _, ok := repos[r.Repo]; !ok {
+		if !slices.Contains(repos, r.Repo) {
 			continue
 		}
 		out = append(out, r)
@@ -212,9 +280,7 @@ func TestMatchMatchesLinearScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repos := map[string]struct{}{
-		"org/repo": {}, "org/other": {}, "org/none": {},
-	}
+	repos := []string{"org/repo", "org/other", "org/none"}
 	for _, wantType := range []string{"git", "github-pr", "time", "docker"} {
 		got := c.Match(wantType, repos)
 		if want := linearScan(index, wantType, repos); !sameResources(got, want) {
@@ -225,11 +291,32 @@ func TestMatchMatchesLinearScan(t *testing.T) {
 			t.Fatalf("Match(%s) order unstable: %+v vs %+v", wantType, again, got)
 		}
 	}
+	// Unsorted + duplicate repos (stack path <=8 and heap fallback >8)
+	// must deduplicate without mutating the caller's slice.
+	unsorted := []string{"org/other", "org/repo", "org/other"}
+	origUnsorted := slices.Clone(unsorted)
+	got := c.Match("git", unsorted)
+	if !slices.Equal(unsorted, origUnsorted) {
+		t.Fatalf("caller slice mutated: got %v want %v", unsorted, origUnsorted)
+	}
+	if want := linearScan(index, "git", []string{"org/other", "org/repo"}); !sameResources(got, want) {
+		t.Fatalf("Match unsorted+dup=%+v want %+v", got, want)
+	}
+	many := []string{"org/z", "org/other", "org/a", "org/b", "org/c", "org/d", "org/e", "org/f", "org/repo", "org/other"}
+	origMany := slices.Clone(many)
+	gotMany := c.Match("git", many)
+	if !slices.Equal(many, origMany) {
+		t.Fatalf("caller >8 slice mutated: got %v want %v", many, origMany)
+	}
+	if want := linearScan(index, "git", []string{"org/other", "org/repo"}); !sameResources(gotMany, want) {
+		t.Fatalf("Match >8 unsorted+dup=%+v want %+v", gotMany, want)
+	}
+
 	// Edge cases: no repos and unknown repos match nothing.
 	if got := c.Match("git", nil); len(got) != 0 {
 		t.Fatalf("Match(git, nil)=%+v want empty", got)
 	}
-	if got := c.Match("git", map[string]struct{}{"org/absent": {}}); len(got) != 0 {
+	if got := c.Match("git", []string{"org/absent"}); len(got) != 0 {
 		t.Fatalf("Match(git, absent)=%+v want empty", got)
 	}
 }
@@ -258,12 +345,12 @@ func TestReturnedIndexAndMatchesAreCopies(t *testing.T) {
 		}
 	}
 
-	matched := c.Match("git", map[string]struct{}{"org/repo": {}})
+	matched := c.Match("git", []string{"org/repo"})
 	if len(matched) == 0 {
 		t.Fatal("Match returned nothing — index build broken")
 	}
 	matched[0].Repo = "mutated/caller"
-	if again := c.Match("git", map[string]struct{}{"org/repo": {}}); slices.ContainsFunc(again,
+	if again := c.Match("git", []string{"org/repo"}); slices.ContainsFunc(again,
 		func(r Resource) bool { return r.Repo == "mutated/caller" }) {
 		t.Fatal("caller mutation reached the lookup map")
 	}
@@ -366,10 +453,13 @@ func benchmarkClient(index []Resource) *Client {
 // set exercises the sorted-visit path.
 func BenchmarkMatch(b *testing.B) {
 	c := benchmarkClient(benchmarkIndex())
-	single := map[string]struct{}{"org03/repo-07": {}}
-	fanout := make(map[string]struct{}, 16)
+	single := []string{"org03/repo-07"}
+	fanout := make([]string, 0, 16)
 	for i := range 16 {
-		fanout[fmt.Sprintf("org%02d/repo-%02d", i%8, i%12)] = struct{}{}
+		r := fmt.Sprintf("org%02d/repo-%02d", i%8, i%12)
+		if !slices.Contains(fanout, r) {
+			fanout = append(fanout, r)
+		}
 	}
 	b.Run("one_repo", func(b *testing.B) {
 		b.ReportAllocs()

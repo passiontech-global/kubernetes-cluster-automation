@@ -1146,7 +1146,7 @@ func TestEnsureIndexAndRefreshIndex(t *testing.T) {
 	if err := c.EnsureIndex(t.Context()); err != nil {
 		t.Fatalf("EnsureIndex: %v", err)
 	}
-	if matches := c.Match("git", map[string]struct{}{"org/repo": {}}); len(matches) == 0 {
+	if matches := c.Match("git", []string{"org/repo"}); len(matches) == 0 {
 		t.Fatal("expected Match to find org/repo after EnsureIndex")
 	}
 

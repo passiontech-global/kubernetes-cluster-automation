@@ -199,9 +199,9 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 				if index == nil && f.err != nil {
 					return nil, f.err
 				}
-				c.mu.Lock()
+				c.mu.RLock()
 				index = c.index
-				c.mu.Unlock()
+				c.mu.RUnlock()
 				if index != nil {
 					return serveIndex(index, clone), nil
 				}
@@ -267,9 +267,9 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 		// shared error on a cold start).
 		select {
 		case <-flight.done:
-			c.mu.Lock()
+			c.mu.RLock()
 			index := c.index
-			c.mu.Unlock()
+			c.mu.RUnlock()
 			if index != nil {
 				return serveIndex(index, clone), nil
 			}
@@ -293,9 +293,9 @@ func (c *Client) resources(ctx context.Context, clone bool) ([]Resource, error) 
 // expired — the deadline-fallback half of every wait site. A cold
 // start (nothing published yet) reports ctx.Err() instead.
 func (c *Client) staleOrErr(ctx context.Context, clone bool) ([]Resource, error) {
-	c.mu.Lock()
+	c.mu.RLock()
 	index := c.index
-	c.mu.Unlock()
+	c.mu.RUnlock()
 	if index != nil {
 		return serveIndex(index, clone), nil
 	}
@@ -464,9 +464,9 @@ func (c *Client) refresh(ctx context.Context, clone bool) ([]Resource, error) {
 		}
 		// Our fetch published a fresh index — serve it directly
 		// rather than re-deciding through the throttle.
-		c.mu.Lock()
+		c.mu.RLock()
 		index := c.index
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		if index != nil {
 			return serveIndex(index, clone), nil
 		}

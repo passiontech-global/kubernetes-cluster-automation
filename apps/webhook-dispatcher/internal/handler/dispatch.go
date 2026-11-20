@@ -7,6 +7,7 @@ package handler
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,13 +74,14 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request,
 	// The event's repo identities — resources reference the same repo
 	// via ssh or https indifferently, so every URL form the payload
 	// carries is a match candidate.
-	repos := map[string]struct{}{}
-	for _, u := range []string{
+	var repoBuf [4]string
+	repos := repoBuf[:0]
+	for _, u := range [4]string{
 		p.Repository.FullName, p.Repository.SSHURL,
 		p.Repository.CloneURL, p.Repository.HTMLURL,
 	} {
-		if n := concourse.NormalizeRepo(u); n != "" {
-			repos[n] = struct{}{}
+		if n := concourse.NormalizeRepo(u); n != "" && !slices.Contains(repos, n) {
+			repos = append(repos, n)
 		}
 	}
 
@@ -237,9 +239,15 @@ func (h *Handler) dispatch(resources []concourse.Resource,
 // "checked" resources without a second channel.
 func (h *Handler) checkOne(ctx context.Context, res concourse.Resource,
 	delivery string) int64 {
-	select {
-	case h.sem <- struct{}{}:
-	case <-ctx.Done():
+	acquired := false
+	if ctx.Err() == nil {
+		select {
+		case h.sem <- struct{}{}:
+			acquired = true
+		case <-ctx.Done():
+		}
+	}
+	if !acquired {
 		// Budget spent queued — skip the POST and let the target go.
 		fanoutTotal.WithLabelValues("budget").Inc()
 		logger().Warn("check webhook skipped: fan-out budget expired while queued",

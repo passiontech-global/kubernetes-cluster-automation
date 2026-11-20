@@ -17,10 +17,9 @@
 package handler
 
 import (
-	"bytes"
 	"context"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
-	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -71,18 +70,40 @@ const (
 // bodyPool recycles the request-body buffers of the four handled
 // event types — each delivery can hold up to maxBodyBytes, and
 // webhook volume is far higher than GC would reclaim them at. Buffers
-// are Reset before Put so a pooled slab never leaks stale body bytes
-// into the next delivery. New preallocates 16 KiB — the typical
-// delivery size — so steady-state traffic stops growing pooled
-// buffers; on Put, buffers over 64 KiB are dropped to GC instead of
-// being recycled, so one huge delivery cannot pin an 8 MiB-class
-// slab in the pool for the process lifetime.
+// are sliced to [:0] before Put so a pooled slab never leaks stale
+// body bytes into the next delivery. New preallocates 16 KiB — the
+// typical delivery size — so steady-state traffic stops growing
+// pooled buffers; on Put, buffers over 64 KiB are dropped to GC
+// instead of being recycled, so one huge delivery cannot pin an
+// 8 MiB-class slab in the pool for the process lifetime.
 var bodyPool = sync.Pool{
 	New: func() any {
-		b := new(bytes.Buffer)
-		b.Grow(16 << 10)
-		return b
+		b := make([]byte, 0, 16<<10)
+		return &b
 	},
+}
+
+// cappedBodyWriter appends read chunks into buf without doubling
+// capacity past max (maxBodyBytes), preventing 8 MiB -> 16 MiB buffer
+// amplification.
+type cappedBodyWriter struct {
+	buf []byte
+	max int
+}
+
+func (w *cappedBodyWriter) Write(p []byte) (int, error) {
+	need := len(w.buf) + len(p)
+	if need > cap(w.buf) {
+		newCap := max(cap(w.buf)*2, need)
+		if w.max > 0 && newCap > w.max {
+			newCap = max(w.max, need)
+		}
+		grown := make([]byte, len(w.buf), newCap)
+		copy(grown, w.buf)
+		w.buf = grown
+	}
+	w.buf = append(w.buf, p...)
+	return len(p), nil
 }
 
 // maxPooledBodyCap is the largest buffer bodyPool recycles: a delivery
@@ -107,7 +128,7 @@ type Backend interface {
 	// answers from the (type, repo) map built once per fetch publish;
 	// fakes answer from their own slice — the lookup must be
 	// equivalent either way.
-	Match(wantType string, repos map[string]struct{}) []concourse.Resource
+	Match(wantType string, repos []string) []concourse.Resource
 	CheckWebhook(ctx context.Context, r concourse.Resource) (int, error)
 }
 
@@ -187,6 +208,10 @@ type Handler struct {
 	// wg.Add past Wait's observation of an empty WaitGroup.
 	drainMu  sync.Mutex
 	draining bool
+	// onBodyPut, when non-nil (test seam), overrides bodyPool.Put in
+	// releaseBuf so tests can deterministically observe buffer returns
+	// under -race (where sync.Pool.Put drops ~25% of pooled items).
+	onBodyPut func(*[]byte)
 }
 
 // New returns a Handler verifying signatures against secret and
@@ -201,14 +226,38 @@ func New(secret string, b Backend) *Handler {
 	}
 }
 
-// admit registers an authenticated request for the shutdown drain
-// and takes an in-flight slot — MUST run before the body read so a
-// slow-loris flood can't pile up unbounded goroutines+buffers, and
-// so Wait covers every request that passed the signature gate (the
-// fan-out's own fanoutStart only fires much later, after the index
-// fetch). ok=false means the caller answers 503; draining reports
-// WHICH refusal (shutdown vs capacity) for the metric label — it is
-// read under drainMu so it can't race Wait's flip.
+// isDraining reports whether Wait has initiated shutdown drain so
+// ServeHTTP can fail fast with 503 before buffering/hashing a body.
+func (h *Handler) isDraining() bool {
+	h.drainMu.Lock()
+	d := h.draining
+	h.drainMu.Unlock()
+	return d
+}
+
+// refuseAdmission answers 503 for either drain or semaphore saturation.
+func (h *Handler) refuseAdmission(w http.ResponseWriter, r *http.Request,
+	delivery, eventMetric string, draining bool) {
+	status := "overloaded"
+	if draining {
+		status = "draining"
+	}
+	code := http.StatusServiceUnavailable
+	deliveriesTotal.WithLabelValues(eventMetric, status).Inc()
+	logger().Warn("webhook rejected: admission refused",
+		"remote_addr", r.RemoteAddr,
+		"delivery", delivery, "event", eventMetric,
+		"status", code)
+	http.Error(w, "service unavailable", code)
+}
+
+// admit registers an HMAC-verified request for the shutdown drain
+// and takes an in-flight slot — run AFTER HMAC verification so
+// unauthenticated slow-loris requests cannot hold reqSem slots for
+// ReadTimeout (10s), while drainMu still ensures Wait cannot observe
+// an empty WaitGroup ahead of an in-flight admission. ok=false means
+// the caller answers 503; draining reports WHICH refusal (shutdown vs
+// capacity) for the metric label.
 func (h *Handler) admit() (ok, draining bool) {
 	select {
 	case h.reqSem <- struct{}{}:
@@ -269,26 +318,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Admission gate: bounded concurrency + shutdown drain, taken
-	// BEFORE the body read — the signature format check above is
-	// cheap, but the body buffer (8 MiB cap) and HMAC are not, and
-	// an unbounded flood of well-formed-signature probes would
-	// otherwise stack goroutines without limit.
-	if ok, draining := h.admit(); !ok {
-		status := "overloaded"
-		if draining {
-			status = "draining"
-		}
-		code := http.StatusServiceUnavailable
-		deliveriesTotal.WithLabelValues(eventMetric, status).Inc()
-		logger().Warn("webhook rejected: admission refused",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", eventMetric,
-			"status", code)
-		http.Error(w, "service unavailable", code)
+	// Reject declared-oversized payloads immediately after signature
+	// format validation (preserving 401 for unsigned probes) and before
+	// touching bodyPool, reqSem, or reading r.Body.
+	if r.ContentLength > maxBodyBytes {
+		h.failBodyRead(w, r, delivery, event, eventMetric,
+			&http.MaxBytesError{Limit: maxBodyBytes})
 		return
 	}
-	defer h.release()
+
+	// Fast-reject draining servers before reading/hashing the body.
+	if h.isDraining() {
+		h.refuseAdmission(w, r, delivery, eventMetric, true)
+		return
+	}
 
 	wantType, handledEvent := resourceTypeForEvent[event]
 	if !handledEvent {
@@ -309,6 +352,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.rejectSignature(w, r, delivery, eventMetric)
 			return
 		}
+		if ok, draining := h.admit(); !ok {
+			h.refuseAdmission(w, r, delivery, eventMetric, draining)
+			return
+		}
+		defer h.release()
 		deliveriesTotal.WithLabelValues(eventMetric, "ignored").Inc()
 		logger().Info("webhook delivery ignored: unhandled event",
 			"remote_addr", r.RemoteAddr,
@@ -318,27 +366,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The four handled events DO parse the payload — borrow a
-	// MaxBytesReader-bounded buffer from the pool instead of
-	// io.ReadAll's fresh allocation per delivery.
-	buf := bodyPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer func() {
-		buf.Reset()
-		if buf.Cap() <= maxPooledBodyCap {
-			bodyPool.Put(buf)
+	// MaxBytesReader-bounded buffer from the pool and hash+buffer in
+	// a single streaming pass so 8 MiB bodies never double to 16 MiB
+	// and slow-loris requests only hold 16 KiB until ReadTimeout.
+	bp := bodyPool.Get().(*[]byte)
+	cw := cappedBodyWriter{buf: (*bp)[:0], max: maxBodyBytes}
+	releaseBuf := func() {
+		if bp == nil {
+			return
 		}
-	}()
-	if _, err := io.Copy(buf, http.MaxBytesReader(w, r.Body, maxBodyBytes)); err != nil {
+		if cap(cw.buf) <= maxPooledBodyCap {
+			*bp = cw.buf[:0]
+			if h.onBodyPut != nil {
+				h.onBodyPut(bp)
+			} else {
+				bodyPool.Put(bp)
+			}
+		}
+		cw.buf = nil
+		bp = nil
+	}
+	defer releaseBuf()
+
+	matched, err := verify.SignatureTee(h.secret,
+		http.MaxBytesReader(w, r.Body, maxBodyBytes), &cw, sig)
+	if err != nil {
 		h.failBodyRead(w, r, delivery, event, eventMetric, err)
 		return
 	}
-	if !verify.Signature(h.secret, buf.Bytes(), sig) {
+	if !matched {
 		h.rejectSignature(w, r, delivery, eventMetric)
 		return
 	}
 
+	// Admission gate after HMAC verification so unauthenticated slow
+	// readers cannot exhaust reqSem across ReadTimeout.
+	if ok, draining := h.admit(); !ok {
+		h.refuseAdmission(w, r, delivery, eventMetric, draining)
+		return
+	}
+	defer h.release()
+
 	var p payload
-	if err := json.Unmarshal(buf.Bytes(), &p); err != nil {
+	err = json.Unmarshal(cw.buf, &p,
+		jsontext.AllowInvalidUTF8(true),
+		jsontext.AllowDuplicateNames(true),
+	)
+	// Return the pooled buffer immediately once JSON decode finishes
+	// so it is never held across h.accept()'s 7s index wait.
+	releaseBuf()
+	if err != nil {
 		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
 		logger().Warn("webhook rejected: malformed JSON payload",
 			"remote_addr", r.RemoteAddr,

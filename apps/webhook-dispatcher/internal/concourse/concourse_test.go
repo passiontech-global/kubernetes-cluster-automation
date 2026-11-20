@@ -7,7 +7,9 @@
 package concourse
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -223,31 +225,82 @@ func TestGetJSONDecodes2xxBody(t *testing.T) {
 	}
 }
 
+type closeTrackingBody struct {
+	rc            io.ReadCloser
+	mu            sync.Mutex
+	bytesRead     int
+	sawEOF        bool
+	closed        bool
+	bytesAtClose  int
+	sawEOFAtClose bool
+}
+
+func (b *closeTrackingBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	b.mu.Lock()
+	b.bytesRead += n
+	if errors.Is(err, io.EOF) {
+		b.sawEOF = true
+	}
+	b.mu.Unlock()
+	return n, err
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.mu.Lock()
+	if !b.closed {
+		b.closed = true
+		b.bytesAtClose = b.bytesRead
+		b.sawEOFAtClose = b.sawEOF
+	}
+	b.mu.Unlock()
+	return b.rc.Close()
+}
+
+type drainTrackingTransport struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	req1 *closeTrackingBody
+}
+
+func (t *drainTrackingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	if req.URL.Path == "/x" {
+		t.mu.Lock()
+		if t.req1 == nil {
+			tracked := &closeTrackingBody{rc: resp.Body}
+			t.req1 = tracked
+			resp.Body = tracked
+		}
+		t.mu.Unlock()
+	}
+	return resp, nil
+}
+
 func TestGetJSONDrainsBodyForKeepAliveReuse(t *testing.T) {
-	// A 2xx body the decoder does not consume to EOF must be drained
-	// before the body closes — leftover bytes make http.Transport drop
-	// the keep-alive connection, so every later call re-dials.
-	// The payload is written in two flushes: the JSON value first
-	// (larger than the decoder's initial buffer, so it must refill),
-	// and the trailing newline only after the decode has finished —
-	// bytes that only the post-decode drain can pick up.
-	//
-	// The 50ms hold is pacing, not synchronization: the trailing
-	// newline must land strictly BETWEEN the decode consuming the
-	// value and the drain reading the rest, and the client exposes no
-	// signal at that point — writing it earlier makes the decoder
-	// buffer it (the pin goes vacuous), later and the connection is
-	// dropped before the drain runs.
+	// A 2xx body the decoder aborts early on (trailing bytes past the
+	// first JSON value) must be drained synchronously before Close:
+	// in Go 1.27, http.Transport drains <=256 KiB bodies asynchronously
+	// in maybeDrainBody after Close() (maxPostCloseReadBytes = 256<<10),
+	// which masks missing drains most of the time when only connection
+	// count is checked. Wrapping Request 1's resp.Body proves
+	// concourse.go's bounded post-decode drain consumes the full 32 KiB
+	// tail to EOF BEFORE Close() is invoked, while also verifying both
+	// requests share 1 TCP connection.
+	payload1 := `{"ok":true}{"trailing":"` + strings.Repeat("x", 32<<10) + `"}`
 	var conns atomic.Int64
+	var reqNum atomic.Int64
 	mux := http.NewServeMux()
 	mux.HandleFunc("/x", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"pad":"` + strings.Repeat("p", 700) + `"}`))
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+		if reqNum.Add(1) == 1 {
+			_, _ = w.Write([]byte(payload1))
+			return
 		}
-		time.Sleep(50 * time.Millisecond) // let the decode finish the value
-		_, _ = w.Write([]byte("\n"))      // trailing bytes past the JSON value
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	srv := httptest.NewUnstartedServer(mux)
 	srv.Config.ConnState = func(_ net.Conn, cs http.ConnState) {
@@ -258,20 +311,76 @@ func TestGetJSONDrainsBodyForKeepAliveReuse(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	c := &Client{BaseURL: srv.URL, Team: "main"}
-	for range 3 {
-		var out struct {
-			Pad string `json:"pad"`
-		}
-		if err := c.getJSON(t.Context(), "/x", &out); err != nil {
-			t.Fatal(err)
-		}
-		if len(out.Pad) != 700 {
-			t.Fatalf("decoded pad=%d bytes want 700", len(out.Pad))
-		}
+	baseTR := &http.Transport{}
+	defer baseTR.CloseIdleConnections()
+	rt := &drainTrackingTransport{base: baseTR}
+	c := &Client{
+		BaseURL: srv.URL,
+		Team:    "main",
+		HTTP:    &http.Client{Transport: rt},
+	}
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := c.getJSON(t.Context(), "/x", &out); err == nil {
+		t.Fatal("request 1 with trailing JSON document want decode error")
+	}
+
+	rt.mu.Lock()
+	req1Body := rt.req1
+	rt.mu.Unlock()
+	if req1Body == nil {
+		t.Fatal("request 1 body was not captured by RoundTripper")
+	}
+	req1Body.mu.Lock()
+	closed := req1Body.closed
+	bytesAtClose := req1Body.bytesAtClose
+	sawEOFAtClose := req1Body.sawEOFAtClose
+	req1Body.mu.Unlock()
+	if !closed {
+		t.Fatal("request 1 body was not closed")
+	}
+	if !sawEOFAtClose || bytesAtClose != len(payload1) {
+		t.Fatalf("at Close(): sawEOF=%v bytesRead=%d want sawEOF=true bytesRead=%d (body not synchronously drained before Close)",
+			sawEOFAtClose, bytesAtClose, len(payload1))
+	}
+
+	out.OK = false
+	if err := c.getJSON(t.Context(), "/x", &out); err != nil {
+		t.Fatalf("request 2 failed: %v", err)
+	}
+	if !out.OK {
+		t.Fatal("request 2 decoded OK=false want true")
 	}
 	if got := conns.Load(); got != 1 {
 		t.Fatalf("TCP connections=%d want 1 (keep-alive reuse requires the body drained)", got)
+	}
+}
+
+func TestGetJSONToleratesInvalidUTF8AndDuplicateKeys(t *testing.T) {
+	t.Parallel()
+	body := append([]byte(`[{"name":"p1","name":"p2","extra":"bad`), 0xff)
+	body = append(body, []byte(`","surrogate":"\uD800"}]`)...)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/sky/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL, Team: "main"}
+	var out []struct {
+		Name string `json:"name"`
+	}
+	if err := c.getJSON(t.Context(), "/api/v1/teams/main/pipelines", &out); err != nil {
+		t.Fatalf("getJSON failed on invalid UTF-8 / duplicate keys: %v", err)
+	}
+	if len(out) != 1 || out[0].Name != "p2" {
+		t.Fatalf("decoded=%+v want [{Name:p2}]", out)
 	}
 }
 

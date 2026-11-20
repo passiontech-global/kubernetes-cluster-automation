@@ -7,10 +7,10 @@ package concourse
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -45,23 +45,44 @@ func newLookup(index []Resource) map[indexKey][]Resource {
 // client's snapshot. Repos are visited in sorted order so the result
 // order is deterministic (equal inputs, equal output — helps logs and
 // tests; the fan-out itself is order-insensitive).
-func (c *Client) Match(wantType string, repos map[string]struct{}) []Resource {
+func (c *Client) Match(wantType string, repos []string) []Resource {
+	if len(repos) == 0 {
+		return nil
+	}
+	if len(repos) == 1 {
+		c.mu.RLock()
+		res := slices.Clone(c.lookup[indexKey{wantType, repos[0]}])
+		c.mu.RUnlock()
+		return res
+	}
+	ordered := repos
+	if !isStrictlySorted(repos) {
+		var stackBuf [8]string
+		if len(repos) <= len(stackBuf) {
+			ordered = stackBuf[:len(repos)]
+			copy(ordered, repos)
+		} else {
+			ordered = slices.Clone(repos)
+		}
+		slices.Sort(ordered)
+		ordered = slices.Compact(ordered)
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	// Fast path: the overwhelmingly common delivery carries exactly
-	// one normalized repo — answer it without building the sorted
-	// key slice. The value is still cloned out of the lookup map:
-	// callers must never reach the client's snapshot.
-	if len(repos) == 1 {
-		for repo := range repos {
-			return slices.Clone(c.lookup[indexKey{wantType, repo}])
-		}
-	}
 	var matched []Resource
-	for _, repo := range slices.Sorted(maps.Keys(repos)) {
+	for _, repo := range ordered {
 		matched = append(matched, c.lookup[indexKey{wantType, repo}]...)
 	}
 	return matched
+}
+
+func isStrictlySorted(s []string) bool {
+	for i := 1; i < len(s); i++ {
+		if s[i-1] >= s[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // source is the slice of a resource's source config the index needs:
@@ -74,6 +95,63 @@ func (c *Client) Match(wantType string, repos map[string]struct{}) []Resource {
 type source struct {
 	URI        string `json:"uri"`
 	Repository string `json:"repository"`
+}
+
+// UnmarshalJSONFrom decodes Concourse resource source configs without
+// failing the team index when a custom resource stores a non-string
+// value (object, array, number, bool, null) under "uri" or
+// "repository", or carries arbitrary extra keys.
+func (s *source) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	switch dec.PeekKind() {
+	case jsontext.KindNull:
+		*s = source{}
+		_, err := dec.ReadToken()
+		return err
+	case jsontext.KindBeginObject:
+		if _, err := dec.ReadToken(); err != nil {
+			return err
+		}
+	default:
+		// PeekKind returns KindInvalid on syntactic/IO errors;
+		// ReadToken surfaces that error instead of a SemanticError.
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		return &json.SemanticError{JSONKind: tok.Kind()}
+	}
+	*s = source{}
+	for dec.PeekKind() != jsontext.KindEndObject {
+		key, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		switch key.String() {
+		case "uri":
+			if dec.PeekKind() == jsontext.KindString {
+				val, err := dec.ReadToken()
+				if err != nil {
+					return err
+				}
+				s.URI = val.String()
+				continue
+			}
+		case "repository":
+			if dec.PeekKind() == jsontext.KindString {
+				val, err := dec.ReadToken()
+				if err != nil {
+					return err
+				}
+				s.Repository = val.String()
+				continue
+			}
+		}
+		if err := dec.SkipValue(); err != nil {
+			return err
+		}
+	}
+	_, err := dec.ReadToken()
+	return err
 }
 
 // sourceRepo pulls the repo identity out of a resource's source;
@@ -150,10 +228,10 @@ func NormalizeRepo(s string) string {
 // it has no business matching.
 func hostInAuthority(prefix string) bool {
 	auth := prefix
-	if k := strings.LastIndex(auth, "://"); k >= 0 {
+	if k := strings.Index(auth, "://"); k >= 0 && !strings.ContainsAny(auth[:k], "/?#") {
 		auth = auth[k+3:]
 	}
-	return !strings.ContainsRune(auth, '/')
+	return !strings.ContainsAny(auth, "/?#")
 }
 
 // normalizeRepoRest strips the host's separator (scp colon, or an

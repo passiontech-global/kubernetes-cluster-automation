@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -410,4 +411,325 @@ func TestGetJSONDrains401RetryBodyForKeepAliveReuse(t *testing.T) {
 	if got := conns.Load(); got != 1 {
 		t.Fatalf("TCP connections=%d want 1 (the 401 body must be drained before the retry)", got)
 	}
+}
+
+// TestAuthOIDCDecodeRemainsStrict verifies that auth.go:272 keeps
+// strict encoding/json/v2 defaults (rejecting duplicate keys and
+// invalid UTF-8 in OIDC token responses).
+func TestAuthOIDCDecodeRemainsStrict(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "duplicate_keys",
+			body: []byte(`{"access_token":"tok-1","access_token":"tok-2","expires_in":3600}`),
+		},
+		{
+			name: "invalid_utf8",
+			body: append(append([]byte(`{"access_token":"tok-`), 0xff), []byte(`","expires_in":3600}`)...),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/sky/issuer/token" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write(tc.body)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer srv.Close()
+
+			_, _, _, err := mintAuth(srv).mint(t.Context())
+			if err == nil {
+				t.Fatalf("mint(%s) succeeded, want strict json/v2 decode error", tc.name)
+			}
+		})
+	}
+}
+
+// TestBearerModeTreatsToken404And405AsTransient proves that once a
+// Client has authenticated with Bearer, a transient 404/405 from both
+// token endpoints (e.g. during an ATC rollout) fails that refresh
+// without permanently downgrading to authModeBasic.
+func TestBearerModeTreatsToken404And405AsTransient(t *testing.T) {
+	var logBuf strings.Builder
+	var logMu sync.Mutex
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&syncWriter{mu: &logMu, dst: &logBuf}, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for _, failStatus := range []int{http.StatusNotFound, http.StatusMethodNotAllowed} {
+		t.Run(fmt.Sprintf("status_%d", failStatus), func(t *testing.T) {
+			var tokenStatus atomic.Int32
+			tokenStatus.Store(http.StatusOK)
+			var mintSeq atomic.Int32
+			var basicSeen atomic.Bool
+			var apiPhase atomic.Int32 // 0=ok, 1=401 once
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/sky/issuer/token", "/sky/token":
+					st := int(tokenStatus.Load())
+					if st != http.StatusOK {
+						w.WriteHeader(st)
+						return
+					}
+					n := mintSeq.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"access_token":"tok-%d","expires_in":3600}`, n)
+				case "/api/v1/teams/main/x":
+					if strings.HasPrefix(r.Header.Get("Authorization"), "Basic ") {
+						basicSeen.Store(true)
+					}
+					if apiPhase.CompareAndSwap(1, 0) {
+						w.WriteHeader(http.StatusUnauthorized)
+						return
+					}
+					if r.Header.Get("Authorization") == "" {
+						w.WriteHeader(http.StatusUnauthorized)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"ok":true}`))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			clk := newFakeClock()
+			c := &Client{
+				BaseURL:  srv.URL,
+				Team:     "main",
+				User:     "u",
+				Password: "p",
+				now:      clk.Now,
+			}
+
+			var out struct {
+				OK bool `json:"ok"`
+			}
+			if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err != nil {
+				t.Fatalf("initial bearer getJSON failed: %v", err)
+			}
+			if a := c.authPtr.Load(); a == nil || a.mode != authModeBearer {
+				t.Fatalf("mode=%v want authModeBearer", a.mode)
+			}
+
+			// Simulate token expiry + both /sky/* returning 404/405.
+			tokenStatus.Store(int32(failStatus))
+			clk.Advance(2 * time.Hour)
+			if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err == nil {
+				t.Fatal("expected error when token endpoints 404/405 in bearer mode")
+			}
+			if basicSeen.Load() {
+				t.Fatal("Basic auth was sent after bearer mode downgrade attempt")
+			}
+			if a := c.authPtr.Load(); a.mode != authModeBearer {
+				t.Fatalf("mode downgraded to %v, want authModeBearer preserved", a.mode)
+			}
+
+			// Also verify 401 invalidation -> re-mint hitting 404/405 does not downgrade.
+			tokenStatus.Store(http.StatusOK)
+			if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err != nil {
+				t.Fatalf("recovery bearer getJSON failed: %v", err)
+			}
+			if mintSeq.Load() < 2 {
+				t.Fatalf("mintSeq=%d want >= 2 after recovery", mintSeq.Load())
+			}
+
+			tokenStatus.Store(int32(failStatus))
+			apiPhase.Store(1)
+			if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err == nil {
+				t.Fatal("expected error on 401 re-mint when token endpoints 404/405")
+			}
+			if a := c.authPtr.Load(); a.mode != authModeBearer {
+				t.Fatalf("mode downgraded on 401 remint to %v, want authModeBearer", a.mode)
+			}
+		})
+	}
+
+	logMu.Lock()
+	logs := logBuf.String()
+	logMu.Unlock()
+	if !strings.Contains(logs, "keeping bearer auth") {
+		t.Fatalf("expected Warn log keeping bearer auth, got:\n%s", logs)
+	}
+}
+
+// TestBasicFallbackRecoversToAutoOn401WithBackoff verifies that a Client
+// latched into authModeBasic resets to authModeAuto on an API 401,
+// rate-limited by basicRecoveryBackoff, and recovers to Bearer when
+// token endpoints become available.
+func TestBasicFallbackRecoversToAutoOn401WithBackoff(t *testing.T) {
+	var logBuf strings.Builder
+	var logMu sync.Mutex
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&syncWriter{mu: &logMu, dst: &logBuf}, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	t.Run("recovers_to_bearer_on_first_401", func(t *testing.T) {
+		var skyAvailable atomic.Bool
+		var apiRequiresBearer atomic.Bool
+		var skyHits atomic.Int32
+		var authHeaders []string
+		var mu sync.Mutex
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/sky/issuer/token":
+				skyHits.Add(1)
+				if !skyAvailable.Load() {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"access_token":"recovered-tok","expires_in":3600}`))
+			case "/sky/token":
+				if !skyAvailable.Load() {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			case "/api/v1/teams/main/x":
+				auth := r.Header.Get("Authorization")
+				mu.Lock()
+				authHeaders = append(authHeaders, auth)
+				mu.Unlock()
+				if apiRequiresBearer.Load() && !strings.HasPrefix(auth, "Bearer ") {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+
+		clk := newFakeClock()
+		c := &Client{BaseURL: srv.URL, Team: "main", User: "u", Password: "p", now: clk.Now}
+		var out struct {
+			OK bool `json:"ok"`
+		}
+		// Initial call: /sky/* 404 -> latches Basic and succeeds.
+		if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err != nil {
+			t.Fatalf("initial basic getJSON failed: %v", err)
+		}
+		if a := c.authPtr.Load(); a.mode != authModeBasic {
+			t.Fatalf("mode=%v want authModeBasic", a.mode)
+		}
+
+		// ATC upgrades: /sky/issuer/token now 200 and API rejects Basic with 401.
+		skyAvailable.Store(true)
+		apiRequiresBearer.Store(true)
+		out.OK = false
+		if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err != nil {
+			t.Fatalf("recovery getJSON failed: %v", err)
+		}
+		if !out.OK {
+			t.Fatal("expected OK=true after Basic -> Auto -> Bearer recovery")
+		}
+		if a := c.authPtr.Load(); a.mode != authModeBearer {
+			t.Fatalf("mode=%v want authModeBearer", a.mode)
+		}
+		mu.Lock()
+		lastAuth := authHeaders[len(authHeaders)-1]
+		mu.Unlock()
+		if lastAuth != "Bearer recovered-tok" {
+			t.Fatalf("last Authorization=%q want Bearer recovered-tok", lastAuth)
+		}
+	})
+
+	t.Run("backoff_suppresses_repeat_probes", func(t *testing.T) {
+		var skyAvailable atomic.Bool
+		var skyHits atomic.Int32
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/sky/issuer/token":
+				skyHits.Add(1)
+				if !skyAvailable.Load() {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"access_token":"tok-after-backoff","expires_in":3600}`))
+			case "/sky/token":
+				w.WriteHeader(http.StatusNotFound)
+			case "/api/v1/teams/main/x":
+				if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"ok":true}`))
+					return
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+
+		clk := newFakeClock()
+		c := &Client{BaseURL: srv.URL, Team: "main", User: "u", Password: "p", now: clk.Now}
+		var out struct {
+			OK bool `json:"ok"`
+		}
+		// Call 1: /sky/* 404 -> latches Basic -> API 401 -> recoverBasicOn401()
+		// resets to Auto (stamping basicRetryAt = now+1m) -> retry probes /sky/*
+		// again (still 404 -> re-latches Basic) -> retry API 401 -> fails.
+		if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err == nil {
+			t.Fatal("expected 401 error when /sky/* 404 and API 401")
+		}
+		hitsAfterCall1 := skyHits.Load()
+		if hitsAfterCall1 != 2 {
+			t.Fatalf("skyHits after call 1=%d want 2 (initial + recovery probe)", hitsAfterCall1)
+		}
+
+		// Call 2 inside backoff window: must NOT probe /sky/* again.
+		clk.Advance(basicRecoveryBackoff / 2)
+		if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err == nil {
+			t.Fatal("expected 401 error during backoff")
+		}
+		if got := skyHits.Load(); got != hitsAfterCall1 {
+			t.Fatalf("skyHits inside backoff=%d want %d (backoff must suppress probe)", got, hitsAfterCall1)
+		}
+
+		// Call 3 after backoff expires: /sky/issuer/token now available -> recovers.
+		skyAvailable.Store(true)
+		clk.Advance(basicRecoveryBackoff)
+		if err := c.getJSON(t.Context(), "/api/v1/teams/main/x", &out); err != nil {
+			t.Fatalf("getJSON after backoff failed: %v", err)
+		}
+		if !out.OK {
+			t.Fatal("expected OK=true after backoff recovery")
+		}
+		if got := skyHits.Load(); got != hitsAfterCall1+1 {
+			t.Fatalf("skyHits after backoff=%d want %d", got, hitsAfterCall1+1)
+		}
+	})
+
+	logMu.Lock()
+	logs := logBuf.String()
+	logMu.Unlock()
+	if !strings.Contains(logs, "resetting to auto to probe token endpoints") {
+		t.Fatalf("expected Warn log resetting to auto, got:\n%s", logs)
+	}
+}
+
+type syncWriter struct {
+	mu  *sync.Mutex
+	dst *strings.Builder
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dst.Write(p)
 }

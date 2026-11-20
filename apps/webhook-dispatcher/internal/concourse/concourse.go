@@ -11,6 +11,7 @@ package concourse
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -289,16 +290,23 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 		if err != nil {
 			return stripURLError(err)
 		}
-		if resp.StatusCode == http.StatusUnauthorized && usedToken != "" && attempt == 0 {
-			// Drain (bounded) BEFORE closing so the keep-alive
-			// connection survives into the retry instead of being
-			// dropped by the transport over unconsumed bytes.
-			_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
-			_ = resp.Body.Close()
-			// Invalidate only the token THIS request carried — a
-			// fresher token another worker already minted survives.
-			c.invalidateToken(usedToken)
-			continue
+		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+			if usedToken != "" {
+				// Drain (bounded) BEFORE closing so the keep-alive
+				// connection survives into the retry instead of being
+				// dropped by the transport over unconsumed bytes.
+				_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
+				_ = resp.Body.Close()
+				// Invalidate only the token THIS request carried — a
+				// fresher token another worker already minted survives.
+				c.invalidateToken(usedToken)
+				continue
+			}
+			if c.recoverBasicOn401() {
+				_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
+				_ = resp.Body.Close()
+				continue
+			}
 		}
 		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode/100 != 2 {
@@ -308,7 +316,12 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 		}
 		// Bound the decode: without LimitReader a 2xx body longer than
 		// maxJSONBody (an ATC streaming forever) would be buffered whole.
-		err = json.UnmarshalRead(io.LimitReader(resp.Body, maxJSONBody), out)
+		err = json.UnmarshalRead(
+			io.LimitReader(resp.Body, maxJSONBody),
+			out,
+			jsontext.AllowInvalidUTF8(true),
+			jsontext.AllowDuplicateNames(true),
+		)
 		// Drain whatever the decoder left before the body closes: a decode
 		// that finished before EOF (trailing newline, whitespace, extra
 		// documents) or one that failed at the maxJSONBody cap would

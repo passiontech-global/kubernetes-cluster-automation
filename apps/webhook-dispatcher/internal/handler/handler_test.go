@@ -9,11 +9,14 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,7 +87,7 @@ func (f *fakeBackend) RefreshIndex(_ context.Context) error {
 	return f.refreshErr
 }
 
-func (f *fakeBackend) Match(wantType string, repos map[string]struct{}) []concourse.Resource {
+func (f *fakeBackend) Match(wantType string, repos []string) []concourse.Resource {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return linearMatch(f.cur, wantType, repos)
@@ -168,13 +171,13 @@ func (s *checkStats) calls() int {
 // (type, repo) lookup map; the two must stay equivalent (the O(1)
 // index test in the concourse package pins that directly).
 func linearMatch(resources []concourse.Resource, wantType string,
-	repos map[string]struct{}) []concourse.Resource {
+	repos []string) []concourse.Resource {
 	var out []concourse.Resource
 	for _, r := range resources {
 		if r.Type != wantType {
 			continue
 		}
-		if _, ok := repos[r.Repo]; !ok {
+		if !slices.Contains(repos, r.Repo) {
 			continue
 		}
 		out = append(out, r)
@@ -1089,6 +1092,248 @@ func TestRegisterMetricsAndFailBodyRead(t *testing.T) {
 		h.failBodyRead(rec, req, "del-2", "push", "push", errors.New("unexpected EOF"))
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d want 400", rec.Code)
+		}
+	})
+}
+
+func TestCheckOneExpiredBudgetDeterministic(t *testing.T) {
+	budgetBefore := testutil.ToFloat64(fanoutTotal.WithLabelValues("budget"))
+	errorBefore := testutil.ToFloat64(fanoutTotal.WithLabelValues("error"))
+
+	b := &fakeBackend{status: http.StatusCreated}
+	h := New(testSecret, b)
+	expiredCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res := concourse.Resource{Pipeline: "p1", Name: "r1", Type: "git", Repo: "org/repo"}
+	const iters = 50
+	for range iters {
+		if got := h.checkOne(expiredCtx, res, "del-budget"); got != 0 {
+			t.Fatalf("checkOne returned %d want 0 on expired ctx", got)
+		}
+	}
+	if got := testutil.ToFloat64(fanoutTotal.WithLabelValues("budget")); got != budgetBefore+iters {
+		t.Fatalf("budget metric=%v want %v", got, budgetBefore+iters)
+	}
+	if got := testutil.ToFloat64(fanoutTotal.WithLabelValues("error")); got != errorBefore {
+		t.Fatalf("error metric=%v want %v (must not misclassify expired budget as error)", got, errorBefore)
+	}
+	if calls := len(b.checkList()); calls != 0 {
+		t.Fatalf("CheckWebhook calls=%d want 0", calls)
+	}
+}
+
+func TestWriteSkippedDeterministic(t *testing.T) {
+	for range 20 {
+		rec := httptest.NewRecorder()
+		writeSkipped(rec, "custom")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d want 200", rec.Code)
+		}
+		if got := strings.TrimSpace(rec.Body.String()); got != `{"matched":0,"skipped":"custom"}` {
+			t.Fatalf("body=%q want {\"matched\":0,\"skipped\":\"custom\"}", got)
+		}
+	}
+}
+
+func TestOversizedContentLengthWithValidFormatRejectedBeforeBodyOrAdmission(t *testing.T) {
+	tooLargeBefore := testutil.ToFloat64(deliveriesTotal.WithLabelValues("push", "payload_too_large"))
+	h := New(testSecret, &fakeBackend{})
+	for range maxInflightRequests {
+		h.reqSem <- struct{}{}
+	}
+	defer func() {
+		for range maxInflightRequests {
+			<-h.reqSem
+		}
+	}()
+
+	body := &errReader{}
+	req := httptest.NewRequest(http.MethodPost, "/webhook", body)
+	req.ContentLength = maxBodyBytes + 1
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d want 413 (must reject declared ContentLength before reqSem/body read)", rec.Code)
+	}
+	if body.reads != 0 {
+		t.Fatalf("body reads=%d want 0", body.reads)
+	}
+	if got := testutil.ToFloat64(deliveriesTotal.WithLabelValues("push", "payload_too_large")); got != tooLargeBefore+1 {
+		t.Fatalf("payload_too_large metric=%v want %v", got, tooLargeBefore+1)
+	}
+}
+
+func TestChunkedOversizedBodyReturns413(t *testing.T) {
+	h := New(testSecret, &fakeBackend{})
+	oversized := strings.Repeat("x", maxBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(oversized))
+	req.ContentLength = -1 // chunked / unknown length
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d want 413", rec.Code)
+	}
+}
+
+func TestUnauthenticatedSlowBodyDoesNotExhaustReqSem(t *testing.T) {
+	b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+	h := New(testSecret, b)
+
+	pipes := make([]*io.PipeWriter, maxInflightRequests)
+	codes := make([]int, maxInflightRequests)
+	var slowWG sync.WaitGroup
+	var readingWG sync.WaitGroup
+	readingWG.Add(maxInflightRequests)
+
+	for i := range maxInflightRequests {
+		pr, pw := io.Pipe()
+		pipes[i] = pw
+		req := httptest.NewRequest(http.MethodPost, "/webhook", pr)
+		req.Header.Set("X-GitHub-Event", "push")
+		req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+		slowWG.Go(func() {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		})
+		// Writing 1 byte completes only once ServeHTTP's SignatureTee
+		// starts reading from pr, then the request blocks waiting for EOF.
+		go func() {
+			defer readingWG.Done()
+			_, _ = pw.Write([]byte("{"))
+		}()
+	}
+	readingWG.Wait()
+
+	// All 128 unauthenticated slow requests are mid-read; a genuine
+	// signed delivery must still be admitted and return 202.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("legitimate delivery status=%d want 202 (reqSem exhausted by unauthenticated slow readers)", rec.Code)
+	}
+
+	for _, pw := range pipes {
+		_ = pw.Close()
+	}
+	slowWG.Wait()
+	for i, code := range codes {
+		if code != http.StatusUnauthorized {
+			t.Fatalf("slow probe[%d] status=%d want 401", i, code)
+		}
+	}
+	if dropped := h.Wait(t.Context()); dropped != 0 {
+		t.Fatalf("dropped=%d want 0", dropped)
+	}
+}
+
+func TestCappedBodyWriterNeverDoublesPastMaxBodyBytes(t *testing.T) {
+	cw := cappedBodyWriter{buf: make([]byte, 0, 16<<10), max: maxBodyBytes}
+	chunk1 := make([]byte, 10_000)
+	chunk2 := make([]byte, 32_768)
+	total := 0
+	for i := 0; total < maxBodyBytes; i++ {
+		chunk := chunk2
+		if i%2 == 0 {
+			chunk = chunk1
+		}
+		if rem := maxBodyBytes - total; len(chunk) > rem {
+			chunk = chunk[:rem]
+		}
+		if _, err := cw.Write(chunk); err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+		total += len(chunk)
+		if cap(cw.buf) > maxBodyBytes {
+			t.Fatalf("cap(cw.buf)=%d exceeded maxBodyBytes=%d (amplification bug)", cap(cw.buf), maxBodyBytes)
+		}
+	}
+	if len(cw.buf) != maxBodyBytes {
+		t.Fatalf("len(cw.buf)=%d want %d", len(cw.buf), maxBodyBytes)
+	}
+}
+
+func TestBodyPoolReleasedBeforeAccept(t *testing.T) {
+	var (
+		releasedCount atomic.Int64
+		releasedCap   atomic.Int64
+		releasedLen   atomic.Int64
+		inAcceptCount atomic.Int64
+		inAcceptCap   atomic.Int64
+		inAcceptLen   atomic.Int64
+	)
+	inAcceptLen.Store(-1)
+	b := &fakeBackend{
+		resources: testIndex(),
+		status:    http.StatusCreated,
+		ensureFn: func(context.Context) error {
+			inAcceptCount.Store(releasedCount.Load())
+			inAcceptCap.Store(releasedCap.Load())
+			inAcceptLen.Store(releasedLen.Load())
+			return nil
+		},
+	}
+	h := New(testSecret, b)
+	h.onBodyPut = func(bp *[]byte) {
+		releasedCount.Add(1)
+		releasedLen.Store(int64(len(*bp)))
+		releasedCap.Store(int64(cap(*bp)))
+		bodyPool.Put(bp)
+	}
+	// Build a ~20 KiB valid push payload (>16 KiB initial cap, <=64 KiB maxPooledBodyCap).
+	body := fmt.Sprintf(`{"commits":[{"message":%q}],"repository":{"full_name":"org/repo"}}`,
+		strings.Repeat("a", 20<<10))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signedRequest(t, "push", body))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want 202", rec.Code)
+	}
+	h.Wait(t.Context())
+	if got := inAcceptCount.Load(); got != 1 {
+		t.Fatalf("releasedCount during accept()=%d want 1 (buffer was not returned before accept)", got)
+	}
+	if got := inAcceptCap.Load(); got < 20<<10 {
+		t.Fatalf("releasedCap during accept()=%d want >= %d", got, 20<<10)
+	}
+	if got := inAcceptLen.Load(); got != 0 {
+		t.Fatalf("releasedLen during accept()=%d want 0 (buffer was not reset before Put)", got)
+	}
+}
+
+func TestPayloadAllowsInvalidUTF8AndDuplicateNames(t *testing.T) {
+	t.Run("lone_surrogate_in_unmapped_field", func(t *testing.T) {
+		b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+		h := New(testSecret, b)
+		body := `{"commits":[{"message":"bad \uD83D"}],"repository":{"full_name":"org/repo"}}`
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", body))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status=%d want 202 (lone surrogate in unmapped field must be tolerated)", rec.Code)
+		}
+		h.Wait(t.Context())
+		if got := len(b.checkList()); got != 2 {
+			t.Fatalf("checks=%d want 2", got)
+		}
+	})
+
+	t.Run("duplicate_object_keys_last_wins", func(t *testing.T) {
+		b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+		h := New(testSecret, b)
+		body := `{"action":"closed","action":"opened","repository":{"full_name":"org/repo"}}`
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "pull_request", body))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status=%d want 202 (duplicate keys must tolerate last-wins opened)", rec.Code)
+		}
+		h.Wait(t.Context())
+		if got := len(b.checkList()); got != 1 {
+			t.Fatalf("checks=%d want 1", got)
 		}
 	})
 }

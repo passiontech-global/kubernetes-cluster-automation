@@ -58,7 +58,7 @@ func Signature(secret string, body []byte, header string) bool {
 	return hmac.Equal(sig[:], digest[:])
 }
 
-// SignatureReader is Signature's streaming form: it hashes r
+// SignatureReader delegates to SignatureTee with dst=nil: it hashes r
 // incrementally instead of requiring the whole body in memory, for
 // deliveries whose payload is never parsed (events outside
 // resourceTypeForEvent — acknowledged 202 on a valid signature
@@ -68,6 +68,12 @@ func Signature(secret string, body []byte, header string) bool {
 // buffered path. (matched, err) — matched=false with err=nil means
 // "not a valid signature", same verdict Signature returns.
 func SignatureReader(secret string, r io.Reader, header string) (bool, error) {
+	return SignatureTee(secret, r, nil, header)
+}
+
+// SignatureTee verifies header against r while copying r into dst (if
+// non-nil) in a single pass using hmacBufPool's 32 KiB scratch buffer.
+func SignatureTee(secret string, r io.Reader, dst io.Writer, header string) (bool, error) {
 	if secret == "" {
 		return false, nil
 	}
@@ -76,10 +82,13 @@ func SignatureReader(secret string, r io.Reader, header string) (bool, error) {
 		return false, nil
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
+	var sink io.Writer = mac
+	if dst != nil {
+		sink = io.MultiWriter(dst, mac)
+	}
 	bufp := hmacBufPool.Get().(*[]byte)
-	_, err := io.CopyBuffer(mac, r, *bufp)
-	hmacBufPool.Put(bufp)
-	if err != nil {
+	defer hmacBufPool.Put(bufp)
+	if _, err := io.CopyBuffer(sink, r, *bufp); err != nil {
 		return false, err
 	}
 	var digest [sha256.Size]byte

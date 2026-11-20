@@ -133,3 +133,72 @@ func TestSignatureReaderLargeBodyConcurrent(t *testing.T) {
 		t.Fatal("concurrent large-body verify failed")
 	}
 }
+
+func TestSignatureTee(t *testing.T) {
+	body := `{"zen":"Keep it simple."}`
+	valid := sign("s3cret", []byte(body))
+
+	var dst bytes.Buffer
+	ok, err := SignatureTee("s3cret", strings.NewReader(body), &dst, valid)
+	if err != nil || !ok {
+		t.Fatalf("SignatureTee valid = (%v, %v), want (true, nil)", ok, err)
+	}
+	if dst.String() != body {
+		t.Fatalf("dst=%q want %q", dst.String(), body)
+	}
+
+	dst.Reset()
+	ok, err = SignatureTee("s3cret", strings.NewReader(body), &dst, sign("other", []byte(body)))
+	if err != nil || ok {
+		t.Fatalf("SignatureTee wrong sig = (%v, %v), want (false, nil)", ok, err)
+	}
+
+	// Malformed header must fail without reading r or writing dst.
+	dst.Reset()
+	boom := errors.New("must not read")
+	ok, err = SignatureTee("s3cret", errReader{err: boom}, &dst, "bad-header")
+	if err != nil || ok {
+		t.Fatalf("SignatureTee bad header = (%v, %v), want (false, nil)", ok, err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("dst len=%d want 0 on malformed header", dst.Len())
+	}
+
+	// Read error surfaces.
+	ok, err = SignatureTee("s3cret", errReader{err: boom}, &dst, valid)
+	if !errors.Is(err, boom) || ok {
+		t.Fatalf("SignatureTee errReader = (%v, %v), want (false, %v)", ok, err, boom)
+	}
+
+	// dst == nil behaves identically to SignatureReader.
+	ok, err = SignatureTee("s3cret", strings.NewReader(body), nil, valid)
+	if err != nil || !ok {
+		t.Fatalf("SignatureTee dst=nil = (%v, %v), want (true, nil)", ok, err)
+	}
+}
+
+func TestSignatureTeeLargeBodyConcurrent(t *testing.T) {
+	body := bytes.Repeat([]byte("delivery-tee-payload-"), 8192)
+	sig := sign("s3cret", body)
+	const callers = 16
+	errs := make(chan string, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Go(func() {
+			var dst bytes.Buffer
+			ok, err := SignatureTee("s3cret", bytes.NewReader(body), &dst, sig)
+			if err != nil || !ok {
+				errs <- "verify failed"
+				return
+			}
+			if !bytes.Equal(dst.Bytes(), body) {
+				errs <- "dst mismatch"
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for msg := range errs {
+		t.Fatal(msg)
+	}
+}

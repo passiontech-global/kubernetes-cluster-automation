@@ -119,5 +119,5 @@ func writeSkipped(w http.ResponseWriter, reason string) {
 	_ = json.MarshalWrite(w, map[string]any{
 		"matched": 0,
 		"skipped": reason,
-	})
+	}, json.Deterministic(true))
 }
