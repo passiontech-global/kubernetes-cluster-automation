@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // The eviction cap bounds churn at partitionEvictCap (8) pods per run:
@@ -526,5 +528,243 @@ func TestPartitionEvictorNoEligiblePodSpendsNoBudget(t *testing.T) {
 	if !proceed || unverifiable {
 		t.Fatalf("partition sweep with 0 eligible pods spent a budget token: Gate = (%v,%v)",
 			proceed, unverifiable)
+	}
+}
+
+// PDB 429 refusals on an already-tainted node refund the target breaker grant
+// so repeated refusals never open the circuit; once the PDB frees up, eviction
+// succeeds immediately.
+func TestPartitionEvictorPDBRefusalsDoNotOpenTargetBreaker(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+
+	partitionTaint := corev1.Taint{
+		Key:    partitionTaintKey,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint),
+		pePod("flux-system", "p1", "pod-0"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
+
+	var refuse atomic.Bool
+	refuse.Store(true)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" && refuse.Load() {
+				return true, nil, apierrors.NewTooManyRequests("Too many disruptions", 0)
+			}
+			return false, nil, nil
+		})
+
+	now := time.Now()
+	e := &partitionEvictor{
+		cs:    cs,
+		queue: "partition-pod-evictor",
+		now:   func() time.Time { return now },
+	}
+	for i := range 4 {
+		now = now.Add(time.Minute)
+		if err := e.run(ctx); err != nil {
+			t.Fatalf("sweep %d: %v", i+1, err)
+		}
+		if !testutil.PodExistsStrict(t, cs, "flux-system", "pod-0") {
+			t.Fatalf("pod evicted during 429 refusal on sweep %d", i+1)
+		}
+	}
+
+	// PDB unblocks on sweep 5: circuit must still be closed and evict pod-0.
+	refuse.Store(false)
+	now = now.Add(time.Minute)
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if testutil.PodExistsStrict(t, cs, "flux-system", "pod-0") {
+		t.Fatal("pod not evicted after PDB cleared — 429 refusals opened target breaker")
+	}
+}
+
+// L1 local-remediation holds on an already-tainted node refund the target
+// breaker grant so repeated L1 deferrals do not open the target circuit.
+func TestPartitionEvictorL1HoldDoesNotOpenTargetBreaker(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+
+	now := time.Now()
+	partitionTaint := corev1.Taint{
+		Key:    partitionTaintKey,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	p1 := pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint)
+	p1.Annotations = map[string]string{
+		nodecond.AnnoLocalRemediationUntil: now.Add(30 * time.Minute).UTC().Format(time.RFC3339),
+	}
+	objs := append([]runtime.Object{
+		p1,
+		pePod("flux-system", "p1", "pod-0"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
+
+	e := &partitionEvictor{
+		cs:    cs,
+		queue: "partition-pod-evictor",
+		now:   func() time.Time { return now },
+	}
+	for i := range 4 {
+		now = now.Add(time.Minute)
+		if err := e.run(ctx); err != nil {
+			t.Fatalf("sweep %d: %v", i+1, err)
+		}
+		if !testutil.PodExistsStrict(t, cs, "flux-system", "pod-0") {
+			t.Fatalf("pod evicted during L1 hold on sweep %d", i+1)
+		}
+	}
+
+	// Clear L1 hold on p1: sweep 5 must still find the circuit closed and evict.
+	live := testutil.GetNode(t, cs, "p1")
+	delete(live.Annotations, nodecond.AnnoLocalRemediationUntil)
+	if _, err := cs.CoreV1().Nodes().Update(ctx, live, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if testutil.PodExistsStrict(t, cs, "flux-system", "pod-0") {
+		t.Fatal("pod not evicted after L1 hold cleared — L1 deferrals opened target breaker")
+	}
+}
+
+// An already-tainted node whose target circuit is already open defers in
+// evictPods with zero pods/eviction API calls.
+func TestPartitionEvictorAlreadyTaintedDefersUnderOpenCircuit(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	heal.ConfigureTargetBreaker(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+
+	now := time.Now()
+	for range 3 {
+		heal.TryAcquireTarget("partition-pod-evictor", "p1", now)
+	}
+	partitionTaint := corev1.Taint{
+		Key:    partitionTaintKey,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint),
+		pePod("flux-system", "p1", "pod-0"),
+	}, peHealthyNodes("h", 2)...)
+	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
+
+	var evictCalls atomic.Int32
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" {
+				evictCalls.Add(1)
+			}
+			return false, nil, nil
+		})
+
+	e := &partitionEvictor{
+		cs:    cs,
+		queue: "partition-pod-evictor",
+		now:   func() time.Time { return now },
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := evictCalls.Load(); got != 0 {
+		t.Fatalf("eviction calls = %d on open circuit, want 0", got)
+	}
+	if !testutil.PodExistsStrict(t, cs, "flux-system", "pod-0") {
+		t.Fatal("pod evicted while target circuit is open")
+	}
+}
+
+// Multi-node mixed outcome: node p1 receives only PDB 429s (refunded, circuit
+// stays open-ready for next sweep), while node p2 mixes a PDB 429 and a
+// delivered eviction (keeps its 1 breaker grant and trips limit=1 on sweep 2).
+func TestPartitionEvictorMixedRefusalAndDeliveryMultiNode(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	heal.ConfigureTargetBreaker(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+
+	partitionTaint := corev1.Taint{
+		Key:    partitionTaintKey,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	objs := append([]runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint),
+		pePartitionedNode("p2", "HostNetworkProblems", 20*time.Minute, partitionTaint),
+		pePod("flux-system", "p1", "pod-p1"),
+		pePod("flux-system", "p2", "pod-p2-refused"),
+		pePod("flux-system", "p2", "pod-p2-ok"),
+		pePod("flux-system", "p2", "pod-p2-next"),
+	}, peHealthyNodes("h", 4)...)
+	cs := fake.NewSimpleClientset(objs...)
+	peEmulateEviction(cs)
+
+	var refuseP1, refuseP2 atomic.Bool
+	refuseP1.Store(true)
+	refuseP2.Store(true)
+	cs.PrependReactor("create", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			ca, ok := a.(ktesting.CreateAction)
+			if !ok || ca.GetSubresource() != "eviction" {
+				return false, nil, nil
+			}
+			ev := ca.GetObject().(*policyv1.Eviction)
+			if ev.Name == "pod-p1" && refuseP1.Load() {
+				return true, nil, apierrors.NewTooManyRequests("pdb p1", 0)
+			}
+			if (ev.Name == "pod-p2-refused" || ev.Name == "pod-p2-next") && refuseP2.Load() {
+				return true, nil, apierrors.NewTooManyRequests("pdb p2", 0)
+			}
+			return false, nil, nil
+		})
+
+	now := time.Now()
+	e := &partitionEvictor{
+		cs:    cs,
+		queue: "partition-pod-evictor",
+		now:   func() time.Time { return now },
+	}
+	// Sweep 1: p1 all-429 -> refunded; p2 delivers pod-p2-ok -> keeps its 1 grant.
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !testutil.PodExistsStrict(t, cs, "flux-system", "pod-p1") {
+		t.Fatal("pod-p1 evicted despite 429")
+	}
+	if testutil.PodExistsStrict(t, cs, "flux-system", "pod-p2-ok") {
+		t.Fatal("pod-p2-ok was not evicted")
+	}
+	if !testutil.PodExistsStrict(t, cs, "flux-system", "pod-p2-refused") {
+		t.Fatal("pod-p2-refused evicted despite 429")
+	}
+
+	// Sweep 2 with all 429s lifted: p1 was refunded so it evicts pod-p1;
+	// p2 kept its 1 grant (at limit=1) so its circuit opens and pod-p2-refused stays.
+	refuseP1.Store(false)
+	refuseP2.Store(false)
+	now = now.Add(time.Minute)
+	if err := e.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if testutil.PodExistsStrict(t, cs, "flux-system", "pod-p1") {
+		t.Fatal("pod-p1 not evicted on sweep 2 — all-refusal grant on p1 was not refunded")
+	}
+	if !testutil.PodExistsStrict(t, cs, "flux-system", "pod-p2-refused") {
+		t.Fatal("pod-p2-refused evicted on sweep 2 — p2 did not keep its delivered grant")
 	}
 }

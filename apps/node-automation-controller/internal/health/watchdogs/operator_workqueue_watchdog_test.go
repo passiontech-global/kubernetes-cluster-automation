@@ -366,3 +366,34 @@ func TestCarryFrozen(t *testing.T) {
 		t.Fatalf("op-b tuple leaked into the report: %v", last)
 	}
 }
+
+// Delayed-queue regression: when AllLeases was fetched at T0 (Lease
+// RenewTime = T0 - 2s) and this check runs at T0 + 5m, lease age must
+// be measured against LeasesFetchedAt (T0), not Now() (T0 + 5m).
+func TestCheckOperatorWorkqueuesUsesLeasesFetchedAt(t *testing.T) {
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "cert-manager", opReasonNoConditions)
+	t0 := time.Now()
+	cs := fake.NewSimpleClientset(
+		shLease("kube-system", "cert-manager-controller",
+			"cert-manager-abc_uid", 2*time.Second, t0))
+	stuck := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate", "apps", "tls", 1, 0)
+	p := testProberDyn(cs, probetest.OpDyn(stuck))
+	probetest.FreezeNow(p.Deps, t0)
+	chk := probetest.MustCheck[*operatorWorkqueueCheck](t, p)
+	chk.opFirstSeen.Observe("cert-manager/certificates/apps/tls/"+opReasonNoConditions, t0.Add(-time.Hour))
+
+	sctx := probetest.SweepCtx(ctx, p.Deps)
+	if _, err := p.Deps.AllLeases(sctx); err != nil {
+		t.Fatalf("warm AllLeases: %v", err)
+	}
+	// Simulate 5m of worker-queue lag before this check runs.
+	probetest.FreezeNow(p.Deps, t0.Add(5*time.Minute))
+
+	res := chk.Run(sctx)
+	if res.Pass {
+		t.Fatal("aged Certificate signature must FAIL when Lease was live at LeasesFetchedAt")
+	}
+	if _, ok := chk.opFirstSeen.Seen("cert-manager/certificates/apps/tls/"+opReasonNoConditions, t0); !ok {
+		t.Fatal("opFirstSeen was reset due to worker-queue lag")
+	}
+}

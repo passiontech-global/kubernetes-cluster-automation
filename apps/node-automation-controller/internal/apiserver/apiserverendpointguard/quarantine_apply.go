@@ -62,7 +62,20 @@ func (g *apiServerEndpointGuard) applySliceQuarantine(ctx context.Context, log l
 	// The primary always carries the annotation — persist it even
 	// when its endpoint set itself was unchanged this cycle.
 	writeQuarantineAnnotation(copies[0], quarantinedIPs)
-	for _, err := range g.updateDirtySlices(ctx, copies, dirty, true) {
+	mutate := func(target *discoveryv1.EndpointSlice, idx int) {
+		for _, ip := range toRemove {
+			removeSliceIP(target, ip)
+		}
+		for _, ip := range toAdd {
+			if sliceIdxForIP(copies, ip) == idx {
+				addSliceIP(target, ip)
+			}
+		}
+		if idx == 0 {
+			writeQuarantineAnnotation(target, quarantinedIPs)
+		}
+	}
+	for _, err := range g.updateDirtySlices(ctx, copies, dirty, true, mutate) {
 		if err != nil {
 			return err
 		}
@@ -140,7 +153,17 @@ func (g *apiServerEndpointGuard) applyEndpointsQuarantine(ctx context.Context, l
 	// above against the actual slice contents — reaching this
 	// block on drift alone repairs the slice without touching
 	// the Endpoints object at all.
-	for i, err := range g.updateDirtySlices(ctx, sliceCopies, sliceDirty, false) {
+	mutate := func(target *discoveryv1.EndpointSlice, idx int) {
+		for ip := range quarantinedIPs {
+			removeSliceIP(target, ip)
+		}
+		for _, ip := range toAdd {
+			if sliceIdxForIP(sliceCopies, ip) == idx {
+				addSliceIP(target, ip)
+			}
+		}
+	}
+	for i, err := range g.updateDirtySlices(ctx, sliceCopies, sliceDirty, false, mutate) {
 		if err == nil {
 			continue
 		}
@@ -156,23 +179,45 @@ func (g *apiServerEndpointGuard) applyEndpointsQuarantine(ctx context.Context, l
 
 // updateDirtySlices Updates every dirty slice copy — plus the primary
 // (copies[0]) when updatePrimary, because only the primary carries the
-// quarantine annotation even when its endpoint set was untouched. The
-// per-slice errors are returned aligned with copies (nil = skipped or
-// succeeded): the EndpointSlice-SSOT path STOPS at the first failure —
-// a failed primary (annotation-carrier) update must persist nothing,
-// so the next cycle retries the whole decision — while the
-// Endpoints-mirror convergence path logs and meters each one and
-// keeps converging the remaining slices (different error contracts by
-// design).
+// quarantine annotation even when its endpoint set was untouched. Each
+// write is wrapped in retry.RetryOnConflict so 409 races against the
+// apiserver's endpoint reconciler / endpointslicemirroring controller
+// re-GET fresh slice state, replay mutate(target, i), and skip no-op
+// updates rather than dropping or failing the write. The per-slice
+// errors are returned aligned with copies (nil = skipped or succeeded):
+// the EndpointSlice-SSOT path STOPS at the first failure — a failed
+// primary (annotation-carrier) update must persist nothing, so the next
+// cycle retries the whole decision — while the Endpoints-mirror
+// convergence path logs and meters each one and keeps converging the
+// remaining slices (different error contracts by design).
 func (g *apiServerEndpointGuard) updateDirtySlices(ctx context.Context,
-	copies []*discoveryv1.EndpointSlice, dirty []bool, updatePrimary bool) []error {
+	copies []*discoveryv1.EndpointSlice, dirty []bool, updatePrimary bool,
+	mutate func(target *discoveryv1.EndpointSlice, idx int)) []error {
 	errs := make([]error, len(copies))
+	slicesClient := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS)
 	for i, s := range copies {
 		if !dirty[i] && !(updatePrimary && i == 0) {
 			continue
 		}
-		if _, err := g.cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
-			Update(ctx, s, metav1.UpdateOptions{}); err != nil {
+		first := true
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			target := s
+			if !first {
+				fresh, err := slicesClient.Get(ctx, s.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				target = fresh.DeepCopy()
+				mutate(target, i)
+				if reflect.DeepEqual(target, fresh) {
+					return nil
+				}
+			}
+			first = false
+			_, err := slicesClient.Update(ctx, target, metav1.UpdateOptions{})
+			return err
+		})
+		if err != nil {
 			errs[i] = fmt.Errorf("update endpointslice/%s: %w", s.Name, err)
 			if updatePrimary {
 				return errs

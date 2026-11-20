@@ -64,7 +64,7 @@ type opScan struct {
 //     healOperatorLeader/leaderPods both tolerate a nil Lease:
 //     selector fallback, no stamp persist).
 func (p *operatorWorkqueueCheck) operatorLiveness(ctx context.Context,
-	op operatorTarget, now time.Time, rep *probefw.SweepReport) (
+	op operatorTarget, rep *probefw.SweepReport) (
 	lease *coordinationv1.Lease, carry, reset bool) {
 
 	lease, lerr := p.operatorLease(ctx, op)
@@ -86,7 +86,7 @@ func (p *operatorWorkqueueCheck) operatorLiveness(ctx context.Context,
 		// No leader Lease — no elected operator to judge.
 		return nil, false, true
 	case lease.Spec.RenewTime == nil ||
-		now.Sub(lease.Spec.RenewTime.Time) > operatorLeaseMaxAge:
+		p.LeasesFetchedAt(ctx).Sub(lease.Spec.RenewTime.Time) > operatorLeaseMaxAge:
 		// Stale renewTime = the holder is gone — a dead
 		// operator, not a frozen one. Stay quiet.
 		return nil, false, true

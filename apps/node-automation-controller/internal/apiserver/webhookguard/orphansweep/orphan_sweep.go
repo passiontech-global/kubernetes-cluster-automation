@@ -151,7 +151,7 @@ func Sweep(ctx context.Context, snap *guardstate.Snapshot) error {
 		// webhook list every reconcile — dropping entries past the
 		// Heal-Revert-Loop threshold fights Flux (the orphans are
 		// IN Git). Skip + report; fix the source in Git.
-		if !heal.FluxPatchGate(p.cfg.Kind, p.cfg.Object, p.cfg.Kind+"/"+p.cfg.Name, g.Now.Now()) {
+		if !heal.FluxPatchGate(p.cfg.Kind, p.cfg.Object, "orphansweep/"+p.cfg.Kind+"/"+p.cfg.Name, g.Now.Now()) {
 			log.Info("skip heal: Flux Heal-Revert Loop detected — orphan-entry patch deferred",
 				"kind", p.cfg.Kind, "config", p.cfg.Name)
 			continue

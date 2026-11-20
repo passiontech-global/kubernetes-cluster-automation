@@ -251,9 +251,13 @@ func mergeExclusion(sel *metav1.LabelSelector) map[string]any {
 			}
 			merged = true
 		}
-		exprs = append(exprs, map[string]any{
-			"key": e.Key, "operator": string(e.Operator), "values": vals,
-		})
+		expr := map[string]any{
+			"key": e.Key, "operator": string(e.Operator),
+		}
+		if len(vals) > 0 {
+			expr["values"] = vals
+		}
+		exprs = append(exprs, expr)
 	}
 	if !merged {
 		exprs = append(exprs, map[string]any{
@@ -308,7 +312,7 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 		// Past the Heal-Revert-Loop threshold the patch SKIPS — the
 		// missing-exclusion series stays live (onFail) and the
 		// conflict counter fires, so the drift gets fixed in Git.
-		if !heal.FluxPatchGate(cfg.Kind, cfg.Object, cfg.Kind+"/"+cfg.Name, g.Now.Now()) {
+		if !heal.FluxPatchGate(cfg.Kind, cfg.Object, "criticalns/"+cfg.Kind+"/"+cfg.Name, g.Now.Now()) {
 			log.Info("skip heal: Flux Heal-Revert Loop detected — exclusion patch deferred",
 				"kind", cfg.Kind, "config", cfg.Name)
 			onFail()

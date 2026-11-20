@@ -193,9 +193,10 @@ var DeadNodeFencedWithoutSNRTotal = prometheus.NewCounterVec(prometheus.CounterO
 // preemptions (internal/platform/leaderelect — the
 // NeedLeaderElection=false sweep that shortens the controller's own
 // leader-election LeaseDuration to 1s when the holder pod is
-// deleted/terminating or its node is NotReady/tainted-dead). The
-// reason label carries which dead-holder evidence fired
-// (pod_missing / pod_terminating / node_not_ready /
+// deleted/terminating/not-running, its container restarted, or its
+// node is NotReady/tainted-dead). The reason label carries which
+// dead-holder evidence fired (pod_missing / pod_terminating /
+// pod_not_running / container_restarted / node_not_ready /
 // node_unreachable). A sustained rate means the active/passive HA
 // pair is failing over on dead-node evidence repeatedly — check
 // whether the leader's node is flapping rather than truly dead.

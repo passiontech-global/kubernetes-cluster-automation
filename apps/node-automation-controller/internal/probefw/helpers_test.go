@@ -23,6 +23,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
 
@@ -504,4 +506,57 @@ func TestHealAllowedPersisted(t *testing.T) {
 				proceed, unverifiable)
 		}
 	})
+}
+
+// A sweep's maintSnapshot evaluation must stay isolated on the
+// sweepSnapshot's local Verdict so frozen sweep censuses never poison
+// the process-global shared.Deps.Maintenance used by non-sweep modules.
+func TestSweepVerdictDoesNotPoisonGlobalMaintenance(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "w1"}})
+	dyn := testhelp.NewDynamicClient()
+	globalVerdict := &maintenance.Verdict{}
+	d := &Deps{
+		Name:        "cluster-health-probes",
+		CS:          cs,
+		Dyn:         dyn,
+		Maintenance: globalVerdict,
+	}
+
+	sweepCtx := WithSweepSnapshot(t.Context(), d)
+	// Warm the sweep's node census while cluster is clear.
+	if _, err := d.AllNodes(sweepCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now cordon w1 in live apiserver state AFTER the sweep census froze.
+	n, err := cs.CoreV1().Nodes().Get(t.Context(), "w1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.Spec.Unschedulable = true
+	tAdded := metav1.NewTime(now.Add(-time.Minute))
+	n.Spec.Taints = []corev1.Taint{{Key: kube.UnschedulableTaintKey, TimeAdded: &tAdded}}
+	if _, err := cs.CoreV1().Nodes().Update(t.Context(), n, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inside the sweep, HealAllowed reads the frozen clear census via
+	// the sweep-local Verdict and proceeds.
+	proceed, unverifiable := d.HealAllowed(sweepCtx, logr.Discard(), nil, "k", time.Minute, now)
+	if !proceed || unverifiable {
+		t.Fatalf("sweep HealAllowed = (%v,%v), want (true,false) on frozen clear census",
+			proceed, unverifiable)
+	}
+
+	// Outside the sweep, the global Maintenance Verdict must NOT have
+	// been poisoned with the sweep's stale "clear" scope — evaluating
+	// it live must observe the active cordon on w1.
+	held, why, err := globalVerdict.Active(t.Context(), cs, dyn, now)
+	if err != nil {
+		t.Fatalf("globalVerdict.Active err = %v", err)
+	}
+	if !held {
+		t.Fatalf("globalVerdict.Active = (false, %q) — sweep maintSnapshot poisoned global Verdict", why)
+	}
 }

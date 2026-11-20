@@ -354,7 +354,7 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	// stale stamps, then the ratio-capped cordon pass.
 	cordoned = p.uncordonCleared(ctx, log, uncordon, cordoned, nodes)
 	p.clearStaleStamps(ctx, log, staleStamp, nodes)
-	p.cordonLatched(ctx, log, &rep, nodes, workers, cordoned)
+	p.cordonLatched(ctx, log, &rep, nodes, workers, cordoned, now)
 	// Complete sweep — retire cordon/uncordon series whose node has
 	// now missed two consecutive censuses (the churn guard; see
 	// hangCounterLedger).

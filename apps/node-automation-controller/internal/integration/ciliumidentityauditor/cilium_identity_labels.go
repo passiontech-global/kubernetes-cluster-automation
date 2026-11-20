@@ -24,24 +24,35 @@ import (
 // its VALUES is what names it (a key seen on every identity with
 // one fixed value mints nothing). Sort is count-desc then key-asc
 // so the report is deterministic.
-func topSecurityLabelKeys(ids []unstructured.Unstructured, n int) []string {
-	values := map[string]map[string]struct{}{}
-	for i := range ids {
-		sec, _ := kube.NestedStringMap(
-			ids[i].Object, "spec", "security-labels")
-		for k, v := range sec {
-			if values[k] == nil {
-				values[k] = map[string]struct{}{}
-			}
-			values[k][v] = struct{}{}
-		}
+type securityLabelProfiler struct {
+	values map[string]map[string]struct{}
+}
+
+func (p *securityLabelProfiler) observe(id *unstructured.Unstructured) {
+	sec, _ := kube.NestedStringMap(id.Object, "spec", "security-labels")
+	if len(sec) == 0 {
+		return
 	}
+	if p.values == nil {
+		p.values = map[string]map[string]struct{}{}
+	}
+	for k, v := range sec {
+		set := p.values[k]
+		if set == nil {
+			set = map[string]struct{}{}
+			p.values[k] = set
+		}
+		set[v] = struct{}{}
+	}
+}
+
+func (p *securityLabelProfiler) top(n int) []string {
 	type kv struct {
 		key string
 		n   int
 	}
-	keys := make([]kv, 0, len(values))
-	for k, set := range values {
+	keys := make([]kv, 0, len(p.values))
+	for k, set := range p.values {
 		keys = append(keys, kv{k, len(set)})
 	}
 	slices.SortFunc(keys, func(a, b kv) int {
@@ -58,4 +69,12 @@ func topSecurityLabelKeys(ids []unstructured.Unstructured, n int) []string {
 		out = append(out, fmt.Sprintf("%s(%d)", k.key, k.n))
 	}
 	return out
+}
+
+func topSecurityLabelKeys(ids []unstructured.Unstructured, n int) []string {
+	var p securityLabelProfiler
+	for i := range ids {
+		p.observe(&ids[i])
+	}
+	return p.top(n)
 }

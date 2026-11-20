@@ -40,10 +40,11 @@ const moduleRoot = "../.."
 var envxDir = filepath.Join(moduleRoot, "..", "..",
 	"libs", "hostkit", "envx")
 
-// registryDir is internal/registry relative to this package's dir —
-// ScanTree collects `GateEnv: "NAME"` composite-literal fields there
-// (the module registration gates) as env reads.
-var registryDir = filepath.Join(moduleRoot, "internal", "registry")
+// registryDir is internal/registry relative to moduleRoot (ScanTree
+// joins RegistryDir onto Root) — ScanTree collects `GateEnv: "NAME"`
+// composite-literal fields there (the module registration gates) as
+// env reads.
+var registryDir = filepath.Join("internal", "registry")
 
 // knownGaps exempts env vars the code reads that deliberately have no
 // docs/env.md row — each entry is name -> reason the doc must NOT list
@@ -101,6 +102,13 @@ func TestEnvDocCoversSource(t *testing.T) {
 	if _, ok := where["PARTITION_EVICT_NAMESPACES"]; !ok {
 		t.Errorf("PARTITION_EVICT_NAMESPACES missing from scan results — " +
 			"const-key resolution in the scanner regressed")
+	}
+	// Verify RegistryDir GateEnv scanning didn't silently turn off
+	// (an off-root RegistryDir path yields 0 GateEnv hits).
+	for _, gate := range []string{"FLUENTBIT_ROLLER_ENABLED", "CLUSTER_HEALTH_PROBES_ENABLED"} {
+		if _, ok := where[gate]; !ok {
+			t.Errorf("%s missing from scan results — GateEnv scanning under RegistryDir (%s) regressed", gate, registryDir)
+		}
 	}
 
 	docPath := filepath.Join(moduleRoot, "docs", "env.md")

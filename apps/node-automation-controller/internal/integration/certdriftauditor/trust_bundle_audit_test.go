@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // chainCA issues a self-signed CA — returns key, parsed cert and PEM.
@@ -196,5 +197,98 @@ func TestEmitTrustBundleWrites(t *testing.T) {
 		metrics.TrustBundleDaysToExpiry.WithLabelValues("ns", "bundle"))
 	if got <= 0 || got > 1 {
 		t.Fatalf("days-to-expiry = %v, want ~1 (the fixture cert lives 24h)", got)
+	}
+}
+
+func TestAuditTrustBundlesConcatenatesWithoutTrailingNewline(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	makeCertWithExpiry := func(d time.Duration) []byte {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(d.Nanoseconds()),
+			Subject:               pkix.Name{CommonName: "bundle-test"},
+			NotBefore:             now.Add(-time.Hour),
+			NotAfter:              now.Add(d),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	}
+	trimTrailingNL := func(b []byte) []byte {
+		for len(b) > 0 && b[len(b)-1] == '\n' {
+			b = b[:len(b)-1]
+		}
+		return b
+	}
+
+	ca30d := trimTrailingNL(makeCertWithExpiry(30 * 24 * time.Hour))
+	crt5d := trimTrailingNL(makeCertWithExpiry(5 * 24 * time.Hour))
+	crlf30d := append(append([]byte(nil), ca30d...), '\r', '\n')
+
+	for _, tc := range []struct {
+		name     string
+		data     map[string][]byte
+		wantEmit bool
+		wantMin  float64
+		wantMax  float64
+	}{
+		{
+			name:     "ca.crt without trailing newline + crt.pem reports 5d earliest",
+			data:     map[string][]byte{"ca.crt": ca30d, "crt.pem": crt5d},
+			wantEmit: true, wantMin: 4.9, wantMax: 5.1,
+		},
+		{
+			name:     "ca.crt with CRLF + crt.pem reports 5d earliest",
+			data:     map[string][]byte{"ca.crt": crlf30d, "crt.pem": crt5d},
+			wantEmit: true, wantMin: 4.9, wantMax: 5.1,
+		},
+		{
+			name:     "ca.crt only",
+			data:     map[string][]byte{"ca.crt": ca30d},
+			wantEmit: true, wantMin: 29.9, wantMax: 30.1,
+		},
+		{
+			name:     "crt.pem only",
+			data:     map[string][]byte{"crt.pem": crt5d},
+			wantEmit: true, wantMin: 4.9, wantMax: 5.1,
+		},
+		{
+			name:     "both empty skipped",
+			data:     map[string][]byte{"ca.crt": nil, "crt.pem": {}},
+			wantEmit: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics.TrustBundleDaysToExpiry.Reset()
+			sec := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: kube.LinkerdNS, Name: "test-bundle"},
+				Data:       tc.data,
+			}
+			a := newCertDriftAuditor(fake.NewSimpleClientset(sec), cdaDyn(), now)
+			if err := a.auditTrustBundles(ctx); err != nil {
+				t.Fatal(err)
+			}
+			count := promtestutil.CollectAndCount(metrics.TrustBundleDaysToExpiry)
+			if !tc.wantEmit {
+				if count != 0 {
+					t.Fatalf("emitted %d series, want 0", count)
+				}
+				return
+			}
+			if count != 1 {
+				t.Fatalf("emitted %d series, want 1", count)
+			}
+			got := promtestutil.ToFloat64(metrics.TrustBundleDaysToExpiry.WithLabelValues(kube.LinkerdNS, "test-bundle"))
+			if got < tc.wantMin || got > tc.wantMax {
+				t.Fatalf("days-to-expiry = %v, want [%v, %v]", got, tc.wantMin, tc.wantMax)
+			}
+		})
 	}
 }

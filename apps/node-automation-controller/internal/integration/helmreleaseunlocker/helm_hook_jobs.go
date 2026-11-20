@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -16,6 +17,43 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/reap"
 )
+
+// hookJobCache memoizes read-only namespace Job lists and records
+// deleted Job keys ("ns/name") within a single sweep so
+// helmUpgradeInProgress and cleanFailedHookJobs across one or more
+// releases in the same namespace share one watch-cache LIST.
+type hookJobCache struct {
+	byNS    map[string][]batchv1.Job
+	deleted map[string]bool
+}
+
+func newHookJobCache() *hookJobCache {
+	return &hookJobCache{
+		byNS:    map[string][]batchv1.Job{},
+		deleted: map[string]bool{},
+	}
+}
+
+func (u *helmReleaseUnlocker) listNamespaceJobs(ctx context.Context, cache *hookJobCache, ns string) ([]batchv1.Job, error) {
+	if cache != nil {
+		if jobs, ok := cache.byNS[ns]; ok {
+			return jobs, nil
+		}
+	}
+	jobs, err := kube.ListAll(ctx,
+		metav1.ListOptions{
+			ResourceVersion: "0",
+			Limit:           kube.DefaultListPageSize,
+		},
+		kube.Jobs(u.cs, ns))
+	if err != nil {
+		return nil, err
+	}
+	if cache != nil {
+		cache.byNS[ns] = jobs
+	}
+	return jobs, nil
+}
 
 // cleanFailedHookJobs deletes batchv1 Jobs in ns that carry the
 // helm.sh/hook annotation AND this release's attribution — the
@@ -30,11 +68,9 @@ import (
 // never reaped. Each deletion bumps
 // metrics.HelmHookJobsCleanedTotal{namespace}. Errors are logged and
 // skipped — hook cleanup never fails the caller.
-func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns, release string) {
+func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, cache *hookJobCache, ns, release string) {
 	log := logf.FromContext(ctx)
-	jobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Jobs(u.cs, ns))
+	jobs, err := u.listNamespaceJobs(ctx, cache, ns)
 	if err != nil {
 		log.Error(err, "helm-hook job list failed — hook cleanup skipped", "ns", ns)
 		return
@@ -42,6 +78,9 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns, relea
 	var targets []*batchv1.Job
 	for i := range jobs {
 		j := &jobs[i]
+		if cache != nil && cache.deleted[ns+"/"+j.Name] {
+			continue
+		}
 		if _, ok := j.Annotations["helm.sh/hook"]; !ok {
 			continue // not a helm hook — never ours to reap
 		}
@@ -64,7 +103,13 @@ func (u *helmReleaseUnlocker) cleanFailedHookJobs(ctx context.Context, ns, relea
 		Delete: func(ctx context.Context, j *batchv1.Job) error {
 			if err := u.cs.BatchV1().Jobs(ns).Delete(ctx, j.Name,
 				kube.UIDDeleteOptions(j.UID, metav1.DeletePropagationBackground)); err != nil {
+				if apierrors.IsNotFound(err) && cache != nil {
+					cache.deleted[ns+"/"+j.Name] = true
+				}
 				return err
+			}
+			if cache != nil {
+				cache.deleted[ns+"/"+j.Name] = true
 			}
 			metrics.HelmHookJobsCleanedTotal.WithLabelValues(ns).Inc()
 			return nil

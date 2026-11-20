@@ -12,9 +12,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -790,3 +794,103 @@ func TestAPIServiceGuardUnblockPDBRefusalDefers(t *testing.T) {
 
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()
+
+type asgListOptsCS struct {
+	kubernetes.Interface
+	opts map[string][]metav1.ListOptions
+}
+
+func (r *asgListOptsCS) CoreV1() corev1client.CoreV1Interface {
+	return &asgCoreV1{CoreV1Interface: r.Interface.CoreV1(), r: r}
+}
+
+type asgCoreV1 struct {
+	corev1client.CoreV1Interface
+	r *asgListOptsCS
+}
+
+func (c *asgCoreV1) Namespaces() corev1client.NamespaceInterface {
+	return &asgNamespaces{NamespaceInterface: c.CoreV1Interface.Namespaces(), r: c.r}
+}
+
+func (c *asgCoreV1) Events(ns string) corev1client.EventInterface {
+	return &asgEvents{EventInterface: c.CoreV1Interface.Events(ns), r: c.r}
+}
+
+func (c *asgCoreV1) Pods(ns string) corev1client.PodInterface {
+	return &asgPods{PodInterface: c.CoreV1Interface.Pods(ns), r: c.r}
+}
+
+type asgNamespaces struct {
+	corev1client.NamespaceInterface
+	r *asgListOptsCS
+}
+
+func (n *asgNamespaces) List(ctx context.Context, opts metav1.ListOptions) (*corev1.NamespaceList, error) {
+	n.r.opts["namespaces"] = append(n.r.opts["namespaces"], opts)
+	return n.NamespaceInterface.List(ctx, opts)
+}
+
+type asgEvents struct {
+	corev1client.EventInterface
+	r *asgListOptsCS
+}
+
+func (e *asgEvents) List(ctx context.Context, opts metav1.ListOptions) (*corev1.EventList, error) {
+	e.r.opts["events"] = append(e.r.opts["events"], opts)
+	return e.EventInterface.List(ctx, opts)
+}
+
+type asgPods struct {
+	corev1client.PodInterface
+	r *asgListOptsCS
+}
+
+func (p *asgPods) List(ctx context.Context, opts metav1.ListOptions) (*corev1.PodList, error) {
+	p.r.opts["pods"] = append(p.r.opts["pods"], opts)
+	return p.PodInterface.List(ctx, opts)
+}
+
+type asgListOptsDyn struct {
+	dynamic.Interface
+	opts []metav1.ListOptions
+}
+
+func (d *asgListOptsDyn) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &asgDynRI{NamespaceableResourceInterface: d.Interface.Resource(gvr), d: d}
+}
+
+type asgDynRI struct {
+	dynamic.NamespaceableResourceInterface
+	d *asgListOptsDyn
+}
+
+func (r *asgDynRI) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	r.d.opts = append(r.d.opts, opts)
+	return r.NamespaceableResourceInterface.List(ctx, opts)
+}
+
+func TestAPIServiceGuardSnapshotAndEventsUseWatchCacheRV0(t *testing.T) {
+	apiSvc := asgObj("v1beta1.metrics.k8s.io", "kube-system", "metrics-server")
+	asgUnavailable(apiSvc, 30*time.Minute)
+	rawCS := asgUnblockCS("kube-system", "metrics.k8s.io", "metrics-server", "metrics-server", 20*time.Minute, "ms-0")
+	recCS := &asgListOptsCS{Interface: rawCS, opts: map[string][]metav1.ListOptions{}}
+	recDyn := &asgListOptsDyn{Interface: asgDynFake(apiSvc)}
+
+	g := &apiServiceGuard{cs: recCS, dyn: recDyn, now: time.Now}
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(recDyn.opts) == 0 || recDyn.opts[0].ResourceVersion != "0" {
+		t.Fatalf("APIServices snapshot ListOptions = %+v, want ResourceVersion=\"0\"", recDyn.opts)
+	}
+	if got := recCS.opts["namespaces"]; len(got) != 1 || got[0].ResourceVersion != "0" {
+		t.Fatalf("Namespaces snapshot ListOptions = %+v, want ResourceVersion=\"0\"", got)
+	}
+	if got := recCS.opts["events"]; len(got) != 1 || got[0].ResourceVersion != "0" {
+		t.Fatalf("Events ListOptions = %+v, want ResourceVersion=\"0\"", got)
+	}
+	if got := recCS.opts["pods"]; len(got) != 1 || got[0].ResourceVersion != "" {
+		t.Fatalf("backingPodTargets Pods ListOptions = %+v, want strong read ResourceVersion=\"\"", got)
+	}
+}

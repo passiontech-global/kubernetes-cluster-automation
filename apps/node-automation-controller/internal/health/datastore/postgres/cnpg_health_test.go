@@ -5,17 +5,22 @@ package postgres
 
 import (
 	json "encoding/json/v2"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -169,7 +174,7 @@ func TestCNPGFencedInstancesDetectOnly(t *testing.T) {
 	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge,
 		"db", "pg-f", "fenced_instances")
 	now := time.Now()
-	cr := cnpgClusterFenced("db", "pg-f", "pg-f-2")
+	cr := cnpgClusterFenced("db", "pg-f", `["pg-f-2"]`)
 	p := testProberDyn(fake.NewSimpleClientset(), probetest.OpDyn(cr))
 	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
 
@@ -188,8 +193,8 @@ func TestCNPGFencedInstancesDetectOnly(t *testing.T) {
 		"fenced_instances"); !ok || v != 1 {
 		t.Fatalf("fenced_instances series = %v,%v want 1,true", v, ok)
 	}
-	if got := fencedAnnotation(t, p, "db", "pg-f"); got != "pg-f-2" {
-		t.Fatalf("annotation = %q, want unchanged pg-f-2", got)
+	if got := fencedAnnotation(t, p, "db", "pg-f"); got != `["pg-f-2"]` {
+		t.Fatalf("annotation = %q, want unchanged [\"pg-f-2\"]", got)
 	}
 }
 
@@ -200,7 +205,7 @@ func TestCNPGFencedInstanceAutoUnfence(t *testing.T) {
 	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge,
 		"db", "pg-f", "fenced_instances")
 	now := time.Now()
-	cr := cnpgClusterFenced("db", "pg-f", "pg-f-1,pg-f-2")
+	cr := cnpgClusterFenced("db", "pg-f", `["pg-f-1","pg-f-2"]`)
 	node := testutil.Node("w1", corev1.ConditionTrue, nil)
 	pod1 := fencedPod("db", "pg-f", "pg-f-1", "w1")
 	// pg-f-2 has no pod — stays fenced.
@@ -217,8 +222,8 @@ func TestCNPGFencedInstanceAutoUnfence(t *testing.T) {
 	if res.Pass {
 		t.Fatal("fenced_instances held past the window must fail")
 	}
-	if got := fencedAnnotation(t, p, "db", "pg-f"); got != "pg-f-2" {
-		t.Fatalf("annotation = %q, want pg-f-2 only", got)
+	if got := fencedAnnotation(t, p, "db", "pg-f"); got != `["pg-f-2"]` {
+		t.Fatalf("annotation = %q, want [\"pg-f-2\"] only", got)
 	}
 }
 
@@ -231,7 +236,7 @@ func TestCNPGUnfencePatchPinsResourceVersion(t *testing.T) {
 	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge,
 		"db", "pg-f", "fenced_instances")
 	now := time.Now()
-	cr := cnpgClusterFenced("db", "pg-f", "pg-f-1")
+	cr := cnpgClusterFenced("db", "pg-f", `["pg-f-1"]`)
 	cr.SetResourceVersion("4217")
 	node := testutil.Node("w1", corev1.ConditionTrue, nil)
 	pod := fencedPod("db", "pg-f", "pg-f-1", "w1")
@@ -273,7 +278,7 @@ func TestCNPGFencedInstanceTaintedNodeStays(t *testing.T) {
 	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge,
 		"db", "pg-f", "fenced_instances")
 	now := time.Now()
-	cr := cnpgClusterFenced("db", "pg-f", "pg-f-1")
+	cr := cnpgClusterFenced("db", "pg-f", `["pg-f-1"]`)
 	node := testutil.Node("w1", corev1.ConditionTrue, nil,
 		corev1.Taint{
 			Key:    kube.TaintKubeletUnresponsive,
@@ -293,8 +298,8 @@ func TestCNPGFencedInstanceTaintedNodeStays(t *testing.T) {
 	if res.Pass {
 		t.Fatal("fenced_instances held past the window must fail")
 	}
-	if got := fencedAnnotation(t, p, "db", "pg-f"); got != "pg-f-1" {
-		t.Fatalf("annotation = %q, want unchanged pg-f-1", got)
+	if got := fencedAnnotation(t, p, "db", "pg-f"); got != `["pg-f-1"]` {
+		t.Fatalf("annotation = %q, want unchanged [\"pg-f-1\"]", got)
 	}
 }
 
@@ -303,7 +308,7 @@ func TestCNPGFencedInstanceUnschedulableStays(t *testing.T) {
 	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge,
 		"db", "pg-f", "fenced_instances")
 	now := time.Now()
-	cr := cnpgClusterFenced("db", "pg-f", "pg-f-1")
+	cr := cnpgClusterFenced("db", "pg-f", `["pg-f-1"]`)
 	node := testutil.Node("w1", corev1.ConditionTrue, nil)
 	node.Spec.Unschedulable = true
 	pod := fencedPod("db", "pg-f", "pg-f-1", "w1")
@@ -320,8 +325,8 @@ func TestCNPGFencedInstanceUnschedulableStays(t *testing.T) {
 	if res.Pass {
 		t.Fatal("fenced_instances held past the window must fail")
 	}
-	if got := fencedAnnotation(t, p, "db", "pg-f"); got != "pg-f-1" {
-		t.Fatalf("annotation = %q, want unchanged pg-f-1", got)
+	if got := fencedAnnotation(t, p, "db", "pg-f"); got != `["pg-f-1"]` {
+		t.Fatalf("annotation = %q, want unchanged [\"pg-f-1\"]", got)
 	}
 }
 
@@ -331,7 +336,7 @@ func TestCNPGFencedWholeClusterStarStays(t *testing.T) {
 	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge,
 		"db", "pg-f", "fenced_instances")
 	now := time.Now()
-	cr := cnpgClusterFenced("db", "pg-f", "*")
+	cr := cnpgClusterFenced("db", "pg-f", `["*"]`)
 	node := testutil.Node("w1", corev1.ConditionTrue, nil)
 	pod := fencedPod("db", "pg-f", "pg-f-1", "w1")
 	cs := fake.NewSimpleClientset(node, pod)
@@ -347,15 +352,14 @@ func TestCNPGFencedWholeClusterStarStays(t *testing.T) {
 	if res.Pass {
 		t.Fatal("fenced_instances held past the window must fail")
 	}
-	if got := fencedAnnotation(t, p, "db", "pg-f"); got != "*" {
-		t.Fatalf("annotation = %q, want unchanged *", got)
+	if got := fencedAnnotation(t, p, "db", "pg-f"); got != `["*"]` {
+		t.Fatalf("annotation = %q, want unchanged [\"*\"]", got)
 	}
 }
 
-// A fenced instance whose pod is terminating, or Running but with
-// Ready != True, is not proof the fence is stale. Both must stay
-// fenced (fail closed on partial liveness evidence).
-func TestCNPGUnfenceRequiresLiveReadyPod(t *testing.T) {
+// A fenced instance whose pod is terminating, not Running, or has an
+// explicitly non-running container status must stay fenced.
+func TestCNPGUnfenceRequiresLiveRunningPod(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		mut  func(*corev1.Pod)
@@ -364,14 +368,20 @@ func TestCNPGUnfenceRequiresLiveReadyPod(t *testing.T) {
 			now := metav1.Now()
 			pod.DeletionTimestamp = &now
 		}},
-		{"not ready", func(pod *corev1.Pod) {
-			pod.Status.Conditions = []corev1.PodCondition{{
-				Type: corev1.PodReady, Status: corev1.ConditionFalse,
+		{"pending", func(pod *corev1.Pod) {
+			pod.Status.Phase = corev1.PodPending
+		}},
+		{"waiting container", func(pod *corev1.Pod) {
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "postgres",
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+				},
 			}}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cr := cnpgClusterFenced("db", "pg-live", "pg-live-1")
+			cr := cnpgClusterFenced("db", "pg-live", `["pg-live-1"]`)
 			node := testutil.Node("w1", corev1.ConditionTrue, nil)
 			pod := fencedPod("db", "pg-live", "pg-live-1", "w1")
 			tc.mut(pod)
@@ -382,10 +392,37 @@ func TestCNPGUnfenceRequiresLiveReadyPod(t *testing.T) {
 			chk.Run(probetest.SweepCtx(ctx, chk.Deps))
 			probetest.FreezeNow(p.Deps, base.Add(16*time.Minute))
 			chk.Run(probetest.SweepCtx(ctx, chk.Deps))
-			if got := fencedAnnotation(t, p, "db", "pg-live"); got != "pg-live-1" {
+			if got := fencedAnnotation(t, p, "db", "pg-live"); got != `["pg-live-1"]` {
 				t.Fatalf("%s pod must stay fenced, annotation = %q", tc.name, got)
 			}
 		})
+	}
+}
+
+// Fencing stops postmaster, keeping PodReady=False until unfenced. A
+// PodRunning pod with PodReady=False on a healthy node must still
+// auto-unfence after the 15m settle window.
+func TestCNPGUnfenceAllowsUnreadyRunningPod(t *testing.T) {
+	cr := cnpgClusterFenced("db", "pg-unready", `["pg-unready-1"]`)
+	node := testutil.Node("w1", corev1.ConditionTrue, nil)
+	pod := fencedPod("db", "pg-unready", "pg-unready-1", "w1")
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionFalse,
+	}}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "postgres",
+		Ready: false,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}}
+	p := testProberDyn(fake.NewSimpleClientset(node, pod), probetest.OpDyn(cr))
+	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+	base := time.Now()
+	probetest.FreezeNow(p.Deps, base)
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	probetest.FreezeNow(p.Deps, base.Add(16*time.Minute))
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if got := fencedAnnotation(t, p, "db", "pg-unready"); got != "" {
+		t.Fatalf("unready Running pod on healthy node should unfence, annotation = %q", got)
 	}
 }
 
@@ -394,7 +431,7 @@ func TestCNPGUnfenceRequiresLiveReadyPod(t *testing.T) {
 // time: when its node recovers the window starts fresh, so one
 // Ready flicker cannot strip a protective fence.
 func TestCNPGUnfenceWindowStartsOnlyWhenSafe(t *testing.T) {
-	cr := cnpgClusterFenced("db", "pg-settle", "pg-settle-1")
+	cr := cnpgClusterFenced("db", "pg-settle", `["pg-settle-1"]`)
 	badNode := testutil.Node("w1", corev1.ConditionFalse, nil)
 	pod := fencedPod("db", "pg-settle", "pg-settle-1", "w1")
 	cs := fake.NewSimpleClientset(badNode, pod)
@@ -414,7 +451,7 @@ func TestCNPGUnfenceWindowStartsOnlyWhenSafe(t *testing.T) {
 	}
 	probetest.FreezeNow(p.Deps, base.Add(17*time.Minute))
 	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
-	if got := fencedAnnotation(t, p, "db", "pg-settle"); got != "pg-settle-1" {
+	if got := fencedAnnotation(t, p, "db", "pg-settle"); got != `["pg-settle-1"]` {
 		t.Fatalf("first healthy sweep must not unfence, annotation = %q", got)
 	}
 	// A full window of verifiable health later, the stale fence clears.
@@ -429,7 +466,7 @@ func TestCNPGUnfenceWindowStartsOnlyWhenSafe(t *testing.T) {
 // when the node drops NotReady mid-window: the prune drops the key
 // while the safety gate fails, so recovery re-arms a fresh 15m.
 func TestCNPGUnfenceWindowResetsWhenNodeDropsNotReady(t *testing.T) {
-	cr := cnpgClusterFenced("db", "pg-reset-node", "pg-reset-node-1")
+	cr := cnpgClusterFenced("db", "pg-reset-node", `["pg-reset-node-1"]`)
 	node := testutil.Node("w1", corev1.ConditionTrue, nil)
 	pod := fencedPod("db", "pg-reset-node", "pg-reset-node-1", "w1")
 	cs := fake.NewSimpleClientset(node, pod)
@@ -454,7 +491,7 @@ func TestCNPGUnfenceWindowResetsWhenNodeDropsNotReady(t *testing.T) {
 	}
 	probetest.FreezeNow(p.Deps, base.Add(20*time.Minute))
 	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
-	if got := fencedAnnotation(t, p, "db", "pg-reset-node"); got != "pg-reset-node-1" {
+	if got := fencedAnnotation(t, p, "db", "pg-reset-node"); got != `["pg-reset-node-1"]` {
 		t.Fatalf("first sweep after recovery must not unfence, annotation = %q", got)
 	}
 	// A fresh full window of health finally clears the stale fence.
@@ -469,7 +506,7 @@ func TestCNPGUnfenceWindowResetsWhenNodeDropsNotReady(t *testing.T) {
 // (targetPrimary diverges) prunes the settle counter. A single
 // healthy sweep after the failover lands must not unfence.
 func TestCNPGUnfenceWindowResetsOnFailover(t *testing.T) {
-	cr := cnpgClusterFenced("db", "pg-reset-fo", "pg-reset-fo-1")
+	cr := cnpgClusterFenced("db", "pg-reset-fo", `["pg-reset-fo-1"]`)
 	node := testutil.Node("w1", corev1.ConditionTrue, nil)
 	pod := fencedPod("db", "pg-reset-fo", "pg-reset-fo-1", "w1")
 	cs := fake.NewSimpleClientset(node, pod)
@@ -500,7 +537,7 @@ func TestCNPGUnfenceWindowResetsOnFailover(t *testing.T) {
 	setTarget("pg-reset-fo-0") // failover lands
 	probetest.FreezeNow(p.Deps, base.Add(20*time.Minute))
 	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
-	if got := fencedAnnotation(t, p, "db", "pg-reset-fo"); got != "pg-reset-fo-1" {
+	if got := fencedAnnotation(t, p, "db", "pg-reset-fo"); got != `["pg-reset-fo-1"]` {
 		t.Fatalf("first sweep after failover must not unfence, annotation = %q", got)
 	}
 	probetest.FreezeNow(p.Deps, base.Add(20*time.Minute+16*time.Minute))
@@ -516,7 +553,7 @@ func TestCNPGFencedInstanceFirstSweepStays(t *testing.T) {
 	testutil.CleanupMetric(t, cnpgClusterUnhealthyGauge,
 		"db", "pg-f", "fenced_instances")
 	now := time.Now()
-	cr := cnpgClusterFenced("db", "pg-f", "pg-f-1")
+	cr := cnpgClusterFenced("db", "pg-f", `["pg-f-1"]`)
 	node := testutil.Node("w1", corev1.ConditionTrue, nil)
 	pod := fencedPod("db", "pg-f", "pg-f-1", "w1")
 	cs := fake.NewSimpleClientset(node, pod)
@@ -527,7 +564,129 @@ func TestCNPGFencedInstanceFirstSweepStays(t *testing.T) {
 	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
 		t.Fatalf("first sight must arm, not fail: %+v", res)
 	}
-	if got := fencedAnnotation(t, p, "db", "pg-f"); got != "pg-f-1" {
-		t.Fatalf("annotation = %q, want unchanged pg-f-1", got)
+	if got := fencedAnnotation(t, p, "db", "pg-f"); got != `["pg-f-1"]` {
+		t.Fatalf("annotation = %q, want unchanged [\"pg-f-1\"]", got)
+	}
+}
+
+func TestCNPGFencedInstanceListJSONEdgeCases(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{"empty json array", `[]`, 0},
+		{"whitespace json array", " [ ] ", 0},
+		{"null json", "null", 0},
+		{"blank", "", 0},
+		{"invalid json", "[broken", 0},
+		{"wrong json type", `{"a":1}`, 0},
+		{"plain string", "not-json", 0},
+		{"padded entries", ` [ "pg-1" , "" , " pg-2 " ] `, 2},
+		{"star entry", `["*"]`, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cr := cnpgClusterFenced("db", "pg-edge", tc.raw)
+			got := cnpgFencedInstanceList(ctx, cr)
+			if len(got) != tc.want {
+				t.Fatalf("cnpgFencedInstanceList(%q) = %v (len %d), want len %d",
+					tc.raw, got, len(got), tc.want)
+			}
+		})
+	}
+
+	// ["*", "pg-1"] must keep the whole cluster fenced and not unfence pg-1.
+	now := time.Now()
+	cr := cnpgClusterFenced("db", "pg-star-mix", `["*","pg-star-mix-1"]`)
+	node := testutil.Node("w1", corev1.ConditionTrue, nil)
+	pod := fencedPod("db", "pg-star-mix", "pg-star-mix-1", "w1")
+	p := testProberDyn(fake.NewSimpleClientset(node, pod), probetest.OpDyn(cr))
+	chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+	probetest.FreezeNow(p.Deps, now)
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	probetest.FreezeNow(p.Deps, now.Add(16*time.Minute))
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if got := fencedAnnotation(t, p, "db", "pg-star-mix"); got != `["*","pg-star-mix-1"]` {
+		t.Fatalf("cluster with * in fencedInstances must not unfence any member, got %q", got)
+	}
+}
+
+func TestCNPGUnfencePatchConflictAndNotFoundRefundGrant(t *testing.T) {
+	runErrs := func(name string) float64 {
+		m := probetest.FindMetric(t, "shell_operator_hook_run_errors_total",
+			map[string]string{"queue": name})
+		if m == nil {
+			return 0
+		}
+		return m.GetCounter().GetValue()
+	}
+
+	for _, tc := range []struct {
+		name       string
+		patchErr   error
+		wantErrInc float64
+		wantRefund bool
+	}{
+		{
+			name:       "409 conflict refunds grant and skips IncError",
+			patchErr:   apierrors.NewConflict(schema.GroupResource{Group: "postgresql.cnpg.io", Resource: "clusters"}, "pg-race", errors.New("rv mismatch")),
+			wantErrInc: 0,
+			wantRefund: true,
+		},
+		{
+			name:       "404 not found refunds grant and skips IncError",
+			patchErr:   apierrors.NewNotFound(schema.GroupResource{Group: "postgresql.cnpg.io", Resource: "clusters"}, "pg-race"),
+			wantErrInc: 0,
+			wantRefund: true,
+		},
+		{
+			name:       "500 internal error increments IncError and spends grant",
+			patchErr:   apierrors.NewInternalError(errors.New("etcd timeout")),
+			wantErrInc: 1,
+			wantRefund: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			heal.ConfigureBudget(1, time.Hour)
+			defer heal.ConfigureBudget(0, 0)
+
+			cr := cnpgClusterFenced("db", "pg-race", `["pg-race-1","pg-race-2"]`)
+			node := testutil.Node("w1", corev1.ConditionTrue, nil)
+			pod1 := fencedPod("db", "pg-race", "pg-race-1", "w1")
+			pod2 := fencedPod("db", "pg-race", "pg-race-2", "w1")
+			cs := fake.NewSimpleClientset(node, pod1, pod2)
+			dyn := probetest.OpDyn(cr)
+			var patchCalls int
+			dyn.PrependReactor("patch", "clusters", func(ktesting.Action) (bool, runtime.Object, error) {
+				patchCalls++
+				return true, nil, tc.patchErr
+			})
+			p := testProberDyn(cs, dyn)
+			chk := probetest.MustCheck[*postgresWALArchiveGuardCheck](t, p)
+
+			base := time.Now()
+			probetest.FreezeNow(p.Deps, base)
+			chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+
+			at := base.Add(16 * time.Minute)
+			probetest.FreezeNow(p.Deps, at)
+			beforeErrs := runErrs(p.Name)
+			chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+
+			if got := runErrs(p.Name) - beforeErrs; got != tc.wantErrInc {
+				t.Fatalf("run_errors delta = %v, want %v", got, tc.wantErrInc)
+			}
+			if tc.wantRefund && patchCalls != 1 {
+				t.Fatalf("conflict/404 must break per-cluster loop after 1 patch, got %d", patchCalls)
+			}
+			// Check whether the single budget grant at `at` is available again.
+			proceed, unverifiable := chk.HealAllowed(ctx, logr.Discard(), nil, "probe-budget", time.Minute, at)
+			if unverifiable {
+				t.Fatal("unexpected unverifiable gate")
+			}
+			if proceed != tc.wantRefund {
+				t.Fatalf("post-patch budget grant available = %v, want %v", proceed, tc.wantRefund)
+			}
+		})
 	}
 }

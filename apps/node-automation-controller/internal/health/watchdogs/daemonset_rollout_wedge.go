@@ -264,11 +264,13 @@ func (p *dsRolloutWedgeCheck) newRevisionHashes(ctx context.Context,
 	}
 	// Fallback: ControllerRevision objects owned by this DS. The one
 	// with the largest .Revision is the target the controller is
-	// rolling toward, and its NAME is what the controller stamps into
-	// controller-revision-hash. Listing needs an RBAC grant some
-	// installs do not give us — on denial (or no matching CR) the
-	// target is UNKNOWN, so the caller must skip the heal rather than
-	// risk deleting a pod on the new revision.
+	// rolling toward, and its controller-revision-hash label (falling
+	// back to Name with the "<ds.Name>-" prefix stripped) is what the
+	// controller stamps into pods' controller-revision-hash. Listing
+	// needs an RBAC grant some installs do not give us — on denial
+	// (or no matching CR) the target is UNKNOWN, so the caller must
+	// skip the heal rather than risk deleting a pod on the new
+	// revision.
 	crs, err := p.CS.AppsV1().ControllerRevisions(ds.Namespace).
 		List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -288,7 +290,14 @@ func (p *dsRolloutWedgeCheck) newRevisionHashes(ctx context.Context,
 	if target == nil || target.Name == "" {
 		return nil, false
 	}
-	hashes[target.Name] = true
+	h := target.Labels["controller-revision-hash"]
+	if h == "" {
+		h = strings.TrimPrefix(target.Name, ds.Name+"-")
+	}
+	if h == "" {
+		return nil, false
+	}
+	hashes[h] = true
 	return hashes, true
 }
 
@@ -398,8 +407,9 @@ func (p *dsRolloutWedgeCheck) maybeHealPod(ctx context.Context,
 	if healed[dsKey] {
 		return
 	}
+	healKey := probefw.SelfHealKey(CheckNameDaemonSetRolloutWedge, dsKey)
 	proceed, unverifiable := p.HealAllowedClusterWideOnly(ctx, log, &p.Heals,
-		dsKey, dsWedgeHealCooldown, now)
+		healKey, dsWedgeHealCooldown, now)
 	switch {
 	case unverifiable:
 		metrics.IncError(p.Name)
@@ -426,9 +436,9 @@ func (p *dsRolloutWedgeCheck) maybeHealPod(ctx context.Context,
 		// Already Terminating on a vanished/fenced node — a plain
 		// delete is an apiserver no-op, so the force path (grace=0)
 		// is required. blockingPod proved no PVC and no live kubelet.
-		deleted, err = heal.ForceDeletePod(ctx, p.CS, &p.Heals, dsKey, pod, now)
+		deleted, err = heal.ForceDeletePod(ctx, p.CS, &p.Heals, healKey, pod, now)
 	} else {
-		deleted, err = heal.DeletePod(ctx, p.CS, &p.Heals, dsKey, pod, now)
+		deleted, err = heal.DeletePod(ctx, p.CS, &p.Heals, healKey, pod, now)
 	}
 	if err != nil {
 		metrics.IncError(p.Name)
@@ -443,7 +453,6 @@ func (p *dsRolloutWedgeCheck) maybeHealPod(ctx context.Context,
 		return
 	}
 	healed[dsKey] = true
-	p.InvalidatePods(ctx)
 	rep.Find("healed: deleted wedging pod " + pod.Namespace + "/" +
 		pod.Name + " on " + dsKey)
 	log.Info("ACTION: deleted wedging DaemonSet pod to unstick rollout",

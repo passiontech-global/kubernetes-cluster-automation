@@ -132,10 +132,10 @@ type Snapshot struct {
 // (fail-closed source) or merely skips a check.
 func (g *Guard) TakeSnapshot(ctx context.Context) *Snapshot {
 	s := &Snapshot{G: g, Ctx: ctx}
-	// Paged censuses — the bare List calls below used to rely on the
-	// apiserver's default page size; on a cluster past it the webhook
-	// duties silently audited a truncated census.
-	opts := metav1.ListOptions{Limit: ListPageSize}
+	// Watch-cache censuses (Namespaces, MWC, VWC): ResourceVersion="0"
+	// lets kube-apiserver serve the list from its watch cache without
+	// Kine quorum pagination (pageOpts clears Limit when RV="0").
+	opts := metav1.ListOptions{ResourceVersion: "0", Limit: ListPageSize}
 	if items, err := kube.ListAll(ctx, opts, kube.Namespaces(g.CS)); err != nil {
 		s.NSErr = err
 	} else {

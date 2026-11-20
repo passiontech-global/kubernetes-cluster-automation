@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
@@ -128,5 +129,57 @@ func TestWireTargetBreakerLedger(t *testing.T) {
 	if metrics.HealTargetCircuitBrokenTotal.
 		DeleteLabelValues("kubelet-liveness-reaper", "n1") {
 		t.Fatal("expiry GC left the emitted series alive — forget must prune it")
+	}
+}
+
+func TestCircuitOpenEventNameSanitization(t *testing.T) {
+	now := time.Unix(1_700_000_000, 123456)
+	suffix := ".1798718e3b2e3340"
+	_ = suffix
+	cases := []struct {
+		name       string
+		target     string
+		wantPrefix string
+	}{
+		{"plain node", "worker-7", "worker-7."},
+		{"slash target", "loop-node/worker-7", "loop-node-worker-7."},
+		{"dotted target", "ns.ds.node-1", "ns.ds.node-1."},
+		{"mixed case underscore double dot", "Foo_Bar/Baz..1/", "foo-bar-baz.1."},
+		{"all punctuation", "///...", "target."},
+		{"empty", "", "target."},
+		{"over 253 chars", strings.Repeat("a", 300), "aaaa"},
+		{"boundary cut on dash", strings.Repeat("a", 230) + "---" + strings.Repeat("b", 30), "aaaa"},
+		{"boundary cut on dot", strings.Repeat("a", 230) + "..." + strings.Repeat("b", 30), "aaaa"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := circuitOpenEventName(tc.target, now)
+			if len(got) > maxCircuitEventNameLen {
+				t.Fatalf("len(%q) = %d > %d", got, len(got), maxCircuitEventNameLen)
+			}
+			if errs := validation.IsDNS1123Subdomain(got); len(errs) != 0 {
+				t.Fatalf("circuitOpenEventName(%q) = %q invalid DNS1123 subdomain: %v", tc.target, got, errs)
+			}
+			if !strings.HasPrefix(got, tc.wantPrefix) {
+				t.Fatalf("circuitOpenEventName(%q) = %q, want prefix %q", tc.target, got, tc.wantPrefix)
+			}
+		})
+	}
+}
+
+func TestEmitCircuitOpenEventSanitizesTargetInName(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	emitCircuitOpenEvent(cs, "coredns-stale-watchdog", "loop-node/worker-7", "3 heals")
+
+	events, err := cs.EventsV1().Events("default").List(t.Context(), metav1.ListOptions{})
+	if err != nil || len(events.Items) != 1 {
+		t.Fatalf("events = (%v, %v), want 1", events, err)
+	}
+	ev := events.Items[0]
+	if errs := validation.IsDNS1123Subdomain(ev.Name); len(errs) != 0 {
+		t.Fatalf("ev.Name %q invalid DNS1123 subdomain: %v", ev.Name, errs)
+	}
+	if ev.Regarding.Name != "loop-node/worker-7" {
+		t.Fatalf("ev.Regarding.Name = %q, want raw loop-node/worker-7", ev.Regarding.Name)
 	}
 }

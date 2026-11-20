@@ -143,10 +143,10 @@ type apiServiceSnapshot struct {
 // apiServiceSnapshot.
 func (g *apiServiceGuard) takeSnapshot(ctx context.Context) *apiServiceSnapshot {
 	items, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: apiServiceListPageSize},
+		metav1.ListOptions{Limit: apiServiceListPageSize, ResourceVersion: "0"},
 		kube.DynamicPage(g.dyn.Resource(apiServiceGVR)))
 	nss, nsErr := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: apiServiceListPageSize},
+		metav1.ListOptions{Limit: apiServiceListPageSize, ResourceVersion: "0"},
 		kube.Namespaces(g.cs))
 	return &apiServiceSnapshot{
 		g:     g,

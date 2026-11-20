@@ -176,9 +176,30 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	now := a.now.Now()
 
-	ids, err := kube.ListAll(ctx,
+	// Stream CiliumIdentity pages via ListEach: only totalIDs, the
+	// streaming security-label profiler, and name -> (creationTimestamp, UID)
+	// for non-reserved identities are retained, avoiding materializing a
+	// multi-10k Unstructured slice in memory.
+	var totalIDs int
+	var profiler securityLabelProfiler
+	idCreated := map[string]time.Time{}
+	idUIDs := map[string]types.UID{}
+	err := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.DynamicPage(a.dyn.Resource(ciliumIdentityGVR)))
+		kube.DynamicPage(a.dyn.Resource(ciliumIdentityGVR)),
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				id := &page[i]
+				totalIDs++
+				profiler.observe(id)
+				if reservedIdentity(id) {
+					continue
+				}
+				idCreated[id.GetName()] = id.GetCreationTimestamp().Time
+				idUIDs[id.GetName()] = id.GetUID()
+			}
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("list ciliumidentities: %w", err) // wrapper IncErrors — a returned error must not count itself
 	}
@@ -190,32 +211,14 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 	// name the keys minting identities (each distinct label SET is
 	// one identity; the top keys are the workload attributes
 	// inflating the table).
-	totalIDs := len(ids)
 	metrics.CiliumActiveIdentities.Set(float64(totalIDs))
 	if totalIDs > ciliumActiveIdentityWarn {
 		log.Info("CiliumIdentity count above warn threshold — top "+
 			"security-label keys by distinct values",
 			"total", totalIDs, "threshold", ciliumActiveIdentityWarn,
-			"topLabelKeys", topSecurityLabelKeys(ids, 3))
+			"topLabelKeys", profiler.top(3))
 	}
-	// Keep only name → (creationTimestamp, UID): the audit never
-	// reads identity bodies beyond the age gate and the delete
-	// precondition, and dropping the whole UnstructuredList here lets
-	// GC reclaim it while the two cluster-wide lists below are still
-	// in flight. Reserved-range identities (1–255, or a `reserved:`
-	// security label) are skipped outright — upstream GC exempts
-	// them, so they are neither orphans nor collectible.
-	idCreated := make(map[string]time.Time, len(ids))
-	idUIDs := make(map[string]types.UID, len(ids))
-	for i := range ids {
-		id := &ids[i]
-		if reservedIdentity(id) {
-			continue
-		}
-		idCreated[id.GetName()] = id.GetCreationTimestamp().Time
-		idUIDs[id.GetName()] = id.GetUID()
-	}
-	ids = nil
+	profiler = securityLabelProfiler{}
 
 	used := map[string]struct{}{}
 

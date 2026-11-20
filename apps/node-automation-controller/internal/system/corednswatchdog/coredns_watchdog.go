@@ -150,9 +150,12 @@ type coreDNSWatchdog struct {
 	// one Service GET + one namespaced EndpointSlice list instead
 	// of re-scanning every Service in the cluster. cachedFresh
 	// records which selection path produced the target: the
-	// <10m-old-Service path (fresh=true) must re-prove its age
-	// window on refresh, while the EndpointSlice fallback
-	// (fresh=false) only needs live endpoints + a want-set.
+	// <10m-Service path (fresh=true) refreshes on both TTL expiry
+	// and invalidation while re-proving its age window; a headless
+	// fallback (fresh=false) refreshes only on mid-cycle invalidation
+	// (so TTL expiry re-picks cluster-wide), and a ClusterIP fallback
+	// (fresh=false) never refreshes so a newer headless or <10m target
+	// is picked instead.
 	cachedNS    string
 	cachedName  string
 	cachedFresh bool
@@ -186,17 +189,20 @@ func (w *coreDNSWatchdog) probeFQDNState(ctx context.Context) (string, map[strin
 	fqdn, want, at := w.cachedFQDN, w.cachedWant, w.cachedAt
 	ns, name, fresh := w.cachedNS, w.cachedName, w.cachedFresh
 	w.fqdnMu.Unlock()
-	if fqdn != "" && w.now.Now().Sub(at) < corednsFQDNCacheTTL {
-		return fqdn, want, true
+	if fqdn != "" {
+		if age := w.now.Now().Sub(at); age >= 0 && age < corednsFQDNCacheTTL {
+			return fqdn, want, true
+		}
 	}
 	// TTL expired (or the entry was invalidated mid-cycle): refresh
-	// the SAME target's want-set through targeted reads first — the
-	// steady-state fallback target lives for many cycles and only
-	// its endpoint IPs churn, so a cluster-wide re-pick every 10m
-	// (and every invalidate-reprobe) is wasted apiserver load. A
-	// dead/aged-out/unqualifying target falls through to the full
-	// pick, preserving the original selection semantics.
-	if ns != "" {
+	// the SAME target's want-set through targeted reads when either the
+	// <10m freshness window (fresh=true) still holds or a headless
+	// fallback was invalidated mid-cycle (fresh=false, invalidated).
+	// On TTL expiry a fresh=false target must fall through to the full
+	// pick so a newer <10m Service or EndpointIP target can supersede
+	// it; ClusterIP fallbacks are always rejected by refreshProbeTarget.
+	invalidated := fqdn == ""
+	if ns != "" && (fresh || invalidated) {
 		if fqdn, want, ok := w.refreshProbeTarget(ctx, ns, name, fresh); ok {
 			w.fqdnMu.Lock()
 			w.cachedFQDN, w.cachedWant, w.cachedAt = fqdn, want, w.now.Now()
@@ -232,9 +238,10 @@ func (w *coreDNSWatchdog) invalidateFQDNCache() {
 	w.fqdnMu.Lock()
 	// The want-set is what's distrusted — the target's identity is
 	// not. Keeping ns/name/fresh lets the next probeFQDNState
-	// refresh the same target's want-set through targeted reads
-	// instead of paying a cluster-wide re-pick; a target that no
-	// longer qualifies falls through to the full pick anyway.
+	// refresh a fresh=true or headless fallback target's want-set
+	// through targeted reads instead of paying a cluster-wide re-pick;
+	// a ClusterIP fallback or aged-out target falls through to the
+	// full pick.
 	w.cachedFQDN, w.cachedWant, w.cachedAt = "", nil, time.Time{}
 	w.fqdnMu.Unlock()
 }

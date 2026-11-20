@@ -149,6 +149,14 @@ func vwc() *admissionv1.ValidatingWebhookConfiguration {
 
 func TestSweepFlipsOnlyBootEntries(t *testing.T) {
 	cfg := vwc()
+	for _, w := range []string{
+		"vselfnoderemediationconfig.kb.io", "vselfnoderemediationtemplate.kb.io",
+		"vfenceagentsremediation.kb.io", "vfenceagentsremediationtemplate.kb.io",
+		"vnodehealthcheck.kb.io", "vselfnoderemediation.kb.io",
+	} {
+		metrics.BootWebhookFailOpenTotal.DeleteLabelValues(cfg.Name, w)
+		t.Cleanup(func() { metrics.BootWebhookFailOpenTotal.DeleteLabelValues(cfg.Name, w) })
+	}
 	cs := k8sfake.NewClientset(cfg)
 	snap := &guardstate.Snapshot{G: &guardstate.Guard{CS: cs}}
 	var err error

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1320,5 +1321,119 @@ func TestVolumeAttachmentRWOFailsClosed(t *testing.T) {
 				t.Fatalf("volumeAttachmentRWO = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// Per-NotReady-node pod listing: Ready nodes (w1, w2) receive zero pod LISTs;
+// only NotReady nodes (w3, w4) are queried with spec.nodeName=<n> and
+// status.phase!=Succeeded,status.phase!=Failed.
+func TestDeadNodeSweeperPodListScopedToNotReadyNodes(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w3", "false")
+	cs := fake.NewSimpleClientset(
+		testutil.Node("w1", corev1.ConditionTrue, nil),
+		testutil.Node("w2", corev1.ConditionTrue, nil),
+		unknownNode("w3", 45*time.Minute),
+		unknownNode("w4", 45*time.Minute),
+		stuckTerminatingPod("web", "ready-stuck", "w1", 20*time.Minute),
+		stuckTerminatingPod("web", "dead-stuck", "w3", 20*time.Minute),
+	)
+	testutil.EmulatePodNodeNameSelector(cs)
+
+	var selectors []string
+	cs.PrependReactor("list", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			selectors = append(selectors, a.(ktesting.ListAction).GetListRestrictions().Fields.String())
+			return false, nil, nil
+		})
+
+	dyn := deadNodeDynFake(selfNodeRemediation("medik8s", "w3"))
+	s := deadNodeSweeperFor(cs, dyn, deadProbe)
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"spec.nodeName=w3,status.phase!=Failed,status.phase!=Succeeded",
+		"spec.nodeName=w4,status.phase!=Failed,status.phase!=Succeeded",
+	}
+	if !slices.Equal(selectors, want) {
+		t.Fatalf("pod list field selectors = %v, want %v", selectors, want)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintNodeOutOfService) {
+		t.Fatal("Ready node w1 was fenced")
+	}
+	if !kube.HasTaint(testutil.GetNode(t, cs, "w3").Spec.Taints, kube.TaintNodeOutOfService) {
+		t.Fatal("NotReady node w3 was not fenced")
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w4").Spec.Taints, kube.TaintNodeOutOfService) {
+		t.Fatal("NotReady node w4 with no stuck pods was fenced")
+	}
+}
+
+// Fail closed on multi-NotReady pod list error: if any NotReady node's pod
+// list fails, s.run returns an error and does NOT prune statefulSkipEmitted.
+func TestDeadNodeSweeperMultiNotReadyPodListErrorAborts(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		unknownNode("w2", 45*time.Minute),
+		stsOwnedTerminatingPod("db", "pg-0", "w1", 20*time.Minute),
+	)
+	testutil.EmulatePodNodeNameSelector(cs)
+
+	var failW2 atomic.Bool
+	cs.PrependReactor("list", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			if failW2.Load() {
+				if fields := a.(ktesting.ListAction).GetListRestrictions().Fields; fields != nil {
+					if nn, ok := fields.RequiresExactMatch("spec.nodeName"); ok && nn == "w2" {
+						return true, nil, errors.New("w2 pod list failed")
+					}
+				}
+			}
+			return false, nil, nil
+		})
+
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+	// Sweep 1 succeeds and sets DeadNodeUnfencedStatefulSkipped{node="w1"}=1.
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 1 {
+		t.Fatalf("skip gauge after sweep 1 = %v, want 1", got)
+	}
+
+	// Sweep 2 fails on w2: run must error and preserve w1's skip gauge series.
+	failW2.Store(true)
+	if err := s.run(ctx); err == nil {
+		t.Fatal("expected error when w2 pod list failed")
+	}
+	if got := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); got != 1 {
+		t.Fatalf("skip gauge after aborted sweep = %v, want 1 (must not prune on partial error)", got)
+	}
+}
+
+// stateful_holders.go's pod scan includes both spec.nodeName=<node> and
+// status.phase!=Succeeded,status.phase!=Failed.
+func TestDeadNodeSweeperStatefulHoldersFieldSelector(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", "false")
+	cs := fake.NewSimpleClientset(
+		unknownNode("w1", 45*time.Minute),
+		stuckTerminatingPod("web", "web-abc", "w1", 20*time.Minute),
+	)
+	var selectors []string
+	cs.PrependReactor("list", "pods",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			selectors = append(selectors, a.(ktesting.ListAction).GetListRestrictions().Fields.String())
+			return false, nil, nil
+		})
+
+	s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+	if err := s.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := "spec.nodeName=w1,status.phase!=Failed,status.phase!=Succeeded"
+	if len(selectors) != 2 || selectors[0] != want || selectors[1] != want {
+		t.Fatalf("pod list selectors = %v, want [%q, %q]", selectors, want, want)
 	}
 }

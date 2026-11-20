@@ -7,6 +7,7 @@ package reap
 
 import (
 	"context"
+	"errors"
 	"slices"
 
 	"github.com/go-logr/logr"
@@ -95,30 +96,48 @@ func Sweep[T any](ctx context.Context, log logr.Logger, items []T,
 		if opts.Cap > 0 && deleted+failed >= opts.Cap {
 			return deleted, failed, true
 		}
+		if ctx.Err() != nil {
+			return deleted, failed, false
+		}
 		item := items[i]
 		if opts.Confirm != nil {
 			proceed, err := opts.Confirm(ctx, item)
 			switch {
 			case err != nil:
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return deleted, failed, false
+				}
 				// Could not verify — keep the item (fail closed)
 				// and report; no delete was attempted so the cap
 				// is untouched.
 				if opts.OnError != nil {
 					opts.OnError(log, item, err)
 				}
+				if ctx.Err() != nil {
+					return deleted, failed, false
+				}
 				continue
 			case !proceed:
 				continue
 			}
 		}
+		if ctx.Err() != nil {
+			return deleted, failed, false
+		}
 		if opts.LogTarget != nil {
 			opts.LogTarget(log, item)
 		}
 		if err := opts.Delete(ctx, item); err != nil {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return deleted, failed, false
+			}
 			if opts.OnError != nil {
 				opts.OnError(log, item, err)
 			}
 			failed++
+			if ctx.Err() != nil {
+				return deleted, failed, false
+			}
 			continue
 		}
 		deleted++

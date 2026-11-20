@@ -43,16 +43,19 @@ func CRDInformerEnabled() bool {
 // update storm (CRD churn loops) cannot grow the map unbounded.
 const crdSizeTableCap = 1024
 
-// crdSizeKey is name+RV: the RV half makes a re-created CRD's fresh
-// object miss the old entry instead of inheriting its size.
-type crdSizeKey struct{ name, rv string }
+// crdSizeEntry stores the latest observed resourceVersion and JSON
+// byte size for one CRD name so updates overwrite in O(1).
+type crdSizeEntry struct {
+	rv   string
+	size int64
+}
 
-// CRDSizeTable is the bounded (name, resourceVersion) →
-// full-object JSON size map the CRD cache transform writes and the
-// kine census reads.
+// CRDSizeTable is the bounded name → (resourceVersion, full-object
+// JSON size) map the CRD cache transform writes and the kine census
+// reads.
 type CRDSizeTable struct {
 	mu       sync.RWMutex
-	m        map[crdSizeKey]int64
+	m        map[string]crdSizeEntry
 	capacity int
 }
 
@@ -64,7 +67,7 @@ var CRDSizeIndex = NewCRDSizeTable(crdSizeTableCap)
 
 // NewCRDSizeTable builds a table with the given entry capacity.
 func NewCRDSizeTable(capacity int) *CRDSizeTable {
-	return &CRDSizeTable{m: map[crdSizeKey]int64{}, capacity: capacity}
+	return &CRDSizeTable{m: map[string]crdSizeEntry{}, capacity: capacity}
 }
 
 // Record stamps one CRD's full serialized size. Called from the
@@ -72,24 +75,20 @@ func NewCRDSizeTable(capacity int) *CRDSizeTable {
 // the size is the json.Marshal-equivalent byte count of the UNSTRIPPED
 // object — exactly the number the pre-table census measured.
 func (t *CRDSizeTable) Record(name, rv string, size int64) {
-	k := crdSizeKey{name, rv}
+	if t == nil {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	// A CRD's resourceVersion moves on every update — entries keyed
-	// by older RVs of the SAME name are unreachable (a lookup only
-	// ever asks for the version the informer currently holds) and
-	// would grow the map one dead entry per CRD update forever.
-	for kk := range t.m {
-		if kk.name == name && kk != k {
-			delete(t.m, kk)
-		}
+	if t.m == nil {
+		t.m = map[string]crdSizeEntry{}
 	}
-	// Only a NEW key can grow the map — an update overwrites in
-	// place. Past capacity, drop roughly half the entries (map
-	// iteration order — the survivors are repopulated by the next
-	// informer pass/lookup fallback, and a miss costs one live read,
-	// never a wrong number).
-	if _, ok := t.m[k]; !ok && len(t.m) >= t.capacity {
+	// Only a NEW CRD name can grow the map — an RV update overwrites
+	// in place in O(1) without leaving stale RV entries behind. Past
+	// capacity, drop roughly half the entries (map iteration order —
+	// the survivors are repopulated by the next informer pass/lookup
+	// fallback, and a miss costs one live read, never a wrong number).
+	if _, ok := t.m[name]; !ok && len(t.m) >= t.capacity {
 		target := t.capacity / 2
 		for k := range t.m {
 			if len(t.m) <= target {
@@ -98,7 +97,7 @@ func (t *CRDSizeTable) Record(name, rv string, size int64) {
 			delete(t.m, k)
 		}
 	}
-	t.m[k] = size
+	t.m[name] = crdSizeEntry{rv: rv, size: size}
 }
 
 // Lookup returns the recorded full-object size for name at the given
@@ -106,8 +105,14 @@ func (t *CRDSizeTable) Record(name, rv string, size int64) {
 // (name, RV) pair yet (fresh CRD inside the watch-latency window, or
 // an unwired table): the consumer then measures live.
 func (t *CRDSizeTable) Lookup(name, rv string) (int64, bool) {
+	if t == nil {
+		return 0, false
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	size, ok := t.m[crdSizeKey{name, rv}]
-	return size, ok
+	e, ok := t.m[name]
+	if !ok || e.rv != rv {
+		return 0, false
+	}
+	return e.size, true
 }

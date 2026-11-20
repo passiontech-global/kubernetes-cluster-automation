@@ -10,8 +10,12 @@ import (
 
 	"github.com/go-logr/logr"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 )
 
 // tripThreshold picks the faster partition window only when raw
@@ -96,9 +100,10 @@ func TestCircuitPatchUnmeasurableRefFreezesRecovery(t *testing.T) {
 }
 
 func TestEmergencyPatch(t *testing.T) {
-	// Fail -> Ignore trips are the emergency actuation: the payload
-	// must bypass the Flux heal-revert gate. Pure Ignore -> Fail
-	// recoveries and annotation-only payloads stay gated.
+	// Fail -> Ignore trips are the emergency actuation: emergencyPatch
+	// returns true ONLY for payloads flipping at least one hook TO Ignore;
+	// pure Ignore -> Fail recoveries (handled separately by recoveryPatch)
+	// and annotation-only payloads return false.
 	for _, tc := range []struct {
 		name    string
 		payload string
@@ -114,4 +119,116 @@ func TestEmergencyPatch(t *testing.T) {
 			t.Errorf("%s: emergencyPatch = %v, want %v", tc.name, got, tc.want)
 		}
 	}
+}
+
+func TestRecoveryPatch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{"recover to Fail", `{"webhooks":[{"name":"h","failurePolicy":"Fail"}]}`, true},
+		{"mixed payload", `{"webhooks":[{"name":"a","failurePolicy":"Fail"},{"name":"b","failurePolicy":"Ignore"}]}`, true},
+		{"trip to Ignore", `{"webhooks":[{"name":"h","failurePolicy":"Ignore"}]}`, false},
+		{"annotation only", `{"metadata":{"annotations":{"x":"y"}}}`, false},
+		{"undecodable", `not json`, false},
+	} {
+		if got := recoveryPatch([]byte(tc.payload)); got != tc.want {
+			t.Errorf("%s: recoveryPatch = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestCircuitSweepFluxGateIsolationAndDirection(t *testing.T) {
+	metrics.WebhookCircuitBroken.Reset()
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	heal.ConfigureFluxConflictLoop(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureFluxConflictLoop(0, 0) })
+
+	fluxFields := []metav1.ManagedFieldsEntry{{Manager: "helm-controller", Operation: "Update"}}
+
+	t.Run("sibling duty Flux strikes do not block circuit_sweep annotation cleanup", func(t *testing.T) {
+		mwc := &admissionv1.MutatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:          "flux-iso-mwc",
+				ManagedFields: fluxFields,
+				// Stale annotation entry for a removed webhook -> annotation-only dropStale patch.
+				Annotations: map[string]string{guardstate.CircuitBrokenAnno: "gone.example.com"},
+			},
+		}
+		cs := fake.NewSimpleClientset(mwc)
+		g, b := wgBreakerGuard(cs, &now)
+
+		// Exhaust FluxPatchGate on all sibling duty keyspaces.
+		for _, prefix := range []string{"criticalns/", "orphansweep/", "timeoutclamp/"} {
+			key := prefix + guardstate.KindMutating + "/flux-iso-mwc"
+			heal.FluxPatchGate(guardstate.KindMutating, mwc, key, now)
+			heal.FluxPatchGate(guardstate.KindMutating, mwc, key, now)
+		}
+
+		if err := b.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		got, _ := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, "flux-iso-mwc", metav1.GetOptions{})
+		if _, exists := got.Annotations[guardstate.CircuitBrokenAnno]; exists {
+			t.Fatalf("circuit_sweep dropStale blocked by sibling duty Flux keys: annotations=%v", got.Annotations)
+		}
+	})
+
+	t.Run("Ignore to Fail recovery bypasses circuit_sweep Flux strikes while dropStale stays gated", func(t *testing.T) {
+		mwcRecover := &admissionv1.MutatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:          "flux-rec-mwc",
+				ManagedFields: fluxFields,
+				Annotations:   map[string]string{guardstate.CircuitBrokenAnno: "live.example.com"},
+			},
+			Webhooks: []admissionv1.MutatingWebhook{{
+				Name:          "live.example.com",
+				FailurePolicy: new(admissionv1.Ignore),
+				ClientConfig:  admissionv1.WebhookClientConfig{Service: wgSvcRef("backend", "svc")},
+			}},
+		}
+		mwcStale := &admissionv1.MutatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:          "flux-stale-mwc",
+				ManagedFields: fluxFields,
+				Annotations:   map[string]string{guardstate.CircuitBrokenAnno: "gone.example.com"},
+			},
+		}
+		cs := fake.NewSimpleClientset(
+			wgNamespace("backend"),
+			wgEndpointSlice("backend", "svc", 1, 0),
+			mwcRecover,
+			mwcStale,
+		)
+		g, b := wgBreakerGuard(cs, &now)
+
+		// Burn circuit_sweep/ strikes on both configs.
+		for _, name := range []string{"flux-rec-mwc", "flux-stale-mwc"} {
+			key := "circuit_sweep/" + guardstate.KindMutating + "/" + name
+			heal.FluxPatchGate(guardstate.KindMutating, mwcRecover, key, now)
+			heal.FluxPatchGate(guardstate.KindMutating, mwcRecover, key, now)
+		}
+
+		// Two healthy sweeps confirm Ignore -> Fail recovery.
+		for i := range RecoverConfirmSweeps {
+			if err := b.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+				t.Fatalf("sweep %d: %v", i+1, err)
+			}
+		}
+
+		gotRec, _ := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, "flux-rec-mwc", metav1.GetOptions{})
+		if *gotRec.Webhooks[0].FailurePolicy != admissionv1.Fail {
+			t.Fatalf("Ignore -> Fail recovery blocked by FluxPatchGate, got %v", *gotRec.Webhooks[0].FailurePolicy)
+		}
+		if _, exists := gotRec.Annotations[guardstate.CircuitBrokenAnno]; exists {
+			t.Fatalf("circuit-broken annotation not cleared after recovery: %v", gotRec.Annotations)
+		}
+
+		// Annotation-only dropStale patch MUST still be gated by circuit_sweep/ strikes.
+		gotStale, _ := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, "flux-stale-mwc", metav1.GetOptions{})
+		if gotStale.Annotations[guardstate.CircuitBrokenAnno] != "gone.example.com" {
+			t.Fatalf("annotation-only dropStale bypassed FluxPatchGate: %v", gotStale.Annotations)
+		}
+	})
 }

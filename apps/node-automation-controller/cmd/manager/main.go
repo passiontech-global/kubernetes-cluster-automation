@@ -51,6 +51,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -77,6 +80,8 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/registry"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx/pprofx"
 )
 
 var version = "dev"
@@ -90,7 +95,7 @@ func main() {
 }
 
 func run(sigCtx context.Context, args []string) error {
-	var metricsAddr, probeAddr, modulesFilter string
+	var metricsAddr, probeAddr, pprofAddr, modulesFilter string
 	var showVersion, leaderElect bool
 	var leaseDuration, renewDeadline, retryPeriod time.Duration
 	fs := flag.NewFlagSet("node-automation-controller", flag.ContinueOnError)
@@ -98,6 +103,11 @@ func run(sigCtx context.Context, args []string) error {
 		"address the Prometheus metrics endpoint binds to")
 	fs.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
 		"address the health/readiness probe endpoints bind to")
+	fs.StringVar(&pprofAddr, "pprof-bind-address",
+		envx.String("NODE_AUTOMATION_PPROF_BIND_ADDRESS", "127.0.0.1:9116"),
+		"LOOPBACK-ONLY address the /debug/pprof endpoints bind to "+
+			"(empty disables the listener; env "+
+			"NODE_AUTOMATION_PPROF_BIND_ADDRESS feeds the default)")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	fs.BoolVar(&leaderElect, "leader-elect", false,
 		"enable leader election via a coordination.k8s.io Lease — "+
@@ -148,6 +158,13 @@ func run(sigCtx context.Context, args []string) error {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	log := ctrl.Log.WithName("main")
+
+	if pprofAddr != "" {
+		if err := validateLoopbackBindAddr(pprofAddr); err != nil {
+			log.Error(err, "invalid -pprof-bind-address", "addr", pprofAddr)
+			return err
+		}
+	}
 
 	// Resolve the -modules allowlist before touching the cluster: an
 	// unknown name fails boot here (fail fast — a typo'd allowlist
@@ -335,12 +352,13 @@ func run(sigCtx context.Context, args []string) error {
 		// modules stop inside one poll interval instead of riding
 		// out the Active-Active Split-Brain window.
 		if err := mgr.Add(&leaseLossWatchdog{
-			cs:        probeCS,
-			namespace: leaderNS,
-			selfID:    leaderLock.Identity(),
-			stolen:    &leaseStolen,
-			cancel:    workCancel,
-			log:       ctrl.Log.WithName("lease-loss-watchdog"),
+			cs:            probeCS,
+			namespace:     leaderNS,
+			selfID:        leaderLock.Identity(),
+			stolen:        &leaseStolen,
+			cancel:        workCancel,
+			log:           ctrl.Log.WithName("lease-loss-watchdog"),
+			renewDeadline: renewDeadline,
 		}); err != nil {
 			log.Error(err, "unable to add lease loss watchdog")
 			return err
@@ -363,18 +381,64 @@ func run(sigCtx context.Context, args []string) error {
 		return err
 	}
 
+	liveness := shared.NewLiveness()
+	workCtx = shared.WithLiveness(workCtx, liveness)
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to add healthz check")
+		return err
+	}
+	if err := mgr.AddHealthzCheck("periodic-loops", liveness.Check); err != nil {
+		log.Error(err, "unable to add periodic-loops healthz check")
 		return err
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		log.Error(err, "unable to add readyz check")
 		return err
 	}
+	if err := mgr.AddReadyzCheck("informer-cache", func(req *http.Request) error {
+		if workCtx.Err() != nil {
+			return errors.New("manager shutting down")
+		}
+		cctx, cancel := context.WithTimeout(req.Context(), 50*time.Millisecond)
+		defer cancel()
+		if !mgr.GetCache().WaitForCacheSync(cctx) {
+			return errors.New("informer cache not synced")
+		}
+		return nil
+	}); err != nil {
+		log.Error(err, "unable to add informer-cache readyz check")
+		return err
+	}
+
+	var pprofBind string
+	var pprofErr atomic.Pointer[error]
+	if pprofAddr != "" {
+		pprofSrv, err := httpx.New(pprofAddr, pprofMux(), pprofServerOpts)
+		if err != nil {
+			log.Error(err, "unable to bind pprof loopback listener", "addr", pprofAddr)
+			return err
+		}
+		pprofBind = pprofSrv.Addr()
+		defer func() {
+			sctx, scancel := context.WithTimeout(context.Background(), httpx.DefaultShutdownBudget)
+			defer scancel()
+			if serr := pprofSrv.Shutdown(sctx); serr != nil {
+				log.Error(serr, "pprof loopback server shutdown failed")
+			}
+		}()
+		pprofErrCh := pprofSrv.Serve()
+		go func() {
+			if err := <-pprofErrCh; err != nil {
+				pprofErr.Store(&err)
+				workCancel()
+			}
+		}()
+	}
 
 	log.Info("starting manager", "version", version,
 		"leaderElection", leaderElect, "metricsAddr", metricsAddr,
-		"probeAddr", probeAddr,
+		"probeAddr", probeAddr, "pprofAddr", pprofBind,
 		// 0s in this line means "controller-runtime default" — see the
 		// flag comments above.
 		"leaseDuration", leaseDuration, "renewDeadline", renewDeadline,
@@ -382,6 +446,52 @@ func run(sigCtx context.Context, args []string) error {
 	if err := mgr.Start(workCtx); err != nil {
 		log.Error(err, "manager exited")
 		return err
+	}
+	if ep := pprofErr.Load(); ep != nil {
+		log.Error(*ep, "pprof loopback server exited")
+		return *ep
+	}
+	return nil
+}
+
+// pprofServerOpts keeps the loopback-only profile listener bounded
+// against slowloris headers/reads while leaving WriteTimeout at 0 so
+// pprof.Profile/Trace legitimately outlive their sampling windows.
+var pprofServerOpts = httpx.Opts{
+	ReadHeaderTimeout: 5 * time.Second,
+	ReadTimeout:       15 * time.Second,
+	WriteTimeout:      0,
+	IdleTimeout:       60 * time.Second,
+}
+
+// pprofMux serves /debug/pprof/* via libs/hostkit/httpx/pprofx so this
+// binary never imports net/http/pprof directly (which mutates
+// http.DefaultServeMux via init()).
+func pprofMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	pprofx.Register(mux)
+	return mux
+}
+
+// validateLoopbackBindAddr enforces that -pprof-bind-address targets
+// loopback only (127.0.0.0/8, ::1, or localhost) with a non-empty port.
+func validateLoopbackBindAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid pprof bind address %q: %w", addr, err)
+	}
+	if port == "" {
+		return fmt.Errorf("invalid pprof bind address %q: port must be specified", addr)
+	}
+	if host == "" {
+		return fmt.Errorf("pprof bind address %q must be loopback-only (wildcard bind disallowed)", addr)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil || !ip.Unmap().IsLoopback() {
+		return fmt.Errorf("pprof bind address %q must be loopback-only (127.0.0.0/8, ::1, or localhost)", addr)
 	}
 	return nil
 }

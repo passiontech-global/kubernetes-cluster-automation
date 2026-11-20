@@ -11,6 +11,7 @@ package shared
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,13 +38,58 @@ const eventReasonRemediationCircuitBreakerOpen = "RemediationCircuitBreakerOpen"
 // (the zone-starvation emitter's rule). Best-effort: a failure is
 // logged and never escalates — the HealTargetCircuitBrokenTotal
 // counter is the guaranteed signal.
+const maxCircuitEventNameLen = 253
+
+// circuitOpenEventName turns an arbitrary target key (e.g.
+// "loop-node/worker-7", "ns.ds.node", "Foo_Bar") into a valid RFC
+// 1123 DNS subdomain Event metadata.name while preserving the
+// trailing .<hex> timestamp suffix. Metrics and Regarding.Name keep
+// the raw target unchanged.
+func circuitOpenEventName(target string, now time.Time) string {
+	suffix := fmt.Sprintf(".%x", uint64(now.UnixNano()))
+	var segments []string
+	for _, seg := range strings.Split(target, ".") {
+		var b strings.Builder
+		b.Grow(len(seg))
+		for i := 0; i < len(seg); i++ {
+			c := seg[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-':
+				b.WriteByte(c)
+			case c >= 'A' && c <= 'Z':
+				b.WriteByte(c + ('a' - 'A'))
+			default:
+				b.WriteByte('-')
+			}
+		}
+		clean := strings.Trim(b.String(), "-")
+		if clean != "" {
+			segments = append(segments, clean)
+		}
+	}
+	base := strings.Join(segments, ".")
+	if base == "" {
+		base = "target"
+	}
+	if maxBase := maxCircuitEventNameLen - len(suffix); len(base) > maxBase {
+		if maxBase <= 0 {
+			return strings.TrimLeft(suffix, ".")
+		}
+		base = strings.TrimRight(base[:maxBase], ".-")
+		if base == "" {
+			base = "target"
+		}
+	}
+	return base + suffix
+}
+
 func emitCircuitOpenEvent(cs kubernetes.Interface, module, target, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	now := time.Now()
 	ev := &eventsv1.Event{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("%s.%x", target, now.UnixNano()),
+			Name: circuitOpenEventName(target, now),
 		},
 		EventTime:           metav1.NewMicroTime(now),
 		Reason:              eventReasonRemediationCircuitBreakerOpen,

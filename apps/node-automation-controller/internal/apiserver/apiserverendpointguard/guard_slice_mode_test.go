@@ -10,9 +10,13 @@ import (
 	"testing"
 
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	discoveryv1client "k8s.io/client-go/kubernetes/typed/discovery/v1"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -328,5 +332,119 @@ func TestEndpointGuardMirrorSliceIgnoredOnNewVersion(t *testing.T) {
 	}
 	if probed["10.0.0.1"] != 1 || probed["10.0.0.2"] != 1 {
 		t.Fatalf("endpoints IPs not probed through the mirror-slice path: %v", probed)
+	}
+}
+
+func TestEndpointGuardSliceModeRetryOnConflict(t *testing.T) {
+	eps := kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"})
+	eps.ResourceVersion = "1"
+	cs := fake.NewSimpleClientset(eps)
+	dyn := testutil.NewDynamicClient()
+	fakeServerVersion(cs, "1", "33")
+	g := newEndpointGuard(cs, dyn, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	for range endpointGuardErrCycles - 1 {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	attempts := 0
+	cs.PrependReactor("update", "endpointslices",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			if attempts == 1 {
+				// Simulate the apiserver endpoint reconciler concurrently
+				// adding a 3rd backend and bumping ResourceVersion before retry.
+				// Use cs.Tracker().Get directly (calling cs.DiscoveryV1()...Get
+				// inside a reactor deadlocks on Fake.Invokes's non-reentrant lock).
+				obj, err := cs.Tracker().Get(
+					discoveryv1.SchemeGroupVersion.WithResource("endpointslices"),
+					endpointGuardNS, eps.Name,
+				)
+				if err != nil {
+					t.Fatalf("tracker get: %v", err)
+				}
+				cur := obj.(*discoveryv1.EndpointSlice).DeepCopy()
+				cur.ResourceVersion = "2"
+				ready := true
+				cur.Endpoints = append(cur.Endpoints, discoveryv1.Endpoint{
+					Addresses:  []string{"10.0.0.3"},
+					Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+				})
+				if err := cs.Tracker().Update(
+					discoveryv1.SchemeGroupVersion.WithResource("endpointslices"),
+					cur, endpointGuardNS,
+				); err != nil {
+					t.Fatalf("tracker update: %v", err)
+				}
+				return true, nil, apierrors.NewConflict(
+					schema.GroupResource{Group: "discovery.k8s.io", Resource: "endpointslices"},
+					cur.Name, errors.New("resourceVersion mismatch"))
+			}
+			return false, nil, nil
+		})
+
+	if err := g.run(ctx); err != nil {
+		t.Fatalf("slice-mode conflict retry failed: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("update attempts = %d, want 2 (initial conflict + retry)", attempts)
+	}
+	got := getKubeSlice(t, cs)
+	addrs := sliceAddrSet(got)
+	if addrs["10.0.0.1"] {
+		t.Fatal("wedged IP 10.0.0.1 still present after conflict retry")
+	}
+	if !addrs["10.0.0.2"] || !addrs["10.0.0.3"] {
+		t.Fatalf("concurrent/healthy IPs lost after conflict retry: %v", addrs)
+	}
+	if got.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation = %q, want 10.0.0.1", got.Annotations[endpointGuardAnno])
+	}
+}
+
+type ssotSliceListRecorder struct {
+	kubernetes.Interface
+	opts []metav1.ListOptions
+}
+
+func (r *ssotSliceListRecorder) DiscoveryV1() discoveryv1client.DiscoveryV1Interface {
+	return &recSSOTDiscovery{DiscoveryV1Interface: r.Interface.DiscoveryV1(), r: r}
+}
+
+type recSSOTDiscovery struct {
+	discoveryv1client.DiscoveryV1Interface
+	r *ssotSliceListRecorder
+}
+
+func (d *recSSOTDiscovery) EndpointSlices(ns string) discoveryv1client.EndpointSliceInterface {
+	return &recSSOTEndpointSlices{EndpointSliceInterface: d.DiscoveryV1Interface.EndpointSlices(ns), r: d.r}
+}
+
+type recSSOTEndpointSlices struct {
+	discoveryv1client.EndpointSliceInterface
+	r *ssotSliceListRecorder
+}
+
+func (e *recSSOTEndpointSlices) List(ctx context.Context, opts metav1.ListOptions) (*discoveryv1.EndpointSliceList, error) {
+	e.r.opts = append(e.r.opts, opts)
+	return e.EndpointSliceInterface.List(ctx, opts)
+}
+
+func TestKubernetesSlicesUsesStrongRead(t *testing.T) {
+	rec := &ssotSliceListRecorder{Interface: fake.NewSimpleClientset(kubeEndpointSlice([]string{"10.0.0.1"}))}
+	g := &apiServerEndpointGuard{cs: rec}
+	slices, err := g.kubernetesSlices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slices) != 1 {
+		t.Fatalf("slices = %d, want 1", len(slices))
+	}
+	if len(rec.opts) != 1 || rec.opts[0].ResourceVersion != "" {
+		t.Fatalf("kubernetesSlices ListOptions = %+v, want strong read ResourceVersion=\"\"", rec.opts)
 	}
 }

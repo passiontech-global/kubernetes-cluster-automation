@@ -242,10 +242,14 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 		blocked := p.Status.ExpectedPods > 0 && p.Status.DisruptionsAllowed == 0
 		// cordoned_node_blocked requires the PDB's own pods on a
 		// cordoned node — computed lazily so the pod list only runs
-		// for PDBs that are actually blocking right now.
+		// for PDBs that are actually blocking right now. Reuse the
+		// fetched pod slice in relieveCordonedBlockWithPods below so
+		// each blocked PDB pays at most 1 pod LIST per sweep.
 		cordonedBlocked := false
+		var pdbPods []corev1.Pod
+		podsListed := false
 		if blocked && anyCordoned {
-			cordonedBlocked = w.pdbPodsOnCordonedNodes(ctx, p, cordoned)
+			cordonedBlocked, pdbPods, podsListed = w.pdbPodsOnCordonedNodes(ctx, p, cordoned)
 		}
 		reasons := []struct {
 			name   string
@@ -288,9 +292,11 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 				"since", first.Format(time.RFC3339))
 			// The cordoned-node deadlock is the one reason with an
 			// automated relief: patch unhealthyPodEvictionPolicy or
-			// delete the wedged pod so the drain can finish.
-			if r.name == pdbReasonCordonedNode {
-				w.relieveCordonedBlock(ctx, log, now, p, cordoned)
+			// delete the wedged pod so the drain can finish. Skip
+			// relief when the pod LIST itself failed (!podsListed):
+			// we already IncError'd once above.
+			if r.name == pdbReasonCordonedNode && podsListed {
+				w.relieveCordonedBlockWithPods(ctx, log, now, p, cordoned, pdbPods, true)
 			}
 		}
 		if reported {
@@ -324,20 +330,23 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 // deadlock real. A pod in a terminal phase does not count (it is
 // already on its way out). Fail closed: an unreadable selector or a
 // failed pod list keeps the flag (a false cordoned_node_blocked is
-// loud; a silently-cleared one hides a live drain wedge).
+// loud; a silently-cleared one hides a live drain wedge). Returns the
+// listed pods and listOK so run() passes them straight to
+// relieveCordonedBlockWithPods without a duplicate pod LIST.
 func (w *pdbDeadlockWatchdog) pdbPodsOnCordonedNodes(ctx context.Context,
-	p *policyv1.PodDisruptionBudget, cordoned map[string]bool) bool {
+	p *policyv1.PodDisruptionBudget, cordoned map[string]bool) (blocked bool, pods []corev1.Pod, listOK bool) {
 
 	if p.Spec.Selector == nil {
-		return false // policy/v1 nil selector matches no pods
+		return false, nil, true // policy/v1 nil selector matches no pods
 	}
 	sel, err := metav1.LabelSelectorAsSelector(p.Spec.Selector)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "PDB selector unparseable — keeping cordoned verdict",
 			"pdb", p.Namespace+"/"+p.Name)
-		return true
+		return true, nil, false
 	}
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
+	pods, err = kube.ListAll(ctx, metav1.ListOptions{
+		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
 		Limit:         kube.DefaultListPageSize,
 		LabelSelector: sel.String(),
 	}, kube.Pods(w.cs, p.Namespace))
@@ -345,7 +354,7 @@ func (w *pdbDeadlockWatchdog) pdbPodsOnCordonedNodes(ctx context.Context,
 		metrics.IncError(w.queue)
 		logf.FromContext(ctx).Error(err, "PDB pod list failed — keeping cordoned verdict",
 			"pdb", p.Namespace+"/"+p.Name)
-		return true
+		return true, nil, false
 	}
 	for i := range pods {
 		pod := &pods[i]
@@ -356,9 +365,9 @@ func (w *pdbDeadlockWatchdog) pdbPodsOnCordonedNodes(ctx context.Context,
 			pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		return true
+		return true, pods, true
 	}
-	return false
+	return false, pods, true
 }
 
 // ---------------------------------------------------------------------------
@@ -410,11 +419,17 @@ var pdbDBQuorumLabels = []string{
 func (w *pdbDeadlockWatchdog) relieveCordonedBlock(ctx context.Context,
 	log logr.Logger, now time.Time, pdb *policyv1.PodDisruptionBudget,
 	cordoned map[string]bool) {
+	w.relieveCordonedBlockWithPods(ctx, log, now, pdb, cordoned, nil, false)
+}
+
+func (w *pdbDeadlockWatchdog) relieveCordonedBlockWithPods(ctx context.Context,
+	log logr.Logger, now time.Time, pdb *policyv1.PodDisruptionBudget,
+	cordoned map[string]bool, pods []corev1.Pod, podsFetched bool) {
 
 	if !w.cfg.cordonedUnhealthyRelief {
 		return
 	}
-	pod := w.failingPodOnCordonedNode(ctx, pdb, cordoned)
+	pod := w.failingPodOnCordonedNodeWithPods(ctx, now, pdb, cordoned, pods, podsFetched)
 	if pod == nil {
 		return
 	}
@@ -501,34 +516,38 @@ func (w *pdbDeadlockWatchdog) relieveCordonedBlock(ctx context.Context,
 		"pod", pod.Namespace+"/"+pod.Name)
 }
 
-// failingPodOnCordonedNode returns the first pod matching the PDB's
-// selector that sits on an actively-cordoned node, is not in a
+// failingPodOnCordonedNodeWithPods returns the first pod matching the
+// PDB's selector that sits on an actively-cordoned node, is not in a
 // terminal phase, has been Ready=False for >= pdbReliefPodMinAge,
 // and carries a container waiting in a hard-error reason. nil when
 // no pod qualifies — the PDB block then has no pod-level wedge this
-// relief can act on.
-func (w *pdbDeadlockWatchdog) failingPodOnCordonedNode(ctx context.Context,
-	pdb *policyv1.PodDisruptionBudget,
-	cordoned map[string]bool) *corev1.Pod {
+// relief can act on. When podsFetched is true, reuses pods from
+// pdbPodsOnCordonedNodes without issuing a second pod LIST.
+func (w *pdbDeadlockWatchdog) failingPodOnCordonedNodeWithPods(ctx context.Context,
+	now time.Time, pdb *policyv1.PodDisruptionBudget,
+	cordoned map[string]bool, pods []corev1.Pod, podsFetched bool) *corev1.Pod {
 
-	if pdb.Spec.Selector == nil {
-		return nil
+	if !podsFetched {
+		if pdb.Spec.Selector == nil {
+			return nil
+		}
+		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			return nil
+		}
+		var listErr error
+		pods, listErr = kube.ListAll(ctx, metav1.ListOptions{
+			FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
+			Limit:         kube.DefaultListPageSize,
+			LabelSelector: sel.String(),
+		}, kube.Pods(w.cs, pdb.Namespace))
+		if listErr != nil {
+			metrics.IncError(w.queue)
+			logf.FromContext(ctx).Error(listErr, "PDB relief pod list failed",
+				"pdb", pdb.Namespace+"/"+pdb.Name)
+			return nil
+		}
 	}
-	sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
-	if err != nil {
-		return nil
-	}
-	pods, err := kube.ListAll(ctx, metav1.ListOptions{
-		Limit:         kube.DefaultListPageSize,
-		LabelSelector: sel.String(),
-	}, kube.Pods(w.cs, pdb.Namespace))
-	if err != nil {
-		metrics.IncError(w.queue)
-		logf.FromContext(ctx).Error(err, "PDB relief pod list failed",
-			"pdb", pdb.Namespace+"/"+pdb.Name)
-		return nil
-	}
-	now := w.now.Now()
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Spec.NodeName == "" || !cordoned[pod.Spec.NodeName] {

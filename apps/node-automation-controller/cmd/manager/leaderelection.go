@@ -124,6 +124,17 @@ func buildLeaderLock(cfg *rest.Config, scheme *runtime.Scheme,
 	stolen *atomic.Bool, done <-chan struct{}) (resourcelock.Interface, error) {
 
 	elCfg := leaderClientConfig(cfg, renewDeadline)
+	// Isolate leader-election + event-sink HTTP/2 + TCP pool from
+	// both the fleet and probe clients so fleet congestion or stale
+	// pooled sockets cannot stall Lease renewals.
+	tr, err := isolatedTransport(elCfg)
+	if err != nil {
+		return nil, fmt.Errorf("leader-election transport: %w", err)
+	}
+	if tr != elCfg.Transport {
+		elCfg.Transport = tr
+		elCfg.TLSClientConfig = rest.TLSClientConfig{}
+	}
 	// ONE clientset for the whole election — the resource lock's
 	// core/coordination faces, the event sink and the guard's live
 	// Gets all share it. The per-surface constructors this replaced

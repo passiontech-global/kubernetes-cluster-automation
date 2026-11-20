@@ -154,8 +154,8 @@ func TestWatchdogSelfFencesOnSustainedReadFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("watchdog did not self-fence on sustained read failure")
 	}
-	if !stolen.Load() {
-		t.Fatal("stolen flag not set before self-fence cancel")
+	if stolen.Load() {
+		t.Fatal("stolen flag must remain false on inconclusive self-fence")
 	}
 	<-done
 }
@@ -175,8 +175,8 @@ func TestWatchdogSelfFencesOnEmptyHolder(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("watchdog did not self-fence on persistent empty holder")
 	}
-	if !stolen.Load() {
-		t.Fatal("stolen flag not set before self-fence cancel")
+	if stolen.Load() {
+		t.Fatal("stolen flag must remain false on inconclusive self-fence")
 	}
 	<-done
 }
@@ -231,5 +231,99 @@ func TestWatchdogNeedLeaderElection(t *testing.T) {
 	var w leaseLossWatchdog
 	if !w.NeedLeaderElection() {
 		t.Fatal("leaseLossWatchdog.NeedLeaderElection() = false, want true")
+	}
+}
+
+func TestSelfFenceDuration(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"unset zero defaults to 10s", 0, 7500 * time.Millisecond},
+		{"negative defaults to 10s", -5 * time.Second, 7500 * time.Millisecond},
+		{"floor at 1s", time.Second, time.Second},
+		{"default 10s", 10 * time.Second, 7500 * time.Millisecond},
+		{"e2e 15s", 15 * time.Second, 11250 * time.Millisecond},
+		{"deployment 120s", 120 * time.Second, 90 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := selfFenceDuration(tc.in); got != tc.want {
+				t.Fatalf("selfFenceDuration(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWatchdogRenewDeadlineTolerance verifies that a 120s RenewDeadline
+// scales the self-fence horizon proportionally (~90s) rather than using
+// a hardcoded 20s constant — sustained read errors past 50ms must not
+// fence prematurely.
+func TestWatchdogRenewDeadlineTolerance(t *testing.T) {
+	w, stolen, cancelled := newWatchdog(t, leaseObj("pod-a_1234"))
+	w.renewDeadline = 120 * time.Second
+	w.cs.(*fake.Clientset).PrependReactor("get", "leases",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, context.DeadlineExceeded
+		})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx) }()
+	time.Sleep(60 * time.Millisecond)
+	select {
+	case <-cancelled:
+		t.Fatal("watchdog fenced prematurely under 120s renewDeadline")
+	default:
+	}
+	if stolen.Load() {
+		t.Fatal("stolen flag set on inconclusive reads")
+	}
+	cancel()
+	<-done
+}
+
+// TestWatchdogInconclusiveSelfFenceAllowsGuardedRelease verifies the full
+// inconclusive-self-fence + releaseGuardedLock contract: after self-fencing
+// on inconclusive reads, stolen stays false so releaseGuardedLock performs a
+// live Get — releasing immediately when still self-held (avoiding a 180s
+// blackout) and refusing release if a foreign holder took over.
+func TestWatchdogInconclusiveSelfFenceAllowsGuardedRelease(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		liveHolder string
+		wantWrites int
+	}{
+		{"still self-held releases cleanly", "pod-a_1234", 1},
+		{"foreign holder refuses release", "pod-b_5678", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, stolen, cancelled := newWatchdog(t, leaseObj("pod-a_1234"))
+			w.fenceAfter = 40 * time.Millisecond
+			w.cs.(*fake.Clientset).PrependReactor("get", "leases",
+				func(clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, context.DeadlineExceeded
+				})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- w.Start(ctx) }()
+			select {
+			case <-cancelled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("watchdog did not self-fence")
+			}
+			<-done
+
+			inner := &fakeLock{holder: tc.liveHolder}
+			guard := &releaseGuardedLock{Interface: inner, stolen: stolen}
+			if err := guard.Update(t.Context(), releaseRec()); err != nil {
+				t.Fatalf("guarded release error: %v", err)
+			}
+			if len(inner.updates) != tc.wantWrites {
+				t.Fatalf("release writes = %d, want %d (holder=%q, stolen=%v)",
+					len(inner.updates), tc.wantWrites, tc.liveHolder, stolen.Load())
+			}
+		})
 	}
 }

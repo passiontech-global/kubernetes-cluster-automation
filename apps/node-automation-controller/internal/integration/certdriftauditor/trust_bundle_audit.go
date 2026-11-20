@@ -86,7 +86,14 @@ func (a *certDriftAuditor) auditTrustBundles(ctx context.Context) error {
 		// ca.crt + crt.pem is what the gauge reports.
 		var bundle []byte
 		for _, key := range []string{"ca.crt", "crt.pem"} {
-			bundle = append(bundle, s.Data[key]...)
+			part := s.Data[key]
+			if len(part) == 0 {
+				continue
+			}
+			if len(bundle) > 0 && bundle[len(bundle)-1] != '\n' {
+				bundle = append(bundle, '\n')
+			}
+			bundle = append(bundle, part...)
 		}
 		if len(bundle) == 0 {
 			continue

@@ -154,8 +154,9 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 	}
 	stsPod := false
 	err = kube.ListEach(ctx, metav1.ListOptions{
-		FieldSelector: "spec.nodeName=" + nodeName,
-		Limit:         kube.DefaultListPageSize,
+		FieldSelector: "spec.nodeName=" + nodeName +
+			",status.phase!=Succeeded,status.phase!=Failed",
+		Limit: kube.DefaultListPageSize,
 	}, kube.Pods(s.cs, metav1.NamespaceAll),
 		func(items []corev1.Pod) error {
 			for i := range items {

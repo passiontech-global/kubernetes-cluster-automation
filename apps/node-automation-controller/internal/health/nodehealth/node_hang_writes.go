@@ -13,6 +13,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +23,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // uncordonCleared lifts the cordon this check stamped on nodes
@@ -115,17 +117,41 @@ func nodeByName(nodes []corev1.Node, name string) *corev1.Node {
 	return nil
 }
 
+// nodeHangLocalRemediationLease matches node-host-agent's
+// LocalRemediationLease / heal.localRemediationLease: L3 yields
+// precordoning while L1 is actively remediating within its 3m lease.
+const nodeHangLocalRemediationLease = 3 * time.Minute
+
+func nodeLocalRemediationActive(ctx context.Context, n *corev1.Node, now time.Time) bool {
+	if until, ok := kube.AnnoTimeCtx(ctx, n, nodecond.AnnoLocalRemediationUntil); ok &&
+		until.After(now) {
+		return true
+	}
+	if c := kube.NodeCondition(n, nodecond.CondLocalRemediation); c != nil &&
+		c.Status == corev1.ConditionTrue &&
+		kube.CondHeartbeatLive(c, nodeHangLocalRemediationLease, now) {
+		return true
+	}
+	return false
+}
+
 // cordonLatched patches spec.unschedulable=true + the precordon
 // stamp onto every latch-positive, still-schedulable worker —
 // bounded by the 35% cordoned-worker ratio so the guard cannot
 // unnode the fleet during a correlated event (bad kernel rollout,
 // storage backend outage). Returns the updated cordoned count.
 func (p *nodeHangCheck) cordonLatched(ctx context.Context, log logr.Logger,
-	rep *probefw.SweepReport, nodes []corev1.Node, workers, cordoned int) int {
+	rep *probefw.SweepReport, nodes []corev1.Node, workers, cordoned int,
+	now time.Time) int {
 	for _, entry := range rep.Sorted() {
 		name, _, _ := strings.Cut(entry, ":")
 		target := nodeByName(nodes, name)
 		if target == nil || target.Spec.Unschedulable {
+			continue
+		}
+		if nodeLocalRemediationActive(ctx, target, now) {
+			log.Info("YIELD: node-host-agent local remediation in flight — precordon deferred",
+				"node", name, "condition", entry)
 			continue
 		}
 		// Cap invariant: after this cordon at most

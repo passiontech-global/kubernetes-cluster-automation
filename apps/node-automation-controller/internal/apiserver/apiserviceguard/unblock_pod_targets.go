@@ -53,7 +53,7 @@ func (u *unblockHealer) stuckTerminatingNamespaces(ctx context.Context,
 			corpus.WriteByte('\n')
 		}
 		evs, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: apiServiceListPageSize},
+			metav1.ListOptions{Limit: apiServiceListPageSize, ResourceVersion: "0"},
 			kube.Events(g.cs, ns.Name))
 		if err != nil {
 			// Conditions-only corpus still carries
@@ -147,7 +147,7 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 	deleted := 0
 	for i := range targets {
 		if deleted >= apiServiceUnblockPodCap ||
-			u.sweepEvicted+deleted >= apiServiceUnblockSweepCap {
+			u.sweepEvicted >= u.effectiveSweepCap() {
 			break
 		}
 		p := &targets[i]
@@ -165,7 +165,7 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 				"pod", p.Namespace+"/"+p.Name)
 			return deleted
 		case !proceed:
-			continue // mutex held / budget denied — nothing this pass
+			return deleted // mutex held / budget denied — applies to all remaining targets
 		case refused:
 			log.Info("DEFER: PDB refused backing pod eviction — keeping pod alive",
 				"pod", p.Namespace+"/"+p.Name)

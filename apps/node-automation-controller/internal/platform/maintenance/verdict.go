@@ -160,8 +160,25 @@ func (v *Verdict) Scope(ctx context.Context, cs kubernetes.Interface,
 	// THEIR ctx via the flight select above.
 	mctx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), maintenanceEvalTimeout)
+	defer cancel()
+
+	// Ensure a panic inside maintenanceScope cannot wedge v.flight
+	// non-nil forever or leave blocked waiters stuck on f.done:
+	// clear v.flight, fail closed via errMaintenancePanicked, and
+	// wake all waiters before the panic unwinds.
+	completed := false
+	defer func() {
+		if !completed {
+			v.mu.Lock()
+			v.flight = nil
+			f.err = errMaintenancePanicked
+			close(f.done)
+			v.mu.Unlock()
+		}
+	}()
+
 	scope, err := maintenanceScope(mctx, cs, dyn, v.NodeReader, now)
-	cancel()
+	completed = true
 
 	v.mu.Lock()
 	v.scope, v.err, v.at = scope, err, now
@@ -171,6 +188,8 @@ func (v *Verdict) Scope(ctx context.Context, cs kubernetes.Interface,
 	v.mu.Unlock()
 	return scope, err
 }
+
+var errMaintenancePanicked = errors.New("maintenance scope evaluation panicked")
 
 // maintenanceScope evaluates all four maintenance signals through
 // the shared stamp.go target resolver at the VERDICT's 45m cordon

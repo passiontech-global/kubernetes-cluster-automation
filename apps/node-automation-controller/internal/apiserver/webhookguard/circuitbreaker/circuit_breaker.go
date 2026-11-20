@@ -211,10 +211,11 @@ func (b *Breaker) sweep(ctx context.Context, snap *guardstate.Snapshot,
 	defer b.deadSince.Prune(func(k string) bool { return s.seen[k] })
 	defer b.recoverStreak.Prune(func(k string) bool { return s.recoverSeen[k] })
 	defer func() {
-		// RestoreOnly never queries metrics: an empty keep-set here
-		// would wipe the breach streaks and let a levered-off breaker
-		// trip immediately the moment it is re-enabled.
-		if allowTrips && !s.latency.queryError {
+		// Keep breach streaks only across transient Prometheus query errors.
+		// In RestoreOnly (allowTrips=false), s.latencySeen is empty so pruning
+		// clears degradedSince — preventing stale pre-disable timestamps from
+		// tripping immediately when the breaker is re-enabled.
+		if !s.latency.queryError {
 			b.degradedSince.Prune(func(k string) bool { return s.latencySeen[k] })
 		}
 	}()

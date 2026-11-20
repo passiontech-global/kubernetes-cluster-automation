@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -544,5 +545,178 @@ func TestRunBoundedParallelism(t *testing.T) {
 		m.GetCounter().GetValue()-runErrsBefore != 0 {
 		t.Fatalf("metric-only FAIL bumped run errors: +%v",
 			m.GetCounter().GetValue()-runErrsBefore)
+	}
+}
+
+type funcCheck struct {
+	fn func(context.Context) probefw.Result
+}
+
+func (f funcCheck) Run(ctx context.Context) probefw.Result { return f.fn(ctx) }
+
+// Streaming commit must publish completed prefix checks immediately
+// instead of blocking behind g.SetLimit(6) until the whole pool drains.
+func TestRunStreamingCommitBeforePoolDrains(t *testing.T) {
+	p := testProber(fake.NewSimpleClientset())
+	releaseTail := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseTail:
+		default:
+			close(releaseTail)
+		}
+	}()
+
+	checks := make([]checkEntry, checkParallelism+2)
+	checks[0] = checkEntry{
+		name: "stream-prefix-0",
+		check: funcCheck{fn: func(context.Context) probefw.Result {
+			return probefw.Result{Pass: true}
+		}},
+	}
+	for i := 1; i <= checkParallelism; i++ {
+		checks[i] = checkEntry{
+			name: fmt.Sprintf("stream-blocker-%d", i),
+			check: funcCheck{fn: func(ctx context.Context) probefw.Result {
+				select {
+				case <-releaseTail:
+				case <-ctx.Done():
+				}
+				return probefw.Result{Pass: true}
+			}},
+		}
+	}
+	checks[len(checks)-1] = checkEntry{
+		name: "stream-tail",
+		check: funcCheck{fn: func(context.Context) probefw.Result {
+			return probefw.Result{Pass: true}
+		}},
+	}
+	p.checks = checks
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.run(t.Context())
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	committedEarly := false
+	for time.Now().Before(deadline) {
+		if v, ok := probetest.HealthGauge(t, "stream-prefix-0", "OK"); ok && v == 1 {
+			committedEarly = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	close(releaseTail)
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !committedEarly {
+		t.Fatal("prefix check stream-prefix-0 did not commit before tail blockers drained")
+	}
+}
+
+func TestRunDeadlineExceededIncErrorVsCanceled(t *testing.T) {
+	p := testProber(fake.NewSimpleClientset())
+	p.checks = []checkEntry{{
+		name: "slow-deadline-check",
+		check: funcCheck{fn: func(ctx context.Context) probefw.Result {
+			<-ctx.Done()
+			return probefw.Result{Pass: true}
+		}},
+	}}
+
+	runErrs := func() float64 {
+		m := probetest.FindMetric(t, "shell_operator_hook_run_errors_total",
+			map[string]string{"queue": p.Name})
+		if m == nil {
+			return 0
+		}
+		return m.GetCounter().GetValue()
+	}
+
+	before := runErrs()
+	dctx, cancel := context.WithTimeout(t.Context(), 15*time.Millisecond)
+	defer cancel()
+	if err := p.run(dctx); err != nil {
+		t.Fatalf("run must return nil on DeadlineExceeded after counting IncError: %v", err)
+	}
+	if delta := runErrs() - before; delta != 1 {
+		t.Fatalf("DeadlineExceeded run_errors delta = %v, want 1", delta)
+	}
+
+	// Verify Periodic.RunTimeout hits DeadlineExceeded and increments
+	// run_errors exactly once (no double-counting).
+	beforePeriodic := runErrs()
+	per := &shared.Periodic{
+		Name:       p.Name,
+		Interval:   time.Hour,
+		RunTimeout: 15 * time.Millisecond,
+		Fn:         p.run,
+	}
+	ctx, stop := context.WithCancel(t.Context())
+	p.checks = []checkEntry{{
+		name: "slow-periodic-deadline",
+		check: funcCheck{fn: func(c context.Context) probefw.Result {
+			<-c.Done()
+			stop()
+			return probefw.Result{Pass: true}
+		}},
+	}}
+	_ = per.Start(ctx)
+	if delta := runErrs() - beforePeriodic; delta != 1 {
+		t.Fatalf("Periodic RunTimeout run_errors delta = %v, want 1 (no double-count)", delta)
+	}
+}
+
+func TestRunCheckIsolatedTimeoutBlocksPass(t *testing.T) {
+	p := testProber(fake.NewSimpleClientset())
+	p.Cfg.Timeouts.PerCheck = 10 * time.Millisecond
+	p.checks = []checkEntry{{
+		name: "ignore-ctx-timeout",
+		check: funcCheck{fn: func(context.Context) probefw.Result {
+			time.Sleep(35 * time.Millisecond)
+			return probefw.Result{Pass: true}
+		}},
+	}}
+
+	out := runCheckIsolated(p.checks[0], t.Context(), 10*time.Millisecond)
+	if !out.timedOut {
+		t.Fatal("expected out.timedOut == true")
+	}
+	if out.pass {
+		t.Fatalf("timed-out check must not report pass=true: %+v", out)
+	}
+	if out.why == "" {
+		t.Fatal("timed-out check must carry non-empty why")
+	}
+
+	if err := p.run(t.Context()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if fail, ok := probetest.HealthGauge(t, "ignore-ctx-timeout", "FAIL"); !ok || fail != 1 {
+		t.Fatalf("timed-out check FAIL gauge = %v,%v want 1", fail, ok)
+	}
+	if _, stamped := p.lastPass["ignore-ctx-timeout"]; stamped {
+		t.Fatal("timed-out check must not stamp lastPass")
+	}
+}
+
+func TestRunCheckIsolatedPanicCapturesStack(t *testing.T) {
+	out := runCheckIsolated(checkEntry{
+		name: "panicking-check",
+		check: funcCheck{fn: func(context.Context) probefw.Result {
+			panic("boom-stack")
+		}},
+	}, t.Context(), time.Minute)
+	if out.pass {
+		t.Fatalf("panicking check must fail: %+v", out)
+	}
+	if out.infra == nil || !strings.Contains(out.infra.Error(), "boom-stack") {
+		t.Fatalf("infra error = %v, want panic message", out.infra)
+	}
+	if !strings.Contains(out.stack, "TestRunCheckIsolatedPanicCapturesStack") {
+		t.Fatalf("captured stack missing caller frame: %q", out.stack)
 	}
 }

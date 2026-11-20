@@ -137,8 +137,12 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 			c.Status != corev1.ConditionTrue {
 			continue
 		}
-		var stale []corev1.NodeCondition
-		collect := func(conds []corev1.NodeConditionType, maxAge time.Duration, why string) {
+		type staleCond struct {
+			cond corev1.NodeCondition
+			fail bool
+		}
+		var stale []staleCond
+		collect := func(conds []corev1.NodeConditionType, maxAge time.Duration, why string, fail bool) {
 			for _, t := range conds {
 				c := kube.NodeCondition(n, t)
 				if c == nil || !condZombie(c, now, maxAge) {
@@ -149,26 +153,33 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 					hbAge = fmt.Sprintf("frozen %s",
 						now.Sub(c.LastHeartbeatTime.Time).Round(time.Second))
 				}
-				stale = append(stale, corev1.NodeCondition{
-					Type:   c.Type,
-					Status: corev1.ConditionFalse,
-					Reason: "StaleConditionCleared",
-					Message: fmt.Sprintf("heartbeat %s — %s; cleared by %s",
-						hbAge, why, CheckNameNodeCondSweeper),
-					LastHeartbeatTime:  metav1.NewTime(now),
-					LastTransitionTime: metav1.NewTime(now),
+				stale = append(stale, staleCond{
+					cond: corev1.NodeCondition{
+						Type:   c.Type,
+						Status: corev1.ConditionFalse,
+						Reason: "StaleConditionCleared",
+						Message: fmt.Sprintf("heartbeat %s — %s; cleared by %s",
+							hbAge, why, CheckNameNodeCondSweeper),
+						LastHeartbeatTime:  metav1.NewTime(now),
+						LastTransitionTime: metav1.NewTime(now),
+					},
+					fail: fail,
 				})
 			}
 		}
 		collect(nodeCondSweptConds, nodeCondSweepHeartbeatMaxAge,
-			"owning reporter presumed dead")
+			"owning reporter presumed dead", true)
 		collect(nodeCondRemediationConds, nodeCondRemediationSweepMaxAge,
-			"remediation episode expired")
+			"remediation episode expired", false)
 		if len(stale) == 0 {
 			continue
 		}
+		conds := make([]corev1.NodeCondition, len(stale))
+		for j, s := range stale {
+			conds[j] = s.cond
+		}
 		payload, err := json.Marshal(map[string]any{
-			"status": map[string]any{"conditions": stale},
+			"status": map[string]any{"conditions": conds},
 		})
 		if err != nil {
 			metrics.IncError(p.Name)
@@ -182,11 +193,16 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		p.InvalidateNodes(ctx) // node status changed — drop the node census, arm a CS re-read
-		for _, c := range stale {
-			nodeCondSweepsTotal.WithLabelValues(n.Name, string(c.Type)).Inc()
-			rep.Find(n.Name + ":" + string(c.Type))
-			log.Info("CONDITION CLEARED: zombie True with frozen heartbeat",
-				"node", n.Name, "condition", c.Type)
+		for _, s := range stale {
+			nodeCondSweepsTotal.WithLabelValues(n.Name, string(s.cond.Type)).Inc()
+			if s.fail {
+				rep.Find(n.Name + ":" + string(s.cond.Type))
+				log.Info("CONDITION CLEARED: zombie True with frozen heartbeat",
+					"node", n.Name, "condition", s.cond.Type)
+			} else {
+				log.Info("REMEDIATION CONDITION CLEARED: expired remediation episode",
+					"node", n.Name, "condition", s.cond.Type)
+			}
 		}
 	}
 	return rep.Verdict("zombie node conditions cleared: ", ", ")

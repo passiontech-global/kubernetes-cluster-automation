@@ -239,7 +239,7 @@ func (p *meshControlPlaneCheck) healComponentPod(ctx context.Context, log logr.L
 // re-rollable targets.
 func (p *meshControlPlaneCheck) ciliumOperatorLeaderPod(ctx context.Context,
 	log logr.Logger, pods []*corev1.Pod) *corev1.Pod {
-	var fallback *corev1.Pod
+	var opPods []*corev1.Pod
 	for i := range pods {
 		pod := pods[i]
 		if !strings.HasPrefix(pod.Name, ciliumOperatorPrefix) ||
@@ -247,9 +247,11 @@ func (p *meshControlPlaneCheck) ciliumOperatorLeaderPod(ctx context.Context,
 			pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
-		if fallback == nil {
-			fallback = pod
-		}
+		opPods = append(opPods, pod)
+	}
+	var fallback *corev1.Pod
+	if len(opPods) > 0 {
+		fallback = opPods[0]
 	}
 	lease, err := p.Lease(ctx, ciliumOperatorNS, ciliumOperatorLease)
 	if err != nil {
@@ -267,21 +269,17 @@ func (p *meshControlPlaneCheck) ciliumOperatorLeaderPod(ctx context.Context,
 	}
 	holder := *lease.Spec.HolderIdentity
 	for _, name := range candidates {
-		for i := range pods {
-			pod := pods[i]
-			if pod.Name == name && pod.DeletionTimestamp == nil &&
-				pod.Status.Phase == corev1.PodRunning {
+		for _, pod := range opPods {
+			if pod.Name == name {
 				return pod
 			}
 		}
 	}
 	// hostNetwork identity: "<nodeHostname>-<rand>" never equals a
 	// pod name — match the holder's hostname prefix against each
-	// candidate pod's scheduled node instead.
-	for i := range pods {
-		pod := pods[i]
-		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning ||
-			pod.Spec.NodeName == "" {
+	// candidate cilium-operator pod's scheduled node instead.
+	for _, pod := range opPods {
+		if pod.Spec.NodeName == "" {
 			continue
 		}
 		if strings.HasPrefix(holder, pod.Spec.NodeName+"-") {

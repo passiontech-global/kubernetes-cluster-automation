@@ -359,11 +359,12 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 
 	jobName := target.Name
 	key := cj.Namespace + "/" + cj.Name
-	if p.Heals.CooledDown(key+"/active-ref", cjForbidHealCooldown, now) {
+	healKey := probefw.SelfHealKey(CheckNameCronJobForbidZombie, key+"/active-ref")
+	if p.Heals.CooledDown(healKey, cjForbidHealCooldown, now) {
 		return
 	}
 	proceed, unverifiable := p.HealAllowedUpgradeOnly(ctx, log,
-		"cj/"+key+"/active-ref", now)
+		healKey, now)
 	switch {
 	case unverifiable:
 		metrics.IncError(p.Name)
@@ -421,7 +422,7 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 			// stop retrying the doomed write every sweep. The audit
 			// finding (gauge + FAIL) was already emitted above; this
 			// is a tolerated sub-failure, never an aborted audit.
-			p.Heals.Stamp(key+"/active-ref", now)
+			p.Heals.Stamp(healKey, now)
 			log.Info("WARN: cronjob forbid zombie status.active clear forbidden (RBAC) — cooldown stamped",
 				"cronjob", key, "job", jobName, "error", err)
 			return
@@ -436,7 +437,7 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 			"cronjob", key, "job", jobName)
 		return
 	}
-	p.Heals.Stamp(key+"/active-ref", now)
+	p.Heals.Stamp(healKey, now)
 	rep.Find("healed: cleared ghost active ref " + jobName + " on " + key)
 	log.Info("ACTION: cleared ghost status.active ref on Forbid CronJob",
 		"cronjob", key, "job", jobName)
@@ -459,8 +460,9 @@ func (p *cjForbidZombieCheck) deleteStalledJob(ctx context.Context,
 		return
 	}
 	key := cj.Namespace + "/" + cj.Name
+	healKey := probefw.SelfHealKey(CheckNameCronJobForbidZombie, key)
 	proceed, unverifiable := p.HealAllowedClusterWideOnly(ctx, log, &p.Heals,
-		key, cjForbidHealCooldown, now)
+		healKey, cjForbidHealCooldown, now)
 	switch {
 	case unverifiable:
 		metrics.IncError(p.Name)
@@ -486,7 +488,7 @@ func (p *cjForbidZombieCheck) deleteStalledJob(ctx context.Context,
 			"cronjob", key, "job", job.Namespace+"/"+job.Name)
 		return
 	}
-	p.Heals.Stamp(key, now)
+	p.Heals.Stamp(healKey, now)
 	rep.Find("healed: deleted stalled job " + job.Namespace + "/" +
 		job.Name + " on " + key)
 	log.Info("ACTION: deleted stalled Job to unblock Forbid CronJob",

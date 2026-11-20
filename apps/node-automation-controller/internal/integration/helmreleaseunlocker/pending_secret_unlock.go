@@ -54,7 +54,7 @@ func hrStuckInProgress(hr *unstructured.Unstructured) bool {
 // pending-secret delete, reconcile stamp — and returns how many HRs
 // were actually unlocked.
 func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVersionResource,
-	stuck map[string]*unstructured.Unstructured, due []string, now time.Time) int {
+	stuck map[string]*unstructured.Unstructured, due []string, now time.Time, jobCache *hookJobCache) int {
 	log := logf.FromContext(ctx)
 	unlocked := 0
 	for _, key := range due {
@@ -85,7 +85,7 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 			}
 			continue
 		}
-		acted, err := u.unlock(ctx, gvr, hr)
+		acted, err := u.unlockWithJobs(ctx, gvr, hr, jobCache)
 		if err != nil {
 			// Tolerated per-HR failure: the run absorbs it (logs +
 			// continues, returns nil) so it never reaches the
@@ -116,6 +116,10 @@ func (u *helmReleaseUnlocker) unlockDue(ctx context.Context, gvr schema.GroupVer
 // progressing, or the secret already gone) — the caller must not
 // stamp the cooldown ledger for those.
 func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersionResource, hr *unstructured.Unstructured) (bool, error) {
+	return u.unlockWithJobs(ctx, gvr, hr, newHookJobCache())
+}
+
+func (u *helmReleaseUnlocker) unlockWithJobs(ctx context.Context, gvr schema.GroupVersionResource, hr *unstructured.Unstructured, jobCache *hookJobCache) (bool, error) {
 	log := logf.FromContext(ctx)
 	key := hr.GetNamespace() + "/" + hr.GetName()
 	release := hrReleaseName(hr)
@@ -129,9 +133,10 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// targetNamespace is NOT part of that chain.
 	secrets, err := kube.ListAll(ctx,
 		metav1.ListOptions{
-			Limit:         kube.DefaultListPageSize,
-			LabelSelector: "owner=helm,name=" + release,
-			FieldSelector: "type=helm.sh/release.v1"},
+			ResourceVersion: "0",
+			Limit:           kube.DefaultListPageSize,
+			LabelSelector:   "owner=helm,name=" + release,
+			FieldSelector:   "type=helm.sh/release.v1"},
 		kube.Secrets(u.cs, hrStorageNS(hr)))
 	if err != nil {
 		return false, fmt.Errorf("list release secrets in %s for %s: %w",
@@ -192,7 +197,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// only lastAttemptedGeneration, which has no timestamp and cannot
 	// prove recency — so the hook-Job evidence is the gate.) A failed
 	// Job list fails closed: unverifiable means no delete.
-	inProgress, err := u.helmUpgradeInProgress(ctx, hrReleaseNS(hr), release)
+	inProgress, err := u.helmUpgradeInProgress(ctx, jobCache, hrReleaseNS(hr), release)
 	if err != nil {
 		return false, fmt.Errorf("list hook jobs in %s for %s: %w",
 			hrReleaseNS(hr), key, err)
@@ -258,7 +263,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 		// nudge + persisted cooldown never landed — still sweep
 		// the failed hook Jobs so the next attempt is not
 		// re-wedged by the same residue, then surface the error.
-		u.cleanFailedHookJobs(ctx, hrReleaseNS(hr), hrReleaseName(hr))
+		u.cleanFailedHookJobs(ctx, jobCache, hrReleaseNS(hr), hrReleaseName(hr))
 		return false, fmt.Errorf("annotate helmrelease %s: %w", key, err)
 	}
 	// HR patch landed — the 24h cooldown may stamp now (the
@@ -280,7 +285,7 @@ func (u *helmReleaseUnlocker) unlock(ctx context.Context, gvr schema.GroupVersio
 	// the hook fresh. Best-effort: a list/delete failure here must
 	// NOT undo the unlock that already landed — the pending-secret
 	// delete + reconcile stamp are the fix.
-	u.cleanFailedHookJobs(ctx, hrReleaseNS(hr), hrReleaseName(hr))
+	u.cleanFailedHookJobs(ctx, jobCache, hrReleaseNS(hr), hrReleaseName(hr))
 	return true, nil
 }
 
@@ -300,16 +305,17 @@ func helmLastUnlock(hr *unstructured.Unstructured) (time.Time, bool) {
 // same release-name filter cleanFailedHookJobs applies). The same
 // paged Job list feeds both consumers — one read, two uses.
 func (u *helmReleaseUnlocker) helmUpgradeInProgress(ctx context.Context,
-	ns, release string) (bool, error) {
-	jobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Jobs(u.cs, ns))
+	cache *hookJobCache, ns, release string) (bool, error) {
+	jobs, err := u.listNamespaceJobs(ctx, cache, ns)
 	if err != nil {
 		return false, err
 	}
 	now := u.now.Now()
 	for i := range jobs {
 		j := &jobs[i]
+		if cache != nil && cache.deleted[ns+"/"+j.Name] {
+			continue
+		}
 		// Only helm's own hook Jobs are reconcile evidence — a plain
 		// batch Job running in the namespace is just a workload, and
 		// a hook Job labeled for ANOTHER release says nothing about

@@ -26,7 +26,7 @@ import (
 // helper pages at kube.DefaultListPageSize.
 func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
 	list, gvr, err := kube.ListFirstUnstructured(ctx, u.dyn, helmReleaseGVRs,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+		metav1.ListOptions{ResourceVersion: "0", Limit: kube.DefaultListPageSize})
 	if err != nil {
 		return nil, schema.GroupVersionResource{},
 			fmt.Errorf("list helmreleases (all known GVRs failed): %w", err)
@@ -40,7 +40,7 @@ func (u *helmReleaseUnlocker) listHelmReleases(ctx context.Context) (*unstructur
 func (u *helmReleaseUnlocker) listAllPages(ctx context.Context,
 	ri dynamic.ResourceInterface) (*unstructured.UnstructuredList, error) {
 	return kube.ListAllUnstructured(ctx, ri,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+		metav1.ListOptions{ResourceVersion: "0", Limit: kube.DefaultListPageSize})
 }
 
 // helmControllerDown reports whether any helm-controller pod is
@@ -48,8 +48,9 @@ func (u *helmReleaseUnlocker) listAllPages(ctx context.Context,
 func (u *helmReleaseUnlocker) helmControllerDown(ctx context.Context) (bool, error) {
 	pods, err := kube.ListAll(ctx,
 		metav1.ListOptions{
-			Limit:         kube.DefaultListPageSize,
-			LabelSelector: helmControllerSel},
+			ResourceVersion: "0",
+			Limit:           kube.DefaultListPageSize,
+			LabelSelector:   helmControllerSel},
 		kube.Pods(u.cs, helmControllerNS))
 	if err != nil {
 		return false, fmt.Errorf("list helm-controller pods: %w", err)

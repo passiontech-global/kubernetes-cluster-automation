@@ -158,3 +158,79 @@ func TestAllowedOnNodePersistedAndUpgradeOnlyPersisted(t *testing.T) {
 		t.Fatalf("AllowedUpgradeOnlyPersisted expired = (%v,%v), want (true,false)", proceed, unver)
 	}
 }
+
+// When obj == nil or annoKey == "", AllowedOnNodePersisted and
+// AllowedUpgradeOnlyPersisted must still enforce the in-RAM heals
+// cooldown before consulting the maintenance mutex.
+func TestAllowedOnNodeAndUpgradeOnlyPersistedNilObjEnforcesHeals(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset()
+	obj := allowedPersistedObj()
+	obj.Annotations["passiontech.dev/last-heal"] =
+		now.Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+
+	var warm state.CooldownSet
+	warm.Stamp("k", now.Add(-time.Minute))
+
+	// Warm heals + obj == nil -> (false, false) even with dyn == nil.
+	if proceed, unver := AllowedOnNodePersisted(t.Context(),
+		logr.Discard(), nil, cs, nil, &warm, nil,
+		"passiontech.dev/last-heal", "k", "node-1", time.Hour, now); proceed || unver {
+		t.Fatalf("AllowedOnNodePersisted(nil obj, warm) = (%v,%v), want (false,false)", proceed, unver)
+	}
+	if proceed, unver := AllowedUpgradeOnlyPersisted(t.Context(),
+		logr.Discard(), nil, cs, nil, &warm, nil,
+		"passiontech.dev/last-heal", "k", time.Hour, now); proceed || unver {
+		t.Fatalf("AllowedUpgradeOnlyPersisted(nil obj, warm) = (%v,%v), want (false,false)", proceed, unver)
+	}
+
+	// Warm heals + empty annoKey with non-nil obj -> (false, false).
+	if proceed, unver := AllowedOnNodePersisted(t.Context(),
+		logr.Discard(), nil, cs, nil, &warm, obj,
+		"", "k", "node-1", time.Hour, now); proceed || unver {
+		t.Fatalf("AllowedOnNodePersisted(empty annoKey, warm) = (%v,%v), want (false,false)", proceed, unver)
+	}
+	if proceed, unver := AllowedUpgradeOnlyPersisted(t.Context(),
+		logr.Discard(), nil, cs, nil, &warm, obj,
+		"", "k", time.Hour, now); proceed || unver {
+		t.Fatalf("AllowedUpgradeOnlyPersisted(empty annoKey, warm) = (%v,%v), want (false,false)", proceed, unver)
+	}
+
+	// Warm heals + expired annotation -> (false, false).
+	if proceed, unver := AllowedOnNodePersisted(t.Context(),
+		logr.Discard(), nil, cs, nil, &warm, obj,
+		"passiontech.dev/last-heal", "k", "node-1", time.Hour, now); proceed || unver {
+		t.Fatalf("AllowedOnNodePersisted(warm + expired anno) = (%v,%v), want (false,false)", proceed, unver)
+	}
+	if proceed, unver := AllowedUpgradeOnlyPersisted(t.Context(),
+		logr.Discard(), nil, cs, nil, &warm, obj,
+		"passiontech.dev/last-heal", "k", time.Hour, now); proceed || unver {
+		t.Fatalf("AllowedUpgradeOnlyPersisted(warm + expired anno) = (%v,%v), want (false,false)", proceed, unver)
+	}
+
+	// Clear heals + obj == nil -> reaches mutex: dyn==nil -> (false,true),
+	// clear dyn -> (true,false).
+	var clear state.CooldownSet
+	if proceed, unver := AllowedOnNodePersisted(t.Context(),
+		logr.Discard(), nil, cs, nil, &clear, nil,
+		"passiontech.dev/last-heal", "k", "node-1", time.Hour, now); proceed || !unver {
+		t.Fatalf("AllowedOnNodePersisted(nil obj, clear, nil dyn) = (%v,%v), want (false,true)", proceed, unver)
+	}
+	if proceed, unver := AllowedUpgradeOnlyPersisted(t.Context(),
+		logr.Discard(), nil, cs, nil, &clear, nil,
+		"passiontech.dev/last-heal", "k", time.Hour, now); proceed || !unver {
+		t.Fatalf("AllowedUpgradeOnlyPersisted(nil obj, clear, nil dyn) = (%v,%v), want (false,true)", proceed, unver)
+	}
+
+	dyn := testhelp.NewDynamicClient()
+	if proceed, unver := AllowedOnNodePersisted(t.Context(),
+		logr.Discard(), nil, cs, dyn, &clear, nil,
+		"passiontech.dev/last-heal", "k", "node-1", time.Hour, now); !proceed || unver {
+		t.Fatalf("AllowedOnNodePersisted(nil obj, clear, ok dyn) = (%v,%v), want (true,false)", proceed, unver)
+	}
+	if proceed, unver := AllowedUpgradeOnlyPersisted(t.Context(),
+		logr.Discard(), nil, cs, dyn, &clear, nil,
+		"passiontech.dev/last-heal", "k", time.Hour, now); !proceed || unver {
+		t.Fatalf("AllowedUpgradeOnlyPersisted(nil obj, clear, ok dyn) = (%v,%v), want (true,false)", proceed, unver)
+	}
+}

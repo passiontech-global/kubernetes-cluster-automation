@@ -294,3 +294,54 @@ func TestInstantQuerySkipsNonFiniteSamples(t *testing.T) {
 		t.Fatalf("samples = %+v, want only node=ok value=1.5", got)
 	}
 }
+
+// External Prometheus responses may carry lone UTF-16 surrogates, raw
+// invalid UTF-8 bytes, or duplicate JSON keys in envelopes/metrics —
+// promq must accept them via AllowInvalidUTF8/AllowDuplicateNames and
+// skip any sample whose scalar value string itself fails float parse.
+func TestInstantQueryAllowsInvalidUTF8AndDuplicateNames(t *testing.T) {
+	t.Run("lone surrogate and raw invalid UTF-8 in labels", func(t *testing.T) {
+		payload := []byte(`{"status":"success","data":{"result":[` +
+			`{"metric":{"node":"n1","msg":"bad\uD83Dlabel"},"value":[1710000000,"2.5"]},` +
+			`{"metric":{"node":"n2","raw":"`)
+		payload = append(payload, 0xff)
+		payload = append(payload, []byte(`"},"value":[1710000000,"3.5"]},`+
+			`{"metric":{"node":"badval"},"value":[1710000000,"\uD800"]}`+
+			`]}}`)...)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(payload)
+		}))
+		defer srv.Close()
+
+		got, err := (&Client{HTTP: srv.Client()}).InstantQuery(t.Context(), srv.URL, "up")
+		if err != nil {
+			t.Fatalf("InstantQuery failed on invalid UTF-8/surrogate: %v", err)
+		}
+		if len(got) != 2 || got[0].Metric["node"] != "n1" || got[0].Value != 2.5 ||
+			got[1].Metric["node"] != "n2" || got[1].Value != 3.5 {
+			t.Fatalf("samples = %+v, want n1=2.5 and n2=3.5", got)
+		}
+	})
+
+	t.Run("duplicate object keys use last-wins semantics", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{
+				"status": "error",
+				"status": "success",
+				"data": {"result": [
+					{"metric": {"node": "old", "node": "n1"}, "value": [1710000000, "7.25"]}
+				]}
+			}`))
+		}))
+		defer srv.Close()
+
+		got, err := (&Client{HTTP: srv.Client()}).InstantQuery(t.Context(), srv.URL, "up")
+		if err != nil {
+			t.Fatalf("InstantQuery failed on duplicate keys: %v", err)
+		}
+		if len(got) != 1 || got[0].Metric["node"] != "n1" || got[0].Value != 7.25 {
+			t.Fatalf("samples = %+v, want node=n1 value=7.25", got)
+		}
+	})
+}

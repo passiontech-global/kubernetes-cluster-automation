@@ -55,8 +55,9 @@ type maintenanceStamperRunnable struct {
 	nodeReader kube.CachedNodeReader
 	// now is the clock seam — zero value is system time; tests pin
 	// it instead of sleeping through the ticker.
-	now shared.Clock
-	log logr.Logger
+	now     shared.Clock
+	log     logr.Logger
+	tracker maintenance.StampTracker
 }
 
 func (r *maintenanceStamperRunnable) Start(ctx context.Context) error {
@@ -81,5 +82,5 @@ func (r *maintenanceStamperRunnable) Start(ctx context.Context) error {
 // sweep census: this runnable is the freshness backstop for exactly
 // the mid-sweep changes a memoized census cannot see.
 func (r *maintenanceStamperRunnable) stamp(ctx context.Context) {
-	maintenance.StampMaintenanceTargets(ctx, r.cs, r.dyn, r.nodeReader, r.now.Now())
+	r.tracker.StampMaintenanceTargets(ctx, r.cs, r.dyn, r.nodeReader, r.now.Now())
 }

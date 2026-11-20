@@ -68,7 +68,7 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	// is armed: a wedged connect-sync leaves every store Ready=True
 	// while connect-api answers from its stale SQLite cache — the
 	// exact outage the heal exists for, invisible to triggers 1-2.
-	degraded := n.scanConnectSyncPods(ctx, now)
+	degraded, oldest := n.scanConnectSyncPods(ctx, now)
 	syncDegraded := false
 	var degradedPod *corev1.Pod
 	keys := make([]string, 0, len(degraded))
@@ -104,13 +104,13 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 	// trigger is a degraded connect-sync, delete the pod CARRYING
 	// the failing container — the oldest pod may be the healthy
 	// replica. Only store-outage/storm triggers (which name no pod)
-	// fall back to the oldest running pod. A trigger with NO running
-	// connect pod behind it can never deliver — discovering that
-	// after the budget grant burned a fleet token every sweep for
-	// the whole outage.
+	// fall back to the oldest running pod found by the same sweep.
+	// A trigger with NO running connect pod behind it can never
+	// deliver — discovering that after the budget grant burned a
+	// fleet token every sweep for the whole outage.
 	pod := degradedPod
 	if pod == nil {
-		pod = n.oldestConnectPod(ctx)
+		pod = oldest
 	}
 	if pod == nil {
 		log.Info("connect heal: no running onepassword-connect pod found")
@@ -172,27 +172,30 @@ func (n *externalSecretNudge) maybeHealConnect(ctx context.Context,
 
 // scanConnectSyncPods censuses the connect-sync container inside
 // every Running onepassword-connect* pod across the candidate
-// namespaces. A pod whose connect-sync container status reports
-// !Ready or a live crashloop (restarts past the ceiling while in
-// CrashLoopBackOff or with a recent last termination) is a stalled
-// sync plane — connect-api keeps serving the stale SQLite cache, so
-// pod-level readiness stays green while every secret pull ages out
-// (the exact blind spot this module's storm census cannot see when
-// the sync failure is not a store outage). Degraded pods stamp
-// syncDegradedSince (the heal trigger's persistence clock); a pod
-// back to healthy, gone, or no longer Running forgets it. Returns
-// the pods degraded THIS pass by "ns/pod" key — the heal deletes the
-// pod carrying the failing container. Per-namespace list failures
-// are tolerated (IncError + carry-forward via the ledger): an
-// unverifiable namespace must not flap live series or the heal
-// clock.
+// namespaces and tracks the oldest running connect pod from the same
+// single pass (avoiding a duplicate per-namespace Pod LIST when
+// store-outage/storm fallback needs oldest). A pod whose connect-sync
+// container status reports !Ready or a live crashloop (restarts past
+// the ceiling while in CrashLoopBackOff or with a recent last
+// termination) is a stalled sync plane — connect-api keeps serving
+// the stale SQLite cache, so pod-level readiness stays green while
+// every secret pull ages out (the exact blind spot this module's
+// storm census cannot see when the sync failure is not a store
+// outage). Degraded pods stamp syncDegradedSince (the heal trigger's
+// persistence clock); a pod back to healthy, gone, or no longer
+// Running forgets it. Returns the pods degraded THIS pass by "ns/pod"
+// key plus the oldest running connect pod (or nil when none).
+// Per-namespace list failures are tolerated (IncError + carry-forward
+// via the ledger): an unverifiable namespace must not flap live
+// series or the heal clock.
 func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
-	now time.Time) map[string]*corev1.Pod {
+	now time.Time) (map[string]*corev1.Pod, *corev1.Pod) {
 
 	log := logf.FromContext(ctx)
 	degraded := map[string]*corev1.Pod{}
+	var oldest *corev1.Pod
 	if n.cs == nil {
-		return degraded // no typed client wired — cannot inspect pods
+		return degraded, nil // no typed client wired — cannot inspect pods
 	}
 	// live/listedOK feed the ledger prune below: a pod that VANISHED
 	// entirely is never visited by the loop, so without the prune its
@@ -204,7 +207,7 @@ func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
 	listedOK := map[string]bool{}
 	for _, ns := range esConnectNamespaces {
 		pods, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			metav1.ListOptions{ResourceVersion: "0", Limit: kube.DefaultListPageSize},
 			kube.Pods(n.cs, ns))
 		if err != nil {
 			if apierrors.IsNotFound(err) {
@@ -230,6 +233,10 @@ func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
 				n.syncDegradedSince.Forget(key)
 				continue
 			}
+			if oldest == nil ||
+				p.CreationTimestamp.Time.Before(oldest.CreationTimestamp.Time) {
+				oldest = p
+			}
 			if why, bad := connectSyncDegraded(p, now); bad {
 				degraded[key] = p
 				n.syncDegradedSince.Observe(key, now)
@@ -249,7 +256,7 @@ func (n *externalSecretNudge) scanConnectSyncPods(ctx context.Context,
 		ns, _, _ := strings.Cut(key, "/")
 		return !listedOK[ns] || live[key]
 	})
-	return degraded
+	return degraded, oldest
 }
 
 // connectSyncDegraded reports whether the pod's connect-sync
@@ -300,39 +307,4 @@ func connectSyncDegraded(p *corev1.Pod, now time.Time) (why string, bad bool) {
 		return "", false
 	}
 	return "connect-sync container status missing", true
-}
-
-// oldestConnectPod returns the oldest Running pod named
-// onepassword-connect* across the candidate namespaces, or nil when
-// none qualifies. List errors other than NotFound are logged and
-// skipped — an unverifiable namespace must not block the heal on the
-// other one, but it also cannot produce a delete target.
-func (n *externalSecretNudge) oldestConnectPod(ctx context.Context) *corev1.Pod {
-	log := logf.FromContext(ctx)
-	var oldest *corev1.Pod
-	for _, ns := range esConnectNamespaces {
-		pods, err := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
-			kube.Pods(n.cs, ns))
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				metrics.IncError(n.queue)
-				log.Error(err, "connect pod list failed", "namespace", ns)
-			}
-			continue
-		}
-		for i := range pods {
-			p := &pods[i]
-			if p.DeletionTimestamp != nil ||
-				p.Status.Phase != corev1.PodRunning ||
-				!strings.HasPrefix(p.Name, esConnectPodPrefix) {
-				continue
-			}
-			if oldest == nil ||
-				p.CreationTimestamp.Time.Before(oldest.CreationTimestamp.Time) {
-				oldest = p
-			}
-		}
-	}
-	return oldest
 }

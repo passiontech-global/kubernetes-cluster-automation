@@ -236,6 +236,37 @@ func (b *TargetBreaker) RecordTargetHealthy(module, targetKey string) {
 	}
 }
 
+// Refund returns one grant TryAcquireTarget consumed at now for
+// (module,targetKey) — the refused-actuation counterpart of
+// Budget.Refund: when an action acquires a target grant before calling
+// the API and every attempt is cleanly deferred (e.g. PDB 429 or L1
+// hold), handing the stamp back prevents deferrals from opening the
+// target circuit. Removes the last stamp Equal(now), deleting the
+// entry when empty and not already open without firing forgetHook; a
+// refund for a missing target, nil receiver, or mismatched timestamp is
+// a safe no-op.
+func (b *TargetBreaker) Refund(module, targetKey string, now time.Time) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	k := breakerTarget{module: module, target: targetKey}
+	h := b.targets[k]
+	if h == nil {
+		return
+	}
+	for i := len(h.stamps) - 1; i >= 0; i-- {
+		if h.stamps[i].Equal(now) {
+			h.stamps = append(h.stamps[:i], h.stamps[i+1:]...)
+			if len(h.stamps) == 0 && !h.open {
+				delete(b.targets, k)
+			}
+			return
+		}
+	}
+}
+
 // defaultTargetBreaker is the process-wide breaker the module sweeps
 // consult; nil (unconfigured or limit<=0) disables the gate — the
 // same opt-in contract as defaultBudget. Boot-time write, read per
@@ -318,5 +349,14 @@ func TryAcquireTarget(module, targetKey string, now time.Time) (bool, string) {
 func RecordTargetHealthy(module, targetKey string) {
 	if b := defaultTargetBreaker.Load(); b != nil {
 		b.RecordTargetHealthy(module, targetKey)
+	}
+}
+
+// RefundTarget hands back one grant TryAcquireTarget consumed at now
+// for (module,targetKey) on the process-global breaker. No-op while no
+// breaker is configured.
+func RefundTarget(module, targetKey string, now time.Time) {
+	if b := defaultTargetBreaker.Load(); b != nil {
+		b.Refund(module, targetKey, now)
 	}
 }

@@ -124,7 +124,10 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	// Service body is ever read.
 	svcs, err := kube.ListPartialOrFallback(ctx, c.meta, c.cs, c.dyn,
 		corev1.SchemeGroupVersion.WithResource("services"), metav1.NamespaceAll,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		})
 	if err != nil {
 		return fmt.Errorf("list services (API flap) — abort: %w", err)
 	}
@@ -143,8 +146,9 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	slices, err := kube.ListPartialOrFallback(ctx, c.meta, c.cs, c.dyn,
 		discoveryv1.SchemeGroupVersion.WithResource("endpointslices"),
 		metav1.NamespaceAll, metav1.ListOptions{
-			LabelSelector: discoveryv1.LabelServiceName,
-			Limit:         kube.DefaultListPageSize,
+			LabelSelector:   discoveryv1.LabelServiceName,
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
 		})
 	if err != nil {
 		return fmt.Errorf("list endpointslices: %w", err)

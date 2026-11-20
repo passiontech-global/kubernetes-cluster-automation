@@ -23,6 +23,7 @@ import (
 // Get returns a scripted record, Update records what was written.
 type fakeLock struct {
 	holder   string
+	gets     int
 	updates  []resourcelock.LeaderElectionRecord
 	getErr   error
 	updateEr error
@@ -33,6 +34,7 @@ func (f *fakeLock) Create(context.Context, resourcelock.LeaderElectionRecord) er
 	return nil
 }
 func (f *fakeLock) Get(context.Context) (*resourcelock.LeaderElectionRecord, []byte, error) {
+	f.gets++
 	if f.getErr != nil {
 		return nil, nil, f.getErr
 	}
@@ -111,6 +113,37 @@ func TestReleaseGuardNeverTouchesRenew(t *testing.T) {
 	}
 	if len(inner.updates) != 1 {
 		t.Fatalf("renew blocked: %+v", inner.updates)
+	}
+}
+
+func TestReleaseGuardRespectsStolenFlag(t *testing.T) {
+	var stolen atomic.Bool
+	stolen.Store(true)
+	inner := &fakeLock{holder: "pod-a_1234"}
+	l := &releaseGuardedLock{Interface: inner, stolen: &stolen}
+
+	if err := l.Update(t.Context(), releaseRec()); err != nil {
+		t.Fatalf("guarded release (stolen=true) returned error: %v", err)
+	}
+	if inner.gets != 0 || len(inner.updates) != 0 {
+		t.Fatalf("stolen=true must skip Get and Update: gets=%d updates=%d", inner.gets, len(inner.updates))
+	}
+
+	stolen.Store(false)
+	if err := l.Update(t.Context(), releaseRec()); err != nil {
+		t.Fatalf("guarded release (stolen=false, self-held) returned error: %v", err)
+	}
+	if inner.gets != 1 || len(inner.updates) != 1 {
+		t.Fatalf("stolen=false self-held must Get and Update: gets=%d updates=%d", inner.gets, len(inner.updates))
+	}
+
+	innerForeign := &fakeLock{holder: "pod-b_5678"}
+	lForeign := &releaseGuardedLock{Interface: innerForeign, stolen: &stolen}
+	if err := lForeign.Update(t.Context(), releaseRec()); err != nil {
+		t.Fatalf("guarded release (stolen=false, foreign-held) returned error: %v", err)
+	}
+	if innerForeign.gets != 1 || len(innerForeign.updates) != 0 {
+		t.Fatalf("stolen=false foreign-held must Get and refuse Update: gets=%d updates=%d", innerForeign.gets, len(innerForeign.updates))
 	}
 }
 

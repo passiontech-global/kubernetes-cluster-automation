@@ -188,10 +188,10 @@ func (a *certDriftAuditor) auditLiveSockets(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	now := a.now.Now()
 	seenStreaks := map[string]bool{}
-	defer func() {
+	prune := func() {
 		a.liveDriftStreak.Prune(func(k string) bool { return seenStreaks[k] })
 		a.seenLiveDrift.Prune(metrics.TLSLiveSocketDrift.DeleteLabelValues)
-	}()
+	}
 
 	var err error
 	secrets := a.cachedTLSSecretMeta()
@@ -205,6 +205,7 @@ func (a *certDriftAuditor) auditLiveSockets(ctx context.Context) error {
 		}
 	}
 	if len(secrets) == 0 {
+		prune()
 		return nil
 	}
 
@@ -265,6 +266,7 @@ func (a *certDriftAuditor) auditLiveSockets(ctx context.Context) error {
 		}
 	}
 	if len(targets) == 0 {
+		prune()
 		return nil
 	}
 
@@ -273,6 +275,9 @@ func (a *certDriftAuditor) auditLiveSockets(ctx context.Context) error {
 		prober = defaultLiveCertProber
 	}
 	runProbePool(ctx, prober, targets)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	rolledWorkloads := map[string]bool{}
 	for i := range targets {
@@ -323,6 +328,7 @@ func (a *certDriftAuditor) auditLiveSockets(ctx context.Context) error {
 		}
 		a.maybeRolloutWorkload(ctx, log, t, rolledWorkloads, now)
 	}
+	prune()
 	return nil
 }
 
@@ -424,11 +430,11 @@ func (a *certDriftAuditor) collectReferencedTLSServices(ctx context.Context) (ma
 		}
 	}
 
-	if a.dyn != nil {
-		// CRD conversion refs ride the same page read as Check A (which
-		// already scans full CRD schemas every sweep) — no second
-		// full-schema CRD list. The cache is only warm when run() called
-		// auditWebhookCABundles first; standalone unit tests fall back.
+	// CRD conversion refs ride the same census as Check A (informer
+	// cache first, dynamic fallback). The cache is only warm when run()
+	// called auditWebhookCABundles first; standalone unit tests fall
+	// back to listCachedCRDs or dynamic ListEach.
+	if a.crdRefsCached() {
 		for key, port := range a.cachedCRDRefs() {
 			ns, name, ok := strings.Cut(key, "/")
 			if !ok {
@@ -436,19 +442,24 @@ func (a *certDriftAuditor) collectReferencedTLSServices(ctx context.Context) (ma
 			}
 			putRef(refs, ns, name, port)
 		}
-		if !a.crdRefsCached() {
-			listErr := kube.ListEach(ctx, opts,
-				kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)),
-				func(page []unstructured.Unstructured) error {
-					for i := range page {
-						collectCRDConversionService(&page[i], refs)
-					}
-					return nil
-				})
-			if listErr != nil && !kube.IsCRDAbsent(listErr) && !apierrors.IsForbidden(listErr) {
-				return nil, listErr
-			}
+	} else if crds, ok := a.listCachedCRDs(ctx); ok {
+		for i := range crds {
+			collectTypedCRDConversionService(&crds[i], refs)
 		}
+	} else if a.dyn != nil {
+		listErr := kube.ListEach(ctx, opts,
+			kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)),
+			func(page []unstructured.Unstructured) error {
+				for i := range page {
+					collectCRDConversionService(&page[i], refs)
+				}
+				return nil
+			})
+		if listErr != nil && !kube.IsCRDAbsent(listErr) && !apierrors.IsForbidden(listErr) {
+			return nil, listErr
+		}
+	}
+	if a.dyn != nil {
 		// APIService objects are tiny — reading them here is cheap.
 		listErr := kube.ListEach(ctx, opts,
 			kube.DynamicPage(a.dyn.Resource(kube.GVRAPIService)),

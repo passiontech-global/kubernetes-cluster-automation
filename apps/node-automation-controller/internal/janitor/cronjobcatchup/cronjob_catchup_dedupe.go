@@ -119,7 +119,10 @@ func jobStillActive(j *batchv1.Job) bool {
 func (c *cronJobCatchup) buildJobDedupeIndex(ctx context.Context,
 	log logr.Logger) *jobDedupeIndex {
 	jobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		},
 		kube.Jobs(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		metrics.IncError(c.queue)

@@ -334,8 +334,9 @@ func (p *stsRolloutUnstickCheck) maybeHealPod(ctx context.Context,
 		return // one delete per set per sweep — the 30m cooldown
 		// enforces the same bound across sweeps.
 	}
+	healKey := probefw.SelfHealKey(CheckNameStatefulSetRolloutUnstick, stsKey)
 	proceed, unverifiable := p.HealAllowedClusterWideOnly(ctx, log, &p.Heals,
-		stsKey, stsUnstickHealCooldown, now)
+		healKey, stsUnstickHealCooldown, now)
 	switch {
 	case unverifiable:
 		// Tolerated sub-failure: the sweep continues and the run
@@ -346,7 +347,7 @@ func (p *stsRolloutUnstickCheck) maybeHealPod(ctx context.Context,
 	case !proceed:
 		return
 	}
-	deleted, err := heal.DeletePod(ctx, p.CS, &p.Heals, stsKey, pod, now)
+	deleted, err := heal.DeletePod(ctx, p.CS, &p.Heals, healKey, pod, now)
 	if err != nil {
 		metrics.IncError(p.Name)
 		log.Error(err, "statefulset unstick pod delete failed",
@@ -360,7 +361,6 @@ func (p *stsRolloutUnstickCheck) maybeHealPod(ctx context.Context,
 		return
 	}
 	healed[stsKey] = true
-	p.InvalidatePods(ctx)
 	rep.Find("healed: deleted wedged pod " + pod.Namespace + "/" +
 		pod.Name + " on " + stsKey)
 	log.Info("ACTION: deleted wedged StatefulSet pod to unstick rollout",

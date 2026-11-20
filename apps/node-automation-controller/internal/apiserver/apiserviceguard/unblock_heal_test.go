@@ -243,3 +243,110 @@ func TestHealCandidateCooledDownSkipsBeforeBudget(t *testing.T) {
 			proceed, unverifiable)
 	}
 }
+
+func TestDeleteBackingPodsSweepCapNoDoubleCount(t *testing.T) {
+	t.Run("single call reaches full sweepCap without 2x double-count", func(t *testing.T) {
+		targets := backingTargets("kube-system", "ms-0", "ms-1", "ms-2", "ms-3")
+		cs := fake.NewSimpleClientset(&targets[0], &targets[1], &targets[2], &targets[3])
+		testutil.EmulateEviction(cs)
+		g := asgGuard(cs, asgDynFake())
+		g.queue = "apiservice-guard"
+		u := &unblockHealer{sweepCap: 2}
+
+		deleted := u.deleteBackingPods(ctx, g, "v1beta1.metrics.k8s.io", targets, time.Now())
+		if deleted != 2 || u.sweepEvicted != 2 {
+			t.Fatalf("deleted=%d sweepEvicted=%d, want 2/2 (double-count bug stops at 1)", deleted, u.sweepEvicted)
+		}
+		if testutil.PodExists(t, cs, "kube-system", "ms-0") || testutil.PodExists(t, cs, "kube-system", "ms-1") {
+			t.Fatal("first 2 targets should have been evicted")
+		}
+		if !testutil.PodExists(t, cs, "kube-system", "ms-2") || !testutil.PodExists(t, cs, "kube-system", "ms-3") {
+			t.Fatal("targets past sweepCap=2 should remain alive")
+		}
+	})
+
+	t.Run("sequential calls share sweepCap across candidates", func(t *testing.T) {
+		targetsA := backingTargets("kube-system", "a-0")
+		targetsB := backingTargets("kube-system", "b-0", "b-1")
+		targetsC := backingTargets("kube-system", "c-0")
+		cs := fake.NewSimpleClientset(&targetsA[0], &targetsB[0], &targetsB[1], &targetsC[0])
+		testutil.EmulateEviction(cs)
+		g := asgGuard(cs, asgDynFake())
+		g.queue = "apiservice-guard"
+		u := &unblockHealer{sweepCap: 2}
+
+		if got := u.deleteBackingPods(ctx, g, "v1.a", targetsA, time.Now()); got != 1 {
+			t.Fatalf("call 1 deleted=%d, want 1", got)
+		}
+		if got := u.deleteBackingPods(ctx, g, "v1.b", targetsB, time.Now()); got != 1 {
+			t.Fatalf("call 2 deleted=%d, want 1 (cap=2, 1 already evicted)", got)
+		}
+		if got := u.deleteBackingPods(ctx, g, "v1.c", targetsC, time.Now()); got != 0 {
+			t.Fatalf("call 3 deleted=%d, want 0 (sweepCap exhausted)", got)
+		}
+		if u.sweepEvicted != 2 {
+			t.Fatalf("u.sweepEvicted = %d, want 2", u.sweepEvicted)
+		}
+		if !testutil.PodExists(t, cs, "kube-system", "b-1") || !testutil.PodExists(t, cs, "kube-system", "c-0") {
+			t.Fatal("pods past sweepCap=2 were evicted")
+		}
+	})
+}
+
+func TestDeleteBackingPodsProceedFalseStopsLoop(t *testing.T) {
+	t.Run("maintenance mutex stops loop on first !proceed", func(t *testing.T) {
+		targets := backingTargets("kube-system", "ms-0", "ms-1", "ms-2")
+		ts := metav1.NewTime(time.Now())
+		cordoned := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "w1"},
+			Spec: corev1.NodeSpec{
+				Unschedulable: true,
+				Taints:        []corev1.Taint{{Key: kube.UnschedulableTaintKey, TimeAdded: &ts}},
+			},
+		}
+		cs := fake.NewSimpleClientset(&targets[0], &targets[1], &targets[2], cordoned)
+		testutil.EmulateEviction(cs)
+		nodeLists := 0
+		cs.PrependReactor("list", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+			nodeLists++
+			return false, nil, nil
+		})
+		g := asgGuard(cs, asgDynFake())
+		g.queue = "apiservice-guard"
+		u := &unblockHealer{sweepCap: 3}
+
+		deleted := u.deleteBackingPods(ctx, g, "v1beta1.metrics.k8s.io", targets, time.Now())
+		if deleted != 0 {
+			t.Fatalf("deleted = %d, want 0", deleted)
+		}
+		if nodeLists != 1 {
+			t.Fatalf("nodes listed %d times across 3 targets, want 1 (loop must exit on first !proceed)", nodeLists)
+		}
+	})
+
+	t.Run("exhausted heal budget stops loop on first !proceed", func(t *testing.T) {
+		heal.ConfigureBudget(1, time.Hour)
+		t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+		targets := backingTargets("kube-system", "ms-0", "ms-1", "ms-2")
+		cs := fake.NewSimpleClientset(&targets[0], &targets[1], &targets[2])
+		testutil.EmulateEviction(cs)
+		nodeLists := 0
+		cs.PrependReactor("list", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+			nodeLists++
+			return false, nil, nil
+		})
+		g := asgGuard(cs, asgDynFake())
+		g.queue = "apiservice-guard"
+		u := &unblockHealer{sweepCap: 3}
+
+		deleted := u.deleteBackingPods(ctx, g, "v1beta1.metrics.k8s.io", targets, time.Now())
+		if deleted != 1 {
+			t.Fatalf("deleted = %d, want 1 (budget=1)", deleted)
+		}
+		// Target 0 succeeds (1 list), target 1 hits !proceed on budget (1 list) -> stops before target 2.
+		if nodeLists != 2 {
+			t.Fatalf("nodes listed %d times, want 2 (must stop immediately when target 1 hits !proceed)", nodeLists)
+		}
+	})
+}

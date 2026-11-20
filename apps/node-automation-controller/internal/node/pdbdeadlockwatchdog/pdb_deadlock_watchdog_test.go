@@ -3,6 +3,7 @@ package pdbdeadlockwatchdog
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -852,4 +853,128 @@ func pdbUnhealthyPolicyPatchedTotalValue(t *testing.T) float64 {
 		return v
 	}
 	return 0
+}
+
+// run() reuses the pod slice fetched in pdbPodsOnCordonedNodes when calling
+// relief, issuing exactly 1 pod LIST per blocked PDB per sweep (whether relief
+// fires on a failing pod or finds only healthy pods).
+func TestPDBWatchdogSinglePodListPerBlockedPDBInSweep(t *testing.T) {
+	t.Run("failing pod triggers relief with single pod LIST", func(t *testing.T) {
+		clock := time.Now()
+		t.Cleanup(func() { pdwClearMetrics(t, [2]string{"app", "web-pdb"}) })
+		pdb := pdwBlockedPDB("app", "web-pdb", 3, 1, 1)
+		pod := pdwUnreadyPod("app", "web-0", "node-cordoned", 10*time.Minute, "CrashLoopBackOff")
+		cs := fake.NewSimpleClientset(pdwCordonedNode("node-cordoned"), pdb, pod)
+		var podLists atomic.Int32
+		var gotFields string
+		cs.PrependReactor("list", "pods",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				podLists.Add(1)
+				gotFields = a.(ktesting.ListAction).GetListRestrictions().Fields.String()
+				return false, nil, nil
+			})
+		w := pdwReliefWatchdog(cs, &clock)
+		w.queue = "pdb-deadlock-watchdog"
+
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := podLists.Swap(0); got != 1 {
+			t.Fatalf("sweep 1 pod lists = %d, want 1", got)
+		}
+
+		clock = clock.Add(16 * time.Minute)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := podLists.Load(); got != 1 {
+			t.Fatalf("sweep 2 pod lists = %d, want 1 (duplicate pod LIST in relief)", got)
+		}
+		if want := "status.phase!=Failed,status.phase!=Succeeded"; gotFields != want {
+			t.Fatalf("pod list field selector = %q, want %q", gotFields, want)
+		}
+		got, err := cs.PolicyV1().PodDisruptionBudgets("app").Get(ctx, "web-pdb", metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Spec.UnhealthyPodEvictionPolicy == nil || *got.Spec.UnhealthyPodEvictionPolicy != policyv1.AlwaysAllow {
+			t.Fatalf("unhealthyPodEvictionPolicy = %v, want AlwaysAllow", got.Spec.UnhealthyPodEvictionPolicy)
+		}
+	})
+
+	t.Run("healthy pod skips relief with single pod LIST", func(t *testing.T) {
+		clock := time.Now()
+		t.Cleanup(func() { pdwClearMetrics(t, [2]string{"app", "healthy-pdb"}) })
+		pdb := pdwBlockedPDB("app", "healthy-pdb", 3, 1, 1)
+		pod := pdwPod("app", "web-0", "node-cordoned")
+		pod.Status.Conditions = []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}}
+		cs := fake.NewSimpleClientset(pdwCordonedNode("node-cordoned"), pdb, pod)
+		var podLists atomic.Int32
+		cs.PrependReactor("list", "pods",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				podLists.Add(1)
+				return false, nil, nil
+			})
+		w := pdwReliefWatchdog(cs, &clock)
+		w.queue = "pdb-deadlock-watchdog"
+
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		podLists.Store(0)
+
+		clock = clock.Add(16 * time.Minute)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := podLists.Load(); got != 1 {
+			t.Fatalf("sweep 2 pod lists = %d, want 1", got)
+		}
+	})
+}
+
+// When pdbPodsOnCordonedNodes fails to list pods past pdbCordonedMinAge, run()
+// skips relief so the failed LIST is neither retried nor double-IncError'd.
+func TestPDBWatchdogPodListErrorNoDoubleIncError(t *testing.T) {
+	clock := time.Now()
+	t.Cleanup(func() { pdwClearMetrics(t, [2]string{"app", "err-pdb"}) })
+	pdb := pdwBlockedPDB("app", "err-pdb", 3, 1, 1)
+	pod := pdwUnreadyPod("app", "web-0", "node-cordoned", 10*time.Minute, "CrashLoopBackOff")
+	cs := fake.NewSimpleClientset(pdwCordonedNode("node-cordoned"), pdb, pod)
+
+	var failPods atomic.Bool
+	var podLists atomic.Int32
+	cs.PrependReactor("list", "pods",
+		func(ktesting.Action) (bool, runtime.Object, error) {
+			podLists.Add(1)
+			if failPods.Load() {
+				return true, nil, errors.New("pod list boom")
+			}
+			return false, nil, nil
+		})
+
+	w := pdwReliefWatchdog(cs, &clock)
+	w.queue = "pdb-deadlock-watchdog"
+
+	// Sweep 1 opens the cordoned_node_blocked firstSeen window.
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	podLists.Store(0)
+
+	// Sweep 2 past pdbCordonedMinAge fails pod list: exactly 1 list and 1 IncError.
+	failPods.Store(true)
+	before := testutil.QueueErrorCount(t, "pdb-deadlock-watchdog")
+	clock = clock.Add(16 * time.Minute)
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := podLists.Load(); got != 1 {
+		t.Fatalf("sweep 2 pod lists = %d, want 1", got)
+	}
+	if got := testutil.QueueErrorCount(t, "pdb-deadlock-watchdog") - before; got != 1 {
+		t.Fatalf("queue error delta = %v, want 1 (no double IncError)", got)
+	}
 }

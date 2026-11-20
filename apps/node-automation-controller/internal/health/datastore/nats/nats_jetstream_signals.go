@@ -133,85 +133,77 @@ func (s *natsSweep) promSignals(ctx context.Context) {
 		}
 	}
 
-	// (b2) stream-leaderless — stream leader loss: members publish the
-	// per-stream nats_jetstream_stream_leader gauge; a namespace
-	// whose MINIMUM series value is 0 has at least one tracked stream
-	// group that lost its leader — `min by` (not `sum by`) because a
-	// namespace running several streams stays sum-positive while one
-	// stream is leaderless, hiding the partial loss. Diffed
-	// client-side across the same two instant queries as the meta
-	// check (the literal `and` form never matches: a ==0 comparison
-	// produces an empty vector on the leader side, and PromQL `and`
-	// intersects it away). Pod-resolvable findings join the
-	// windowed/healable pod-local path (bounce only under the
-	// >=2-Ready-siblings quorum guard); series whose pod cannot be
-	// resolved emit at namespace scope — a namespace-scope Raft
-	// verdict has no single culprit pod. The pod-local stamp needs
-	// PER-POD evidence — a member whose OWN per-stream minimum is 0,
-	// i.e. some stream leader it reports is gone. A member whose
-	// series are all positive still holds its leadership and must
-	// never stamp: bounceWedged would delete the very member the
-	// raft groups rally around, cascading leader loss (one bounce
-	// per 30m loop).
-	streamCounts, errSC := s.p.PromQuery(ctx,
-		`nats_jetstream_stream_leader`)
-	streamMins, errSM := s.p.PromQuery(ctx,
-		`min by (namespace) (nats_jetstream_stream_leader)`)
-	if errSC != nil || errSM != nil {
-		s.log.Info("WARN: nats stream-leader queries failed — stream-leaderless signal skipped",
-			"countErr", errSC, "minErr", errSM)
+	// (b2) stream-leaderless — stream leader loss: in replicated
+	// JetStream (e.g. R=3), 1 replica holds the stream leader (gauge=1)
+	// while healthy followers report 0. Therefore we MUST aggregate per
+	// (namespace, stream) client-side: a stream has lost its leader only
+	// when count > 0 and sum == 0 across all replicas reporting it.
+	// Emitted at namespace scope (pod="") so healthy followers are never
+	// bounced; pod-local stream_leaderless bounces remain driven by
+	// natsLogMarkers ("stream has no leader" / "group has no leader").
+	streamSeries, errSL := s.p.PromQuery(ctx, `nats_jetstream_stream_leader`)
+	if errSL != nil {
+		s.log.Info("WARN: nats stream-leader query failed — stream-leaderless signal skipped",
+			"error", errSL)
 		s.promDegraded = true
 	} else {
-		minByNS := map[string]float64{}
-		for _, series := range streamMins {
-			minByNS[series.Label("namespace")] = series.Value
+		type streamTally struct {
+			stream string
+			count  int
+			sum    float64
 		}
-		podsByNS := map[string][]string{}
-		// minByPod carries each member's OWN per-stream minimum — the
-		// per-pod evidence the healable stamp requires (the
-		// namespace-scope min by (namespace) above only proves SOME
-		// member in the namespace lost a stream leader).
-		minByPod := map[string]float64{} // "ns/pod" -> minimum
-		for _, series := range streamCounts {
+		byNSStream := map[string]map[string]*streamTally{}
+		for _, series := range streamSeries {
 			ns := series.Label("namespace")
-			if ns == "" {
+			if ns == "" || !s.census.namespaces[ns] {
 				continue
 			}
-			if _, seen := podsByNS[ns]; !seen {
-				podsByNS[ns] = nil // registered even without pod labels
+			stream := series.Label("stream_name", "stream", "nats_stream_name")
+			acct := series.Label("account", "account_name")
+			streamKey := stream
+			if acct != "" {
+				streamKey = acct + "/" + stream
 			}
-			if pod := series.Label("pod", "pod_name"); pod != "" {
-				podsByNS[ns] = append(podsByNS[ns], pod)
-				key := ns + "/" + pod
-				if prev, seen := minByPod[key]; !seen || series.Value < prev {
-					minByPod[key] = series.Value
-				}
+			m := byNSStream[ns]
+			if m == nil {
+				m = map[string]*streamTally{}
+				byNSStream[ns] = m
 			}
+			t := m[streamKey]
+			if t == nil {
+				t = &streamTally{stream: stream}
+				m[streamKey] = t
+			}
+			t.count++
+			t.sum += series.Value
 		}
-		for ns, podNames := range podsByNS {
-			if !s.census.namespaces[ns] || minByNS[ns] != 0 {
-				continue // every tracked stream has a leader — healthy, or not a NATS namespace
-			}
-			resolved := false
-			for _, podName := range podNames {
-				if minByPod[ns+"/"+podName] != 0 {
-					continue // its own streams are all led — a leadership holder, never a bounce target
+		for ns, streams := range byNSStream {
+			var leaderless []string
+			totalCount := 0
+			hasLeaderless := false
+			for _, t := range streams {
+				if t.count > 0 && t.sum == 0 {
+					hasLeaderless = true
+					totalCount += t.count
+					if t.stream != "" {
+						leaderless = append(leaderless, t.stream)
+					}
 				}
-				pod := s.census.resolvePod(ns, podName)
-				if pod == nil || pod.DeletionTimestamp != nil {
-					continue // stale series or a non-member — not ours
-				}
-				s.addReason(pod.Namespace+"/"+pod.Name,
-					natsReasonStreamLeaderless, true)
-				resolved = true
 			}
-			if !resolved {
-				s.rep.Emit(natsJetstreamUnhealthyGauge,
-					ns+"/"+natsReasonStreamLeaderless,
-					[]string{ns, "", natsReasonStreamLeaderless},
-					fmt.Sprintf("%s(stream_leaderless: %d stream-leader series, min 0)",
-						ns, len(podNames)))
+			if !hasLeaderless {
+				continue
 			}
+			slices.Sort(leaderless)
+			detail := fmt.Sprintf("%s(stream_leaderless: %d stream-leader series, sum 0)",
+				ns, totalCount)
+			if len(leaderless) > 0 {
+				detail = fmt.Sprintf("%s(stream_leaderless: %d stream-leader series across [%s], sum 0)",
+					ns, totalCount, strings.Join(leaderless, ","))
+			}
+			s.rep.Emit(natsJetstreamUnhealthyGauge,
+				ns+"/"+natsReasonStreamLeaderless,
+				[]string{ns, "", natsReasonStreamLeaderless},
+				detail)
 		}
 	}
 
@@ -407,8 +399,7 @@ func (s *natsSweep) applyPersistence() {
 			return true
 		}
 		if s.promDegraded &&
-			(strings.HasSuffix(k, "/"+natsReasonJetStreamDisabled) ||
-				strings.HasSuffix(k, "/"+natsReasonStreamLeaderless)) {
+			strings.HasSuffix(k, "/"+natsReasonJetStreamDisabled) {
 			if _, ok := s.census.memberByName[podKey]; ok {
 				return true
 			}

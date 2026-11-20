@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1227,3 +1228,406 @@ func TestSetupCoreDNSWatchdogDisabled(t *testing.T) {
 
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()
+
+func TestCoreDNSProbeFallbackClusterIPExpiresOnTTL(t *testing.T) {
+	ready := true
+	pinned := time.Unix(1700000000, 0)
+	clock := pinned
+
+	// Old (>10m) ClusterIP Service -> forces fallback selection (fresh == false).
+	oldClusterIP := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "old-cip",
+			Namespace:         "app-ns",
+			CreationTimestamp: metav1.NewTime(pinned.Add(-30 * time.Minute)),
+		},
+		Spec: corev1.ServiceSpec{ClusterIP: "10.96.1.10"},
+	}
+	oldES := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "old-cip-eps",
+			Namespace:       "app-ns",
+			ResourceVersion: "10",
+			Labels:          map[string]string{discoveryv1.LabelServiceName: "old-cip"},
+		},
+		Endpoints: []discoveryv1.Endpoint{{
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+			Addresses:  []string{"10.0.0.10"},
+		}},
+	}
+	cs := fake.NewSimpleClientset(oldClusterIP, oldES)
+	w := newCDNSWatchdog(cs)
+	w.now = func() time.Time { return clock }
+
+	fqdn, want, fromCache := w.probeFQDNState(ctx)
+	if fqdn != "old-cip.app-ns.svc.cluster.local" || fromCache {
+		t.Fatalf("initial pick = (%q, %v), want old-cip with fromCache=false", fqdn, fromCache)
+	}
+	if !want["10.96.1.10"] || w.cachedFresh {
+		t.Fatalf("unexpected initial want=%v cachedFresh=%v", want, w.cachedFresh)
+	}
+
+	// Inside TTL: cache hit.
+	clock = pinned.Add(5 * time.Minute)
+	fqdn2, _, fromCache2 := w.probeFQDNState(ctx)
+	if fqdn2 != fqdn || !fromCache2 {
+		t.Fatalf("within TTL = (%q, %v), want cache hit on %q", fqdn2, fromCache2, fqdn)
+	}
+
+	// Add a headless Service and expire the cache TTL.
+	hlSvc, hlES := headlessProbeTarget("200", "10.0.9.1", "10.0.9.2")
+	hlSvc.CreationTimestamp = metav1.NewTime(pinned.Add(-30 * time.Minute))
+	if _, err := cs.CoreV1().Services("app-ns").Create(ctx, hlSvc, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.DiscoveryV1().EndpointSlices("app-ns").Create(ctx, hlES, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	clock = pinned.Add(corednsFQDNCacheTTL)
+	fqdn3, want3, fromCache3 := w.probeFQDNState(ctx)
+	if fqdn3 != "headless-svc.app-ns.svc.cluster.local" || fromCache3 {
+		t.Fatalf("post-TTL pick = (%q, %v), want headless-svc with fromCache=false", fqdn3, fromCache3)
+	}
+	if !maps.Equal(want3, map[string]bool{"10.0.9.1": true, "10.0.9.2": true}) {
+		t.Fatalf("post-TTL want = %v, want headless endpoint IPs", want3)
+	}
+}
+
+func TestCoreDNSProbeEndpointIPToClusterIPAndBack(t *testing.T) {
+	ready := true
+	pinned := time.Unix(1700000000, 0)
+	clock := pinned
+
+	hlSvc, hlES := headlessProbeTarget("200", "10.0.9.1", "10.0.9.2")
+	hlSvc.CreationTimestamp = metav1.NewTime(pinned.Add(-30 * time.Minute))
+	cipSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "old-cip",
+			Namespace:         "app-ns",
+			CreationTimestamp: metav1.NewTime(pinned.Add(-30 * time.Minute)),
+		},
+		Spec: corev1.ServiceSpec{ClusterIP: "10.96.1.10"},
+	}
+	cipES := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "old-cip-eps",
+			Namespace:       "app-ns",
+			ResourceVersion: "10",
+			Labels:          map[string]string{discoveryv1.LabelServiceName: "old-cip"},
+		},
+		Endpoints: []discoveryv1.Endpoint{{
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+			Addresses:  []string{"10.0.0.10"},
+		}},
+	}
+	cs := fake.NewSimpleClientset(hlSvc, hlES, cipSvc, cipES)
+	w := newCDNSWatchdog(cs)
+	w.now = func() time.Time { return clock }
+
+	// Step 1: starts on headless EndpointIP target.
+	fqdn1, _, _ := w.probeFQDNState(ctx)
+	if fqdn1 != "headless-svc.app-ns.svc.cluster.local" {
+		t.Fatalf("step 1 fqdn = %q, want headless-svc", fqdn1)
+	}
+
+	// Step 2: headless endpoints disappear; TTL expires -> falls back to ClusterIP.
+	notReady := false
+	hlESDown := hlES.DeepCopy()
+	hlESDown.Endpoints[0].Conditions.Ready = &notReady
+	if _, err := cs.DiscoveryV1().EndpointSlices("app-ns").Update(ctx, hlESDown, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(corednsFQDNCacheTTL)
+	fqdn2, want2, _ := w.probeFQDNState(ctx)
+	if fqdn2 != "old-cip.app-ns.svc.cluster.local" || !want2["10.96.1.10"] {
+		t.Fatalf("step 2 = (%q, %v), want old-cip fallback", fqdn2, want2)
+	}
+
+	// Step 3: headless endpoint recovers; TTL expires -> recovers back to EndpointIP!
+	hlESUp := hlES.DeepCopy()
+	hlESUp.ResourceVersion = "250"
+	if _, err := cs.DiscoveryV1().EndpointSlices("app-ns").Update(ctx, hlESUp, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(corednsFQDNCacheTTL)
+	fqdn3, want3, _ := w.probeFQDNState(ctx)
+	if fqdn3 != "headless-svc.app-ns.svc.cluster.local" {
+		t.Fatalf("step 3 fqdn = %q, want recovery to headless-svc", fqdn3)
+	}
+	if !maps.Equal(want3, map[string]bool{"10.0.9.1": true, "10.0.9.2": true}) {
+		t.Fatalf("step 3 want = %v, want headless endpoint IPs", want3)
+	}
+}
+
+func TestCoreDNSProbeClusterIPFallbackInvalidationDoesNotPin(t *testing.T) {
+	ready := true
+	pinned := time.Unix(1700000000, 0)
+	clock := pinned
+
+	oldClusterIP := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "old-cip",
+			Namespace:         "app-ns",
+			CreationTimestamp: metav1.NewTime(pinned.Add(-30 * time.Minute)),
+		},
+		Spec: corev1.ServiceSpec{ClusterIP: "10.96.1.10"},
+	}
+	oldES := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "old-cip-eps",
+			Namespace:       "app-ns",
+			ResourceVersion: "10",
+			Labels:          map[string]string{discoveryv1.LabelServiceName: "old-cip"},
+		},
+		Endpoints: []discoveryv1.Endpoint{{
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+			Addresses:  []string{"10.0.0.10"},
+		}},
+	}
+	cs := fake.NewSimpleClientset(oldClusterIP, oldES)
+	w := newCDNSWatchdog(cs)
+	w.now = func() time.Time { return clock }
+
+	if fqdn, _ := w.probeFQDN(ctx); fqdn != "old-cip.app-ns.svc.cluster.local" {
+		t.Fatalf("initial fqdn = %q", fqdn)
+	}
+
+	// Headless target appears; mid-cycle invalidation must NOT pin old-cip.
+	hlSvc, hlES := headlessProbeTarget("200", "10.0.9.1", "10.0.9.2")
+	hlSvc.CreationTimestamp = metav1.NewTime(pinned.Add(-30 * time.Minute))
+	if _, err := cs.CoreV1().Services("app-ns").Create(ctx, hlSvc, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.DiscoveryV1().EndpointSlices("app-ns").Create(ctx, hlES, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	w.invalidateFQDNCache()
+	fqdn, want := w.probeFQDN(ctx)
+	if fqdn != "headless-svc.app-ns.svc.cluster.local" {
+		t.Fatalf("post-invalidation fqdn = %q, want headless-svc", fqdn)
+	}
+	if !maps.Equal(want, map[string]bool{"10.0.9.1": true, "10.0.9.2": true}) {
+		t.Fatalf("post-invalidation want = %v", want)
+	}
+}
+
+func TestCoreDNSProbeTransientEndpointSliceErrorOnTTLExpiry(t *testing.T) {
+	pinned := time.Unix(1700000000, 0)
+	clock := pinned
+
+	hlSvc, hlES := headlessProbeTarget("200", "10.0.9.1", "10.0.9.2")
+	hlSvc.CreationTimestamp = metav1.NewTime(pinned.Add(-30 * time.Minute))
+	cs := fake.NewSimpleClientset(hlSvc, hlES)
+	w := newCDNSWatchdog(cs)
+	w.now = func() time.Time { return clock }
+
+	if fqdn, _, _ := w.probeFQDNState(ctx); fqdn != "headless-svc.app-ns.svc.cluster.local" {
+		t.Fatalf("initial fqdn = %q", fqdn)
+	}
+
+	var failSlices atomic.Bool
+	failSlices.Store(true)
+	cs.PrependReactor("list", "endpointslices", func(ktesting.Action) (bool, runtime.Object, error) {
+		if failSlices.Load() {
+			return true, nil, errors.New("transient apiserver error")
+		}
+		return false, nil, nil
+	})
+
+	clock = clock.Add(corednsFQDNCacheTTL)
+	fqdn, want, fromCache := w.probeFQDNState(ctx)
+	if fqdn != "" || want != nil || fromCache {
+		t.Fatalf("transient error pick = (%q, %v, %v), want empty", fqdn, want, fromCache)
+	}
+	if w.cachedFQDN != "" || w.cachedNS != "" || w.cachedName != "" {
+		t.Fatalf("expected cache identity cleared on inconclusive pick, got (%q, %q, %q)",
+			w.cachedFQDN, w.cachedNS, w.cachedName)
+	}
+
+	// Next sweep recovers once the error clears.
+	failSlices.Store(false)
+	fqdn2, _, fromCache2 := w.probeFQDNState(ctx)
+	if fqdn2 != "headless-svc.app-ns.svc.cluster.local" || fromCache2 {
+		t.Fatalf("recovery pick = (%q, %v), want headless-svc", fqdn2, fromCache2)
+	}
+}
+
+func TestCoreDNSProbeFQDNCacheBackwardClockStep(t *testing.T) {
+	ready := true
+	pinned := time.Unix(1700000000, 0)
+	clock := pinned
+	svc, es := cdnsProbeService("fresh-svc", "app-ns", 0, &ready)
+	svc.CreationTimestamp = metav1.NewTime(pinned)
+	cs := fake.NewSimpleClientset(svc, es)
+	w := newCDNSWatchdog(cs)
+	w.now = func() time.Time { return clock }
+	gets := svcGetCounter(cs)
+
+	if fqdn, _, fromCache := w.probeFQDNState(ctx); fqdn == "" || fromCache {
+		t.Fatalf("initial pick = (%q, %v)", fqdn, fromCache)
+	}
+
+	// Step wall clock backward by 1 minute -> must NOT serve stale cache hit.
+	clock = pinned.Add(-time.Minute)
+	fqdn2, _, fromCache2 := w.probeFQDNState(ctx)
+	if fqdn2 != "fresh-svc.app-ns.svc.cluster.local" || fromCache2 {
+		t.Fatalf("backward clock step returned (%q, fromCache=%v), want fromCache=false", fqdn2, fromCache2)
+	}
+	if *gets != 1 {
+		t.Fatalf("expected targeted refresh on backward clock step, gets=%d", *gets)
+	}
+}
+
+func TestCoreDNSProbeNoDuplicateEndpointSliceLists(t *testing.T) {
+	sliceListCounter := func(cs *fake.Clientset) *int {
+		n := 0
+		cs.PrependReactor("list", "endpointslices", func(ktesting.Action) (bool, runtime.Object, error) {
+			n++
+			return false, nil, nil
+		})
+		return &n
+	}
+
+	t.Run("<10m headless service (probeFQDNUncached)", func(t *testing.T) {
+		ready := true
+		pinned := time.Unix(1700000000, 0)
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "fresh-hl",
+				Namespace:         "app-ns",
+				CreationTimestamp: metav1.NewTime(pinned.Add(-2 * time.Minute)),
+			},
+			Spec: corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone},
+		}
+		es := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "fresh-hl-eps",
+				Namespace: "app-ns",
+				Labels:    map[string]string{discoveryv1.LabelServiceName: "fresh-hl"},
+			},
+			Endpoints: []discoveryv1.Endpoint{{
+				Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+				Addresses:  []string{"10.0.5.1"},
+			}},
+		}
+		cs := fake.NewSimpleClientset(svc, es)
+		lists := sliceListCounter(cs)
+		w := newCDNSWatchdog(cs)
+		w.now = func() time.Time { return pinned }
+		fqdn, want := w.probeFQDN(ctx)
+		if fqdn != "fresh-hl.app-ns.svc.cluster.local" || !want["10.0.5.1"] {
+			t.Fatalf("pick = (%q, %v)", fqdn, want)
+		}
+		if *lists != 1 {
+			t.Fatalf("endpointslice LIST count = %d, want 1", *lists)
+		}
+	})
+
+	t.Run("fallback headless multi-slice with PublishNotReadyAddresses (probeFQDNFromSlices)", func(t *testing.T) {
+		ready := true
+		notReady := false
+		pinned := time.Unix(1700000000, 0)
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "old-hl",
+				Namespace:         "app-ns",
+				CreationTimestamp: metav1.NewTime(pinned.Add(-30 * time.Minute)),
+			},
+			Spec: corev1.ServiceSpec{
+				ClusterIP:                corev1.ClusterIPNone,
+				PublishNotReadyAddresses: true,
+			},
+		}
+		es1 := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "old-hl-eps-1",
+				Namespace:       "app-ns",
+				ResourceVersion: "100",
+				Labels:          map[string]string{discoveryv1.LabelServiceName: "old-hl"},
+			},
+			Endpoints: []discoveryv1.Endpoint{{
+				Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+				Addresses:  []string{"10.0.6.1"},
+			}},
+		}
+		es2 := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "old-hl-eps-2",
+				Namespace:       "app-ns",
+				ResourceVersion: "50",
+				Labels:          map[string]string{discoveryv1.LabelServiceName: "old-hl"},
+			},
+			Endpoints: []discoveryv1.Endpoint{
+				{
+					Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+					Addresses:  []string{"10.0.6.2"},
+				},
+				{
+					Conditions: discoveryv1.EndpointConditions{Ready: &notReady},
+					Addresses:  []string{"10.0.6.3"},
+				},
+			},
+		}
+		cs := fake.NewSimpleClientset(svc, es1, es2)
+		lists := sliceListCounter(cs)
+		w := newCDNSWatchdog(cs)
+		w.now = func() time.Time { return pinned }
+		fqdn, want := w.probeFQDN(ctx)
+		if fqdn != "old-hl.app-ns.svc.cluster.local" {
+			t.Fatalf("pick fqdn = %q", fqdn)
+		}
+		expected := map[string]bool{"10.0.6.1": true, "10.0.6.2": true, "10.0.6.3": true}
+		if !maps.Equal(want, expected) {
+			t.Fatalf("want = %v, expected %v", want, expected)
+		}
+		if *lists != 1 {
+			t.Fatalf("endpointslice LIST count = %d, want 1", *lists)
+		}
+	})
+
+	t.Run("targeted refresh on <10m headless service (refreshProbeTarget)", func(t *testing.T) {
+		ready := true
+		pinned := time.Unix(1700000000, 0)
+		clock := pinned
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "fresh-hl",
+				Namespace:         "app-ns",
+				CreationTimestamp: metav1.NewTime(pinned.Add(5 * time.Minute)),
+			},
+			Spec: corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone},
+		}
+		es := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "fresh-hl-eps",
+				Namespace: "app-ns",
+				Labels:    map[string]string{discoveryv1.LabelServiceName: "fresh-hl"},
+			},
+			Endpoints: []discoveryv1.Endpoint{{
+				Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+				Addresses:  []string{"10.0.7.1"},
+			}},
+		}
+		cs := fake.NewSimpleClientset(svc, es)
+		lists := sliceListCounter(cs)
+		gets := svcGetCounter(cs)
+		w := newCDNSWatchdog(cs)
+		w.now = func() time.Time { return clock }
+
+		if fqdn, _ := w.probeFQDN(ctx); fqdn == "" {
+			t.Fatal("initial pick empty")
+		}
+		*lists = 0
+		*gets = 0
+		clock = clock.Add(corednsFQDNCacheTTL)
+		fqdn, want := w.probeFQDN(ctx)
+		if fqdn != "fresh-hl.app-ns.svc.cluster.local" || !want["10.0.7.1"] {
+			t.Fatalf("refresh pick = (%q, %v)", fqdn, want)
+		}
+		if *gets != 1 || *lists != 1 {
+			t.Fatalf("refresh counts: gets=%d lists=%d, want 1 and 1", *gets, *lists)
+		}
+	})
+}

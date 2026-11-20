@@ -100,39 +100,20 @@ func (w *coreDNSWatchdog) probeFQDNUncached(ctx context.Context) (string, map[st
 		eps, err := kube.ListAll(ctx,
 			metav1.ListOptions{
 				ResourceVersion: "0",
-				LabelSelector:   "kubernetes.io/service-name=" + svc.name},
+				LabelSelector:   discoveryv1.LabelServiceName + "=" + svc.name},
 			kube.EndpointSlices(w.cs, svc.ns))
 		if err != nil {
 			log.Info("dns: cannot list endpointslices — skipping probe candidate",
 				"service", svc.ns+"/"+svc.name, "error", err)
 			continue
 		}
-		ready := false
-		for _, es := range eps {
-			for _, ep := range es.Endpoints {
-				// bash: conditions.ready == true — nil does NOT count.
-				if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
-					ready = true
-					break
-				}
-			}
-			if ready {
-				break
-			}
-		}
-		if !ready {
+		if !hasReadyEndpoint(eps) {
 			continue
 		}
 		if svc.headless {
-			want, err := w.headlessWantSet(ctx, svc.ns, svc.name,
-				svc.publishNotReady)
-			if err != nil {
-				log.Info("dns: headless probe want-set failed — trying next candidate",
-					"service", svc.ns+"/"+svc.name, "error", err)
-				continue
-			}
+			want := headlessWantSetFromSlices(eps, svc.publishNotReady)
 			if len(want) == 0 {
-				continue // endpoints vanished between the two reads
+				continue // ready endpoint carried no addresses
 			}
 			return svc.name + "." + svc.ns + ".svc.cluster.local", want,
 				svc.ns, svc.name, true
@@ -175,7 +156,13 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 		ns, svc string
 		rv      int64
 	}
+	type svcKey struct{ ns, svc string }
+	type svcAddrs struct {
+		ready    []string
+		notReady []string
+	}
 	var cands []cand
+	addrsBySvc := map[svcKey]*svcAddrs{}
 	err := kube.ListEach(ctx,
 		metav1.ListOptions{ResourceVersion: "0"},
 		kube.EndpointSlices(w.cs, metav1.NamespaceAll),
@@ -186,11 +173,24 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 				if svcName == "" {
 					continue
 				}
+				key := svcKey{es.Namespace, svcName}
+				sa := addrsBySvc[key]
 				ready := false
 				for _, ep := range es.Endpoints {
-					if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+					epReady := ep.Conditions.Ready != nil && *ep.Conditions.Ready
+					if epReady {
 						ready = true
-						break
+					}
+					if len(ep.Addresses) > 0 {
+						if sa == nil {
+							sa = &svcAddrs{}
+							addrsBySvc[key] = sa
+						}
+						if epReady {
+							sa.ready = append(sa.ready, ep.Addresses...)
+						} else {
+							sa.notReady = append(sa.notReady, ep.Addresses...)
+						}
 					}
 				}
 				if !ready {
@@ -225,12 +225,18 @@ func (w *coreDNSWatchdog) probeFQDNFromSlices(ctx context.Context) (string, map[
 			continue // service gone or unreadable — try the next slice
 		}
 		if svc.Spec.ClusterIP == corev1.ClusterIPNone {
-			want, err := w.headlessWantSet(ctx, c.ns, c.svc,
-				svc.Spec.PublishNotReadyAddresses)
-			if err != nil {
-				log.Info("dns: headless fallback want-set failed — inconclusive",
-					"service", c.ns+"/"+c.svc, "error", err)
-				return "", nil, "", "", false
+			sa := addrsBySvc[svcKey{c.ns, c.svc}]
+			var want map[string]bool
+			if sa != nil {
+				want = make(map[string]bool, len(sa.ready))
+				for _, a := range sa.ready {
+					want[a] = true
+				}
+				if svc.Spec.PublishNotReadyAddresses {
+					for _, a := range sa.notReady {
+						want[a] = true
+					}
+				}
 			}
 			if len(want) == 0 {
 				continue
@@ -287,6 +293,9 @@ func (w *coreDNSWatchdog) refreshProbeTarget(ctx context.Context,
 	if err != nil {
 		return "", nil, false
 	}
+	if !fresh && svc.Spec.ClusterIP != corev1.ClusterIPNone {
+		return "", nil, false // never pin a ClusterIP fallback across refreshes
+	}
 	if fresh && w.now.Now().Sub(svc.CreationTimestamp.Time) >=
 		corednsLogSinceS*time.Second {
 		return "", nil, false // aged out of the freshness window
@@ -294,31 +303,18 @@ func (w *coreDNSWatchdog) refreshProbeTarget(ctx context.Context,
 	eps, err := kube.ListAll(ctx,
 		metav1.ListOptions{
 			ResourceVersion: "0",
-			LabelSelector:   "kubernetes.io/service-name=" + name},
+			LabelSelector:   discoveryv1.LabelServiceName + "=" + name},
 		kube.EndpointSlices(w.cs, ns))
 	if err != nil {
 		return "", nil, false
 	}
-	ready := false
-	for _, es := range eps {
-		for _, ep := range es.Endpoints {
-			if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
-				ready = true
-				break
-			}
-		}
-		if ready {
-			break
-		}
-	}
-	if !ready {
+	if !hasReadyEndpoint(eps) {
 		return "", nil, false
 	}
 	fqdn := name + "." + ns + ".svc.cluster.local"
 	if svc.Spec.ClusterIP == corev1.ClusterIPNone {
-		want, err := w.headlessWantSet(ctx, ns, name,
-			svc.Spec.PublishNotReadyAddresses)
-		if err != nil || len(want) == 0 {
+		want := headlessWantSetFromSlices(eps, svc.Spec.PublishNotReadyAddresses)
+		if len(want) == 0 {
 			return "", nil, false
 		}
 		return fqdn, want, true
@@ -339,23 +335,26 @@ func (w *coreDNSWatchdog) refreshProbeTarget(ctx context.Context,
 	return fqdn, want, true
 }
 
-// headlessWantSet builds the expected A-record set for a headless
-// service: every Ready endpoint address across ALL slices the
-// Service owns — a Ready IP in a second slice is a valid DNS answer
-// the single-slice want set would wrongly judge stale.
+func hasReadyEndpoint(eps []discoveryv1.EndpointSlice) bool {
+	for _, es := range eps {
+		for _, ep := range es.Endpoints {
+			// bash: conditions.ready == true — nil does NOT count.
+			if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// headlessWantSetFromSlices builds the expected A-record set for a
+// headless service: every Ready endpoint address across ALL slices
+// the Service owns — a Ready IP in a second slice is a valid DNS
+// answer the single-slice want set would wrongly judge stale.
 // publishNotReady mirrors spec.publishNotReadyAddresses: when the
 // Service opts in, DNS publishes NotReady addresses too, so they
 // belong in the expected set as well.
-func (w *coreDNSWatchdog) headlessWantSet(ctx context.Context,
-	ns, svcName string, publishNotReady bool) (map[string]bool, error) {
-	eps, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			ResourceVersion: "0",
-			LabelSelector:   discoveryv1.LabelServiceName + "=" + svcName},
-		kube.EndpointSlices(w.cs, ns))
-	if err != nil {
-		return nil, err
-	}
+func headlessWantSetFromSlices(eps []discoveryv1.EndpointSlice, publishNotReady bool) map[string]bool {
 	want := map[string]bool{}
 	for _, es := range eps {
 		for _, ep := range es.Endpoints {
@@ -368,5 +367,5 @@ func (w *coreDNSWatchdog) headlessWantSet(ctx context.Context,
 			}
 		}
 	}
-	return want, nil
+	return want
 }

@@ -105,7 +105,7 @@ const (
 	AnnoLastDeploymentUnstick = "passiontech.dev/last-deployment-unstick"
 	// AnnoSubPathReloadOptOut opts a workload out of
 	// subpath-config-drift's restart-template reload when set to
-	// "false" (the plan's literal exclusion value).
+	// "true", "1", or "yes" (case-insensitive).
 	AnnoSubPathReloadOptOut = "passiontech.dev/subpath-reload-opt-out"
 	// AnnoLastSubPathReload is subpath-config-drift's persisted
 	// cooldown stamp on the restarted workload.

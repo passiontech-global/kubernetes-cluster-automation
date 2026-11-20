@@ -386,3 +386,44 @@ func TestCheckKCMWorkqueueIgnoresEmptyDaemonSet(t *testing.T) {
 		t.Fatalf("non-signature must not be tracked: %v", keys)
 	}
 }
+
+// Delayed-queue regression: when the sweep's AllLeases snapshot was
+// fetched at T0 (Lease RenewTime = T0 - 2s) and this check runs at
+// T0 + 5m, lease age must be measured against LeasesFetchedAt (T0),
+// not p.Now() (T0 + 5m), so KCM is not misclassified as dead.
+func TestCheckKCMWorkqueueUsesLeasesFetchedAt(t *testing.T) {
+	resetKCMFrozenSeries(t, "stale_observed_generation")
+	t0 := time.Now()
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  metav1.NamespaceSystem,
+			Name:       "coredns",
+			Generation: 5,
+		},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 3},
+	}
+	cs := fake.NewSimpleClientset(
+		kcmReadyNode(),
+		kcmLease(2*time.Second, t0),
+		dep,
+	)
+	p := testProber(cs)
+	probetest.FreezeNow(p.Deps, t0)
+	chk := probetest.MustCheck[*kcmWorkqueueCheck](t, p)
+	chk.kcmFirstSeen.Observe("stale_observed_generation/deployment/coredns", t0.Add(-time.Hour))
+
+	sctx := probetest.SweepCtx(ctx, p.Deps)
+	if _, err := p.Deps.AllLeases(sctx); err != nil {
+		t.Fatalf("warm AllLeases: %v", err)
+	}
+	// Simulate 5m of worker-queue lag before this check runs.
+	probetest.FreezeNow(p.Deps, t0.Add(5*time.Minute))
+
+	res := chk.Run(sctx)
+	if res.Pass {
+		t.Fatal("aged KCM signature must FAIL when Lease was live at LeasesFetchedAt")
+	}
+	if keys := probetest.LedgerKeys(&chk.kcmFirstSeen); len(keys) != 1 {
+		t.Fatalf("kcmFirstSeen was reset due to worker-queue lag: %v", keys)
+	}
+}

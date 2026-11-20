@@ -20,10 +20,14 @@
 // Self-fencing: the same GET stream also bounds the OTHER split-
 // brain shape — an apiserver partition where the leader can neither
 // renew NOR read the Lease. lastVerified only advances on a read
-// confirming holder == selfID; after leaseSelfFenceAfter (25s —
-// under the Preemptor's 30s frozen-renew proof) of inconclusive
-// reads the leader fences itself rather than ride out an
-// unverifiable hold into a standby's acquire.
+// confirming holder == selfID; after selfFenceDuration(renewDeadline)
+// (3/4 of RenewDeadline, e.g. 90s for 120s RenewDeadline or 7.5s for
+// the 10s default) of inconclusive reads the leader fences itself
+// rather than ride out an unverifiable hold indefinitely. On
+// inconclusive self-fence, stolen stays false so releaseGuardedLock
+// still checks the live Lease during drain and releases cleanly if
+// still self-held (avoiding a 180s blackout when connectivity recovers
+// mid-shutdown), while refusing release if a foreign holder took over.
 //
 // NeedLeaderElection stays true (the default for a plain Runnable):
 // only the replica that believes it leads may run this — on a
@@ -50,22 +54,9 @@ const (
 	// leaseWatchTimeout bounds each GET on probeCS so a hung
 	// apiserver cannot stall the watchdog past its own interval.
 	leaseWatchTimeout = 3 * time.Second
-	// leaseSelfFenceAfter bounds how long the leader may run
-	// WITHOUT a verified self-held Lease read before fencing
-	// itself. It sits BELOW the Preemptor's 30s frozen-renew proof
-	// (leaderelect.PreemptStaleAfter): during an apiserver
-	// partition the watchdog's GETs fail exactly like the renew
-	// path's writes, so "cannot verify I still hold" is the only
-	// signal available — and a standby that CAN reach the apiserver
-	// would acquire the lease the moment it expires while this
-	// replica kept running every leader-gated module. Self-fencing
-	// at 20s of unverifiable lease state stops the old leader
-	// before the 180s LeaseDuration hand-off can produce two
-	// active managers. The budget is fence + one poll interval +
-	// one GET timeout = 20+5+3 = 28s worst-case detection — 20s
-	// keeps that under the 30s preempt proof with margin (25s
-	// left only ~2s).
-	leaseSelfFenceAfter = 20 * time.Second
+	// defaultRenewDeadline mirrors controller-runtime's 10s default
+	// when -leader-elect-renew-deadline is unset (0).
+	defaultRenewDeadline = 10 * time.Second
 	// leaseRenewStaleAfter bounds how old a self-held Lease's
 	// RenewTime may be before the hold stops counting as
 	// verified. HolderIdentity alone is not proof of a LIVE hold:
@@ -95,8 +86,25 @@ type leaseLossWatchdog struct {
 	log    logr.Logger
 	// interval overrides leaseWatchInterval when > 0 (tests).
 	interval time.Duration
-	// fenceAfter overrides leaseSelfFenceAfter when > 0 (tests).
+	// fenceAfter overrides selfFenceDuration(renewDeadline) when > 0 (tests).
 	fenceAfter time.Duration
+	// renewDeadline sizes the inconclusive self-fence window
+	// proportionally (3/4 of RenewDeadline, preserving Nebula blip
+	// tolerance when configured with e.g. 120s).
+	renewDeadline time.Duration
+}
+
+// selfFenceDuration scales the inconclusive self-fence horizon to
+// 3/4 of renewDeadline (normalizing <=0 to defaultRenewDeadline=10s,
+// floored at 1s). At the deployment's 120s RenewDeadline this yields
+// 90s (worst-case 98s detection + 5s drain < 120s), preserving Nebula
+// dataplane blip tolerance while still stepping down before
+// RenewDeadline/LeaseDuration expire.
+func selfFenceDuration(renewDeadline time.Duration) time.Duration {
+	if renewDeadline <= 0 {
+		renewDeadline = defaultRenewDeadline
+	}
+	return max(renewDeadline*3/4, time.Second)
 }
 
 // NeedLeaderElection reports true explicitly: this runnable must
@@ -111,7 +119,7 @@ func (w *leaseLossWatchdog) Start(ctx context.Context) error {
 	}
 	fence := w.fenceAfter
 	if fence <= 0 {
-		fence = leaseSelfFenceAfter
+		fence = selfFenceDuration(w.renewDeadline)
 	}
 	// lastVerified is the self-fencing clock: the last poll that
 	// read the Lease AND confirmed holder == selfID. It starts
@@ -131,19 +139,26 @@ func (w *leaseLossWatchdog) Start(ctx context.Context) error {
 				w.log.Info("leader lease held by another identity — "+
 					"stopping manager work (split-brain guard)",
 					"self", w.selfID)
-				w.stolen.Store(true)
+				if w.stolen != nil {
+					w.stolen.Store(true)
+				}
 				w.cancel()
 				return nil
 			case leaseSelf:
 				lastVerified = time.Now()
-			default: // leaseInconclusive — unverifiable, not theft
+			default: // leaseInconclusive — unverifiable, not proven theft
 				if elapsed := time.Since(lastVerified); elapsed >= fence {
 					w.log.Info("leader lease unverifiable for "+
 						fence.String()+" — self-fencing "+
 						"(split-brain guard)",
 						"self", w.selfID,
 						"unverified_for", elapsed.String())
-					w.stolen.Store(true)
+					// Do NOT set w.stolen here: leaseInconclusive
+					// has not proven a foreign holder. Leaving
+					// stolen=false lets releaseGuardedLock perform
+					// a live Get during shutdown drain — releasing
+					// if still self-held (avoiding a 180s blackout)
+					// and refusing if someone else took over.
 					w.cancel()
 					return nil
 				}

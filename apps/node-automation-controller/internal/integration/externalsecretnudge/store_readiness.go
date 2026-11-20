@@ -24,7 +24,7 @@ import (
 func (n *externalSecretNudge) listFirst(ctx context.Context,
 	gvrs []schema.GroupVersionResource) (*unstructured.UnstructuredList, error) {
 	list, _, err := kube.ListFirstUnstructured(ctx, n.dyn, gvrs,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+		metav1.ListOptions{ResourceVersion: "0", Limit: kube.DefaultListPageSize})
 	return list, err
 }
 
@@ -33,7 +33,7 @@ func (n *externalSecretNudge) listFirst(ctx context.Context,
 // served version.
 func (n *externalSecretNudge) listES(ctx context.Context) (*unstructured.UnstructuredList, schema.GroupVersionResource, error) {
 	return kube.ListFirstUnstructured(ctx, n.dyn, externalSecretGVRs,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+		metav1.ListOptions{ResourceVersion: "0", Limit: kube.DefaultListPageSize})
 }
 
 // esStoreReady reports whether every store the ES can pull from is

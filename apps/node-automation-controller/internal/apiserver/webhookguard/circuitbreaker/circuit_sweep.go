@@ -107,19 +107,18 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 		// state carries forward untouched (the annotation, the SSOT,
 		// still lists whatever it listed).
 		//
-		// P0-4: the gate applies ONLY to the recovery direction
-		// (Ignore -> Fail). A payload flipping any hook TO Ignore is
-		// the breaker's emergency actuation — a Fail-closed webhook on
-		// a dead backend keeps paralyzing kube-apiserver until it is
-		// tripped, so it must never sit behind the loop window (a
-		// blocked trip also left carryBrokenForward reporting a
-		// circuit that was never actually broken). The ping-pong
-		// rate-limit still guards Ignore -> Fail recoveries; a mixed
-		// payload rides the emergency write since its trips need it
-		// anyway.
+		// P0-4 & M3-20: the gate exempts BOTH failurePolicy flip directions
+		// — Fail -> Ignore (emergencyPatch, so a dead backend cannot
+		// deadlock cluster admission fail-closed) and Ignore -> Fail
+		// (recoveryPatch, so a Flux loop on sibling duties or stale
+		// annotations never leaves a healthy webhook stranded fail-open).
+		// Annotation-only payloads (such as dropStale) and undecodable
+		// payloads stay gated under the duty-prefixed circuit_sweep/
+		// keyspace.
 		if !emergencyPatch(payload) &&
+			!recoveryPatch(payload) &&
 			!heal.FluxPatchGate(job.Kind, job.Object,
-				job.Kind+"/"+job.Name, s.now) {
+				"circuit_sweep/"+job.Kind+"/"+job.Name, s.now) {
 			s.b.carryBrokenForward(job.Kind, job.Name, job.Hooks)
 			s.log.Info("skip heal: Flux Heal-Revert Loop detected — circuit patch deferred",
 				"kind", job.Kind, "config", job.Name)
@@ -161,11 +160,26 @@ func (s *circuitSweep) runJobs(ctx context.Context) {
 // sub-webhook's failurePolicy TO Ignore — the breaker's emergency
 // Fail -> Ignore actuation, which bypasses the Flux heal-revert
 // gate (see runJobs). Annotation-only payloads and pure
-// Ignore -> Fail recoveries return false and stay gated. An
-// undecodable payload fails closed to gated: the write is skipped
-// either way only when the gate also denies, and a corrupt payload
-// would fail the Patch call regardless.
+// Ignore -> Fail recoveries return false for emergencyPatch (see
+// recoveryPatch for the recovery bypass). An undecodable payload
+// fails closed to gated: the write is skipped either way only when
+// the gate also denies, and a corrupt payload would fail the Patch
+// call regardless.
 func emergencyPatch(payload []byte) bool {
+	return patchHasFailurePolicy(payload, admissionv1.Ignore)
+}
+
+// recoveryPatch reports whether the circuit patch flips any
+// sub-webhook's failurePolicy TO Fail — the Ignore -> Fail recovery
+// direction, which also bypasses the Flux heal-revert gate so a Flux
+// conflict loop never leaves a recovered webhook stranded fail-open.
+// Annotation-only payloads (e.g. dropStale) and undecodable payloads
+// return false and remain gated under "circuit_sweep/".
+func recoveryPatch(payload []byte) bool {
+	return patchHasFailurePolicy(payload, admissionv1.Fail)
+}
+
+func patchHasFailurePolicy(payload []byte, want admissionv1.FailurePolicyType) bool {
 	var doc struct {
 		Webhooks []struct {
 			FailurePolicy string `json:"failurePolicy"`
@@ -175,7 +189,7 @@ func emergencyPatch(payload []byte) bool {
 		return false
 	}
 	for _, w := range doc.Webhooks {
-		if w.FailurePolicy == string(admissionv1.Ignore) {
+		if w.FailurePolicy == string(want) {
 			return true
 		}
 	}

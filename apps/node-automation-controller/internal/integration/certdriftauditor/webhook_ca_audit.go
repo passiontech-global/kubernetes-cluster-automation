@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -81,42 +82,55 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 
 	// CRD conversion webhooks share the caBundle surface — the
 	// cainjector annotations and the empty/drifted-bundle failure
-	// modes are identical, but the object reaches through dyn (the
-	// typed clientset has no apiextensions surface) and the bundle
-	// arrives base64-encoded like every []byte JSON field. The list
-	// runs AFTER the admission-config audits so their emissions land
-	// first, and its failure skips the prune below: "can't read the
-	// surface" must not delete live drift series.
-	if a.dyn == nil {
-		return errors.New("list customresourcedefinitions: no dynamic client")
-	}
-	// ListEach at the CRD page bound: the audit consumes each object
-	// inside the visit, so a page's full CRDs — OpenAPI schemas are
-	// the bulk of a CRD object's heap — are garbage-collected with
-	// the page instead of a cluster-wide census pinning ~80–150 MiB
-	// for the whole sweep.
+	// modes are identical. Read from the manager's CRD informer cache
+	// first (ListEach over dynamic client is the fallback when no cache
+	// reader is wired or the cache read fails). The list runs AFTER
+	// the admission-config audits so their emissions land first, and
+	// its failure skips the prune below: "can't read the surface"
+	// must not delete live drift series.
 	a.liveRunCRDRefs = map[string]int32{}
-	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: crdAuditPageSize},
-		kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)),
-		func(page []unstructured.Unstructured) error {
-			for i := range page {
-				crd := &page[i]
-				// Harvest the conversion service ref while the full
-				// CRD schema is already in hand — the live-socket
-				// audit must never trigger a second full-schema list.
-				collectCRDConversionService(crd, a.liveRunCRDRefs)
-				entry, ok := crdConversionEntry(crd)
-				if !ok {
-					continue
-				}
-				a.auditOneWebhookConfig(ctx, "CustomResourceDefinition",
-					crd.GetName(), crd.GetAnnotations(), []webhookEntry{entry})
+	if crds, ok := a.listCachedCRDs(ctx); ok {
+		for i := range crds {
+			crd := &crds[i]
+			collectTypedCRDConversionService(crd, a.liveRunCRDRefs)
+			entry, ok := typedCRDConversionEntry(crd)
+			if !ok {
+				continue
 			}
-			return nil
-		})
-	if err != nil {
-		return fmt.Errorf("list customresourcedefinitions: %w", err)
+			a.auditOneWebhookConfig(ctx, "CustomResourceDefinition",
+				crd.Name, crd.Annotations, []webhookEntry{entry})
+		}
+	} else {
+		if a.dyn == nil {
+			return errors.New("list customresourcedefinitions: no dynamic client")
+		}
+		// ListEach at the CRD page bound: the audit consumes each object
+		// inside the visit, so a page's full CRDs — OpenAPI schemas are
+		// the bulk of a CRD object's heap — are garbage-collected with
+		// the page instead of a cluster-wide census pinning ~80–150 MiB
+		// for the whole sweep.
+		err = kube.ListEach(ctx,
+			metav1.ListOptions{Limit: crdAuditPageSize},
+			kube.DynamicPage(a.dyn.Resource(kube.GVRCustomResourceDefinition)),
+			func(page []unstructured.Unstructured) error {
+				for i := range page {
+					crd := &page[i]
+					// Harvest the conversion service ref while the full
+					// CRD schema is already in hand — the live-socket
+					// audit must never trigger a second full-schema list.
+					collectCRDConversionService(crd, a.liveRunCRDRefs)
+					entry, ok := crdConversionEntry(crd)
+					if !ok {
+						continue
+					}
+					a.auditOneWebhookConfig(ctx, "CustomResourceDefinition",
+						crd.GetName(), crd.GetAnnotations(), []webhookEntry{entry})
+				}
+				return nil
+			})
+		if err != nil {
+			return fmt.Errorf("list customresourcedefinitions: %w", err)
+		}
 	}
 	a.liveRunCRDRefsSet = true
 
@@ -392,4 +406,51 @@ func crdConversionEntry(crd *unstructured.Unstructured) (webhookEntry, bool) {
 		e.service = &admissionv1.ServiceReference{Namespace: ns, Name: name}
 	}
 	return e, true
+}
+
+func (a *certDriftAuditor) listCachedCRDs(ctx context.Context) ([]apiextensionsv1.CustomResourceDefinition, bool) {
+	if a.nodeReader == nil || !kube.CRDInformerEnabled() {
+		return nil, false
+	}
+	var list apiextensionsv1.CustomResourceDefinitionList
+	if err := a.nodeReader.List(ctx, &list); err != nil {
+		logf.FromContext(ctx).Info(
+			"CRD informer cache read failed — falling back to the dynamic list",
+			"error", err)
+		return nil, false
+	}
+	return list.Items, true
+}
+
+func typedCRDConversionEntry(crd *apiextensionsv1.CustomResourceDefinition) (webhookEntry, bool) {
+	if crd.Spec.Conversion == nil || crd.Spec.Conversion.Strategy != apiextensionsv1.WebhookConverter {
+		return webhookEntry{}, false
+	}
+	e := webhookEntry{name: "conversion", fail: true}
+	if wh := crd.Spec.Conversion.Webhook; wh != nil && wh.ClientConfig != nil {
+		e.caBundle = wh.ClientConfig.CABundle
+		if svc := wh.ClientConfig.Service; svc != nil && svc.Namespace != "" && svc.Name != "" {
+			e.service = &admissionv1.ServiceReference{
+				Namespace: svc.Namespace,
+				Name:      svc.Name,
+				Port:      svc.Port,
+				Path:      svc.Path,
+			}
+		}
+	}
+	return e, true
+}
+
+func collectTypedCRDConversionService(crd *apiextensionsv1.CustomResourceDefinition, refs map[string]int32) {
+	if crd.Spec.Conversion == nil || crd.Spec.Conversion.Strategy != apiextensionsv1.WebhookConverter {
+		return
+	}
+	if wh := crd.Spec.Conversion.Webhook; wh != nil && wh.ClientConfig != nil && wh.ClientConfig.Service != nil {
+		svc := wh.ClientConfig.Service
+		var port int32
+		if svc.Port != nil {
+			port = *svc.Port
+		}
+		putRef(refs, svc.Namespace, svc.Name, port)
+	}
 }

@@ -172,7 +172,10 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 			} `json:"result"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
+	if err := json.Unmarshal(body, &parsed,
+		jsontext.AllowInvalidUTF8(true),
+		jsontext.AllowDuplicateNames(true),
+	); err != nil {
 		return nil, fmt.Errorf("decode prometheus response: %w", err)
 	}
 	if parsed.Status != "success" {
@@ -185,7 +188,10 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 			continue
 		}
 		var raw string
-		if err := json.Unmarshal(r.Value[1], &raw); err != nil {
+		if err := json.Unmarshal(r.Value[1], &raw,
+			jsontext.AllowInvalidUTF8(true),
+			jsontext.AllowDuplicateNames(true),
+		); err != nil {
 			continue
 		}
 		v, err := strconv.ParseFloat(raw, 64)

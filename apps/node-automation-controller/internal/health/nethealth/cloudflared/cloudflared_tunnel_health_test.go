@@ -200,6 +200,7 @@ func TestCfTunnelInconclusiveSweepKeepsStreak(t *testing.T) {
 // ledger, the replacement counts once, a stable UID re-fires
 // nothing, and the wedge evaluation re-arms on the fresh UID.
 func TestCloudflaredEndpointBounceDetected(t *testing.T) {
+	testutil.CleanupMetric(t, cloudflaredEndpointBouncedTotal, "cf")
 	pod := cfPod("cf", "cf-1", "10.0.0.1", types.UID("rs-cf"))
 	cs := fake.NewSimpleClientset(pod)
 	p := testProber(cs)

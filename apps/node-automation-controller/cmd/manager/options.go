@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"math/rand/v2"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -27,7 +26,6 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/leaderelect"
-	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx/pprofx"
 )
 
 // stripManagedFields is the shared managedFields stripper — a factory
@@ -39,15 +37,24 @@ var stripManagedFields = cache.TransformStripManagedFields()
 // 50-80% of a Node's size — no module reads either field.
 func defaultCacheTransform(obj interface{}) (interface{}, error) {
 	// A delete delta can arrive wrapped in the DeltaFIFO tombstone —
-	// unwrap before the type switch or the strip silently no-ops.
-	if tomb, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
+	// unwrap before stripping, then re-wrap with Key preserved so
+	// downstream DeltaFIFO delete consumers still receive a valid
+	// tombstone.
+	tomb, isTombstone := obj.(toolscache.DeletedFinalStateUnknown)
+	if isTombstone {
 		obj = tomb.Obj
 	}
-	if _, err := stripManagedFields(obj); err != nil {
-		return nil, err
+	if obj != nil {
+		if _, err := stripManagedFields(obj); err != nil {
+			return nil, err
+		}
+		if n, ok := obj.(*corev1.Node); ok {
+			n.Status.Images = nil
+		}
 	}
-	if n, ok := obj.(*corev1.Node); ok {
-		n.Status.Images = nil
+	if isTombstone {
+		tomb.Obj = obj
+		return tomb, nil
 	}
 	return obj, nil
 }
@@ -123,36 +130,39 @@ func makeCRDCacheTransform(crdSize *kube.CRDSizeTable) toolscache.TransformFunc 
 		crdSize = kube.CRDSizeIndex
 	}
 	return func(obj interface{}) (interface{}, error) {
-		// Same tombstone unwrap as defaultCacheTransform — a deleted
-		// CRD's final state must still record/strip, not pass through
-		// as an opaque DeletedFinalStateUnknown.
-		if tomb, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
+		// Same tombstone unwrap + re-wrap as defaultCacheTransform.
+		// Skip JSONSize/crdSize.Record for tombstones because
+		// DeltaFIFO's DeletedFinalStateUnknown.Obj is the already-
+		// stripped cached object and would overwrite CRDSizeTable with
+		// the stripped byte count.
+		tomb, isTombstone := obj.(toolscache.DeletedFinalStateUnknown)
+		if isTombstone {
 			obj = tomb.Obj
 		}
 		crd, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
 		if !ok {
+			if isTombstone {
+				tomb.Obj = obj
+				return tomb, nil
+			}
 			return obj, nil
 		}
-		if size, err := kube.JSONSize(crd); err == nil {
-			crdSize.Record(crd.Name, crd.ResourceVersion, size)
+		if !isTombstone {
+			if size, err := kube.JSONSize(crd); err == nil {
+				crdSize.Record(crd.Name, crd.ResourceVersion, size)
+			}
 		}
 		for i := range crd.Spec.Versions {
 			crd.Spec.Versions[i].Schema = nil
 		}
 		crd.ManagedFields = nil
 		delete(crd.Annotations, corev1.LastAppliedConfigAnnotation)
+		if isTombstone {
+			tomb.Obj = crd
+			return tomb, nil
+		}
 		return crd, nil
 	}
-}
-
-// pprofHandlers is the metrics-server ExtraHandlers map — the
-// pprof endpoints live on :9115 next to /metrics. The handlers come
-// from libs/hostkit/httpx/pprofx so this binary never imports
-// net/http/pprof directly: that import's init() registers
-// /debug/pprof/* on http.DefaultServeMux unconditionally, growing a
-// debug surface on every mux in the process that never asked for it.
-func pprofHandlers() map[string]http.Handler {
-	return pprofx.Handlers()
 }
 
 func resolveLeaderNamespace() string {
@@ -171,8 +181,7 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 	mgrOptions := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
-			BindAddress:   metricsAddr,
-			ExtraHandlers: pprofHandlers(),
+			BindAddress: metricsAddr,
 		},
 		HealthProbeBindAddress:              probeAddr,
 		LeaderElection:                      leaderElect,

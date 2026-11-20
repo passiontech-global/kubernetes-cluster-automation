@@ -95,8 +95,9 @@ func (j *evictedPodJanitor) run(ctx context.Context) error {
 	}
 	var targets []target
 	err := kube.ListEach(ctx, metav1.ListOptions{
-		FieldSelector: "status.phase=" + string(corev1.PodFailed),
-		Limit:         kube.DefaultListPageSize,
+		FieldSelector:   "status.phase=" + string(corev1.PodFailed),
+		Limit:           kube.DefaultListPageSize,
+		ResourceVersion: "0",
 	}, kube.Pods(j.cs, metav1.NamespaceAll),
 		func(page []corev1.Pod) error {
 			for i := range page {

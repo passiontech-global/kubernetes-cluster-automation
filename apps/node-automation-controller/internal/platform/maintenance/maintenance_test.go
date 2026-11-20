@@ -524,9 +524,13 @@ func TestKuredLockNodeID(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"", ""},
 		{`{"nodeID":"w1"}`, "w1"},
+		{`{"nodeId":"w1"}`, "w1"},
+		{`{"nodeid":"w1"}`, "w1"},
+		{`{"NODEID":"w1"}`, "w1"},
 		{`{"nodeID":"w1","extra":1}`, "w1"},
 		{"w1", "w1"},                       // legacy raw-node-name writer
 		{`{"nodeID":""}`, `{"nodeID":""}`}, // JSON without usable nodeID → raw
+		{`{"nodeId":""}`, `{"nodeId":""}`},
 		{`{"other":"x"}`, `{"other":"x"}`},
 		{"not-json{", "not-json{"},
 	} {
@@ -621,19 +625,22 @@ func stampTestNode(name string, cordonAgo time.Duration,
 
 // StampMaintenanceTargets converges the annotation set: the cordoned
 // node takes a fresh stamp (~now+15m), a node outside the target set
-// loses a stamp THIS controller could have written, and foreign
-// values are never touched.
+// loses a stamp THIS controller previously wrote via its StampTracker,
+// and foreign/manual values (including <=16m manual stamps and manual
+// overwrites) are never touched.
 func TestStampMaintenanceTargetsStampsAndUnstamps(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
-	owned := now.Add(maintenanceStampTTL).UTC().Format(time.RFC3339)
+	manualShort := now.Add(5 * time.Minute).UTC().Format(time.RFC3339)
 	farFuture := now.Add(3 * time.Hour).UTC().Format(time.RFC3339)
 	w1 := stampTestNode("w1", time.Minute, "")     // cordoned → target
-	w2 := stampTestNode("w2", 0, owned)            // owned stamp → removed
+	w2 := stampTestNode("w2", time.Minute, "")     // cordoned → stamped, then uncordoned → unstamped
 	w3 := stampTestNode("w3", 0, "manual-forever") // foreign → kept
 	w4 := stampTestNode("w4", 0, farFuture)        // out-of-domain → kept
-	cs := fake.NewSimpleClientset(w1, w2, w3, w4)
+	w5 := stampTestNode("w5", 0, manualShort)      // manual <=16m → kept
+	cs := fake.NewSimpleClientset(w1, w2, w3, w4, w5)
 
-	StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now)
+	tracker := &StampTracker{}
+	tracker.StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now)
 
 	get := func(name string) *corev1.Node {
 		n, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
@@ -649,6 +656,20 @@ func TestStampMaintenanceTargetsStampsAndUnstamps(t *testing.T) {
 		ts.After(now.Add(maintenanceStampTTL+time.Minute)) {
 		t.Fatalf("w1 stamp %q is not ~now+TTL", v)
 	}
+	if v := get("w2").Annotations["passiontech.dev/cluster-maintenance-until"]; v == "" {
+		t.Fatal("cordoned node w2 was not stamped on pass 1")
+	}
+
+	// End maintenance on w2 (uncordon) and run pass 2: controller-owned
+	// w2 stamp is removed, while manualShort/foreign/farFuture remain.
+	w2Cur := get("w2")
+	w2Cur.Spec.Unschedulable = false
+	w2Cur.Spec.Taints = nil
+	if _, err := cs.CoreV1().Nodes().Update(ctx, w2Cur, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	tracker.StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now.Add(time.Minute))
+
 	if v, ok := get("w2").Annotations["passiontech.dev/cluster-maintenance-until"]; ok {
 		t.Fatalf("w2's controller-owned stamp survived maintenance end: %q", v)
 	}
@@ -658,6 +679,55 @@ func TestStampMaintenanceTargetsStampsAndUnstamps(t *testing.T) {
 	if v := get("w4").Annotations["passiontech.dev/cluster-maintenance-until"]; v != farFuture {
 		t.Fatalf("w4's out-of-domain stamp was touched: %q", v)
 	}
+	if v := get("w5").Annotations["passiontech.dev/cluster-maintenance-until"]; v != manualShort {
+		t.Fatalf("w5's manual <=16m stamp was wiped: %q", v)
+	}
+}
+
+// Manual operator <=16m stamps (RFC3339 and unix seconds) and manual
+// overwrites of a previously controller-stamped node must never be
+// wiped when maintenance ends.
+func TestStampTrackerPreservesManualShortStampsAndOverwrites(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	manualRFC := now.Add(15 * time.Minute).UTC().Format(time.RFC3339)
+	manualUnix := strconv.FormatInt(now.Add(10*time.Minute).Unix(), 10)
+	manualOverwrite := now.Add(8 * time.Minute).UTC().Format(time.RFC3339)
+
+	w1 := stampTestNode("w1", time.Minute, "") // stamped by controller, then operator overwrites
+	w2 := stampTestNode("w2", 0, manualRFC)    // operator <=16m RFC3339
+	w3 := stampTestNode("w3", 0, manualUnix)   // operator <=16m unix seconds
+	cs := fake.NewSimpleClientset(w1, w2, w3)
+
+	tracker := &StampTracker{}
+	tracker.StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now)
+
+	// Uncordon w1 AND have an operator overwrite its annotation manually.
+	w1Cur, err := cs.CoreV1().Nodes().Get(ctx, "w1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w1Cur.Spec.Unschedulable = false
+	w1Cur.Spec.Taints = nil
+	w1Cur.Annotations["passiontech.dev/cluster-maintenance-until"] = manualOverwrite
+	if _, err := cs.CoreV1().Nodes().Update(ctx, w1Cur, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker.StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now.Add(time.Minute))
+
+	for name, want := range map[string]string{
+		"w1": manualOverwrite,
+		"w2": manualRFC,
+		"w3": manualUnix,
+	} {
+		n, err := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := n.Annotations["passiontech.dev/cluster-maintenance-until"]; got != want {
+			t.Fatalf("%s stamp = %q, want %q (manual stamp/overwrite must be preserved)", name, got, want)
+		}
+	}
 }
 
 // A degraded signal read disables ONLY the unstamp half: with the
@@ -666,16 +736,42 @@ func TestStampMaintenanceTargetsStampsAndUnstamps(t *testing.T) {
 // signal we failed to observe is the unsafe direction.
 func TestStampMaintenanceTargetsDegradedKeepsStamps(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
-	owned := now.Add(maintenanceStampTTL).UTC().Format(time.RFC3339)
-	w1 := stampTestNode("w1", time.Minute, "")
-	w2 := stampTestNode("w2", 0, owned)
+	w1 := stampTestNode("w1", 0, "")
+	w2 := stampTestNode("w2", time.Minute, "")
 	cs := fake.NewSimpleClientset(w1, w2)
+	tracker := &StampTracker{}
+
+	// Pass 1: healthy read stamps w2 and records ownership in tracker.
+	tracker.StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now)
+	w2Owned, err := cs.CoreV1().Nodes().Get(ctx, "w2", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := w2Owned.Annotations["passiontech.dev/cluster-maintenance-until"]
+	if owned == "" {
+		t.Fatal("pass 1 did not stamp w2")
+	}
+
+	// Pass 2: w1 cordoned, w2 uncordoned, but kured GET fails (degraded).
+	w1Cur, _ := cs.CoreV1().Nodes().Get(ctx, "w1", metav1.GetOptions{})
+	w1Cur.Spec.Unschedulable = true
+	tAdded := metav1.NewTime(now.Add(-time.Minute))
+	w1Cur.Spec.Taints = []corev1.Taint{{Key: kube.UnschedulableTaintKey, TimeAdded: &tAdded}}
+	if _, err := cs.CoreV1().Nodes().Update(ctx, w1Cur, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	w2Owned.Spec.Unschedulable = false
+	w2Owned.Spec.Taints = nil
+	if _, err := cs.CoreV1().Nodes().Update(ctx, w2Owned, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
 	cs.PrependReactor("get", "daemonsets",
 		func(ktesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("apiserver flap")
 		})
 
-	StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now)
+	tracker.StampMaintenanceTargets(ctx, cs, maintenanceDynFake(), nil, now.Add(time.Minute))
 
 	w1n, err := cs.CoreV1().Nodes().Get(ctx, "w1", metav1.GetOptions{})
 	if err != nil {

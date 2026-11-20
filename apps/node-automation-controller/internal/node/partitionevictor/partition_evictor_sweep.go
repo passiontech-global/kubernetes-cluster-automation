@@ -326,35 +326,32 @@ func (s *partitionSweep) evictPods(ctx context.Context) {
 	// grant per pass, not per pod; refused attempts need no
 	// counter — they are the no-delivery case by definition).
 	deliveredN, errN := 0, 0
-loop:
-	for _, name := range names {
-		// Never evict off a node whose NoSchedule fence did not
-		// land this sweep — the taint API error or a closed breaker
-		// leaves the node schedulable, and deleted pods would be
-		// rescheduled straight back onto the blackholed host.
-		if !s.taintedNode[name] {
-			continue
-		}
-		pods, err := kube.ListAll(ctx, metav1.ListOptions{
-			FieldSelector: "spec.nodeName=" + name +
-				",status.phase!=Succeeded,status.phase!=Failed",
-			Limit: kube.DefaultListPageSize,
-		}, kube.Pods(s.e.cs, metav1.NamespaceAll))
-		if err != nil {
-			metrics.IncError(s.e.queue)
-			s.log.Error(err, "list pods failed", "node", name)
-			continue
-		}
+	evictNode := func(name string, pods []corev1.Pod) (stopSweep, abortRun bool) {
 		// Per-target breaker charge state for this node's pass —
 		// inherited from the taint step: a node fenced AND evicted
 		// in the same sweep spends ONE grant, not two.
 		charged := s.breakerCharged[name]
+		acquiredInEvict := false
+		nodeDelivered, nodeErr := 0, 0
+		defer func() {
+			// Mirror the fleet budget refund on the per-target
+			// breaker: if eviction acquired a fresh target grant on
+			// an already-tainted node and every attempt deferred (e.g.
+			// PDB 429 or L1 hold — zero deliveries, zero actuation
+			// errors), return the grant so non-convergent refusals
+			// never open the target circuit. Grants acquired by
+			// taintFlagged (charged already true) delivered a taint
+			// and are never refunded here.
+			if acquiredInEvict && nodeDelivered == 0 && nodeErr == 0 {
+				heal.RefundTarget(s.e.queue, name, s.now)
+			}
+		}()
 		for i := range pods {
 			p := &pods[i]
 			if evicted >= partitionEvictCap {
 				s.log.Info("SKIP rest: cap reached", "cap", partitionEvictCap,
 					"node", name)
-				break loop
+				return true, false
 			}
 			// Belt: the spec.nodeName field selector scopes the
 			// server-side list, but fake clientsets ignore field
@@ -388,12 +385,12 @@ loop:
 			}
 			if gateUnverifiable {
 				metrics.IncError(s.e.queue)
-				return
+				return false, true
 			}
 			if !gateProceed {
 				// Mutex held or budget spent — every later candidate
 				// defers identically this sweep.
-				break loop
+				return true, false
 			}
 			// Per-target non-convergent circuit breaker, eviction
 			// side: a sweep that evicts off a node spends ONE grant
@@ -406,9 +403,10 @@ loop:
 				if allowed, reason := heal.TryAcquireTarget(s.e.queue, name, s.now); !allowed {
 					s.log.Info("DEFER: heal target circuit open — evictions skipped",
 						"node", name, "reason", reason)
-					continue loop
+					return false, false
 				}
 				charged = true
+				acquiredInEvict = true
 			}
 			s.log.Info("EVICT: pod off partitioned node",
 				"pod", p.Namespace+"/"+p.Name, "node", name)
@@ -445,14 +443,44 @@ loop:
 				continue
 			case err != nil:
 				errN++
+				nodeErr++
 				metrics.IncError(s.e.queue)
 				s.log.Error(err, "evict failed", "pod", p.Namespace+"/"+p.Name,
 					"node", name)
 			}
 			if delivered {
 				deliveredN++
+				nodeDelivered++
 			}
 			evicted++ // every real attempt (or non-404/409 error) counts against the cap
+		}
+		return false, false
+	}
+
+	for _, name := range names {
+		// Never evict off a node whose NoSchedule fence did not
+		// land this sweep — the taint API error or a closed breaker
+		// leaves the node schedulable, and deleted pods would be
+		// rescheduled straight back onto the blackholed host.
+		if !s.taintedNode[name] {
+			continue
+		}
+		pods, err := kube.ListAll(ctx, metav1.ListOptions{
+			FieldSelector: "spec.nodeName=" + name +
+				",status.phase!=Succeeded,status.phase!=Failed",
+			Limit: kube.DefaultListPageSize,
+		}, kube.Pods(s.e.cs, metav1.NamespaceAll))
+		if err != nil {
+			metrics.IncError(s.e.queue)
+			s.log.Error(err, "list pods failed", "node", name)
+			continue
+		}
+		stopSweep, abortRun := evictNode(name, pods)
+		if abortRun {
+			return
+		}
+		if stopSweep {
+			break
 		}
 	}
 	// The sweep grant bought no heal when NOTHING was delivered and

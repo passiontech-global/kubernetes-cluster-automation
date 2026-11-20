@@ -74,6 +74,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
@@ -204,11 +205,15 @@ func (m *memo[T]) get(load func(forceCS bool) (T, error)) (T, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.set {
-		m.set = true
-		force := m.forceCS
+		// Flip m.set and consume m.forceCS only after load returns
+		// normally so a panic inside load leaves the memo unset (not
+		// poisoned with zero items and nil error). Returned err != nil
+		// still memoizes per the sweep-census contract.
+		items, err := load(m.forceCS)
 		m.forceCS = false
-		m.items, m.err = load(force)
+		m.items, m.err = items, err
 		m.fetchedAt = m.nowTime()
+		m.set = true
 		if verifySnapshots.Load() {
 			m.verifyHash = fingerprintValue(m.items)
 		}
@@ -461,6 +466,11 @@ type sweepSnapshot struct {
 	// (unstruct reads, prom dedup) copy it at creation.
 	nowFn func() time.Time
 
+	// verdict is the sweep-local maintenance mutex Verdict so
+	// maintSnapshot (frozen sweep censuses) never writes into the
+	// process-global shared.Deps.Maintenance.
+	verdict maintenance.Verdict
+
 	// memos and resets hold every registered census/index member bound ONCE
 	// at construction: InvalidateSweep resets both, and verifyUnmutated
 	// walks memos so new census fields can never drift between invalidation
@@ -564,8 +574,16 @@ func (s *sweepSnapshot) promNoteResult(err error) {
 // typed memos' reset().
 func (s *sweepSnapshot) resetUnstructs() {
 	s.muUnstructs.Lock()
-	defer s.muUnstructs.Unlock()
+	if len(s.unstructReads) == 0 {
+		s.muUnstructs.Unlock()
+		return
+	}
+	memos := make([]*memo[[]unstructured.Unstructured], 0, len(s.unstructReads))
 	for _, m := range s.unstructReads {
+		memos = append(memos, m)
+	}
+	s.muUnstructs.Unlock()
+	for _, m := range memos {
 		m.reset()
 	}
 }
@@ -603,6 +621,9 @@ func WithSweepSnapshot(ctx context.Context, deps ...*Deps) context.Context {
 		}
 	}
 	snap := newSweepSnapshot(ctx, nowFn)
+	if len(deps) > 0 && deps[0] != nil {
+		snap.verdict.NodeReader = deps[0].NodeReader
+	}
 	ctx = context.WithValue(ctx, sweepCtxKey{}, snap)
 	ctx = kube.WithSweepOverlay(ctx)
 	// Bind the O(1) node lookup heal's local-remediation yield

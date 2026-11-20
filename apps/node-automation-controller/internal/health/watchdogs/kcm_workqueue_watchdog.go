@@ -135,7 +135,7 @@ func (p *kcmWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 	}
 	if lease == nil ||
 		lease.Spec.RenewTime == nil ||
-		now.Sub(lease.Spec.RenewTime.Time) > p.cfg.LeaseMaxAge {
+		p.LeasesFetchedAt(ctx).Sub(lease.Spec.RenewTime.Time) > p.cfg.LeaseMaxAge {
 		// No leader Lease at all, or a stale renewTime = the holder
 		// is gone — a dead KCM, not a frozen one. Stay quiet.
 		p.resetKCMWorkqueue()

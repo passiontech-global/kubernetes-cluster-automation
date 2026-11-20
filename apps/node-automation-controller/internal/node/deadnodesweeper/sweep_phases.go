@@ -40,7 +40,7 @@ const (
 // (log + IncError + skip that node): the next cycle retries.
 func (s *deadNodeSweeper) reconcileRecoveredNodes(ctx context.Context,
 	nodes []corev1.Node) (nodeByName map[string]*corev1.Node,
-	nodeNames map[string]bool, hasNotReady bool, untainted int) {
+	nodeNames map[string]bool, notReadyNodes []string, untainted int) {
 	log := logf.FromContext(ctx)
 
 	nodeByName = make(map[string]*corev1.Node, len(nodes))
@@ -50,7 +50,7 @@ func (s *deadNodeSweeper) reconcileRecoveredNodes(ctx context.Context,
 		nodeByName[n.Name] = n
 		nodeNames[n.Name] = true
 		if !kube.NodeReady(n) {
-			hasNotReady = true
+			notReadyNodes = append(notReadyNodes, n.Name)
 		}
 
 		// Recovery first: a node back to Ready=True must not keep
@@ -88,55 +88,55 @@ func (s *deadNodeSweeper) reconcileRecoveredNodes(ctx context.Context,
 		metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues(n.Name)
 		log.Info("UNTAINT: node Ready again -> out-of-service removed", "node", n.Name)
 	}
-	return nodeByName, nodeNames, hasNotReady, untainted
+	slices.Sort(notReadyNodes)
+	return nodeByName, nodeNames, notReadyNodes, untainted
 }
 
-// stuckTerminatingCensus counts, per node, the pods stuck in
+// stuckTerminatingCensus counts, per NotReady node, the pods stuck in
 // Terminating for longer than deadNodeStuckPodAge, returning the
 // counts plus the node names in deterministic order so the per-cycle
 // cap picks the same node.
 //
-// Server-side phase filter: terminal pods can never be "stuck
-// Terminating" evidence, so they are dead weight in the biggest
-// read this module makes. The in-code phase check stays — fake
-// clientsets ignore field selectors and the belt costs nothing.
-// Paged: one unbounded List forces the apiserver to serialize
-// every pod in the cluster into a single response — a multi-MB
-// heap burst both server- and client-side; 500-per-page flattens
-// it while keeping only the per-node Terminating counts.
-// The stuck-pod count is folded INTO the pagination loop — each
-// page is tallied and dropped, so peak client heap is one page,
-// not every pod in the cluster (which is the same footprint the
-// unbounded List had).
-// `now` is the caller's pinned sweep clock — a stuck verdict measured
-// against a drifting wall clock inside a thousands-pod page loop
-// could straddle the threshold mid-pass.
+// Scoped per NotReady node with server-side phase filter: Ready nodes
+// can never be fenced, so listing every pod in the cluster only to
+// discard Ready-node pods wastes apiserver bandwidth and deserialization
+// across healthy clusters; terminal pods can never be "stuck
+// Terminating" evidence either. The in-code phase and spec.nodeName
+// checks stay — fake clientsets ignore field selectors and the belt
+// costs nothing. Quorum reads (no ResourceVersion="0") ensure fencing
+// verdicts never act on stale watch-cache Terminating state.
+// Paged per node: 500-per-page flattens memory while folding counts
+// inline. `now` is the caller's pinned sweep clock.
 func (s *deadNodeSweeper) stuckTerminatingCensus(ctx context.Context,
-	now time.Time) (stuck map[string]int, names []string, err error) {
+	notReadyNodes []string, now time.Time) (stuck map[string]int, names []string, err error) {
 	stuck = map[string]int{}
-	err = kube.ListEach(ctx, metav1.ListOptions{
-		FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
-		Limit:         kube.DefaultListPageSize,
-	}, kube.Pods(s.cs, metav1.NamespaceAll),
-		func(items []corev1.Pod) error {
-			for i := range items {
-				p := &items[i]
-				if p.Status.Phase == corev1.PodSucceeded ||
-					p.Status.Phase == corev1.PodFailed {
-					continue // mirrors the FieldSelector for fake clients
+	for _, nodeName := range notReadyNodes {
+		err = kube.ListEach(ctx, metav1.ListOptions{
+			FieldSelector: "spec.nodeName=" + nodeName +
+				",status.phase!=Succeeded,status.phase!=Failed",
+			Limit: kube.DefaultListPageSize,
+		}, kube.Pods(s.cs, metav1.NamespaceAll),
+			func(items []corev1.Pod) error {
+				for i := range items {
+					p := &items[i]
+					if p.Status.Phase == corev1.PodSucceeded ||
+						p.Status.Phase == corev1.PodFailed {
+						continue // mirrors the FieldSelector for fake clients
+					}
+					if p.DeletionTimestamp == nil || p.Spec.NodeName == "" ||
+						p.Spec.NodeName != nodeName {
+						continue
+					}
+					if now.Sub(p.DeletionTimestamp.Time) <= deadNodeStuckPodAge {
+						continue // still inside a legitimate graceful shutdown
+					}
+					stuck[p.Spec.NodeName]++
 				}
-				if p.DeletionTimestamp == nil || p.Spec.NodeName == "" {
-					continue
-				}
-				if now.Sub(p.DeletionTimestamp.Time) <= deadNodeStuckPodAge {
-					continue // still inside a legitimate graceful shutdown
-				}
-				stuck[p.Spec.NodeName]++
-			}
-			return nil
-		})
-	if err != nil {
-		return nil, nil, err
+				return nil
+			})
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	for name := range stuck {

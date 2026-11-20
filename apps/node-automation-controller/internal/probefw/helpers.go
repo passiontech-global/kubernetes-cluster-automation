@@ -194,28 +194,29 @@ func (m maintSnapshot) DaemonSets(ctx context.Context) ([]appsv1.DaemonSet, erro
 // ledger skips it, matching heal.AllowedV's nil-heals contract),
 // then the maintenance mutex plus the global heal budget — one
 // maintenance-mutex evaluation per Verdict TTL across ALL checks in
-// the sweep (the memo lives on Deps.verdict), instead of three API
-// reads per target per check.
+// the sweep (the memo lives on the sweep snapshot's local Verdict),
+// instead of three API reads per target per check.
 func (d *Deps) HealAllowed(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
 	now time.Time) (proceed, unverifiable bool) {
-	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
-	return heal.AllowedV(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+	ctx, v := d.sweepHealGate(ctx)
+	return heal.AllowedV(ctx, log, v, d.CS, d.Dyn,
 		heals, key, cooldown, now)
 }
 
 // HealAllowedPersisted is HealAllowed with the cooldown widened to
 // the target's persisted stamp: heal.AllowedVPersisted running on the
-// Deps-wide memoized verdict — same cooldown → mutex → budget order,
-// the wider-of in-RAM+annotation window, and one maintenance-mutex
-// evaluation per Verdict TTL across the whole sweep (never per
-// target). The caller stamps the annotation itself, only after a
-// delivered action; a nil obj/empty annoKey collapses to HealAllowed.
+// sweep-local (or Deps-level outside a sweep) memoized verdict —
+// same cooldown → mutex → budget order, the wider-of
+// in-RAM+annotation window, and one maintenance-mutex evaluation per
+// Verdict TTL across the whole sweep (never per target). The caller
+// stamps the annotation itself, only after a delivered action; a nil
+// obj/empty annoKey collapses to HealAllowed.
 func (d *Deps) HealAllowedPersisted(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
 	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
-	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
-	return heal.AllowedVPersisted(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+	ctx, v := d.sweepHealGate(ctx)
+	return heal.AllowedVPersisted(ctx, log, v, d.CS, d.Dyn,
 		heals, obj, annoKey, key, cooldown, now)
 }
 
@@ -229,8 +230,8 @@ func (d *Deps) HealAllowedPersisted(ctx context.Context, log logr.Logger,
 func (d *Deps) HealAllowedOnNode(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, key, nodeName string,
 	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
-	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
-	return heal.AllowedOnNode(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+	ctx, v := d.sweepHealGate(ctx)
+	return heal.AllowedOnNode(ctx, log, v, d.CS, d.Dyn,
 		heals, key, nodeName, cooldown, now)
 }
 
@@ -246,8 +247,8 @@ func (d *Deps) HealAllowedOnNode(ctx context.Context, log logr.Logger,
 func (d *Deps) HealAllowedClusterWideOnly(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, key string, cooldown time.Duration,
 	now time.Time) (proceed, unverifiable bool) {
-	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
-	return heal.AllowedClusterWideOnly(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+	ctx, v := d.sweepHealGate(ctx)
+	return heal.AllowedClusterWideOnly(ctx, log, v, d.CS, d.Dyn,
 		heals, key, cooldown, now)
 }
 
@@ -257,8 +258,8 @@ func (d *Deps) HealAllowedClusterWideOnly(ctx context.Context, log logr.Logger,
 // is consumed.
 func (d *Deps) HealAllowedUpgradeOnly(ctx context.Context, log logr.Logger,
 	key string, now time.Time) (proceed, unverifiable bool) {
-	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
-	return heal.AllowedUpgradeOnly(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+	ctx, v := d.sweepHealGate(ctx)
+	return heal.AllowedUpgradeOnly(ctx, log, v, d.CS, d.Dyn,
 		key, now)
 }
 
@@ -272,21 +273,26 @@ func (d *Deps) HealAllowedUpgradeOnly(ctx context.Context, log logr.Logger,
 func (d *Deps) HealAllowedUpgradeOnlyPersisted(ctx context.Context, log logr.Logger,
 	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
 	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
-	ctx = maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d})
-	return heal.AllowedUpgradeOnlyPersisted(ctx, log, d.maintenanceVerdict(), d.CS, d.Dyn,
+	ctx, v := d.sweepHealGate(ctx)
+	return heal.AllowedUpgradeOnlyPersisted(ctx, log, v, d.CS, d.Dyn,
 		heals, obj, annoKey, key, cooldown, now)
 }
 
-// maintenanceVerdict resolves the verdict the heal gates memoize
-// on: the sweep-shared Maintenance pointer when the module wired
-// one, else this Deps' own fallback (nil Maintenance on a
-// literally-constructed test Deps must still memoize — a nil *Verdict
-// would re-evaluate the mutex on every gate call).
-func (d *Deps) maintenanceVerdict() *maintenance.Verdict {
-	if d.Maintenance != nil {
-		return d.Maintenance
+// sweepHealGate resolves the ctx and Verdict for a heal gate: inside
+// a sweep, it attaches maintSnapshot so the evaluation rides the
+// sweep's memoized censuses and isolates the result onto the sweep's
+// local Verdict (never writing sweep-frozen state into the
+// process-global Deps.Maintenance shared with non-sweep modules).
+// Outside a sweep, it leaves ctx unmodified (live reads) and uses
+// d.Maintenance (or d.verdictFallback when nil).
+func (d *Deps) sweepHealGate(ctx context.Context) (context.Context, *maintenance.Verdict) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		return maintenance.WithMaintenanceSnapshot(ctx, maintSnapshot{d}), &s.verdict
 	}
-	return &d.verdictFallback
+	if d.Maintenance != nil {
+		return ctx, d.Maintenance
+	}
+	return ctx, &d.verdictFallback
 }
 
 // DeletePodHeal is the pod-delete heal shape the self-healing checks

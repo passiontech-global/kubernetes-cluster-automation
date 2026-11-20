@@ -14,7 +14,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	typedbatchv1 "k8s.io/client-go/kubernetes/typed/batch/v1"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
@@ -959,6 +961,234 @@ func TestUnfreezeDeadlinePatchErrorCounted(t *testing.T) {
 	}
 	if got := testutil.QueueErrorCount(t, "cronjob-catchup") - before; got != 1 {
 		t.Fatalf("queue errors delta = %v, want 1", got)
+	}
+}
+
+type ccRecordingCS struct {
+	kubernetes.Interface
+	cjListOpts  []metav1.ListOptions
+	jobListOpts []metav1.ListOptions
+	cjGetOpts   []metav1.GetOptions
+}
+
+type ccRecordingBatchV1 struct {
+	typedbatchv1.BatchV1Interface
+	parent *ccRecordingCS
+}
+
+type ccRecordingCronJobs struct {
+	typedbatchv1.CronJobInterface
+	parent *ccRecordingCS
+}
+
+type ccRecordingJobs struct {
+	typedbatchv1.JobInterface
+	parent *ccRecordingCS
+}
+
+func (c *ccRecordingCS) BatchV1() typedbatchv1.BatchV1Interface {
+	return &ccRecordingBatchV1{BatchV1Interface: c.Interface.BatchV1(), parent: c}
+}
+
+func (b *ccRecordingBatchV1) CronJobs(ns string) typedbatchv1.CronJobInterface {
+	return &ccRecordingCronJobs{CronJobInterface: b.BatchV1Interface.CronJobs(ns), parent: b.parent}
+}
+
+func (b *ccRecordingBatchV1) Jobs(ns string) typedbatchv1.JobInterface {
+	return &ccRecordingJobs{JobInterface: b.BatchV1Interface.Jobs(ns), parent: b.parent}
+}
+
+func (c *ccRecordingCronJobs) List(ctx context.Context, opts metav1.ListOptions) (*batchv1.CronJobList, error) {
+	c.parent.cjListOpts = append(c.parent.cjListOpts, opts)
+	return c.CronJobInterface.List(ctx, opts)
+}
+
+func (c *ccRecordingCronJobs) Get(ctx context.Context, name string, opts metav1.GetOptions) (*batchv1.CronJob, error) {
+	c.parent.cjGetOpts = append(c.parent.cjGetOpts, opts)
+	return c.CronJobInterface.Get(ctx, name, opts)
+}
+
+func (j *ccRecordingJobs) List(ctx context.Context, opts metav1.ListOptions) (*batchv1.JobList, error) {
+	j.parent.jobListOpts = append(j.parent.jobListOpts, opts)
+	return j.JobInterface.List(ctx, opts)
+}
+
+// Both cluster-wide census LISTs (CronJobs and Jobs) serve from the watch cache
+// (ResourceVersion="0", Limit=0 via pageOpts), while spawn issues a live
+// quorum CronJobs.Get (ResourceVersion="").
+func TestCronJobCatchupResourceVersionZero(t *testing.T) {
+	cj := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
+	fakeCS := fake.NewSimpleClientset(cj)
+	rec := &ccRecordingCS{Interface: fakeCS}
+	c := &cronJobCatchup{cs: rec, lastCatchup: map[string]string{}}
+	if err := c.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.cjListOpts) != 1 || len(rec.jobListOpts) != 1 {
+		t.Fatalf("list counts = (cronjobs=%d, jobs=%d), want (1, 1)",
+			len(rec.cjListOpts), len(rec.jobListOpts))
+	}
+	if opts := rec.cjListOpts[0]; opts.ResourceVersion != "0" || opts.Limit != 0 {
+		t.Fatalf("cronjobs list = (RV=%q, Limit=%d), want (\"0\", 0)",
+			opts.ResourceVersion, opts.Limit)
+	}
+	if opts := rec.jobListOpts[0]; opts.ResourceVersion != "0" || opts.Limit != 0 {
+		t.Fatalf("jobs list = (RV=%q, Limit=%d), want (\"0\", 0)",
+			opts.ResourceVersion, opts.Limit)
+	}
+	if len(rec.cjGetOpts) != 1 || rec.cjGetOpts[0].ResourceVersion != "" {
+		t.Fatalf("spawn CronJob.Get opts = %+v, want 1 live Get with RV=\"\"", rec.cjGetOpts)
+	}
+	if n := ccJobCount(t, fakeCS, "ops"); n != 1 {
+		t.Fatalf("expected 1 catch-up job, got %d", n)
+	}
+}
+
+// Stale RV="0" snapshot vs live state in spawn: if the live CronJob was
+// suspended, already has an active Job, became non-stale, or vanished, spawn
+// skips cleanly without creating a Job or metering an error; a live Get error
+// fails closed and meters once.
+func TestCronJobCatchupSpawnLiveConfirmSkipsStaleCache(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name     string
+		mutate   func(live *batchv1.CronJob)
+		deleteCJ bool
+		getErr   error
+		wantErr  float64
+	}{
+		{
+			name:   "suspended live",
+			mutate: func(live *batchv1.CronJob) { live.Spec.Suspend = ptr.To(true) },
+		},
+		{
+			name: "active live",
+			mutate: func(live *batchv1.CronJob) {
+				live.Status.Active = []corev1.ObjectReference{{Kind: "Job", Namespace: "ops", Name: "nightly-1"}}
+			},
+		},
+		{
+			name:     "deleted live",
+			deleteCJ: true,
+		},
+		{
+			name: "not stale live",
+			mutate: func(live *batchv1.CronJob) {
+				live.Status.LastScheduleTime = ptr.To(metav1.NewTime(now.Add(-time.Minute)))
+			},
+		},
+		{
+			name:    "get error fails closed",
+			getErr:  errors.New("live get failed"),
+			wantErr: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stale := ccCronJob("ops", "nightly", "*/5 * * * *", nil)
+			stale.CreationTimestamp = metav1.NewTime(now.Add(-2 * time.Hour))
+
+			var objs []runtime.Object
+			if !tc.deleteCJ {
+				live := stale.DeepCopy()
+				if tc.mutate != nil {
+					tc.mutate(live)
+				}
+				objs = append(objs, live)
+			}
+			cs := fake.NewSimpleClientset(objs...)
+			cs.PrependReactor("list", "cronjobs",
+				func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, &batchv1.CronJobList{Items: []batchv1.CronJob{*stale.DeepCopy()}}, nil
+				})
+			if tc.getErr != nil {
+				cs.PrependReactor("get", "cronjobs",
+					func(ktesting.Action) (bool, runtime.Object, error) {
+						return true, nil, tc.getErr
+					})
+			}
+
+			c := newCatchupAt(cs, now)
+			c.queue = "cronjob-catchup"
+			before := testutil.QueueErrorCount(t, "cronjob-catchup")
+			if err := c.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if n := ccJobCount(t, cs, "ops"); n != 0 {
+				t.Fatalf("spawned %d catch-up job(s) despite stale-cache confirm guard", n)
+			}
+			if got := testutil.QueueErrorCount(t, "cronjob-catchup") - before; got != tc.wantErr {
+				t.Fatalf("queue error delta = %v, want %v", got, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Stale RV="0" snapshot vs live state in unfreezeDeadline: if the live CronJob
+// already carries StartingDeadlineSeconds, was suspended, or vanished, the
+// patch is skipped cleanly; a live Get error fails closed and meters once.
+func TestCronJobCatchupUnfreezeLiveConfirmSkipsStaleCache(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutate   func(live *batchv1.CronJob)
+		deleteCJ bool
+		getErr   error
+		wantErr  float64
+	}{
+		{
+			name:   "startingDeadlineSeconds already set live",
+			mutate: func(live *batchv1.CronJob) { live.Spec.StartingDeadlineSeconds = ptr.To(int64(120)) },
+		},
+		{
+			name:   "suspended live",
+			mutate: func(live *batchv1.CronJob) { live.Spec.Suspend = ptr.To(true) },
+		},
+		{
+			name:     "deleted live",
+			deleteCJ: true,
+		},
+		{
+			name:    "get error fails closed",
+			getErr:  errors.New("live get failed"),
+			wantErr: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stale := ccCronJob("batch", "nightly", "0 0 * * *", nil)
+			var objs []runtime.Object
+			if !tc.deleteCJ {
+				live := stale.DeepCopy()
+				if tc.mutate != nil {
+					tc.mutate(live)
+				}
+				objs = append(objs, live)
+			}
+			cs := fake.NewSimpleClientset(objs...)
+			var patches atomic.Int32
+			cs.PrependReactor("patch", "cronjobs",
+				func(ktesting.Action) (bool, runtime.Object, error) {
+					patches.Add(1)
+					return false, nil, nil
+				})
+			if tc.getErr != nil {
+				cs.PrependReactor("get", "cronjobs",
+					func(ktesting.Action) (bool, runtime.Object, error) {
+						return true, nil, tc.getErr
+					})
+			}
+
+			c := newCatchup(cs)
+			c.queue = "cronjob-catchup"
+			before := testutil.QueueErrorCount(t, "cronjob-catchup")
+			if c.unfreezeDeadline(ctx, logr.Discard(), stale, time.Now()) {
+				t.Fatal("unfreezeDeadline returned true despite stale-cache skip")
+			}
+			if got := patches.Load(); got != 0 {
+				t.Fatalf("patches = %d, want 0", got)
+			}
+			if got := testutil.QueueErrorCount(t, "cronjob-catchup") - before; got != tc.wantErr {
+				t.Fatalf("queue error delta = %v, want %v", got, tc.wantErr)
+			}
+		})
 	}
 }
 

@@ -18,8 +18,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---- subprocess tests for main() -------------------------------------
@@ -62,7 +67,8 @@ func kubeScrubbedEnv() []string {
 	for _, kv := range os.Environ() {
 		key, _, _ := strings.Cut(kv, "=")
 		switch key {
-		case "KUBECONFIG", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT":
+		case "KUBECONFIG", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT",
+			"NODE_AUTOMATION_PPROF_BIND_ADDRESS":
 			continue
 		}
 		env = append(env, kv)
@@ -241,8 +247,9 @@ func TestMainStartsManagerUntilSignal(t *testing.T) {
 	cmd := exec.Command(os.Args[0],
 		"-test.run=TestHelperProcess", "--",
 		// :0 picks ephemeral ports so the child cannot collide with a
-		// real listener on :9115/:8081.
-		"-metrics-bind-address=:0", "-health-probe-bind-address=:0")
+		// real listener on :9115/:8081/:9116.
+		"-metrics-bind-address=:0", "-health-probe-bind-address=:0",
+		"-pprof-bind-address=127.0.0.1:0")
 	cmd.Env = append(kubeScrubbedEnv(), "GO_HELPER_PROCESS=1", "KUBECONFIG="+kubeconfig)
 	cmd.Stdout = &stdout
 	cmd.Stderr = stderr
@@ -329,7 +336,7 @@ func TestMainManagerStartFails(t *testing.T) {
 	srv := fakeDiscoveryAPIServer(t)
 	kubeconfig := writeKubeconfig(t, srv.URL)
 	stdout, stderr, code := runMainInSubprocess(t,
-		[]string{"-metrics-bind-address=bad-address", "-health-probe-bind-address=:0"},
+		[]string{"-metrics-bind-address=bad-address", "-health-probe-bind-address=:0", "-pprof-bind-address=127.0.0.1:0"},
 		"KUBECONFIG="+kubeconfig)
 	if code != 1 {
 		t.Fatalf("exit code = %d, want 1 (stdout=%q stderr=%q)", code, stdout, stderr)
@@ -400,34 +407,172 @@ func TestDefaultCacheTransform(t *testing.T) {
 			t.Fatal("managedFields not stripped on a non-Node object")
 		}
 	})
+
+	t.Run("tombstone re-wraps node with preserved key and strips fields", func(t *testing.T) {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:          "n-del",
+				ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "kubelet"}},
+			},
+			Status: corev1.NodeStatus{
+				Images: []corev1.ContainerImage{{Names: []string{"img:latest"}}},
+			},
+		}
+		out, err := defaultCacheTransform(toolscache.DeletedFinalStateUnknown{
+			Key: "n-del",
+			Obj: n,
+		})
+		if err != nil {
+			t.Fatalf("transform: %v", err)
+		}
+		tomb, ok := out.(toolscache.DeletedFinalStateUnknown)
+		if !ok {
+			t.Fatalf("transformed tombstone is %T, want DeletedFinalStateUnknown", out)
+		}
+		if tomb.Key != "n-del" {
+			t.Fatalf("tomb.Key = %q, want n-del", tomb.Key)
+		}
+		got, ok := tomb.Obj.(*corev1.Node)
+		if !ok {
+			t.Fatalf("tomb.Obj is %T, want *corev1.Node", tomb.Obj)
+		}
+		if got.Status.Images != nil {
+			t.Fatalf("Status.Images not stripped: %+v", got.Status.Images)
+		}
+		if got.GetManagedFields() != nil {
+			t.Fatalf("managedFields not stripped: %+v", got.GetManagedFields())
+		}
+	})
+
+	t.Run("tombstone with nil Obj stays wrapped safely", func(t *testing.T) {
+		out, err := defaultCacheTransform(toolscache.DeletedFinalStateUnknown{Key: "gone"})
+		if err != nil {
+			t.Fatalf("transform: %v", err)
+		}
+		tomb, ok := out.(toolscache.DeletedFinalStateUnknown)
+		if !ok || tomb.Key != "gone" || tomb.Obj != nil {
+			t.Fatalf("got %#v, want DeletedFinalStateUnknown{Key:\"gone\", Obj:nil}", out)
+		}
+	})
 }
 
-// TestPprofHandlers pins the memory-triage contract: the metrics
-// server must carry the net/http/pprof endpoints as ExtraHandlers
-// (heap/goroutine profiles on :9115) and must never claim /metrics —
-// controller-runtime rejects that mapping in Options validation, so
-// a key that collides would fail Start, not shadow silently.
-func TestPprofHandlers(t *testing.T) {
-	handlers := pprofHandlers()
-	for _, path := range []string{
-		"/debug/pprof/", "/debug/pprof/cmdline", "/debug/pprof/profile",
-		"/debug/pprof/symbol", "/debug/pprof/trace",
-	} {
-		if handlers[path] == nil {
-			t.Fatalf("pprofHandlers missing %s", path)
+func TestMakeCRDCacheTransform(t *testing.T) {
+	makeCRD := func(rv, schemaDesc string) *apiextensionsv1.CustomResourceDefinition {
+		return &apiextensionsv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "widgets.example.com",
+				ResourceVersion: rv,
+				ManagedFields:   []metav1.ManagedFieldsEntry{{Manager: "helm"}},
+				Annotations: map[string]string{
+					corev1.LastAppliedConfigAnnotation: `{"huge":"manifest"}`,
+					"keep":                             "yes",
+				},
+			},
+			Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+				Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
+					Name: "v1",
+					Schema: &apiextensionsv1.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensionsv1.JSONSchemaProps{
+							Type:        "object",
+							Description: schemaDesc,
+						},
+					},
+				}},
+			},
 		}
 	}
-	if handlers["/metrics"] != nil {
-		t.Fatal("/metrics must stay controller-runtime's own route")
-	}
 
-	// pprof.Index dispatches the named profiles — the heap profile is
-	// the exact artifact the memory investigation needs, so a broken
-	// dispatch (404/redirect) must fail here, not during the next
-	// working-set incident.
+	t.Run("live CRD records unstripped size and strips bulk fields", func(t *testing.T) {
+		crdSize := kube.NewCRDSizeTable(16)
+		tr := makeCRDCacheTransform(crdSize)
+		raw := makeCRD("10", strings.Repeat("x", 512))
+		wantSize, err := kube.JSONSize(raw)
+		if err != nil {
+			t.Fatalf("JSONSize: %v", err)
+		}
+
+		out, err := tr(raw)
+		if err != nil {
+			t.Fatalf("transform: %v", err)
+		}
+		got, ok := out.(*apiextensionsv1.CustomResourceDefinition)
+		if !ok {
+			t.Fatalf("out is %T, want *CustomResourceDefinition", out)
+		}
+		if got.Spec.Versions[0].Schema != nil {
+			t.Fatal("Schema not stripped")
+		}
+		if got.ManagedFields != nil {
+			t.Fatal("ManagedFields not stripped")
+		}
+		if _, exists := got.Annotations[corev1.LastAppliedConfigAnnotation]; exists {
+			t.Fatal("LastAppliedConfigAnnotation not stripped")
+		}
+		if got.Annotations["keep"] != "yes" {
+			t.Fatalf("non-applied annotation lost: %+v", got.Annotations)
+		}
+		recorded, ok := crdSize.Lookup("widgets.example.com", "10")
+		if !ok || recorded != wantSize {
+			t.Fatalf("crdSize.Lookup = (%d, %v), want (%d, true)", recorded, ok, wantSize)
+		}
+	})
+
+	t.Run("tombstone CRD re-wraps with key and does not overwrite CRDSizeTable", func(t *testing.T) {
+		crdSize := kube.NewCRDSizeTable(16)
+		tr := makeCRDCacheTransform(crdSize)
+		raw := makeCRD("10", strings.Repeat("y", 512))
+		wantSize, err := kube.JSONSize(raw)
+		if err != nil {
+			t.Fatalf("JSONSize: %v", err)
+		}
+		crdSize.Record("widgets.example.com", "10", wantSize)
+
+		// DeltaFIFO tombstone carries an already-stripped cached CRD (or partial object).
+		stripped := makeCRD("10", "")
+		stripped.Spec.Versions[0].Schema = nil
+		out, err := tr(toolscache.DeletedFinalStateUnknown{
+			Key: "widgets.example.com",
+			Obj: stripped,
+		})
+		if err != nil {
+			t.Fatalf("transform: %v", err)
+		}
+		tomb, ok := out.(toolscache.DeletedFinalStateUnknown)
+		if !ok || tomb.Key != "widgets.example.com" {
+			t.Fatalf("got %#v, want DeletedFinalStateUnknown with key widgets.example.com", out)
+		}
+		got, ok := tomb.Obj.(*apiextensionsv1.CustomResourceDefinition)
+		if !ok || got.ManagedFields != nil {
+			t.Fatalf("tombstone CRD not stripped: %#v", tomb.Obj)
+		}
+		recorded, ok := crdSize.Lookup("widgets.example.com", "10")
+		if !ok || recorded != wantSize {
+			t.Fatalf("tombstone overwrote CRDSizeTable: got (%d, %v), want (%d, true)", recorded, ok, wantSize)
+		}
+	})
+
+	t.Run("non-CRD tombstone stays wrapped", func(t *testing.T) {
+		tr := makeCRDCacheTransform(kube.NewCRDSizeTable(16))
+		s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s1"}}
+		out, err := tr(toolscache.DeletedFinalStateUnknown{Key: "ns/s1", Obj: s})
+		if err != nil {
+			t.Fatalf("transform: %v", err)
+		}
+		tomb, ok := out.(toolscache.DeletedFinalStateUnknown)
+		if !ok || tomb.Key != "ns/s1" || tomb.Obj != s {
+			t.Fatalf("got %#v, want preserved tombstone", out)
+		}
+	})
+}
+
+// TestPprofMuxAndMetricsServerSeparation pins the loopback-only pprof
+// posture: pprofMux serves the /debug/pprof/* endpoints and never
+// /metrics, while buildMgrOptions leaves Metrics.ExtraHandlers nil so
+// :9115/debug/pprof/ returns 404.
+func TestPprofMuxAndMetricsServerSeparation(t *testing.T) {
+	mux := pprofMux()
 	rec := httptest.NewRecorder()
-	handlers["/debug/pprof/"].ServeHTTP(rec,
-		httptest.NewRequest(http.MethodGet, "/debug/pprof/heap?debug=1", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/heap?debug=1", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("heap profile: got %d, want 200", rec.Code)
 	}
@@ -436,11 +581,68 @@ func TestPprofHandlers(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	handlers["/debug/pprof/cmdline"].ServeHTTP(rec,
-		httptest.NewRequest(http.MethodGet, "/debug/pprof/cmdline", nil))
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/cmdline", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("cmdline: got %d, want 200", rec.Code)
 	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("/metrics on pprofMux: got %d, want 404", rec.Code)
+	}
+
+	opts := buildMgrOptions(runtime.NewScheme(), ":9115", ":8081", false, 0, 0, 0, "node-ops", nil, nil, false)
+	if opts.Metrics.ExtraHandlers != nil {
+		t.Fatalf("Metrics.ExtraHandlers = %v, want nil (pprof must not mount on :9115)", opts.Metrics.ExtraHandlers)
+	}
+}
+
+func TestValidateLoopbackBindAddr(t *testing.T) {
+	for _, valid := range []string{
+		"127.0.0.1:9116",
+		"127.0.0.1:0",
+		"127.0.0.42:9116",
+		"[::1]:9116",
+		"localhost:9116",
+		"LOCALHOST:0",
+	} {
+		if err := validateLoopbackBindAddr(valid); err != nil {
+			t.Errorf("validateLoopbackBindAddr(%q) unexpected error: %v", valid, err)
+		}
+	}
+	for _, invalid := range []string{
+		"0.0.0.0:9116",
+		"[::]:9116",
+		":9116",
+		"10.0.0.1:9116",
+		"192.168.1.5:9116",
+		"example.com:9116",
+		"127.0.0.1:",
+		"bad-address",
+	} {
+		if err := validateLoopbackBindAddr(invalid); err == nil {
+			t.Errorf("validateLoopbackBindAddr(%q) = nil, want rejection", invalid)
+		}
+	}
+}
+
+func TestRunRejectsNonLoopbackPprof(t *testing.T) {
+	if pprofServerOpts.WriteTimeout != 0 {
+		t.Fatalf("pprofServerOpts.WriteTimeout = %v, want 0", pprofServerOpts.WriteTimeout)
+	}
+	t.Run("via flag", func(t *testing.T) {
+		t.Setenv("NODE_AUTOMATION_PPROF_BIND_ADDRESS", "")
+		if err := run(t.Context(), []string{"-pprof-bind-address=0.0.0.0:9116"}); err == nil {
+			t.Fatal("expected run() to reject non-loopback -pprof-bind-address")
+		}
+	})
+	t.Run("via env", func(t *testing.T) {
+		t.Setenv("NODE_AUTOMATION_PPROF_BIND_ADDRESS", "0.0.0.0:9116")
+		if err := run(t.Context(), nil); err == nil {
+			t.Fatal("expected run() to reject non-loopback NODE_AUTOMATION_PPROF_BIND_ADDRESS")
+		}
+	})
 }
 
 // TestGoAndProcessRuntimeMetricsRegistered pins the memory-triage

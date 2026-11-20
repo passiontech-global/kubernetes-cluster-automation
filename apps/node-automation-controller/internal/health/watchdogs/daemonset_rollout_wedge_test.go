@@ -188,8 +188,9 @@ func dsOnTargetRevision(ds *appsv1.DaemonSet, pod *corev1.Pod,
 	pod.Labels["controller-revision-hash"] = revision
 }
 
-// dsControllerRevision builds a ControllerRevision owned by ds whose
-// name is what the DS controller stamps into controller-revision-hash.
+// dsControllerRevision builds a ControllerRevision owned by ds; its
+// controller-revision-hash label (or Name minus "<ds.Name>-") is what
+// the DS controller stamps into pods' controller-revision-hash.
 func dsControllerRevision(ds *appsv1.DaemonSet, name string,
 	revision int64) *appsv1.ControllerRevision {
 	return &appsv1.ControllerRevision{
@@ -439,8 +440,20 @@ func TestDaemonSetRolloutWedgeRevisionFromMetadata(t *testing.T) {
 			dsControllerRevision(ds, "log-agent-r7", 7),
 			dsControllerRevision(other, "other-r99", 99)) // not ours
 		got, known := chk.newRevisionHashes(ctx, ds, []*corev1.Pod{ready})
-		if !known || !got["log-agent-r7"] || len(got) != 1 {
-			t.Fatalf("target = %v, want the largest owned .Revision (log-agent-r7)", got)
+		if !known || !got["r7"] || len(got) != 1 {
+			t.Fatalf("target = %v, want the largest owned .Revision hash (r7)", got)
+		}
+	})
+
+	t.Run("controller-revision-hash-label-defines-target", func(t *testing.T) {
+		ds := wedgedDS("kube-system", "log-agent")
+		ds.Status.ObservedGeneration = 0
+		cr := dsControllerRevision(ds, "log-agent-7d9f8c", 7)
+		cr.Labels = map[string]string{"controller-revision-hash": "7d9f8c"}
+		_, chk := dsWedgeFixture(t, now, ds, cr)
+		got, known := chk.newRevisionHashes(ctx, ds, nil)
+		if !known || !got["7d9f8c"] || len(got) != 1 {
+			t.Fatalf("target = %v, want {7d9f8c}", got)
 		}
 	})
 }
@@ -563,5 +576,72 @@ func TestDaemonSetWedgeTargetKeyStableAcrossPodRecreate(t *testing.T) {
 	}
 	if strings.Contains(key1, "/") {
 		t.Fatalf("key must be a DNS-1123 Event-name prefix, got %q", key1)
+	}
+}
+
+// P0-7 end-to-end: when ObservedGeneration < Generation forces the
+// ControllerRevision fallback, a new-revision unready pod on a cordoned
+// node must survive while an old-revision blocker is deleted.
+func TestDaemonSetRolloutWedgeP07ControllerRevisionFallbackEndToEnd(t *testing.T) {
+	now := time.Now()
+	ds := wedgedDS("kube-system", "log-agent")
+	ds.Status.ObservedGeneration = 0
+	cr := dsControllerRevision(ds, "log-agent-new", 7)
+	cr.Labels = map[string]string{"controller-revision-hash": "new"}
+
+	newPod := dsPod("kube-system", "log-agent", "log-agent-new-pod", "node-c1",
+		false, "ImagePullBackOff", false)
+	newPod.UID = "uid-new-pod"
+	newPod.Labels["controller-revision-hash"] = "new"
+	oldPod := dsPod("kube-system", "log-agent", "log-agent-old-pod", "node-c2",
+		false, "CrashLoopBackOff", false)
+	oldPod.UID = "uid-old-pod"
+	oldPod.Labels["controller-revision-hash"] = "old"
+
+	cs, chk := dsWedgeFixture(t, now, ds, cr, newPod, oldPod,
+		dsStaticCordonedNode("node-c1"), dsStaticCordonedNode("node-c2"))
+	var podLists int
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		podLists++
+		return false, nil, nil
+	})
+
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	probetest.FreezeNow(chk.Deps, now.Add(31*time.Minute))
+
+	podLists = 0
+	sctx := probetest.SweepCtx(ctx, chk.Deps)
+	res := chk.Run(sctx)
+	if res.Pass {
+		t.Fatalf("aged wedge must flag: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, newPod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("new-revision pod was deleted via P0-7 fallback: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, oldPod.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("old-revision blocker pod was not deleted")
+	}
+
+	// SelfHealKey prefixing: Deps.Heals must stamp under SelfHealKey.
+	expectedKey := "selfheal/" + CheckNameDaemonSetRolloutWedge + "/kube-system/log-agent"
+	if !chk.Heals.CooledDown(expectedKey, time.Hour, now.Add(31*time.Minute)) {
+		t.Fatalf("Deps.Heals missing key %q", expectedKey)
+	}
+	if chk.Heals.CooledDown("kube-system/log-agent", time.Hour, now.Add(31*time.Minute)) {
+		t.Fatal("Deps.Heals must not stamp bare ns/name key")
+	}
+
+	// Wave 4: MarkPodDeleted tombstones the pod without calling InvalidatePods.
+	podsInSweep, err := chk.Deps.AllPods(sctx)
+	if err != nil {
+		t.Fatalf("AllPods in same sweep: %v", err)
+	}
+	if podLists != 1 {
+		t.Fatalf("pod list count in sweep = %d, want 1 (no InvalidatePods re-list)", podLists)
+	}
+	for i := range podsInSweep {
+		if podsInSweep[i].Name == oldPod.Name {
+			t.Fatalf("deleted pod %s still visible in same sweep after MarkPodDeleted", oldPod.Name)
+		}
 	}
 }

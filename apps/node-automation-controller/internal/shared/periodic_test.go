@@ -3,6 +3,9 @@ package shared
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -350,4 +354,278 @@ func TestNodeUpdatePredicateAndRequeueAfter(t *testing.T) {
 			t.Fatalf("RequeueAfter(10s) = %v outside [9s, 11s)", got)
 		}
 	}
+}
+
+type captureLogSink struct {
+	mu      sync.Mutex
+	entries []capturedLog
+}
+
+type capturedLog struct {
+	msg string
+	err error
+	kvs map[string]any
+}
+
+func (s *captureLogSink) Init(logr.RuntimeInfo)    {}
+func (s *captureLogSink) Enabled(int) bool         { return true }
+func (s *captureLogSink) Info(int, string, ...any) {}
+func (s *captureLogSink) Error(err error, msg string, keysAndValues ...any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kvs := make(map[string]any, len(keysAndValues)/2)
+	for i := 0; i+1 < len(keysAndValues); i += 2 {
+		if k, ok := keysAndValues[i].(string); ok {
+			kvs[k] = keysAndValues[i+1]
+		}
+	}
+	s.entries = append(s.entries, capturedLog{msg: msg, err: err, kvs: kvs})
+}
+func (s *captureLogSink) WithValues(...any) logr.LogSink { return s }
+func (s *captureLogSink) WithName(string) logr.LogSink   { return s }
+
+func TestPeriodicPanicLogsStack(t *testing.T) {
+	sink := &captureLogSink{}
+	log := logr.New(sink)
+	p := &Periodic{
+		Name:     "test-panic-stack",
+		Interval: 10 * time.Millisecond,
+		Fn: func(context.Context) error {
+			panic("boom")
+		},
+		Log: log,
+	}
+
+	p.invokeOnce(t.Context(), log)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.entries) != 1 {
+		t.Fatalf("logged entries = %d, want 1", len(sink.entries))
+	}
+	entry := sink.entries[0]
+	if entry.msg != "periodic run failed" {
+		t.Fatalf("msg = %q, want periodic run failed", entry.msg)
+	}
+	if entry.err == nil || entry.err.Error() != "panic in periodic run: boom" {
+		t.Fatalf("err = %v, want panic in periodic run: boom", entry.err)
+	}
+	stack, ok := entry.kvs["stack"].(string)
+	if !ok || !strings.Contains(stack, "TestPeriodicPanicLogsStack") {
+		t.Fatalf("stack = %q, want stack trace containing panicking frame", stack)
+	}
+}
+
+type fakePeriodicMgr struct {
+	manager.Manager
+	added []manager.Runnable
+}
+
+func (m *fakePeriodicMgr) Add(r manager.Runnable) error {
+	m.added = append(m.added, r)
+	return nil
+}
+
+func (m *fakePeriodicMgr) GetLogger() logr.Logger {
+	return logr.Discard()
+}
+
+func TestAddPeriodicWithTimeout(t *testing.T) {
+	mgr := &fakePeriodicMgr{}
+	if err := AddPeriodic(mgr, "default-p", time.Minute, func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddPeriodic err: %v", err)
+	}
+	if err := AddPeriodicWithTimeout(mgr, "custom-p", 5*time.Minute, 25*time.Minute, func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddPeriodicWithTimeout err: %v", err)
+	}
+	if len(mgr.added) != 2 {
+		t.Fatalf("added = %d, want 2", len(mgr.added))
+	}
+	p0 := mgr.added[0].(*Periodic)
+	p1 := mgr.added[1].(*Periodic)
+	if p0.RunTimeout != 0 {
+		t.Fatalf("AddPeriodic RunTimeout = %v, want 0", p0.RunTimeout)
+	}
+	if p1.RunTimeout != 25*time.Minute || p1.Interval != 5*time.Minute || p1.Name != "custom-p" {
+		t.Fatalf("AddPeriodicWithTimeout stored %+v", p1)
+	}
+
+	// Verify runOnce honors RunTimeout shorter than 2*Interval.
+	var deadline time.Time
+	var hasDeadline bool
+	pShort := &Periodic{
+		Name:       "short-timeout",
+		Interval:   time.Hour,
+		RunTimeout: 50 * time.Millisecond,
+		Fn: func(c context.Context) error {
+			deadline, hasDeadline = c.Deadline()
+			<-c.Done()
+			return c.Err()
+		},
+		Log: logr.Discard(),
+	}
+	start := time.Now()
+	err := pShort.runOnce(t.Context())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runOnce err = %v, want DeadlineExceeded", err)
+	}
+	if !hasDeadline || deadline.Sub(start) > time.Second {
+		t.Fatalf("runOnce deadline = %v (has=%v), want ~50ms", deadline.Sub(start), hasDeadline)
+	}
+}
+
+func TestPeriodicLiveness(t *testing.T) {
+	t.Run("empty liveness returns nil", func(t *testing.T) {
+		l := NewLiveness()
+		if err := l.Check(nil); err != nil {
+			t.Fatalf("empty Liveness.Check = %v, want nil", err)
+		}
+		if err := (*Liveness)(nil).Check(nil); err != nil {
+			t.Fatalf("nil Liveness.Check = %v, want nil", err)
+		}
+	})
+
+	t.Run("active loop healthy across ticks, errors, panics, and unregisters on cancel", func(t *testing.T) {
+		l := NewLiveness()
+		l.Floor = 500 * time.Millisecond
+		var count atomic.Int32
+		third := make(chan struct{})
+		p := &Periodic{
+			Name:       "healthy-loop",
+			Interval:   10 * time.Millisecond,
+			RunTimeout: 50 * time.Millisecond,
+			Fn: func(context.Context) error {
+				switch count.Add(1) {
+				case 1:
+					return errors.New("transient")
+				case 2:
+					panic("transient panic")
+				case 3:
+					close(third)
+				}
+				return nil
+			},
+			Log: logr.Discard(),
+		}
+
+		pctx, cancel := context.WithCancel(WithLiveness(t.Context(), l))
+		done := make(chan error, 1)
+		go func() { done <- p.Start(pctx) }()
+
+		select {
+		case <-third:
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatal("loop did not reach 3rd tick")
+		}
+		if err := l.Check(nil); err != nil {
+			cancel()
+			t.Fatalf("healthy loop Check = %v, want nil", err)
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatalf("Start err = %v", err)
+		}
+		// Unregistered on exit: loops list must be empty and Check nil.
+		l.mu.Lock()
+		remaining := len(l.loops)
+		l.mu.Unlock()
+		if remaining != 0 {
+			t.Fatalf("loops remaining after Start exit = %d, want 0", remaining)
+		}
+		if err := l.Check(nil); err != nil {
+			t.Fatalf("post-exit Check = %v, want nil", err)
+		}
+	})
+
+	t.Run("hung Fn trips Check with loop name", func(t *testing.T) {
+		var fakeNow atomic.Int64
+		fakeNow.Store(int64(time.Second))
+		l := &Liveness{
+			Floor: 100 * time.Millisecond,
+			nowFn: func() time.Duration { return time.Duration(fakeNow.Load()) },
+		}
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		p := &Periodic{
+			Name:       "wedged-loop",
+			Interval:   10 * time.Millisecond,
+			RunTimeout: 20 * time.Millisecond,
+			Liveness:   l,
+			Fn: func(context.Context) error {
+				select {
+				case <-entered:
+				default:
+					close(entered)
+				}
+				<-release
+				return nil
+			},
+			Log: logr.Discard(),
+		}
+
+		pctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- p.Start(pctx) }()
+
+		<-entered
+		if err := l.Check(nil); err != nil {
+			close(release)
+			cancel()
+			t.Fatalf("Check before budget exceeded = %v, want nil", err)
+		}
+		// Advance monotonic clock past budget (max(2*1s+20ms, 100ms) if clamped, else 100ms).
+		fakeNow.Add(int64(5 * time.Second))
+		err := l.Check(nil)
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q", "wedged-loop")) {
+			close(release)
+			cancel()
+			t.Fatalf("Check after budget exceeded = %v, want error naming wedged-loop", err)
+		}
+		close(release)
+		cancel()
+		<-done
+	})
+
+	t.Run("NextInterval updates beat.staleAfter when interval grows", func(t *testing.T) {
+		l := NewLiveness()
+		l.Floor = 50 * time.Millisecond
+		var fakeNow atomic.Int64
+		fakeNow.Store(int64(time.Second))
+		l.nowFn = func() time.Duration { return time.Duration(fakeNow.Load()) }
+
+		nextStarted := make(chan struct{})
+		p := &Periodic{
+			Name:       "adaptive-loop",
+			Interval:   10 * time.Millisecond,
+			RunTimeout: 20 * time.Millisecond,
+			Liveness:   l,
+			NextInterval: func(time.Duration) time.Duration {
+				select {
+				case <-nextStarted:
+				default:
+					close(nextStarted)
+				}
+				return 5 * time.Second
+			},
+			Fn:  func(context.Context) error { return nil },
+			Log: logr.Discard(),
+		}
+
+		pctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- p.Start(pctx) }()
+
+		<-nextStarted
+		// Give Start a moment to store the updated staleAfter before waitTimer.
+		time.Sleep(15 * time.Millisecond)
+		// Advance past original 100ms floor, still inside 2*5s+20ms budget.
+		fakeNow.Add(int64(2 * time.Second))
+		if err := l.Check(nil); err != nil {
+			cancel()
+			t.Fatalf("adaptive loop Check = %v, want nil with grown staleAfter", err)
+		}
+		cancel()
+		<-done
+	})
 }

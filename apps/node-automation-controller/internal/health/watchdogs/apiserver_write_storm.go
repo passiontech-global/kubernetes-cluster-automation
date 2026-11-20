@@ -361,6 +361,9 @@ func (p *apiserverWriteStormCheck) suspendStormFlux(ctx context.Context,
 func (p *apiserverWriteStormCheck) restoreSuspendedFlux(ctx context.Context,
 	log logr.Logger, now time.Time) bool {
 
+	if !p.healEnabled {
+		return true
+	}
 	targets := p.stormFluxTargets(ctx, log, true)
 	if targets == nil {
 		return false // census failed — inconclusive, keep armed

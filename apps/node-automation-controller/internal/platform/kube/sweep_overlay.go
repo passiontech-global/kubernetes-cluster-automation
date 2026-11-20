@@ -203,27 +203,43 @@ func EffectiveAnno(ctx context.Context, obj metav1.Object, key string) string {
 // object's own annotations overlaid with every recorded patch delta
 // (a recorded null deletes the key) — for sweep readers that must
 // scan keys rather than fetch one value (prefix matches, opt-out
-// vetoes). Outside a sweep it is a copy of the object's own map.
+// vetoes). Returns obj.GetAnnotations() unchanged (zero allocations)
+// when outside a sweep or when no delta was recorded for obj; callers
+// must treat the returned map as read-only.
 func EffectiveAnnos(ctx context.Context, obj metav1.Object) map[string]string {
 	if obj == nil {
 		return nil
 	}
-	out := make(map[string]string, len(obj.GetAnnotations())+4)
-	for k, v := range obj.GetAnnotations() {
+	base := obj.GetAnnotations()
+	ov := sweepOverlay(ctx)
+	if ov == nil {
+		return base
+	}
+	ov.mu.RLock()
+	if len(ov.annos) == 0 {
+		ov.mu.RUnlock()
+		return base
+	}
+	m, ok := ov.annos[overlayObjKey(obj)]
+	if !ok || len(m) == 0 {
+		ov.mu.RUnlock()
+		return base
+	}
+	delta := make(map[string]*string, len(m))
+	for k, v := range m {
+		delta[k] = v
+	}
+	ov.mu.RUnlock()
+	out := make(map[string]string, len(base)+len(delta))
+	for k, v := range base {
 		out[k] = v
 	}
-	if ov := sweepOverlay(ctx); ov != nil {
-		ov.mu.RLock()
-		if m, ok := ov.annos[overlayObjKey(obj)]; ok {
-			for k, v := range m {
-				if v == nil {
-					delete(out, k)
-				} else {
-					out[k] = *v
-				}
-			}
+	for k, v := range delta {
+		if v == nil {
+			delete(out, k)
+		} else {
+			out[k] = *v
 		}
-		ov.mu.RUnlock()
 	}
 	return out
 }
@@ -518,6 +534,27 @@ func TryReserveWorkloadDisruption(ctx context.Context, pod *corev1.Pod) bool {
 	}
 	ov.ownerDisrupt[key] = struct{}{}
 	return true
+}
+
+// ReleaseWorkloadDisruption releases a workload disruption slot
+// previously reserved for pod (e.g. when the subsequent Delete or
+// Eviction returned 404 NotFound, 409 Conflict, or 429
+// TooManyRequests without delivering a disruption). Terminal pods
+// (PodSucceeded/PodFailed) are a no-op because TryReserveWorkloadDisruption
+// exempts them and must never erase a live sibling's reservation.
+func ReleaseWorkloadDisruption(ctx context.Context, pod *corev1.Pod) {
+	ov := sweepOverlay(ctx)
+	if ov == nil || pod == nil {
+		return
+	}
+	if pod.Status.Phase == corev1.PodSucceeded ||
+		pod.Status.Phase == corev1.PodFailed {
+		return
+	}
+	key := disruptionKey(pod)
+	ov.mu.Lock()
+	delete(ov.ownerDisrupt, key)
+	ov.mu.Unlock()
 }
 
 // disruptionKey derives the workload identity a pod belongs to:

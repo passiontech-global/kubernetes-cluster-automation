@@ -330,6 +330,7 @@ func TestLiqoDisconnectedFor(t *testing.T) {
 // the Connected condition never dropped — the first sighting arms
 // the ledger, the move fires the bounce + the endpoint counter.
 func TestLiqoEndpointChangeBouncesGateway(t *testing.T) {
+	testutil.CleanupMetric(t, liqoEndpointChangedTotal, "peer-b")
 	connected := map[string]any{
 		"type": "Connected", "status": "True",
 		"lastTransitionTime": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)}

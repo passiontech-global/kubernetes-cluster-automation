@@ -5,6 +5,7 @@
 package unmeshed
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -23,7 +24,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -990,5 +993,50 @@ func TestUnmeshedSweepNilSnapshotFailsClosed(t *testing.T) {
 	a := &Auditor{}
 	if err := a.Sweep(ctx, nil); err == nil {
 		t.Fatal("nil snapshot must be a tolerated fail-closed error, not a pass")
+	}
+}
+
+type podListOptsRecorder struct {
+	kubernetes.Interface
+	opts []metav1.ListOptions
+}
+
+func (r *podListOptsRecorder) CoreV1() corev1client.CoreV1Interface {
+	return &recPodCoreV1{CoreV1Interface: r.Interface.CoreV1(), r: r}
+}
+
+type recPodCoreV1 struct {
+	corev1client.CoreV1Interface
+	r *podListOptsRecorder
+}
+
+func (c *recPodCoreV1) Pods(ns string) corev1client.PodInterface {
+	return &recPods{PodInterface: c.CoreV1Interface.Pods(ns), r: c.r}
+}
+
+type recPods struct {
+	corev1client.PodInterface
+	r *podListOptsRecorder
+}
+
+func (p *recPods) List(ctx context.Context, opts metav1.ListOptions) (*corev1.PodList, error) {
+	p.r.opts = append(p.r.opts, opts)
+	return p.PodInterface.List(ctx, opts)
+}
+
+func TestUnmeshedPodsListStaysPagedWithoutRV0(t *testing.T) {
+	cs := upSeed(nil)
+	rec := &podListOptsRecorder{Interface: cs}
+	a := &Auditor{}
+	g := &guardstate.Guard{CS: rec, Dyn: wgDyn(), Now: time.Now}
+	if err := a.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.opts) != 1 {
+		t.Fatalf("pods list calls = %d, want 1", len(rec.opts))
+	}
+	if rec.opts[0].ResourceVersion != "" || rec.opts[0].Limit != guardstate.ListPageSize {
+		t.Fatalf("pods ListOptions = %+v, want ResourceVersion=\"\" Limit=%d",
+			rec.opts[0], guardstate.ListPageSize)
 	}
 }

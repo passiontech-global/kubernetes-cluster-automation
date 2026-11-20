@@ -706,3 +706,203 @@ func TestEvictPodNotFoundConflict(t *testing.T) {
 			evicted, refused, err)
 	}
 }
+
+func ownedPodPair(rsName string) (*corev1.Pod, *corev1.Pod) {
+	ctrl := true
+	owner := metav1.OwnerReference{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: rsName, Controller: &ctrl,
+	}
+	p1 := pod("ns1", rsName+"-0", "u1", corev1.PodRunning, time.Now())
+	p1.OwnerReferences = []metav1.OwnerReference{owner}
+	p2 := pod("ns1", rsName+"-1", "u2", corev1.PodRunning, time.Now())
+	p2.OwnerReferences = []metav1.OwnerReference{owner}
+	return p1, p2
+}
+
+// ForceDeletePod checks PodClaimedPVCs before preparePodDisruption so a
+// refused PVC-holding pod does not consume the workload's disruption slot.
+func TestForceDeletePodWithPVCDoesNotReserveDisruption(t *testing.T) {
+	p1, p2 := ownedPodPair("sts-pvc")
+	p1.Spec.Volumes = []corev1.Volume{{
+		Name:         "data",
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc-1"}},
+	}}
+	cs := fake.NewSimpleClientset(p1, p2)
+	sctx := kube.WithSweepOverlay(ctx)
+	now := time.Now()
+
+	deleted, err := ForceDeletePod(sctx, cs, nil, "k1", p1, now)
+	if err != nil || deleted {
+		t.Fatalf("ForceDeletePod(PVC) = (%v,%v), want (false,nil)", deleted, err)
+	}
+	// Sibling pod without PVC must still acquire the workload slot.
+	deleted, err = DeletePod(sctx, cs, nil, "k2", p2, now)
+	if err != nil || !deleted {
+		t.Fatalf("sibling DeletePod after PVC refusal = (%v,%v), want (true,nil)", deleted, err)
+	}
+}
+
+// DeletePod and ForceDeletePod release the workload disruption slot on
+// 404/409/429 (non-disruptive API rejections), while 500 keeps it held.
+func TestDeleteAndForceDeleteReleaseDisruptionOnAPIRefusals(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name        string
+		force       bool
+		reactorErr  error
+		wantErr     bool
+		wantSibling bool
+	}{
+		{
+			name:        "DeletePod 404 releases slot",
+			reactorErr:  apierrors.NewNotFound(corev1.Resource("pods"), "x"),
+			wantSibling: true,
+		},
+		{
+			name:        "DeletePod 409 releases slot",
+			reactorErr:  apierrors.NewConflict(corev1.Resource("pods"), "x", errors.New("uid")),
+			wantSibling: true,
+		},
+		{
+			name:        "DeletePod 429 releases slot",
+			reactorErr:  apierrors.NewTooManyRequests("apf busy", 1),
+			wantErr:     true,
+			wantSibling: true,
+		},
+		{
+			name:        "DeletePod 500 keeps slot held",
+			reactorErr:  apierrors.NewInternalError(errors.New("boom")),
+			wantErr:     true,
+			wantSibling: false,
+		},
+		{
+			name:        "ForceDeletePod 404 releases slot",
+			force:       true,
+			reactorErr:  apierrors.NewNotFound(corev1.Resource("pods"), "x"),
+			wantSibling: true,
+		},
+		{
+			name:        "ForceDeletePod 409 releases slot",
+			force:       true,
+			reactorErr:  apierrors.NewConflict(corev1.Resource("pods"), "x", errors.New("uid")),
+			wantSibling: true,
+		},
+		{
+			name:        "ForceDeletePod 429 releases slot",
+			force:       true,
+			reactorErr:  apierrors.NewTooManyRequests("apf busy", 1),
+			wantErr:     true,
+			wantSibling: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p1, p2 := ownedPodPair("rs-del")
+			cs := fake.NewSimpleClientset(p1, p2)
+			cs.PrependReactor("delete", "pods",
+				func(a ktesting.Action) (bool, runtime.Object, error) {
+					da := a.(ktesting.DeleteAction)
+					if da.GetName() == p1.Name {
+						return true, nil, tc.reactorErr
+					}
+					return false, nil, nil
+				})
+			sctx := kube.WithSweepOverlay(ctx)
+
+			var deleted bool
+			var err error
+			if tc.force {
+				deleted, err = ForceDeletePod(sctx, cs, nil, "k1", p1, now)
+			} else {
+				deleted, err = DeletePod(sctx, cs, nil, "k1", p1, now)
+			}
+			if deleted || (err != nil) != tc.wantErr {
+				t.Fatalf("first delete = (%v,%v), want (false, err=%v)", deleted, err, tc.wantErr)
+			}
+
+			sibDeleted, sibErr := DeletePod(sctx, cs, nil, "k2", p2, now)
+			if sibErr != nil || sibDeleted != tc.wantSibling {
+				t.Fatalf("sibling DeletePod = (%v,%v), want (%v,nil)", sibDeleted, sibErr, tc.wantSibling)
+			}
+		})
+	}
+}
+
+// EvictPod/EvictPodV release the disruption slot on 404/409/429 (and
+// EvictPodV refunds its single budget grant), while a quorum-denied
+// (deferred=true) call must NOT release the prior pod's reservation.
+func TestEvictPodReleasesDisruptionOnAPIRefusalsAndPreservesDeferred(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name       string
+		reactorErr error
+	}{
+		{"404", apierrors.NewNotFound(corev1.Resource("pods"), "x")},
+		{"409", apierrors.NewConflict(corev1.Resource("pods"), "x", errors.New("uid"))},
+		{"429", apierrors.NewTooManyRequests("pdb", 1)},
+	} {
+		t.Run("EvictPodV/"+tc.name, func(t *testing.T) {
+			resetBudget(t)
+			ConfigureBudget(1, time.Minute)
+			p1, p2 := ownedPodPair("rs-evict")
+			cs := fake.NewSimpleClientset(p1, p2)
+			dyn := planAwareDyn()
+			cs.PrependReactor("create", "pods",
+				func(a ktesting.Action) (bool, runtime.Object, error) {
+					if a.GetSubresource() != "eviction" {
+						return false, nil, nil
+					}
+					ca := a.(ktesting.CreateAction)
+					ev := ca.GetObject().(*policyv1.Eviction)
+					if ev.Name == p1.Name {
+						return true, nil, tc.reactorErr
+					}
+					return false, nil, nil
+				})
+			sctx := kube.WithSweepOverlay(ctx)
+
+			proceed, unver, evicted, refused, err := EvictPodV(
+				sctx, logr.Discard(), nil, cs, dyn, nil, "k1", time.Minute, p1, now)
+			if !proceed || unver || evicted || !refused || err != nil {
+				t.Fatalf("EvictPodV = (%v,%v,%v,%v,%v), want (true,false,false,true,nil)",
+					proceed, unver, evicted, refused, err)
+			}
+			b := defaultBudget.Load()
+			b.mu.Lock()
+			used := len(b.grants)
+			b.mu.Unlock()
+			if used != 0 {
+				t.Fatalf("budget grants = %d after refused EvictPodV, want 0 (refunded once)", used)
+			}
+
+			// Sibling pod must acquire the released slot and succeed.
+			sibEvicted, sibRefused, sibErr := EvictPod(sctx, cs, nil, "k2", p2, now)
+			if sibErr != nil || !sibEvicted || sibRefused {
+				t.Fatalf("sibling EvictPod = (%v,%v,%v), want (true,false,nil)",
+					sibEvicted, sibRefused, sibErr)
+			}
+		})
+	}
+
+	t.Run("quorum-denied deferred does not release prior reservation", func(t *testing.T) {
+		p1, p2 := ownedPodPair("rs-defer")
+		p3 := pod("ns1", "rs-defer-2", "u3", corev1.PodRunning, now)
+		p3.OwnerReferences = p1.OwnerReferences
+		cs := fake.NewSimpleClientset(p1, p2, p3)
+		sctx := kube.WithSweepOverlay(ctx)
+
+		// Reserve slot via p1.
+		if !kube.TryReserveWorkloadDisruption(sctx, p1) {
+			t.Fatal("initial reserve failed")
+		}
+		// p2 hits deferred=true (quorum already reserved) — must NOT release p1's slot.
+		evicted, refused, err := EvictPod(sctx, cs, nil, "k2", p2, now)
+		if err != nil || evicted || !refused {
+			t.Fatalf("p2 EvictPod = (%v,%v,%v), want (false,true,nil)", evicted, refused, err)
+		}
+		// p3 must STILL see the slot occupied.
+		if kube.TryReserveWorkloadDisruption(sctx, p3) {
+			t.Fatal("deferred EvictPod released prior reservation")
+		}
+	})
+}

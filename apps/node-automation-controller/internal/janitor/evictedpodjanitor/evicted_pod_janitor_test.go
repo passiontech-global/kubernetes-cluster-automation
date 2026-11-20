@@ -1,6 +1,7 @@
 package evictedpodjanitor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -12,7 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
@@ -310,5 +313,60 @@ func TestEvictedPodJanitorDeleteConflictNotMetered(t *testing.T) {
 	}
 	if got := testutil.QueueErrorCount(t, "evicted-pod-janitor") - before; got != 0 {
 		t.Fatalf("Conflict race metered as an error: delta = %v, want 0", got)
+	}
+}
+
+type epjRecordingCS struct {
+	kubernetes.Interface
+	listOpts []metav1.ListOptions
+}
+
+type epjRecordingCoreV1 struct {
+	typedcorev1.CoreV1Interface
+	parent *epjRecordingCS
+}
+
+type epjRecordingPods struct {
+	typedcorev1.PodInterface
+	parent *epjRecordingCS
+}
+
+func (c *epjRecordingCS) CoreV1() typedcorev1.CoreV1Interface {
+	return &epjRecordingCoreV1{CoreV1Interface: c.Interface.CoreV1(), parent: c}
+}
+
+func (c *epjRecordingCoreV1) Pods(ns string) typedcorev1.PodInterface {
+	return &epjRecordingPods{PodInterface: c.CoreV1Interface.Pods(ns), parent: c.parent}
+}
+
+func (p *epjRecordingPods) List(ctx context.Context, opts metav1.ListOptions) (*corev1.PodList, error) {
+	p.parent.listOpts = append(p.parent.listOpts, opts)
+	return p.PodInterface.List(ctx, opts)
+}
+
+// The cluster-wide pod census serves from the apiserver watch cache
+// (ResourceVersion="0"); kube.pageOpts clears Limit on the wire so the
+// apiserver accepts RV="0" without rejecting pagination.
+func TestEvictedPodJanitorResourceVersionZero(t *testing.T) {
+	fakeCS := fake.NewSimpleClientset(
+		epjPod("a", "old-evicted", corev1.PodFailed, "Evicted", 2*time.Hour))
+	rec := &epjRecordingCS{Interface: fakeCS}
+	j := &evictedPodJanitor{cs: rec}
+	if err := j.run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.listOpts) != 1 {
+		t.Fatalf("pod list calls = %d, want 1", len(rec.listOpts))
+	}
+	opts := rec.listOpts[0]
+	if opts.ResourceVersion != "0" || opts.Limit != 0 {
+		t.Fatalf("list options = (RV=%q, Limit=%d), want (\"0\", 0)",
+			opts.ResourceVersion, opts.Limit)
+	}
+	if want := "status.phase=" + string(corev1.PodFailed); opts.FieldSelector != want {
+		t.Fatalf("field selector = %q, want %q", opts.FieldSelector, want)
+	}
+	if testutil.PodExistsStrict(t, fakeCS, "a", "old-evicted") {
+		t.Fatal("old evicted pod not deleted")
 	}
 }

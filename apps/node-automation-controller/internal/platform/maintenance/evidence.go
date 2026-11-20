@@ -125,7 +125,7 @@ func kuredLockNodeID(raw string) string {
 		return ""
 	}
 	var lock struct {
-		NodeID string `json:"nodeID"`
+		NodeID string `json:"nodeID,case:ignore"`
 	}
 	if err := json.Unmarshal([]byte(raw), &lock); err == nil &&
 		lock.NodeID != "" {

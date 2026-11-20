@@ -782,3 +782,91 @@ func TestHealNamedPodDeleteErrorCounted(t *testing.T) {
 		t.Fatalf("run_errors delta = %v, want 1 — the failed delete must be counted", got)
 	}
 }
+
+// hostNetwork cilium-operator pods use "<nodeHostname>-<rand>" as the
+// Lease holderIdentity. Decoy kube-system pods (coredns, cilium-agent)
+// scheduled on the same node must never be matched or deleted.
+func TestCiliumOperatorLeaderPodHostNetworkSkipsNonOperatorPods(t *testing.T) {
+	decoy1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: "coredns-abc",
+			UID: types.UID("u-coredns"),
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	decoy2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: "cilium-agent-xyz",
+			UID: types.UID("u-cilium-agent"),
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	standby := ciliumOpRunning("cilium-operator-standby")
+	standby.Spec.NodeName = "node-b"
+	leader := ciliumOpRunning("cilium-operator-leader")
+	leader.Spec.NodeName = "node-a"
+
+	holder := "node-a-9f8e7d"
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("node-a", "", 0, false),
+		probetest.ReadyWorkerNode("node-b", "", 0, false),
+		decoy1, decoy2, standby, leader, ciliumOpLease(holder))
+	p := testProberDyn(cs, probetest.OpDyn())
+	chk := probetest.MustCheck[*meshControlPlaneCheck](t, p)
+
+	pods := []*corev1.Pod{decoy1, decoy2, standby, leader}
+	if got := chk.ciliumOperatorLeaderPod(ctx, logr.Discard(), pods); got != leader {
+		t.Fatalf("leader pod = %v, want %s", got, leader.Name)
+	}
+
+	// If the leader on node-a is Terminating, it must fall back to
+	// standby (never to decoy1/decoy2 on node-a).
+	now := metav1.Now()
+	leader.DeletionTimestamp = &now
+	if got := chk.ciliumOperatorLeaderPod(ctx, logr.Discard(), pods); got != standby {
+		t.Fatalf("terminating leader fallback = %v, want %s", got, standby.Name)
+	}
+}
+
+func TestMeshIPAMExhaustedHostNetworkSkipsDecoyPods(t *testing.T) {
+	decoy := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ciliumOperatorNS, Name: "coredns-abc",
+			UID: types.UID("u-coredns"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: "coredns-rs", UID: types.UID("rs-coredns"),
+				Controller: &ctrue,
+			}},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	standby := ciliumOpPod(ciliumOperatorPrefix + "standby-111")
+	standby.Spec.NodeName = "node-b"
+	leader := ciliumOpPod(ciliumOperatorPrefix + "leader-222")
+	leader.Spec.NodeName = "node-a"
+	holder := "node-a-77aa88"
+	lease := ciliumOpLease(holder)
+
+	cs := fake.NewSimpleClientset(
+		ipamNode("node-a", 20*time.Minute, false),
+		probetest.ReadyWorkerNode("node-b", "", 0, false),
+		decoy, standby, leader, lease)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*meshControlPlaneCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatal("fresh CiliumIPAMExhausted must FAIL the check")
+	}
+	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).Get(ctx, decoy.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("decoy kube-system pod deleted: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).Get(ctx, standby.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("standby cilium-operator deleted: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods(ciliumOperatorNS).Get(ctx, leader.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("hostNetwork lease-holder cilium-operator was not deleted")
+	}
+}

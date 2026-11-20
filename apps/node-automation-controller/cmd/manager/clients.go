@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -120,6 +121,36 @@ func sharedBaseTransport(cfg *rest.Config) (http.RoundTripper, error) {
 	}), nil
 }
 
+// isolatedTransport builds a dedicated RoundTripper with an
+// independent TCP and HTTP/2 connection pool off cfg. When cfg already
+// carries a tuned *http.Transport (tuneClientConfig cleared
+// cfg.TLSClientConfig), we deep-clone tr.TLSClientConfig and construct
+// a fresh *http.Transport through utilnet.SetTransportDefaults instead
+// of calling tr.Clone() — Clone copies TLSNextProto["h2"] and would
+// still share the underlying *http2.Transport pool.
+func isolatedTransport(cfg *rest.Config) (http.RoundTripper, error) {
+	if cfg.Transport == nil {
+		return sharedBaseTransport(cfg)
+	}
+	tr, ok := cfg.Transport.(*http.Transport)
+	if !ok {
+		return cfg.Transport, nil
+	}
+	var tlsCfg *tls.Config
+	if tr.TLSClientConfig != nil {
+		tlsCfg = tr.TLSClientConfig.Clone()
+	}
+	return utilnet.SetTransportDefaults(&http.Transport{
+		Proxy:               tr.Proxy,
+		TLSHandshakeTimeout: tr.TLSHandshakeTimeout,
+		IdleConnTimeout:     tr.IdleConnTimeout,
+		TLSClientConfig:     tlsCfg,
+		MaxIdleConnsPerHost: tr.MaxIdleConnsPerHost,
+		DialContext:         tr.DialContext,
+		DisableCompression:  tr.DisableCompression,
+	}), nil
+}
+
 // kubeClients bundles the four API clients module Setup receives:
 // the shared-bucket direct pair every module reads through, and the
 // probe-bucket pair the Module.ProbeClients registry rows swap in.
@@ -195,6 +226,12 @@ func buildKubeClients(cfg *rest.Config) (*kubeClients, error) {
 	}
 
 	probeCfg := rest.CopyConfig(directCfg)
+	if ptr, err := isolatedTransport(probeCfg); err != nil {
+		return nil, fmt.Errorf("unable to build probe transport: %w", err)
+	} else if ptr != probeCfg.Transport {
+		probeCfg.Transport = ptr
+		probeCfg.TLSClientConfig = rest.TLSClientConfig{}
+	}
 	probeCfg.QPS = float32(envx.GetenvIntMin("NODE_AUTOMATION_PROBE_CLIENT_QPS", 20, 1))
 	probeCfg.Burst = envx.GetenvIntMin("NODE_AUTOMATION_PROBE_CLIENT_BURST", 40, 1)
 	probeCfg.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(

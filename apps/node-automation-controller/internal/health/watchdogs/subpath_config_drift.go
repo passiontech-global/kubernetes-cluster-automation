@@ -23,7 +23,7 @@
 // template carries a stateful data-store quorum label (a restart
 // there can breach quorum — same label set the PDB deadlock
 // watchdog uses), and workloads stamped
-// kube.AnnoSubPathReloadOptOut=="false". The heal itself rides the
+// kube.AnnoSubPathReloadOptOut=="true"|"1"|"yes". The heal itself rides the
 // persisted cooldown kube.AnnoLastSubPathReload (1h, wider-of
 // in-RAM+annotation) behind the maintenance mutex.
 package watchdogs

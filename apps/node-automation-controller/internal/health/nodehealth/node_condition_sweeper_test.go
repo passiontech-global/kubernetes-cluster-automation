@@ -5,9 +5,11 @@
 package nodehealth
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -403,8 +405,12 @@ func TestNodeCondSweeperClearsExpiredRemediation(t *testing.T) {
 		nodeCondRemediationSweepMaxAge+time.Minute)
 	cs := fake.NewSimpleClientset(n)
 	p := testProberDyn(cs, probetest.OpDyn())
-	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
-		t.Fatal("expired remediation condition did not fail the check")
+	before := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues("w-expired", nodecond.CondLocalRemediation))
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("expired remediation cleanup must not fail the check: %+v", res)
+	}
+	if delta := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues("w-expired", nodecond.CondLocalRemediation)) - before; delta != 1 {
+		t.Fatalf("sweeps_total delta = %v, want 1", delta)
 	}
 	got, err := cs.CoreV1().Nodes().Get(ctx, "w-expired", metav1.GetOptions{})
 	if err != nil {
@@ -473,5 +479,41 @@ func TestNodeCondSweeperRemediationGroupIsSeparate(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("LocalRemediationInProgress missing from the remediation sweep group")
+	}
+}
+
+func TestNodeCondSweeperMixedZombieAndExpiredRemediation(t *testing.T) {
+	n := probetest.ReadyWorkerNode("w-mixed", "KubeletPLEGUnhealthy",
+		nodeCondSweepHeartbeatMaxAge+time.Minute, false)
+	n.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeCondSweepHeartbeatMaxAge - time.Minute))
+	n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+		Type:               corev1.NodeConditionType(nodecond.CondLocalRemediation),
+		Status:             corev1.ConditionTrue,
+		Reason:             "L1SelfHeal",
+		LastHeartbeatTime:  metav1.NewTime(time.Now().Add(-nodeCondRemediationSweepMaxAge - time.Minute)),
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-nodeCondRemediationSweepMaxAge - time.Minute)),
+	})
+	cs := fake.NewSimpleClientset(n)
+	p := testProberDyn(cs, probetest.OpDyn())
+	res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatal("mixed zombie KubeletPLEGUnhealthy + expired remediation must FAIL")
+	}
+	if !strings.Contains(res.Why, "KubeletPLEGUnhealthy") {
+		t.Fatalf("res.Why missing zombie condition KubeletPLEGUnhealthy: %q", res.Why)
+	}
+	if strings.Contains(res.Why, nodecond.CondLocalRemediation) {
+		t.Fatalf("res.Why must not blame normal expired %s: %q", nodecond.CondLocalRemediation, res.Why)
+	}
+	got, err := cs.CoreV1().Nodes().Get(ctx, "w-mixed", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, condType := range []corev1.NodeConditionType{"KubeletPLEGUnhealthy", corev1.NodeConditionType(nodecond.CondLocalRemediation)} {
+		c := kube.NodeCondition(got, condType)
+		if c == nil || c.Status != corev1.ConditionFalse {
+			t.Fatalf("%s not cleared to False: %+v", condType, c)
+		}
 	}
 }

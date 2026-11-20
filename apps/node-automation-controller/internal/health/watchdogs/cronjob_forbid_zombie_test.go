@@ -18,6 +18,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
 // cjFixture builds a Forbid CronJob world: the CronJob plus Job/Pod/
@@ -336,5 +337,43 @@ func TestCronJobForbidZombieSkipsNonForbid(t *testing.T) {
 		if _, err := cs.BatchV1().Jobs("batch").Get(ctx, n, metav1.GetOptions{}); err != nil {
 			t.Fatalf("out-of-scope Job %s deleted: %v", n, err)
 		}
+	}
+}
+
+func TestCronJobForbidZombieSelfHealKeyspace(t *testing.T) {
+	now := time.Now()
+
+	// 1. Stalled Job delete uses SelfHealKey(CheckNameCronJobForbidZombie, ns/name).
+	cjJobTarget := forbidCJ("batch", "nightly", "nightly-1")
+	job := cjJob("batch", "nightly-1", 2*time.Hour, batchv1.JobFailed, cjJobTarget)
+	// 2. Ghost active ref clear uses SelfHealKey(CheckNameCronJobForbidZombie, ns/name+"/active-ref").
+	cjGhost := forbidCJ("batch", "ghost", "ghost-1")
+
+	cs, chk := cjFixture(t, now, false, cjJobTarget, job, cjGhost)
+	// Seed bare keys to prove no cross-collision / suppression from bare ns/name.
+	chk.Heals.Stamp("batch/nightly", now.Add(16*time.Minute))
+	chk.Heals.Stamp("batch/ghost/active-ref", now.Add(16*time.Minute))
+
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	probetest.FreezeNow(chk.Deps, now.Add(16*time.Minute))
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if res.Pass {
+		t.Fatalf("aged zombies must flag: %+v", res)
+	}
+	if _, err := cs.BatchV1().Jobs("batch").Get(ctx, "nightly-1", metav1.GetOptions{}); err == nil {
+		t.Fatal("stalled Job was suppressed by bare key")
+	}
+	liveGhost, err := cs.BatchV1().CronJobs("batch").Get(ctx, "ghost", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get ghost cronjob: %v", err)
+	}
+	if len(liveGhost.Status.Active) != 0 {
+		t.Fatalf("ghost active ref was suppressed by bare key: %+v", liveGhost.Status.Active)
+	}
+	if !chk.Heals.CooledDown(probefw.SelfHealKey(CheckNameCronJobForbidZombie, "batch/nightly"), time.Hour, now.Add(16*time.Minute)) {
+		t.Fatal("stalled Job heal not stamped under SelfHealKey")
+	}
+	if !chk.Heals.CooledDown(probefw.SelfHealKey(CheckNameCronJobForbidZombie, "batch/ghost/active-ref"), time.Hour, now.Add(16*time.Minute)) {
+		t.Fatal("ghost active-ref heal not stamped under SelfHealKey")
 	}
 }

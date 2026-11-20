@@ -745,5 +745,135 @@ func TestCiliumIdentityAuditorHighCardinalityWarn(t *testing.T) {
 	}
 }
 
+type paginatedIdentityDyn struct {
+	dynamic.Interface
+	page1     []unstructured.Unstructured
+	page2     []unstructured.Unstructured
+	failPage2 *bool
+	limits    *[]int64
+}
+
+func (p *paginatedIdentityDyn) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	base := p.Interface.Resource(gvr)
+	if gvr != ciliumIdentityGVR {
+		return base
+	}
+	return &paginatedIdentityRes{NamespaceableResourceInterface: base, parent: p}
+}
+
+type paginatedIdentityRes struct {
+	dynamic.NamespaceableResourceInterface
+	parent *paginatedIdentityDyn
+}
+
+func (r *paginatedIdentityRes) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	*r.parent.limits = append(*r.parent.limits, opts.Limit)
+	if opts.Continue == "p2" {
+		if *r.parent.failPage2 {
+			return nil, errors.New("page 2 error")
+		}
+		return &unstructured.UnstructuredList{Items: append([]unstructured.Unstructured(nil), r.parent.page2...)}, nil
+	}
+	out := &unstructured.UnstructuredList{Items: append([]unstructured.Unstructured(nil), r.parent.page1...)}
+	out.SetContinue("p2")
+	return out, nil
+}
+
+func TestCiliumIdentityAuditorPaginatedListEach(t *testing.T) {
+	metrics.CiliumActiveIdentities.Set(0)
+	clock := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	old := clock.Add(-2 * time.Hour)
+
+	id100 := ciliumIdentityAged("100", old) // reserved <= 255
+	id1000 := ciliumIdentityAged("1000", old)
+	id1000.SetUID("uid-1000")
+	id1001 := ciliumIdentityAged("1001", old)
+	id1001.SetUID("uid-1001")
+	id1002 := ciliumIdentityAged("1002", old)
+	id1002.SetUID("uid-1002")
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "app",
+			Name:        "web-0",
+			Annotations: map[string]string{ciliumIDAnnotation: "1000"},
+		},
+	}
+	cs := fake.NewSimpleClientset(pod, testutil.Node("n1", corev1.ConditionTrue, nil))
+
+	baseDyn := testutil.NewDynamicClient(id100, id1000, id1001, id1002)
+	deleted := map[string]types.UID{}
+	baseDyn.PrependReactor("delete", "ciliumidentities", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		da := action.(clienttesting.DeleteAction)
+		opts := da.GetDeleteOptions()
+		if opts.Preconditions == nil || opts.Preconditions.UID == nil {
+			t.Errorf("delete %s missing UID precondition", da.GetName())
+		} else {
+			deleted[da.GetName()] = *opts.Preconditions.UID
+		}
+		return false, nil, nil
+	})
+
+	var failPage2 bool
+	var limits []int64
+	dyn := &paginatedIdentityDyn{
+		Interface: baseDyn,
+		page1:     []unstructured.Unstructured{*id100, *id1000, *id1001},
+		page2:     []unstructured.Unstructured{*id1002},
+		failPage2: &failPage2,
+		limits:    &limits,
+	}
+
+	a := &ciliumIdentityAuditor{
+		queue:     "cilium-identity-auditor",
+		cs:        cs,
+		dyn:       dyn,
+		gcEnabled: true,
+		now:       func() time.Time { return clock },
+	}
+
+	// Sweep 1: both pages streamed -> gauge == 4, orphans 1001 & 1002 observed.
+	if err := a.run(ctx); err != nil {
+		t.Fatalf("sweep 1: %v", err)
+	}
+	if len(limits) != 2 || limits[0] != kube.DefaultListPageSize || limits[1] != kube.DefaultListPageSize {
+		t.Fatalf("expected 2 paginated lists with limit %d, got %v", kube.DefaultListPageSize, limits)
+	}
+	if got := promtestutil.ToFloat64(metrics.CiliumActiveIdentities); got != 4 {
+		t.Fatalf("active identities gauge = %v, want 4", got)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("sweep 1 deleted %v, want 0 (grace period)", deleted)
+	}
+
+	// Page-2 failure: run errors, gauge stays 4 (not partial 3), no GC.
+	failPage2 = true
+	clock = clock.Add(20 * time.Minute)
+	if err := a.run(ctx); err == nil {
+		t.Fatal("expected page-2 error")
+	}
+	if got := promtestutil.ToFloat64(metrics.CiliumActiveIdentities); got != 4 {
+		t.Fatalf("after page-2 error gauge = %v, want 4", got)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("after page-2 error deleted %v, want 0", deleted)
+	}
+
+	// Sweep 2 succeeds after grace period -> orphans 1001 and 1002 across pages are GC'd with UID precondition.
+	failPage2 = false
+	if err := a.run(ctx); err != nil {
+		t.Fatalf("sweep 2: %v", err)
+	}
+	if deleted["1001"] != "uid-1001" || deleted["1002"] != "uid-1002" {
+		t.Fatalf("expected 1001 and 1002 GC'd with UIDs, got %v", deleted)
+	}
+	if _, ok := deleted["100"]; ok {
+		t.Fatal("reserved identity 100 must not be deleted")
+	}
+	if _, ok := deleted["1000"]; ok {
+		t.Fatal("used identity 1000 must not be deleted")
+	}
+}
+
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()

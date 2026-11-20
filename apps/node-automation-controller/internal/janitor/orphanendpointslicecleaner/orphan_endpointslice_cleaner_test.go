@@ -14,7 +14,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	typeddiscoveryv1 "k8s.io/client-go/kubernetes/typed/discovery/v1"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -476,6 +479,104 @@ func TestOrphanEndpointSliceConfirmErrorFailsClosed(t *testing.T) {
 	if got := c.absentStreak.Count(oescStreakKey(slice)); got != orphanEndpointSliceStreak {
 		t.Fatalf("streak not retained after failed confirm: %d, want %d",
 			got, orphanEndpointSliceStreak)
+	}
+}
+
+type oescRecordingCS struct {
+	kubernetes.Interface
+	svcListOpts   []metav1.ListOptions
+	sliceListOpts []metav1.ListOptions
+	svcGetOpts    []metav1.GetOptions
+}
+
+type oescRecordingCoreV1 struct {
+	typedcorev1.CoreV1Interface
+	parent *oescRecordingCS
+}
+
+type oescRecordingServices struct {
+	typedcorev1.ServiceInterface
+	parent *oescRecordingCS
+}
+
+type oescRecordingDiscoveryV1 struct {
+	typeddiscoveryv1.DiscoveryV1Interface
+	parent *oescRecordingCS
+}
+
+type oescRecordingSlices struct {
+	typeddiscoveryv1.EndpointSliceInterface
+	parent *oescRecordingCS
+}
+
+func (c *oescRecordingCS) CoreV1() typedcorev1.CoreV1Interface {
+	return &oescRecordingCoreV1{CoreV1Interface: c.Interface.CoreV1(), parent: c}
+}
+
+func (c *oescRecordingCS) DiscoveryV1() typeddiscoveryv1.DiscoveryV1Interface {
+	return &oescRecordingDiscoveryV1{DiscoveryV1Interface: c.Interface.DiscoveryV1(), parent: c}
+}
+
+func (c *oescRecordingCoreV1) Services(ns string) typedcorev1.ServiceInterface {
+	return &oescRecordingServices{ServiceInterface: c.CoreV1Interface.Services(ns), parent: c.parent}
+}
+
+func (s *oescRecordingServices) List(ctx context.Context, opts metav1.ListOptions) (*corev1.ServiceList, error) {
+	s.parent.svcListOpts = append(s.parent.svcListOpts, opts)
+	return s.ServiceInterface.List(ctx, opts)
+}
+
+func (s *oescRecordingServices) Get(ctx context.Context, name string, opts metav1.GetOptions) (*corev1.Service, error) {
+	s.parent.svcGetOpts = append(s.parent.svcGetOpts, opts)
+	return s.ServiceInterface.Get(ctx, name, opts)
+}
+
+func (d *oescRecordingDiscoveryV1) EndpointSlices(ns string) typeddiscoveryv1.EndpointSliceInterface {
+	return &oescRecordingSlices{EndpointSliceInterface: d.DiscoveryV1Interface.EndpointSlices(ns), parent: d.parent}
+}
+
+func (s *oescRecordingSlices) List(ctx context.Context, opts metav1.ListOptions) (*discoveryv1.EndpointSliceList, error) {
+	s.parent.sliceListOpts = append(s.parent.sliceListOpts, opts)
+	return s.EndpointSliceInterface.List(ctx, opts)
+}
+
+// Both census LISTs (Services and EndpointSlices) read from the watch cache
+// (ResourceVersion="0", Limit=0 via pageOpts), while Confirm still issues a
+// live quorum Services.Get (ResourceVersion="").
+func TestOrphanEndpointSliceResourceVersionZeroAndLiveConfirm(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.OrphanEndpointSlicesCleanedTotal, "apps")
+	fakeCS := fake.NewSimpleClientset(
+		oescService("default", "kubernetes"),
+		oescSlice("apps", "gone-abc", "gone", 30*time.Minute))
+	rec := &oescRecordingCS{Interface: fakeCS}
+	c := &orphanEndpointSliceCleaner{cs: rec, now: time.Now}
+
+	for range 2 {
+		if err := c.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(rec.svcListOpts) != 2 || len(rec.sliceListOpts) != 2 {
+		t.Fatalf("list counts = (services=%d, slices=%d), want (2, 2)",
+			len(rec.svcListOpts), len(rec.sliceListOpts))
+	}
+	for i, opts := range rec.svcListOpts {
+		if opts.ResourceVersion != "0" || opts.Limit != 0 {
+			t.Fatalf("service list %d = (RV=%q, Limit=%d), want (\"0\", 0)",
+				i, opts.ResourceVersion, opts.Limit)
+		}
+	}
+	for i, opts := range rec.sliceListOpts {
+		if opts.ResourceVersion != "0" || opts.Limit != 0 || opts.LabelSelector != discoveryv1.LabelServiceName {
+			t.Fatalf("endpointslice list %d = (RV=%q, Limit=%d, Label=%q), want (\"0\", 0, %q)",
+				i, opts.ResourceVersion, opts.Limit, opts.LabelSelector, discoveryv1.LabelServiceName)
+		}
+	}
+	if len(rec.svcGetOpts) != 1 || rec.svcGetOpts[0].ResourceVersion != "" {
+		t.Fatalf("confirm Service.Get opts = %+v, want 1 live Get with RV=\"\"", rec.svcGetOpts)
+	}
+	if oescSliceExists(t, fakeCS, "apps", "gone-abc") {
+		t.Fatal("orphan slice not reaped")
 	}
 }
 

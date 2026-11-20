@@ -281,10 +281,13 @@ func TestTimeoutClampUsesOwnFluxGateKey(t *testing.T) {
 		CS: cs, Now: func() time.Time { return now },
 		TimeoutClampEnabled: true, MaxWebhookTimeoutSeconds: 10,
 	}
-	// Burn two of the three allowed stamps on the circuit breaker's
-	// key. The clamp's third call must NOT be denied by that history.
-	heal.FluxPatchGate(guardstate.KindValidating, vwc, guardstate.KindValidating+"/flux-vwc", now)
-	heal.FluxPatchGate(guardstate.KindValidating, vwc, guardstate.KindValidating+"/flux-vwc", now)
+	// Burn two of the three allowed stamps on sibling duties' keys
+	// (including bare legacy key). The clamp's call must NOT be denied.
+	for _, prefix := range []string{"", "circuit_sweep/", "criticalns/", "orphansweep/"} {
+		key := prefix + guardstate.KindValidating + "/flux-vwc"
+		heal.FluxPatchGate(guardstate.KindValidating, vwc, key, now)
+		heal.FluxPatchGate(guardstate.KindValidating, vwc, key, now)
+	}
 	var s Sweeper
 	if err := s.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
 		t.Fatalf("Sweep: %v", err)

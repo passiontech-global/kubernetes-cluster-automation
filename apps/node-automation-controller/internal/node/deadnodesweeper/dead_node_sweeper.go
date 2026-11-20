@@ -43,7 +43,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
-	nodeByName, nodeNames, hasNotReady, untainted :=
+	nodeByName, nodeNames, notReadyNodes, untainted :=
 		s.reconcileRecoveredNodes(ctx, nodes)
 
 	// Carry-forward: a without-SNR fence counter series stays alive
@@ -58,11 +58,11 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	}
 
 	// Every node Ready = nothing can be fenced this cycle, so skip
-	// the cluster-wide pod list entirely: it is by far the biggest
-	// read this module makes (every pod in the cluster, deserialized)
-	// and the all-Ready happy path never consumes it. A stuck pod on
-	// a since-deleted node could only produce a skip-log anyway.
-	if !hasNotReady {
+	// the pod census entirely: it is by far the biggest read this
+	// module makes and the all-Ready happy path never consumes it.
+	// A stuck pod on a since-deleted node could only produce a
+	// skip-log anyway.
+	if len(notReadyNodes) == 0 {
 		log.Info("sweep done — all nodes Ready", "untainted", untainted)
 		s.statefulSkipEmitted.Prune(metrics.DeadNodeUnfencedStatefulSkipped.DeleteLabelValues)
 		s.fencedWithoutSNREmitted.Prune(metrics.DeadNodeFencedWithoutSNRTotal.DeleteLabelValues)
@@ -73,7 +73,7 @@ func (s *deadNodeSweeper) run(ctx context.Context) error {
 	// against a drifting wall clock inside a thousands-pod page loop
 	// could straddle the threshold mid-pass.
 	now := s.now.Now()
-	stuck, names, err := s.stuckTerminatingCensus(ctx, now)
+	stuck, names, err := s.stuckTerminatingCensus(ctx, notReadyNodes, now)
 	if err != nil {
 		return fmt.Errorf("list pods: %w", err)
 	}

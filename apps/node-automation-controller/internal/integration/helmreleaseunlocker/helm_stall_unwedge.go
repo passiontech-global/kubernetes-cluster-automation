@@ -170,7 +170,7 @@ func hrCondition(o *unstructured.Unstructured, condType string) (status, reason,
 // many HRs were actually unwedged.
 func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 	gvr schema.GroupVersionResource, stalled map[string]*unstructured.Unstructured,
-	due []string, now time.Time) int {
+	due []string, now time.Time, jobCache *hookJobCache) int {
 	log := logf.FromContext(ctx)
 	unwedged := 0
 	for _, key := range due {
@@ -258,7 +258,7 @@ func (u *helmReleaseUnlocker) unwedgeDue(ctx context.Context,
 		case !proceed:
 			continue
 		}
-		acted, err := u.unwedgeAct(ctx, gvr, hr, dep, plan)
+		acted, err := u.unwedgeAct(ctx, gvr, hr, dep, plan, jobCache)
 		if err == nil {
 			att.count++
 			att.last = now
@@ -328,7 +328,7 @@ func (u *helmReleaseUnlocker) unwedgeAnalyze(ctx context.Context,
 // RefundGrant pairing honest if a future early-exit lands here.
 func (u *helmReleaseUnlocker) unwedgeAct(ctx context.Context,
 	gvr schema.GroupVersionResource, hr *unstructured.Unstructured,
-	dep *appsv1.Deployment, plan *stallPlan) (bool, error) {
+	dep *appsv1.Deployment, plan *stallPlan, jobCache *hookJobCache) (bool, error) {
 	log := logf.FromContext(ctx)
 	key := hr.GetNamespace() + "/" + hr.GetName()
 
@@ -362,7 +362,7 @@ func (u *helmReleaseUnlocker) unwedgeAct(ctx context.Context,
 	// hook while its Job object still exists, so the retry would
 	// wedge identically. Reap it BEFORE the requestedAt cycle; the
 	// sweep is best-effort and cannot undo the window we just opened.
-	u.cleanFailedHookJobs(ctx, hrReleaseNS(hr), hrReleaseName(hr))
+	u.cleanFailedHookJobs(ctx, jobCache, hrReleaseNS(hr), hrReleaseName(hr))
 
 	// Then poke the HR: requestedAt is the reconcile-now hint,
 	// resetAt (same token — required pairing) zeroes the failure
@@ -388,7 +388,7 @@ func (u *helmReleaseUnlocker) unwedgeAct(ctx context.Context,
 		// cooldown for an unwedge that did not happen. Reap the
 		// failed hook Jobs once more on the way out so a partial
 		// earlier pass cannot leave the wedge in place.
-		u.cleanFailedHookJobs(ctx, hrReleaseNS(hr), hrReleaseName(hr))
+		u.cleanFailedHookJobs(ctx, jobCache, hrReleaseNS(hr), hrReleaseName(hr))
 		return false, fmt.Errorf("annotate helmrelease %s: %w", key, err)
 	}
 	// The HR patch landed — NOW the 24h cooldown may stamp (RAM +

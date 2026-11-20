@@ -14,11 +14,17 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	ktesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
 
 // ctxCaptureCS wraps a fake clientset so tests can see WHICH context
@@ -306,5 +312,94 @@ func TestInvalidateLeasesDropsMemoAndIndex(t *testing.T) {
 	}
 	if leaseLists != 2 {
 		t.Fatalf("lease LISTs=%d after InvalidateLeases, want 2", leaseLists)
+	}
+}
+
+type blockListDyn struct {
+	dynamic.Interface
+	blockGVR schema.GroupVersionResource
+	started  chan struct{}
+	release  chan struct{}
+}
+
+func (b *blockListDyn) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	res := b.Interface.Resource(gvr)
+	if gvr != b.blockGVR {
+		return res
+	}
+	return &blockListRes{NamespaceableResourceInterface: res, b: b}
+}
+
+type blockListRes struct {
+	dynamic.NamespaceableResourceInterface
+	b *blockListDyn
+}
+
+func (r *blockListRes) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	close(r.b.started)
+	<-r.b.release
+	return r.NamespaceableResourceInterface.List(ctx, opts)
+}
+
+// resetUnstructs must release s.muUnstructs before calling m.reset()
+// on each per-GVR memo so an in-flight slow LIST on gvrA does not
+// block AllUnstructured(gvrB) after InvalidateUnstructured.
+func TestResetUnstructsDoesNotBlockOtherGVRs(t *testing.T) {
+	gvrA := kube.AutopilotPlanGVR
+	gvrB := kube.GVRSelfNodeRemediation
+
+	aStarted := make(chan struct{})
+	aRelease := make(chan struct{})
+	dyn := &blockListDyn{
+		Interface: testhelp.NewDynamicClient(),
+		blockGVR:  gvrA,
+		started:   aStarted,
+		release:   aRelease,
+	}
+
+	d := &Deps{CS: fake.NewSimpleClientset(), Dyn: dyn}
+	sweepCtx := WithSweepSnapshot(t.Context(), d)
+
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := d.AllUnstructured(sweepCtx, gvrA)
+		aDone <- err
+	}()
+	<-aStarted
+
+	// InvalidateUnstructured runs concurrently with the blocked gvrA LIST.
+	invDone := make(chan struct{})
+	go func() {
+		d.InvalidateUnstructured(sweepCtx)
+		close(invDone)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// AllUnstructured(gvrB) must acquire s.muUnstructs immediately without
+	// waiting for gvrA's blocked m.reset().
+	bDone := make(chan error, 1)
+	go func() {
+		_, err := d.AllUnstructured(sweepCtx, gvrB)
+		bDone <- err
+	}()
+
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatalf("AllUnstructured(gvrB) err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(aRelease)
+		t.Fatal("AllUnstructured(gvrB) blocked while resetUnstructs waited on gvrA")
+	}
+
+	close(aRelease)
+	if err := <-aDone; err != nil {
+		t.Fatalf("AllUnstructured(gvrA) err = %v", err)
+	}
+	select {
+	case <-invDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("InvalidateUnstructured did not finish after gvrA released")
 	}
 }

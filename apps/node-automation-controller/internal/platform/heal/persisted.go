@@ -151,13 +151,15 @@ func AllowedVPersisted(ctx context.Context, log logr.Logger,
 // and persist their cooldown on the pod/object itself: the wider-of
 // in-RAM+annotation window runs first, then the node-scoped
 // maintenance Scope and the heal budget. A nil obj/empty annoKey
-// collapses to plain AllowedOnNode.
+// collapses to plain AllowedOnNode with the in-RAM heals ledger.
 func AllowedOnNodePersisted(ctx context.Context, log logr.Logger,
 	v *maintenance.Verdict, cs kubernetes.Interface, dyn dynamic.Interface,
 	heals *state.CooldownSet, obj metav1.Object, annoKey, key, nodeName string,
 	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
-	if obj != nil && annoKey != "" &&
-		PersistedCooledDown(ctx, heals, obj, annoKey, key, cooldown, now) {
+	if obj == nil || annoKey == "" {
+		return AllowedOnNode(ctx, log, v, cs, dyn, heals, key, nodeName, cooldown, now)
+	}
+	if PersistedCooledDown(ctx, heals, obj, annoKey, key, cooldown, now) {
 		log.Info("skip heal: persisted stamp inside cooldown", "target", key)
 		return false, false
 	}
@@ -169,13 +171,20 @@ func AllowedOnNodePersisted(ctx context.Context, log logr.Logger,
 // nudges that stamp their own cooldown on the target object. The
 // wider-of window runs first, then the cluster-wide-only maintenance
 // Scope; node-scoped holds and the heal budget never apply (the
-// nudge writes metadata, not pods).
+// nudge writes metadata, not pods). A nil obj/empty annoKey
+// collapses to the in-RAM heals ledger followed by AllowedUpgradeOnly.
 func AllowedUpgradeOnlyPersisted(ctx context.Context, log logr.Logger,
 	v *maintenance.Verdict, cs kubernetes.Interface, dyn dynamic.Interface,
 	heals *state.CooldownSet, obj metav1.Object, annoKey, key string,
 	cooldown time.Duration, now time.Time) (proceed, unverifiable bool) {
-	if obj != nil && annoKey != "" &&
-		PersistedCooledDown(ctx, heals, obj, annoKey, key, cooldown, now) {
+	if obj == nil || annoKey == "" {
+		if heals != nil && heals.CooledDown(key, cooldown, now) {
+			log.Info("skip heal: inside cooldown", "target", key)
+			return false, false
+		}
+		return AllowedUpgradeOnly(ctx, log, v, cs, dyn, key, now)
+	}
+	if PersistedCooledDown(ctx, heals, obj, annoKey, key, cooldown, now) {
 		log.Info("skip heal: persisted stamp inside cooldown", "target", key)
 		return false, false
 	}

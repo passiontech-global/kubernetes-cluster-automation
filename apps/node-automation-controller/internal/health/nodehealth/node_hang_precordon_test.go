@@ -21,6 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // node-hang-precordon — a hung worker gets spec.unschedulable patched; an already-
@@ -93,6 +94,7 @@ func TestCheckNodeHangPreCordonStampsAnnotation(t *testing.T) {
 // A stamped cordon lifts itself once every latch cleared — the
 // transient-recovery / post-SNR-reboot shape.
 func TestCheckNodeHangAutoUncordon(t *testing.T) {
+	testutil.CleanupMetric(t, nodeHangUncordonsTotal, "w-recover")
 	cs := fake.NewSimpleClientset(
 		precordonedWorkerNode("w-recover", true),
 		probetest.ReadyWorkerNode("w-ok", "", 0, false))
@@ -934,4 +936,149 @@ func TestCheckNodeHangWaveConditions(t *testing.T) {
 		}
 		testutil.CleanupMetric(t, nodeHangCordonsTotal, name)
 	}
+}
+
+func TestCheckNodeHangYieldsToActiveLocalRemediation(t *testing.T) {
+	now := time.Now()
+	hungNode := func(name string) *corev1.Node {
+		n := probetest.ReadyWorkerNode(name, "KernelHungTasks", 5*time.Minute, false)
+		// Anchor conditions to `now` so FreezeNow clock advances match cleanly.
+		for i := range n.Status.Conditions {
+			if n.Status.Conditions[i].Type == "KernelHungTasks" {
+				n.Status.Conditions[i].LastTransitionTime = metav1.NewTime(now.Add(-5 * time.Minute))
+				n.Status.Conditions[i].LastHeartbeatTime = metav1.NewTime(now)
+			}
+		}
+		return n
+	}
+
+	t.Run("active LocalRemediationInProgress condition defers cordon", func(t *testing.T) {
+		n := hungNode("w-l1-cond")
+		n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+			Type:               corev1.NodeConditionType(nodecond.CondLocalRemediation),
+			Status:             corev1.ConditionTrue,
+			LastHeartbeatTime:  metav1.NewTime(now.Add(-time.Minute)),
+			LastTransitionTime: metav1.NewTime(now.Add(-time.Minute)),
+		})
+		cs := fake.NewSimpleClientset(n, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+		p := testProberDyn(cs, probetest.OpDyn())
+		probetest.FreezeNow(p.Deps, now)
+		before := ptestutil.ToFloat64(nodeHangCordonsTotal.WithLabelValues("w-l1-cond"))
+
+		res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+		if res.Pass {
+			t.Fatal("sustained hang latch must still report finding while yielding to L1")
+		}
+		got, _ := cs.CoreV1().Nodes().Get(ctx, "w-l1-cond", metav1.GetOptions{})
+		if got.Spec.Unschedulable {
+			t.Fatal("node cordoned while L1 LocalRemediationInProgress lease is active")
+		}
+		if _, ok := got.Annotations[nodeHangPreCordonAnno]; ok {
+			t.Fatal("pre-cordon stamp written while yielding to L1")
+		}
+		if delta := ptestutil.ToFloat64(nodeHangCordonsTotal.WithLabelValues("w-l1-cond")) - before; delta != 0 {
+			t.Fatalf("cordons_total delta = %v, want 0", delta)
+		}
+	})
+
+	t.Run("expired LocalRemediationInProgress condition cordons normally", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			cond corev1.NodeCondition
+		}{
+			{"hb >= 3m", corev1.NodeCondition{
+				Type:               corev1.NodeConditionType(nodecond.CondLocalRemediation),
+				Status:             corev1.ConditionTrue,
+				LastHeartbeatTime:  metav1.NewTime(now.Add(-nodeHangLocalRemediationLease)),
+				LastTransitionTime: metav1.NewTime(now.Add(-nodeHangLocalRemediationLease)),
+			}},
+			{"status false", corev1.NodeCondition{
+				Type:               corev1.NodeConditionType(nodecond.CondLocalRemediation),
+				Status:             corev1.ConditionFalse,
+				LastHeartbeatTime:  metav1.NewTime(now.Add(-time.Minute)),
+				LastTransitionTime: metav1.NewTime(now.Add(-time.Minute)),
+			}},
+			{"zero hb", corev1.NodeCondition{
+				Type:               corev1.NodeConditionType(nodecond.CondLocalRemediation),
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: metav1.NewTime(now.Add(-time.Minute)),
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				n := hungNode("w-l1-exp")
+				n.Status.Conditions = append(n.Status.Conditions, tc.cond)
+				cs := fake.NewSimpleClientset(n, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+				p := testProberDyn(cs, probetest.OpDyn())
+				probetest.FreezeNow(p.Deps, now)
+				testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-l1-exp")
+
+				res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+				if res.Pass {
+					t.Fatal("sustained hang latch must fail")
+				}
+				got, _ := cs.CoreV1().Nodes().Get(ctx, "w-l1-exp", metav1.GetOptions{})
+				if !got.Spec.Unschedulable || got.Annotations[nodeHangPreCordonAnno] != nodeHangPreCordonValue {
+					t.Fatal("expired/inactive L1 remediation must fall through to precordon")
+				}
+			})
+		}
+	})
+
+	t.Run("AnnoLocalRemediationUntil active defers and expired cordons", func(t *testing.T) {
+		nActive := hungNode("w-anno-active")
+		nActive.Annotations = map[string]string{
+			nodecond.AnnoLocalRemediationUntil: now.Add(2 * time.Minute).UTC().Format(time.RFC3339),
+		}
+		nExpired := hungNode("w-anno-expired")
+		nExpired.Annotations = map[string]string{
+			nodecond.AnnoLocalRemediationUntil: now.Add(-time.Second).UTC().Format(time.RFC3339),
+		}
+		cs := fake.NewSimpleClientset(
+			nActive, nExpired,
+			probetest.ReadyWorkerNode("w-ok1", "", 0, false),
+			probetest.ReadyWorkerNode("w-ok2", "", 0, false),
+			probetest.ReadyWorkerNode("w-ok3", "", 0, false),
+		)
+		p := testProberDyn(cs, probetest.OpDyn())
+		probetest.FreezeNow(p.Deps, now)
+		testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-anno-expired")
+
+		_ = probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+		gotActive, _ := cs.CoreV1().Nodes().Get(ctx, "w-anno-active", metav1.GetOptions{})
+		if gotActive.Spec.Unschedulable {
+			t.Fatal("node with active AnnoLocalRemediationUntil was cordoned")
+		}
+		gotExp, _ := cs.CoreV1().Nodes().Get(ctx, "w-anno-expired", metav1.GetOptions{})
+		if !gotExp.Spec.Unschedulable || gotExp.Annotations[nodeHangPreCordonAnno] != nodeHangPreCordonValue {
+			t.Fatal("node with expired AnnoLocalRemediationUntil was not cordoned")
+		}
+	})
+
+	t.Run("yielding node does not consume 35% cap", func(t *testing.T) {
+		// 3 workers total, 0 cordoned: max(1, floor(0.35*3)) = 1 cordon allowed.
+		// w-a yields to L1 (alphabetically first); w-b must still be cordoned!
+		nA := hungNode("w-a")
+		nA.Status.Conditions = append(nA.Status.Conditions, corev1.NodeCondition{
+			Type:               corev1.NodeConditionType(nodecond.CondLocalRemediation),
+			Status:             corev1.ConditionTrue,
+			LastHeartbeatTime:  metav1.NewTime(now.Add(-time.Minute)),
+			LastTransitionTime: metav1.NewTime(now.Add(-time.Minute)),
+		})
+		nB := hungNode("w-b")
+		nC := probetest.ReadyWorkerNode("w-c", "", 0, false)
+		cs := fake.NewSimpleClientset(nA, nB, nC)
+		p := testProberDyn(cs, probetest.OpDyn())
+		probetest.FreezeNow(p.Deps, now)
+		testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-b")
+
+		_ = probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+		gotA, _ := cs.CoreV1().Nodes().Get(ctx, "w-a", metav1.GetOptions{})
+		gotB, _ := cs.CoreV1().Nodes().Get(ctx, "w-b", metav1.GetOptions{})
+		if gotA.Spec.Unschedulable {
+			t.Fatal("yielding node w-a was cordoned")
+		}
+		if !gotB.Spec.Unschedulable {
+			t.Fatal("node w-b was blocked from cordoning — yielding node must not consume cap")
+		}
+	})
 }

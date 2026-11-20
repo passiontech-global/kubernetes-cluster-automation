@@ -15,7 +15,7 @@ package cilium
 import (
 	"context"
 	"fmt"
-	"strings"
+	"regexp"
 
 	"github.com/prometheus/client_golang/prometheus"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -64,6 +64,11 @@ var ciliumDatapathQueries = []struct {
 }
 
 var (
+	// natCTReasonRe enforces word-boundary matching so unrelated
+	// substrings ("select", "packet", "rejected", "sctp", "direction")
+	// never trigger nat_ct_map_exhaustion.
+	natCTReasonRe = regexp.MustCompile(`(?i)\b(nat|snat|ct|conntrack)\b`)
+
 	// cilium-datapath-map-guard — 1 while a datapath-degraded
 	// signature is live, by reason.
 	ciliumDatapathDegradedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -111,10 +116,11 @@ func (p *ciliumDatapathMapCheck) Run(ctx context.Context) probefw.Result {
 	// client-side with the same matchers its old standalone query
 	// carried. invalid_identity_drops totals the two exact reasons
 	// cluster-wide (>1); nat_ct_map_exhaustion flags any
-	// (node,reason) row whose reason contains nat/ct case-
-	// insensitively (>1) — identical verdicts, half the round-trips.
+	// (node,reason) row whose reason matches word-bounded
+	// nat/snat/ct/conntrack case-insensitively (>1) — identical
+	// verdicts, half the round-trips.
 	dropSeries, dropErr := p.PromQuery(ctx,
-		`sum by (node, reason) (rate(cilium_drop_count_total{reason=~"Invalid identity|Unknown L3 target address|(?i).*(nat|ct).*"}[5m]))`)
+		`sum by (node, reason) (rate(cilium_drop_count_total{reason=~"Invalid identity|Unknown L3 target address|(?i).*\\b(nat|snat|ct|conntrack)\\b.*"}[5m]))`)
 	if dropErr != nil {
 		for _, reason := range []string{"invalid_identity_drops", "nat_ct_map_exhaustion"} {
 			log.Info("WARN: cilium datapath query failed — signature inconclusive",
@@ -129,11 +135,9 @@ func (p *ciliumDatapathMapCheck) Run(ctx context.Context) probefw.Result {
 		natBreached := false
 		for _, s := range dropSeries {
 			reason := s.Label("reason")
-			lower := strings.ToLower(reason)
 			isIdentity := reason == "Invalid identity" ||
 				reason == "Unknown L3 target address"
-			isNatCT := strings.Contains(lower, "nat") ||
-				strings.Contains(lower, "ct")
+			isNatCT := natCTReasonRe.MatchString(reason)
 			if isIdentity {
 				identityTotal += s.Value
 			}

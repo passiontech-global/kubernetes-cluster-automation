@@ -1,6 +1,7 @@
 package externalsecretnudge
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -17,8 +18,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
 	kfake "k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -1237,5 +1241,198 @@ func TestHealConnectPodNoCandidateSpendsNoBudget(t *testing.T) {
 	if !proceed || unverifiable {
 		t.Fatalf("healConnectPod with 0 connect pods spent a budget token: Gate = (%v,%v)",
 			proceed, unverifiable)
+	}
+}
+
+func TestConnectHealSinglePodListPerSweep(t *testing.T) {
+	now := time.Now()
+	older := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         esConnectNamespaces[0],
+			Name:              "onepassword-connect-old",
+			UID:               "uid-old",
+			CreationTimestamp: metav1.NewTime(now.Add(-2 * time.Hour)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	newer := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         esConnectNamespaces[1],
+			Name:              "onepassword-connect-new",
+			UID:               "uid-new",
+			CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	t.Run("storeDown fallback to oldest pod issues 1 Pod LIST per namespace", func(t *testing.T) {
+		cs := kfake.NewSimpleClientset(older, newer)
+		var podLists int
+		cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+			podLists++
+			return false, nil, nil
+		})
+		dyn := esNudgeDynFake(cssObj("store", "False"))
+		n := &externalSecretNudge{
+			queue:      "externalsecret-nudge",
+			cs:         cs,
+			dyn:        dyn,
+			storeReady: map[string]bool{},
+		}
+		n.storeDownSince.Seed("ClusterSecretStore//store", now.Add(-20*time.Minute))
+
+		if err := n.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if podLists != len(esConnectNamespaces) {
+			t.Fatalf("pod LIST calls = %d, want %d (no duplicate oldestConnectPod list)", podLists, len(esConnectNamespaces))
+		}
+		if _, err := cs.CoreV1().Pods(esConnectNamespaces[0]).Get(ctx, "onepassword-connect-old", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected oldest connect pod deleted, get err=%v", err)
+		}
+	})
+
+	t.Run("failing namespace list while storeDown=true counts only 1 IncError", func(t *testing.T) {
+		cs := kfake.NewSimpleClientset(newer)
+		cs.PrependReactor("list", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
+			if action.GetNamespace() == esConnectNamespaces[0] {
+				return true, nil, errors.New("apiserver error")
+			}
+			return false, nil, nil
+		})
+		dyn := esNudgeDynFake(cssObj("store", "False"))
+		n := &externalSecretNudge{
+			queue:      "externalsecret-nudge-single-err",
+			cs:         cs,
+			dyn:        dyn,
+			storeReady: map[string]bool{},
+		}
+		n.storeDownSince.Seed("ClusterSecretStore//store", now.Add(-20*time.Minute))
+		before := testutil.QueueErrorCount(t, n.queue)
+		if err := n.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if delta := testutil.QueueErrorCount(t, n.queue) - before; delta != 1 {
+			t.Fatalf("IncError delta = %v, want 1 (must not double-count)", delta)
+		}
+	})
+}
+
+type esListOptRecord struct {
+	resource string
+	rv       string
+	limit    int64
+}
+
+type esRecordingDyn struct {
+	dynamic.Interface
+	records *[]esListOptRecord
+}
+
+func (d *esRecordingDyn) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &esRecordingDynRes{NamespaceableResourceInterface: d.Interface.Resource(gvr), res: gvr.Resource, records: d.records}
+}
+
+type esRecordingDynRes struct {
+	dynamic.NamespaceableResourceInterface
+	res     string
+	records *[]esListOptRecord
+}
+
+func (r *esRecordingDynRes) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	*r.records = append(*r.records, esListOptRecord{resource: r.res, rv: opts.ResourceVersion, limit: opts.Limit})
+	return r.NamespaceableResourceInterface.List(ctx, opts)
+}
+
+func (r *esRecordingDynRes) Namespace(ns string) dynamic.ResourceInterface {
+	return &esRecordingDynNSRes{ResourceInterface: r.NamespaceableResourceInterface.Namespace(ns), res: r.res, records: r.records}
+}
+
+type esRecordingDynNSRes struct {
+	dynamic.ResourceInterface
+	res     string
+	records *[]esListOptRecord
+}
+
+func (r *esRecordingDynNSRes) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	*r.records = append(*r.records, esListOptRecord{resource: r.res, rv: opts.ResourceVersion, limit: opts.Limit})
+	return r.ResourceInterface.List(ctx, opts)
+}
+
+type esRecordingCS struct {
+	kubernetes.Interface
+	records *[]esListOptRecord
+}
+
+func (c *esRecordingCS) CoreV1() corev1client.CoreV1Interface {
+	return &esRecordingCoreV1{CoreV1Interface: c.Interface.CoreV1(), records: c.records}
+}
+
+type esRecordingCoreV1 struct {
+	corev1client.CoreV1Interface
+	records *[]esListOptRecord
+}
+
+func (c *esRecordingCoreV1) Secrets(ns string) corev1client.SecretInterface {
+	return &esRecordingSecrets{SecretInterface: c.CoreV1Interface.Secrets(ns), records: c.records}
+}
+
+func (c *esRecordingCoreV1) Pods(ns string) corev1client.PodInterface {
+	return &esRecordingPods{PodInterface: c.CoreV1Interface.Pods(ns), records: c.records}
+}
+
+type esRecordingSecrets struct {
+	corev1client.SecretInterface
+	records *[]esListOptRecord
+}
+
+func (s *esRecordingSecrets) List(ctx context.Context, opts metav1.ListOptions) (*corev1.SecretList, error) {
+	*s.records = append(*s.records, esListOptRecord{resource: "secrets", rv: opts.ResourceVersion, limit: opts.Limit})
+	return s.SecretInterface.List(ctx, opts)
+}
+
+type esRecordingPods struct {
+	corev1client.PodInterface
+	records *[]esListOptRecord
+}
+
+func (p *esRecordingPods) List(ctx context.Context, opts metav1.ListOptions) (*corev1.PodList, error) {
+	*p.records = append(*p.records, esListOptRecord{resource: "pods", rv: opts.ResourceVersion, limit: opts.Limit})
+	return p.PodInterface.List(ctx, opts)
+}
+
+func TestExternalSecretNudgeListOptionsEconomy(t *testing.T) {
+	var dynRecords, csRecords []esListOptRecord
+	baseDyn := esNudgeDynFake(cssObj("store", "True"), esObj("apps", "es-1", "True", 0))
+	dyn := &esRecordingDyn{Interface: baseDyn, records: &dynRecords}
+	cs := &esRecordingCS{Interface: kfake.NewSimpleClientset(), records: &csRecords}
+	n := &externalSecretNudge{
+		queue:      "externalsecret-nudge",
+		cs:         cs,
+		dyn:        dyn,
+		storeReady: map[string]bool{},
+	}
+	if err := n.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range dynRecords {
+		if rec.rv != "0" || rec.limit != 0 {
+			t.Fatalf("dynamic %s ListOptions = %+v, want rv=0 limit=0", rec.resource, rec)
+		}
+	}
+	seenSecrets, seenPods := false, false
+	for _, rec := range csRecords {
+		if rec.resource == "secrets" {
+			seenSecrets = true
+		}
+		if rec.resource == "pods" {
+			seenPods = true
+		}
+		if rec.rv != "0" || rec.limit != 0 {
+			t.Fatalf("typed %s ListOptions = %+v, want rv=0 limit=0", rec.resource, rec)
+		}
+	}
+	if !seenSecrets || !seenPods {
+		t.Fatalf("expected secrets (%v) and pods (%v) listed", seenSecrets, seenPods)
 	}
 }

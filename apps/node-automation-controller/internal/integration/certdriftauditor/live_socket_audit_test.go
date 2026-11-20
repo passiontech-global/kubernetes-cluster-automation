@@ -605,3 +605,118 @@ func TestLiveSocketAuditPinnedServicePortIsTranslated(t *testing.T) {
 		t.Fatalf("pinned service port 8443 must be translated to targetPort 9443, probed %q", probedAddr)
 	}
 }
+
+func TestLiveSocketAuditEarlyListErrorDoesNotPruneStreakOrMetric(t *testing.T) {
+	metrics.TLSLiveSocketDrift.Reset()
+	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	servedOld, _ := genSelfSignedCert(t, 1001, now.Add(90*24*time.Hour), "svc.apps.svc")
+	_, newPEM := genSelfSignedCert(t, 2002, now.Add(90*24*time.Hour), "svc.apps.svc")
+	_, matchedPEM := genSelfSignedCert(t, 1001, now.Add(90*24*time.Hour), "svc.apps.svc")
+	isCtrl := true
+	pin := int32(443)
+
+	cs := fake.NewSimpleClientset(
+		makeTLSSecret("apps", "my-tls", newPEM, now.Add(-time.Hour)),
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "my-svc", UID: "svc-1"},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "my-pod"},
+				Ports:    []corev1.ServicePort{{Port: 443, TargetPort: intstr.FromInt32(8443)}},
+			},
+		},
+		makeReadyTLSPod("apps", "my-pod", "10.0.0.12", "my-tls",
+			metav1.OwnerReference{Kind: "Deployment", Name: "my-dep", Controller: &isCtrl}),
+		&admissionv1.ValidatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-vwc"},
+			Webhooks: []admissionv1.ValidatingWebhook{{
+				Name: "my.example.com",
+				ClientConfig: admissionv1.WebhookClientConfig{
+					Service: &admissionv1.ServiceReference{Namespace: "apps", Name: "my-svc", Port: &pin},
+				},
+			}},
+		},
+	)
+
+	var failPods, failSecrets bool
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if failPods {
+			return true, nil, errors.New("pods list error")
+		}
+		return false, nil, nil
+	})
+	cs.PrependReactor("list", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if failSecrets {
+			return true, nil, errors.New("secrets list error")
+		}
+		return false, nil, nil
+	})
+
+	var currentServed = servedOld
+	a := &certDriftAuditor{
+		cs: cs, now: func() time.Time { return now },
+		disableLiveRollout: true,
+		prober: func(_ context.Context, _, _ string) (*x509.Certificate, error) {
+			return currentServed, nil
+		},
+	}
+
+	// Scan 1: streak=1 (no metric yet).
+	if err := a.auditLiveSockets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	streakKey := "apps/my-svc/my-tls"
+	if got := a.liveDriftStreak.Count(streakKey); got != 1 {
+		t.Fatalf("after scan 1 streak = %d, want 1", got)
+	}
+
+	// Transient pods list error must NOT prune streak=1.
+	a.beginLiveRun()
+	failPods = true
+	if err := a.auditLiveSockets(ctx); err == nil {
+		t.Fatal("expected pods list error")
+	}
+	if got := a.liveDriftStreak.Count(streakKey); got != 1 {
+		t.Fatalf("after pods error streak = %d, want 1 (must not prune)", got)
+	}
+	failPods = false
+
+	// Scan 2: streak=2 -> TLSLiveSocketDrift = 1.
+	a.beginLiveRun()
+	if err := a.auditLiveSockets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.ToFloat64(metrics.TLSLiveSocketDrift.WithLabelValues("apps", "my-svc", "my-tls")); got != 1 {
+		t.Fatalf("drift metric = %v, want 1", got)
+	}
+
+	// Transient secrets list error must NOT prune active metric or streak.
+	a.beginLiveRun()
+	failSecrets = true
+	if err := a.auditLiveSockets(ctx); err == nil {
+		t.Fatal("expected secrets list error")
+	}
+	if got := ptestutil.ToFloat64(metrics.TLSLiveSocketDrift.WithLabelValues("apps", "my-svc", "my-tls")); got != 1 {
+		t.Fatalf("after secrets error drift metric = %v, want 1 (must not prune)", got)
+	}
+	if got := a.liveDriftStreak.Count(streakKey); got != 2 {
+		t.Fatalf("after secrets error streak = %d, want 2 (must not prune)", got)
+	}
+	failSecrets = false
+
+	// Secret rotates / pod serves matching cert -> clean sweep prunes both metric and streak.
+	a.beginLiveRun()
+	if _, err := cs.CoreV1().Secrets("apps").Update(ctx,
+		makeTLSSecret("apps", "my-tls", matchedPEM, now.Add(-time.Hour)),
+		metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.auditLiveSockets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := ptestutil.CollectAndCount(metrics.TLSLiveSocketDrift); got != 0 {
+		t.Fatalf("after clean sweep metric count = %d, want 0 (pruned)", got)
+	}
+	if got := a.liveDriftStreak.Count(streakKey); got != 0 {
+		t.Fatalf("after clean sweep streak = %d, want 0 (pruned)", got)
+	}
+}

@@ -38,7 +38,10 @@ func JSONSize(v any) (int64, error) {
 		v = u.Object
 	}
 	w := &countingWriter{}
-	if err := jsonv2.MarshalWrite(w, v, jsonv1.DefaultOptionsV1()); err != nil {
+	// Disable map-key sorting: JSON byte length is invariant to key
+	// order, and DefaultOptionsV1 enables Deterministic(true) which
+	// needlessly sorts large OpenAPI schema maps.
+	if err := jsonv2.MarshalWrite(w, v, jsonv1.DefaultOptionsV1(), jsonv2.Deterministic(false)); err != nil {
 		return 0, err
 	}
 	return w.n, nil

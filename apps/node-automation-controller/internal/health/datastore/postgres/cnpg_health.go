@@ -10,16 +10,19 @@ import (
 	"context"
 	json "encoding/json/v2"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
@@ -192,8 +195,9 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGClusterHealth(
 // ---------------------------------------------------------------------------
 
 // cnpgFencedInstancesAnno is the CNPG operator's fenced-instance
-// list — comma-separated instance names ("*" fences the whole
-// cluster) the operator wrote after losing contact with them.
+// list — JSON-encoded string slice of instance names (e.g.
+// ["pg-1"], ["*"], []) the operator wrote after losing contact
+// with them ("*" fences the whole cluster).
 const cnpgFencedInstancesAnno = "cnpg.io/fencedInstances"
 
 // cnpgUnfenceCooldown bounds auto-unfence churn per cluster+instance
@@ -299,6 +303,9 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 		// planned", NOT a disagreement (blocking on it would
 		// disable unfence on every steady-state cluster).
 		failoverInFlight := tgtPrimary != "" && curPrimary != tgtPrimary
+		if slices.Contains(instances, "*") {
+			continue
+		}
 		for _, inst := range instances {
 			if inst == "*" {
 				continue
@@ -339,6 +346,12 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 			var nextRV string
 			if err := p.unfenceCNPGInstance(ctx, cr, curRV, inst,
 				instances, removed, &nextRV); err != nil {
+				if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+					heal.RefundGrant(now)
+					log.Info("SKIP: cnpg unfence raced (cluster changed or gone)",
+						"cluster", ns+"/"+name, "instance", inst, "error", err)
+					break
+				}
 				metrics.IncError(p.Name)
 				log.Error(err, "cnpg unfence patch failed",
 					"cluster", ns+"/"+name, "instance", inst)
@@ -356,14 +369,22 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 	p.cnpgFenceSeen.Prune(func(k string) bool { return fenceLive[k] })
 }
 
-// cnpgFencedInstanceList parses the fencedInstances annotation into
-// instance names — empty list when absent or blank. Reads through
-// EffectiveAnno so a fence/unfence patch recorded on the sweep
-// overlay earlier this sweep is visible to later checks.
+// cnpgFencedInstanceList parses the CNPG JSON-encoded fencedInstances
+// annotation into instance names — empty list when absent, blank,
+// "[]", or malformed. Reads through EffectiveAnno so a fence/unfence
+// patch recorded on the sweep overlay earlier this sweep is visible to
+// later checks.
 func cnpgFencedInstanceList(ctx context.Context, cr *unstructured.Unstructured) []string {
-	raw := kube.EffectiveAnno(ctx, cr, cnpgFencedInstancesAnno)
+	raw := strings.TrimSpace(kube.EffectiveAnno(ctx, cr, cnpgFencedInstancesAnno))
+	if raw == "" {
+		return nil
+	}
+	var parsed []string
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil
+	}
 	var out []string
-	for s := range strings.SplitSeq(raw, ",") {
+	for _, s := range parsed {
 		if s = strings.TrimSpace(s); s != "" {
 			out = append(out, s)
 		}
@@ -372,12 +393,14 @@ func cnpgFencedInstanceList(ctx context.Context, cr *unstructured.Unstructured) 
 }
 
 // cnpgInstanceOnHealthyNode reports whether the fenced instance's
-// pod is Running and Ready, not terminating or already reaped by a
-// sibling heal this sweep, on a node that is Ready, schedulable and
-// free of every remediation/out-of-service taint — the evidence that
-// the fence is stale rather than protective. A missing pod or node
-// census, a non-Running/unready pod, or an unverifiable node all
-// read false (fail closed — never unfence on partial evidence).
+// pod is Running (not terminating or already reaped by a sibling heal
+// this sweep, and with no explicitly non-running container status), on
+// a node that is Ready, schedulable and free of every
+// remediation/out-of-service taint — the evidence that the fence is
+// stale rather than protective. PodReadyCond is deliberately NOT
+// required because fencing stops postmaster (keeping Ready=False until
+// unfenced). A missing pod or node census, a non-Running pod, or an
+// unverifiable node all read false (fail closed).
 func cnpgInstanceOnHealthyNode(ctx context.Context, pods []corev1.Pod,
 	nodeByName map[string]*corev1.Node, ns, cluster, inst string) bool {
 
@@ -406,9 +429,13 @@ func cnpgInstanceOnHealthyNode(ctx context.Context, pods []corev1.Pod,
 	}
 	if pod == nil || pod.Spec.NodeName == "" ||
 		pod.Status.Phase != corev1.PodRunning ||
-		pod.DeletionTimestamp != nil || kube.IsPodDeleted(ctx, pod.UID) ||
-		!kube.PodReadyCond(pod) {
+		pod.DeletionTimestamp != nil || kube.IsPodDeleted(ctx, pod.UID) {
 		return false
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Running == nil {
+			return false
+		}
 	}
 	node := nodeByName[pod.Spec.NodeName]
 	if node == nil || node.Spec.Unschedulable {
@@ -463,7 +490,11 @@ func (p *postgresWALArchiveGuardCheck) unfenceCNPGInstance(
 		},
 	}
 	if len(next) > 0 {
-		patch["metadata"].(map[string]any)["annotations"].(map[string]any)[cnpgFencedInstancesAnno] = strings.Join(next, ",")
+		enc, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+		patch["metadata"].(map[string]any)["annotations"].(map[string]any)[cnpgFencedInstancesAnno] = string(enc)
 	}
 	data, err := json.Marshal(patch)
 	if err != nil {

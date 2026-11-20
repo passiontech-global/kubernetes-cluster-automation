@@ -277,10 +277,10 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 			"pod", ns+"/"+pod.Name, "deployment", ns+"/"+name)
 	}
 	if deletedPods > 0 {
-		p.InvalidatePods(ctx)
-		// ONE stage per sweep: the pod census just changed, so the
-		// RS-zeroing / nudge verdicts below must be re-derived from a
-		// fresh snapshot next sweep instead of riding stale state.
+		// ONE stage per sweep: MarkPodDeleted already tombstoned the
+		// deleted pods in the sweep overlay, and the RS-zeroing /
+		// nudge verdicts below must wait for the next sweep instead of
+		// riding stale ReplicaSet state.
 		return
 	}
 	// Stage 2 — stale ReplicaSet zeroing: old revisions with

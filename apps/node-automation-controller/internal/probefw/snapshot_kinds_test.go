@@ -523,3 +523,43 @@ func TestAllUnstructuredFirst(t *testing.T) {
 		}
 	})
 }
+
+// A panic inside memo.get's load callback must NOT mark m.set=true or
+// clear m.forceCS — otherwise every subsequent caller in the sweep
+// reads zero items and nil error (silent empty census).
+func TestMemoGetPanicDoesNotPoisonMemo(t *testing.T) {
+	m := memo[[]string]{forceCS: true}
+	calls := 0
+	var gotForce bool
+
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = m.get(func(forceCS bool) ([]string, error) {
+			calls++
+			gotForce = forceCS
+			panic("boom inside list")
+		})
+	}()
+
+	if calls != 1 || !gotForce {
+		t.Fatalf("first call = (calls=%d, forceCS=%v), want (1, true)", calls, gotForce)
+	}
+	if m.set {
+		t.Fatal("m.set became true after panicking load — memo poisoned")
+	}
+	if !m.forceCS {
+		t.Fatal("m.forceCS was cleared despite panicking load")
+	}
+
+	items, err := m.get(func(forceCS bool) ([]string, error) {
+		calls++
+		gotForce = forceCS
+		return []string{"ok"}, nil
+	})
+	if err != nil || len(items) != 1 || items[0] != "ok" {
+		t.Fatalf("retry get = (%v, %v), want ([ok], nil)", items, err)
+	}
+	if calls != 2 || !gotForce {
+		t.Fatalf("retry call = (calls=%d, forceCS=%v), want (2, true)", calls, gotForce)
+	}
+}

@@ -604,3 +604,129 @@ func TestFluentBitRollerCachedDriftConfirmRolls(t *testing.T) {
 		t.Fatalf("rolled-config-hash = %q, want h1", got)
 	}
 }
+
+// When the informer cache holds an older unrolled hash ("h1") and the
+// live Secret has moved to "h2", Reconcile must stamp and roll with
+// "h2" (liveHash), never the stale cached "h1".
+func TestFluentBitRollerCachedDriftConfirmUsesLiveHash(t *testing.T) {
+	now := time.Now()
+	stale := pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h1"})
+	live := pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h2"})
+	cs := fake.NewSimpleClientset(live, fluentBitDS(1, 1, 1, 1),
+		testutil.Node("n1", corev1.ConditionTrue, nil))
+	r := newRoller(cs)
+	reader := &cacheReader{sec: stale}
+	r.secretReader = reader
+	r.now = func() time.Time { return now }
+
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	ds := getFluentBitDS(t, cs)
+	if got := ds.Spec.Template.Annotations[kube.AnnoRolledConfigHash]; got != "h2" {
+		t.Fatalf("DS rolled-config-hash = %q, want h2", got)
+	}
+	if got := rolledHash(getPipelineSecret(t, cs)); got != "h2" {
+		t.Fatalf("Secret rolled-config-hash = %q, want h2", got)
+	}
+
+	// Second reconcile once the informer catches up must be a no-op (0 DS patches).
+	reader.sec = getPipelineSecret(t, cs).DeepCopy()
+	var dsPatches int
+	cs.PrependReactor("patch", "daemonsets", func(ktesting.Action) (bool, runtime.Object, error) {
+		dsPatches++
+		return false, nil, nil
+	})
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if dsPatches != 0 {
+		t.Fatalf("second reconcile fired %d DS patches, want 0", dsPatches)
+	}
+}
+
+func TestFluentBitRollerCachedDriftConfirmLiveHashShortCircuit(t *testing.T) {
+	t.Run("ds already has live h2 while cache has h1 -> stamps secret h2 without re-rolling", func(t *testing.T) {
+		now := time.Now()
+		stale := pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h1"})
+		live := pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h2"})
+		ds := fluentBitDS(1, 1, 1, 1)
+		ds.Spec.Template.Annotations = map[string]string{kube.AnnoRolledConfigHash: "h2"}
+		cs := fake.NewSimpleClientset(live, ds, testutil.Node("n1", corev1.ConditionTrue, nil))
+		var dsPatches int
+		cs.PrependReactor("patch", "daemonsets", func(ktesting.Action) (bool, runtime.Object, error) {
+			dsPatches++
+			return false, nil, nil
+		})
+		r := newRoller(cs)
+		r.secretReader = &cacheReader{sec: stale}
+		r.now = func() time.Time { return now }
+
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if dsPatches != 0 {
+			t.Fatalf("DS patches = %d, want 0 (idempotence short-circuit)", dsPatches)
+		}
+		if got := rolledHash(getPipelineSecret(t, cs)); got != "h2" {
+			t.Fatalf("Secret rolled-config-hash = %q, want h2", got)
+		}
+	})
+
+	t.Run("ds has stale h1 while cache has h1 and live moved to h2 -> rolls DS and stamps h2", func(t *testing.T) {
+		now := time.Now()
+		stale := pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h1"})
+		live := pipelineSecret(map[string]string{kube.AnnoFluentConfigHash: "h2"})
+		ds := fluentBitDS(1, 1, 1, 1)
+		ds.Spec.Template.Annotations = map[string]string{kube.AnnoRolledConfigHash: "h1"}
+		cs := fake.NewSimpleClientset(live, ds, testutil.Node("n1", corev1.ConditionTrue, nil))
+		var dsPatches int
+		cs.PrependReactor("patch", "daemonsets", func(ktesting.Action) (bool, runtime.Object, error) {
+			dsPatches++
+			return false, nil, nil
+		})
+		r := newRoller(cs)
+		r.secretReader = &cacheReader{sec: stale}
+		r.now = func() time.Time { return now }
+
+		if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		if dsPatches != 1 {
+			t.Fatalf("DS patches = %d, want 1 (must roll for h2)", dsPatches)
+		}
+		gotDS := getFluentBitDS(t, cs)
+		if got := gotDS.Spec.Template.Annotations[kube.AnnoRolledConfigHash]; got != "h2" {
+			t.Fatalf("DS rolled-config-hash = %q, want h2", got)
+		}
+		if got := rolledHash(getPipelineSecret(t, cs)); got != "h2" {
+			t.Fatalf("Secret rolled-config-hash = %q, want h2", got)
+		}
+	})
+}
+
+func TestFluentBitRollerCachedDriftConfirmContentHashFallback(t *testing.T) {
+	now := time.Now()
+	stale := pipelineSecret(nil)
+	stale.Data = map[string][]byte{"fluent.conf": []byte("v1")}
+	live := pipelineSecret(nil)
+	live.Data = map[string][]byte{"fluent.conf": []byte("v2")}
+	wantHash := secretDataHash(live)
+
+	cs := fake.NewSimpleClientset(live, fluentBitDS(1, 1, 1, 1),
+		testutil.Node("n1", corev1.ConditionTrue, nil))
+	r := newRoller(cs)
+	r.secretReader = &cacheReader{sec: stale}
+	r.now = func() time.Time { return now }
+
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	ds := getFluentBitDS(t, cs)
+	if got := ds.Spec.Template.Annotations[kube.AnnoRolledConfigHash]; got != wantHash {
+		t.Fatalf("DS rolled-config-hash = %q, want %q", got, wantHash)
+	}
+	if got := rolledHash(getPipelineSecret(t, cs)); got != wantHash {
+		t.Fatalf("Secret rolled-config-hash = %q, want %q", got, wantHash)
+	}
+}

@@ -56,3 +56,37 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 		t.Fatalf("disabled module registered %d runnables, want 0", len(m.Added))
 	}
 }
+
+func TestSetupRunTimeoutCovers68CheckWorstCase(t *testing.T) {
+	t.Setenv("CLUSTER_HEALTH_PROBES_INTERVAL", "")
+	t.Setenv("HEALTH_PER_CHECK_TIMEOUT", "")
+	m := testutil.NewStubManager()
+	if err := Setup(shared.Deps{
+		Name:      "cluster-health-probes",
+		Mgr:       m,
+		CS:        fake.NewSimpleClientset(),
+		Dyn:       testutil.NewDynamicClient(),
+		CheckRegs: fleetCheckRegs(),
+	}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	testutil.ExpectPeriodic(t, m, "cluster-health-probes", 5*time.Minute)
+	p := m.Added[0].(*shared.Periodic)
+	if p.RunTimeout != 25*time.Minute {
+		t.Fatalf("68-check RunTimeout = %v, want 25m (12 waves * 2m + 1m)", p.RunTimeout)
+	}
+
+	mEmpty := testutil.NewStubManager()
+	if err := Setup(shared.Deps{
+		Name: "cluster-health-probes",
+		Mgr:  mEmpty,
+		CS:   fake.NewSimpleClientset(),
+		Dyn:  testutil.NewDynamicClient(),
+	}); err != nil {
+		t.Fatalf("setup empty: %v", err)
+	}
+	pEmpty := mEmpty.Added[0].(*shared.Periodic)
+	if pEmpty.RunTimeout < 2*5*time.Minute {
+		t.Fatalf("empty-roster RunTimeout = %v, want >= 10m (2*interval)", pEmpty.RunTimeout)
+	}
+}

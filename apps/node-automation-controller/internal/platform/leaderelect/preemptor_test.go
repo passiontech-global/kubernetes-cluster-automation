@@ -111,6 +111,28 @@ func TestSweepDeadHolderReasons(t *testing.T) {
 		}
 		return p
 	}
+	runningPod := func(nodeName string, statuses ...corev1.ContainerStatus) *corev1.Pod {
+		p := pod(nodeName, false)
+		p.Status.Phase = corev1.PodRunning
+		p.Status.ContainerStatuses = statuses
+		return p
+	}
+	phasePod := func(nodeName string, phase corev1.PodPhase) *corev1.Pod {
+		p := pod(nodeName, false)
+		p.Status.Phase = phase
+		return p
+	}
+	leaseNoRenew := func() *coordinationv1.Lease {
+		l := staleLease()
+		l.Spec.RenewTime = nil
+		return l
+	}
+	leaseZeroRenew := func() *coordinationv1.Lease {
+		l := staleLease()
+		z := metav1.MicroTime{}
+		l.Spec.RenewTime = &z
+		return l
+	}
 	readyNode := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
 		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
@@ -129,6 +151,22 @@ func TestSweepDeadHolderReasons(t *testing.T) {
 		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
 			Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
 	}
+	// staleLease() has RenewTime = testNow - 1m.
+	oldStart := metav1.NewTime(testNow.Add(-5 * time.Minute))
+	newStart := metav1.NewTime(testNow.Add(-30 * time.Second))
+	equalStart := metav1.NewTime(testNow.Add(-time.Minute))
+	oldFinish := metav1.NewTime(testNow.Add(-10 * time.Minute))
+	newFinish := metav1.NewTime(testNow.Add(-35 * time.Second))
+
+	podWithInit := runningPod("node-a", corev1.ContainerStatus{
+		Name:  "manager",
+		Ready: true,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: oldStart}},
+	})
+	podWithInit.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "init",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "Completed", FinishedAt: oldFinish}},
+	}}
 
 	cases := []struct {
 		name string
@@ -143,7 +181,84 @@ func TestSweepDeadHolderReasons(t *testing.T) {
 		{"node unreachable taint", []runtime.Object{
 			staleLease(), pod("node-c", false), taintedNode}, ReasonNodeUnreachable},
 		{"live leader untouched", []runtime.Object{
+			staleLease(), runningPod("node-a", corev1.ContainerStatus{
+				Name:  "manager",
+				Ready: true,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: oldStart}},
+			}), readyNode}, ""},
+		{"minimal pod empty status untouched", []runtime.Object{
 			staleLease(), pod("node-a", false), readyNode}, ""},
+		{"in-place container restart StartedAt after RenewTime", []runtime.Object{
+			staleLease(), runningPod("node-a", corev1.ContainerStatus{
+				Name:         "manager",
+				RestartCount: 1,
+				State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: newStart}},
+			}), readyNode}, ReasonContainerRestarted},
+		{"in-place restart LastTerminationState FinishedAt after RenewTime", []runtime.Object{
+			staleLease(), runningPod("node-a", corev1.ContainerStatus{
+				Name:         "manager",
+				RestartCount: 1,
+				State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: oldStart}},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{FinishedAt: newFinish},
+				},
+			}), readyNode}, ReasonContainerRestarted},
+		{"container waiting CrashLoopBackOff", []runtime.Object{
+			staleLease(), runningPod("node-a", corev1.ContainerStatus{
+				Name:  "manager",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+			}), readyNode}, ReasonContainerRestarted},
+		{"container terminated OOMKilled", []runtime.Object{
+			staleLease(), runningPod("node-a", corev1.ContainerStatus{
+				Name:  "manager",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "OOMKilled"}},
+			}), readyNode}, ReasonContainerRestarted},
+		{"pod failed evicted", []runtime.Object{
+			staleLease(), phasePod("node-a", corev1.PodFailed), readyNode}, ReasonPodNotRunning},
+		{"pod succeeded", []runtime.Object{
+			staleLease(), phasePod("node-a", corev1.PodSucceeded), readyNode}, ReasonPodNotRunning},
+		{"pod pending scheduled", []runtime.Object{
+			staleLease(), phasePod("node-a", corev1.PodPending), readyNode}, ReasonPodNotRunning},
+		{"multi-container sidecar old manager restarted", []runtime.Object{
+			staleLease(), runningPod("node-a",
+				corev1.ContainerStatus{
+					Name:  "sidecar",
+					Ready: true,
+					State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: oldStart}},
+				},
+				corev1.ContainerStatus{
+					Name:         "manager",
+					RestartCount: 1,
+					State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: newStart}},
+				},
+			), readyNode}, ReasonContainerRestarted},
+		{"old restart before RenewTime untouched", []runtime.Object{
+			staleLease(), runningPod("node-a", corev1.ContainerStatus{
+				Name:         "manager",
+				RestartCount: 3,
+				Ready:        false, // transient readiness failure during blip must keep 180s tolerance
+				State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: oldStart}},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{FinishedAt: oldFinish},
+				},
+			}), readyNode}, ""},
+		{"completed init container untouched", []runtime.Object{
+			staleLease(), podWithInit, readyNode}, ""},
+		{"nil RenewTime skips timestamp check", []runtime.Object{
+			leaseNoRenew(), runningPod("node-a", corev1.ContainerStatus{
+				Name:  "manager",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: oldStart}},
+			}), readyNode}, ""},
+		{"zero RenewTime skips timestamp check", []runtime.Object{
+			leaseZeroRenew(), runningPod("node-a", corev1.ContainerStatus{
+				Name:  "manager",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: oldStart}},
+			}), readyNode}, ""},
+		{"StartedAt equal to RenewTime untouched", []runtime.Object{
+			staleLease(), runningPod("node-a", corev1.ContainerStatus{
+				Name:  "manager",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: equalStart}},
+			}), readyNode}, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

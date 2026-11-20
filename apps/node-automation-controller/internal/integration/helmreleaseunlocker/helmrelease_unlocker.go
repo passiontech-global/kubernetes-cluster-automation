@@ -358,8 +358,9 @@ func (u *helmReleaseUnlocker) run(ctx context.Context) error {
 			log.Info("SKIP: helm-controller pod CrashLoopBackOff — unlock/unwedge would not converge",
 				"due", due, "stallDue", stallDue)
 		default:
-			unlocked = u.unlockDue(ctx, gvr, stuck, due, now)
-			unwedged = u.unwedgeDue(ctx, gvr, stalled, stallDue, now)
+			jobCache := newHookJobCache()
+			unlocked = u.unlockDue(ctx, gvr, stuck, due, now, jobCache)
+			unwedged = u.unwedgeDue(ctx, gvr, stalled, stallDue, now, jobCache)
 		}
 	}
 

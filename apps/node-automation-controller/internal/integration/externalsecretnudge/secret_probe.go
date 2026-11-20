@@ -113,7 +113,7 @@ func (n *externalSecretNudge) buildSecretIndex(ctx context.Context,
 	for ns := range namespaces {
 		items, err := kube.ListPartialOrFallback(ctx, n.meta, n.cs, n.dyn,
 			secretGVR, ns,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize})
+			metav1.ListOptions{ResourceVersion: "0", Limit: kube.DefaultListPageSize})
 		if err != nil {
 			metrics.IncError(n.queue)
 			log.Error(err, "secret index list failed — target-secret probes fall back to live GETs",

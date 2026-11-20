@@ -156,8 +156,9 @@ type webhookEntry struct {
 }
 
 type certDriftAuditor struct {
-	cs  kubernetes.Interface
-	dyn dynamic.Interface
+	cs         kubernetes.Interface
+	dyn        dynamic.Interface
+	nodeReader kube.CachedNodeReader
 	// queue is the module's ops name — stamped from Deps.Name (the
 	// registry row) so the periodic's name and every IncError label
 	// come from one place.
@@ -290,6 +291,7 @@ func Setup(d shared.Deps) error {
 			verdict:            d.Maintenance,
 			cs:                 cs,
 			dyn:                dyn,
+			nodeReader:         d.CachedClient(),
 			queue:              d.Name,
 			now:                shared.SystemClock,
 			disableLiveRollout: !liveRolloutEnabled,

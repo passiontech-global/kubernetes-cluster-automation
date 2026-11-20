@@ -31,13 +31,36 @@ func TestCRDSizeTableRecordLookup(t *testing.T) {
 	if _, ok := tab.Lookup("other.example.com", "100"); ok {
 		t.Fatal("lookup matched a foreign name")
 	}
-	// Update overwrites in place — the map does not grow per RV churn
-	// of the SAME CRD... it keys by RV, so an update lands on a new
-	// key and the old one lingers until eviction; the NEW lookup must
-	// win.
+	// Update overwrites in place in O(1) — the map stays at 1 entry
+	// per CRD name, old RVs miss, and the NEW lookup wins.
 	tab.Record("gatekeepers.example.com", "101", 42)
 	if size, ok := tab.Lookup("gatekeepers.example.com", "101"); !ok || size != 42 {
 		t.Fatalf("post-update Lookup = %d,%v want 42,true", size, ok)
+	}
+	if _, ok := tab.Lookup("gatekeepers.example.com", "100"); ok {
+		t.Fatal("stale RV 100 remained reachable after update to 101")
+	}
+	tab.mu.RLock()
+	entries := len(tab.m)
+	tab.mu.RUnlock()
+	if entries != 1 {
+		t.Fatalf("table len = %d after updating same CRD name, want 1", entries)
+	}
+}
+
+func TestCRDSizeTableOverwriteSameNameO1(t *testing.T) {
+	tab := NewCRDSizeTable(4)
+	for i := range 100 {
+		tab.Record("crds.example.com", string(rune('a'+i%26))+string(rune('0'+i)), int64(i))
+	}
+	tab.mu.RLock()
+	n := len(tab.m)
+	tab.mu.RUnlock()
+	if n != 1 {
+		t.Fatalf("len(tab.m) = %d after 100 RV updates of same name, want 1", n)
+	}
+	if size, ok := tab.Lookup("crds.example.com", string(rune('a'+99%26))+string(rune('0'+99))); !ok || size != 99 {
+		t.Fatalf("Lookup(latest) = (%d,%v), want (99,true)", size, ok)
 	}
 }
 

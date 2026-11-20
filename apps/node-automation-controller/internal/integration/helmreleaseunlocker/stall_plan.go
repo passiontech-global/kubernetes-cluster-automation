@@ -287,16 +287,16 @@ func podsOwnedBy(pods []corev1.Pod, rs *appsv1.ReplicaSet) []*corev1.Pod {
 
 // podBlockedByAffinity reports whether the pod is stuck unscheduled
 // BECAUSE of anti-affinity: PodScheduled=False whose message mentions
-// affinity ("didn't satisfy existing pods anti-affinity rules",
-// "didn't match pod anti-affinity rules"). Insufficient cpu, taints,
-// image pulls and every other scheduling failure read false — the
-// caller refuses those.
+// anti-affinity ("didn't satisfy existing pods anti-affinity rules",
+// "didn't match pod anti-affinity rules"). Node/pod affinity,
+// insufficient cpu, taints, image pulls and every other scheduling
+// failure read false — the caller refuses those.
 func podBlockedByAffinity(p *corev1.Pod) bool {
 	for _, c := range p.Status.Conditions {
 		if c.Type != corev1.PodScheduled || c.Status != corev1.ConditionFalse {
 			continue
 		}
-		return strings.Contains(strings.ToLower(c.Message), "affinity")
+		return strings.Contains(strings.ToLower(c.Message), "anti-affinity")
 	}
 	return false
 }

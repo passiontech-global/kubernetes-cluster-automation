@@ -284,17 +284,22 @@ func DeletePod(ctx context.Context, cs kubernetes.Interface,
 		kube.UIDDeleteOptions(pod.UID, ""))
 	switch {
 	case apierrors.IsNotFound(err):
-		// The pod is already gone — tombstone the UID so later
-		// sweep readers hide it and return (false, nil): no heal
-		// was delivered but none was needed, so the gate owner
-		// refunds its grant instead of IncErroring a phantom.
+		// The pod is already gone — release the disruption slot,
+		// tombstone the UID so later sweep readers hide it, and
+		// return (false, nil): no heal was delivered so the gate
+		// owner refunds its grant instead of IncErroring a phantom.
+		kube.ReleaseWorkloadDisruption(ctx, pod)
 		kube.MarkPodDeleted(ctx, pod.UID)
 		return false, nil
 	case apierrors.IsConflict(err):
 		// UID precondition lost — the pod was recreated under a
 		// new UID mid-sweep; deleting it now would hit the wrong
-		// incarnation. Clean deferral, same as a PDB refusal.
+		// incarnation. Release the disruption slot and defer cleanly.
+		kube.ReleaseWorkloadDisruption(ctx, pod)
 		return false, nil
+	case apierrors.IsTooManyRequests(err):
+		kube.ReleaseWorkloadDisruption(ctx, pod)
+		return false, err
 	case err != nil:
 		return false, err
 	}
@@ -326,12 +331,12 @@ func ForceDeletePod(ctx context.Context, cs kubernetes.Interface,
 	heals *state.CooldownSet, key string, pod *corev1.Pod,
 	now time.Time) (bool, error) {
 
+	if len(kube.PodClaimedPVCs(pod)) > 0 {
+		return false, nil
+	}
 	deferred, err := preparePodDisruption(ctx, cs, pod, now)
 	if err != nil || deferred {
 		return false, err
-	}
-	if len(kube.PodClaimedPVCs(pod)) > 0 {
-		return false, nil
 	}
 	grace := int64(0)
 	opts := metav1.DeleteOptions{
@@ -341,10 +346,15 @@ func ForceDeletePod(ctx context.Context, cs kubernetes.Interface,
 	err = cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, opts)
 	switch {
 	case apierrors.IsNotFound(err):
+		kube.ReleaseWorkloadDisruption(ctx, pod)
 		kube.MarkPodDeleted(ctx, pod.UID)
 		return false, nil
 	case apierrors.IsConflict(err):
+		kube.ReleaseWorkloadDisruption(ctx, pod)
 		return false, nil
+	case apierrors.IsTooManyRequests(err):
+		kube.ReleaseWorkloadDisruption(ctx, pod)
+		return false, err
 	case err != nil:
 		return false, err
 	}
@@ -425,15 +435,18 @@ func evictPod(ctx context.Context, cs kubernetes.Interface,
 		DeleteOptions: &deleteOpts,
 	})
 	if apierrors.IsNotFound(err) {
-		// Already-gone pod: tombstone the UID like DeletePod's and
-		// report the reason so callers need not log a normal census
-		// race as an eviction refusal.
+		// Already-gone pod: release the disruption slot, tombstone
+		// the UID like DeletePod's, and report the reason so callers
+		// need not log a normal census race as an eviction refusal.
+		kube.ReleaseWorkloadDisruption(ctx, pod)
 		kube.MarkPodDeleted(ctx, pod.UID)
 		return false, true, true, nil
 	}
 	if apierrors.IsTooManyRequests(err) || apierrors.IsConflict(err) {
 		// PDB refusal or UID-precondition loss: clean deferrals,
-		// no heal delivered, no mutation executed.
+		// no heal delivered, no mutation executed — release the
+		// disruption slot for sibling pods of this workload.
+		kube.ReleaseWorkloadDisruption(ctx, pod)
 		return false, true, false, nil
 	}
 	if err != nil {

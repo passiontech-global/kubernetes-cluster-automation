@@ -12,6 +12,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +23,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -301,5 +303,62 @@ func TestSweepCRDConversionBackendWarnOnly(t *testing.T) {
 		if a.GetVerb() != "list" && a.GetVerb() != "get" {
 			t.Fatalf("warn-only CRD path issued a write: %v", a)
 		}
+	}
+}
+
+func TestOrphanSweepUsesOwnFluxGateKey(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	heal.ConfigureFluxConflictLoop(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureFluxConflictLoop(0, 0) })
+
+	fluxFields := []metav1.ManagedFieldsEntry{{Manager: "helm-controller", Operation: "Update"}}
+	mwc := &admissionv1.MutatingWebhookConfigurationList{
+		Items: []admissionv1.MutatingWebhookConfiguration{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "flux-iso-mwc", ManagedFields: fluxFields},
+				Webhooks: []admissionv1.MutatingWebhook{
+					osMutatingHook("keep.example.com", osSvcRef("alive", "svc")),
+					osMutatingHook("orphan.example.com", osSvcRef("dead-ns", "svc")),
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "flux-gated-mwc", ManagedFields: fluxFields},
+				Webhooks: []admissionv1.MutatingWebhook{
+					osMutatingHook("keep.example.com", osSvcRef("alive", "svc")),
+					osMutatingHook("orphan.example.com", osSvcRef("dead-ns", "svc")),
+				},
+			},
+		},
+	}
+	cs := fake.NewSimpleClientset(
+		osNamespace("kube-system"), osNamespace("alive"),
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "alive", Name: "svc"}},
+		&mwc.Items[0], &mwc.Items[1],
+	)
+	snap := osSnap(cs, []string{"kube-system", "alive"}, mwc, nil)
+	snap.G.Now = func() time.Time { return now }
+
+	// Burn sibling duty keys for flux-iso-mwc; orphansweep must NOT be blocked.
+	for _, prefix := range []string{"circuit_sweep/", "criticalns/", "timeoutclamp/"} {
+		key := prefix + guardstate.KindMutating + "/flux-iso-mwc"
+		heal.FluxPatchGate(guardstate.KindMutating, &mwc.Items[0], key, now)
+		heal.FluxPatchGate(guardstate.KindMutating, &mwc.Items[0], key, now)
+	}
+	// Burn orphansweep/ key for flux-gated-mwc; orphansweep MUST defer its patch.
+	ownKey := "orphansweep/" + guardstate.KindMutating + "/flux-gated-mwc"
+	heal.FluxPatchGate(guardstate.KindMutating, &mwc.Items[1], ownKey, now)
+	heal.FluxPatchGate(guardstate.KindMutating, &mwc.Items[1], ownKey, now)
+
+	if err := Sweep(ctx, snap); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	gotIso := osMutatingNames(snap, "flux-iso-mwc")
+	if len(gotIso) != 1 || gotIso[0] != "keep.example.com" {
+		t.Fatalf("flux-iso-mwc was blocked by sibling duty Flux keys: %v", gotIso)
+	}
+	gotGated := osMutatingNames(snap, "flux-gated-mwc")
+	if len(gotGated) != 2 {
+		t.Fatalf("flux-gated-mwc was not deferred by its own Flux key: %v", gotGated)
 	}
 }

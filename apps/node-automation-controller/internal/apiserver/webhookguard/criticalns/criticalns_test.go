@@ -6,9 +6,11 @@ package criticalns
 
 import (
 	"context"
+	json "encoding/json/v2"
 	"errors"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -561,4 +564,91 @@ func TestCriticalNSAutoPatchSeriesEmission(t *testing.T) {
 			t.Fatalf("allowlisted webhook must keep its series, got %v", got)
 		}
 	})
+}
+
+func TestMergeExclusionOmitsEmptyValuesForExistsDoesNotExist(t *testing.T) {
+	sel := &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "env", Operator: metav1.LabelSelectorOpExists, Values: nil},
+			{Key: "legacy", Operator: metav1.LabelSelectorOpDoesNotExist, Values: []string{}},
+		},
+	}
+	payload, err := json.Marshal(map[string]any{
+		"webhooks": []map[string]any{{"name": "w", "namespaceSelector": mergeExclusion(sel)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(payload)
+	if strings.Contains(raw, `"values":[]`) || strings.Contains(raw, `"values":null`) {
+		t.Fatalf("empty values serialized in JSON payload: %s", raw)
+	}
+
+	var decoded struct {
+		Webhooks []struct {
+			Name              string               `json:"name"`
+			NamespaceSelector metav1.LabelSelector `json:"namespaceSelector"`
+		} `json:"webhooks"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal into LabelSelector: %v", err)
+	}
+	exprs := decoded.Webhooks[0].NamespaceSelector.MatchExpressions
+	if len(exprs) != 3 {
+		t.Fatalf("expected 3 matchExpressions (Exists, DoesNotExist, NotIn), got %d: %+v", len(exprs), exprs)
+	}
+	if exprs[0].Operator != metav1.LabelSelectorOpExists || exprs[0].Values != nil {
+		t.Fatalf("Exists expression invalid: %+v", exprs[0])
+	}
+	if exprs[1].Operator != metav1.LabelSelectorOpDoesNotExist || exprs[1].Values != nil {
+		t.Fatalf("DoesNotExist expression invalid: %+v", exprs[1])
+	}
+	if exprs[2].Operator != metav1.LabelSelectorOpNotIn || len(exprs[2].Values) != len(criticalSelfHealingNamespaces) {
+		t.Fatalf("NotIn expression missing values: %+v", exprs[2])
+	}
+}
+
+func TestCriticalNSUsesOwnFluxGateKey(t *testing.T) {
+	t.Setenv("WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED", "true")
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	heal.ConfigureFluxConflictLoop(3, time.Hour)
+	t.Cleanup(func() { heal.ConfigureFluxConflictLoop(0, 0) })
+
+	fluxFields := []metav1.ManagedFieldsEntry{{Manager: "helm-controller", Operation: "Update"}}
+	vwcA := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "flux-a-vwc", ManagedFields: fluxFields},
+		Webhooks:   []admissionv1.ValidatingWebhook{cpValidatingHook("a.example.com", nil, admissionv1.Fail, nil)},
+	}
+	vwcB := &admissionv1.ValidatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "flux-b-vwc", ManagedFields: fluxFields},
+		Webhooks:   []admissionv1.ValidatingWebhook{cpValidatingHook("b.example.com", nil, admissionv1.Fail, nil)},
+	}
+	testutil.CleanupMetric(t, metrics.WebhookMissingCriticalNSExclusion,
+		guardstate.KindValidating, "flux-b-vwc", "b.example.com")
+
+	cs := fake.NewSimpleClientset(upNamespace("kube-system", ""), vwcA, vwcB)
+	s := &Sweeper{}
+	g := &guardstate.Guard{CS: cs, Dyn: wgDyn(), Now: func() time.Time { return now }}
+
+	// Burn sibling duty keys for flux-a-vwc; criticalns must NOT be blocked.
+	for _, prefix := range []string{"circuit_sweep/", "orphansweep/", "timeoutclamp/"} {
+		key := prefix + guardstate.KindValidating + "/flux-a-vwc"
+		heal.FluxPatchGate(guardstate.KindValidating, vwcA, key, now)
+		heal.FluxPatchGate(guardstate.KindValidating, vwcA, key, now)
+	}
+	// Burn criticalns/ key for flux-b-vwc; criticalns MUST defer its patch.
+	ownKey := "criticalns/" + guardstate.KindValidating + "/flux-b-vwc"
+	heal.FluxPatchGate(guardstate.KindValidating, vwcB, ownKey, now)
+	heal.FluxPatchGate(guardstate.KindValidating, vwcB, ownKey, now)
+
+	s.Sweep(g.TakeSnapshot(ctx))
+
+	gotA, _ := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, "flux-a-vwc", metav1.GetOptions{})
+	if gotA.Webhooks[0].NamespaceSelector == nil {
+		t.Fatal("criticalns patch on flux-a-vwc was blocked by sibling duty Flux keys")
+	}
+	gotB, _ := cs.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, "flux-b-vwc", metav1.GetOptions{})
+	if gotB.Webhooks[0].NamespaceSelector != nil {
+		t.Fatal("criticalns patch on flux-b-vwc was not deferred by its own Flux key")
+	}
 }

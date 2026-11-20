@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -290,5 +291,43 @@ func TestWriteStormRestoreOnlyStamped(t *testing.T) {
 		Namespace("apps").Get(ctx, "hand-suspended", metav1.GetOptions{})
 	if susp, _, _ := unstructured.NestedBool(got.Object, "spec", "suspend"); !susp {
 		t.Fatal("hand-suspended object was resurrected — restore must be stamped-only")
+	}
+}
+
+func TestWriteStormHealDisabledDoesNotRestore(t *testing.T) {
+	stamped := fluxKS("apps", "was-stormed", true,
+		map[string]string{kube.AnnoWriteStormSuspendedBy: "2025-01-01T00:00:00Z"}, true)
+	dyn := probetest.OpDyn(stamped)
+	var patches int
+	dyn.PrependReactor("patch", "*", func(ktesting.Action) (bool, runtime.Object, error) {
+		patches++
+		return false, nil, nil
+	})
+	d, _ := stormDeps(t, 0, 0, nil) // clean metrics — would trigger restore if healEnabled
+	d.Dyn = dyn
+	ch := stormCheck(d, false)
+	ch.suspended = true
+	ch.reliefDue = true
+
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
+	if !res.Pass {
+		t.Fatalf("clean sweep must pass: %+v", res)
+	}
+	if patches != 0 {
+		t.Fatalf("heal-disabled check issued %d patches during restore", patches)
+	}
+	if ch.reliefDue {
+		t.Fatal("heal-disabled restore must disarm reliefDue")
+	}
+	got, err := dyn.Resource(kube.GVRFluxKustomization).
+		Namespace("apps").Get(ctx, "was-stormed", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get kustomization: %v", err)
+	}
+	if susp, _, _ := unstructured.NestedBool(got.Object, "spec", "suspend"); !susp {
+		t.Fatal("heal-disabled check unsuspended a Flux object")
+	}
+	if gotStamp := kube.EffectiveAnno(ctx, got, kube.AnnoWriteStormSuspendedBy); gotStamp == "" {
+		t.Fatal("heal-disabled check cleared the storm stamp")
 	}
 }

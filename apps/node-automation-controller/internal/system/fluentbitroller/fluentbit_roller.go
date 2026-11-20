@@ -150,11 +150,13 @@ func (r *fluentBitRoller) Reconcile(ctx context.Context, _ reconcile.Request) (c
 			return ctrl.Result{}, fmt.Errorf(
 				"confirm secret fluent-system/passiontech-pipeline on direct client: %w", err)
 		}
-		if liveHash, liveCur := pipelineDrift(live); liveHash == liveCur {
+		liveHash, liveCur := pipelineDrift(live)
+		if liveHash == liveCur {
 			log.Info("config already rolled (confirmed on direct client) — nothing to do",
 				"secret", "fluent-system/passiontech-pipeline", "hash", liveHash)
 			return res, nil
 		}
+		hash = liveHash
 	}
 
 	// The DaemonSet read stays on the direct clientset: the manager's

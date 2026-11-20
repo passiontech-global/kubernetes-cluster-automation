@@ -227,3 +227,138 @@ func TestDeleteErrorHandler(t *testing.T) {
 		t.Fatalf("generic error count = %d, want 1", errs)
 	}
 }
+
+func TestSweepPreCanceledContextSkipsAll(t *testing.T) {
+	r := &rec{}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	var confirms int
+	deleted, failed, capped := Sweep(cctx, logr.Discard(),
+		[]string{"a", "b"}, Options[string]{
+			Confirm: func(context.Context, string) (bool, error) {
+				confirms++
+				return true, nil
+			},
+			LogTarget: r.target(),
+			Delete:    r.delete(),
+			OnError:   r.onErr(),
+		})
+	if deleted != 0 || failed != 0 || capped {
+		t.Fatalf("Sweep = (%d,%d,%v), want (0,0,false)", deleted, failed, capped)
+	}
+	if confirms != 0 || len(r.calls) != 0 {
+		t.Fatalf("pre-canceled Sweep invoked callbacks: confirms=%d calls=%v", confirms, r.calls)
+	}
+}
+
+func TestSweepMidSweepCancelSuppressesErrors(t *testing.T) {
+	t.Run("cancel during Delete", func(t *testing.T) {
+		r := &rec{}
+		cctx, cancel := context.WithCancel(ctx)
+		deleted, failed, capped := Sweep(cctx, logr.Discard(),
+			[]string{"a", "b", "c"}, Options[string]{
+				LogTarget: r.target(),
+				Delete: func(_ context.Context, it string) error {
+					r.calls = append(r.calls, "del:"+it)
+					if it == "b" {
+						cancel()
+						return context.Canceled
+					}
+					return nil
+				},
+				OnError: r.onErr(),
+			})
+		if deleted != 1 || failed != 0 || capped {
+			t.Fatalf("Sweep = (%d,%d,%v), want (1,0,false)", deleted, failed, capped)
+		}
+		want := []string{"log:a", "del:a", "log:b", "del:b"}
+		if !slices.Equal(r.calls, want) {
+			t.Fatalf("calls = %v, want %v", r.calls, want)
+		}
+	})
+
+	t.Run("cancel during Confirm", func(t *testing.T) {
+		r := &rec{}
+		cctx, cancel := context.WithCancel(ctx)
+		deleted, failed, capped := Sweep(cctx, logr.Discard(),
+			[]string{"a", "b", "c"}, Options[string]{
+				Confirm: func(_ context.Context, it string) (bool, error) {
+					if it == "b" {
+						cancel()
+						return false, context.Canceled
+					}
+					return true, nil
+				},
+				LogTarget: r.target(),
+				Delete:    r.delete(),
+				OnError:   r.onErr(),
+			})
+		if deleted != 1 || failed != 0 || capped {
+			t.Fatalf("Sweep = (%d,%d,%v), want (1,0,false)", deleted, failed, capped)
+		}
+		want := []string{"log:a", "del:a"}
+		if !slices.Equal(r.calls, want) {
+			t.Fatalf("calls = %v, want %v", r.calls, want)
+		}
+	})
+}
+
+func TestSweepDeadlineExceededReportsSingleError(t *testing.T) {
+	t.Run("deadline during Delete", func(t *testing.T) {
+		r := &rec{}
+		swCtx := &deadlineSwitchCtx{Context: ctx}
+		deleted, failed, capped := Sweep(swCtx, logr.Discard(),
+			[]string{"a", "b", "c"}, Options[string]{
+				LogTarget: r.target(),
+				Delete: func(_ context.Context, it string) error {
+					r.calls = append(r.calls, "del:"+it)
+					if it == "b" {
+						swCtx.err = context.DeadlineExceeded
+						return context.DeadlineExceeded
+					}
+					return nil
+				},
+				OnError: r.onErr(),
+			})
+		if deleted != 1 || failed != 1 || capped {
+			t.Fatalf("Sweep = (%d,%d,%v), want (1,1,false)", deleted, failed, capped)
+		}
+		want := []string{"log:a", "del:a", "log:b", "del:b", "err:b"}
+		if !slices.Equal(r.calls, want) {
+			t.Fatalf("calls = %v, want %v", r.calls, want)
+		}
+	})
+
+	t.Run("deadline during Confirm", func(t *testing.T) {
+		r := &rec{}
+		swCtx := &deadlineSwitchCtx{Context: ctx}
+		deleted, failed, capped := Sweep(swCtx, logr.Discard(),
+			[]string{"a", "b", "c"}, Options[string]{
+				Confirm: func(_ context.Context, it string) (bool, error) {
+					if it == "b" {
+						swCtx.err = context.DeadlineExceeded
+						return false, context.DeadlineExceeded
+					}
+					return true, nil
+				},
+				LogTarget: r.target(),
+				Delete:    r.delete(),
+				OnError:   r.onErr(),
+			})
+		if deleted != 1 || failed != 0 || capped {
+			t.Fatalf("Sweep = (%d,%d,%v), want (1,0,false)", deleted, failed, capped)
+		}
+		want := []string{"log:a", "del:a", "err:b"}
+		if !slices.Equal(r.calls, want) {
+			t.Fatalf("calls = %v, want %v", r.calls, want)
+		}
+	})
+}
+
+type deadlineSwitchCtx struct {
+	context.Context
+	err error
+}
+
+func (d *deadlineSwitchCtx) Err() error { return d.err }

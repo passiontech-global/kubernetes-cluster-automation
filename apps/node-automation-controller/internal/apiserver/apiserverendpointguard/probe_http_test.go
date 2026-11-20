@@ -60,6 +60,38 @@ func TestFetchListRV(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects invalid UTF-8 strictly", func(t *testing.T) {
+		for _, body := range []string{
+			`{"kind":"PartialObjectMetadataList","note":"\uD800","metadata":{"resourceVersion":"123"}}`,
+			`{"metadata":{"resourceVersion":"123"},"note":"` + "\xff" + `"}`,
+		} {
+			rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+				return testutil.ProbeResponse(200, body), nil
+			}}
+			if _, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x"); err == nil {
+				t.Fatalf("expected strict json/v2 error for invalid UTF-8 payload %q", body)
+			}
+		}
+	})
+
+	t.Run("rejects duplicate object keys strictly", func(t *testing.T) {
+		rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return testutil.ProbeResponse(200, `{"metadata":{"resourceVersion":"1","resourceVersion":"2"}}`), nil
+		}}
+		if _, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x"); err == nil {
+			t.Fatal("expected strict json/v2 error for duplicate object keys")
+		}
+	})
+
+	t.Run("rejects truncated JSON strictly", func(t *testing.T) {
+		rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return testutil.ProbeResponse(200, `{"metadata":{"resourceVersion":"123"`), nil
+		}}
+		if _, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x"); err == nil {
+			t.Fatal("expected strict json/v2 error for truncated JSON")
+		}
+	})
+
 	t.Run("non-numeric resourceVersion", func(t *testing.T) {
 		rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
 			return testutil.ProbeResponse(200, `{"metadata":{"resourceVersion":"abc"}}`), nil
@@ -281,6 +313,34 @@ func TestFetchJWKSKIDs(t *testing.T) {
 		}}
 		if _, err := fetchJWKSKIDs(ctx, &http.Client{Transport: rt}, "10.0.0.1"); err == nil {
 			t.Fatal("expected HTTP error to propagate")
+		}
+	})
+
+	t.Run("rejects invalid UTF-8 strictly", func(t *testing.T) {
+		for _, body := range []string{
+			`{"keys":[{"kid":"\uD800"}]}`,
+			`{"keys":[{"kid":"` + "\xff" + `"}]}`,
+		} {
+			rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+				return testutil.ProbeResponse(200, body), nil
+			}}
+			if _, err := fetchJWKSKIDs(ctx, &http.Client{Transport: rt}, "10.0.0.1"); err == nil {
+				t.Fatalf("expected strict json/v2 error for invalid UTF-8 JWKS %q", body)
+			}
+		}
+	})
+
+	t.Run("rejects duplicate keys and truncated JSON strictly", func(t *testing.T) {
+		for _, body := range []string{
+			`{"keys":[{"kid":"a","kid":"b"}]}`,
+			`{"keys":[`,
+		} {
+			rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+				return testutil.ProbeResponse(200, body), nil
+			}}
+			if _, err := fetchJWKSKIDs(ctx, &http.Client{Transport: rt}, "10.0.0.1"); err == nil {
+				t.Fatalf("expected strict json/v2 error for malformed JWKS %q", body)
+			}
 		}
 	})
 }

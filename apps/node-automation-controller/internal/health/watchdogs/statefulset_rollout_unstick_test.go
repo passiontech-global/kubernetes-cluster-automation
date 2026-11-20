@@ -10,9 +10,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
 // stsUnstickFixture builds the wedged-rollout world: one
@@ -292,5 +294,52 @@ func TestStatefulSetRolloutUnstickReportOnly(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("app").Get(ctx, "db-0", metav1.GetOptions{}); err != nil {
 		t.Fatalf("report-only mode deleted the pod: %v", err)
+	}
+}
+
+func TestStatefulSetRolloutUnstickSelfHealKeyAndNoPodReList(t *testing.T) {
+	now := time.Now()
+	sts := rollingSTS("apps", "web")
+	wedged := stsPod("apps", "web", "web-0", "rev-old", "CrashLoopBackOff", false)
+	wedged.UID = "uid-web-0"
+	cs, chk := stsUnstickFixture(t, now, sts, wedged)
+	var podLists int
+	cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		podLists++
+		return false, nil, nil
+	})
+
+	// Seed colliding DaemonSet heal key in shared Deps.Heals — STS must NOT be suppressed.
+	chk.Heals.Stamp(probefw.SelfHealKey(CheckNameDaemonSetRolloutWedge, "apps/web"), now.Add(16*time.Minute))
+	chk.Heals.Stamp("apps/web", now.Add(16*time.Minute))
+
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	probetest.FreezeNow(chk.Deps, now.Add(16*time.Minute))
+
+	podLists = 0
+	sctx := probetest.SweepCtx(ctx, chk.Deps)
+	res := chk.Run(sctx)
+	if res.Pass {
+		t.Fatalf("aged wedge must flag: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-0", metav1.GetOptions{}); err == nil {
+		t.Fatal("wedged STS pod was suppressed by colliding DS/bare key")
+	}
+	expectedKey := probefw.SelfHealKey(CheckNameStatefulSetRolloutUnstick, "apps/web")
+	if !chk.Heals.CooledDown(expectedKey, time.Hour, now.Add(16*time.Minute)) {
+		t.Fatalf("Deps.Heals missing STS key %q", expectedKey)
+	}
+
+	podsInSweep, err := chk.Deps.AllPods(sctx)
+	if err != nil {
+		t.Fatalf("AllPods in same sweep: %v", err)
+	}
+	if podLists != 1 {
+		t.Fatalf("pod list count = %d, want 1 (no InvalidatePods re-list)", podLists)
+	}
+	for i := range podsInSweep {
+		if podsInSweep[i].Name == "web-0" {
+			t.Fatal("deleted pod still visible in same sweep after MarkPodDeleted")
+		}
 	}
 }

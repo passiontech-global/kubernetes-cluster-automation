@@ -120,7 +120,12 @@ func (u *helmReleaseUnlocker) healImmutableJobs(ctx context.Context,
 		if gone {
 			continue // already gone — nothing to reap
 		}
-		done := job.Status.Succeeded >= 1 || kube.JobTerminal(job)
+		if job.DeletionTimestamp != nil {
+			log.Info("skip: immutable Job already terminating",
+				"kustomization", key, "job", jobNS+"/"+job.Name)
+			continue
+		}
+		done := job.Status.Active == 0 && kube.JobTerminal(job)
 		if !done {
 			log.Info("skip: immutable Job still active — deleting it mid-run would orphan its pods",
 				"kustomization", key, "job", jobNS+"/"+job.Name)

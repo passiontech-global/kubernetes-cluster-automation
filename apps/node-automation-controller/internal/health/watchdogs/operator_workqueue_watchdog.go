@@ -134,7 +134,7 @@ func (p *operatorWorkqueueCheck) Run(ctx context.Context) probefw.Result {
 		// Leader-election precondition — infra failures carry the
 		// held tuples forward, "no leader to judge" resets the
 		// operator's in-RAM first-seen.
-		lease, carry, reset := p.operatorLiveness(ctx, op, now, &rep)
+		lease, carry, reset := p.operatorLiveness(ctx, op, &rep)
 		switch {
 		case carry:
 			// Never evaluated — carry the held tuples forward.

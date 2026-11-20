@@ -13,8 +13,10 @@ import (
 
 	"github.com/go-logr/logr"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/version"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/kubernetes/fake"
@@ -549,5 +551,85 @@ func TestEndpointGuardCycleRecoversPanics(t *testing.T) {
 	g.quarantineActive = false
 	if got := g.nextInterval(2 * time.Millisecond); got != 5*time.Millisecond {
 		t.Fatalf("nextInterval(steady) = %v, want 5ms", got)
+	}
+}
+
+func TestEndpointGuardMirrorSliceRetryOnConflict(t *testing.T) {
+	mirror := kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2"})
+	mirror.ResourceVersion = "1"
+	cs := fake.NewSimpleClientset(mirror)
+	dyn := testutil.NewDynamicClient(
+		kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil))
+	fakeServerVersion(cs, "1", "37")
+	g := newEndpointGuard(cs, dyn, probeTable{
+		"10.0.0.1": {err: errors.New("wedged")},
+		"10.0.0.2": apiHealthyProbe(500),
+	})
+	g.queue = "apiserver-endpoint-guard"
+
+	for range endpointGuardErrCycles - 1 {
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	attempts := 0
+	cs.PrependReactor("update", "endpointslices",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			if attempts == 1 {
+				// Use cs.Tracker().Get directly (calling cs.DiscoveryV1()...Get
+				// inside a reactor deadlocks on Fake.Invokes's non-reentrant lock).
+				obj, err := cs.Tracker().Get(
+					discoveryv1.SchemeGroupVersion.WithResource("endpointslices"),
+					endpointGuardNS, "kubernetes-89b87",
+				)
+				if err != nil {
+					t.Fatalf("tracker get mirror slice: %v", err)
+				}
+				cur := obj.(*discoveryv1.EndpointSlice).DeepCopy()
+				cur.ResourceVersion = "2"
+				ready := true
+				cur.Endpoints = append(cur.Endpoints, discoveryv1.Endpoint{
+					Addresses:  []string{"10.0.0.3"},
+					Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+				})
+				if err := cs.Tracker().Update(
+					discoveryv1.SchemeGroupVersion.WithResource("endpointslices"),
+					cur, endpointGuardNS,
+				); err != nil {
+					t.Fatalf("tracker update: %v", err)
+				}
+				return true, nil, apierrors.NewConflict(
+					schema.GroupResource{Group: "discovery.k8s.io", Resource: "endpointslices"},
+					cur.Name, errors.New("resourceVersion mismatch"))
+			}
+			return false, nil, nil
+		})
+
+	before := testutil.QueueErrorCount(t, g.queue)
+	if err := g.run(ctx); err != nil {
+		t.Fatalf("mirror slice conflict retry failed: %v", err)
+	}
+	if delta := testutil.QueueErrorCount(t, g.queue) - before; delta != 0 {
+		t.Fatalf("queue error count delta = %v, want 0 after conflict retry", delta)
+	}
+	if attempts != 2 {
+		t.Fatalf("update attempts = %d, want 2", attempts)
+	}
+	got, err := cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+		Get(ctx, "kubernetes-89b87", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs := sliceAddrSet(got)
+	if addrs["10.0.0.1"] {
+		t.Fatal("wedged IP 10.0.0.1 still in mirror slice after conflict retry")
+	}
+	if !addrs["10.0.0.2"] || !addrs["10.0.0.3"] {
+		t.Fatalf("concurrent/healthy IPs missing in mirror slice: %v", addrs)
+	}
+	if _, hasAnno := got.Annotations[endpointGuardAnno]; hasAnno {
+		t.Fatalf("mirror slice must not carry quarantine annotation: %v", got.Annotations)
 	}
 }

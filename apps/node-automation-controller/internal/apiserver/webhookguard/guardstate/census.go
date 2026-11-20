@@ -158,6 +158,7 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	listOpts := metav1.ListOptions{Limit: ListPageSize}
 	if filtered {
 		listOpts.LabelSelector = sel
+		listOpts.ResourceVersion = "0"
 	}
 	err := kube.ListEach(ctx, listOpts,
 		kube.EndpointSlices(g.CS, metav1.NamespaceAll),

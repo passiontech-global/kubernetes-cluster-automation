@@ -71,7 +71,7 @@ func TestCoreDNSUpstreamDeletesIsolatedFailingPod(t *testing.T) {
 // started while the first pod was being healed.
 func TestCoreDNSUpstreamTracksAllFlaggedPodsPastHealCap(t *testing.T) {
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
-		if strings.Contains(query, "ForwardHealthcheckFailureCount") {
+		if strings.Contains(query, "healthcheck_failures_total") {
 			return []probetest.PromTestSample{
 				{Labels: map[string]string{"pod": "coredns-bad", "namespace": "kube-system"}, Value: 1},
 				{Labels: map[string]string{"pod": "coredns-bad2", "namespace": "kube-system"}, Value: 1},
@@ -131,7 +131,7 @@ func TestCoreDNSUpstreamTracksAllFlaggedPodsPastHealCap(t *testing.T) {
 func TestCoreDNSUpstreamFleetWideDoesNotDelete(t *testing.T) {
 	// Both dns pods flagged -> no healthy sibling -> detection only.
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
-		if strings.Contains(query, "ForwardHealthcheckFailureCount") {
+		if strings.Contains(query, "healthcheck_failures_total") {
 			return []probetest.PromTestSample{
 				{Labels: map[string]string{"pod": "coredns-a", "namespace": "kube-system"}, Value: 1},
 				{Labels: map[string]string{"pod": "coredns-b", "namespace": "kube-system"}, Value: 1},
@@ -243,7 +243,7 @@ func TestCoreDNSFallbackDaemonSetCooldownPerNode(t *testing.T) {
 func coreDNSUpstreamPromServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
-		if strings.Contains(query, "ForwardHealthcheckFailureCount") {
+		if strings.Contains(query, "healthcheck_failures_total") {
 			return []probetest.PromTestSample{{
 				Labels: map[string]string{"pod": "coredns-bad", "namespace": "kube-system"},
 				Value:  1.4,
@@ -259,7 +259,7 @@ func coreDNSUpstreamPromServer(t *testing.T) *httptest.Server {
 // collapse them and silently drop one namespace's flag.
 func TestCoreDNSUpstreamDuplicateNamesAcrossNamespaces(t *testing.T) {
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
-		if strings.Contains(query, "ForwardHealthcheckFailureCount") {
+		if strings.Contains(query, "healthcheck_failures_total") {
 			return []probetest.PromTestSample{
 				{Labels: map[string]string{"pod": "coredns-dup", "namespace": "kube-system"}, Value: 1},
 				{Labels: map[string]string{"pod": "coredns-dup", "namespace": "dns-secondary"}, Value: 1},
@@ -313,5 +313,44 @@ func TestIsDNSPod(t *testing.T) {
 		if got := isDNSPod(tc.pod); got != tc.want {
 			t.Errorf("%s: isDNSPod=%v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestCoreDNSUpstreamDualMetricQueryAndLegacySupport(t *testing.T) {
+	var seenQueries []string
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		seenQueries = append(seenQueries, query)
+		if strings.Contains(query, `coredns_proxy_healthcheck_failures_total{proxy_name="forward"}`) &&
+			strings.Contains(query, "coredns_forward_healthcheck_failures_total") {
+			return []probetest.PromTestSample{{
+				Labels: map[string]string{"pod": "coredns-bad", "namespace": "kube-system"},
+				Value:  1.2,
+			}}
+		}
+		return nil
+	})
+	bad := probetest.PodWithPhase("kube-system", "coredns-bad", corev1.PodRunning, true, time.Hour)
+	good := probetest.PodWithPhase("kube-system", "coredns-good", corev1.PodRunning, true, time.Hour)
+	cs := fake.NewSimpleClientset(bad, good)
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+
+	res := probetest.MustCheck[*coreDNSUpstreamCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatalf("expected dual-metric query to flag failing pod: %+v", res)
+	}
+	foundHealthQuery := false
+	for _, q := range seenQueries {
+		if strings.Contains(q, "ForwardHealthcheckFailureCount") {
+			t.Fatalf("issued obsolete non-existent CoreDNS metric query: %q", q)
+		}
+		if strings.Contains(q, `coredns_proxy_healthcheck_failures_total{proxy_name="forward"}`) &&
+			strings.Contains(q, "coredns_forward_healthcheck_failures_total") {
+			foundHealthQuery = true
+		}
+	}
+	if !foundHealthQuery {
+		t.Fatalf("missing modern+legacy CoreDNS healthcheck failure query in %v", seenQueries)
 	}
 }

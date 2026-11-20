@@ -62,10 +62,12 @@ package clusterhealthprobes
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"runtime/debug"
+	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
@@ -185,12 +187,15 @@ func Setup(d shared.Deps) error {
 		if err != nil {
 			return err
 		}
+		waves := max(1, (len(p.checks)+checkParallelism-1)/checkParallelism)
+		runTimeout := max(2*cfg.interval, time.Duration(waves)*p.Cfg.Timeouts.PerCheck+time.Minute)
 		logf.Log.WithName(d.Name).Info("registered",
 			"checks", len(p.checks),
-			"interval", cfg.interval, "perCheckTimeout", p.Cfg.Timeouts.PerCheck,
+			"interval", cfg.interval, "runTimeout", runTimeout,
+			"perCheckTimeout", p.Cfg.Timeouts.PerCheck,
 			"checkTimeout", p.Cfg.Timeouts.Check, "httpURL", p.Cfg.HTTPContent.URL,
 			"httpExpectedContent", p.Cfg.HTTPContent.Expected)
-		return shared.AddPeriodic(d.Mgr, d.Name, cfg.interval, p.run)
+		return shared.AddPeriodicWithTimeout(d.Mgr, d.Name, cfg.interval, runTimeout, p.run)
 	})
 }
 
@@ -236,6 +241,7 @@ type checkOutcome struct {
 	pass     bool
 	why      string
 	infra    error
+	stack    string
 	timedOut bool
 }
 
@@ -264,28 +270,36 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 	// Bounded worker pool: each check runs under its own PerCheck
 	// deadline — a hung apiserver call still cancels only that
 	// check's share — and slots its verdict into outcomes[idx].
-	// Workers never fail (a check's error is the product, carried in
-	// the outcome), so the group's error is always nil and g.Wait
-	// just joins the pool.
+	// Jobs are pre-queued into a buffered channel and drained by a
+	// fixed worker pool so the main goroutine never blocks on
+	// g.SetLimit and immediately begins streaming completed prefix
+	// slots to p.report.
 	outcomes := make([]checkOutcome, len(p.checks))
 	finished := make(chan int, len(p.checks))
-	var g errgroup.Group
-	g.SetLimit(checkParallelism)
+	jobs := make(chan int, len(p.checks))
 	for i := range p.checks {
-		idx, entry := i, p.checks[i]
-		g.Go(func() error {
-			// A cancelled sweep context (SIGTERM during
-			// rollout/shutdown) is not a health signal: the slot
-			// stays empty so no verdict is invented for a check the
-			// dying pod never ran — the surviving leader's next
-			// cycle reports it.
-			if ctx.Err() == nil {
-				outcomes[idx] = runCheckIsolated(entry, ctx,
-					p.Cfg.Timeouts.PerCheck)
+		jobs <- i
+	}
+	close(jobs)
+	var wg sync.WaitGroup
+	workers := min(checkParallelism, len(p.checks))
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				// A cancelled sweep context (SIGTERM during
+				// rollout/shutdown) is not a health signal: the slot
+				// stays empty so no verdict is invented for a check
+				// the dying pod never ran — the surviving leader's
+				// next cycle reports it.
+				if ctx.Err() == nil {
+					outcomes[idx] = runCheckIsolated(p.checks[idx], ctx,
+						p.Cfg.Timeouts.PerCheck)
+				}
+				finished <- idx
 			}
-			finished <- idx
-			return nil
-		})
+		}()
 	}
 
 	// commitIdx: workers signal each finished slot and this loop
@@ -299,7 +313,7 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 	for remaining > 0 {
 		select {
 		case <-ctx.Done():
-			remaining = 0 // stop committing; g.Wait still joins
+			remaining = 0 // stop committing; wg.Wait still joins
 		case idx := <-finished:
 			if ctx.Err() != nil {
 				// SIGTERM raced the completion signal — select
@@ -332,9 +346,15 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 				// queue's run-error counters.
 				if o.infra != nil {
 					metrics.IncError(p.Name)
-					log.Error(o.infra,
-						"health check probe errored — marked FAIL",
-						"check", o.name)
+					if o.stack != "" {
+						log.Error(o.infra,
+							"health check probe panicked — marked FAIL",
+							"check", o.name, "stack", o.stack)
+					} else {
+						log.Error(o.infra,
+							"health check probe errored — marked FAIL",
+							"check", o.name)
+					}
 				} else if !o.pass {
 					log.Info("health check FAIL",
 						"check", o.name, "reason", o.why)
@@ -342,18 +362,25 @@ func (p *clusterHealthProber) run(ctx context.Context) error {
 			}
 		}
 	}
-	_ = g.Wait()
+	wg.Wait()
 
 	// A cancelled sweep context (SIGTERM during rollout/shutdown) is
 	// not a health signal: emitting FAIL=1 or a run error now would
 	// leave fake series behind on the dying pod. Bail out silently —
 	// the surviving leader's next cycle reports (completed workers'
 	// slots included: half a sweep's series is still half a fake
-	// signal).
+	// signal). By contrast, DeadlineExceeded means the sweep blew its
+	// overall RunTimeout budget — count it once here and return nil
+	// so Periodic.invokeOnce does not double-count.
 	if err := ctx.Err(); err != nil {
-		log.V(1).Info("sweep context cancelled — bailing without reporting",
-			"error", err)
-		return nil // cancelled ctx is not a run error — bail silently
+		if errors.Is(err, context.DeadlineExceeded) {
+			metrics.IncError(p.Name)
+			log.Error(err, "sweep deadline exceeded — bailing without completing")
+		} else {
+			log.V(1).Info("sweep context cancelled — bailing without reporting",
+				"error", err)
+		}
+		return nil
 	}
 
 	// Post-sweep mutation guard: re-verify every census memo the
@@ -396,20 +423,25 @@ func runCheckIsolated(entry checkEntry, ctx context.Context,
 				name:  entry.name,
 				ran:   true,
 				infra: fmt.Errorf("check panicked: %v", r),
+				stack: string(debug.Stack()),
 			}
 		}
 	}()
 	cctx, cancel := context.WithTimeout(ctx, perCheck)
 	defer cancel()
 	res := entry.check.Run(cctx)
-	// An Infra error is "can't tell", never "healthy": a check that
-	// returns Result{Pass:true, Infra:err} must still report FAIL.
+	// An Infra error or per-check timeout is "can't tell", never
+	// "healthy": a check that ignores cctx.Done and returns Pass:true
+	// after PerCheck expires must still report FAIL.
 	// The queue IncError for o.infra happens once in run()'s report
 	// loop — do NOT add one here (the run would double-count it).
-	out.pass = res.Pass && res.Infra == nil
+	out.timedOut = errors.Is(cctx.Err(), context.DeadlineExceeded)
+	out.pass = res.Pass && res.Infra == nil && !out.timedOut
 	out.why = res.Why
+	if out.timedOut && out.why == "" {
+		out.why = fmt.Sprintf("check timed out after %s", perCheck)
+	}
 	out.infra = res.Infra
-	out.timedOut = cctx.Err() == context.DeadlineExceeded
 	return out
 }
 

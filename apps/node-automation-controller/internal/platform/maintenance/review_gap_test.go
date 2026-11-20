@@ -10,10 +10,12 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
@@ -122,5 +124,89 @@ func TestVerdictScopeBackwardClockReevaluates(t *testing.T) {
 	// And a normal forward read inside the TTL still memoizes.
 	if _, err := v.Scope(ctx, cs, dyn, t0.Add(time.Minute)); err != nil {
 		t.Fatalf("forward-clock Scope err=%v", err)
+	}
+}
+
+type panicOnceNodeReader struct {
+	started chan struct{}
+	release chan struct{}
+	calls   int
+	mu      sync.Mutex
+}
+
+func (r *panicOnceNodeReader) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	r.mu.Lock()
+	r.calls++
+	call := r.calls
+	r.mu.Unlock()
+	if call == 1 {
+		close(r.started)
+		<-r.release
+		panic("boom inside node reader")
+	}
+	nl := list.(*corev1.NodeList)
+	nl.Items = nil
+	return nil
+}
+
+// A panic inside maintenanceScope must clear v.flight, fail closed for
+// blocked waiters via f.err, close f.done, and let subsequent Scope
+// calls evaluate normally instead of deadlocking the process.
+func TestVerdictScopePanicUnblocksWaitersAndResetsFlight(t *testing.T) {
+	ctx := t.Context()
+	cs := fake.NewSimpleClientset()
+	dyn := maintenanceDynFake()
+	nr := &panicOnceNodeReader{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	v := &Verdict{NodeReader: nr}
+	now := time.Now()
+
+	leaderPanicked := make(chan any, 1)
+	go func() {
+		defer func() {
+			leaderPanicked <- recover()
+		}()
+		_, _ = v.Scope(ctx, cs, dyn, now)
+	}()
+
+	<-nr.started
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		_, err := v.Scope(ctx, cs, dyn, now)
+		waiterErr <- err
+	}()
+
+	// Wait briefly so the waiter registers on v.flight before releasing the panic.
+	time.Sleep(20 * time.Millisecond)
+	close(nr.release)
+
+	select {
+	case rec := <-leaderPanicked:
+		if rec == nil {
+			t.Fatal("leader did not panic as expected")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader did not return")
+	}
+
+	select {
+	case err := <-waiterErr:
+		if err == nil {
+			t.Fatal("waiter returned nil error on panicked flight — must fail closed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter deadlocked on f.done after leader panic")
+	}
+
+	// Subsequent evaluation must run cleanly (v.flight cleared, v.at not stamped).
+	sc, err := v.Scope(ctx, cs, dyn, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("post-panic Scope err = %v", err)
+	}
+	if sc.Held {
+		t.Fatalf("post-panic Scope = %+v, want clear", sc)
 	}
 }

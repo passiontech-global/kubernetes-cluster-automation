@@ -254,3 +254,82 @@ func TestTemplateAnnosAndPodTombstoneGen(t *testing.T) {
 		t.Fatal("base map must not be mutated")
 	}
 }
+
+func TestReleaseWorkloadDisruption(t *testing.T) {
+	// Outside a sweep and nil pod are safe no-ops.
+	ReleaseWorkloadDisruption(t.Context(), nil)
+	rs := controllerRef("ReplicaSet", "web-6d9f")
+	ReleaseWorkloadDisruption(t.Context(), overlayPod("web-0", rs))
+
+	ctx := WithSweepOverlay(t.Context())
+	ReleaseWorkloadDisruption(ctx, nil)
+
+	p1 := overlayPod("web-0", rs)
+	p2 := overlayPod("web-1", rs)
+	if !TryReserveWorkloadDisruption(ctx, p1) {
+		t.Fatal("initial reserve must succeed")
+	}
+	if TryReserveWorkloadDisruption(ctx, p2) {
+		t.Fatal("second live sibling must be blocked while reserved")
+	}
+
+	// Terminal pod release must NOT clear a live sibling's reservation.
+	dead := overlayPod("web-dead", rs)
+	dead.Status.Phase = corev1.PodSucceeded
+	ReleaseWorkloadDisruption(ctx, dead)
+	if TryReserveWorkloadDisruption(ctx, p2) {
+		t.Fatal("terminal pod release erased live sibling's slot")
+	}
+
+	// Real release allows sibling reservation.
+	ReleaseWorkloadDisruption(ctx, p1)
+	if !TryReserveWorkloadDisruption(ctx, p2) {
+		t.Fatal("sibling reserve must succeed after ReleaseWorkloadDisruption")
+	}
+}
+
+func TestEffectiveAnnosFastPathZeroAllocsAndDelta(t *testing.T) {
+	obj := overlayPod("p-annos", nil)
+	obj.SetAnnotations(map[string]string{"a": "1", "b": "2"})
+	other := overlayPod("p-other", nil)
+
+	// 1. Outside a sweep: zero allocs, returns base map.
+	plainCtx := t.Context()
+	if got := EffectiveAnnos(plainCtx, obj); got["a"] != "1" || len(got) != 2 {
+		t.Fatalf("outside sweep = %v, want {a:1 b:2}", got)
+	}
+	if allocs := testing.AllocsPerRun(20, func() {
+		_ = EffectiveAnnos(plainCtx, obj)
+	}); allocs != 0 {
+		t.Fatalf("outside sweep EffectiveAnnos allocs = %v, want 0", allocs)
+	}
+
+	// 2. Inside a sweep with empty overlay: zero allocs.
+	ctx := WithSweepOverlay(t.Context())
+	if allocs := testing.AllocsPerRun(20, func() {
+		_ = EffectiveAnnos(ctx, obj)
+	}); allocs != 0 {
+		t.Fatalf("empty overlay EffectiveAnnos allocs = %v, want 0", allocs)
+	}
+
+	// 3. Delta on another object only: still zero allocs for obj.
+	RecordAnnoPatch(ctx, other, []byte(`{"metadata":{"annotations":{"x":"y"}}}`))
+	if allocs := testing.AllocsPerRun(20, func() {
+		_ = EffectiveAnnos(ctx, obj)
+	}); allocs != 0 {
+		t.Fatalf("unrelated delta EffectiveAnnos allocs = %v, want 0", allocs)
+	}
+
+	// 4. Delta on obj: add, edit, delete reflected without mutating obj.
+	RecordAnnoPatch(ctx, obj, []byte(`{"metadata":{"annotations":{"a":"new","b":null,"c":"added"}}}`))
+	got := EffectiveAnnos(ctx, obj)
+	if got["a"] != "new" || got["c"] != "added" {
+		t.Fatalf("overlay EffectiveAnnos = %v, want a=new c=added", got)
+	}
+	if _, ok := got["b"]; ok {
+		t.Fatalf("overlay EffectiveAnnos kept deleted key b: %v", got)
+	}
+	if obj.GetAnnotations()["a"] != "1" || obj.GetAnnotations()["b"] != "2" {
+		t.Fatal("EffectiveAnnos mutated base object map")
+	}
+}

@@ -89,8 +89,9 @@ func isDNSPod(pod *corev1.Pod) bool {
 
 // checkCoreDNSUpstream detects per-pod CoreDNS/node-local-dns
 // upstream failures via Prometheus: healthcheck failures
-// (coredns_ForwardHealthcheckFailureCount_total rate >0.5/s over 5m)
-// or a SERVFAIL ratio >15%. When a SINGLE dns pod fails while a
+// (coredns_proxy_healthcheck_failures_total{proxy_name="forward"} or
+// legacy coredns_forward_healthcheck_failures_total rate >0.5/s over
+// 5m) or a SERVFAIL ratio >15%. When a SINGLE dns pod fails while a
 // sibling in the same namespace stays healthy, the pod is deleted
 // (30m cooldown) — an upstream socket/conntrack wedge is per-pod
 // state a restart clears. Both queries failing is inconclusive and
@@ -109,7 +110,8 @@ func (p *coreDNSUpstreamCheck) Run(ctx context.Context) probefw.Result {
 	// the record() below then flags "unknown/<name>" and the heal
 	// resolves the wrong namespace's pod.
 	healthSeries, errH := p.PromQuery(ctx,
-		`sum by (namespace, pod) (rate(coredns_ForwardHealthcheckFailureCount_total[5m])) > 0.5`)
+		`(sum by (namespace, pod) (rate(coredns_proxy_healthcheck_failures_total{proxy_name="forward"}[5m])) or `+
+			`sum by (namespace, pod) (rate(coredns_forward_healthcheck_failures_total[5m]))) > 0.5`)
 	servfailSeries, errS := p.PromQuery(ctx,
 		`sum by (namespace, pod) (rate(coredns_dns_responses_total{rcode="SERVFAIL"}[5m]))`+
 			` / clamp_min(sum by (namespace, pod) (rate(coredns_dns_responses_total[5m])), 1) > 0.15`)

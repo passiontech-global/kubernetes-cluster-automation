@@ -12,8 +12,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
@@ -261,5 +263,47 @@ func TestRolloutWedgeNudgeLandsOnPlainDeployment(t *testing.T) {
 	}
 	if !templateNudged(t, cs, "apps", "plain") {
 		t.Fatal("template nudge did not land on an eligible Deployment")
+	}
+}
+
+func TestRolloutWedgeTerminalDeleteUsesTombstoneWithoutReList(t *testing.T) {
+	dep := wedgeDep("apps", "staged", 3, "ProgressDeadlineExceeded",
+		corev1.ConditionFalse, rolloutWedgeMinAge+time.Minute)
+	dep.UID = "staged-uid"
+	rsOld := wedgeRS("apps", "staged-old", "staged-uid", "staged", 1)
+	rsOld.UID = "rs-old-uid"
+	terminal := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "apps", Name: "staged-old-abc", UID: "terminal-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet",
+				Name: rsOld.Name, UID: rsOld.UID, Controller: ptr.To(true),
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+	cs := fake.NewSimpleClientset(dep, rsOld, terminal)
+	var podLists int
+	cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		podLists++
+		return false, nil, nil
+	})
+	d := probetest.NewDeps(cs, probetest.OpDyn())
+	ch := &deploymentRolloutWedgeCheck{Deps: d}
+
+	sctx := probetest.SweepCtx(ctx, ch.Deps)
+	ch.Run(sctx)
+
+	podsInSweep, err := ch.Deps.AllPods(sctx)
+	if err != nil {
+		t.Fatalf("AllPods in same sweep: %v", err)
+	}
+	if podLists != 1 {
+		t.Fatalf("pod list count = %d, want 1 (no InvalidatePods re-list)", podLists)
+	}
+	for i := range podsInSweep {
+		if podsInSweep[i].Name == terminal.Name {
+			t.Fatal("tombstoned terminal pod still visible in same sweep")
+		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -50,25 +51,81 @@ const maintenanceStampRefreshFloor = 10 * time.Minute
 // private here because platform cannot import the domain package).
 const remediationNodeNameAnno = "remediation.medik8s.io/node-name"
 
+// StampTracker records the exact cluster-maintenance-until stamp
+// values written by this controller per node so unstamp only removes
+// controller-owned stamps and never touches manual operator stamps
+// (even those <= 16m) or values overwritten by an operator.
+// Zero value is ready for use.
+type StampTracker struct {
+	mu    sync.Mutex
+	owned map[string]string
+}
+
+var defaultStampTracker StampTracker
+
+func (t *StampTracker) record(name, stamp string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.owned == nil {
+		t.owned = map[string]string{}
+	}
+	t.owned[name] = stamp
+}
+
+func (t *StampTracker) owns(name, value string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	want, ok := t.owned[name]
+	return ok && want == value
+}
+
+func (t *StampTracker) forget(name string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.owned, name)
+}
+
+func (t *StampTracker) pruneMissing(nodes []corev1.Node) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.owned) == 0 {
+		return
+	}
+	present := make(map[string]struct{}, len(nodes))
+	for i := range nodes {
+		present[nodes[i].Name] = struct{}{}
+	}
+	for name := range t.owned {
+		if _, ok := present[name]; !ok {
+			delete(t.owned, name)
+		}
+	}
+}
+
 // StampMaintenanceTargets is the L1↔L3 coordination WRITE half of
 // the maintenance mutex — deliberately separate from the read-only
 // MaintenanceActive verdict so a "does maintenance hold?" query can
-// never patch Nodes as a side effect. Each pass converges every
-// node's cluster-maintenance-until annotation toward the active
-// target set:
+// never patch Nodes as a side effect. Delegates to the process-wide
+// defaultStampTracker; tests and multi-instance callers can drive
+// an isolated *StampTracker via (*StampTracker).StampMaintenanceTargets.
+func StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
+	dyn dynamic.Interface, nodeReader kube.CachedNodeReader, now time.Time) {
+	defaultStampTracker.StampMaintenanceTargets(ctx, cs, dyn, nodeReader, now)
+}
+
+// StampMaintenanceTargets converges every node's
+// cluster-maintenance-until annotation toward the active target set:
 //
 //   - actively-cordoned nodes and nodes named by live medik8s
 //     remediation CRs stamp INDIVIDUALLY — a single-node SNR must
 //     not freeze every node's L1 self-heal;
 //   - a live autopilot Plan or kured lock is cluster-wide by
 //     nature (upgrade / reboot drain) — every node takes the stamp;
-//   - a node OUTSIDE the target set has its stamp REMOVED when the
-//     value is one this controller could have written — maintenance
-//     ending must not leave agents paused on a stale window, and
-//     waiting out the 15m TTL would extend every drain's tail by
-//     that much. The unstamp keys off the STAMP target computation
-//     (2h cordon horizon), never the 45m verdict window: a node
-//     cordoned 90m is still mid-drain for stamping purposes.
+//   - a node OUTSIDE the target set has its stamp REMOVED only when
+//     this tracker recorded that exact stamp value on a prior
+//     successful patch — maintenance ending must not leave agents
+//     paused on a stale window, while manual operator stamps (of any
+//     duration/format) and manual overwrites are never touched.
 //
 // Best-effort by contract: per-node patch errors are swallowed (a
 // failed stamp costs one agent cache window, never a wrong verdict)
@@ -76,14 +133,18 @@ const remediationNodeNameAnno = "remediation.medik8s.io/node-name"
 // targets — but a degraded read also disables the unstamp half:
 // removing a hold on a signal we failed to observe is the one
 // direction that must fail closed.
-func StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
+func (t *StampTracker) StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
 	dyn dynamic.Interface, nodeReader kube.CachedNodeReader, now time.Time) {
+	if t == nil {
+		t = &defaultStampTracker
+	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	nodes, err := kube.ListNodesCached(ctx, nodeReader, cs)
 	if err != nil {
 		return
 	}
+	t.pruneMissing(nodes)
 	all, names, complete := maintenanceStampTargets(ctx, cs, dyn, nodes, now)
 	if !all && len(names) == 0 && !complete {
 		return // degraded read, nothing to stamp, unstamp unsafe
@@ -94,9 +155,9 @@ func StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
 	for i := range nodes {
 		n := &nodes[i]
 		if all || names[n.Name] {
-			if t, ok := kube.ParseAnnoTime(n.Annotations[nodecond.AnnoClusterMaintenanceUntil]); ok &&
-				t.After(floor) {
-				continue // stamp fresh enough — skip the write
+			if parsed, ok := kube.ParseAnnoTime(n.Annotations[nodecond.AnnoClusterMaintenanceUntil]); ok &&
+				parsed.After(floor) {
+				continue // stamp fresh enough — skip the write without claiming foreign stamps
 			}
 			if stampPatch == nil {
 				var perr error
@@ -107,16 +168,23 @@ func StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
 					return
 				}
 			}
-			_, _ = cs.CoreV1().Nodes().Patch(ctx, n.Name,
-				types.MergePatchType, stampPatch, metav1.PatchOptions{})
+			if _, err := cs.CoreV1().Nodes().Patch(ctx, n.Name,
+				types.MergePatchType, stampPatch, metav1.PatchOptions{}); err == nil {
+				t.record(n.Name, stamp)
+			}
 			continue
 		}
 		if !complete {
 			continue // a signal read failed — never drop a hold blind
 		}
 		v, ok := n.Annotations[nodecond.AnnoClusterMaintenanceUntil]
-		if !ok || !controllerOwnedStamp(v, now) {
-			continue // absent, or a value this controller did not write
+		if !ok {
+			t.forget(n.Name)
+			continue
+		}
+		if !t.owns(n.Name, v) {
+			t.forget(n.Name) // drop stale ownership if an operator overwrote the stamp
+			continue
 		}
 		if unstampPatch == nil {
 			var perr error
@@ -127,30 +195,11 @@ func StampMaintenanceTargets(ctx context.Context, cs kubernetes.Interface,
 				return
 			}
 		}
-		_, _ = cs.CoreV1().Nodes().Patch(ctx, n.Name,
-			types.MergePatchType, unstampPatch, metav1.PatchOptions{})
+		if _, err := cs.CoreV1().Nodes().Patch(ctx, n.Name,
+			types.MergePatchType, unstampPatch, metav1.PatchOptions{}); err == nil {
+			t.forget(n.Name)
+		}
 	}
-}
-
-// controllerOwnedStamp reports whether an annotation value has the
-// shape THIS controller writes: an RFC3339 timestamp no further out
-// than the stamp TTL plus a minute of slack. The stamp
-// carries no owner field, so ownership is the value domain — a
-// parseable timestamp inside the writable window is a stamp we (or
-// a previous replica of us) could have written; anything else (a
-// hand-set sentinel, another tool's format, a far-future "forever"
-// mark) is left untouched. Past timestamps pass: an expired stamp
-// is dead weight regardless of which replica wrote it, and removing
-// it cannot extend a hold. The one-minute slack covers write/read
-// clock skew between replicas — a live stamp's value is always
-// <= its write time + TTL, so now+TTL+1m is the widest value this
-// controller can legitimately have on a node.
-func controllerOwnedStamp(value string, now time.Time) bool {
-	t, ok := kube.ParseAnnoTime(value)
-	if !ok {
-		return false
-	}
-	return !t.After(now.Add(maintenanceStampTTL + time.Minute))
 }
 
 // maintenanceStampTargets resolves which nodes the active

@@ -93,6 +93,16 @@ type unblockHealer struct {
 	// APIService at once would churn replicas the PDBs were asked
 	// to protect. Reset at the top of sweepUnblock.
 	sweepEvicted int
+	// sweepCap overrides apiServiceUnblockSweepCap in tests; <= 0
+	// falls back to apiServiceUnblockSweepCap.
+	sweepCap int
+}
+
+func (u *unblockHealer) effectiveSweepCap() int {
+	if u.sweepCap > 0 {
+		return u.sweepCap
+	}
+	return apiServiceUnblockSweepCap
 }
 
 // unblockCandidate is one APIService that passed the cheap
@@ -248,7 +258,7 @@ func (u *unblockHealer) healCandidate(ctx context.Context,
 	// One pod restart per sweep across ALL candidates — checked
 	// before the target lookup so a spent sweep does not pay the
 	// Service get + pod list per remaining candidate.
-	if u.sweepEvicted >= apiServiceUnblockSweepCap {
+	if u.sweepEvicted >= u.effectiveSweepCap() {
 		return false
 	}
 	svcNs, svcName, _ := apiServiceBackend(svc)

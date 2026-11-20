@@ -7,8 +7,14 @@ package shared
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
+	"runtime/debug"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -29,6 +35,139 @@ import (
 // periodic — replaces a shell-operator `schedule:` binding.
 // ---------------------------------------------------------------------------
 
+// DefaultLivenessFloor is the minimum staleness budget for any
+// active Periodic loop — keeps short-interval loops from tripping
+// /healthz during normal apiserver jitter.
+const DefaultLivenessFloor = 15 * time.Minute
+
+var monoEpoch = time.Now()
+
+type livenessCtxKey struct{}
+
+type loopBeat struct {
+	name         string
+	staleAfter   atomic.Int64
+	lastProgress atomic.Int64
+}
+
+// Liveness tracks monotonic progress across active leader-elected
+// Periodic loops so /healthz can detect wedged run loops without
+// false-failing on standby replicas (0 registered loops) or NTP
+// wall-clock jumps.
+type Liveness struct {
+	// Floor sets the minimum staleness budget; <= 0 uses
+	// DefaultLivenessFloor.
+	Floor time.Duration
+
+	mu    sync.Mutex
+	loops []*loopBeat
+
+	epoch time.Time
+	nowFn func() time.Duration
+}
+
+// NewLiveness constructs a Liveness tracker anchored to the
+// monotonic clock at creation time.
+func NewLiveness() *Liveness {
+	return &Liveness{
+		Floor: DefaultLivenessFloor,
+		epoch: time.Now(),
+	}
+}
+
+// WithLiveness attaches l to ctx so every Periodic loop started under
+// ctx registers and heartbeats automatically.
+func WithLiveness(ctx context.Context, l *Liveness) context.Context {
+	if l == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, livenessCtxKey{}, l)
+}
+
+// LivenessFromContext returns the Liveness tracker attached to ctx,
+// or nil if none was installed.
+func LivenessFromContext(ctx context.Context) *Liveness {
+	if ctx == nil {
+		return nil
+	}
+	l, _ := ctx.Value(livenessCtxKey{}).(*Liveness)
+	return l
+}
+
+func (l *Liveness) monoNow() time.Duration {
+	if l != nil && l.nowFn != nil {
+		return l.nowFn()
+	}
+	epoch := monoEpoch
+	if l != nil && !l.epoch.IsZero() {
+		epoch = l.epoch
+	}
+	d := time.Since(epoch) + 1
+	if d < 1 {
+		return 1
+	}
+	return d
+}
+
+func (l *Liveness) floor() time.Duration {
+	if l != nil && l.Floor > 0 {
+		return l.Floor
+	}
+	return DefaultLivenessFloor
+}
+
+func (l *Liveness) register(name string, budget time.Duration) *loopBeat {
+	b := &loopBeat{name: name}
+	b.staleAfter.Store(int64(budget))
+	b.lastProgress.Store(int64(l.monoNow()))
+	l.mu.Lock()
+	l.loops = append(l.loops, b)
+	l.mu.Unlock()
+	return b
+}
+
+func (l *Liveness) unregister(b *loopBeat) {
+	if l == nil || b == nil {
+		return
+	}
+	l.mu.Lock()
+	for i, existing := range l.loops {
+		if existing == b {
+			l.loops = append(l.loops[:i], l.loops[i+1:]...)
+			break
+		}
+	}
+	l.mu.Unlock()
+}
+
+// Check implements controller-runtime's healthz.Checker signature:
+// returns nil when no loops are registered (standby / pre-start) or
+// every active loop has progressed within its staleness budget.
+func (l *Liveness) Check(_ *http.Request) error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	loops := slices.Clone(l.loops)
+	l.mu.Unlock()
+	now := l.monoNow()
+	for _, b := range loops {
+		last := time.Duration(b.lastProgress.Load())
+		if last <= 0 {
+			continue
+		}
+		budget := time.Duration(b.staleAfter.Load())
+		if budget <= 0 {
+			continue
+		}
+		if elapsed := now - last; elapsed > budget {
+			return fmt.Errorf("periodic loop %q stale for %s (budget %s)",
+				b.name, elapsed.Round(time.Second), budget)
+		}
+	}
+	return nil
+}
+
 // Periodic replaces a shell-operator `schedule:` binding — a
 // manager.Runnable that ticks fn on interval. Start owns run-level
 // error accounting: every non-nil fn return IncErrors p.Name exactly
@@ -45,6 +184,21 @@ type Periodic struct {
 	NextInterval func(prev time.Duration) time.Duration
 	Fn           func(ctx context.Context) error
 	Log          logr.Logger
+	// Liveness overrides the context-injected Liveness tracker when
+	// non-nil (useful for isolated unit tests).
+	Liveness *Liveness
+}
+
+func (p *Periodic) effectiveTimeout() time.Duration {
+	if p.RunTimeout > 0 {
+		return p.RunTimeout
+	}
+	return max(2*p.Interval, 3*time.Minute)
+}
+
+func (p *Periodic) livenessBudget(wait, floor time.Duration) time.Duration {
+	span := max(p.Interval, wait)
+	return max(2*span+p.effectiveTimeout(), floor)
 }
 
 func (p *Periodic) Start(ctx context.Context) error {
@@ -70,6 +224,22 @@ func (p *Periodic) Start(ctx context.Context) error {
 		log = logf.FromContext(ctx).WithName(p.Name)
 	}
 	runCtx := logf.IntoContext(ctx, log)
+
+	liveness := p.Liveness
+	if liveness == nil {
+		liveness = LivenessFromContext(ctx)
+	}
+	var beat *loopBeat
+	if liveness != nil {
+		beat = liveness.register(p.Name, p.livenessBudget(p.Interval, liveness.floor()))
+		defer liveness.unregister(beat)
+	}
+	stamp := func() {
+		if beat != nil {
+			beat.lastProgress.Store(int64(liveness.monoNow()))
+		}
+	}
+
 	// De-phase the sweep modules: every AddPeriodic caller begins at
 	// the same startup moment, so identical NewTicker intervals would
 	// fire all modules on the same wall-clock minute — a thundering
@@ -95,16 +265,17 @@ func (p *Periodic) Start(ctx context.Context) error {
 		return nil
 	case <-timer.C:
 	}
-	if err := p.runOnce(runCtx); err != nil {
-		metrics.IncError(p.Name)
-		log.Error(err, "periodic run failed")
-	}
+	p.invokeOnce(runCtx, log)
+	stamp()
 	if p.NextInterval != nil {
 		cur := p.Interval
 		for {
 			cur = p.NextInterval(cur)
 			if cur <= 0 {
 				cur = p.Interval
+			}
+			if beat != nil {
+				beat.staleAfter.Store(int64(p.livenessBudget(cur, liveness.floor())))
 			}
 			waitTimer := time.NewTimer(cur)
 			select {
@@ -113,10 +284,8 @@ func (p *Periodic) Start(ctx context.Context) error {
 				return nil
 			case <-waitTimer.C:
 			}
-			if err := p.runOnce(runCtx); err != nil {
-				metrics.IncError(p.Name)
-				log.Error(err, "periodic run failed")
-			}
+			p.invokeOnce(runCtx, log)
+			stamp()
 		}
 	}
 	// ±5% per-tick jitter: modules sharing an interval (the 5/10/
@@ -132,6 +301,9 @@ func (p *Periodic) Start(ctx context.Context) error {
 		if wait < time.Second {
 			wait = time.Second
 		}
+		if beat != nil && wait > p.Interval {
+			beat.staleAfter.Store(int64(p.livenessBudget(wait, liveness.floor())))
+		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -139,35 +311,50 @@ func (p *Periodic) Start(ctx context.Context) error {
 			return nil
 		case <-timer.C:
 		}
-		if err := p.runOnce(runCtx); err != nil {
-			metrics.IncError(p.Name)
+		p.invokeOnce(runCtx, log)
+		stamp()
+	}
+}
+
+type panicError struct {
+	val   any
+	stack string
+}
+
+func (e *panicError) Error() string {
+	return fmt.Sprintf("panic in periodic run: %v", e.val)
+}
+
+func (p *Periodic) invokeOnce(ctx context.Context, log logr.Logger) {
+	if err := p.runOnce(ctx); err != nil {
+		metrics.IncError(p.Name)
+		var pe *panicError
+		if errors.As(err, &pe) {
+			log.Error(err, "periodic run failed", "stack", pe.stack)
+		} else {
 			log.Error(err, "periodic run failed")
 		}
 	}
 }
 
 // runOnce invokes Fn once, converting a panic into a plain run error
-// so the tick loop treats it exactly like a returned error. The
-// choice is deliberate — panic → run error + continue, never
-// propagate: controller-runtime does not recover Runnable panics, so
-// an unrecovered panic in one module's Fn would take down the whole
-// 32-module operator process — a single module's bug crash-looping
-// the entire fleet. Folding the panic into the error path keeps the
-// ticker alive while the failure still surfaces where ops looks for
-// it: IncError bumps shell_operator_hook_run_errors_total{queue} and
-// the "periodic run failed" line logs the recovered value under the
-// module's named logger. No stack is captured — the named logger +
-// queue counter already attribute the failure to the module, which
-// is all the run-level contract needs.
+// (capturing debug.Stack) so the tick loop treats it exactly like a
+// returned error. The choice is deliberate — panic → run error +
+// continue, never propagate: controller-runtime does not recover
+// Runnable panics, so an unrecovered panic in one module's Fn would
+// take down the whole 32-module operator process — a single module's
+// bug crash-looping the entire fleet. Folding the panic into the
+// error path keeps the ticker alive while the failure still surfaces
+// where ops looks for it: IncError bumps
+// shell_operator_hook_run_errors_total{queue} and the "periodic run
+// failed" line logs the recovered value plus stack under the
+// module's named logger.
 func (p *Periodic) runOnce(ctx context.Context) (err error) {
 	// Default run budget for modules that declare none:
 	// max(2*Interval, 3m) — a wedged sweep must not park its
 	// goroutine forever, and a run legitimately longer than its
 	// own period is already a bug the timeout should surface.
-	timeout := p.RunTimeout
-	if timeout <= 0 {
-		timeout = max(2*p.Interval, 3*time.Minute)
-	}
+	timeout := p.effectiveTimeout()
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -175,7 +362,10 @@ func (p *Periodic) runOnce(ctx context.Context) (err error) {
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("panic in periodic run: %v", recovered)
+			err = &panicError{
+				val:   recovered,
+				stack: string(debug.Stack()),
+			}
 		}
 	}()
 	return p.Fn(ctx)
@@ -189,15 +379,23 @@ func (p *Periodic) runOnce(ctx context.Context) (err error) {
 // sweep — returning an error here instead lets setupModules abort
 // boot with the module name attached.
 func AddPeriodic(mgr manager.Manager, name string, interval time.Duration, fn func(ctx context.Context) error) error {
+	return AddPeriodicWithTimeout(mgr, name, interval, 0, fn)
+}
+
+// AddPeriodicWithTimeout is AddPeriodic with an explicit per-run
+// RunTimeout override (<= 0 uses Periodic's default
+// max(2*Interval, 3m)).
+func AddPeriodicWithTimeout(mgr manager.Manager, name string, interval, runTimeout time.Duration, fn func(ctx context.Context) error) error {
 	if interval < time.Second {
 		return fmt.Errorf("periodic %q: interval must be >= 1s, got %s",
 			name, interval)
 	}
 	return mgr.Add(&Periodic{
-		Name:     name,
-		Interval: interval,
-		Fn:       fn,
-		Log:      mgr.GetLogger().WithName(name),
+		Name:       name,
+		Interval:   interval,
+		RunTimeout: runTimeout,
+		Fn:         fn,
+		Log:        mgr.GetLogger().WithName(name),
 	})
 }
 

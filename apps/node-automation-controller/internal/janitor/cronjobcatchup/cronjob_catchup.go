@@ -121,7 +121,10 @@ func (c *cronJobCatchup) run(ctx context.Context) error {
 	now := c.now.Now()
 
 	cronjobs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		},
 		kube.CronJobs(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list cronjobs: %w", err) // periodic wrapper IncErrors c.queue

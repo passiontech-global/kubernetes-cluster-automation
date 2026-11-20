@@ -72,12 +72,15 @@ const (
 )
 
 // Reason labels for the preemption counter — the holder-dead
-// evidence that justified the shorten. Ops contract: do not rename.
+// evidence that justified the shorten. Ops contract: do not rename
+// existing constants.
 const (
-	ReasonPodMissing      = "pod_missing"
-	ReasonPodTerminating  = "pod_terminating"
-	ReasonNodeNotReady    = "node_not_ready"
-	ReasonNodeUnreachable = "node_unreachable"
+	ReasonPodMissing         = "pod_missing"
+	ReasonPodTerminating     = "pod_terminating"
+	ReasonPodNotRunning      = "pod_not_running"
+	ReasonContainerRestarted = "container_restarted"
+	ReasonNodeNotReady       = "node_not_ready"
+	ReasonNodeUnreachable    = "node_unreachable"
 )
 
 // Preemptor audits the controller's leader-election Lease and
@@ -237,6 +240,9 @@ func (p *Preemptor) holderDead(ctx context.Context,
 	if pod.Spec.NodeName == "" {
 		return "", false // unscheduled — the pod object is alive, election will sort it
 	}
+	if reason, dead := podContainerDead(pod, lease); dead {
+		return reason, true
+	}
 	node, err := p.CS.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName,
 		metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -267,3 +273,41 @@ func (p *Preemptor) holderDead(ctx context.Context,
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// podContainerDead detects in-place container death or restart on a
+// Ready node (OOMKill/crash/exit leaves the Pod object scheduled without
+// DeletionTimestamp while the restarted process holds a new election UUID,
+// which would otherwise strand the standby for the full 180s LeaseDuration).
+//
+// Only regular ContainerStatuses are inspected (never InitContainerStatuses,
+// whose normal steady state is State.Terminated{Reason:"Completed"}).
+// Container Ready is deliberately ignored so a transient readiness failure
+// during a Nebula dataplane blip keeps the 180s tolerance.
+func podContainerDead(pod *corev1.Pod, lease *coordinationv1.Lease) (string, bool) {
+	if pod.Status.Phase != "" && pod.Status.Phase != corev1.PodRunning {
+		return ReasonPodNotRunning, true
+	}
+	var renewTime time.Time
+	if lease != nil && lease.Spec.RenewTime != nil {
+		renewTime = lease.Spec.RenewTime.Time
+	}
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.State.Waiting != nil || cs.State.Terminated != nil {
+			return ReasonContainerRestarted, true
+		}
+		if !renewTime.IsZero() {
+			if cs.State.Running != nil &&
+				!cs.State.Running.StartedAt.Time.IsZero() &&
+				cs.State.Running.StartedAt.Time.After(renewTime) {
+				return ReasonContainerRestarted, true
+			}
+			if cs.LastTerminationState.Terminated != nil &&
+				!cs.LastTerminationState.Terminated.FinishedAt.Time.IsZero() &&
+				cs.LastTerminationState.Terminated.FinishedAt.Time.After(renewTime) {
+				return ReasonContainerRestarted, true
+			}
+		}
+	}
+	return "", false
+}

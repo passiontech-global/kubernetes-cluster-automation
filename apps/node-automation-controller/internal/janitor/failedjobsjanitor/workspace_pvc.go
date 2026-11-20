@@ -158,7 +158,10 @@ func (j *failedJobsJanitor) claimedPVCNames(ctx context.Context,
 	// page's pod bodies die with the page (needs Spec.Volumes +
 	// Status.Phase, so metadata lists cannot serve it).
 	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{
+			FieldSelector: "status.phase!=Succeeded,status.phase!=Failed",
+			Limit:         kube.DefaultListPageSize,
+		},
 		kube.Pods(j.cs, ns),
 		func(page []corev1.Pod) error {
 			for i := range page {
@@ -266,6 +269,12 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 	}
 	pvcs = nil
 
+	// confirmClaims batches Confirm's fresh pod LIST per namespace within
+	// this sweep (strictly separate from collect-time census.claims(), so
+	// Confirm still re-queries pods fresh after the collect loop while
+	// N targets in one namespace pay 1 pod LIST instead of N). A nil
+	// map entry records a failed pod LIST (fail closed, metered once).
+	confirmClaims := map[string]map[string]bool{}
 	deleted, _, capped := reap.Sweep(ctx, log, targets, reap.Options[orphanWorkspaceTarget]{
 		Cap: workspacePVCCap,
 		// Deterministic victims: a capped sweep reaps the same
@@ -280,7 +289,9 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 		// ref still gone-or-terminal (a run recreated or re-Resumed
 		// since the list keeps its workspace), and a FRESH per-
 		// namespace pod re-query (the collect-time claimsCache
-		// predates this run's deletes and the minutes since).
+		// predates this run's deletes and the minutes since, batched
+		// per namespace in confirmClaims so N targets in one
+		// namespace pay 1 Confirm pod LIST).
 		// Owner refs are checked FIRST: a still-live run rejects the
 		// candidate without paying the per-namespace pod LIST — the
 		// expensive part of Confirm — for a claim that was never
@@ -294,11 +305,19 @@ func (j *failedJobsJanitor) sweepOrphanWorkspacePVCs(ctx context.Context,
 			if !done {
 				return false, nil
 			}
-			freshClaims, err := j.claimedPVCNames(ctx, t.ns)
-			if err != nil {
-				return false, err // cannot prove — keep, report via OnError
+			claims, ok := confirmClaims[t.ns]
+			if !ok {
+				claims, err = j.claimedPVCNames(ctx, t.ns)
+				confirmClaims[t.ns] = claims // nil on error
+				if err != nil {
+					return false, err // cannot prove — keep, report once via OnError
+				}
+			} else if claims == nil {
+				log.Info("pod list failed earlier in confirm — keeping claim (fail closed)",
+					"pvc", t.ns+"/"+t.name)
+				return false, nil // already IncError'd on first hit
 			}
-			if freshClaims[t.name] {
+			if claims[t.name] {
 				return false, nil // a pod mounted the claim since collect
 			}
 			return true, nil

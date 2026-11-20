@@ -418,3 +418,169 @@ func TestRestoreOnlySkipsLatencyQuery(t *testing.T) {
 		t.Fatalf("RestoreOnly issued %d Prometheus queries, want 0", queries)
 	}
 }
+
+func TestRestoreOnlyClearsDegradedSinceOnReenable(t *testing.T) {
+	metrics.WebhookAdmissionDegraded.Reset()
+	metrics.WebhookCircuitBroken.Reset()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "backend"}}
+	pod := wgPod("backend", "wh-pod-0", 30*time.Minute)
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "reenable-mwc"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "slow.example.com",
+			FailurePolicy: new(admissionv1.Fail),
+			ClientConfig:  admissionv1.WebhookClientConfig{Service: wgSvcRef("backend", "wh-svc")},
+		}},
+	}
+	cs := fake.NewSimpleClientset(ns, mwc, readySliceWithPod("backend", "wh-svc", "wh-pod-0"), pod)
+	testutil.EmulateEviction(cs)
+
+	srv := mockPromServer(t, func(query string) []promResult {
+		if strings.Contains(query, "rejection_count") {
+			return []promResult{{
+				Metric: map[string]string{"name": "slow.example.com", "error_type": "calling_webhook_error"},
+				Value:  [2]any{1, "0.8"},
+			}}
+		}
+		return nil
+	})
+
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	g, b := wgBreakerGuard(cs, &now)
+	g.PromEndpoint = srv.URL + "/api/v1/query"
+	g.PromClient = promq.Client{HTTP: srv.Client()}
+	g.WebhookErrorRateThreshold = 0.5
+	g.WebhookLatencyP99Seconds = 5.0
+	g.LatencyBreakerTripEnabled = true
+	b.degradedThreshold = 10 * time.Minute
+	b.latencyTripThreshold = 15 * time.Minute
+
+	// T=0: breaker enabled, observes breach -> degradedSince stamped at T=0.
+	t.Setenv("WEBHOOK_CIRCUIT_BREAKER_ENABLED", "true")
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatalf("sweep T=0: %v", err)
+	}
+
+	// T=5m: disable breaker -> RestoreOnly runs and prunes stale degradedSince.
+	now = now.Add(5 * time.Minute)
+	t.Setenv("WEBHOOK_CIRCUIT_BREAKER_ENABLED", "false")
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatalf("RestoreOnly T=5m: %v", err)
+	}
+
+	// T=20m (past 15m from T=0): re-enable breaker with Prom still breaching.
+	// Must NOT trip, bounce pod, or emit degraded immediately — needs a fresh window from T=20m.
+	now = now.Add(15 * time.Minute)
+	t.Setenv("WEBHOOK_CIRCUIT_BREAKER_ENABLED", "true")
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatalf("sweep T=20m: %v", err)
+	}
+	gotMWC, _ := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, "reenable-mwc", metav1.GetOptions{})
+	if *gotMWC.Webhooks[0].FailurePolicy != admissionv1.Fail {
+		t.Fatalf("stale degradedSince tripped immediately on re-enable, got %v", *gotMWC.Webhooks[0].FailurePolicy)
+	}
+	if _, err := cs.CoreV1().Pods("backend").Get(ctx, "wh-pod-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected pod still present at T=20m, got %v", err)
+	}
+	if v := ptestutil.ToFloat64(metrics.WebhookAdmissionDegraded.WithLabelValues("mutating", "reenable-mwc", "slow.example.com", "error_rate")); v != 0 {
+		t.Fatalf("expected WebhookAdmissionDegraded=0 on re-enable at T=20m, got %v", v)
+	}
+
+	// T=30m (10m from T=20m): degraded gauge + pod bounce.
+	now = now.Add(10 * time.Minute)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatalf("sweep T=30m: %v", err)
+	}
+	if v := ptestutil.ToFloat64(metrics.WebhookAdmissionDegraded.WithLabelValues("mutating", "reenable-mwc", "slow.example.com", "error_rate")); v != 1 {
+		t.Fatalf("expected WebhookAdmissionDegraded=1 at T=30m, got %v", v)
+	}
+	if _, err := cs.CoreV1().Pods("backend").Get(ctx, "wh-pod-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected eviction at T=30m, got %v", err)
+	}
+
+	// T=35m (15m from T=20m): trips to Ignore.
+	now = now.Add(5 * time.Minute)
+	if err := runBreaker(ctx, g, b); err != nil {
+		t.Fatalf("sweep T=35m: %v", err)
+	}
+	gotMWC, _ = cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, "reenable-mwc", metav1.GetOptions{})
+	if *gotMWC.Webhooks[0].FailurePolicy != admissionv1.Ignore {
+		t.Fatalf("expected Ignore after fresh 15m window at T=35m, got %v", *gotMWC.Webhooks[0].FailurePolicy)
+	}
+}
+
+func TestLatencyQueryErrorPreservesDegradedSince(t *testing.T) {
+	metrics.WebhookAdmissionDegraded.Reset()
+	metrics.WebhookCircuitBroken.Reset()
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "backend"}}
+	pod := wgPod("backend", "wh-pod-0", 30*time.Minute)
+	mwc := &admissionv1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "qerr-mwc"},
+		Webhooks: []admissionv1.MutatingWebhook{{
+			Name:          "slow.example.com",
+			FailurePolicy: new(admissionv1.Fail),
+			ClientConfig:  admissionv1.WebhookClientConfig{Service: wgSvcRef("backend", "wh-svc")},
+		}},
+	}
+	cs := fake.NewSimpleClientset(ns, mwc, readySliceWithPod("backend", "wh-svc", "wh-pod-0"), pod)
+	testutil.EmulateEviction(cs)
+
+	var promDown atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if promDown.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = r.ParseForm()
+		var res []promResult
+		if strings.Contains(r.FormValue("query"), "rejection_count") {
+			res = []promResult{{
+				Metric: map[string]string{"name": "slow.example.com", "error_type": "calling_webhook_error"},
+				Value:  [2]any{1, "0.8"},
+			}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.MarshalWrite(w, promResponse{
+			Status: "success",
+			Data:   promData{ResultType: "vector", Result: res},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	g, b := wgBreakerGuard(cs, &now)
+	g.Queue = "admission-webhook-guard"
+	g.PromEndpoint = srv.URL + "/api/v1/query"
+	g.PromClient = promq.Client{HTTP: srv.Client()}
+	g.WebhookErrorRateThreshold = 0.5
+	g.WebhookLatencyP99Seconds = 5.0
+	g.LatencyBreakerTripEnabled = true
+	b.degradedThreshold = 10 * time.Minute
+	b.latencyTripThreshold = 15 * time.Minute
+
+	// T=0: breach observed, degradedSince stamped.
+	if err := b.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatalf("sweep T=0: %v", err)
+	}
+
+	// T=5m: Prometheus returns 500 -> queryError=true must preserve degradedSince.
+	now = now.Add(5 * time.Minute)
+	promDown.Store(true)
+	if err := b.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatalf("sweep T=5m: %v", err)
+	}
+
+	// T=15m: Prometheus recovers, still breaching -> trips using preserved T=0 timestamp.
+	now = now.Add(10 * time.Minute)
+	promDown.Store(false)
+	if err := b.Sweep(ctx, g.TakeSnapshot(ctx)); err != nil {
+		t.Fatalf("sweep T=15m: %v", err)
+	}
+	gotMWC, _ := cs.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, "qerr-mwc", metav1.GetOptions{})
+	if *gotMWC.Webhooks[0].FailurePolicy != admissionv1.Ignore {
+		t.Fatalf("expected degradedSince to survive Prom queryError and trip to Ignore at T=15m, got %v",
+			*gotMWC.Webhooks[0].FailurePolicy)
+	}
+}

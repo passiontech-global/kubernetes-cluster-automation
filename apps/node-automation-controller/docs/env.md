@@ -29,6 +29,7 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 | `NODE_AUTOMATION_PROBE_CLIENT_QPS` | manager | `20` | client-go QPS on the SECOND rest.Config built for the latency-sensitive probe modules (apiserver-endpoint-guard, kubelet-liveness-reaper, dead-node-sweeper — the `Module.ProbeClients` registry rows): their own token bucket, so janitor delete bursts draining the shared `NODE_AUTOMATION_KUBE_CLIENT_*` bucket cannot queue-delay a probe verdict mid-incident. |
 | `NODE_AUTOMATION_PROBE_CLIENT_BURST` | manager | `40` | client-go burst paired with the probe QPS knob above; shares the per-request timeout inherited from the direct clients. |
 | `POD_NAME` | manager (leader election) | downward-API pod name | Preferred prefix for the leader-election `HolderIdentity` (`<pod>_<uuid>`) over `os.Hostname()` — `spec.hostname` can differ from `metadata.name`, and the lease preemptor parses the pod name back out of the holder identity, so a mismatched hostname would make a live leader read as `pod_missing`. Not a `NODE_AUTOMATION_*` knob — the standard Kubernetes downward-API variable. |
+| `NODE_AUTOMATION_PPROF_BIND_ADDRESS` | manager | `127.0.0.1:9116` | Default loopback-only bind address for `/debug/pprof/*` (`httpx` + `pprofx`). Unset or empty `NODE_AUTOMATION_PPROF_BIND_ADDRESS` uses the default `127.0.0.1:9116` (`envx.String`); pass `-pprof-bind-address=""` to disable the pprof listener. Non-loopback addresses are rejected at startup. |
 
 ## Global heal budget
 
@@ -172,6 +173,7 @@ knobs (always-on, no gates).
 |---|---|---|
 | `-metrics-bind-address` | `:9115` | Address the Prometheus `/metrics` endpoint binds to. |
 | `-health-probe-bind-address` | `:8081` | Address `/healthz` and `/readyz` bind to. |
+| `-pprof-bind-address` | `127.0.0.1:9116` | Loopback-only address `/debug/pprof/*` binds to (empty disables the listener; `NODE_AUTOMATION_PPROF_BIND_ADDRESS` feeds the default). |
 | `-version` | `false` | Print version and exit. |
 | `-leader-elect` | `false` | Enable active/passive HA via a `coordination.k8s.io` Lease (required for >1 replica; `ReleaseOnCancel` hands the lease over on graceful shutdown). |
 | `-leader-elect-lease-duration` | `0` | Time non-leaders wait before force-acquiring the Lease; `0` = controller-runtime default (15s). |

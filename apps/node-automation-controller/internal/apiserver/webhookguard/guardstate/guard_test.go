@@ -7,13 +7,22 @@ package guardstate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	admissionregclient "k8s.io/client-go/kubernetes/typed/admissionregistration/v1"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	discoveryv1client "k8s.io/client-go/kubernetes/typed/discovery/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
 )
@@ -169,5 +178,191 @@ func TestReadyCountsMemoized(t *testing.T) {
 	_, err2 := errSnap.ReadyCounts()
 	if err1 == nil || err1.Error() != err2.Error() {
 		t.Fatalf("memoized error differs: %v vs %v", err1, err2)
+	}
+}
+
+type listOptsRecorder struct {
+	kubernetes.Interface
+	opts map[string][]metav1.ListOptions
+}
+
+func newListOptsRecorder(cs kubernetes.Interface) *listOptsRecorder {
+	return &listOptsRecorder{Interface: cs, opts: map[string][]metav1.ListOptions{}}
+}
+
+func (r *listOptsRecorder) record(res string, o metav1.ListOptions) {
+	r.opts[res] = append(r.opts[res], o)
+}
+
+func (r *listOptsRecorder) CoreV1() corev1client.CoreV1Interface {
+	return &recCoreV1{CoreV1Interface: r.Interface.CoreV1(), r: r}
+}
+
+func (r *listOptsRecorder) AdmissionregistrationV1() admissionregclient.AdmissionregistrationV1Interface {
+	return &recAdmissionV1{AdmissionregistrationV1Interface: r.Interface.AdmissionregistrationV1(), r: r}
+}
+
+func (r *listOptsRecorder) DiscoveryV1() discoveryv1client.DiscoveryV1Interface {
+	return &recDiscoveryV1{DiscoveryV1Interface: r.Interface.DiscoveryV1(), r: r}
+}
+
+type recCoreV1 struct {
+	corev1client.CoreV1Interface
+	r *listOptsRecorder
+}
+
+func (c *recCoreV1) Namespaces() corev1client.NamespaceInterface {
+	return &recNamespaces{NamespaceInterface: c.CoreV1Interface.Namespaces(), r: c.r}
+}
+
+type recNamespaces struct {
+	corev1client.NamespaceInterface
+	r *listOptsRecorder
+}
+
+func (n *recNamespaces) List(ctx context.Context, opts metav1.ListOptions) (*corev1.NamespaceList, error) {
+	n.r.record("namespaces", opts)
+	return n.NamespaceInterface.List(ctx, opts)
+}
+
+type recAdmissionV1 struct {
+	admissionregclient.AdmissionregistrationV1Interface
+	r *listOptsRecorder
+}
+
+func (a *recAdmissionV1) MutatingWebhookConfigurations() admissionregclient.MutatingWebhookConfigurationInterface {
+	return &recMWC{MutatingWebhookConfigurationInterface: a.AdmissionregistrationV1Interface.MutatingWebhookConfigurations(), r: a.r}
+}
+
+func (a *recAdmissionV1) ValidatingWebhookConfigurations() admissionregclient.ValidatingWebhookConfigurationInterface {
+	return &recVWC{ValidatingWebhookConfigurationInterface: a.AdmissionregistrationV1Interface.ValidatingWebhookConfigurations(), r: a.r}
+}
+
+type recMWC struct {
+	admissionregclient.MutatingWebhookConfigurationInterface
+	r *listOptsRecorder
+}
+
+func (m *recMWC) List(ctx context.Context, opts metav1.ListOptions) (*admissionv1.MutatingWebhookConfigurationList, error) {
+	m.r.record("mutatingwebhookconfigurations", opts)
+	return m.MutatingWebhookConfigurationInterface.List(ctx, opts)
+}
+
+type recVWC struct {
+	admissionregclient.ValidatingWebhookConfigurationInterface
+	r *listOptsRecorder
+}
+
+func (v *recVWC) List(ctx context.Context, opts metav1.ListOptions) (*admissionv1.ValidatingWebhookConfigurationList, error) {
+	v.r.record("validatingwebhookconfigurations", opts)
+	return v.ValidatingWebhookConfigurationInterface.List(ctx, opts)
+}
+
+type recDiscoveryV1 struct {
+	discoveryv1client.DiscoveryV1Interface
+	r *listOptsRecorder
+}
+
+func (d *recDiscoveryV1) EndpointSlices(ns string) discoveryv1client.EndpointSliceInterface {
+	return &recEndpointSlices{EndpointSliceInterface: d.DiscoveryV1Interface.EndpointSlices(ns), r: d.r}
+}
+
+type recEndpointSlices struct {
+	discoveryv1client.EndpointSliceInterface
+	r *listOptsRecorder
+}
+
+func (e *recEndpointSlices) List(ctx context.Context, opts metav1.ListOptions) (*discoveryv1.EndpointSliceList, error) {
+	e.r.record("endpointslices", opts)
+	return e.EndpointSliceInterface.List(ctx, opts)
+}
+
+type dynListOptsRecorder struct {
+	dynamic.Interface
+	opts []metav1.ListOptions
+}
+
+func (d *dynListOptsRecorder) Resource(gvr schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &recDynRI{NamespaceableResourceInterface: d.Interface.Resource(gvr), d: d}
+}
+
+type recDynRI struct {
+	dynamic.NamespaceableResourceInterface
+	d *dynListOptsRecorder
+}
+
+func (r *recDynRI) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	r.d.opts = append(r.d.opts, opts)
+	return r.NamespaceableResourceInterface.List(ctx, opts)
+}
+
+func TestSnapshotAndCensusResourceVersionOptions(t *testing.T) {
+	mwc := gsInjMWC("hook.example.com", nil, "ns", "svc", "")
+	slice := gsInjSlice("ns", "svc", "")
+	crd := gsCRDWithConversion(map[string]any{"strategy": "None"})
+	crd.SetName("crds.example.com")
+
+	recCS := newListOptsRecorder(fake.NewSimpleClientset(mwc, slice))
+	recDyn := &dynListOptsRecorder{Interface: testhelp.NewDynWithCRDs(crd)}
+	g := &Guard{CS: recCS, Dyn: recDyn}
+
+	snap := g.TakeSnapshot(t.Context())
+	for _, res := range []string{"namespaces", "mutatingwebhookconfigurations", "validatingwebhookconfigurations"} {
+		got := recCS.opts[res]
+		if len(got) != 1 {
+			t.Fatalf("%s list calls = %d, want 1", res, len(got))
+		}
+		if got[0].ResourceVersion != "0" {
+			t.Fatalf("%s ResourceVersion = %q, want \"0\"", res, got[0].ResourceVersion)
+		}
+	}
+	if len(recDyn.opts) != 1 {
+		t.Fatalf("CRD fallback list calls = %d, want 1", len(recDyn.opts))
+	}
+	if recDyn.opts[0].ResourceVersion != "" || recDyn.opts[0].Limit != crdPageSize {
+		t.Fatalf("CRD fallback ListOptions = %+v, want ResourceVersion=\"\" Limit=%d",
+			recDyn.opts[0], crdPageSize)
+	}
+
+	// Filtered EndpointSlices (<=64 backend services) must use ResourceVersion="0".
+	if _, err := snap.ReadyCounts(); err != nil {
+		t.Fatalf("filtered ReadyCounts: %v", err)
+	}
+	esOpts := recCS.opts["endpointslices"]
+	if len(esOpts) != 1 || esOpts[0].ResourceVersion != "0" || esOpts[0].LabelSelector == "" {
+		t.Fatalf("filtered EndpointSlices ListOptions = %+v, want RV=\"0\" and non-empty LabelSelector", esOpts)
+	}
+
+	// Unfiltered EndpointSlices (>64 backend services) must keep ResourceVersion="" and Limit=ListPageSize.
+	recCSUnfiltered := newListOptsRecorder(fake.NewSimpleClientset())
+	gUnfiltered := &Guard{CS: recCSUnfiltered, EndpointProber: func(context.Context, string, int32) bool { return true }}
+	hooks := make([]admissionv1.MutatingWebhook, 0, 65)
+	for i := range 65 {
+		hooks = append(hooks, admissionv1.MutatingWebhook{
+			Name: fmt.Sprintf("h-%02d.example.com", i),
+			ClientConfig: admissionv1.WebhookClientConfig{
+				Service: &admissionv1.ServiceReference{Namespace: "ns", Name: fmt.Sprintf("svc-%02d", i)},
+			},
+		})
+	}
+	unfilteredSnap := &Snapshot{
+		G: gUnfiltered,
+		MWC: &admissionv1.MutatingWebhookConfigurationList{Items: []admissionv1.MutatingWebhookConfiguration{{
+			ObjectMeta: metav1.ObjectMeta{Name: "big-mwc"},
+			Webhooks:   hooks,
+		}}},
+		VWC:            &admissionv1.ValidatingWebhookConfigurationList{},
+		UnhealthyNodes: map[string]bool{},
+	}
+	if _, err := unfilteredSnap.ReadyCounts(); err != nil {
+		t.Fatalf("unfiltered ReadyCounts: %v", err)
+	}
+	unfilteredESOpts := recCSUnfiltered.opts["endpointslices"]
+	if len(unfilteredESOpts) != 1 ||
+		unfilteredESOpts[0].ResourceVersion != "" ||
+		unfilteredESOpts[0].Limit != ListPageSize ||
+		unfilteredESOpts[0].LabelSelector != "" {
+		t.Fatalf("unfiltered EndpointSlices ListOptions = %+v, want RV=\"\" Limit=%d LabelSelector=\"\"",
+			unfilteredESOpts, ListPageSize)
 	}
 }
