@@ -22,6 +22,7 @@ concurrency:
 
 jobs:
   checks:
+    needs: docker-detect
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
@@ -38,14 +39,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache Go module + build caches
+      - name: Cache Go modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ hashFiles('mise.toml', '**/go.mod', '**/go.sum') }}
-          restore-keys: go-${{ runner.os }}-
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: go-mod-${{ runner.os }}-
+
+      - name: Cache Go build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-${{ github.run_id }}
+          restore-keys: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-
 
       # .moon/cache holds moon's task cache + the per-project
       # golangci-lint caches (content-addressed, safe to share across
@@ -79,6 +85,7 @@ jobs:
       # registry-free; working-directory picks up each app's
       # .ko.yaml. node-host-agent ships via Dockerfile, not ko.
       - name: Verify ko build (node-automation-controller)
+        if: contains(fromJSON(needs.docker-detect.outputs.matrix).app, 'node-automation-controller')
         working-directory: apps/node-automation-controller
         env:
           KO_DOCKER_REPO: ko.local
@@ -89,11 +96,15 @@ jobs:
         run: ko build --bare --sbom=none --push=false ./cmd/...
 
       - name: Verify ko build (webhook-dispatcher)
+        if: contains(fromJSON(needs.docker-detect.outputs.matrix).app, 'webhook-dispatcher')
         working-directory: apps/webhook-dispatcher
         env:
           KO_DOCKER_REPO: ko.local
           VERSION: ci
         run: ko build --bare --sbom=none --push=false ./cmd/...
+
+      - name: Prune moon cache
+        run: moon clean --lifetime "3 days"
 
   lint-main:
     if: github.event_name == 'push'
@@ -115,14 +126,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache Go module + build caches
+      - name: Cache Go modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ hashFiles('mise.toml', '**/go.mod', '**/go.sum') }}
-          restore-keys: go-${{ runner.os }}-
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: go-mod-${{ runner.os }}-
+
+      - name: Cache Go build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-${{ github.run_id }}
+          restore-keys: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-
 
       # Same rolling-key scheme as the PR job above.
       - name: Cache moon workspace cache
@@ -140,11 +156,15 @@ jobs:
       - name: Lint and vet main
         run: moon run :format :vet :lint :lint-dockerfile
 
-      # App :test/:build runs live in the release workflows (and the PR
-      # job's affected-only `moon ci`); without this step a main push
-      # touching only the leaf libs would never run their test suites.
-      - name: Test leaf libs
-        run: moon run hostkit:test jinja:test
+      # Release workflows skip **/*.md, libs/hostkit/envdoc/**,
+      # .golangci.yml, and ci.yml; running :test across all projects
+      # here (with .moon/cache hits on unchanged modules) ensures leaf
+      # libs and app envdoc/releaseglob tests still run on main pushes.
+      - name: Test all modules
+        run: moon run :test
+
+      - name: Prune moon cache
+        run: moon clean --lifetime "3 days"
 
   # Resolve which app images a PR actually touches BEFORE the
   # docker-build matrix is evaluated (strategy.matrix cannot read a
@@ -186,7 +206,7 @@ jobs:
               elif $p == "mise.toml" then ["node-host-agent","node-automation-controller","webhook-dispatcher"]
               elif $p == ".dockerignore" then ["node-host-agent","node-automation-controller","webhook-dispatcher"]
               else [] end;
-            [ $changed | split("\n")[] | select(length > 0) | consumers(.) ]
+            [ $changed | split("\n")[] | select(length > 0) | select((endswith(".md") or endswith("_test.go")) | not) | consumers(.) ]
             | add // [] | unique | {app: .}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "affected apps: $matrix"
@@ -203,7 +223,7 @@ jobs:
   # docker-detect narrows the matrix to apps the PR actually touches.
   docker-build:
     needs: docker-detect
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && needs.docker-detect.outputs.matrix != '{"app":[]}'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

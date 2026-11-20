@@ -30,7 +30,6 @@ on:
       - "libs/hostkit/go.sum"
       - ".moon/**"
       - "mise.toml"
-      - ".dockerignore"
       - ".github/workflows/release-app.yml"
       - ".github/workflows/release-node-automation-controller.yml"
       - '!**/*.md'
@@ -64,4 +63,3 @@ jobs:
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
       legacy_v_tags: true
-    secrets: inherit

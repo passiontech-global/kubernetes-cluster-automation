@@ -71,4 +71,3 @@ jobs:
       # ko) — release-app.yml sets up the container-driver builder.
       uses_buildx: true
       lib_paths: "libs/hostkit/envx/** libs/hostkit/fsx/** libs/hostkit/httpx/** libs/hostkit/ledger/** libs/hostkit/logx/** libs/hostkit/nodecond/** libs/hostkit/timex/** libs/hostkit/go.mod libs/hostkit/go.sum libs/jinja/**"
-    secrets: inherit

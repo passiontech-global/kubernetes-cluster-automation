@@ -26,7 +26,6 @@ on:
       - "libs/hostkit/go.sum"
       - ".moon/**"
       - "mise.toml"
-      - ".dockerignore"
       - ".github/workflows/release-app.yml"
       - ".github/workflows/release-webhook-dispatcher.yml"
       - '!**/*.md'
@@ -57,4 +56,3 @@ jobs:
       lib_paths: "libs/hostkit/envx/** libs/hostkit/httpx/** libs/hostkit/logx/** libs/hostkit/go.mod libs/hostkit/go.sum"
       version: ${{ inputs.version || '' }}
       prerelease: ${{ inputs.prerelease || false }}
-    secrets: inherit

@@ -84,14 +84,19 @@ jobs:
       # lint/vet/test plus a cold `go build`; without these every
       # release re-downloads the module graph and rebuilds from
       # scratch.
-      - name: Cache Go module + build caches
+      - name: Cache Go modules
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ hashFiles('mise.toml', '**/go.mod', '**/go.sum') }}
-          restore-keys: go-${{ runner.os }}-
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: go-mod-${{ runner.os }}-
+
+      - name: Cache Go build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-${{ github.run_id }}
+          restore-keys: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-
 
       - name: Cache moon workspace cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -339,6 +344,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Export GHA cache env for buildx
+        id: gha_cache_env
         # JS actions are the only step kind GitHub injects
         # ACTIONS_RUNTIME_TOKEN/ACTIONS_CACHE_URL/ACTIONS_RESULTS_URL/
         # ACTIONS_CACHE_SERVICE_V2 into — this hop lands them in
@@ -367,6 +373,16 @@ jobs:
           # ko publishes directly: --bare keeps the image name exactly
           # $IMAGE (no <hash> suffix); tags come from --tags.
           moon run "$APP:image"
+
+      - name: Scrub GHA cache env
+        if: ${{ always() && inputs.uses_buildx && steps.gha_cache_env.conclusion != 'skipped' }}
+        run: |
+          {
+            echo "ACTIONS_RUNTIME_TOKEN="
+            echo "ACTIONS_CACHE_URL="
+            echo "ACTIONS_RESULTS_URL="
+            echo "ACTIONS_CACHE_SERVICE_V2="
+          } >> "$GITHUB_ENV"
 
       - name: Publish GitHub release
         env:
@@ -400,3 +416,6 @@ jobs:
               --prefer-index=false \
               -t "${IMAGE}:latest" "${IMAGE}:${REL_DOCKER_VERSION}"
           fi
+
+      - name: Prune moon cache
+        run: moon clean --lifetime "3 days"
