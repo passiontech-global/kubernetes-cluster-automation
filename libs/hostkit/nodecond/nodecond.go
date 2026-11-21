@@ -116,6 +116,13 @@ const (
 	MountTablePressure   = "MountTablePressure"   // #4: /proc/1/mountinfo vs fs.mount-max or shared peer-group storm
 	EBPFResourcePressure = "EBPFResourcePressure" // #10: kernel eBPF prog/map/bpffs-pin leak past ceiling
 	EtcdQuorumDegraded   = "EtcdQuorumDegraded"   // #8: embedded etcd CORRUPT alarm, stuck learner, or WAL fsync storm
+
+	// Wave-4 self-healing additions.
+	CondWorkerKubeletCertExpiring = "WorkerKubeletCertExpiring" // #4: kubelet serving cert <14d or live :10250 reload drift (worker-kubelet-cert-expiring latch)
+	CondHostKernelDrift           = "HostKernelDrift"           // #9: persistent THP or CNI/overlay rp_filter sysctl drift (host-kernel-drift latch)
+	CondSystemdOOMDKill           = "SystemdOOMDKill"           // #9: systemd-oomd pod/k0s slice kill within 30m (systemd-oomd-kill latch)
+	CondNetworkMountHung          = "NetworkMountHung"          // #10: NFS/CIFS/FUSE/CephFS mount statfs probe hung (network-mount-hung latch)
+	CondNodeLocalDNSNoTrackDrift  = "NodeLocalDNSNoTrackDrift"  // #12: NodeLocalDNS iptables raw NOTRACK rule missing on 169.254.20.10:53 (nodelocaldns-notrack-drift latch)
 )
 
 // Node/Pod annotation keys carrying the L1 ↔ L3 cooperative
@@ -171,7 +178,7 @@ const (
 )
 
 // HeartbeatSweptNames is every NodeCondition the nodereporter owns
-// and re-stamps LastHeartbeatTime on each cycle while alive: all 62
+// and re-stamps LastHeartbeatTime on each cycle while alive: all 67
 // latch-backed conditions plus ReadonlyFilesystem (the NPD mount
 // monitor rides the same heartbeat patch). InodePressure is in since
 // inode-pressure: the hostmetrics inode-pressure latch sets/clears it and
@@ -221,6 +228,10 @@ var HeartbeatSweptNames = []string{
 	NetfilterLockWedged, CSIRegistrationWedged,
 	// Wave-3 self-healing additions.
 	MountTablePressure, EBPFResourcePressure, EtcdQuorumDegraded,
+	// Wave-4 self-healing additions.
+	CondWorkerKubeletCertExpiring, CondHostKernelDrift,
+	CondSystemdOOMDKill, CondNetworkMountHung,
+	CondNodeLocalDNSNoTrackDrift,
 }
 
 // HangPreCordonNames are the hang-class conditions node-hang-
@@ -298,6 +309,16 @@ var DiskPreFailPreCordonNames = []string{
 	DiskPreFail,
 }
 
+// NetworkMountHungPreCordonNames is the hung network/FUSE mount
+// condition on its own 5-minute fuse — NFS/CIFS/FUSE/CephFS probes
+// need time to distinguish a transient server blip from a wedged
+// mount before the precordon isolates the node. Separate list for
+// the same reason ClockSkewPreCordonNames and
+// DiskPreFailPreCordonNames exist: the fuse differs (5m vs 2m/10m/15m).
+var NetworkMountHungPreCordonNames = []string{
+	CondNetworkMountHung,
+}
+
 // StormGateNames are the node-unhealthy conditions the
 // descheduler-storm-gate treats as "rebalancing is actively
 // harmful": while any is True (or a storm taint sits on the node)
@@ -349,6 +370,14 @@ var StormGateNames = []string{
 	NetfilterLockWedged, CSIRegistrationWedged,
 	// Wave-3 self-healing additions.
 	MountTablePressure, EBPFResourcePressure, EtcdQuorumDegraded,
+	// Wave-4 self-healing additions: a hung network/FUSE mount
+	// (precordon invariant) and recent systemd-oomd cgroup kills
+	// within 30m both warn against rebalancing pods onto the node.
+	// CondWorkerKubeletCertExpiring (like KubeconfigCertExpiring),
+	// CondHostKernelDrift (persistent sysctl/THP drift), and
+	// CondNodeLocalDNSNoTrackDrift (like DNSResolvStale/DNSFallbackActive)
+	// stay out so they do not freeze the cluster-wide descheduler.
+	CondSystemdOOMDKill, CondNetworkMountHung,
 }
 
 // PartitionNames are the network-partition conditions the
