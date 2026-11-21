@@ -20,6 +20,7 @@ type CiliumConfig struct {
 	WG0Iface        string  // cilium WG tunnel iface (cilium_wg0)
 	RuntimeConfig   string  // agent-runtime-config.json MTU fallback
 	BPFMapHighRatio float64 // critical-map fill ratio → latch (0.90)
+	IPAMReapEnabled bool    // reap confirmed dead-netdev zombie endpoints when IPAM exhausted
 }
 
 func (cl *CiliumConfig) applyDefaults() {
@@ -58,5 +59,6 @@ func (cl *CiliumConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 			hostPath("/run/cilium/cilium.sock")),
 		// env knob — empty env → in-package default.
 		envx.StringKnob(envnames.EnvCiliumEnvoyAdminURL, &cl.EnvoyAdminURL, ""),
+		envx.BoolKnob(envnames.EnvCiliumIPAMReapEnabled, &cl.IPAMReapEnabled, true),
 	}
 }

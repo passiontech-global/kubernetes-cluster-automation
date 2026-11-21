@@ -12,16 +12,20 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 )
 
-// Cilium holds the ONE cilium seam — the unix-socket GET every
-// agent endpoint shares. The WireGuard allowed-ips / encrypt-peers /
-// BPF service-map evidence reads are derived from it (or from
-// Config.Systemd for the `wg` exec): they are methods below, not
-// seams — stubbing UnixGet and testing the parsers directly gives
-// equal coverage with less surface.
+// Cilium holds the Cilium agent unix-API seams — UnixGet (shared read
+// transport) and UnixDelete (zombie endpoint DELETE). The WireGuard
+// allowed-ips / encrypt-peers / BPF service-map evidence reads are
+// derived from UnixGet (or from Config.Systemd for the `wg` exec):
+// they are methods below, not seams — stubbing UnixGet and testing
+// the parsers directly gives equal coverage with less surface.
 type Cilium struct {
 	// UnixGet GETs path over a unix socket and returns the body —
 	// the cilium-dbg endpoint list replacement (35). Seam.
 	UnixGet func(ctx context.Context, socket, path string) ([]byte, error)
+	// UnixDelete sends HTTP DELETE for path over the cilium-agent
+	// unix socket (zombie endpoint reap via DELETE /v1/endpoint/{id}).
+	// Seam (default probee.UnixDelete).
+	UnixDelete func(ctx context.Context, socket, path string) error
 	// WGDump returns the raw `wg show cilium_wg0 dump` output —
 	// the zombie-peer evidence source (TSV: one interface
 	// line, then one 8-column line per peer). Seam (default execs
@@ -130,6 +134,9 @@ func (s *Cilium) ServiceBackends(ctx context.Context, socket string) (map[string
 func (s *Cilium) applyDefaults(_ *Config) {
 	if s.UnixGet == nil {
 		s.UnixGet = probee.UnixGet
+	}
+	if s.UnixDelete == nil {
+		s.UnixDelete = probee.UnixDelete
 	}
 	if s.WGDump == nil {
 		s.WGDump = func(ctx context.Context, sd *systemd.Client) (string, error) {

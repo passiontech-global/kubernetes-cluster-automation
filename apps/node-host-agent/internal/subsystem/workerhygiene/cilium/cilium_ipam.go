@@ -162,8 +162,9 @@ func ParseCiliumIPAM(body []byte) (used, available int, ok bool) {
 // the consecutive exhausted-pool streak (ex-Deps.CiliumIPAMFails) —
 // tests poke it via the named Hygiene field.
 type CiliumIPAMCheck struct {
-	d     *wdeps.Deps
-	Fails int
+	d           *wdeps.Deps
+	Fails       int
+	seenZombies map[int64]bool
 }
 
 // Name returns the check label / WD_SIG key.
@@ -218,6 +219,7 @@ func (c *CiliumIPAMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	exhausted := leaked > 30 || (available >= 0 && available <= 2)
 	if !exhausted {
 		c.Fails = 0
+		c.seenZombies = nil
 		c.d.State.Exit(latchdefs.LatchCiliumIPAMExhausted, nil)
 		c.d.CycleResult(wdeps.CheckCiliumIPAM, "ok")
 		return
@@ -230,5 +232,6 @@ func (c *CiliumIPAMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	c.d.State.Enter(latchdefs.LatchCiliumIPAMExhausted, fmt.Sprintf(
 		"used=%d in-use=%d leaked=%d available=%d", used, inUse, leaked, available))
+	c.reapZombieEndpoints(ctx, e)
 	c.d.CycleResult(wdeps.CheckCiliumIPAM, "ok")
 }

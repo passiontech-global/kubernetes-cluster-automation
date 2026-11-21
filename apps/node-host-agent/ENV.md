@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them, listing the
-source location of every reference in that package (208 knobs
+source location of every reference in that package (209 knobs
 referenced across 17 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -180,8 +180,8 @@ subsystem has no env gate.
 ### `internal/subsystem/hubsync`
 
 - `NODE_HOST_AGENT_CONVERGE_SSH_KEY` — `config_env.go:46`
-- `NODE_HOST_AGENT_HUBSYNC_SSH_ALLOW_INSECURE_HOST_KEY` — `config_env.go:48, hostkeys.go:182, ssh.go:107`
-- `NODE_HOST_AGENT_HUBSYNC_SSH_HOST_KEY_FINGERPRINT` — `config_env.go:47, hostkeys.go:181, ssh.go:106`
+- `NODE_HOST_AGENT_HUBSYNC_SSH_ALLOW_INSECURE_HOST_KEY` — `config_env.go:48, hostkeys.go:182, ssh.go:108`
+- `NODE_HOST_AGENT_HUBSYNC_SSH_HOST_KEY_FINGERPRINT` — `config_env.go:47, hostkeys.go:181, ssh.go:107`
 - `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `config_env.go:45`
 
 ### `internal/subsystem/janitor`
@@ -202,15 +202,15 @@ subsystem has no env gate.
 
 ### `internal/subsystem/nethealth`
 
-- `NODE_HOST_AGENT_HOSTS_FILE` — `config_env.go:41`
-- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config_env.go:39`
-- `NODE_HOST_AGENT_NEBULA_DIRECT_TCP_PORTS` — `config_env.go:50`
-- `NODE_HOST_AGENT_NETHEALTH_CONSEC_NEEDED` — `config_env.go:46`
-- `NODE_HOST_AGENT_NETHEALTH_INTERVAL` — `config_env.go:35`
-- `NODE_HOST_AGENT_NETHEALTH_MIN_RESTART` — `config_env.go:47`
-- `NODE_HOST_AGENT_PROC_NET_UDP` — `config_env.go:43`
-- `NODE_HOST_AGENT_PROC_NET_UDP6` — `config_env.go:44`
-- `NODE_HOST_AGENT_UPTIME_FILE` — `config_env.go:45`
+- `NODE_HOST_AGENT_HOSTS_FILE` — `config_env.go:44`
+- `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config_env.go:42`
+- `NODE_HOST_AGENT_NEBULA_DIRECT_TCP_PORTS` — `config_env.go:53`
+- `NODE_HOST_AGENT_NETHEALTH_CONSEC_NEEDED` — `config_env.go:49`
+- `NODE_HOST_AGENT_NETHEALTH_INTERVAL` — `config_env.go:38`
+- `NODE_HOST_AGENT_NETHEALTH_MIN_RESTART` — `config_env.go:50`
+- `NODE_HOST_AGENT_PROC_NET_UDP` — `config_env.go:46`
+- `NODE_HOST_AGENT_PROC_NET_UDP6` — `config_env.go:47`
+- `NODE_HOST_AGENT_UPTIME_FILE` — `config_env.go:48`
 
 ### `internal/subsystem/nodereporter`
 
@@ -231,8 +231,9 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CALICO_FELIX_READY_URL` — `config_calico.go:32`
 - `NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD` — `config_calico.go:33`
 - `NODE_HOST_AGENT_CGROUP_ROOT` — `config_runtime.go:53`
-- `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:60`
-- `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:57`
+- `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:61`
+- `NODE_HOST_AGENT_CILIUM_IPAM_REAP_ENABLED` — `config_cilium.go:62`
+- `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:58`
 - `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:245`
 - `NODE_HOST_AGENT_COREDUMP_DIR` — `config_disk.go:140`
 - `NODE_HOST_AGENT_CPU_CFS_THROTTLE_RATIO` — `config_wave3.go:65`

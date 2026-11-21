@@ -51,14 +51,14 @@ func mtuReadInconclusive(path string) error {
 }
 
 // isPodLxcIface matches the Cilium host-side pod veth names ("lxc" + hex)
-// identical to procfs.MaxPodLxcMTU, excluding lxc_health.
+// identical to procfs.MaxPodLxcMTU (plus uppercase hex), excluding lxc_health.
 func isPodLxcIface(name string) bool {
 	if name == "lxc_health" || !strings.HasPrefix(name, "lxc") || len(name) <= len("lxc") {
 		return false
 	}
 	for i := len("lxc"); i < len(name); i++ {
 		c := name[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
 			return false
 		}
 	}

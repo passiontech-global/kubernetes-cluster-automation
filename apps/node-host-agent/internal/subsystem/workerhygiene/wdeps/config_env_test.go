@@ -119,6 +119,9 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.Cilium.Socket != "/host/run/cilium/cilium.sock" {
 		t.Fatalf("CiliumSocket=%q", cfg.Cilium.Socket)
 	}
+	if !cfg.Cilium.IPAMReapEnabled {
+		t.Fatal("Cilium.IPAMReapEnabled=false, want true by default")
+	}
 	// runtime-resource guards — same hostPath-joined default
 	// contract as the mount paths above.
 	if cfg.Runtime.CgroupRoot != "/host/sys/fs/cgroup" {

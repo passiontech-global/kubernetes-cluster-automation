@@ -27,8 +27,9 @@ const (
 	EnvKubeletWatchdogHosts = "NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS"
 
 	// Cilium domain.
-	EnvCiliumSocket        = "NODE_HOST_AGENT_CILIUM_SOCKET"
-	EnvCiliumEnvoyAdminURL = "NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL"
+	EnvCiliumSocket          = "NODE_HOST_AGENT_CILIUM_SOCKET"
+	EnvCiliumEnvoyAdminURL   = "NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL"
+	EnvCiliumIPAMReapEnabled = "NODE_HOST_AGENT_CILIUM_IPAM_REAP_ENABLED"
 
 	// Teardown domain.
 	EnvHygieneStuckWedgeAge  = "NODE_HOST_AGENT_HYGIENE_STUCK_WEDGE_AGE"

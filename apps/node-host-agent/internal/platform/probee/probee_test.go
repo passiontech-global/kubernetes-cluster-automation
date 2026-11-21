@@ -215,6 +215,45 @@ func TestUnixGet(t *testing.T) {
 	}
 }
 
+func TestUnixDelete(t *testing.T) {
+	socket := unixServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/endpoint/100":
+			w.WriteHeader(http.StatusOK)
+		case "/v1/endpoint/101":
+			w.WriteHeader(http.StatusNoContent)
+		case "/v1/endpoint/102":
+			w.WriteHeader(http.StatusPartialContent)
+		case "/v1/endpoint/103":
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+
+	for _, path := range []string{
+		"/v1/endpoint/100",
+		"/v1/endpoint/101",
+		"/v1/endpoint/102",
+		"/v1/endpoint/103",
+	} {
+		if err := UnixDelete(context.Background(), socket, path); err != nil {
+			t.Fatalf("UnixDelete(%s) unexpected error: %v", path, err)
+		}
+	}
+	if err := UnixDelete(context.Background(), socket, "/v1/endpoint/500"); err == nil {
+		t.Fatal("UnixDelete: 500 endpoint reported nil error")
+	}
+	if err := UnixDelete(context.Background(),
+		filepath.Join(t.TempDir(), "missing.sock"), "/v1/endpoint/1"); err == nil {
+		t.Fatal("UnixDelete: missing socket reported nil error")
+	}
+}
+
 func TestUnixDial(t *testing.T) {
 	socket := unixServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

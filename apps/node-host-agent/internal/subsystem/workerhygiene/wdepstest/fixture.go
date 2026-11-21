@@ -84,14 +84,18 @@ type Fixture struct {
 	LinkDels    []string
 	LinkDelErrs map[string]error
 
-	Probes   map[string]error  // url → error (nil = healthy)
-	Status   map[string]int    // url → canned HTTP status for probeHTTPStatus
-	Bearer   map[string]string // url → bearer token the probe carried
-	SockErrs map[string]error  // unix socket path → dial error
-	DiskUsed float64           // /var/lib/k0s fill ratio for statfsFn
-	BodyOK   map[string]bool   // :10248 healthz body=="ok" canned answers
-	UnixBody []byte
-	UnixErr  error
+	Probes             map[string]error  // url → error (nil = healthy)
+	Status             map[string]int    // url → canned HTTP status for probeHTTPStatus
+	Bearer             map[string]string // url → bearer token the probe carried
+	SockErrs           map[string]error  // unix socket path → dial error
+	DiskUsed           float64           // /var/lib/k0s fill ratio for statfsFn
+	BodyOK             map[string]bool   // :10248 healthz body=="ok" canned answers
+	UnixBody           []byte
+	UnixErr            error
+	EndpointsBody      []byte           // canned GET /v1/endpoint body when non-nil
+	EndpointsErr       error            // canned GET /v1/endpoint error when non-nil
+	DeletedEndpoints   []string         // paths passed to Cilium.UnixDelete
+	EndpointDeleteErrs map[string]error // path → error for Cilium.UnixDelete
 
 	Journal    string // k0sworker journal snapshot body
 	JournalErr error
@@ -240,7 +244,8 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 			MaxShimKill:  10,
 		},
 		Cilium: wdeps.CiliumConfig{
-			RuntimeConfig: f.CiliumRt,
+			RuntimeConfig:   f.CiliumRt,
+			IPAMReapEnabled: true,
 		},
 		Pressure: wdeps.PressureConfig{
 			ZombieStormThreshold: 500,
@@ -331,7 +336,17 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 		if path == "/v1/service" {
 			return f.serviceBody()
 		}
+		if path == "/v1/endpoint" && (f.EndpointsBody != nil || f.EndpointsErr != nil) {
+			return f.EndpointsBody, f.EndpointsErr
+		}
 		return f.UnixBody, f.UnixErr
+	}
+	d.Cfg.Seams.Cilium.UnixDelete = func(_ context.Context, _, path string) error {
+		f.DeletedEndpoints = append(f.DeletedEndpoints, path)
+		if f.EndpointDeleteErrs != nil {
+			return f.EndpointDeleteErrs[path]
+		}
+		return nil
 	}
 	d.Cfg.Seams.Host.JournalFn = func(_ context.Context) (string, error) {
 		return f.Journal, f.JournalErr
