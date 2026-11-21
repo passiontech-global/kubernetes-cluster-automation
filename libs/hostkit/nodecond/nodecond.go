@@ -254,6 +254,11 @@ var HangPreCordonNames = []string{
 	// must stay off it. DiskPreFail deliberately does NOT live here —
 	// it gets its own longer fuse in DiskPreFailPreCordonNames.
 	HardwareCorrupted, GPUHardwareError, InotifyPressure,
+	// CiliumIPAMExhausted joins the 2m hang fuse: a node whose Cilium
+	// IPAM pool is exhausted cannot start new pods and must be
+	// precordoned until IPAM recovers (at which point
+	// node-hang-precordon auto-uncordons it).
+	CiliumIPAMExhausted,
 	// Wave-2 self-healing additions: all four new conditions take
 	// the standard 2m hang fuse — a node whose ephemeral-port or
 	// neighbor table is pinned past ceiling, whose netfilter lock

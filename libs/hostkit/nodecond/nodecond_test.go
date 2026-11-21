@@ -128,7 +128,7 @@ var conditionClasses = map[string]conditionClass{
 	NebulaIsolated:              {stormGate: true, hangPreCordon: true, partition: true},
 	NebulaDegraded:              {stormGate: true},
 	CiliumEnvoyDown:             {stormGate: true, hangPreCordon: true},
-	CiliumIPAMExhausted:         {stormGate: true},
+	CiliumIPAMExhausted:         {stormGate: true, hangPreCordon: true},
 	CiliumBPFMapPressure:        {stormGate: true},
 	CiliumMTUDrift:              {stormGate: true},
 	CiliumWGStale:               {stormGate: true},
