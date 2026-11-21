@@ -96,6 +96,8 @@ func (c *cyc) groupBase() {
 	// small default hashsize leaves long bucket chains that spin
 	// ksoftirqd on every lookup under conntrack pressure.
 	c.conntrackHashsize()
+	// Wave-4 #9: converge transparent hugepage sysfs + tmpfiles.d drop-in.
+	c.convergeTHP()
 	// A4 assert: effective == expected (informational fail like
 	// ansible) — best-effort verify; the apply failures above are
 	// what count the group error. Skipped entirely when

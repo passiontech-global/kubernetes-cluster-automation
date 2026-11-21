@@ -16,6 +16,7 @@ type CiliumConfig struct {
 	Socket          string  // cilium agent unix socket (35)
 	EnvoyReadyURL   string  // cilium-envoy admin :9964/ready
 	EnvoyAdminURL   string  // envoy :9901 /stats?filter=update_rejected
+	MetricsURL      string  // cilium-agent :9962/metrics (#5A toFQDNs guard)
 	Iface           string  // cilium host iface (cilium_net)
 	WG0Iface        string  // cilium WG tunnel iface (cilium_wg0)
 	RuntimeConfig   string  // agent-runtime-config.json MTU fallback
@@ -35,6 +36,9 @@ func (cl *CiliumConfig) applyDefaults() {
 	}
 	if cl.EnvoyAdminURL == "" {
 		cl.EnvoyAdminURL = defaultCiliumEnvoyAdminURL
+	}
+	if cl.MetricsURL == "" {
+		cl.MetricsURL = defaultCiliumMetricsURL
 	}
 	if cl.Iface == "" {
 		cl.Iface = defaultCiliumIface

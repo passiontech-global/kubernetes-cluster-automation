@@ -283,16 +283,26 @@ type k0sWorkerRestartGate struct {
 	suspectTag   string
 	overloadTag  string
 	actionDetail string
+	budget       string
+	cooldown     time.Duration
 	checkAPI     bool
 	apiOK        bool
 	overloaded   bool
 }
 
 // restartK0sWorkerGated enforces the shared overload / API / settle /
-// maintenance-hold / last-restart-budget gate ladder before restarting
+// maintenance-hold / rate-budget gate ladder before restarting
 // k0sworker. Returns true when the restart attempt was triggered (so
 // callers reset their streak counter).
 func restartK0sWorkerGated(d *wdeps.Deps, ctx context.Context, g k0sWorkerRestartGate) bool {
+	budget := g.budget
+	if budget == "" {
+		budget = "last-restart"
+	}
+	cooldown := g.cooldown
+	if cooldown <= 0 {
+		cooldown = d.Cfg.MinRestartInterval
+	}
 	switch {
 	case g.overloaded:
 		d.State.AppendLog(fmt.Sprintf(
@@ -310,9 +320,9 @@ func restartK0sWorkerGated(d *wdeps.Deps, ctx context.Context, g k0sWorkerRestar
 		d.State.AppendLog(fmt.Sprintf(
 			"suspect: %s - emergency k0sworker restart held by maintenance window, skip", g.suspectTag))
 		return false
-	case !d.State.RateTrySpend("last-restart", d.Cfg.MinRestartInterval):
+	case !d.State.RateTrySpend(budget, cooldown):
 		d.State.AppendLog(fmt.Sprintf(
-			"suspect: %s - in restart cooldown (<30m), skip", g.suspectTag))
+			"suspect: %s - in restart cooldown (<%dm), skip", g.suspectTag, int(cooldown.Minutes())))
 		return false
 	default:
 		d.State.AppendLog(latchdefs.ActionK0sworkerRestart + " - " + g.actionDetail)

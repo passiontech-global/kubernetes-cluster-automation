@@ -54,3 +54,19 @@ func TestConfigFromEnvStandaloneRunner(t *testing.T) {
 		t.Fatalf("Runner=%T — standalone root must run direct", cfg.Runner)
 	}
 }
+
+func TestConfigFromEnvTHPOverrides(t *testing.T) {
+	// Unset env keeps THPEnabled/THPDefrag empty so cluster vars can
+	// override compiled defaults during convergeTHP.
+	cfgUnset := ConfigFromEnv(EnvDeps{HostRoot: "/host", VarsDir: "/vars"})
+	if cfgUnset.THPEnabled != "" || cfgUnset.THPDefrag != "" {
+		t.Fatalf("unset THP overrides = %q/%q, want empty", cfgUnset.THPEnabled, cfgUnset.THPDefrag)
+	}
+
+	t.Setenv(envnames.EnvTHPEnabled, "never")
+	t.Setenv(envnames.EnvTHPDefrag, "madvise")
+	cfg := ConfigFromEnv(EnvDeps{HostRoot: "/host", VarsDir: "/vars"})
+	if cfg.THPEnabled != "never" || cfg.THPDefrag != "madvise" {
+		t.Fatalf("THP overrides = %q/%q, want never/madvise", cfg.THPEnabled, cfg.THPDefrag)
+	}
+}

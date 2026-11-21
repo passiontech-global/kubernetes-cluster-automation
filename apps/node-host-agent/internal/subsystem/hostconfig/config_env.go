@@ -51,6 +51,8 @@ func ConfigFromEnv(d EnvDeps) Config {
 			defaultWatchdogDir),
 		envx.DurationKnob(envnames.EnvHostconfigInterval, &cfg.Interval,
 			defaultInterval),
+		envx.StringKnob(envnames.EnvTHPEnabled, &cfg.THPEnabled, ""),
+		envx.StringKnob(envnames.EnvTHPDefrag, &cfg.THPDefrag, ""),
 	})
 	// vars dir + nebula certs mount — vars/cert changes converge on
 	// the next poll instead of waiting out the full interval. The

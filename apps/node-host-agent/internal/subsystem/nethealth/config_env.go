@@ -51,6 +51,10 @@ func ConfigFromEnv(d EnvDeps) Config {
 		// pref-1499 direct-underlay TCP bypass; empty env → nil →
 		// applyDefaults' package default [22 6443 8132 9443 39901].
 		envx.IntListKnob(envnames.EnvNebulaDirectTCPPorts, &cfg.NebulaDirectTCPPorts),
+		envx.StringKnob(envnames.EnvCiliumSocket, &cfg.ciliumSocket,
+			d.PathJoin(defaultCiliumSocket)),
+		envx.StringKnob(envnames.EnvSysClassNet, &cfg.sysClassNet,
+			d.PathJoin(defaultSysClassNet)),
 	})
 	return cfg
 }

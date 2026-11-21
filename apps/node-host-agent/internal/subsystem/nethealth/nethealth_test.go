@@ -150,6 +150,11 @@ func fixture(t *testing.T, wd *watchdogconf.Config) *env {
 	n.cfg.rulesFn = func(int) ([]netlink.Rule, error) {
 		return e.nlRules, nil
 	}
+	n.cfg.sysClassNet = t.TempDir()
+	n.cfg.ciliumSocket = filepath.Join(root, "cilium.sock")
+	n.cfg.linkAddrsFn = func(int, string) ([]netlink.Addr, error) {
+		return nil, netlink.LinkNotFoundError{}
+	}
 	e.n = n
 	return e
 }
@@ -330,13 +335,19 @@ func TestApplyDefaultsZeroConfig(t *testing.T) {
 	if got := c.sysClassNet; got != defaultSysClassNet {
 		t.Fatalf("sysClassNet=%q want %q", got, defaultSysClassNet)
 	}
+	if got := c.ciliumSocket; got != defaultCiliumSocket {
+		t.Fatalf("ciliumSocket=%q want %q", got, defaultCiliumSocket)
+	}
+	if got := c.nodeLocalDNSIP; got != defaultNodeLocalDNSIP {
+		t.Fatalf("nodeLocalDNSIP=%q want %q", got, defaultNodeLocalDNSIP)
+	}
 	// The transport seams fall back to production defaults, not nil.
 	if c.runHostCmd == nil || c.runMountCmd == nil || c.dnsProbe == nil ||
-		c.tcpProbe == nil || c.ping == nil || c.probeHTTP == nil {
+		c.tcpProbe == nil || c.ping == nil || c.probeHTTP == nil || c.unixGet == nil {
 		t.Fatalf("default transport seam missing: runHostCmd=%v runMountCmd=%v "+
-			"dnsProbe=%v tcpProbe=%v ping=%v probeHTTP=%v",
+			"dnsProbe=%v tcpProbe=%v ping=%v probeHTTP=%v unixGet=%v",
 			c.runHostCmd != nil, c.runMountCmd != nil, c.dnsProbe != nil,
-			c.tcpProbe != nil, c.ping != nil, c.probeHTTP != nil)
+			c.tcpProbe != nil, c.ping != nil, c.probeHTTP != nil, c.unixGet != nil)
 	}
 	if c.adjtimexFn == nil {
 		t.Fatal("adjtimexFn default missing")

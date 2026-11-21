@@ -17,6 +17,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // appendLog appends one watchdog log line: "<rfc3339> <msg>\n" —
@@ -952,5 +955,77 @@ func TestReadLogWindowMidSeekNoNewline(t *testing.T) {
 	}
 	if !e.r.logScanned {
 		t.Fatal("first scan did not mark the replay scan done")
+	}
+}
+
+// TestWave4LatchEvents verifies that STATE-ENTER lines for all 5 Wave 4
+// latches emit Warning Events with reason nodecond.Cond* and bump
+// problem_counter, and STATE-EXIT lines emit Normal Events with the matching
+// CondDefs DefaultReason.
+func TestWave4LatchEvents(t *testing.T) {
+	cases := []struct {
+		latch         string
+		condType      string
+		defaultReason string
+	}{
+		{
+			latch:         latchdefs.LatchWorkerKubeletCertExpiring,
+			condType:      nodecond.CondWorkerKubeletCertExpiring,
+			defaultReason: "WorkerKubeletCertValid",
+		},
+		{
+			latch:         latchdefs.LatchHostKernelDrift,
+			condType:      nodecond.CondHostKernelDrift,
+			defaultReason: "HostKernelNormal",
+		},
+		{
+			latch:         latchdefs.LatchSystemdOOMDKill,
+			condType:      nodecond.CondSystemdOOMDKill,
+			defaultReason: "SystemdOOMDHealthy",
+		},
+		{
+			latch:         latchdefs.LatchNetworkMountHung,
+			condType:      nodecond.CondNetworkMountHung,
+			defaultReason: "NetworkMountsHealthy",
+		},
+		{
+			latch:         latchdefs.LatchNodeLocalDNSNoTrackDrift,
+			condType:      nodecond.CondNodeLocalDNSNoTrackDrift,
+			defaultReason: "NodeLocalDNSNoTrackOk",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.latch, func(t *testing.T) {
+			e := fixture(t)
+			e.appendLog(t, latchdefs.StateEnterPrefix+tc.latch+" detail=wave4-test")
+			e.cycle()
+
+			if got := e.counter(tc.condType); got != 1 {
+				t.Fatalf("problem_counter{%s} = %v, want 1", tc.condType, got)
+			}
+			enterEvs := eventsByReason(t, e, tc.condType)
+			if len(enterEvs) != 1 {
+				t.Fatalf("%s events = %d, want 1", tc.condType, len(enterEvs))
+			}
+			if enterEvs[0].Type != "Warning" || !strings.Contains(enterEvs[0].Note, "detail=wave4-test") {
+				t.Fatalf("entry event = %s/%q, want Warning with detail=wave4-test",
+					enterEvs[0].Type, enterEvs[0].Note)
+			}
+
+			e.appendLog(t, latchdefs.StateExitPrefix+tc.latch)
+			e.cycle()
+
+			if got := e.counter(tc.defaultReason); got != 1 {
+				t.Fatalf("problem_counter{%s} = %v, want 1", tc.defaultReason, got)
+			}
+			exitEvs := eventsByReason(t, e, tc.defaultReason)
+			if len(exitEvs) != 1 {
+				t.Fatalf("%s events = %d, want 1", tc.defaultReason, len(exitEvs))
+			}
+			if exitEvs[0].Type != "Normal" {
+				t.Fatalf("exit event type = %s, want Normal", exitEvs[0].Type)
+			}
+		})
 	}
 }

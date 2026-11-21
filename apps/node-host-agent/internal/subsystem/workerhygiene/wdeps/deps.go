@@ -136,6 +136,17 @@ type Series struct {
 	PodCgroupCPUThrottled int64
 	VMAMaxUtilRatio       float64
 	PodDNSResolvOverflow  int64
+	// Wave-4 series.
+	CiliumFQDNPressure int64
+	SystemdOOMDKills   int64
+	NetworkMountHung   []NetworkMountHungEntry
+}
+
+// NetworkMountHungEntry is one confirmed hung network/FUSE mount sample
+// emitted as node_agent_network_mount_hung{mountpoint,fstype} 1.
+type NetworkMountHungEntry struct {
+	Mountpoint string
+	FSType     string
 }
 
 // Deps is the shared state every Check consumes — the split's

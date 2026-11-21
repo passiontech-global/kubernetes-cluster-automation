@@ -33,7 +33,10 @@ const (
 	defaultKubeletWdReprobeGap = 3 * time.Second // remediate Gate-0: two probes ~3s apart
 	// G4 fallback when no API backends are configured — the
 	// worker-local api-local-lb listener (k0s haproxy).
-	defaultAPIFallbackURL = "https://localhost:7443/livez"
+	defaultAPIFallbackURL     = "https://localhost:7443/livez"
+	defaultKubeletServeAddr   = "127.0.0.1:10250"
+	defaultKubeletPKIDir      = "/host/var/lib/k0s/kubelet/pki"
+	defaultKubeletCertMinDays = 14
 
 	// pods domain (was pod_teardown.go).
 	defaultStuckDeleteAge = 20 * time.Minute // audit: pods get 20m before force-delete
@@ -62,6 +65,7 @@ const (
 	defaultCiliumSocket        = "/host/run/cilium/cilium.sock"
 	defaultCiliumEnvoyReadyURL = "http://127.0.0.1:9964/ready"
 	defaultCiliumEnvoyAdminURL = "http://127.0.0.1:9901/stats?filter=update_rejected"
+	defaultCiliumMetricsURL    = "http://127.0.0.1:9962/metrics"
 	defaultCiliumIface         = "cilium_net"
 	defaultCiliumWG0Iface      = "cilium_wg0"
 	defaultCiliumRuntimeConfig = "/host/run/cilium/state/agent-runtime-config.json"

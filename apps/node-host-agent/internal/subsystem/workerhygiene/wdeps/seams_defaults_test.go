@@ -42,6 +42,14 @@ func TestApplyDefaultsNilClients(t *testing.T) {
 			_, err := cfg.Seams.Host.JournalAnyFn(ctx)
 			return err
 		},
+		"Host.JournalExecFn": func() error {
+			_, err := cfg.Seams.Host.JournalExecFn(ctx, "-n", "1")
+			return err
+		},
+		"Host.HostExecFn": func() error {
+			_, err := cfg.Seams.Host.HostExecFn(ctx, time.Second, "stat", "-f", "--", "/mnt")
+			return err
+		},
 		"Cilium.WGDump": func() error {
 			_, err := cfg.Seams.Cilium.WGDump(ctx, nil)
 			return err
@@ -69,6 +77,7 @@ func TestApplyDefaultsSystemdDelegation(t *testing.T) {
 	f.On("leases ls", "LEASE-TABLE\n")
 	f.On("journalctl", "JOURNAL-OUT\n")
 	f.On("wg show", "WG-DUMP\n")
+	f.On("stat -f -- /mnt/nfs", "STAT-OUT\n")
 	sd := systemd.New(systemd.Config{
 		HostRoot:       "/",
 		RunCmd:         f.Run,
@@ -109,6 +118,24 @@ func TestApplyDefaultsSystemdDelegation(t *testing.T) {
 	}
 	if !f.Ran("journalctl -n 1 --no-pager") {
 		t.Fatalf("journal-any argv wrong: %s", f.Joined())
+	}
+
+	// Host.JournalExecFn → sd.Exec("journalctl", args...).
+	if out, err = cfg.Seams.Host.JournalExecFn(ctx, "-n", "5", "-o", "json"); err != nil ||
+		out != "JOURNAL-OUT\n" {
+		t.Fatalf("JournalExecFn = %q,%v", out, err)
+	}
+	if !f.Ran("journalctl -n 5 -o json") {
+		t.Fatalf("journal-exec argv wrong: %s", f.Joined())
+	}
+
+	// Host.HostExecFn → sd.ExecBounded(ctx, budget, name, args...).
+	if out, err = cfg.Seams.Host.HostExecFn(ctx, 2*time.Second, "stat", "-f", "--", "/mnt/nfs"); err != nil ||
+		out != "STAT-OUT\n" {
+		t.Fatalf("HostExecFn = %q,%v", out, err)
+	}
+	if !f.Ran("stat -f -- /mnt/nfs") {
+		t.Fatalf("host-exec argv wrong: %s", f.Joined())
 	}
 
 	// Cilium.WGDump → sd.Exec("wg","show","cilium_wg0","dump").

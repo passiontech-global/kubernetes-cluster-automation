@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -367,6 +368,31 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	b.Gauge("node_agent_pod_dns_resolv_overflow",
 		"Running pods on this node whose /etc/resolv.conf exceeds glibc MAXNS/MAXDNSRCH limits.",
 		float64(d.Series.PodDNSResolvOverflow))
+	// Wave-4 self-healing series.
+	b.Gauge("node_agent_cilium_fqdn_pressure",
+		"1 when Cilium endpoints are stuck waiting-to-regenerate or toFQDNs GC deletions surge (detect-only).",
+		float64(d.Series.CiliumFQDNPressure))
+	counter("node_agent_systemd_oomd_kills_total",
+		"Pod or k0s slice kills by systemd-oomd observed in journald.",
+		d.Series.SystemdOOMDKills)
+	const mountHungHelp = "1 for each network or FUSE mountpoint whose statfs probe hung for >= 2 consecutive cycles."
+	if len(d.Series.NetworkMountHung) == 0 {
+		b.Header("node_agent_network_mount_hung", mountHungHelp)
+	} else {
+		mounts := slices.Clone(d.Series.NetworkMountHung)
+		slices.SortFunc(mounts, func(a, b NetworkMountHungEntry) int {
+			if cmp := strings.Compare(a.Mountpoint, b.Mountpoint); cmp != 0 {
+				return cmp
+			}
+			return strings.Compare(a.FSType, b.FSType)
+		})
+		for _, m := range mounts {
+			labels := fmt.Sprintf(`mountpoint="%s",fstype="%s"`,
+				promfile.EscapeLabelValue(m.Mountpoint),
+				promfile.EscapeLabelValue(m.FSType))
+			b.GaugeLabels("node_agent_network_mount_hung", mountHungHelp, labels, 1)
+		}
+	}
 	if err := promfile.Write(dir, "node-agent-hygiene.prom",
 		[]byte(b.String())); err != nil {
 		fail(err)

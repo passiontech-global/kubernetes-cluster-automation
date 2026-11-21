@@ -199,6 +199,16 @@ type Deps struct {
 	EBPFProgsMax int
 	EBPFMapsMax  int
 
+	// Wave-4 #9: host kernel drift (THP + rp_filter) auto-heal gate
+	// and target THP posture. THPEnabled / THPDefrag override VarsDir
+	// (host_thp_enabled / host_thp_defrag) and compiled defaults when
+	// non-empty; empty leaves VarsDir -> DefaultTHP* resolution active.
+	KernelDriftHeal bool
+	THPEnabled      string
+	THPDefrag       string
+	VarsDir         string
+	NodeName        string
+
 	// TickInterval is the latch ticker's expected cadence — carried
 	// into the warp ACTION line's "tick=" evidence text. <=0 →
 	// defaultTickInterval.
@@ -280,10 +290,12 @@ type Runner struct {
 	// at neighLatchTicks and clears only when every readable family
 	// sits below neighLatchExitRatio (P0.4 hysteresis; the per-tick
 	// fills ride updateNeighborTable's local map, not Runner state).
-	neighPinned    map[string]int
-	nic            nicState
-	ebpfStreak     int       // Wave-3 #10 consecutive NEW SCANS >= EBPFProgsMax / EBPFMapsMax
-	ebpfLastScanAt time.Time // stamp of the snapshot the streak last consumed (zero = none)
+	neighPinned       map[string]int
+	nic               nicState
+	ebpfStreak        int       // Wave-3 #10 consecutive NEW SCANS >= EBPFProgsMax / EBPFMapsMax
+	ebpfLastScanAt    time.Time // stamp of the snapshot the streak last consumed (zero = none)
+	kernelDriftStreak int       // Wave-4 #9 consecutive ticks with THP or rp_filter drift
+	thpVars           thpVarsCache
 }
 
 // defaultTickInterval is the latch ticker cadence the warp detector
@@ -451,6 +463,7 @@ func (r *Runner) Refresh(ctx context.Context) {
 	r.updateNeighborTable(ctx)
 	r.updateNICHealth()
 	r.updateEBPFPressure()
+	r.updateKernelDrift(ctx)
 }
 
 // Close releases the /dev/kmsg fd the session holds — the

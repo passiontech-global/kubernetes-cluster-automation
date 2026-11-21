@@ -86,6 +86,13 @@ const (
 	// Wave-3 self-healing guards — appended at the tail so the existing
 	// check labels keep their dispatch order.
 	CheckUDPStale = "udp-stale-socket" // #3 connected-UDP dead-backend socket destroyer
+
+	// Wave-4 self-healing guards — appended at the tail so the existing
+	// check labels keep their dispatch order.
+	CheckKubeletCert      = "kubelet-cert"       // #4 worker kubelet serving cert expiry & :10250 reload drift
+	CheckCiliumFQDN       = "cilium-fqdn"        // #5A Cilium toFQDNs DNS-proxy & endpoint regen guard (detect-only)
+	CheckSystemdOOMD      = "systemd-oomd"       // #9 systemd-oomd pod/k0s slice kill guard (detect-only)
+	CheckNetworkMountHung = "network-mount-hung" // #10 hung NFS/CIFS/FUSE/CephFS mount statfs subprocess guard
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every

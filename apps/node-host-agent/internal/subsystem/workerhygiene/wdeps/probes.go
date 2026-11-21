@@ -10,8 +10,11 @@ package wdeps
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"syscall"
@@ -92,4 +95,32 @@ var kubeletMetricPrefixes = [][]byte{
 // prefixes.
 func scanKubeletMetrics(r io.Reader) (string, error) {
 	return promfile.ScanLinesWithPrefixes(r, kubeletMetricPrefixes, 4<<20)
+}
+
+const tlsPeerCertTimeout = 3 * time.Second
+
+// tlsDialPeerCert is the TLSPeerCertFn default — dials addr over TLS
+// with a 3s timeout (InsecureSkipVerify because loopback SANs never
+// cover 127.0.0.1) and returns the leaf peer certificate.
+func tlsDialPeerCert(ctx context.Context, addr string) (*x509.Certificate, error) {
+	cctx, cancel := context.WithTimeout(ctx, tlsPeerCertTimeout)
+	defer cancel()
+	d := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: tlsPeerCertTimeout},
+		Config:    &tls.Config{InsecureSkipVerify: true},
+	}
+	conn, err := d.DialContext(cctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return nil, errors.New("not a TLS connection")
+	}
+	certs := tc.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("tls peer %s presented no certificates", addr)
+	}
+	return certs[0], nil
 }

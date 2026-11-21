@@ -110,5 +110,11 @@ func (c *Collector) kernelFailDeps() kernelfail.Deps {
 		EBPFSnapshot: c.ebpfSnapshotAt,
 		EBPFProgsMax: c.cfg.EBPFProgsMax,
 		EBPFMapsMax:  c.cfg.EBPFMapsMax,
+		// Wave-4 #9: host kernel drift (THP + rp_filter).
+		KernelDriftHeal: c.cfg.KernelDriftHeal,
+		THPEnabled:      c.cfg.THPEnabled,
+		THPDefrag:       c.cfg.THPDefrag,
+		VarsDir:         c.cfg.VarsDir,
+		NodeName:        c.cfg.NodeName,
 	}
 }

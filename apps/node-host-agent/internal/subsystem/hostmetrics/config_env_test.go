@@ -72,6 +72,15 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.HostRoot != "" {
 		t.Fatalf("HostRoot = %q, want empty (auto-detect)", cfg.HostRoot)
 	}
+	if !cfg.KernelDriftHeal {
+		t.Fatal("KernelDriftHeal = false, want true default")
+	}
+	if cfg.THPEnabled != "" || cfg.THPDefrag != "" {
+		t.Fatalf("unset THP overrides = %q/%q, want empty (so VarsDir can apply)", cfg.THPEnabled, cfg.THPDefrag)
+	}
+	if en, df := New(cfg).THPTargets(); en != "madvise" || df != "defer+madvise" {
+		t.Fatalf("resolved THP defaults = %q/%q, want madvise/defer+madvise", en, df)
+	}
 }
 
 // TestConfigFromEnvOverrides sets every knob and verifies env wins —
@@ -92,6 +101,9 @@ func TestConfigFromEnvOverrides(t *testing.T) {
 	t.Setenv(envnames.EnvArpTableFile, "/arp")
 	t.Setenv(envnames.EnvCgroupMemUnits, "u1, u2")
 	t.Setenv(envnames.EnvFilesystemTargets, "/f1, /f2")
+	t.Setenv(envnames.EnvKernelDriftHeal, "false")
+	t.Setenv(envnames.EnvTHPEnabled, "always")
+	t.Setenv(envnames.EnvTHPDefrag, "madvise")
 
 	cfg := ConfigFromEnv(EnvDeps{HostPath: testHostPath("/host")})
 
@@ -121,6 +133,12 @@ func TestConfigFromEnvOverrides(t *testing.T) {
 	}
 	if want := []string{"/f1", "/f2"}; !slices.Equal(cfg.FilesystemTargets, want) {
 		t.Fatalf("FilesystemTargets = %v, want %v", cfg.FilesystemTargets, want)
+	}
+	if cfg.KernelDriftHeal {
+		t.Fatal("KernelDriftHeal = true, want false override")
+	}
+	if cfg.THPEnabled != "always" || cfg.THPDefrag != "madvise" {
+		t.Fatalf("THP overrides = %q/%q, want always/madvise", cfg.THPEnabled, cfg.THPDefrag)
 	}
 }
 

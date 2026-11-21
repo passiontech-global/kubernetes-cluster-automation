@@ -39,3 +39,8 @@ func NewCiliumWG(d *wdeps.Deps) *CiliumWGCheck { return &CiliumWGCheck{d: d} }
 func NewCiliumLRP(d *wdeps.Deps) *CiliumLRPCheck {
 	return &CiliumLRPCheck{d: d}
 }
+
+// NewCiliumFQDN returns the #5A Cilium toFQDNs DNS-proxy & endpoint regen guard.
+func NewCiliumFQDN(d *wdeps.Deps) *CiliumFQDNCheck {
+	return &CiliumFQDNCheck{d: d}
+}

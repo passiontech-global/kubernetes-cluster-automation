@@ -17,6 +17,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/agent"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostmetrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/nethealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -390,4 +391,55 @@ func TestNethealthCoordWiring(t *testing.T) {
 			t.Fatalf("kubeClient calls=%d want 1", *calls)
 		}
 	})
+}
+
+func TestBuildAgentConfigTHPVarsDirWiring(t *testing.T) {
+	disableAllSubsystems(t)
+	dir := t.TempDir()
+	varsDir := filepath.Join(dir, "vars")
+	if err := os.MkdirAll(varsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(varsDir, "defaults.yaml"),
+		[]byte("host_thp_enabled: never\nhost_thp_defrag: never\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(envnames.EnvWatchdogConf, filepath.Join(dir, "no.conf"))
+	t.Setenv(envnames.EnvAPIGuardConf, filepath.Join(dir, "no-guard.conf"))
+	t.Setenv(envnames.EnvHostconfigVarsDir, varsDir)
+	t.Setenv(envnames.EnvEnableHostmetrics, "true")
+	t.Setenv(envnames.EnvEnableHostconfig, "auto")
+	t.Setenv(envnames.EnvTHPEnabled, "")
+	t.Setenv(envnames.EnvTHPDefrag, "")
+
+	cfg, _ := testBuildAgentConfig("node-a", "pod-a", true)
+	var hm *hostmetrics.Latches
+	hasHostconfig := false
+	for _, s := range cfg.Subsystems {
+		switch v := s.(type) {
+		case *hostmetrics.Latches:
+			hm = v
+		default:
+			if s.Name() == "hostconfig" {
+				hasHostconfig = true
+			}
+		}
+	}
+	if hm == nil || !hasHostconfig {
+		t.Fatalf("expected both hostmetrics and hostconfig wired, got %v", subsystemNames(cfg))
+	}
+	if en, df := hm.Collector().THPTargets(); en != "never" || df != "never" {
+		t.Fatalf("wired hostmetrics THPTargets() = (%q, %q), want (never, never)", en, df)
+	}
+
+	t.Setenv(envnames.EnvTHPEnabled, "always")
+	cfgEnv, _ := testBuildAgentConfig("node-a", "pod-a", true)
+	for _, s := range cfgEnv.Subsystems {
+		if l, ok := s.(*hostmetrics.Latches); ok {
+			if en, df := l.Collector().THPTargets(); en != "always" || df != "never" {
+				t.Fatalf("env-overridden hostmetrics THPTargets() = (%q, %q), want (always, never)", en, df)
+			}
+		}
+	}
 }

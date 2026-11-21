@@ -124,6 +124,13 @@ var conditionOrder = []string{
 	latchdefs.LatchMountTablePressure,
 	latchdefs.LatchEBPFPressure,
 	latchdefs.LatchEtcdQuorumDegraded,
+	// Wave-4 self-healing wave — appended at the tail so the 62
+	// existing conditions keep their rendered order.
+	latchdefs.LatchWorkerKubeletCertExpiring,
+	latchdefs.LatchHostKernelDrift,
+	latchdefs.LatchSystemdOOMDKill,
+	latchdefs.LatchNetworkMountHung,
+	latchdefs.LatchNodeLocalDNSNoTrackDrift,
 }
 
 // staleConditionDef is WatchdogStale's def — the one condition whose

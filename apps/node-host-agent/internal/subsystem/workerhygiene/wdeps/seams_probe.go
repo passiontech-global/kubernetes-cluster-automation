@@ -5,6 +5,7 @@ package wdeps
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"time"
 
@@ -60,6 +61,10 @@ type Probe struct {
 	// cert SANs never cover the loopback and anonymous /metrics is
 	// denied. Seam.
 	KubeletMetricsFn func(ctx context.Context, url, bearer string, timeout time.Duration) (string, error)
+	// TLSPeerCertFn dials addr over TLS and returns the leaf peer
+	// certificate — used by kubelet-cert to detect reload drift against
+	// the on-disk kubelet-server-current.pem. Seam.
+	TLSPeerCertFn func(ctx context.Context, addr string) (*x509.Certificate, error)
 }
 
 func (s *Probe) applyDefaults(c *Config) {
@@ -114,6 +119,9 @@ func (s *Probe) applyDefaults(c *Config) {
 	}
 	if s.KubeletMetricsFn == nil {
 		s.KubeletMetricsFn = kubeletMetricsGet
+	}
+	if s.TLSPeerCertFn == nil {
+		s.TLSPeerCertFn = tlsDialPeerCert
 	}
 	if s.PodLogFn == nil {
 		s.PodLogFn = func(ctx context.Context, ns, name string, tail int64) (string, error) {

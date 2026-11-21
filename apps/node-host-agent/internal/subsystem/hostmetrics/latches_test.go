@@ -298,6 +298,7 @@ func TestRefreshLatchesTouchesHeldHysteresisLatches(t *testing.T) {
 		latchdefs.LatchEBPFPressure,
 		latchdefs.LatchNeighborPressure,
 		latchdefs.LatchHostNetworkProblems,
+		latchdefs.LatchHostKernelDrift,
 	}
 	old := fixed.Add(-48 * time.Hour)
 	for _, name := range latches {

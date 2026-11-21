@@ -188,6 +188,12 @@ func TestWriteNodeAgentPromTextfile(t *testing.T) {
 	e.D.CgroupDyingDescendants = 4
 	e.D.CgroupReclaimRuns = 1
 	e.D.KernelListenDrops = 9
+	e.D.CiliumFQDNPressure = 1
+	e.D.SystemdOOMDKills = 2
+	e.D.NetworkMountHung = []wdeps.NetworkMountHungEntry{
+		{Mountpoint: `/mnt/z"back\slash`, FSType: "cifs"},
+		{Mountpoint: "/mnt/a", FSType: "nfs4"},
+	}
 
 	e.D.WriteNodeAgentPromTextfile()
 	b, err := os.ReadFile(filepath.Join(dir, "node-agent-hygiene.prom"))
@@ -203,13 +209,41 @@ func TestWriteNodeAgentPromTextfile(t *testing.T) {
 		"node_agent_cgroup_dying_descendants 4",
 		"node_agent_cgroup_reclaim_runs_total 1",
 		"node_agent_kernel_listen_drops_total 9",
+		"node_agent_cilium_fqdn_pressure 1",
+		"node_agent_systemd_oomd_kills_total 2",
+		`node_agent_network_mount_hung{mountpoint="/mnt/a",fstype="nfs4"} 1`,
+		`node_agent_network_mount_hung{mountpoint="/mnt/z\"back\\slash",fstype="cifs"} 1`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing series %q in:\n%s", want, out)
 		}
 	}
+	if strings.Index(out, `mountpoint="/mnt/a"`) > strings.Index(out, `mountpoint="/mnt/z`) {
+		t.Fatalf("network_mount_hung series not sorted deterministically:\n%s", out)
+	}
 	if strings.Count(out, "# TYPE node_agent_host_oom_kills_total counter") != 1 {
 		t.Fatalf("counter TYPE header wrong:\n%s", out)
+	}
+	if strings.Count(out, "# TYPE node_agent_systemd_oomd_kills_total counter") != 1 {
+		t.Fatalf("systemd_oomd_kills_total TYPE header wrong:\n%s", out)
+	}
+	if strings.Count(out, "# TYPE node_agent_network_mount_hung gauge") != 1 {
+		t.Fatalf("network_mount_hung TYPE header wrong:\n%s", out)
+	}
+
+	// Clearing NetworkMountHung emits headers-only so stale 1s disappear.
+	e.D.NetworkMountHung = nil
+	e.D.WriteNodeAgentPromTextfile()
+	b, err = os.ReadFile(filepath.Join(dir, "node-agent-hygiene.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = string(b)
+	if !strings.Contains(out, "# TYPE node_agent_network_mount_hung gauge") {
+		t.Fatalf("missing header-only network_mount_hung after clear:\n%s", out)
+	}
+	if strings.Contains(out, "node_agent_network_mount_hung{") {
+		t.Fatalf("stale network_mount_hung sample remained after clear:\n%s", out)
 	}
 
 	// Garbage + missing marker files degrade to 0, never fail.

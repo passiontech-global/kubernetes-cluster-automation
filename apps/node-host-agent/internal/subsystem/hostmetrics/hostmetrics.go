@@ -243,6 +243,13 @@ func New(cfg Config) *Collector {
 	return c
 }
 
+// THPTargets returns the active transparent_hugepage target posture
+// resolved by kernelfail using hostconfig's precedence
+// (env/Config override > VarsDir host_thp_* > compiled defaults).
+func (c *Collector) THPTargets() (enabled, defrag string) {
+	return c.kf.THPTargets()
+}
+
 // Register adds the collector to reg — the error-returning form of
 // the registration every other subsystem performs inside
 // New(cfg, reg) (workerhygiene parity). hostmetrics keeps a

@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them, listing the
-source location of every reference in that package (209 knobs
+source location of every reference in that package (214 knobs
 referenced across 17 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -136,46 +136,51 @@ subsystem has no env gate.
 
 - `NODE_HOST_AGENT_HOSTCONFIG_INTERVAL` — `config_env.go:52`
 - `NODE_HOST_AGENT_NEBULA_CERTS_DIR` — `config_env.go:48`
+- `NODE_HOST_AGENT_THP_DEFRAG` — `config_env.go:55`
+- `NODE_HOST_AGENT_THP_ENABLED` — `config_env.go:54`
 - `NODE_HOST_AGENT_WATCHDOG_SCRIPTS_DIR` — `config_env.go:50`
 
 ### `internal/subsystem/hostmetrics`
 
-- `NODE_HOST_AGENT_ARP_TABLE_FILE` — `config_env.go:75`
-- `NODE_HOST_AGENT_CGROUP_MEM_UNITS` — `config_env.go:86`
-- `NODE_HOST_AGENT_CLOCKSOURCE_AVAILABLE_FILE` — `config_env.go:83`
-- `NODE_HOST_AGENT_CLOCKSOURCE_CURRENT_FILE` — `config_env.go:80`
-- `NODE_HOST_AGENT_CONNTRACK_STAT_FILE` — `config_env.go:73`
-- `NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL` — `config_env.go:70`
-- `NODE_HOST_AGENT_EBPF_MAPS_MAX` — `config_env.go:154`
-- `NODE_HOST_AGENT_EBPF_PROGS_MAX` — `config_env.go:152`
-- `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:91`
-- `NODE_HOST_AGENT_GPU_EXPECTED_COUNT` — `config_env.go:149`
-- `NODE_HOST_AGENT_GPU_GUARD_MODE` — `config_env.go:146`
-- `NODE_HOST_AGENT_HOST_ROUTE_FILE` — `config_env.go:60`
-- `NODE_HOST_AGENT_K0S_CONFIG` — `config_env.go:61`
-- `NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS` — `config_env.go:68`
-- `NODE_HOST_AGENT_K0S_UNIT` — `config_env.go:63`
-- `NODE_HOST_AGENT_KEY_USERS_FILE` — `config_env.go:54`
-- `NODE_HOST_AGENT_LATCH_INTERVAL` — `config_env.go:56`
-- `NODE_HOST_AGENT_NEBULA_CERT` — `config_env.go:65`
-- `NODE_HOST_AGENT_NEBULA_IFACE` — `config_env.go:59`
-- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_ARP_CEILING` — `config_env.go:131`
-- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_COOLDOWN_MIN` — `config_env.go:122`
-- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_NUD_FAILED` — `config_env.go:118`
-- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_REACHABLE` — `config_env.go:120`
-- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_STALE` — `config_env.go:116`
-- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_GUARD_ENABLED` — `config_env.go:114`
-- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_NDISC_CEILING` — `config_env.go:133`
-- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_TABLE_FULLS` — `config_env.go:135`
-- `NODE_HOST_AGENT_NEIGH_GC_THRESH1_CEILING` — `config_env.go:104`
-- `NODE_HOST_AGENT_NEIGH_GC_THRESH2_CEILING` — `config_env.go:106`
-- `NODE_HOST_AGENT_NEIGH_GC_THRESH3_CEILING` — `config_env.go:108`
-- `NODE_HOST_AGENT_NIC_CARRIER_FLAP_THRESHOLD` — `config_env.go:137`
-- `NODE_HOST_AGENT_NIC_CRC_ERROR_THRESHOLD` — `config_env.go:141`
-- `NODE_HOST_AGENT_NIC_TX_TIMEOUT_THRESHOLD` — `config_env.go:139`
-- `NODE_HOST_AGENT_PSI_FILE` — `config_env.go:69`
-- `NODE_HOST_AGENT_SYS_CLASS_NET` — `config_env.go:58`
-- `NODE_HOST_AGENT_WATCHDOG_LOG_FILE` — `config_env.go:52`
+- `NODE_HOST_AGENT_ARP_TABLE_FILE` — `config_env.go:76`
+- `NODE_HOST_AGENT_CGROUP_MEM_UNITS` — `config_env.go:87`
+- `NODE_HOST_AGENT_CLOCKSOURCE_AVAILABLE_FILE` — `config_env.go:84`
+- `NODE_HOST_AGENT_CLOCKSOURCE_CURRENT_FILE` — `config_env.go:81`
+- `NODE_HOST_AGENT_CONNTRACK_STAT_FILE` — `config_env.go:74`
+- `NODE_HOST_AGENT_CPU_DELIVERED_INTERVAL` — `config_env.go:71`
+- `NODE_HOST_AGENT_EBPF_MAPS_MAX` — `config_env.go:155`
+- `NODE_HOST_AGENT_EBPF_PROGS_MAX` — `config_env.go:153`
+- `NODE_HOST_AGENT_FILESYSTEM_TARGETS` — `config_env.go:92`
+- `NODE_HOST_AGENT_GPU_EXPECTED_COUNT` — `config_env.go:150`
+- `NODE_HOST_AGENT_GPU_GUARD_MODE` — `config_env.go:147`
+- `NODE_HOST_AGENT_HOST_ROUTE_FILE` — `config_env.go:61`
+- `NODE_HOST_AGENT_K0S_CONFIG` — `config_env.go:62`
+- `NODE_HOST_AGENT_K0S_EXPECTED_KCM_ARGS` — `config_env.go:69`
+- `NODE_HOST_AGENT_K0S_UNIT` — `config_env.go:64`
+- `NODE_HOST_AGENT_KERNEL_DRIFT_HEAL` — `config_env.go:160`
+- `NODE_HOST_AGENT_KEY_USERS_FILE` — `config_env.go:55`
+- `NODE_HOST_AGENT_LATCH_INTERVAL` — `config_env.go:57`
+- `NODE_HOST_AGENT_NEBULA_CERT` — `config_env.go:66`
+- `NODE_HOST_AGENT_NEBULA_IFACE` — `config_env.go:60`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_ARP_CEILING` — `config_env.go:132`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_COOLDOWN_MIN` — `config_env.go:123`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_NUD_FAILED` — `config_env.go:119`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_REACHABLE` — `config_env.go:121`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_EVICT_STALE` — `config_env.go:117`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_GUARD_ENABLED` — `config_env.go:115`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_NDISC_CEILING` — `config_env.go:134`
+- `NODE_HOST_AGENT_NEIGHBOR_FLUSH_TABLE_FULLS` — `config_env.go:136`
+- `NODE_HOST_AGENT_NEIGH_GC_THRESH1_CEILING` — `config_env.go:105`
+- `NODE_HOST_AGENT_NEIGH_GC_THRESH2_CEILING` — `config_env.go:107`
+- `NODE_HOST_AGENT_NEIGH_GC_THRESH3_CEILING` — `config_env.go:109`
+- `NODE_HOST_AGENT_NIC_CARRIER_FLAP_THRESHOLD` — `config_env.go:138`
+- `NODE_HOST_AGENT_NIC_CRC_ERROR_THRESHOLD` — `config_env.go:142`
+- `NODE_HOST_AGENT_NIC_TX_TIMEOUT_THRESHOLD` — `config_env.go:140`
+- `NODE_HOST_AGENT_PSI_FILE` — `config_env.go:70`
+- `NODE_HOST_AGENT_SYS_CLASS_NET` — `config_env.go:59`
+- `NODE_HOST_AGENT_THP_DEFRAG` — `config_env.go:164`
+- `NODE_HOST_AGENT_THP_ENABLED` — `config_env.go:162`
+- `NODE_HOST_AGENT_WATCHDOG_LOG_FILE` — `config_env.go:53`
 
 ### `internal/subsystem/hubsync`
 
@@ -202,6 +207,7 @@ subsystem has no env gate.
 
 ### `internal/subsystem/nethealth`
 
+- `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_env.go:54`
 - `NODE_HOST_AGENT_HOSTS_FILE` — `config_env.go:44`
 - `NODE_HOST_AGENT_HOST_RESOLV_CONF` — `config_env.go:42`
 - `NODE_HOST_AGENT_NEBULA_DIRECT_TCP_PORTS` — `config_env.go:53`
@@ -210,6 +216,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_NETHEALTH_MIN_RESTART` — `config_env.go:50`
 - `NODE_HOST_AGENT_PROC_NET_UDP` — `config_env.go:46`
 - `NODE_HOST_AGENT_PROC_NET_UDP6` — `config_env.go:47`
+- `NODE_HOST_AGENT_SYS_CLASS_NET` — `config_env.go:56`
 - `NODE_HOST_AGENT_UPTIME_FILE` — `config_env.go:48`
 
 ### `internal/subsystem/nodereporter`
@@ -231,9 +238,9 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CALICO_FELIX_READY_URL` — `config_calico.go:32`
 - `NODE_HOST_AGENT_CALICO_ORPHAN_VETH_THRESHOLD` — `config_calico.go:33`
 - `NODE_HOST_AGENT_CGROUP_ROOT` — `config_runtime.go:53`
-- `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:61`
-- `NODE_HOST_AGENT_CILIUM_IPAM_REAP_ENABLED` — `config_cilium.go:62`
-- `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:58`
+- `NODE_HOST_AGENT_CILIUM_ENVOY_ADMIN_URL` — `config_cilium.go:65`
+- `NODE_HOST_AGENT_CILIUM_IPAM_REAP_ENABLED` — `config_cilium.go:66`
+- `NODE_HOST_AGENT_CILIUM_SOCKET` — `config_cilium.go:62`
 - `NODE_HOST_AGENT_CONTAINERD_SOCKET` — `config.go:245`
 - `NODE_HOST_AGENT_COREDUMP_DIR` — `config_disk.go:140`
 - `NODE_HOST_AGENT_CPU_CFS_THROTTLE_RATIO` — `config_wave3.go:65`
@@ -267,10 +274,12 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_INOTIFY_MAX_INSTANCES_CEILING` — `config_pressure.go:62`
 - `NODE_HOST_AGENT_INOTIFY_MAX_WATCHES_CEILING` — `config_pressure.go:63`
 - `NODE_HOST_AGENT_K0S_WORKER_UNIT` — `config.go:235`
+- `NODE_HOST_AGENT_KUBELET_CERT_MIN_DAYS` — `config_kubelet.go:124`
+- `NODE_HOST_AGENT_KUBELET_PKI_DIR` — `config_kubelet.go:122`
 - `NODE_HOST_AGENT_KUBELET_PODS_DIR` — `config.go:247`
-- `NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL` — `config_kubelet.go:93`
-- `NODE_HOST_AGENT_KUBELET_TOKEN_FILE` — `config_kubelet.go:94`
-- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:101, env.go:106`
+- `NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL` — `config_kubelet.go:111`
+- `NODE_HOST_AGENT_KUBELET_TOKEN_FILE` — `config_kubelet.go:112`
+- `NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS` — `config_kubelet.go:119, env.go:106`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_ADDR` — `config_net.go:38`
 - `NODE_HOST_AGENT_LOCALDNS_PROBE_NAME` — `config_net.go:39`
 - `NODE_HOST_AGENT_LOCALPV_QUOTA_DIR` — `config_disk.go:133`

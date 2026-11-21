@@ -26,3 +26,8 @@ func NewSyncloop(d *wdeps.Deps) *SyncloopCheck {
 func NewCtrsock(d *wdeps.Deps) *CtrsockCheck {
 	return &CtrsockCheck{d: d}
 }
+
+// NewCert returns the #4 kubelet serving cert expiry & reload-drift guard.
+func NewCert(d *wdeps.Deps) *CertCheck {
+	return &CertCheck{d: d}
+}

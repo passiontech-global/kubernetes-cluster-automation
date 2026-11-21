@@ -21,13 +21,14 @@ import (
 
 // defaultPKIHostPaths are the PKI sources scanned for *.crt/*.pem —
 // host-relative, joined under HostRoot: the k0s apiserver+etcd cert
-// dirs, the kubelet client bundle (a single file), and the kine
+// dirs, the kubelet client+server bundles (single files), and the kine
 // etcd-pki dir on standalone DB VMs.
 var defaultPKIHostPaths = []string{
 	"var/lib/k0s/pki",
 	"var/lib/k0s/pki/etcd",
 	"var/lib/k0s/kubelet/pki/kubelet-client-current.pem",
 	"etc/kine/pki",
+	"var/lib/k0s/kubelet/pki/kubelet-server-current.pem",
 }
 
 // --- 2.4: on-disk PKI cert expiry ---

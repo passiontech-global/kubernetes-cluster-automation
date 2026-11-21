@@ -41,13 +41,13 @@ env-gated behind `NODE_HOST_AGENT_ENABLE_*` knobs.
   `KnownLatchName`/`SharedOwners` lookups, and `CondDefs` — the
   latch→NodeCondition surface registry (type name, OK/problem
   reason+message, alt latches) that nodereporter projects into its
-  rendered-condition order. The NodeCondition surface is 68 name
-  constants in `libs/hostkit/nodecond` (60 in the latch-backed
+  rendered-condition order. The NodeCondition surface is 73 name
+  constants in `libs/hostkit/nodecond` (65 in the latch-backed
   declaration block + 7 monitor/kubelet-owned + the nodes/status
-  `CondLocalRemediation`), of which 62 are latch-backed — 61
+  `CondLocalRemediation`), of which 67 are latch-backed — 66
   `CondDefs` rows plus the `WatchdogStale` probe entry in
-  `nodereporter`'s 62-entry `conditionOrder`;
-  `TestHeartbeatSweptCoversLatchBackedExactly` pins the same 62.
+  `nodereporter`'s 67-entry `conditionOrder`;
+  `TestHeartbeatSweptCoversLatchBackedExactly` pins the same 67.
   Stdlib-only; both the platform leaf (`hoststate` imports it for
   shared-owner validation) and every producing subsystem import it.
 - `internal/platform/*` — leaf libraries: cycle (period loop +

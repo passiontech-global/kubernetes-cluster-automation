@@ -68,14 +68,15 @@ import (
 // nebula labels are owned by the nebula subpackage (the metric-name
 // contract lives next to the code emitting them).
 const (
-	checkDNSFB   = "dns-fallback"
-	checkCoreDNS = "coredns-stub"
-	checkEgress  = "overlay-egress"
-	checkNebula  = nebula.CheckNebula
-	checkF2B     = "fail2ban"
-	checkClock   = "clock-sync"
-	checkCT      = "conntrack-guard"
-	checkNebTCP  = nebula.CheckNebTCP
+	checkDNSFB      = "dns-fallback"
+	checkCoreDNS    = "coredns-stub"
+	checkEgress     = "overlay-egress"
+	checkNebula     = nebula.CheckNebula
+	checkF2B        = "fail2ban"
+	checkClock      = "clock-sync"
+	checkCT         = "conntrack-guard"
+	checkNebTCP     = nebula.CheckNebTCP
+	checkNLDNoTrack = "nodelocaldns-notrack"
 )
 
 // NetHealth runs the network checks on one ticker.
@@ -92,9 +93,10 @@ type NetHealth struct {
 	// unpin streak. The pin drops only after ConsecNeeded
 	// consecutive successes (symmetric with dnsfails' pin-on gate);
 	// a single lucky resolution must not tear the managed block out.
-	dnsok      ledger.StreakLedger // per DNS_FALLBACK_MAP name
-	clockFails int                 // consecutive unsynced adjtimex reads
-	egressCtr  ledger.StreakLedger // per relay probe!=committed counter
+	dnsok           ledger.StreakLedger // per DNS_FALLBACK_MAP name
+	clockFails      int                 // consecutive unsynced adjtimex reads
+	nldNoTrackFails int                 // consecutive missing NodeLocalDNS raw NOTRACK cycles
+	egressCtr       ledger.StreakLedger // per relay probe!=committed counter
 	// ctStatPrev is the last-cycle sum of the nf_conntrack
 	// insert_failed+drop+early_drop columns; ctStatSeen separates
 	// "first read" (baseline only) from a real delta — the spike
@@ -217,6 +219,7 @@ func (n *NetHealth) initChecks() {
 				{Name: checkClock, Run: n.checkClockSync},
 				{Name: checkCT, Run: n.checkConntrack},
 				{Name: checkNebTCP, Run: n.checkNebulaDirectTCP},
+				{Name: checkNLDNoTrack, Run: n.checkNodeLocalDNSNoTrack},
 			},
 		},
 	}

@@ -47,6 +47,15 @@ type KubeletConfig struct {
 	// same bearer auth as the syncloop probe. No env row (the URL
 	// is a wiring constant like APIFallbackURL).
 	MetricsURL string
+	// ServeAddr is the kubelet serving TLS endpoint for cert expiry
+	// and reload-drift comparison against PKIDir (127.0.0.1:10250).
+	ServeAddr string
+	// PKIDir holds kubelet-client-current.pem and
+	// kubelet-server-current.pem on k0s workers.
+	PKIDir string
+	// CertMinDays is the minimum days remaining before
+	// worker-kubelet-cert-expiring latches (default 14).
+	CertMinDays int
 }
 
 func (k *KubeletConfig) applyDefaults() {
@@ -80,6 +89,15 @@ func (k *KubeletConfig) applyDefaults() {
 	if k.TokenPath == "" {
 		k.TokenPath = DefaultKubeletTokenPath
 	}
+	if k.ServeAddr == "" {
+		k.ServeAddr = defaultKubeletServeAddr
+	}
+	if k.PKIDir == "" {
+		k.PKIDir = defaultKubeletPKIDir
+	}
+	if k.CertMinDays <= 0 {
+		k.CertMinDays = defaultKubeletCertMinDays
+	}
 }
 
 // envKnobs returns the kubelet domain's NODE_HOST_AGENT_* env rows —
@@ -101,5 +119,9 @@ func (k *KubeletConfig) envKnobs(d EnvDeps) []envx.Knob {
 		{Name: envnames.EnvKubeletWatchdogHosts, Resolve: func(string) {
 			k.WatchdogHosts = KubeletWatchdogHosts(d.VarsDir, d.NodeName)
 		}},
+		envx.StringKnob(envnames.EnvKubeletPKIDir, &k.PKIDir,
+			d.PathJoin("/var/lib/k0s/kubelet/pki")),
+		envx.IntKnob(envnames.EnvKubeletCertMinDays, &k.CertMinDays,
+			defaultKubeletCertMinDays),
 	}
 }

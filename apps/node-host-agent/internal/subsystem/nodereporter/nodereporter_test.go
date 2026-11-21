@@ -242,6 +242,12 @@ func TestAllConditionDefaults(t *testing.T) {
 		"MountTablePressure":   {"MountTableNormal", "mount table utilization and shared peer-group fan-out within bounds"},
 		"EBPFResourcePressure": {"EBPFResourcesNormal", "kernel eBPF prog and map counts below ceiling"},
 		"EtcdQuorumDegraded":   {"EtcdQuorumHealthy", "embedded etcd healthy (no CORRUPT alarm, stuck learner, or WAL fsync storm)"},
+		// wave-4 self-healing latch→condition surface.
+		nodecond.CondWorkerKubeletCertExpiring: {"WorkerKubeletCertValid", "worker kubelet serving certificate valid beyond expiry horizon and matches :10250"},
+		nodecond.CondHostKernelDrift:           {"HostKernelNormal", "transparent hugepages and rp_filter sysctls match target kernel posture"},
+		nodecond.CondSystemdOOMDKill:           {"SystemdOOMDHealthy", "no recent systemd-oomd pod or k0s slice kills"},
+		nodecond.CondNetworkMountHung:          {"NetworkMountsHealthy", "all probed network and FUSE mounts responsive"},
+		nodecond.CondNodeLocalDNSNoTrackDrift:  {"NodeLocalDNSNoTrackOk", "NodeLocalDNS raw NOTRACK iptables rules present on 169.254.20.10:53"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

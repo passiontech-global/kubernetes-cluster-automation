@@ -44,6 +44,7 @@ func ConfigFromEnv(d EnvDeps) Config {
 	cfg := Config{
 		Base:         subframe.FromDeps(d.Deps),
 		NodeName:     d.NodeName,
+		VarsDir:      d.VarsDir,
 		Standalone:   d.Standalone,
 		EgressRelays: d.OverlayEgressRelays,
 	}
@@ -153,6 +154,15 @@ func ConfigFromEnv(d EnvDeps) Config {
 			&cfg.EBPFProgsMax, kernelfail.DefaultEBPFProgsMax),
 		envx.IntKnob(envnames.EnvEBPFMapsMax,
 			&cfg.EBPFMapsMax, kernelfail.DefaultEBPFMapsMax),
+		// Wave-4 #9: host kernel drift (THP + rp_filter) auto-heal gate
+		// and target THP posture (EnvTHPEnabled/EnvTHPDefrag shared with hostconfig;
+		// empty when unset so VarsDir host_thp_* can take effect).
+		envx.BoolKnob(envnames.EnvKernelDriftHeal,
+			&cfg.KernelDriftHeal, true),
+		envx.StringKnob(envnames.EnvTHPEnabled,
+			&cfg.THPEnabled, ""),
+		envx.StringKnob(envnames.EnvTHPDefrag,
+			&cfg.THPDefrag, ""),
 	})
 	return cfg
 }

@@ -202,6 +202,13 @@ const (
 	LatchMountTablePressure = "mount-table-pressure"   // #4 workerhygiene mount-max & shared peer-group storm
 	LatchEBPFPressure       = "ebpf-resource-pressure" // #10 hostmetrics eBPF prog/map leak
 	LatchEtcdQuorumDegraded = "etcd-quorum-degraded"   // #8 controllerhygiene embedded etcd quorum/learner/fsync
+
+	// Wave-4 self-healing latches.
+	LatchWorkerKubeletCertExpiring = "worker-kubelet-cert-expiring" // #4 workerhygiene kubelet serving cert expiry & :10250 reload drift
+	LatchHostKernelDrift           = "host-kernel-drift"            // #9 hostmetrics persistent THP & rp_filter sysctl drift
+	LatchSystemdOOMDKill           = "systemd-oomd-kill"            // #9 workerhygiene systemd-oomd pod/k0s slice kill within 30m
+	LatchNetworkMountHung          = "network-mount-hung"           // #10 workerhygiene hung NFS/CIFS/FUSE/CephFS mount statfs probe
+	LatchNodeLocalDNSNoTrackDrift  = "nodelocaldns-notrack-drift"   // #12 nethealth NodeLocalDNS raw NOTRACK iptables rule drift
 )
 
 // LatchDef is one registry entry: the latch's <name> suffix, the
@@ -358,6 +365,13 @@ var LatchDefs = []LatchDef{
 	{Name: LatchMountTablePressure, Owner: "workerhygiene"},
 	{Name: LatchEBPFPressure, Owner: "hostmetrics"},
 	{Name: LatchEtcdQuorumDegraded, Owner: "controllerhygiene"},
+
+	// Wave-4 self-healing latches.
+	{Name: LatchWorkerKubeletCertExpiring, Owner: "workerhygiene"},
+	{Name: LatchHostKernelDrift, Owner: "hostmetrics"},
+	{Name: LatchSystemdOOMDKill, Owner: "workerhygiene"},
+	{Name: LatchNetworkMountHung, Owner: "workerhygiene"},
+	{Name: LatchNodeLocalDNSNoTrackDrift, Owner: "nethealth"},
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},

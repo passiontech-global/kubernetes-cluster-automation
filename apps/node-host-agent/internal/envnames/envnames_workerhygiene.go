@@ -25,6 +25,8 @@ const (
 	EnvKubeletSyncloopURL   = "NODE_HOST_AGENT_KUBELET_SYNCLOOP_URL"
 	EnvKubeletTokenFile     = "NODE_HOST_AGENT_KUBELET_TOKEN_FILE"
 	EnvKubeletWatchdogHosts = "NODE_HOST_AGENT_KUBELET_WATCHDOG_HOSTS"
+	EnvKubeletCertMinDays   = "NODE_HOST_AGENT_KUBELET_CERT_MIN_DAYS"
+	EnvKubeletPKIDir        = "NODE_HOST_AGENT_KUBELET_PKI_DIR"
 
 	// Cilium domain.
 	EnvCiliumSocket          = "NODE_HOST_AGENT_CILIUM_SOCKET"

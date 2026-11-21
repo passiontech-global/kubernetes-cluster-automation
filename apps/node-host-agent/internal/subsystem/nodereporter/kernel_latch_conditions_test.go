@@ -172,8 +172,8 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 // latch keys, a present latch flips the condition True with the
 // problem reason, and a removed latch flips it back to False.
 func TestCiliumLatchConditions(t *testing.T) {
-	if len(conditionDefs) != 62 {
-		t.Fatalf("conditionDefs has %d defs, want 62 (50 prior + 5 self-healing wave + 4 wave-2 + 3 wave-3 latch→condition surface)",
+	if len(conditionDefs) != 67 {
+		t.Fatalf("conditionDefs has %d defs, want 67 (50 prior + 5 self-healing wave + 4 wave-2 + 3 wave-3 + 5 wave-4 latch→condition surface)",
 			len(conditionDefs))
 	}
 	// The cilium pair sits before the inode-pressure + W21 tail —
@@ -278,7 +278,8 @@ func TestNoRawConditionNameLiterals(t *testing.T) {
 	names := map[string]bool{}
 	for _, list := range [][]string{
 		nodecond.HeartbeatSweptNames, nodecond.HangPreCordonNames,
-		nodecond.ClockSkewPreCordonNames, nodecond.StormGateNames,
+		nodecond.ClockSkewPreCordonNames, nodecond.DiskPreFailPreCordonNames,
+		nodecond.NetworkMountHungPreCordonNames, nodecond.StormGateNames,
 		nodecond.PartitionNames,
 	} {
 		for _, n := range list {
@@ -291,7 +292,7 @@ func TestNoRawConditionNameLiterals(t *testing.T) {
 		regexp.MustCompile(`(?m)^\t\{"([A-Za-z0-9]+)",`),           // logRules event reasons
 		regexp.MustCompile(`NodeConditionType = "([A-Za-z0-9]+)"`), // npd monitor consts
 	}
-	for _, f := range []string{"conditions.go", "events.go", "npd/kernel.go", "npd/readonly.go"} {
+	for _, f := range []string{"conditions.go", "events.go", "events_rules.go", "npd/kernel.go", "npd/readonly.go"} {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
@@ -303,5 +304,98 @@ func TestNoRawConditionNameLiterals(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestWave4LatchConditions verifies the 5 Wave 4 latch-to-condition contracts:
+// baseline False with DefaultReason/DefaultMessage, state-<latch> flips the
+// corresponding nodecond.Cond* to True with ProblemReason and gauge=1, and
+// removing the latch flips back to False with DefaultReason and gauge=0.
+func TestWave4LatchConditions(t *testing.T) {
+	cases := []struct {
+		latch         string
+		condType      string
+		defaultReason string
+		defaultMsg    string
+		problemReason string
+	}{
+		{
+			latch:         latchdefs.LatchWorkerKubeletCertExpiring,
+			condType:      nodecond.CondWorkerKubeletCertExpiring,
+			defaultReason: "WorkerKubeletCertValid",
+			defaultMsg:    "worker kubelet serving certificate valid beyond expiry horizon and matches :10250",
+			problemReason: "WorkerKubeletCertExpiringDetected",
+		},
+		{
+			latch:         latchdefs.LatchHostKernelDrift,
+			condType:      nodecond.CondHostKernelDrift,
+			defaultReason: "HostKernelNormal",
+			defaultMsg:    "transparent hugepages and rp_filter sysctls match target kernel posture",
+			problemReason: "HostKernelDriftDetected",
+		},
+		{
+			latch:         latchdefs.LatchSystemdOOMDKill,
+			condType:      nodecond.CondSystemdOOMDKill,
+			defaultReason: "SystemdOOMDHealthy",
+			defaultMsg:    "no recent systemd-oomd pod or k0s slice kills",
+			problemReason: "SystemdOOMDKillDetected",
+		},
+		{
+			latch:         latchdefs.LatchNetworkMountHung,
+			condType:      nodecond.CondNetworkMountHung,
+			defaultReason: "NetworkMountsHealthy",
+			defaultMsg:    "all probed network and FUSE mounts responsive",
+			problemReason: "NetworkMountHungDetected",
+		},
+		{
+			latch:         latchdefs.LatchNodeLocalDNSNoTrackDrift,
+			condType:      nodecond.CondNodeLocalDNSNoTrackDrift,
+			defaultReason: "NodeLocalDNSNoTrackOk",
+			defaultMsg:    "NodeLocalDNS raw NOTRACK iptables rules present on 169.254.20.10:53",
+			problemReason: "NodeLocalDNSNoTrackDriftDetected",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.latch, func(t *testing.T) {
+			e := fixture(t)
+			e.cycle()
+
+			c := e.cond(t, corev1.NodeConditionType(tc.condType))
+			if c.Status != corev1.ConditionFalse || c.Reason != tc.defaultReason || c.Message != tc.defaultMsg {
+				t.Fatalf("baseline %s = {%s %q %q}, want {False %q %q}",
+					tc.condType, c.Status, c.Reason, c.Message, tc.defaultReason, tc.defaultMsg)
+			}
+			if g := e.gauge(tc.condType, tc.problemReason); g != 0 {
+				t.Fatalf("baseline problem_gauge = %v, want 0", g)
+			}
+
+			e.writeFile(latchdefs.LatchFilePrefix+tc.latch, "1700000001\n")
+			e.cycle()
+
+			c = e.cond(t, corev1.NodeConditionType(tc.condType))
+			wantMsg := "watchdog state " + tc.latch + " active since 1700000001"
+			if c.Status != corev1.ConditionTrue || c.Reason != tc.problemReason || c.Message != wantMsg {
+				t.Fatalf("latched %s = {%s %q %q}, want {True %q %q}",
+					tc.condType, c.Status, c.Reason, c.Message, tc.problemReason, wantMsg)
+			}
+			if g := e.gauge(tc.condType, tc.problemReason); g != 1 {
+				t.Fatalf("latched problem_gauge = %v, want 1", g)
+			}
+
+			if err := os.Remove(filepath.Join(e.dir, latchdefs.LatchFilePrefix+tc.latch)); err != nil {
+				t.Fatal(err)
+			}
+			e.cycle()
+
+			c = e.cond(t, corev1.NodeConditionType(tc.condType))
+			if c.Status != corev1.ConditionFalse || c.Reason != tc.defaultReason || c.Message != tc.defaultMsg {
+				t.Fatalf("cleared %s = {%s %q %q}, want {False %q %q}",
+					tc.condType, c.Status, c.Reason, c.Message, tc.defaultReason, tc.defaultMsg)
+			}
+			if g := e.gauge(tc.condType, tc.problemReason); g != 0 {
+				t.Fatalf("cleared problem_gauge = %v, want 0", g)
+			}
+		})
 	}
 }

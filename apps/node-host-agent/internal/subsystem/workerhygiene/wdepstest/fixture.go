@@ -17,6 +17,7 @@ package wdepstest
 
 import (
 	"context"
+	"crypto/x509"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -56,17 +57,18 @@ type Fixture struct {
 	CS  *fake.Clientset
 
 	// Host-tree paths under the per-test tempdir.
-	StateDir    string // WatchdogStateDir — state-* latches + last-* budgets
-	ProcDir     string // ProcRoot — fake /proc
-	CtrDir      string // CtrTaskRoot — containerd task dirs
-	SbDir       string // SandboxCtlRoot
-	ResolvConf  string // HostResolvConf
-	UnitFile    string // K0sWorkerUnitFile — the worker gate
-	KubepodsDir string // PodsDir
-	IngestDir   string // Ctr.IngestDir
-	SysNet      string // SysClassNet
-	CiliumRt    string // Cilium.RuntimeConfig
-	JDir        string // Journal.Dirs[0]
+	StateDir      string // WatchdogStateDir — state-* latches + last-* budgets
+	ProcDir       string // ProcRoot — fake /proc
+	CtrDir        string // CtrTaskRoot — containerd task dirs
+	SbDir         string // SandboxCtlRoot
+	ResolvConf    string // HostResolvConf
+	UnitFile      string // K0sWorkerUnitFile — the worker gate
+	KubepodsDir   string // PodsDir
+	IngestDir     string // Ctr.IngestDir
+	SysNet        string // SysClassNet
+	CiliumRt      string // Cilium.RuntimeConfig
+	JDir          string // Journal.Dirs[0]
+	KubeletPKIDir string // Kubelet.PKIDir
 
 	Live   map[int]bool // pids KillFn(0) reports alive
 	Kills  []KillRecord
@@ -97,8 +99,12 @@ type Fixture struct {
 	DeletedEndpoints   []string         // paths passed to Cilium.UnixDelete
 	EndpointDeleteErrs map[string]error // path → error for Cilium.UnixDelete
 
-	Journal    string // k0sworker journal snapshot body
-	JournalErr error
+	Journal     string // k0sworker journal snapshot body
+	JournalErr  error
+	JournalExec func(ctx context.Context, args ...string) (string, error)
+
+	MountStatErrs map[string]error
+	HostExec      func(ctx context.Context, budget time.Duration, name string, args ...string) (string, error)
 
 	DNSTCP bool // cilium-lrp :53 TCP probe canned answer
 	// SvcBackends is the canned cilium-lrp BPF service map —
@@ -109,6 +115,16 @@ type Fixture struct {
 	SvcErr      error
 	MetricsBody string // kubelet /metrics canned body (PLEG)
 	MetricsErr  error  // kubelet /metrics canned error
+
+	TLSPeerCert     *x509.Certificate
+	TLSPeerCertErr  error
+	TLSPeerCerts    map[string]*x509.Certificate
+	TLSPeerCertErrs map[string]error
+
+	FQDNCacheBody []byte
+	FQDNCacheErr  error
+	HTTPBodies    map[string][]byte
+	HTTPErrs      map[string]error
 
 	mu sync.Mutex // guards SDCmds (feeder goroutine + Cycle both record)
 }
@@ -163,14 +179,19 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 	t.Helper()
 	root := t.TempDir()
 	f := &Fixture{
-		Live:     map[int]bool{},
-		Now:      time.Now(),
-		SDReply:  map[string]string{},
-		Probes:   map[string]error{},
-		Status:   map[string]int{},
-		Bearer:   map[string]string{},
-		SockErrs: map[string]error{},
-		BodyOK:   map[string]bool{},
+		Live:            map[int]bool{},
+		Now:             time.Now(),
+		SDReply:         map[string]string{},
+		Probes:          map[string]error{},
+		Status:          map[string]int{},
+		Bearer:          map[string]string{},
+		SockErrs:        map[string]error{},
+		BodyOK:          map[string]bool{},
+		TLSPeerCerts:    map[string]*x509.Certificate{},
+		TLSPeerCertErrs: map[string]error{},
+		HTTPBodies:      map[string][]byte{},
+		HTTPErrs:        map[string]error{},
+		MountStatErrs:   map[string]error{},
 	}
 	f.StateDir = filepath.Join(root, "watchdog")
 	f.ProcDir = filepath.Join(root, "proc")
@@ -183,8 +204,9 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 	f.SysNet = filepath.Join(root, "sysnet")
 	f.CiliumRt = filepath.Join(root, "agent-runtime-config.json")
 	f.JDir = filepath.Join(root, "journal")
+	f.KubeletPKIDir = filepath.Join(root, "kubeletpki")
 	for _, d := range []string{f.StateDir, f.ProcDir, f.CtrDir, f.SbDir,
-		f.KubepodsDir, f.IngestDir, f.SysNet, f.JDir} {
+		f.KubepodsDir, f.IngestDir, f.SysNet, f.JDir, f.KubeletPKIDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -209,6 +231,9 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 	f.SDReply["systemctl is-active k0sworker.service"] = "active\n"
 	f.SDReply["ActiveEnterTimestampMonotonic --value k0sworker.service"] =
 		fmt.Sprintf("%d\n", 7200500000-int64(time.Hour/time.Microsecond))
+	// systemd-oomd is inactive by default so existing tests skip cleanly
+	// without stubbing journalctl -o json.
+	f.SDReply["systemctl is-active systemd-oomd.service"] = "inactive\n"
 	f.Cfg = wdeps.Config{
 		NodeName:          "node-a",
 		Interval:          time.Hour,
@@ -230,6 +255,7 @@ func New(t *testing.T, objs ...runtime.Object) *Fixture {
 		MinRestartInterval: 30 * time.Minute,
 		Kubelet: wdeps.KubeletConfig{
 			WatchMinAge: 15 * time.Minute,
+			PKIDir:      f.KubeletPKIDir,
 		},
 		Teardown: wdeps.TeardownConfig{
 			StuckDeleteAge: 20 * time.Minute,
@@ -339,6 +365,9 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 		if path == "/v1/endpoint" && (f.EndpointsBody != nil || f.EndpointsErr != nil) {
 			return f.EndpointsBody, f.EndpointsErr
 		}
+		if path == "/v1/fqdn/cache" && (f.FQDNCacheBody != nil || f.FQDNCacheErr != nil) {
+			return f.FQDNCacheBody, f.FQDNCacheErr
+		}
 		return f.UnixBody, f.UnixErr
 	}
 	d.Cfg.Seams.Cilium.UnixDelete = func(_ context.Context, _, path string) error {
@@ -350,6 +379,31 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 	}
 	d.Cfg.Seams.Host.JournalFn = func(_ context.Context) (string, error) {
 		return f.Journal, f.JournalErr
+	}
+	d.Cfg.Seams.Host.JournalExecFn = func(ctx context.Context, args ...string) (string, error) {
+		if f.JournalExec != nil {
+			return f.JournalExec(ctx, args...)
+		}
+		if d.Cfg.Systemd == nil {
+			return "", errors.New("wdepstest: no systemd client wired")
+		}
+		return d.Cfg.Systemd.Exec(ctx, "journalctl", args...)
+	}
+	d.Cfg.Seams.Host.HostExecFn = func(ctx context.Context, budget time.Duration, name string, args ...string) (string, error) {
+		if f.HostExec != nil {
+			return f.HostExec(ctx, budget, name, args...)
+		}
+		if name == "stat" {
+			if len(args) > 0 {
+				mp := args[len(args)-1]
+				return "", f.MountStatErrs[mp]
+			}
+			return "", nil
+		}
+		if d.Cfg.Systemd == nil {
+			return "", errors.New("wdepstest: no systemd client wired")
+		}
+		return d.Cfg.Systemd.ExecBounded(ctx, budget, name, args...)
 	}
 	// Base seams: status-code probes default 200 (healthy) unless
 	// Probes[url] errors or Status[url] overrides; the unix socket
@@ -375,6 +429,30 @@ func (f *Fixture) Bind(d *wdeps.Deps) {
 	}
 	d.Cfg.Seams.Probe.KubeletMetricsFn = func(_ context.Context, _, _ string, _ time.Duration) (string, error) {
 		return f.MetricsBody, f.MetricsErr
+	}
+	d.Cfg.Seams.Probe.HTTPGetBody = func(_ context.Context, url string, _ time.Duration) ([]byte, error) {
+		if err := f.HTTPErrs[url]; err != nil {
+			return nil, err
+		}
+		if body, ok := f.HTTPBodies[url]; ok {
+			return body, nil
+		}
+		return nil, errors.New("wdepstest: HTTPGetBody not stubbed")
+	}
+	d.Cfg.Seams.Probe.TLSPeerCertFn = func(_ context.Context, addr string) (*x509.Certificate, error) {
+		if err := f.TLSPeerCertErrs[addr]; err != nil {
+			return nil, err
+		}
+		if cert, ok := f.TLSPeerCerts[addr]; ok {
+			return cert, nil
+		}
+		if f.TLSPeerCertErr != nil {
+			return nil, f.TLSPeerCertErr
+		}
+		if f.TLSPeerCert != nil {
+			return f.TLSPeerCert, nil
+		}
+		return nil, errors.New("wdepstest: tls peer cert not stubbed")
 	}
 	d.Cfg.Seams.Host.StatfsFn = func(_ string, st *unix.Statfs_t) error {
 		st.Blocks = 100

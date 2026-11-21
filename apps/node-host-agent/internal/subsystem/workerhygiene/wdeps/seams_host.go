@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/journalwatch"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -93,11 +94,33 @@ type Host struct {
 	// in the HOST namespace (devPath is the plain /dev/loopN host path);
 	// tests re-stub it to record the request without touching loop devices.
 	DetachLoopFn func(ctx context.Context, devPath string) error
+	// Wave-4 #9: JournalExecFn runs `journalctl <args...>` against the host
+	// journal — low-level transport seam for journalwatch.Multiplexer
+	// consumers (systemd-oomd). nil → Systemd.Exec("journalctl", ...).
+	JournalExecFn journalwatch.ExecFunc
+	// Wave-4 #10: HostExecFn runs `name args...` on the host with a bounded
+	// timeout (nil → Systemd.ExecBounded; nil Systemd → "no systemd client wired").
+	// Low-level transport seam.
+	HostExecFn func(ctx context.Context, budget time.Duration, name string, args ...string) (string, error)
 }
 
 // loopDetachBudget bounds the host-namespace losetup call — far below the
 // shared 30s systemd default so a wedged device can never stall a cycle.
 const loopDetachBudget = 30 * time.Second
+
+// mountStatTimeout bounds the host-namespace `stat -f` mount probe.
+const mountStatTimeout = 3 * time.Second
+
+// StatfsSubprocess probes mountpoint via `stat -f -- <mountpoint>` in a
+// bounded host-namespace subprocess so an uninterruptible D-state network
+// mount never blocks an OS thread inside the agent process.
+func (s *Host) StatfsSubprocess(ctx context.Context, mountpoint string) error {
+	if s.HostExecFn == nil {
+		return errors.New("workerhygiene: HostExecFn is nil")
+	}
+	_, err := s.HostExecFn(ctx, mountStatTimeout, "stat", "-f", "--", mountpoint)
+	return err
+}
 
 func (s *Host) applyDefaults(c *Config) {
 	if s.KillFn == nil {
@@ -183,6 +206,24 @@ func (s *Host) applyDefaults(c *Config) {
 			_, err := c.Systemd.ExecBounded(ctx, loopDetachBudget,
 				"losetup", "-d", devPath)
 			return err
+		}
+	}
+	if s.JournalExecFn == nil {
+		sd := c.Systemd
+		s.JournalExecFn = func(ctx context.Context, args ...string) (string, error) {
+			if sd == nil {
+				return "", errors.New("no systemd client wired")
+			}
+			return sd.Exec(ctx, "journalctl", args...)
+		}
+	}
+	if s.HostExecFn == nil {
+		sd := c.Systemd
+		s.HostExecFn = func(ctx context.Context, budget time.Duration, name string, args ...string) (string, error) {
+			if sd == nil {
+				return "", errors.New("no systemd client wired")
+			}
+			return sd.ExecBounded(ctx, budget, name, args...)
 		}
 	}
 }

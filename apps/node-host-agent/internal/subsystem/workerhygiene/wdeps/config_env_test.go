@@ -38,6 +38,8 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv(envnames.EnvContainerdSocket, "/custom/containerd.sock")
 	t.Setenv(envnames.EnvKubeletTokenFile, "/custom/sa-token")
 	t.Setenv(envnames.EnvKubeletWatchdogHosts, "a , b")
+	t.Setenv(envnames.EnvKubeletPKIDir, "/custom/kubelet-pki")
+	t.Setenv(envnames.EnvKubeletCertMinDays, "21")
 	t.Setenv(envnames.EnvHygieneStuckDeleteAge, "20m")
 	t.Setenv(envnames.EnvHygieneMaxForceDelete, "9")
 	t.Setenv(envnames.EnvDstateStormThreshold, "7")
@@ -82,6 +84,12 @@ func TestConfigFromEnv(t *testing.T) {
 	if !reflect.DeepEqual(cfg.Kubelet.WatchdogHosts, []string{"a", "b"}) {
 		t.Fatalf("KubeletWatchdogHosts=%v", cfg.Kubelet.WatchdogHosts)
 	}
+	if cfg.Kubelet.PKIDir != "/custom/kubelet-pki" {
+		t.Fatalf("Kubelet.PKIDir=%q", cfg.Kubelet.PKIDir)
+	}
+	if cfg.Kubelet.CertMinDays != 21 {
+		t.Fatalf("Kubelet.CertMinDays=%d want 21", cfg.Kubelet.CertMinDays)
+	}
 	if cfg.Teardown.StuckDeleteAge != 20*time.Minute {
 		t.Fatalf("StuckDeleteAge=%v", cfg.Teardown.StuckDeleteAge)
 	}
@@ -115,6 +123,12 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	}
 	if cfg.Kubelet.TokenPath != wdeps.DefaultKubeletTokenPath {
 		t.Fatalf("KubeletTokenPath=%q", cfg.Kubelet.TokenPath)
+	}
+	if cfg.Kubelet.PKIDir != "/host/var/lib/k0s/kubelet/pki" {
+		t.Fatalf("Kubelet.PKIDir=%q", cfg.Kubelet.PKIDir)
+	}
+	if cfg.Kubelet.CertMinDays != 14 {
+		t.Fatalf("Kubelet.CertMinDays=%d want 14", cfg.Kubelet.CertMinDays)
 	}
 	if cfg.Cilium.Socket != "/host/run/cilium/cilium.sock" {
 		t.Fatalf("CiliumSocket=%q", cfg.Cilium.Socket)
@@ -164,6 +178,12 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.Runtime.CgroupRoot != "/sys/fs/cgroup" ||
 		cfg.Runtime.SessionsDir != "/run/systemd/sessions" {
 		t.Fatalf("identity Runtime paths: %+v", cfg.Runtime)
+	}
+	if cfg.Kubelet.ServeAddr != "127.0.0.1:10250" {
+		t.Fatalf("Kubelet.ServeAddr=%q want 127.0.0.1:10250", cfg.Kubelet.ServeAddr)
+	}
+	if cfg.Cilium.MetricsURL != "http://127.0.0.1:9962/metrics" {
+		t.Fatalf("Cilium.MetricsURL=%q want http://127.0.0.1:9962/metrics", cfg.Cilium.MetricsURL)
 	}
 }
 

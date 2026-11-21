@@ -257,3 +257,34 @@ func TestPKICertFilePathEntry(t *testing.T) {
 		t.Fatalf("file-entry days=%v want ~30", v)
 	}
 }
+
+// TestPKICertDefaultKubeletServerPath verifies Wave 4 #4: when
+// PKICertPaths uses defaultPKIHostPaths (nil before New),
+// kubelet-server-current.pem under HostRoot emits
+// node_host_agent_pki_cert_days_left with the HostRoot-stripped path,
+// and skips cleanly with zero series when absent.
+func TestPKICertDefaultKubeletServerPath(t *testing.T) {
+	// Present: emits node_host_agent_pki_cert_days_left with path="/var/lib/k0s/kubelet/pki/kubelet-server-current.pem".
+	cfg, _ := fixture(t)
+	cfg.PKICertPaths = nil
+	srvPEM := filepath.Join(cfg.HostRoot, "var/lib/k0s/kubelet/pki/kubelet-server-current.pem")
+	testutil.WriteFile(t, srvPEM, string(mkTestCertPEM(t, time.Now().Add(25*24*time.Hour))))
+	c := New(cfg)
+	wantPath := "/var/lib/k0s/kubelet/pki/kubelet-server-current.pem"
+	v, ok := metricValue(t, c, "node_host_agent_pki_cert_days_left",
+		map[string]string{"node": "node-a", "path": wantPath})
+	if !ok {
+		t.Fatalf("default kubelet-server-current.pem series absent (want path=%s)", wantPath)
+	}
+	if v < 24 || v > 26 {
+		t.Fatalf("kubelet-server-current.pem days=%v want ~25", v)
+	}
+
+	// Absent: skips cleanly without emitting any fake series.
+	cfgAbsent, _ := fixture(t)
+	cfgAbsent.PKICertPaths = nil
+	cAbsent := New(cfgAbsent)
+	if !metricFamilyAbsent(t, cAbsent, "node_host_agent_pki_cert_days_left") {
+		t.Fatal("expected no pki_cert_days_left series when default PKI paths are absent")
+	}
+}

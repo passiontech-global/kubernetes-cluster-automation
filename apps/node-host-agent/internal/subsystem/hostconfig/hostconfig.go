@@ -128,6 +128,11 @@ type Config struct {
 	// test may force it true with a sandboxed HostRoot to exercise the
 	// standalone-only groups.
 	Standalone bool
+	// THPEnabled / THPDefrag override the transparent_hugepage target
+	// posture when non-empty (precedence: env/Config > cluster vars
+	// host_thp_{enabled,defrag} > compiled defaults madvise / defer+madvise).
+	THPEnabled string
+	THPDefrag  string
 }
 
 func (c *Config) applyDefaults() {

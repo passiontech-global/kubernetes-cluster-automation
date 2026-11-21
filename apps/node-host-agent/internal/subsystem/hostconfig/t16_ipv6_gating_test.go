@@ -75,6 +75,22 @@ func TestT16PairsEphemeralPortHygiene(t *testing.T) {
 	}
 }
 
+func TestT16PairsRPFilter(t *testing.T) {
+	c := &cyc{r: &Reconciler{}}
+	pairs := map[string]string{}
+	for _, kv := range c.t16Pairs() {
+		pairs[kv[0]] = kv[1]
+	}
+	for _, k := range []string{
+		"net.ipv4.conf.all.rp_filter",
+		"net.ipv4.conf.default.rp_filter",
+	} {
+		if got := pairs[k]; got != "2" {
+			t.Fatalf("%s = %q, want \"2\"", k, got)
+		}
+	}
+}
+
 // aio-pressure: fs.aio-max-nr joins the T16 pair list only when the
 // kernel exposes the aio table — an unconditional key would fail
 // sysctl --system on an aio-less kernel.

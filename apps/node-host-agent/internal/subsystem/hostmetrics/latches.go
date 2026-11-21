@@ -151,6 +151,7 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 		latchdefs.LatchEBPFPressure,
 		latchdefs.LatchNeighborPressure,
 		latchdefs.LatchHostNetworkProblems,
+		latchdefs.LatchHostKernelDrift,
 	} {
 		p := c.state.Path(name)
 		if fi, err := os.Stat(p); err == nil {

@@ -63,6 +63,12 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.NebulaDirectTCPPorts != nil {
 		t.Fatalf("NebulaDirectTCPPorts = %v, want nil", cfg.NebulaDirectTCPPorts)
 	}
+	if cfg.ciliumSocket != "/host/run/cilium/cilium.sock" {
+		t.Fatalf("ciliumSocket = %q", cfg.ciliumSocket)
+	}
+	if cfg.sysClassNet != "/host/sys/class/net" {
+		t.Fatalf("sysClassNet = %q", cfg.sysClassNet)
+	}
 }
 
 // TestConfigFromEnvOverrides sets every knob and verifies env wins,
@@ -77,6 +83,8 @@ func TestConfigFromEnvOverrides(t *testing.T) {
 	t.Setenv(envnames.EnvNethealthConsecNeeded, "5")
 	t.Setenv(envnames.EnvNethealthMinRestart, "10m")
 	t.Setenv(envnames.EnvNebulaDirectTCPPorts, "22, 6443 ,bogus,9443")
+	t.Setenv(envnames.EnvCiliumSocket, "/custom/cilium.sock")
+	t.Setenv(envnames.EnvSysClassNet, "/custom/sys/class/net")
 
 	cfg := ConfigFromEnv(EnvDeps{HostRoot: "/"})
 
@@ -100,6 +108,12 @@ func TestConfigFromEnvOverrides(t *testing.T) {
 	if want := []int{22, 6443, 9443}; !slices.Equal(cfg.NebulaDirectTCPPorts, want) {
 		t.Fatalf("NebulaDirectTCPPorts = %v, want %v",
 			cfg.NebulaDirectTCPPorts, want)
+	}
+	if cfg.ciliumSocket != "/custom/cilium.sock" {
+		t.Fatalf("ciliumSocket = %q", cfg.ciliumSocket)
+	}
+	if cfg.sysClassNet != "/custom/sys/class/net" {
+		t.Fatalf("sysClassNet = %q", cfg.sysClassNet)
 	}
 }
 

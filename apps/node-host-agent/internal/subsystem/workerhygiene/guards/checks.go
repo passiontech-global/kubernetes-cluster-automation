@@ -52,3 +52,8 @@ func NewCalico(d *wdeps.Deps) *CalicoCheck { return &CalicoCheck{d: d} }
 func NewCNINetns(d *wdeps.Deps) *CNINetnsCheck {
 	return &CNINetnsCheck{d: d}
 }
+
+// NewSystemdOOMD returns the #9 systemd-oomd pod/k0s slice kill guard.
+func NewSystemdOOMD(d *wdeps.Deps) *SystemdOOMDCheck {
+	return newSystemdOOMD(d)
+}

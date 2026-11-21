@@ -61,4 +61,10 @@ const (
 	// Wave-3 #10: kernel eBPF prog/map resource leak latch ceilings.
 	EnvEBPFProgsMax = "NODE_HOST_AGENT_EBPF_PROGS_MAX"
 	EnvEBPFMapsMax  = "NODE_HOST_AGENT_EBPF_MAPS_MAX"
+
+	// Wave-4 #9: host kernel drift (THP + rp_filter) auto-heal gate.
+	// The THP target knobs themselves (EnvTHPEnabled, EnvTHPDefrag)
+	// live in envnames_hostconfig.go — one env contract shared by
+	// both subsystems.
+	EnvKernelDriftHeal = "NODE_HOST_AGENT_KERNEL_DRIFT_HEAL"
 )

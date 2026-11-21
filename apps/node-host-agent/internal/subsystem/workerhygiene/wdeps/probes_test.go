@@ -8,9 +8,15 @@ package wdeps
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -240,5 +246,70 @@ func TestKubeletMetricsGet(t *testing.T) {
 	}
 	if _, err := kubeletMetricsGet(ctx, "http://127.0.0.1:1/metrics", "", 2*time.Second); err == nil {
 		t.Fatal("unreachable URL must error")
+	}
+}
+
+// TestTLSDialPeerCert verifies tlsDialPeerCert returns the leaf peer
+// certificate from a live TLS listener and errors on a closed port.
+func TestTLSDialPeerCert(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	serial := big.NewInt(424242)
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{der},
+			PrivateKey:  priv,
+		}},
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				if tc, ok := c.(*tls.Conn); ok {
+					_ = tc.Handshake()
+				}
+			}(conn)
+		}
+	}()
+
+	got, err := tlsDialPeerCert(context.Background(), ln.Addr().String())
+	if err != nil {
+		t.Fatalf("tlsDialPeerCert: %v", err)
+	}
+	if got.SerialNumber.Cmp(serial) != 0 {
+		t.Fatalf("serial=%v want %v", got.SerialNumber, serial)
+	}
+
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.Addr().String()
+	_ = dead.Close()
+	if _, err := tlsDialPeerCert(context.Background(), deadAddr); err == nil {
+		t.Fatal("expected error dialing closed port")
 	}
 }

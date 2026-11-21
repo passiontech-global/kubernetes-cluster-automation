@@ -117,6 +117,11 @@ func (h *Hygiene) initChecks() {
 	add(guards.NewNetfilterGuard(d))  // wdeps.CheckNetfilterGuard
 	// Wave-3 self-healing guards — appended at the tail.
 	add(runtime.NewUDPStale(d)) // wdeps.CheckUDPStale
+	// Wave-4 self-healing guards — appended at the tail.
+	add(kubelet.NewCert(d))             // wdeps.CheckKubeletCert
+	add(cilium.NewCiliumFQDN(d))        // wdeps.CheckCiliumFQDN
+	add(guards.NewSystemdOOMD(d))       // wdeps.CheckSystemdOOMD
+	add(runtime.NewNetworkMountHung(d)) // wdeps.CheckNetworkMountHung
 	// A single UNGATED group: the unit-file and uptime gates return
 	// early in Cycle and workerActive gates inside each check
 	// (per-check cycles{check,"gated"}) — none map onto

@@ -30,6 +30,7 @@ type Config struct {
 	// ProcRoot and the clock cell splice (subframe.FromDeps).
 	subframe.Base
 	NodeName       string
+	VarsDir        string
 	SysClassNet    string
 	NebulaIface    string
 	RouteFile      string
@@ -197,6 +198,14 @@ type Config struct {
 	// Wave-3 #10: kernel eBPF prog/map resource leak latch ceilings.
 	EBPFProgsMax int
 	EBPFMapsMax  int
+
+	// Wave-4 #9: host kernel drift (THP + rp_filter) auto-heal gate
+	// and target THP posture. THPEnabled / THPDefrag override VarsDir
+	// (host_thp_enabled / host_thp_defrag) and compiled defaults when
+	// non-empty (matches hostconfig's Config/env > VarsDir > default).
+	KernelDriftHeal bool
+	THPEnabled      string
+	THPDefrag       string
 
 	// collectCacheTTL overrides the Collect snapshot TTL — 0 →
 	// collectSnapshotTTL (10s); a NEGATIVE value disables the cache

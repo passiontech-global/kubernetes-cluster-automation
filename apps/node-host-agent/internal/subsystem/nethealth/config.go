@@ -25,13 +25,15 @@ import (
 
 // Defaults mirror the shell modules + DaemonSet host mounts.
 const (
-	defaultInterval     = 2 * time.Minute
-	defaultCycleTimeout = 15 * time.Minute
-	defaultConsecNeeded = 2
-	defaultMinRestart   = 30 * time.Minute
-	defaultHostRoot     = "/"
-	defaultSysClassNet  = "/sys/class/net"
-	minUptimeSeconds    = 300
+	defaultInterval       = 2 * time.Minute
+	defaultCycleTimeout   = 15 * time.Minute
+	defaultConsecNeeded   = 2
+	defaultMinRestart     = 30 * time.Minute
+	defaultHostRoot       = "/"
+	defaultSysClassNet    = "/sys/class/net"
+	defaultCiliumSocket   = "/run/cilium/cilium.sock"
+	defaultNodeLocalDNSIP = "169.254.20.10"
+	minUptimeSeconds      = 300
 
 	// suspectLogCadence throttles repeat suspect lines so a
 	// persisting cause doesn't spam the watchdog log every cycle
@@ -159,6 +161,16 @@ type Config struct {
 	// adjtimexFn reads the kernel clock discipline — a modes==0
 	// (read-only) adjtimex(2) needs no CAP_SYS_TIME. Tests inject.
 	adjtimexFn func(buf *unix.Timex) (int, error)
+	// ciliumSocket is the cilium-agent Unix API socket path used to
+	// check whether a CiliumLocalRedirectPolicy handles DNS locally
+	// (default /run/cilium/cilium.sock; hostPath-prefixed in pod mode).
+	ciliumSocket string
+	// unixGet GETs path over a unix socket and returns the body —
+	// default probee.UnixGet (Cilium /v1/service LRP bypass check).
+	unixGet func(ctx context.Context, socket, path string) ([]byte, error)
+	// nodeLocalDNSIP is the link-local IP bound on the nodelocaldns
+	// interface in iptables mode (default 169.254.20.10).
+	nodeLocalDNSIP string
 }
 
 func (c *Config) applyDefaults() {
@@ -322,6 +334,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.adjtimexFn == nil {
 		c.adjtimexFn = unix.Adjtimex
+	}
+	if c.ciliumSocket == "" {
+		c.ciliumSocket = defaultCiliumSocket
+	}
+	if c.unixGet == nil {
+		c.unixGet = probee.UnixGet
+	}
+	if c.nodeLocalDNSIP == "" {
+		c.nodeLocalDNSIP = defaultNodeLocalDNSIP
 	}
 }
 

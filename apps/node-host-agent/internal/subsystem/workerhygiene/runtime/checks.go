@@ -92,3 +92,11 @@ func NewKernelNetShim(d *wdeps.Deps) *KernelNetShimCheck {
 func NewInotifyPressure(d *wdeps.Deps) *InotifyPressureCheck {
 	return &InotifyPressureCheck{d: d}
 }
+
+// NewNetworkMountHung returns the #10-L1 hung network/FUSE mount guard.
+func NewNetworkMountHung(d *wdeps.Deps) *NetworkMountHungCheck {
+	return &NetworkMountHungCheck{
+		d:        d,
+		inflight: make(map[string]*mountProbeFlight),
+	}
+}

@@ -255,3 +255,41 @@ func TestServiceBackends(t *testing.T) {
 		t.Fatalf("SvcErr error=%v want %v", err, e.SvcErr)
 	}
 }
+
+// TestHostStatfsSubprocess — StatfsSubprocess builds `stat -f -- <mp>` with
+// the 3s budget over HostExecFn, propagates errors, and fails cleanly when
+// HostExecFn is nil.
+func TestHostStatfsSubprocess(t *testing.T) {
+	e := fixture(t)
+	ctx := context.Background()
+
+	var gotBudget time.Duration
+	var gotName string
+	var gotArgs []string
+	e.D.Cfg.Seams.Host.HostExecFn = func(_ context.Context, budget time.Duration, name string, args ...string) (string, error) {
+		gotBudget = budget
+		gotName = name
+		gotArgs = append([]string(nil), args...)
+		return "ok", nil
+	}
+	if err := e.D.Cfg.Seams.Host.StatfsSubprocess(ctx, "/mnt/nfs share"); err != nil {
+		t.Fatalf("StatfsSubprocess: %v", err)
+	}
+	if gotBudget != 3*time.Second || gotName != "stat" ||
+		strings.Join(gotArgs, "|") != "-f|--|/mnt/nfs share" {
+		t.Fatalf("StatfsSubprocess call=(%v, %q, %v)", gotBudget, gotName, gotArgs)
+	}
+
+	wantErr := errors.New("stat timed out")
+	e.D.Cfg.Seams.Host.HostExecFn = func(context.Context, time.Duration, string, ...string) (string, error) {
+		return "", wantErr
+	}
+	if err := e.D.Cfg.Seams.Host.StatfsSubprocess(ctx, "/mnt/nfs"); !errors.Is(err, wantErr) {
+		t.Fatalf("StatfsSubprocess error=%v want %v", err, wantErr)
+	}
+
+	e.D.Cfg.Seams.Host.HostExecFn = nil
+	if err := e.D.Cfg.Seams.Host.StatfsSubprocess(ctx, "/mnt/nfs"); err == nil {
+		t.Fatal("expected error when HostExecFn is nil")
+	}
+}

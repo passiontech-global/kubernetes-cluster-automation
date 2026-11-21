@@ -436,4 +436,35 @@ var CondDefs = map[string]CondDef{
 		DefaultMessage: "embedded etcd healthy (no CORRUPT alarm, stuck learner, or WAL fsync storm)",
 		ProblemReason:  "EtcdQuorumDegradedDetected",
 	},
+	// --- wave-4 self-healing wave ---
+	LatchWorkerKubeletCertExpiring: {
+		Type:           "WorkerKubeletCertExpiring",
+		DefaultReason:  "WorkerKubeletCertValid",
+		DefaultMessage: "worker kubelet serving certificate valid beyond expiry horizon and matches :10250",
+		ProblemReason:  "WorkerKubeletCertExpiringDetected",
+	},
+	LatchHostKernelDrift: {
+		Type:           "HostKernelDrift",
+		DefaultReason:  "HostKernelNormal",
+		DefaultMessage: "transparent hugepages and rp_filter sysctls match target kernel posture",
+		ProblemReason:  "HostKernelDriftDetected",
+	},
+	LatchSystemdOOMDKill: {
+		Type:           "SystemdOOMDKill",
+		DefaultReason:  "SystemdOOMDHealthy",
+		DefaultMessage: "no recent systemd-oomd pod or k0s slice kills",
+		ProblemReason:  "SystemdOOMDKillDetected",
+	},
+	LatchNetworkMountHung: {
+		Type:           "NetworkMountHung",
+		DefaultReason:  "NetworkMountsHealthy",
+		DefaultMessage: "all probed network and FUSE mounts responsive",
+		ProblemReason:  "NetworkMountHungDetected",
+	},
+	LatchNodeLocalDNSNoTrackDrift: {
+		Type:           "NodeLocalDNSNoTrackDrift",
+		DefaultReason:  "NodeLocalDNSNoTrackOk",
+		DefaultMessage: "NodeLocalDNS raw NOTRACK iptables rules present on 169.254.20.10:53",
+		ProblemReason:  "NodeLocalDNSNoTrackDriftDetected",
+	},
 }
