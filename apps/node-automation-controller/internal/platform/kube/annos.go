@@ -221,6 +221,22 @@ const (
 	// AnnoTopologyRelaxOptIn opts a StatefulSet into temporary relaxation of
 	// topology.kubernetes.io/zone DoNotSchedule constraints during a dead zone.
 	AnnoTopologyRelaxOptIn = "passiontech.dev/topology-relax-opt-in"
+	// AnnoCircuitBrokenCELPolicy records the timestamp and reason on a
+	// ValidatingAdmissionPolicy or MutatingAdmissionPolicy tripped to
+	// failurePolicy=Ignore by webhookguard/celpolicy.
+	AnnoCircuitBrokenCELPolicy = "passiontech.dev/circuit-broken-cel-policy"
+	// AnnoMassPruneGuard opts a Flux Kustomization into automatic suspend
+	// (when set to "suspend") on a gitops-mass-prune-guard inventory drop.
+	AnnoMassPruneGuard = "passiontech.dev/mass-prune-guard"
+	// AnnoMassPruneExpected suppresses gitops-mass-prune-guard alerts/suspends
+	// for an intentional large inventory reduction when set to "true".
+	AnnoMassPruneExpected = "passiontech.dev/mass-prune-expected"
+	// AnnoMassPruneSuspendedBy stamps a Flux Kustomization suspended by
+	// gitops-mass-prune-guard so operators know which guard suspended it.
+	AnnoMassPruneSuspendedBy = "passiontech.dev/mass-prune-suspended-by"
+	// AnnoMutableImageExempt exempts a workload/pod from
+	// image-resilience-auditor checks when set to "true".
+	AnnoMutableImageExempt = "passiontech.dev/mutable-image-exempt"
 )
 
 // ---------------------------------------------------------------------------

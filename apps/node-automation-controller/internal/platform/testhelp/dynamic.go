@@ -50,11 +50,15 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "acme.cert-manager.io", Version: "v1", Kind: "Challenge"},
 
 	// cilium (ciliumidentityauditor, clusterhealthprobes' endpoint/
-	// node scans).
+	// node scans, admission-security-guard, cilium-policy-bgp-guard).
 	{Group: "cilium.io", Version: "v2", Kind: "CiliumIdentity"},
 	{Group: "cilium.io", Version: "v2", Kind: "CiliumEndpoint"},
 	{Group: "cilium.io", Version: "v2", Kind: "CiliumNode"},
 	{Group: "cilium.io", Version: "v2alpha1", Kind: "CiliumEndpointSlice"},
+	{Group: "cilium.io", Version: "v2", Kind: "CiliumNetworkPolicy"},
+	{Group: "cilium.io", Version: "v2", Kind: "CiliumClusterwideNetworkPolicy"},
+	{Group: "cilium.io", Version: "v2", Kind: "CiliumBGPNodeConfig"},
+	{Group: "cilium.io", Version: "v2alpha1", Kind: "CiliumBGPNodeConfig"},
 
 	// external-secrets — v1 and v1beta1 are BOTH served and both
 	// listed (externalsecretnudge tries each in order).

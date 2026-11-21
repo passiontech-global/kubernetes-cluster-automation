@@ -35,6 +35,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	linkerd.NewLinkerdSidecarOOMGuardCheck,
 	NewApiserverNodeReachabilityCheck,
 	NewServiceSelectorBlackholeCheck,
+	NewServiceTrafficPolicyGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

@@ -22,6 +22,9 @@ func TestGatherFindsCounters(t *testing.T) {
 	WebhookMissingCriticalNSExclusion.WithLabelValues("k", "n", "w").Set(1)
 	WebhookHeartbeatResourceExposed.WithLabelValues("k", "n", "w", "r").Set(1)
 	CRDConversionWebhookUnhealthy.WithLabelValues("c", "s", "r").Set(1)
+	CELPolicyCircuitBroken.WithLabelValues("k", "p").Set(1)
+	CELPolicyCriticalNSExposed.WithLabelValues("k", "p", "ns").Set(1)
+	CELPolicyActionsTotal.WithLabelValues("k", "trip").Inc()
 	PDBDrainBlocked.WithLabelValues("ns", "pdb", "r").Set(1)
 	StuckTerminatingResources.WithLabelValues("k", "ns", "n").Set(1)
 	HelmHookJobsCleanedTotal.WithLabelValues("ns").Inc()
@@ -88,6 +91,9 @@ func TestGatherFindsCounters(t *testing.T) {
 		"node_automation_webhook_missing_critical_ns_exclusion",
 		"node_automation_webhook_heartbeat_resource_exposed",
 		"node_automation_crd_conversion_webhook_unhealthy",
+		"node_automation_cel_policy_circuit_broken",
+		"node_automation_cel_policy_critical_ns_exposed",
+		"node_automation_cel_policy_actions_total",
 		"node_automation_pdb_drain_blocked",
 		"node_automation_stuck_terminating_resources",
 		"node_automation_helm_hook_jobs_cleaned_total",

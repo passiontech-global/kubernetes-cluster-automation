@@ -23,6 +23,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewCiliumMissingEndpointsCheck,
 	NewCiliumDatapathMapGuardCheck,
 	NewCiliumL2LeaseGuardCheck,
+	NewCiliumPolicyBGPGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

@@ -28,6 +28,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewNamespaceTerminatingWedgedCheck,
 	NewCPUStealTaintSyncCheck,
 	NewNodeConditionSweeperCheck,
+	NewImageResilienceAuditorCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

@@ -22,6 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // apiObjectSprawlReportGCCheck is the report-garbage and helm-secret
@@ -57,13 +58,23 @@ type apiObjectSprawlReportGCCheck struct {
 	// the census every 5m.
 	kineCycle        uint64
 	kineLastFindings []string
+
+	// historyGCEnabled is NODE_AUTOMATION_SPRAWL_HISTORY_GC_ENABLED
+	// resolved once at construction (default true).
+	historyGCEnabled bool
+	// emittedHistorySprawl tracks node_automation_api_object_sprawl_count
+	// tuples by kind so resolved sprawl kinds prune cleanly.
+	emittedHistorySprawl state.GaugeLedger[string]
 }
 
 // NewAPIObjectSprawlReportGCCheck builds the sprawl-gc check — its
 // state is the emitted-gauge ledgers; deletes carry no cooldown
 // because the GC is idempotent (the object is simply gone next sweep).
 func NewAPIObjectSprawlReportGCCheck(d *probefw.Deps) probefw.Check {
-	return &apiObjectSprawlReportGCCheck{Deps: d}
+	return &apiObjectSprawlReportGCCheck{
+		Deps:             d,
+		historyGCEnabled: envx.Gate("NODE_AUTOMATION_SPRAWL_HISTORY_GC_ENABLED", true),
+	}
 }
 
 const (
@@ -183,7 +194,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	var objects, orphans, helmRep, kineRep probefw.SweepReport
+	var objects, orphans, helmRep, kineRep, historyRep probefw.SweepReport
 	orphanBudget := sprawlMaxOrphanDeletes
 	p.ownerSeen = map[string]bool{}
 	for _, rk := range sprawlReportKinds {
@@ -322,6 +333,10 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: err}
 	}
 
+	if err := p.gcWorkloadHistorySprawl(ctx, log, now, &objects, &historyRep); err != nil {
+		return probefw.Result{Infra: err}
+	}
+
 	// Kine large-object census — cluster-wide ConfigMap/Secret size
 	// census on ITS OWN GaugeScope (kineRep): its tuples
 	// ("kind/ns/name") live on kineLargeObjectBytesGauge, a different
@@ -364,6 +379,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	orphans.Close(&p.emittedOrphans, ephemeralReportsOrphanedGauge.DeleteLabelValues)
 	helmRep.Close(&p.emittedHelm, helmSecretsExcessGauge.DeleteLabelValues)
 	kineRep.Close(&p.emittedLargeObjects, kineLargeObjectBytesGauge.DeleteLabelValues)
+	historyRep.Close(&p.emittedHistorySprawl, apiObjectSprawlCountGauge.DeleteLabelValues)
 	return objects.Verdict("api object sprawl: ", ", ")
 }
 

@@ -114,6 +114,28 @@ var WebhookExcessiveTimeout = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while an admission or CRD conversion webhook with failurePolicy=Fail exceeds max timeoutSeconds.",
 }, []string{"kind", "config", "webhook"})
 
+// CELPolicyCircuitBroken marks (1) each ValidatingAdmissionPolicy or
+// MutatingAdmissionPolicy currently tripped to failurePolicy=Ignore by
+// webhookguard/celpolicy.
+var CELPolicyCircuitBroken = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_cel_policy_circuit_broken",
+	Help: "1 while the named CEL admission policy is circuit-broken (failurePolicy patched to Ignore).",
+}, []string{"kind", "policy"})
+
+// CELPolicyCriticalNSExposed marks (1) each fail-closed CEL admission policy
+// whose MatchConstraints still expose a critical self-healing namespace.
+var CELPolicyCriticalNSExposed = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_cel_policy_critical_ns_exposed",
+	Help: "1 while the fail-closed CEL admission policy matches a critical self-healing namespace.",
+}, []string{"kind", "policy", "namespace"})
+
+// CELPolicyActionsTotal counts CEL admission policy guard actions
+// (trip, restore, criticalns_patch).
+var CELPolicyActionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "node_automation_cel_policy_actions_total",
+	Help: "CEL admission policy guard actions taken (trip, restore, criticalns_patch).",
+}, []string{"kind", "action"})
+
 // ---------------------------------------------------------------------------
 // Operations metrics — cluster-health check series.
 // ---------------------------------------------------------------------------
@@ -170,6 +192,9 @@ var apiserverCollectors = []prometheus.Collector{
 	CRDConversionWebhookUnhealthy,
 	WebhookAdmissionDegraded,
 	WebhookExcessiveTimeout,
+	CELPolicyCircuitBroken,
+	CELPolicyCriticalNSExposed,
+	CELPolicyActionsTotal,
 }
 
 func init() {

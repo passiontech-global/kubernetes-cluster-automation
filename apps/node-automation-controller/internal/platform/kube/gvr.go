@@ -103,6 +103,17 @@ var (
 		Group: "cilium.io", Version: "v2", Resource: "ciliumendpoints"}
 	GVRCiliumEndpointSlice = schema.GroupVersionResource{
 		Group: "cilium.io", Version: "v2alpha1", Resource: "ciliumendpointslices"}
+	GVRCiliumNetworkPolicy = schema.GroupVersionResource{
+		Group: "cilium.io", Version: "v2", Resource: "ciliumnetworkpolicies"}
+	GVRCiliumClusterwideNetworkPolicy = schema.GroupVersionResource{
+		Group: "cilium.io", Version: "v2", Resource: "ciliumclusterwidenetworkpolicies"}
+	GVRCiliumBGPNodeConfigV2 = schema.GroupVersionResource{
+		Group: "cilium.io", Version: "v2", Resource: "ciliumbgpnodeconfigs"}
+	GVRCiliumBGPNodeConfigV2Alpha1 = schema.GroupVersionResource{
+		Group: "cilium.io", Version: "v2alpha1", Resource: "ciliumbgpnodeconfigs"}
+	// CiliumBGPNodeConfigGVRs is the probe order: stable v2 first, then v2alpha1.
+	CiliumBGPNodeConfigGVRs = []schema.GroupVersionResource{
+		GVRCiliumBGPNodeConfigV2, GVRCiliumBGPNodeConfigV2Alpha1}
 
 	// ---------------------------------------------------------------
 	// Velero (velero-backup-auditor).

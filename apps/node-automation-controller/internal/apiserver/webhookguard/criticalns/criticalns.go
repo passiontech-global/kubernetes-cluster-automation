@@ -7,12 +7,9 @@ package criticalns
 
 import (
 	json "encoding/json/v2"
-	"maps"
-	"slices"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -23,109 +20,11 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-// criticalSelfHealingNamespaces are the namespaces that run CNI,
-// DNS, the kubelet heartbeat, the OLM operator stack, and the node
-// self-healing stack itself — a fail-closed admission webhook that
-// matches any of them can deadlock recovery when its own backend
-// dies (critical-ns-audit, mirroring check-webhook-guard.sh at
-// runtime). kube-node-lease joined later: its Lease objects ARE the
-// kubelet node heartbeat, so a webhook that intercepts lease writes
-// can flap every node NotReady on its own. operators joined with it:
-// every OLM Subscription/CSV/operator pod lives there, so a webhook
-// that can wedge pod creation in operators wedges the entire
-// operator-driven remediation fleet at once.
-var criticalSelfHealingNamespaces = []string{"kube-system", "kube-node-lease", "node-ops", "medik8s", "operators"}
-
-// webhookHeartbeatResources is the rule-resource set on the node/pod
-// lifecycle heartbeat path — the runtime twin of check-webhook-guard.sh's
-// blocked_resources grammar. A fail-closed webhook intercepting any of
-// these turns its OWN outage into cluster-wide wedging: nodes/status and
-// leases are the heartbeat writes (webhook dead = every node flaps
-// NotReady / every leader expires), pods/status kills the status writer,
-// pods/eviction blocks every drain, and the wildcards cover all four.
-var webhookHeartbeatResources = map[string]bool{
-	"nodes/status":  true,
-	"pods/status":   true,
-	"pods/eviction": true,
-	"leases":        true,
-	// Resource wildcards: "pods/*" covers every pod subresource
-	// (status AND eviction), "nodes/*" every node subresource —
-	// a webhook listing them intercepts the heartbeat path without
-	// ever naming a heartbeat literal.
-	"pods/*":  true,
-	"nodes/*": true,
-	"*":       true,
-	"*/*":     true,
-}
-
-// ruleGroupMatches reports whether an admission rule's APIGroups
-// includes want. The API server treats a wildcard "*" group as
-// matching EVERY group — including the core group "" and
-// coordination.k8s.io — so a rule carrying ["*"] with an explicit
-// heartbeat resource really does intercept it. A non-wildcard foreign
-// group must still NOT be mistaken for the core/coordination groups:
-// that is the false-positive this group-aware check exists to avoid
-// (wave3.2/api-groups-wildcard).
-func ruleGroupMatches(groups []string, want string) bool {
-	return slices.Contains(groups, want) || slices.Contains(groups, "*")
-}
-
-// heartbeatClusterScopedResources are the heartbeat hits a
-// namespaceSelector can NEVER exclude: nodes/status is cluster-scoped
-// (the API server does not consult namespaceSelector for it at all),
-// pods/eviction wedges every drain in EVERY namespace, and the
-// wildcards cover both by definition. auditHeartbeat flags these
-// unconditionally; pods/status and leases stay namespaced and keep
-// the critical-namespace match requirement.
-var heartbeatClusterScopedResources = map[string]bool{
-	"nodes/status":  true,
-	"pods/eviction": true,
-	// "pods/*" covers pods/eviction (unconditional) and "nodes/*"
-	// covers nodes/status — both wildcards therefore carry an
-	// unconditional heartbeat hit even though they also cover
-	// selector-dependent siblings.
-	"pods/*":  true,
-	"nodes/*": true,
-	"*":       true,
-	"*/*":     true,
-}
-
-// heartbeatNamespacedResources are the heartbeat literals whose
-// underlying resources are namespaced — pods and coordination leases
-// live in a namespace, so a Cluster-scoped rule can NEVER intercept
-// them (flagging one would be a false positive: the rule's scope
-// already makes the exposure impossible).
-var heartbeatNamespacedResources = map[string]bool{
-	"pods/status":   true,
-	"pods/eviction": true,
-	"leases":        true,
-	"pods/*":        true,
-}
-
-// heartbeatClusterResources are the cluster-scoped heartbeat
-// literals — nodes are cluster-scoped, so a Namespaced-scoped rule
-// can never intercept them.
-var heartbeatClusterResources = map[string]bool{
-	"nodes/status": true,
-	"nodes/*":      true,
-}
-
-// heartbeatScopeAllows reports whether a rule carrying the given
-// Scope can actually intercept the heartbeat literal. Scope nil or
-// "*" covers both scopes; "Cluster" rules only see cluster-scoped
-// objects and "Namespaced" rules only namespaced ones.
-func heartbeatScopeAllows(scope *admissionv1.ScopeType, res string) bool {
-	if scope == nil || *scope == admissionv1.AllScopes {
-		return true
-	}
-	switch *scope {
-	case admissionv1.ClusterScope:
-		return !heartbeatNamespacedResources[res]
-	case admissionv1.NamespacedScope:
-		return !heartbeatClusterResources[res]
-	}
-	return true
-}
+var (
+	criticalSelfHealingNamespaces   = guardstate.CriticalSelfHealingNamespaces
+	heartbeatClusterScopedResources = guardstate.HeartbeatClusterScopedResources
+	heartbeatScopeAllows            = guardstate.HeartbeatScopeAllows
+)
 
 // CriticalNSEnforceEnabled reads the critical-ns auto-patch gate EVERY
 // run — the sanctioned exception to the resolve-at-Setup rule (the
@@ -168,106 +67,16 @@ func (s *Sweeper) Sweep(snap *guardstate.Snapshot) {
 	s.auditHeartbeat(snap)
 }
 
-// matcher builds the namespaceSelector predicate both audits share
-// from the snapshot's namespace census: true when the selector still
-// matches (fails to exclude) any of the critical self-healing
-// namespaces — nil or malformed selectors match everything. ok=false
-// when the shared inputs are missing (a census error or nil
-// webhook-config lists); the callers skip their audits rather than act
-// on partial state.
 func matcher(snap *guardstate.Snapshot) (matches func(*metav1.LabelSelector) bool, ok bool) {
-	if snap.NSErr != nil || snap.MWCErr != nil || snap.VWCErr != nil ||
+	if snap == nil || snap.MWCErr != nil || snap.VWCErr != nil ||
 		snap.MWC == nil || snap.VWC == nil {
 		return nil, false
 	}
-	critLabels := make(map[string]labels.Set, len(criticalSelfHealingNamespaces))
-	for _, ns := range criticalSelfHealingNamespaces {
-		critLabels[ns] = labels.Set{"kubernetes.io/metadata.name": ns}
-	}
-	if snap.NS != nil {
-		for i := range snap.NS.Items {
-			ns := &snap.NS.Items[i]
-			if _, ok := critLabels[ns.Name]; !ok {
-				continue
-			}
-			merged := make(labels.Set, len(ns.Labels)+1)
-			maps.Copy(merged, ns.Labels)
-			merged["kubernetes.io/metadata.name"] = ns.Name
-			critLabels[ns.Name] = merged
-		}
-	}
-	return func(ls *metav1.LabelSelector) bool {
-		if ls == nil {
-			return true // nil selector matches all namespaces
-		}
-		sel, err := metav1.LabelSelectorAsSelector(ls)
-		if err != nil {
-			return true
-		}
-		for _, ns := range criticalSelfHealingNamespaces {
-			if sel.Matches(critLabels[ns]) {
-				return true
-			}
-		}
-		return false
-	}, true
+	return guardstate.CriticalNSMatcher(snap)
 }
 
-// mergeExclusion is the namespaceSelector patch the critical-NS
-// auto-patch injects into a webhook — the exact NotIn shape
-// check-webhook-guard.sh demands statically, MERGED into the
-// webhook's EXISTING selector. metav1.LabelSelector.MatchExpressions
-// is a plain list with no patchStrategy:"merge" in the Kubernetes
-// API, so a patch carrying only the exclusion rule would REPLACE
-// every expression the webhook already had — silently widening, say,
-// a tier=prod-restricted webhook to the whole cluster. The payload
-// therefore sends the full union: the existing matchLabels (strategic
-// merge keeps map entries anyway, but stating them keeps the patch
-// self-describing), every existing matchExpressions element, with
-// missing critical namespaces merged into an existing
-// kubernetes.io/metadata.name NotIn rule's values — or that rule
-// appended after the preserved expressions when no such rule exists.
 func mergeExclusion(sel *metav1.LabelSelector) map[string]any {
-	var cur metav1.LabelSelector // nil selector (match-all) contributes nothing
-	if sel != nil {
-		cur = *sel
-	}
-	const nameKey = "kubernetes.io/metadata.name"
-	patch := map[string]any{}
-	if len(cur.MatchLabels) > 0 {
-		ml := make(map[string]string, len(cur.MatchLabels))
-		maps.Copy(ml, cur.MatchLabels)
-		patch["matchLabels"] = ml
-	}
-	exprs := make([]map[string]any, 0, len(cur.MatchExpressions)+1)
-	merged := false
-	for _, e := range cur.MatchExpressions {
-		vals := slices.Clone(e.Values)
-		if e.Key == nameKey && e.Operator == metav1.LabelSelectorOpNotIn {
-			for _, ns := range criticalSelfHealingNamespaces {
-				if !slices.Contains(vals, ns) {
-					vals = append(vals, ns)
-				}
-			}
-			merged = true
-		}
-		expr := map[string]any{
-			"key": e.Key, "operator": string(e.Operator),
-		}
-		if len(vals) > 0 {
-			expr["values"] = vals
-		}
-		exprs = append(exprs, expr)
-	}
-	if !merged {
-		exprs = append(exprs, map[string]any{
-			"key":      nameKey,
-			"operator": string(metav1.LabelSelectorOpNotIn),
-			"values":   slices.Clone(criticalSelfHealingNamespaces),
-		})
-	}
-	patch["matchExpressions"] = exprs
-	return patch
+	return guardstate.MergeCriticalNSExclusion(sel)
 }
 
 // auditExclusions (critical-ns-audit) audits live Mutating/Validating admission
@@ -382,62 +191,12 @@ func (s *Sweeper) auditExclusions(snap *guardstate.Snapshot) {
 	s.exclusionEmitted.Prune(metrics.WebhookMissingCriticalNSExclusion.DeleteLabelValues)
 }
 
-// heartbeatRuleHits returns the rule's resource literals that land on
-// the heartbeat path, checked against the rule's APIGroups — the
-// literal alone lies, because a CRD group can serve its own "leases"
-// resource without ever touching the kubelet heartbeat. leases demands
-// coordination.k8s.io; nodes/status, pods/status and pods/eviction are
-// core-group subresources. An APIGroups entry of "*" DOES match both of
-// those groups server-side (wave3.2/api-groups-wildcard), so a wildcard
-// group with an explicit heartbeat resource is a real exposure; a
-// specific FOREIGN group behind a typed resource is the false-positive
-// shape this check exists to avoid.
 func heartbeatRuleHits(rule admissionv1.RuleWithOperations) []string {
-	var hits []string
-	for _, res := range rule.Resources {
-		if !webhookHeartbeatResources[res] {
-			continue
-		}
-		// The rule's Scope bounds what it can intercept — a hit
-		// outside the scope is impossible, not an exposure.
-		if !heartbeatScopeAllows(rule.Scope, res) {
-			continue
-		}
-		switch {
-		case res == "leases":
-			if !ruleGroupMatches(rule.APIGroups, "coordination.k8s.io") {
-				continue
-			}
-		case res == "*" || res == "*/*":
-			// Wildcard resources cover every group by definition.
-		default:
-			// pods/*, nodes/* and the typed literals are all
-			// core-group resources — but a wildcard APIGroups ["*"]
-			// reaches them too, so it must be accepted with "".
-			if !ruleGroupMatches(rule.APIGroups, "") {
-				continue
-			}
-		}
-		hits = append(hits, res)
-	}
-	return hits
+	return guardstate.HeartbeatRuleHits(rule)
 }
 
-// allClusterScopedRules reports whether every admission rule is
-// cluster-scoped — such a webhook's namespaceSelector is never
-// consulted (cluster-scoped objects carry no namespace), so a
-// missing critical-namespace exclusion is not a finding for it and
-// patching the selector would change nothing.
 func allClusterScopedRules(rules []admissionv1.RuleWithOperations) bool {
-	if len(rules) == 0 {
-		return false
-	}
-	for _, r := range rules {
-		if r.Scope == nil || *r.Scope != admissionv1.ClusterScope {
-			return false
-		}
-	}
-	return true
+	return guardstate.AllClusterScopedRules(rules)
 }
 
 // auditHeartbeat audits live Mutating/Validating admission

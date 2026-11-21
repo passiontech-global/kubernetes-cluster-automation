@@ -3,7 +3,7 @@
 controller-runtime operator replacing the shell-operator Deployment +
 bash hooks for node lifecycle automation. All logic is compiled in —
 no shell, no `kubectl`/`jq`/`curl` forks. One binary runs 32 wired
-modules plus a 68-check cluster-health sweep, grouped in six domain
+modules plus a 75-check cluster-health sweep, grouped in six domain
 trees; the interface contract is Prometheus metrics on
 `:9115/metrics` plus `/healthz`+`/readyz` on `:8081` (kept
 byte-stable with the shell-operator alerts).
@@ -114,9 +114,9 @@ byte-stable with the shell-operator alerts).
   nethealth); `health/nethealth/linkerd` is the oldest such
   subpackage (the linkerd checks + their shared markers behind one
   facade with `NewX` constructors — registry rows point there, duty
-  logic stays out of the nethealth root). The 32 Setup rows and 68
+  logic stays out of the nethealth root). The 32 Setup rows and 75
   health `CheckReg` rows are pinned by `registry_test.go`,
-  `TestCheckRegSweepOrder` and the 68-row `fleetCheckRegs` roster
+  `TestCheckRegSweepOrder` and the 75-row `fleetCheckRegs` roster
   in `clusterhealthprobes`' tests.
   Cross-TREE topology identifiers (linkerd control-plane names,
   dragonfly operator namespace) live once, in
@@ -189,13 +189,15 @@ byte-stable with the shell-operator alerts).
   `shared.SetupWithConfig`, modules without use
   `shared.SetupNoConfig`, so parse warnings fire even when gated
   off and no module hand-rolls `if d.Disabled`. Reading env inside
-  a run/sweep is a bug — the FIVE sanctioned
+  a run/sweep is a bug — the SEVEN sanctioned
   exceptions, all deliberately hot-reloaded per sweep as ops levers,
   are, per module: webhookguard's `WEBHOOK_CIRCUIT_BREAKER_ENABLED`
   (`circuitbreaker/circuit_breaker.go`),
   `UNMESHED_POD_REMEDIATION_ENABLED` (`unmeshed/unmeshed_audit.go`),
   `WEBHOOK_CRITICAL_NS_ENFORCE_ENABLED` (`criticalns/criticalns.go`),
-  and `MEDIK8S_BOOT_FAIL_OPEN_ENABLED` (`bootwebhooks/bootwebhooks.go`),
+  `MEDIK8S_BOOT_FAIL_OPEN_ENABLED` (`bootwebhooks/bootwebhooks.go`),
+  `CEL_POLICY_CRITICAL_NS_ENFORCE_ENABLED` (`celpolicy/cel_policy.go`),
+  and `CEL_POLICY_CIRCUIT_BREAKER_ENABLED` (`celpolicy/cel_policy.go`),
   plus deadnodesweeper's `DEAD_NODE_SWEEPER_FENCE_UNFENCED_STATEFUL`
   (internal/node/deadnodesweeper — read every cycle by
   fenceUnfencedStateful).

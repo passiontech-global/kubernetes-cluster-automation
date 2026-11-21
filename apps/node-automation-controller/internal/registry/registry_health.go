@@ -137,4 +137,14 @@ var healthRows = []shared.Module{
 	// Self-healing wave-3 checks — appended at end of healthRows.
 	{Name: "service-selector-blackhole", Group: groupHealth, GateEnv: "NODE_AUTOMATION_SERVICE_BLACKHOLE_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameServiceSelectorBlackhole, New: nethealth.NewServiceSelectorBlackholeCheck}},
 	{Name: "topology-spread-zone-deadlock", Group: groupHealth, GateEnv: "NODE_AUTOMATION_TOPOLOGY_ZONE_DEADLOCK_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameTopologyZoneDeadlock, New: watchdogs.NewTopologySpreadZoneDeadlockCheck}},
+	// Wave 4A checks — appended at end of healthRows.
+	{Name: "admission-security-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_ADMISSION_SECURITY_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameAdmissionSecurityGuard, New: watchdogs.NewAdmissionSecurityGuardCheck}},
+	// Wave 4B checks — appended at end of healthRows.
+	{Name: "cilium-policy-bgp-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_CILIUM_POLICY_BGP_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: cilium.CheckNameCiliumPolicyBGPGuard, New: cilium.NewCiliumPolicyBGPGuardCheck}},
+	{Name: "service-traffic-policy-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_SERVICE_TRAFFIC_POLICY_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nethealth.CheckNameServiceTrafficPolicyGuard, New: nethealth.NewServiceTrafficPolicyGuardCheck}},
+	{Name: "pvc-lifecycle-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_PVC_LIFECYCLE_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: pvc.CheckNamePVCLifecycleGuard, New: pvc.NewPVCLifecycleGuardCheck}},
+	{Name: "workload-admission-block-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_WORKLOAD_ADMISSION_BLOCK_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameWorkloadAdmissionBlockGuard, New: watchdogs.NewWorkloadAdmissionBlockGuardCheck}},
+	// Wave 4C checks — appended at end of healthRows.
+	{Name: "gitops-mass-prune-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_GITOPS_MASS_PRUNE_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameGitOpsMassPruneGuard, New: gitops.NewGitOpsMassPruneGuardCheck}},
+	{Name: "image-resilience-auditor", Group: groupHealth, GateEnv: "NODE_AUTOMATION_IMAGE_RESILIENCE_AUDITOR_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameImageResilienceAuditor, New: nodehealth.NewImageResilienceAuditorCheck}},
 }

@@ -57,7 +57,7 @@ func TestSetupFeatureFlagVariants(t *testing.T) {
 	}
 }
 
-func TestSetupRunTimeoutCovers68CheckWorstCase(t *testing.T) {
+func TestSetupRunTimeoutCovers75CheckWorstCase(t *testing.T) {
 	t.Setenv("CLUSTER_HEALTH_PROBES_INTERVAL", "")
 	t.Setenv("HEALTH_PER_CHECK_TIMEOUT", "")
 	m := testutil.NewStubManager()
@@ -72,8 +72,8 @@ func TestSetupRunTimeoutCovers68CheckWorstCase(t *testing.T) {
 	}
 	testutil.ExpectPeriodic(t, m, "cluster-health-probes", 5*time.Minute)
 	p := m.Added[0].(*shared.Periodic)
-	if p.RunTimeout != 25*time.Minute {
-		t.Fatalf("68-check RunTimeout = %v, want 25m (12 waves * 2m + 1m)", p.RunTimeout)
+	if p.RunTimeout != 27*time.Minute {
+		t.Fatalf("75-check RunTimeout = %v, want 27m (13 waves * 2m + 1m)", p.RunTimeout)
 	}
 
 	mEmpty := testutil.NewStubManager()

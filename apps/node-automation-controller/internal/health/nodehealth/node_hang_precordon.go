@@ -119,6 +119,12 @@ const (
 	// recovers (remount, controller reset) inside that window.
 	nodeDiskPreFailCordonAge = 15 * time.Minute
 
+	// network-mount-hung-precordon — NetworkMountHung gets a 5-minute
+	// fuse: transient NFS/CIFS/FUSE blips can clear within a couple of
+	// agent cycles, whereas a sustained hung mount stalls new pods in
+	// D-state ContainerCreating and needs pre-cordon + auto-uncordon.
+	nodeNetworkMountHungCordonAge = 5 * time.Minute
+
 	// nodeHangCondHeartbeatMaxAge is how old a condition's
 	// lastHeartbeatTime may be before the value stops being cordon
 	// evidence: the writer (nodereporter refreshes it every ~2m on
@@ -171,6 +177,10 @@ var nodeClockSkewConds = kube.CondTypes(nodecond.ClockSkewPreCordonNames)
 // nodeHangConds for the same reason the clock conditions are: the
 // fuse differs.
 var nodeDiskPreFailConds = kube.CondTypes(nodecond.DiskPreFailPreCordonNames)
+
+// nodeNetworkMountHungConds is the hung network filesystem latch on
+// its own 5-minute fuse (nodecond.NetworkMountHungPreCordonNames).
+var nodeNetworkMountHungConds = kube.CondTypes(nodecond.NetworkMountHungPreCordonNames)
 
 var (
 	// node-hang-precordon — worker nodes patched spec.unschedulable after a
@@ -250,6 +260,16 @@ func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 			}
 		}
 	}
+	for _, t := range nodeNetworkMountHungConds {
+		if c := fused(t, nodeNetworkMountHungCordonAge); c != nil {
+			if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
+				return string(t), stale
+			}
+			if stale == "" {
+				stale = string(t)
+			}
+		}
+	}
 	return "", stale
 }
 
@@ -275,6 +295,12 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 		}
 	}
 	for _, t := range nodeDiskPreFailConds {
+		if c := kube.NodeCondition(n, t); c != nil &&
+			c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	for _, t := range nodeNetworkMountHungConds {
 		if c := kube.NodeCondition(n, t); c != nil &&
 			c.Status == corev1.ConditionTrue {
 			return true

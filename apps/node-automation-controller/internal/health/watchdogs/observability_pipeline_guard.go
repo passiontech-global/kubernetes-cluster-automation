@@ -32,6 +32,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // observabilityPipelineCheck is the monitoring-the-monitor watchdog.
@@ -44,12 +45,24 @@ type observabilityPipelineCheck struct {
 	// evented dedupes the ObservabilityPipelineDegraded K8s Event —
 	// one emission per component episode, re-armed when it clears.
 	evented state.SeenSet
+
+	// Cardinality early-breaker config & state (observability_cardinality.go).
+	cardCfg        obsCardinalityConfig
+	culpritEmitted state.GaugeLedger[culpritKey]
+	growthStreak   state.StreakLedger
+	cardEvented    state.SeenSet
 }
 
 // NewObservabilityPipelineGuardCheck builds the
 // observability-pipeline-guard check.
 func NewObservabilityPipelineGuardCheck(d *probefw.Deps) probefw.Check {
-	return &observabilityPipelineCheck{Deps: d}
+	return &observabilityPipelineCheck{
+		Deps: d,
+		cardCfg: obsCardinalityConfig{
+			headSeriesWarn:    envx.GetenvFloatPositive("NODE_AUTOMATION_OBS_HEAD_SERIES_WARN", defaultObsHeadSeriesWarn),
+			growthPerHourWarn: envx.GetenvFloatPositive("NODE_AUTOMATION_OBS_HEAD_SERIES_GROWTH_PER_HOUR", defaultObsHeadSeriesGrowthPerHour),
+		},
+	}
 }
 
 const (
@@ -133,17 +146,19 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 	degraded := map[string]bool{}
 	inconclusive := false
 
-	// Phase 1 — issue all eight queries concurrently (bounded 8 =
-	// the whole roster): they are independent instant queries and
-	// the serial loop used to pay 8×Prometheus round-trip latency
-	// inside one PerCheck budget. Evaluation stays serial below so
-	// metric series, log lines and Warning Events keep their
-	// declared order regardless of which query answered first.
+	// Phase 1 — issue all baseline queries concurrently (bounded 8):
+	// they are independent instant queries and the serial loop used to
+	// pay Prometheus round-trip latency inside one PerCheck budget.
+	// Evaluation stays serial below so metric series, log lines and
+	// Warning Events keep their declared order regardless of which
+	// query answered first.
 	type qres struct {
 		series []promq.Sample
 		err    error
 	}
-	results := make([]qres, 1+len(obsPipelineCounters))
+	headIdx := 1 + len(obsPipelineCounters)
+	growthIdx := 2 + len(obsPipelineCounters)
+	results := make([]qres, 3+len(obsPipelineCounters))
 	var g errgroup.Group
 	g.SetLimit(8)
 	fire := func(i int, query string) {
@@ -157,6 +172,8 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 	for i, q := range obsPipelineCounters {
 		fire(1+i, q.query)
 	}
+	fire(headIdx, obsHeadSeriesQuery)
+	fire(growthIdx, obsHeadSeriesGrowthQuery)
 	_ = g.Wait()
 
 	// Phase 2 — evaluate in declared order.
@@ -197,6 +214,9 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 		degraded[q.component] = true
 		p.degrade(ctx, log, &rep, q.component, q.desc)
 	}
+	p.evalCardinality(ctx, log, &rep, last, degraded, &inconclusive,
+		results[headIdx].series, results[headIdx].err,
+		results[growthIdx].series, results[growthIdx].err)
 	// Recovery prune — a conclusive cycle in which a component is no
 	// longer degraded clears its episode marker so a later relapse
 	// emits a fresh Warning Event instead of being deduped against

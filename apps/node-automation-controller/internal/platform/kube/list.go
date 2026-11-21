@@ -19,7 +19,9 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -411,4 +413,58 @@ func ValidatingWebhookConfigurations(cs kubernetes.Interface) PageFunc[admission
 		func(l *admissionv1.ValidatingWebhookConfigurationList) []admissionv1.ValidatingWebhookConfiguration {
 			return l.Items
 		})
+}
+
+// NetworkPolicies lists Networking NetworkPolicies in namespace.
+func NetworkPolicies(cs kubernetes.Interface, namespace string) PageFunc[networkingv1.NetworkPolicy] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*networkingv1.NetworkPolicyList, error) {
+			return cs.NetworkingV1().NetworkPolicies(namespace).List(ctx, o)
+		},
+		func(l *networkingv1.NetworkPolicyList) []networkingv1.NetworkPolicy { return l.Items })
+}
+
+// Ingresses lists Networking Ingresses in namespace.
+func Ingresses(cs kubernetes.Interface, namespace string) PageFunc[networkingv1.Ingress] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*networkingv1.IngressList, error) {
+			return cs.NetworkingV1().Ingresses(namespace).List(ctx, o)
+		},
+		func(l *networkingv1.IngressList) []networkingv1.Ingress { return l.Items })
+}
+
+// ClusterRoleBindings lists cluster-scoped RBAC ClusterRoleBindings.
+func ClusterRoleBindings(cs kubernetes.Interface) PageFunc[rbacv1.ClusterRoleBinding] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*rbacv1.ClusterRoleBindingList, error) {
+			return cs.RbacV1().ClusterRoleBindings().List(ctx, o)
+		},
+		func(l *rbacv1.ClusterRoleBindingList) []rbacv1.ClusterRoleBinding { return l.Items })
+}
+
+// RoleBindings lists RBAC RoleBindings in namespace.
+func RoleBindings(cs kubernetes.Interface, namespace string) PageFunc[rbacv1.RoleBinding] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*rbacv1.RoleBindingList, error) {
+			return cs.RbacV1().RoleBindings(namespace).List(ctx, o)
+		},
+		func(l *rbacv1.RoleBindingList) []rbacv1.RoleBinding { return l.Items })
+}
+
+// ControllerRevisions lists Apps ControllerRevisions in namespace.
+func ControllerRevisions(cs kubernetes.Interface, namespace string) PageFunc[appsv1.ControllerRevision] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*appsv1.ControllerRevisionList, error) {
+			return cs.AppsV1().ControllerRevisions(namespace).List(ctx, o)
+		},
+		func(l *appsv1.ControllerRevisionList) []appsv1.ControllerRevision { return l.Items })
+}
+
+// StorageClasses lists cluster-scoped StorageClasses.
+func StorageClasses(cs kubernetes.Interface) PageFunc[storagev1.StorageClass] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*storagev1.StorageClassList, error) {
+			return cs.StorageV1().StorageClasses().List(ctx, o)
+		},
+		func(l *storagev1.StorageClassList) []storagev1.StorageClass { return l.Items })
 }

@@ -92,6 +92,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/bootwebhooks"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/celpolicy"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/circuitbreaker"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/criticalns"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
@@ -153,6 +154,7 @@ type webhookGuard struct {
 	breaker      circuitbreaker.Breaker
 	timeoutClamp timeoutclamp.Sweeper
 	critical     criticalns.Sweeper
+	celPolicy    celpolicy.Sweeper
 	auditor      unmeshed.Auditor
 }
 
@@ -166,6 +168,8 @@ func Setup(d shared.Deps) error {
 		logf.Log.WithName(d.Name).Info("registered",
 			"interval", 5*time.Minute, "circuitBreaker", circuitbreaker.Enabled(),
 			"bootFailOpen", bootwebhooks.Enabled(),
+			"celCriticalNSEnforce", celpolicy.CriticalNSEnforceEnabled(),
+			"celCircuitBreaker", celpolicy.CircuitBreakerEnabled(),
 			"unmeshedRemediation", unmeshed.RemediationEnabled(),
 			"latencyTrip", cfg.latencyTripEnabled,
 			"timeoutClamp", cfg.timeoutClampOn,
@@ -224,6 +228,7 @@ func (g *webhookGuard) run(ctx context.Context) error {
 	// the unmeshed sweep before the duty moved to its own leaf
 	// subpackage — so they read post-breaker webhook state.
 	g.critical.Sweep(snap)
+	celErr := g.celPolicy.Sweep(ctx, snap)
 	unmeshedErr := g.auditor.Sweep(ctx, snap)
-	return errors.Join(orphanErr, breakerErr, conversionErr, bootErr, timeoutErr, unmeshedErr)
+	return errors.Join(orphanErr, breakerErr, conversionErr, bootErr, timeoutErr, celErr, unmeshedErr)
 }

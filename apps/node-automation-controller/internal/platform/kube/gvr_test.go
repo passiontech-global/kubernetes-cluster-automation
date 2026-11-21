@@ -20,6 +20,8 @@ var registryGVRs = []schema.GroupVersionResource{
 	GVRSecretStoreV1, GVRSecretStoreV1Beta1,
 	GVRClusterSecretStoreV1, GVRClusterSecretStoreV1Beta1,
 	GVRCiliumIdentity, GVRCiliumEndpoint, GVRCiliumEndpointSlice,
+	GVRCiliumNetworkPolicy, GVRCiliumClusterwideNetworkPolicy,
+	GVRCiliumBGPNodeConfigV2, GVRCiliumBGPNodeConfigV2Alpha1,
 	GVVeleroSchedule, GVVeleroBackup, GVVeleroBackupStorageLocation,
 	GVVeleroPodVolumeBackup,
 	GVREverestDatabaseCluster, GVREverestDatabaseClusterBackup,
@@ -75,10 +77,11 @@ func TestGVRRegistrySlices(t *testing.T) {
 		t.Fatalf("HelmReleaseGVRs = %v", HelmReleaseGVRs)
 	}
 	for name, s := range map[string][]schema.GroupVersionResource{
-		"ExternalSecretGVRs":     ExternalSecretGVRs,
-		"SecretStoreGVRs":        SecretStoreGVRs,
-		"ClusterSecretStoreGVRs": ClusterSecretStoreGVRs,
-		"PerconaClusterGVRs":     PerconaClusterGVRs,
+		"ExternalSecretGVRs":      ExternalSecretGVRs,
+		"SecretStoreGVRs":         SecretStoreGVRs,
+		"ClusterSecretStoreGVRs":  ClusterSecretStoreGVRs,
+		"PerconaClusterGVRs":      PerconaClusterGVRs,
+		"CiliumBGPNodeConfigGVRs": CiliumBGPNodeConfigGVRs,
 	} {
 		if len(s) == 0 {
 			t.Errorf("%s is empty", name)
@@ -90,9 +93,13 @@ func TestGVRRegistrySlices(t *testing.T) {
 			}
 		}
 	}
-	// Preferred version first: v1 before v1beta1 for external-secrets.
+	// Preferred version first: v1 before v1beta1 for external-secrets,
+	// v2 before v2alpha1 for CiliumBGPNodeConfig.
 	if ExternalSecretGVRs[0].Version != "v1" {
 		t.Fatalf("ExternalSecretGVRs order = %v", ExternalSecretGVRs)
+	}
+	if CiliumBGPNodeConfigGVRs[0].Version != "v2" {
+		t.Fatalf("CiliumBGPNodeConfigGVRs order = %v", CiliumBGPNodeConfigGVRs)
 	}
 }
 

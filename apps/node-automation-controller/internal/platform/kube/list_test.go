@@ -11,7 +11,9 @@ import (
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -256,6 +258,16 @@ func TestTypedPageFuncs(t *testing.T) {
 		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "sts1", Namespace: "ns"}},
 		&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "pdb1", Namespace: "ns"}},
 		&certificatesv1.CertificateSigningRequest{ObjectMeta: metav1.ObjectMeta{Name: "csr1"}},
+		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "np1", Namespace: "ns"}},
+		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "np2", Namespace: "other"}},
+		&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: "ing1", Namespace: "ns"}},
+		&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Name: "ing2", Namespace: "other"}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "crb1"}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "rb1", Namespace: "ns"}},
+		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "rb2", Namespace: "other"}},
+		&appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "cr1", Namespace: "ns"}},
+		&appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "cr2", Namespace: "other"}},
+		&storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: "sc1"}},
 	)
 
 	for _, tc := range []struct {
@@ -309,6 +321,30 @@ func TestTypedPageFuncs(t *testing.T) {
 		}, 1},
 		{"CertificateSigningRequests", func() (int, error) {
 			items, err := ListAll(ctx, metav1.ListOptions{}, CertificateSigningRequests(cs))
+			return len(items), err
+		}, 1},
+		{"NetworkPolicies", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, NetworkPolicies(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"Ingresses", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, Ingresses(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"ClusterRoleBindings", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, ClusterRoleBindings(cs))
+			return len(items), err
+		}, 1},
+		{"RoleBindings", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, RoleBindings(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"ControllerRevisions", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, ControllerRevisions(cs, "ns"))
+			return len(items), err
+		}, 1},
+		{"StorageClasses", func() (int, error) {
+			items, err := ListAll(ctx, metav1.ListOptions{}, StorageClasses(cs))
 			return len(items), err
 		}, 1},
 	} {

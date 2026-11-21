@@ -20,6 +20,7 @@ var ctx = context.Background()
 // wrappers below pass the same slice through probetest.NewCheckProber.
 var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewPVCResizeStallGuardCheck,
+	NewPVCLifecycleGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

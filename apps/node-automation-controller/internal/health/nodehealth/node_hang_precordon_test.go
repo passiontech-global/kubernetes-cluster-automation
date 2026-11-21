@@ -1156,3 +1156,139 @@ func TestNodeHangPreCordonCiliumIPAMExhausted(t *testing.T) {
 		t.Fatal("pre-cordon stamp not removed on auto-uncordon")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// network-mount-hung-precordon — NetworkMountHung rides a 5m fuse
+// ---------------------------------------------------------------------------
+
+func TestNodeHangNetworkMountHungNotInHangSet(t *testing.T) {
+	for _, c := range nodeHangConds {
+		if c == nodecond.CondNetworkMountHung {
+			t.Fatal("NetworkMountHung leaked into the 2m hang fuse set")
+		}
+	}
+	found := false
+	for _, c := range nodeNetworkMountHungConds {
+		if c == nodecond.CondNetworkMountHung {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("NetworkMountHung missing from nodeNetworkMountHungConds")
+	}
+}
+
+func TestCheckNodeHangNetworkMountHungCordonAndAutoUncordon(t *testing.T) {
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-nfs")
+	testutil.CleanupMetric(t, nodeHangUncordonsTotal, "w-nfs")
+
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-nfs", nodecond.CondNetworkMountHung, 6*time.Minute, false),
+		probetest.ReadyWorkerNode("w-nfs-fresh", nodecond.CondNetworkMountHung, 3*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false),
+	)
+	p := testProberDyn(cs, probetest.OpDyn())
+
+	// >=5m cordons + stamps; <5m does not cordon.
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
+		t.Fatal("sustained NetworkMountHung did not fail the check")
+	}
+	old, _ := cs.CoreV1().Nodes().Get(ctx, "w-nfs", metav1.GetOptions{})
+	if !old.Spec.Unschedulable || old.Annotations[nodeHangPreCordonAnno] != nodeHangPreCordonValue {
+		t.Fatalf("sustained NetworkMountHung not cordoned+stamped: unsched=%v annos=%v", old.Spec.Unschedulable, old.Annotations)
+	}
+	fresh, _ := cs.CoreV1().Nodes().Get(ctx, "w-nfs-fresh", metav1.GetOptions{})
+	if fresh.Spec.Unschedulable {
+		t.Fatal("NetworkMountHung cordoned inside the 5m fuse window")
+	}
+
+	// Clearing NetworkMountHung to False auto-uncordons w-nfs and removes the stamp.
+	for i := range old.Status.Conditions {
+		if old.Status.Conditions[i].Type == nodecond.CondNetworkMountHung {
+			old.Status.Conditions[i].Status = corev1.ConditionFalse
+			old.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now())
+			old.Status.Conditions[i].LastHeartbeatTime = metav1.NewTime(time.Now())
+		}
+	}
+	if _, err := cs.CoreV1().Nodes().UpdateStatus(ctx, old, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("cleared NetworkMountHung must pass: %+v", res)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-nfs", metav1.GetOptions{})
+	if got.Spec.Unschedulable {
+		t.Fatal("node stayed cordoned after NetworkMountHung cleared")
+	}
+	if _, ok := got.Annotations[nodeHangPreCordonAnno]; ok {
+		t.Fatal("pre-cordon stamp not removed on auto-uncordon")
+	}
+}
+
+func TestCheckNodeHangNetworkMountHungStaleHeartbeatAndHolds(t *testing.T) {
+	zombie := probetest.ReadyWorkerNode("w-nfs-zombie", nodecond.CondNetworkMountHung, 20*time.Minute, false)
+	zombie.Status.Conditions[1].LastHeartbeatTime =
+		metav1.NewTime(time.Now().Add(-nodeHangCondHeartbeatMaxAge - time.Minute))
+
+	held := precordonedWorkerNode("w-nfs-held", true)
+	held.Status.Conditions = append(held.Status.Conditions, corev1.NodeCondition{
+		Type:               nodecond.CondNetworkMountHung,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-30 * time.Second)),
+		LastHeartbeatTime:  metav1.NewTime(time.Now()),
+	})
+
+	cs := fake.NewSimpleClientset(zombie, held, probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("stale-heartbeat + fresh held NetworkMountHung must pass: %+v", res)
+	}
+	gotZ, _ := cs.CoreV1().Nodes().Get(ctx, "w-nfs-zombie", metav1.GetOptions{})
+	if gotZ.Spec.Unschedulable {
+		t.Fatal("zombie NetworkMountHung cordoned the node")
+	}
+	gotH, _ := cs.CoreV1().Nodes().Get(ctx, "w-nfs-held", metav1.GetOptions{})
+	if !gotH.Spec.Unschedulable {
+		t.Fatal("uncordoned while NetworkMountHung is still True")
+	}
+}
+
+func TestCheckNodeHangNetworkMountHungRatioCapAndL1Yield(t *testing.T) {
+	now := time.Now()
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-nfs-a")
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-nfs-b")
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-nfs-c")
+
+	// 3 workers: max(1, floor(0.35*3)) = 1 cordon allowed.
+	// w-nfs-a yields to L1 remediation; w-nfs-b cordons; w-nfs-c hits 35% cap.
+	nA := probetest.ReadyWorkerNode("w-nfs-a", nodecond.CondNetworkMountHung, 10*time.Minute, false)
+	nA.Status.Conditions = append(nA.Status.Conditions, corev1.NodeCondition{
+		Type:               corev1.NodeConditionType(nodecond.CondLocalRemediation),
+		Status:             corev1.ConditionTrue,
+		LastHeartbeatTime:  metav1.NewTime(now.Add(-time.Minute)),
+		LastTransitionTime: metav1.NewTime(now.Add(-time.Minute)),
+	})
+	nB := probetest.ReadyWorkerNode("w-nfs-b", nodecond.CondNetworkMountHung, 10*time.Minute, false)
+	nC := probetest.ReadyWorkerNode("w-nfs-c", nodecond.CondNetworkMountHung, 10*time.Minute, false)
+
+	cs := fake.NewSimpleClientset(nA, nB, nC)
+	p := testProberDyn(cs, probetest.OpDyn())
+	probetest.FreezeNow(p.Deps, now)
+
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
+		t.Fatal("sustained NetworkMountHung expected to fail check")
+	}
+	gotA, _ := cs.CoreV1().Nodes().Get(ctx, "w-nfs-a", metav1.GetOptions{})
+	gotB, _ := cs.CoreV1().Nodes().Get(ctx, "w-nfs-b", metav1.GetOptions{})
+	gotC, _ := cs.CoreV1().Nodes().Get(ctx, "w-nfs-c", metav1.GetOptions{})
+	if gotA.Spec.Unschedulable {
+		t.Fatal("L1-remediating node w-nfs-a must yield and not cordon")
+	}
+	if !gotB.Spec.Unschedulable {
+		t.Fatal("w-nfs-b must cordon (yielding node must not consume cap)")
+	}
+	if gotC.Spec.Unschedulable {
+		t.Fatal("w-nfs-c must be held back by 35% max cordoned ratio cap")
+	}
+}

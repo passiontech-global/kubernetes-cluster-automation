@@ -157,6 +157,13 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: watchdogs.CheckNameSubPathConfigDrift, New: watchdogs.NewSubPathConfigDriftCheck},
 		{Name: nethealth.CheckNameServiceSelectorBlackhole, New: nethealth.NewServiceSelectorBlackholeCheck},
 		{Name: watchdogs.CheckNameTopologyZoneDeadlock, New: watchdogs.NewTopologySpreadZoneDeadlockCheck},
+		{Name: watchdogs.CheckNameAdmissionSecurityGuard, New: watchdogs.NewAdmissionSecurityGuardCheck},
+		{Name: cilium.CheckNameCiliumPolicyBGPGuard, New: cilium.NewCiliumPolicyBGPGuardCheck},
+		{Name: nethealth.CheckNameServiceTrafficPolicyGuard, New: nethealth.NewServiceTrafficPolicyGuardCheck},
+		{Name: pvc.CheckNamePVCLifecycleGuard, New: pvc.NewPVCLifecycleGuardCheck},
+		{Name: watchdogs.CheckNameWorkloadAdmissionBlockGuard, New: watchdogs.NewWorkloadAdmissionBlockGuardCheck},
+		{Name: gitops.CheckNameGitOpsMassPruneGuard, New: gitops.NewGitOpsMassPruneGuardCheck},
+		{Name: nodehealth.CheckNameImageResilienceAuditor, New: nodehealth.NewImageResilienceAuditorCheck},
 	}
 }
 
@@ -297,8 +304,9 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// the Prometheus outage this fake produces -> thirty total.
 	// Bringing fleetCheckRegs to full 68-check parity adds the 8 newly
 	// registered checks that census pods or query Prometheus -> thirty-eight total.
-	if got := errCount() - before; got != 38 {
-		t.Fatalf("run errors delta = %v, want 38", got)
+	// Wave 4C image-resilience-auditor reads AllPods -> thirty-nine total.
+	if got := errCount() - before; got != 39 {
+		t.Fatalf("run errors delta = %v, want 39", got)
 	}
 }
 

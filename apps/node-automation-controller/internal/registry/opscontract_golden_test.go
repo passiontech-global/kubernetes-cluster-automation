@@ -141,6 +141,16 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	// Self-healing wave-3 checks — appended at end.
 	{"service-selector-blackhole", "health"},
 	{"topology-spread-zone-deadlock", "health"},
+	// Wave 4A checks — appended at end.
+	{"admission-security-guard", "health"},
+	// Wave 4B checks — appended at end.
+	{"cilium-policy-bgp-guard", "health"},
+	{"service-traffic-policy-guard", "health"},
+	{"pvc-lifecycle-guard", "health"},
+	{"workload-admission-block-guard", "health"},
+	// Wave 4C checks — appended at end.
+	{"gitops-mass-prune-guard", "health"},
+	{"image-resilience-auditor", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -317,6 +327,32 @@ var goldenMetricFamilies = []string{
 	"node_automation_tls_live_socket_drift",
 	"node_automation_service_blackhole",
 	"node_automation_topology_zone_deadlock",
+	// Wave 4A metrics.
+	"node_automation_cel_policy_circuit_broken",
+	"node_automation_cel_policy_critical_ns_exposed",
+	"node_automation_cel_policy_actions_total",
+	"node_automation_prometheus_head_series",
+	"node_automation_prometheus_cardinality_culprit",
+	"node_automation_admission_webhook_exposed",
+	"node_automation_anonymous_rbac_binding",
+	// Wave 4B metrics.
+	"node_automation_cilium_policy_error",
+	"node_automation_cilium_bgp_peer_down",
+	"node_automation_service_traffic_policy_degraded",
+	"node_automation_endpointslice_terminating_stuck",
+	"node_automation_workload_missing_prestop",
+	"node_automation_pvc_pending_deadlock",
+	"node_automation_pod_fsgroup_stall",
+	"node_automation_pv_released_stale",
+	"node_automation_volumesnapshot_failed",
+	"node_automation_workload_admission_blocked",
+	// Wave 4C metrics.
+	"node_automation_api_object_sprawl_count",
+	"node_automation_sprawl_history_deleted_total",
+	"node_automation_coredns_nxdomain_ratio",
+	"node_automation_gitops_mass_prune_alert",
+	"node_automation_gitops_mass_prune_suspends_total",
+	"node_automation_workload_image_resilience_risk",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key
@@ -402,6 +438,12 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"AnnoTopologyRelaxedBy", "passiontech.dev/topology-relaxed-by"},
 	{"AnnoTopologyRelaxOptOut", "passiontech.dev/topology-relax-opt-out"},
 	{"AnnoTopologyRelaxOptIn", "passiontech.dev/topology-relax-opt-in"},
+	// Wave 4 stamps.
+	{"AnnoCircuitBrokenCELPolicy", "passiontech.dev/circuit-broken-cel-policy"},
+	{"AnnoMassPruneGuard", "passiontech.dev/mass-prune-guard"},
+	{"AnnoMassPruneExpected", "passiontech.dev/mass-prune-expected"},
+	{"AnnoMassPruneSuspendedBy", "passiontech.dev/mass-prune-suspended-by"},
+	{"AnnoMutableImageExempt", "passiontech.dev/mutable-image-exempt"},
 }
 
 func TestGoldenRegistryRows(t *testing.T) {
@@ -707,6 +749,16 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.AnnoTopologyRelaxOptOut
 	case "AnnoTopologyRelaxOptIn":
 		return kube.AnnoTopologyRelaxOptIn
+	case "AnnoCircuitBrokenCELPolicy":
+		return kube.AnnoCircuitBrokenCELPolicy
+	case "AnnoMassPruneGuard":
+		return kube.AnnoMassPruneGuard
+	case "AnnoMassPruneExpected":
+		return kube.AnnoMassPruneExpected
+	case "AnnoMassPruneSuspendedBy":
+		return kube.AnnoMassPruneSuspendedBy
+	case "AnnoMutableImageExempt":
+		return kube.AnnoMutableImageExempt
 	default:
 		t.Fatalf("golden key %s no longer exists as an exported const in internal/platform/kube/annos.go — update the golden consciously", name)
 		return ""

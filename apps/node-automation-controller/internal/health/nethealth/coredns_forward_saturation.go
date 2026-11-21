@@ -61,6 +61,8 @@ type coreDNSForwardSaturationCheck struct {
 	emitted state.GaugeLedger[string]
 	// eventHealed dedupes the cluster Event per window.
 	eventHealed state.CooldownSet
+	// ndotsEventCooldown dedupes CoreDNSNdotsAmplification events per workload (6h).
+	ndotsEventCooldown state.CooldownSet
 	// boostReplicas is COREDNS_SATURATION_BOOST_REPLICAS resolved
 	// at construction — the SAME knob the coredns-patcher reads,
 	// so the check's one-shot bump and the patcher's steady-state
@@ -107,13 +109,25 @@ func init() {
 // forward queries per second over 5m.
 const coreDNSFwdSatRejectsQuery = `sum(rate(coredns_forward_max_concurrent_rejects_total[5m]))`
 
-// Run evaluates the saturation signature and, past the window,
-// stamps the boost + bumps replicas once per boost window.
+// Run evaluates forward saturation and the ndots amplification audit
+// on every sweep, then reconciles the emitted gauge and returns the verdict.
 func (p *coreDNSForwardSaturationCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 	p.eventHealed.PruneExpired(now, coreDNSFwdSatEventCooldown)
+	p.ndotsEventCooldown.PruneExpired(now, coreDNSNdotsEventCooldown)
 	var rep probefw.SweepReport
+
+	p.evalForwardSaturation(ctx, log, now, &rep)
+	p.auditNdotsAmplification(ctx, log, now, &rep)
+
+	return rep.Result(&p.emitted,
+		coreDNSForwardSaturationGauge.DeleteLabelValues,
+		"coredns forward saturation: ", ", ")
+}
+
+func (p *coreDNSForwardSaturationCheck) evalForwardSaturation(ctx context.Context,
+	log logr.Logger, now time.Time, rep *probefw.SweepReport) {
 
 	rejects, rerr := p.PromQuery(ctx, coreDNSFwdSatRejectsQuery)
 	if rerr != nil {
@@ -123,22 +137,16 @@ func (p *coreDNSForwardSaturationCheck) Run(ctx context.Context) probefw.Result 
 			rep.Carry(k, lv)
 		}
 		rep.InfraErr(fmt.Errorf("coredns forward saturation query: %w", rerr))
-		return rep.Result(&p.emitted,
-			coreDNSForwardSaturationGauge.DeleteLabelValues,
-			"coredns forward saturation: ", ", ")
+		return
 	}
 	saturated := sumSamples(rejects) > 0
 	if !saturated {
 		p.seen.Forget("coredns")
-		return rep.Result(&p.emitted,
-			coreDNSForwardSaturationGauge.DeleteLabelValues,
-			"coredns forward saturation: ", ", ")
+		return
 	}
 	first, _ := p.seen.Observe("coredns", now)
 	if now.Sub(first) < coreDNSFwdSatMinAge {
-		return rep.Result(&p.emitted,
-			coreDNSForwardSaturationGauge.DeleteLabelValues,
-			"coredns forward saturation: ", ", ")
+		return
 	}
 
 	key := "kube-system/coredns"
@@ -147,9 +155,6 @@ func (p *coreDNSForwardSaturationCheck) Run(ctx context.Context) probefw.Result 
 	rep.Find(key)
 	p.emitSaturationEvent(ctx, log, now)
 	p.boostCoreDNS(ctx, log, now)
-	return rep.Result(&p.emitted,
-		coreDNSForwardSaturationGauge.DeleteLabelValues,
-		"coredns forward saturation: ", ", ")
 }
 
 // emitSaturationEvent fires ONE deduped Warning event per window.

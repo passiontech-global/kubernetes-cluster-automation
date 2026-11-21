@@ -144,6 +144,16 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		// Self-healing wave-3 checks — appended after the wave-2 roster.
 		"service-selector-blackhole",
 		"topology-spread-zone-deadlock",
+		// Wave 4A checks — appended at end of healthRows.
+		"admission-security-guard",
+		// Wave 4B checks — appended at end of healthRows.
+		"cilium-policy-bgp-guard",
+		"service-traffic-policy-guard",
+		"pvc-lifecycle-guard",
+		"workload-admission-block-guard",
+		// Wave 4C checks — appended at end of healthRows.
+		"gitops-mass-prune-guard",
+		"image-resilience-auditor",
 	}
 	var got []string
 	for _, m := range Modules {
