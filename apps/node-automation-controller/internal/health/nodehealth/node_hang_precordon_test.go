@@ -1082,3 +1082,77 @@ func TestCheckNodeHangYieldsToActiveLocalRemediation(t *testing.T) {
 		}
 	})
 }
+
+// CiliumIPAMExhausted joins nodeHangConds (2m hang fuse): a node
+// whose Cilium IPAM pool is exhausted cannot start new pods and must
+// be precordoned until IPAM recovers, then auto-uncordoned once
+// CiliumIPAMExhausted clears.
+func TestNodeHangPreCordonCiliumIPAMExhausted(t *testing.T) {
+	found := false
+	for _, c := range nodeHangConds {
+		if c == nodecond.CiliumIPAMExhausted {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("CiliumIPAMExhausted missing from nodeHangConds")
+	}
+
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-ipam")
+	testutil.CleanupMetric(t, nodeHangUncordonsTotal, "w-ipam")
+
+	// Fresh (<2m) CiliumIPAMExhausted must not cordon yet.
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-ipam", nodecond.CiliumIPAMExhausted, time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false))
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("fresh CiliumIPAMExhausted must pass: %+v", res)
+	}
+	n, _ := cs.CoreV1().Nodes().Get(ctx, "w-ipam", metav1.GetOptions{})
+	if n.Spec.Unschedulable {
+		t.Fatal("fresh CiliumIPAMExhausted cordoned inside the 2m hang fuse")
+	}
+
+	// Sustained (>=2m) CiliumIPAMExhausted cordons and stamps the node.
+	for i := range n.Status.Conditions {
+		if n.Status.Conditions[i].Type == nodecond.CiliumIPAMExhausted {
+			n.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now().Add(-5 * time.Minute))
+			n.Status.Conditions[i].LastHeartbeatTime = metav1.NewTime(time.Now())
+		}
+	}
+	if _, err := cs.CoreV1().Nodes().UpdateStatus(ctx, n, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
+		t.Fatal("sustained CiliumIPAMExhausted did not fail the check")
+	}
+	n, _ = cs.CoreV1().Nodes().Get(ctx, "w-ipam", metav1.GetOptions{})
+	if !n.Spec.Unschedulable || n.Annotations[nodeHangPreCordonAnno] != nodeHangPreCordonValue {
+		t.Fatalf("sustained CiliumIPAMExhausted not cordoned+stamped: unsched=%v annos=%v",
+			n.Spec.Unschedulable, n.Annotations)
+	}
+
+	// Clearing CiliumIPAMExhausted to False triggers auto-uncordon and removes the stamp.
+	for i := range n.Status.Conditions {
+		if n.Status.Conditions[i].Type == nodecond.CiliumIPAMExhausted {
+			n.Status.Conditions[i].Status = corev1.ConditionFalse
+			n.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now())
+			n.Status.Conditions[i].LastHeartbeatTime = metav1.NewTime(time.Now())
+		}
+	}
+	if _, err := cs.CoreV1().Nodes().UpdateStatus(ctx, n, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if res := probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("cleared CiliumIPAMExhausted must pass: %+v", res)
+	}
+	n, _ = cs.CoreV1().Nodes().Get(ctx, "w-ipam", metav1.GetOptions{})
+	if n.Spec.Unschedulable {
+		t.Fatal("node stayed cordoned after CiliumIPAMExhausted cleared")
+	}
+	if _, ok := n.Annotations[nodeHangPreCordonAnno]; ok {
+		t.Fatal("pre-cordon stamp not removed on auto-uncordon")
+	}
+}
