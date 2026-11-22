@@ -95,14 +95,14 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/go-build
-          key: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-${{ github.run_id }}
+          key: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-${{ hashFiles('**/go.mod', '**/go.sum', '**/*.go') }}
           restore-keys: go-build-${{ runner.os }}-${{ hashFiles('mise.toml') }}-
 
       - name: Cache moon workspace cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .moon/cache
-          key: moon-${{ runner.os }}-${{ github.run_id }}-${{ inputs.app }}
+          key: moon-${{ runner.os }}-${{ inputs.app }}-${{ hashFiles('mise.toml', '.golangci.yml', '.moon/**', '**/moon.yml', '**/go.mod', '**/go.sum', '**/*.go', 'apps/*/docs/env.md', 'apps/*/ENV.md', '.github/workflows/**') }}
           restore-keys: moon-${{ runner.os }}-
 
       - name: Compute version and changelog
@@ -300,14 +300,11 @@ jobs:
           echo "rel_version=$rel_version" >>"$GITHUB_OUTPUT"
           echo "rel_tag=$rel_tag" >>"$GITHUB_OUTPUT"
 
-      - name: Lint, vet and test
-        run: moon run "$APP:lint" "$APP:vet" "$APP:test"
-
-      - name: Build static binary
+      - name: Lint, vet, test and build static binary
         env:
           VERSION: ${{ env.REL_VERSION }}
         run: |
-          moon run "$APP:build"
+          moon run "$APP:lint" "$APP:vet" "$APP:test" "$APP:build"
           file "apps/$APP/bin/$APP"
           "apps/$APP/bin/$APP" --version
 
@@ -353,7 +350,7 @@ jobs:
         if: inputs.uses_buildx
         uses: ./.github/actions/gha-cache-env
 
-      - name: Build and push GHCR image (ko, see apps/<app>/.ko.yaml)
+      - name: Build and push GHCR image
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ env.REL_VERSION }}
