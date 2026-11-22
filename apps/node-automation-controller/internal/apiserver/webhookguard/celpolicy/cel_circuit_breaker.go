@@ -261,23 +261,52 @@ func queryCELErrorPolicies(ctx context.Context, g *guardstate.Guard) (map[string
 	return out, errs
 }
 
+func resolveParamGVR(ctx context.Context, g *guardstate.Guard,
+	gv schema.GroupVersion, pk *admissionv1.ParamKind) (gvr schema.GroupVersionResource, namespaced bool, ok bool) {
+
+	if pk.Kind == "" {
+		return schema.GroupVersionResource{}, false, false
+	}
+	rl, err := g.CS.Discovery().ServerResourcesForGroupVersion(pk.APIVersion)
+	if err != nil {
+		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
+			logf.FromContext(ctx).V(1).Info("paramKind discovery unavailable — skipping (fail closed)",
+				"apiVersion", pk.APIVersion, "kind", pk.Kind, "error", err)
+			return schema.GroupVersionResource{}, false, false
+		}
+		metrics.IncError(g.Queue)
+		logf.FromContext(ctx).Error(err, "paramKind discovery failed",
+			"apiVersion", pk.APIVersion, "kind", pk.Kind)
+		return schema.GroupVersionResource{}, false, false
+	}
+	if rl != nil {
+		for _, r := range rl.APIResources {
+			if strings.Contains(r.Name, "/") {
+				continue
+			}
+			if r.Kind == pk.Kind {
+				return gv.WithResource(r.Name), r.Namespaced, true
+			}
+		}
+	}
+	logf.FromContext(ctx).V(1).Info("paramKind not found in discovery — skipping (fail closed)",
+		"apiVersion", pk.APIVersion, "kind", pk.Kind)
+	return schema.GroupVersionResource{}, false, false
+}
+
 func checkMissingParamRef(ctx context.Context, g *guardstate.Guard,
 	p *policyView, bindings []bindingView) (missing bool, unverifiable bool) {
 
 	if p.ParamKind == nil || len(bindings) == 0 {
 		return false, false
 	}
-	if g.Dyn == nil {
+	if g.Dyn == nil || g.CS == nil {
 		return false, true
 	}
-	gv, err := schema.ParseGroupVersion(p.ParamKind.APIVersion)
-	if err != nil {
-		logf.FromContext(ctx).V(1).Info("invalid paramKind apiVersion",
-			"kind", p.Kind, "policy", p.Name, "apiVersion", p.ParamKind.APIVersion, "error", err)
-		return false, true
-	}
-	gvr, _ := meta.UnsafeGuessKindToResource(gv.WithKind(p.ParamKind.Kind))
 	log := logf.FromContext(ctx)
+	resolved := false
+	var gvr schema.GroupVersionResource
+	var namespaced bool
 
 	for _, b := range bindings {
 		if b.ParamRef == nil {
@@ -287,18 +316,43 @@ func checkMissingParamRef(ctx context.Context, g *guardstate.Guard,
 			*b.ParamRef.ParameterNotFoundAction == admissionv1.AllowAction {
 			continue
 		}
+		if !resolved {
+			gv, err := schema.ParseGroupVersion(p.ParamKind.APIVersion)
+			if err != nil {
+				log.V(1).Info("invalid paramKind apiVersion",
+					"kind", p.Kind, "policy", p.Name, "apiVersion", p.ParamKind.APIVersion, "error", err)
+				return false, true
+			}
+			var ok bool
+			gvr, namespaced, ok = resolveParamGVR(ctx, g, gv, p.ParamKind)
+			if !ok {
+				return false, true
+			}
+			resolved = true
+		}
+		if namespaced && b.ParamRef.Namespace == "" {
+			// Per-namespace binding: Kubernetes resolves Name/Selector
+			// in the admitted object's namespace per request; never
+			// issue a cluster-scoped Get/List.
+			continue
+		}
 		switch {
 		case b.ParamRef.Name != "":
 			ri := g.Dyn.Resource(gvr)
-			if b.ParamRef.Namespace != "" {
+			var err error
+			if namespaced {
 				_, err = ri.Namespace(b.ParamRef.Namespace).Get(ctx, b.ParamRef.Name, metav1.GetOptions{})
 			} else {
 				_, err = ri.Get(ctx, b.ParamRef.Name, metav1.GetOptions{})
 			}
 			switch {
 			case err == nil:
-			case apierrors.IsNotFound(err) || kube.IsCRDAbsent(err):
+			case apierrors.IsNotFound(err):
 				return true, false
+			case meta.IsNoMatchError(err):
+				log.V(1).Info("paramRef Get no-match — skipping (fail closed)",
+					"kind", p.Kind, "policy", p.Name, "param", b.ParamRef.Name, "error", err)
+				unverifiable = true
 			case apierrors.IsForbidden(err):
 				log.V(1).Info("paramRef Get forbidden (403) — skipping",
 					"kind", p.Kind, "policy", p.Name, "param", b.ParamRef.Name, "error", err)
@@ -313,7 +367,7 @@ func checkMissingParamRef(ctx context.Context, g *guardstate.Guard,
 			ri := g.Dyn.Resource(gvr)
 			var listErr error
 			var count int
-			if b.ParamRef.Namespace != "" {
+			if namespaced {
 				l, e := ri.Namespace(b.ParamRef.Namespace).List(ctx, metav1.ListOptions{LabelSelector: sel, Limit: 1})
 				listErr = e
 				if l != nil {
@@ -331,7 +385,9 @@ func checkMissingParamRef(ctx context.Context, g *guardstate.Guard,
 				return true, false
 			case listErr == nil:
 			case kube.IsCRDAbsent(listErr):
-				return true, false
+				log.V(1).Info("paramRef List resource absent — skipping (fail closed)",
+					"kind", p.Kind, "policy", p.Name, "selector", sel, "error", listErr)
+				unverifiable = true
 			case apierrors.IsForbidden(listErr):
 				log.V(1).Info("paramRef List forbidden (403) — skipping",
 					"kind", p.Kind, "policy", p.Name, "selector", sel, "error", listErr)

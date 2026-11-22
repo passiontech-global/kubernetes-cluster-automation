@@ -68,6 +68,8 @@ type coreDNSForwardSaturationCheck struct {
 	// so the check's one-shot bump and the patcher's steady-state
 	// boost can never drift apart.
 	boostReplicas int32
+	// marshalFn overrides json.Marshal in unit tests (nil = json.Marshal).
+	marshalFn func(any) ([]byte, error)
 }
 
 // NewCoreDNSForwardSaturationCheck builds the check.
@@ -214,11 +216,6 @@ func (p *coreDNSForwardSaturationCheck) boostCoreDNS(ctx context.Context,
 	if p.boostReplicas <= 0 {
 		return // operator disabled the bump — the stamp alone buys nothing
 	}
-	if !heal.FluxPatchGate("deployment", dep, "kube-system/coredns", now) {
-		log.Info("SKIP: coredns boost patch — Flux Heal-Revert Loop " +
-			"(Git owns this Deployment; fix the source)")
-		return
-	}
 	// The replica bump is a live-workload write — it must pass the
 	// shared maintenance mutex + heal budget like every other
 	// destructive-adjacent act (fail closed on unverifiable).
@@ -230,6 +227,13 @@ func (p *coreDNSForwardSaturationCheck) boostCoreDNS(ctx context.Context,
 		metrics.IncError(p.Name)
 		return
 	case !proceed:
+		return
+	}
+	if !heal.FluxPatchGate("deployment", dep,
+		CheckNameCoreDNSForwardSaturation+":kube-system/coredns", now) {
+		heal.RefundGrant(now) // Flux gate denied — no patch attempted
+		log.Info("SKIP: coredns boost patch — Flux Heal-Revert Loop " +
+			"(Git owns this Deployment; fix the source)")
 		return
 	}
 	until := now.Add(coreDNSFwdSatBoostWindow).UTC().Format(time.RFC3339)
@@ -250,7 +254,11 @@ func (p *coreDNSForwardSaturationCheck) boostCoreDNS(ctx context.Context,
 		}
 	}
 	boosted := max(current, base+p.boostReplicas)
-	payload, err := json.Marshal(map[string]any{
+	marshal := p.marshalFn
+	if marshal == nil {
+		marshal = func(v any) ([]byte, error) { return json.Marshal(v) }
+	}
+	payload, err := marshal(map[string]any{
 		"spec": map[string]any{"replicas": boosted},
 		"metadata": map[string]any{"annotations": map[string]any{
 			kube.AnnoCoreDNSBoostUntil: until,
@@ -258,6 +266,7 @@ func (p *coreDNSForwardSaturationCheck) boostCoreDNS(ctx context.Context,
 		}},
 	})
 	if err != nil {
+		heal.RefundGrant(now) // no patch attempted — hand the token back
 		metrics.IncError(p.Name)
 		return
 	}

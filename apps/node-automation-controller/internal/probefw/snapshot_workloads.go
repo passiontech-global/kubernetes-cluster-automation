@@ -103,6 +103,22 @@ func (d *Deps) AllReplicaSets(ctx context.Context) ([]metav1.PartialObjectMetada
 	})
 }
 
+// AllTypedReplicaSets is the full typed apps/v1 ReplicaSet census —
+// lazy like AllReplicaSets, for callers that read spec/status fields
+// (replicas, readyReplicas, conditions) rather than ObjectMeta alone.
+// Uses snapshotListOpts() (ResourceVersion "0") and memoizes once per
+// sweep.
+func (d *Deps) AllTypedReplicaSets(ctx context.Context) ([]appsv1.ReplicaSet, error) {
+	s := sweepSnap(ctx)
+	return s.typedReplicaSets.get(func(bool) ([]appsv1.ReplicaSet, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.ReplicaSets(d.CS, metav1.NamespaceAll))
+	})
+}
+
 // AllCronJobs is the batch/v1 CronJob census — lazy like
 // AllReplicaSets: only the checks that suspend/audit CronJobs pay
 // the LIST, once per sweep.

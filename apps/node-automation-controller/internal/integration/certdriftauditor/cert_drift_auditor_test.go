@@ -1224,3 +1224,319 @@ func TestLinkerdIssuerRolloutPatchNotFoundRefundsGrant(t *testing.T) {
 			proceed, unverifiable)
 	}
 }
+
+func TestLinkerdIssuerRolloutFluxGateAndReservation(t *testing.T) {
+	wKey := kube.LinkerdNS + "/Deployment/" + kube.LinkerdIdentityName
+	fluxDeploy := func(mgr string) *appsv1.Deployment {
+		d := linkerdIdentityDeploy(nil)
+		if mgr != "" {
+			d.ManagedFields = []metav1.ManagedFieldsEntry{{
+				Manager:   mgr,
+				Operation: metav1.ManagedFieldsOperationApply,
+			}}
+		}
+		return d
+	}
+
+	cases := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			name: "FluxPatchGate_denies",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				heal.ConfigureFluxConflictLoop(2, 30*time.Minute)
+				t.Cleanup(func() {
+					heal.ConfigureBudget(0, 0)
+					heal.ConfigureFluxConflictLoop(0, 0)
+				})
+
+				fixedNow := time.Now()
+				dep := fluxDeploy("helm-controller")
+				cs := fake.NewSimpleClientset(issuerSecret(t), dep)
+				a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+				a.queue = "cert-drift-flux-deny-test"
+				sctx := kube.WithSweepOverlay(ctx)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				seeded := a.linkerdIssuerSerial
+				rotateIssuer(t, cs)
+
+				// Pre-warm 1 sighting so auditLinkerdIssuer hits the LOOP_MAX=2 denial.
+				if !heal.FluxPatchGate("deployment", dep, "tls-secret-audit:"+wKey, fixedNow) {
+					t.Fatal("pre-warm sighting unexpectedly denied")
+				}
+				before := testutil.QueueErrorCount(t, a.queue)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 0 {
+					t.Fatalf("queue error delta = %v, want 0", got)
+				}
+				if got := rolloutAnno(t, cs); got != "" {
+					t.Fatalf("rolloutAnno = %q, want empty on FluxPatchGate denial", got)
+				}
+				if a.linkerdIssuerSerial != seeded {
+					t.Fatal("serial latched despite FluxPatchGate denial")
+				}
+				if !kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("ownerDisrupt key leaked on FluxPatchGate denial")
+				}
+				if proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(), "after-flux-deny", fixedNow); !proceed || unverifiable {
+					t.Fatalf("Gate after FluxPatchGate denial = (%v,%v), want (true,false)", proceed, unverifiable)
+				}
+			},
+		},
+		{
+			name: "Duty_key_isolation",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				heal.ConfigureFluxConflictLoop(2, 30*time.Minute)
+				t.Cleanup(func() {
+					heal.ConfigureBudget(0, 0)
+					heal.ConfigureFluxConflictLoop(0, 0)
+				})
+
+				fixedNow := time.Now()
+				dep := fluxDeploy("helm-controller")
+				cs := fake.NewSimpleClientset(issuerSecret(t), dep)
+				a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+				a.queue = "cert-drift-duty-iso-test"
+				sctx := kube.WithSweepOverlay(ctx)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				rotateIssuer(t, cs)
+
+				// Exhaust sibling duty key and legacy bare key.
+				heal.FluxPatchGate("deployment", dep, "live-socket-audit:"+wKey, fixedNow)
+				heal.FluxPatchGate("deployment", dep, "live-socket-audit:"+wKey, fixedNow)
+				heal.FluxPatchGate("deployment", dep, kube.LinkerdNS+"/"+kube.LinkerdIdentityName, fixedNow)
+				heal.FluxPatchGate("deployment", dep, kube.LinkerdNS+"/"+kube.LinkerdIdentityName, fixedNow)
+
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				if got := rolloutAnno(t, cs); got == "" {
+					t.Fatal("rolloutAnno empty — duty key collided with sibling/bare key")
+				}
+				if kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("wKey must stay reserved after successful rollout")
+				}
+			},
+		},
+		{
+			name: "Patch_API_error_releases_key_keeps_grant_spent",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+				fixedNow := time.Now()
+				cs := fake.NewSimpleClientset(issuerSecret(t), fluxDeploy(""))
+				a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+				a.queue = "cert-drift-patch-500-test"
+				sctx := kube.WithSweepOverlay(ctx)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				seeded := a.linkerdIssuerSerial
+				rotateIssuer(t, cs)
+
+				cs.PrependReactor("patch", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewInternalError(errors.New("boom"))
+				})
+				before := testutil.QueueErrorCount(t, a.queue)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 1 {
+					t.Fatalf("queue error delta = %v, want 1", got)
+				}
+				if got := rolloutAnno(t, cs); got != "" {
+					t.Fatalf("rolloutAnno = %q, want empty on 500 Patch", got)
+				}
+				if a.linkerdIssuerSerial != seeded {
+					t.Fatal("serial latched despite 500 Patch failure")
+				}
+				if !kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("ownerDisrupt key leaked on 500 Patch failure")
+				}
+				if proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(), "after-500", fixedNow); proceed || unverifiable {
+					t.Fatalf("Gate after 500 Patch = (%v,%v), want (false,false) — grant must stay spent", proceed, unverifiable)
+				}
+			},
+		},
+		{
+			name: "Patch_404_releases_key_and_refunds_grant",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+				fixedNow := time.Now()
+				cs := fake.NewSimpleClientset(issuerSecret(t), fluxDeploy(""))
+				a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+				a.queue = "cert-drift-patch-404-test"
+				sctx := kube.WithSweepOverlay(ctx)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				seeded := a.linkerdIssuerSerial
+				rotateIssuer(t, cs)
+
+				cs.PrependReactor("patch", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewNotFound(
+						schema.GroupResource{Group: "apps", Resource: "deployments"},
+						kube.LinkerdIdentityName)
+				})
+				before := testutil.QueueErrorCount(t, a.queue)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 0 {
+					t.Fatalf("queue error delta = %v, want 0", got)
+				}
+				if got := rolloutAnno(t, cs); got != "" {
+					t.Fatalf("rolloutAnno = %q, want empty on 404 Patch", got)
+				}
+				if a.linkerdIssuerSerial != seeded {
+					t.Fatal("serial latched despite 404 Patch failure")
+				}
+				if !kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("ownerDisrupt key leaked on 404 Patch failure")
+				}
+				if proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(), "after-404", fixedNow); !proceed || unverifiable {
+					t.Fatalf("Gate after 404 Patch = (%v,%v), want (true,false) — grant not refunded", proceed, unverifiable)
+				}
+			},
+		},
+		{
+			name: "Pre_reserved_workload_defers_and_refunds_grant",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+				fixedNow := time.Now()
+				cs := fake.NewSimpleClientset(issuerSecret(t), fluxDeploy(""))
+				a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+				a.queue = "cert-drift-prereserved-test"
+				sctx := kube.WithSweepOverlay(ctx)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				seeded := a.linkerdIssuerSerial
+				rotateIssuer(t, cs)
+
+				if !kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("pre-reserve failed")
+				}
+				before := testutil.QueueErrorCount(t, a.queue)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 0 {
+					t.Fatalf("queue error delta = %v, want 0", got)
+				}
+				if got := rolloutAnno(t, cs); got != "" {
+					t.Fatalf("rolloutAnno = %q, want empty when workload pre-reserved", got)
+				}
+				if a.linkerdIssuerSerial != seeded {
+					t.Fatal("serial latched despite pre-reserved deferral")
+				}
+				if proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(), "after-prereserve", fixedNow); !proceed || unverifiable {
+					t.Fatalf("Gate after pre-reserve deferral = (%v,%v), want (true,false)", proceed, unverifiable)
+				}
+			},
+		},
+		{
+			name: "Gate_precedes_FluxPatchGate_no_phantom_sightings",
+			run: func(t *testing.T) {
+				heal.ConfigureFluxConflictLoop(2, 30*time.Minute)
+				var hookCalls int
+				heal.SetFluxConflictHook(func(heal.FluxConflictSignal) { hookCalls++ })
+				t.Cleanup(func() {
+					heal.ConfigureFluxConflictLoop(0, 0)
+					heal.SetFluxConflictHook(nil)
+				})
+
+				fixedNow := time.Now()
+				cs := fake.NewSimpleClientset(
+					issuerSecret(t),
+					fluxDeploy("kustomize-controller"),
+					cordonedNode("worker-0"),
+				)
+				a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+				a.queue = "cert-drift-maint-order-test"
+				if err := a.run(kube.WithSweepOverlay(ctx)); err != nil {
+					t.Fatal(err)
+				}
+				rotateIssuer(t, cs)
+
+				// Run 2 sweeps under maintenance hold: Gate defers so FluxPatchGate
+				// must record 0 sightings.
+				for i := range 2 {
+					if err := a.run(kube.WithSweepOverlay(ctx)); err != nil {
+						t.Fatalf("held sweep %d: %v", i+1, err)
+					}
+					if got := rolloutAnno(t, cs); got != "" {
+						t.Fatalf("held sweep %d stamped rolloutAnno=%q", i+1, got)
+					}
+				}
+				if hookCalls != 0 {
+					t.Fatalf("FluxConflictHook fired %d times while maintenance held, want 0", hookCalls)
+				}
+
+				if err := cs.CoreV1().Nodes().Delete(ctx, "worker-0", metav1.DeleteOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := a.run(kube.WithSweepOverlay(ctx)); err != nil {
+					t.Fatal(err)
+				}
+				if got := rolloutAnno(t, cs); got == "" {
+					t.Fatal("post-maintenance sweep failed — phantom sightings recorded during hold")
+				}
+			},
+		},
+		{
+			name: "StampPersisted_error_keeps_wKey_reserved",
+			run: func(t *testing.T) {
+				fixedNow := time.Now()
+				cs := fake.NewSimpleClientset(issuerSecret(t), fluxDeploy(""))
+				a := newCertDriftAuditor(cs, cdaDyn(), fixedNow)
+				a.queue = "cert-drift-stamp-err-test"
+				sctx := kube.WithSweepOverlay(ctx)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				rotateIssuer(t, cs)
+
+				patchCalls := 0
+				cs.PrependReactor("patch", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
+					patchCalls++
+					if patchCalls == 2 { // 1st is rollout RestartTemplatePatch, 2nd is StampPersisted
+						return true, nil, apierrors.NewInternalError(errors.New("stamp failed"))
+					}
+					return false, nil, nil
+				})
+				before := testutil.QueueErrorCount(t, a.queue)
+				if err := a.run(sctx); err != nil {
+					t.Fatal(err)
+				}
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 1 {
+					t.Fatalf("queue error delta = %v, want 1", got)
+				}
+				if got := rolloutAnno(t, cs); got == "" {
+					t.Fatal("rolloutAnno must be stamped when 1st patch succeeded")
+				}
+				if kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("wKey must NOT be released when rollout Patch succeeded and only StampPersisted failed")
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, tc.run)
+	}
+}

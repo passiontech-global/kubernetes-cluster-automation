@@ -13,7 +13,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -25,8 +29,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
@@ -562,4 +569,195 @@ func TestMemoGetPanicDoesNotPoisonMemo(t *testing.T) {
 	if calls != 2 || !gotForce {
 		t.Fatalf("retry call = (calls=%d, forceCS=%v), want (2, true)", calls, gotForce)
 	}
+}
+
+func TestAllTypedReplicaSets(t *testing.T) {
+	rsFixture := func(name string, replicas, ready int32) *appsv1.ReplicaSet {
+		return &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: name},
+			Spec:       appsv1.ReplicaSetSpec{Replicas: ptr.To(replicas)},
+			Status: appsv1.ReplicaSetStatus{
+				ReadyReplicas: ready,
+				Conditions: []appsv1.ReplicaSetCondition{{
+					Type:   appsv1.ReplicaSetReplicaFailure,
+					Status: corev1.ConditionTrue,
+				}},
+			},
+		}
+	}
+
+	t.Run("lazy single-LIST independent of AllReplicaSets and resets on InvalidateSweep", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(rsFixture("web-abc", 3, 2))
+		var rsLists atomic.Int32
+		cs.PrependReactor("list", "replicasets",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				rsLists.Add(1)
+				return false, nil, nil
+			})
+		d := &Deps{CS: cs}
+		ctx := WithSweepSnapshot(t.Context(), d)
+
+		// AllReplicaSets (metadata-only) and AllTypedReplicaSets are independent memos.
+		metaRS, err := d.AllReplicaSets(ctx)
+		if err != nil || len(metaRS) != 1 || metaRS[0].Name != "web-abc" {
+			t.Fatalf("AllReplicaSets = (%v, %v)", metaRS, err)
+		}
+		if got := rsLists.Load(); got != 1 {
+			t.Fatalf("after AllReplicaSets, lists = %d, want 1", got)
+		}
+
+		got1, err := d.AllTypedReplicaSets(ctx)
+		if err != nil || len(got1) != 1 {
+			t.Fatalf("AllTypedReplicaSets #1 = (%v, %v)", got1, err)
+		}
+		if got1[0].Spec.Replicas == nil || *got1[0].Spec.Replicas != 3 ||
+			got1[0].Status.ReadyReplicas != 2 || len(got1[0].Status.Conditions) != 1 {
+			t.Fatalf("typed ReplicaSet fields not preserved: %+v", got1[0])
+		}
+		if got := rsLists.Load(); got != 2 {
+			t.Fatalf("after first AllTypedReplicaSets, lists = %d, want 2", got)
+		}
+
+		// Repeat call in same sweep is memoized (no extra LIST).
+		got2, err := d.AllTypedReplicaSets(ctx)
+		if err != nil || len(got2) != 1 || rsLists.Load() != 2 {
+			t.Fatalf("repeat AllTypedReplicaSets = (%d, %v), lists=%d, want lists=2",
+				len(got2), err, rsLists.Load())
+		}
+
+		// InvalidateSweep resets typedReplicaSets so the next call re-LISTs.
+		d.InvalidateSweep(ctx)
+		if _, err := d.AllTypedReplicaSets(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := rsLists.Load(); got != 3 {
+			t.Fatalf("after InvalidateSweep, lists = %d, want 3", got)
+		}
+
+		// InvalidateReplicaSets also resets typedReplicaSets.
+		d.InvalidateReplicaSets(ctx)
+		if _, err := d.AllTypedReplicaSets(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := rsLists.Load(); got != 4 {
+			t.Fatalf("after InvalidateReplicaSets, lists = %d, want 4", got)
+		}
+	})
+
+	t.Run("wire request carries ResourceVersion=0 and no Limit", func(t *testing.T) {
+		var gotQuery url.Values
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.Query()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiVersion":"apps/v1","kind":"ReplicaSetList","items":[]}`))
+		}))
+		defer srv.Close()
+		cs, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := &Deps{CS: cs}
+		ctx := WithSweepSnapshot(t.Context(), d)
+		if _, err := d.AllTypedReplicaSets(ctx); err != nil {
+			t.Fatalf("AllTypedReplicaSets wire call: %v", err)
+		}
+		if gotQuery.Get("resourceVersion") != "0" {
+			t.Fatalf("resourceVersion query = %q, want \"0\"", gotQuery.Get("resourceVersion"))
+		}
+		if gotQuery.Get("limit") != "" {
+			t.Fatalf("limit query = %q, want empty (stripped by pageOpts for RV=0)", gotQuery.Get("limit"))
+		}
+	})
+
+	t.Run("memoizes error within sweep", func(t *testing.T) {
+		cs := fake.NewSimpleClientset()
+		var lists atomic.Int32
+		boom := errors.New("rs forbidden")
+		cs.PrependReactor("list", "replicasets",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				lists.Add(1)
+				return true, nil, boom
+			})
+		d := &Deps{CS: cs}
+		ctx := WithSweepSnapshot(t.Context(), d)
+
+		_, err1 := d.AllTypedReplicaSets(ctx)
+		_, err2 := d.AllTypedReplicaSets(ctx)
+		if !errors.Is(err1, boom) || !errors.Is(err2, boom) || err1 != err2 {
+			t.Fatalf("errors = (%v, %v), want identical memoized %v", err1, err2, boom)
+		}
+		if got := lists.Load(); got != 1 {
+			t.Fatalf("error memoization issued %d LISTs, want 1", got)
+		}
+	})
+
+	t.Run("outside sweep lists fresh per call", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(rsFixture("web-1", 1, 1))
+		var lists atomic.Int32
+		cs.PrependReactor("list", "replicasets",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				lists.Add(1)
+				return false, nil, nil
+			})
+		d := &Deps{CS: cs}
+		if _, err := d.AllTypedReplicaSets(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.AllTypedReplicaSets(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if got := lists.Load(); got != 2 {
+			t.Fatalf("outside sweep issued %d LISTs, want 2", got)
+		}
+	})
+
+	t.Run("parallel readers under -race issue exactly one LIST", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(rsFixture("web-1", 2, 2))
+		var lists atomic.Int32
+		cs.PrependReactor("list", "replicasets",
+			func(ktesting.Action) (bool, runtime.Object, error) {
+				lists.Add(1)
+				return false, nil, nil
+			})
+		d := &Deps{CS: cs}
+		ctx := WithSweepSnapshot(t.Context(), d)
+		var wg sync.WaitGroup
+		errs := make([]error, 8)
+		for i := range errs {
+			wg.Go(func() {
+				items, err := d.AllTypedReplicaSets(ctx)
+				if err == nil && len(items) != 1 {
+					err = fmt.Errorf("got %d replicasets, want 1", len(items))
+				}
+				errs[i] = err
+			})
+		}
+		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := lists.Load(); got != 1 {
+			t.Fatalf("parallel readers issued %d LISTs, want 1", got)
+		}
+	})
+
+	t.Run("VerifySweepSnapshotUnmutated catches in-place mutation", func(t *testing.T) {
+		EnableSnapshotVerify()
+		cs := fake.NewSimpleClientset(rsFixture("web-1", 2, 2))
+		d := &Deps{CS: cs}
+		ctx := WithSweepSnapshot(t.Context(), d)
+		items, err := d.AllTypedReplicaSets(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items[0].Status.ReadyReplicas = 99
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("VerifySweepSnapshotUnmutated missed in-place typedReplicaSets mutation")
+			}
+		}()
+		VerifySweepSnapshotUnmutated(ctx)
+	})
 }

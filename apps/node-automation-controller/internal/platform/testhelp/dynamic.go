@@ -95,6 +95,7 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	// BackupRepository -> "backuprepositories" pluralizes correctly
 	// via the trailing-"y" -> "ies" rule.
 	{Group: "velero.io", Version: "v1", Kind: "BackupRepository"},
+	{Group: "velero.io", Version: "v1", Kind: "Restore"},
 	{Group: "everest.percona.com", Version: "v1alpha1", Kind: "DatabaseCluster"},
 	{Group: "everest.percona.com", Version: "v1alpha1", Kind: "DatabaseClusterBackup"},
 
@@ -190,6 +191,10 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"},
 	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRoute"},
 	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "GRPCRoute"},
+	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "TLSRoute"},
+	{Group: "gateway.networking.k8s.io", Version: "v1alpha3", Kind: "TLSRoute"},
+	{Group: "gateway.networking.k8s.io", Version: "v1alpha2", Kind: "TLSRoute"},
+	{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "ReferenceGrant"},
 	{Group: "gateway.networking.k8s.io", Version: "v1beta1", Kind: "ReferenceGrant"},
 	{Group: "gateway.networking.k8s.io", Version: "v1alpha2", Kind: "ReferenceGrant"},
 
@@ -218,11 +223,17 @@ func buildDynScheme() *runtime.Scheme {
 		// scheme.New(<Kind>List), and its GVR->list-kind map is
 		// inverted from registered List GVKs — registering only the
 		// object kind would leave List() panicking on "you must
-		// register resource to list kind".
-		s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
-		s.AddKnownTypeWithName(
-			gvk.GroupVersion().WithKind(gvk.Kind+"List"),
-			&unstructured.UnstructuredList{})
+		// register resource to list kind". Guard with !Recognizes
+		// so any GVK already registered by clientgoscheme (e.g.
+		// resource.k8s.io/v1 ResourceClaim) cannot trigger a
+		// double-registration panic.
+		if !s.Recognizes(gvk) {
+			s.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+		}
+		listGVK := gvk.GroupVersion().WithKind(gvk.Kind + "List")
+		if !s.Recognizes(listGVK) {
+			s.AddKnownTypeWithName(listGVK, &unstructured.UnstructuredList{})
+		}
 	}
 	return s
 }
@@ -274,8 +285,13 @@ func DynScheme() *runtime.Scheme {
 // guesses "gatewaies" for Gateway — the gateway-api CRD's real
 // resource is "gateways". Custom entries merge over the guessed map,
 // so the wrong guess can stay (harmless) alongside the right one.
+// resource.k8s.io/v1 ResourceClaim is a built-in API already registered
+// in clientgoscheme (not a CRD, so omitted from dynCRDGVKs to avoid
+// double-registration with *resourcev1.ResourceClaim); adding its list
+// kind override here lets NewFakeDyn(DynListKinds()) list resourceclaims too.
 var dynListKindOverrides = map[schema.GroupVersionResource]string{
 	{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}: "GatewayList",
+	{Group: "resource.k8s.io", Version: "v1", Resource: "resourceclaims"}:     "ResourceClaimList",
 }
 
 // NewDynamicClient returns a dynamic fake that can List every CRD

@@ -337,7 +337,10 @@ func (c *admissionSecurityGuardCheck) collectCRDWebhookTargets(
 		return nil
 	}
 	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: admissionSecCRDPageSize},
+		metav1.ListOptions{
+			Limit:           admissionSecCRDPageSize,
+			ResourceVersion: "0",
+		},
 		kube.DynamicPage(c.Dyn.Resource(kube.GVRCustomResourceDefinition)),
 		func(page []unstructured.Unstructured) error {
 			for i := range page {
@@ -370,7 +373,10 @@ func (c *admissionSecurityGuardCheck) listNetworkPolicies(
 	blocked bool,
 ) ([]networkingv1.NetworkPolicy, bool) {
 	nps, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		},
 		kube.NetworkPolicies(c.CS, metav1.NamespaceAll))
 	if err != nil {
 		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
@@ -417,7 +423,10 @@ func (c *admissionSecurityGuardCheck) auditAnonymousRBAC(
 	summaryRep *probefw.SweepReport,
 ) {
 	crbs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		},
 		kube.ClusterRoleBindings(c.CS))
 	if err != nil {
 		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
@@ -450,7 +459,10 @@ func (c *admissionSecurityGuardCheck) auditAnonymousRBAC(
 	}
 
 	rbs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		},
 		kube.RoleBindings(c.CS, metav1.NamespaceAll))
 	if err != nil {
 		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {

@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -20,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -767,4 +771,125 @@ func TestPartitionEvictorMixedRefusalAndDeliveryMultiNode(t *testing.T) {
 	if !testutil.PodExistsStrict(t, cs, "flux-system", "pod-p2-refused") {
 		t.Fatal("pod-p2-refused evicted on sweep 2 — p2 did not keep its delivered grant")
 	}
+}
+
+// HTTP 404 from EvictV1 is handled via heal.EvictPodNotFound's notFound
+// branch BEFORE refused: no "DEFER:"/"PDB refused" log, no cap slot
+// consumed, zero IncError, and both fleet/target grants refunded when
+// all pods return 404.
+func TestPartitionEvictorNotFoundEvictionQuietNoCapOrGrantBurn(t *testing.T) {
+	t.Setenv(partitionNSsEnv, "flux-system")
+	partitionTaint := corev1.Taint{
+		Key:    partitionTaintKey,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+
+	t.Run("404 logs no PDB refusal, consumes no cap slot, causes zero IncError", func(t *testing.T) {
+		objs := []runtime.Object{
+			pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint),
+		}
+		objs = append(objs, peHealthyNodes("h", 2)...)
+		for i := range partitionEvictCap + 1 {
+			objs = append(objs, pePod("flux-system", "p1", fmt.Sprintf("pod-%02d", i)))
+		}
+		cs := fake.NewSimpleClientset(objs...)
+		peEmulateEviction(cs)
+		cs.PrependReactor("create", "pods",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				ca, ok := a.(ktesting.CreateAction)
+				if !ok || ca.GetSubresource() != "eviction" {
+					return false, nil, nil
+				}
+				ev := ca.GetObject().(*policyv1.Eviction)
+				if ev.Name == "pod-00" {
+					return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), "pod-00")
+				}
+				return false, nil, nil
+			})
+
+		var logMu sync.Mutex
+		var logs []string
+		logger := funcr.New(func(prefix, args string) {
+			logMu.Lock()
+			logs = append(logs, prefix+" "+args)
+			logMu.Unlock()
+		}, funcr.Options{})
+		lctx := logf.IntoContext(ctx, logger)
+
+		beforeErr := testutil.QueueErrorCount(t, "partition-pod-evictor")
+		e := &partitionEvictor{cs: cs, queue: "partition-pod-evictor"}
+		if err := e.run(lctx); err != nil {
+			t.Fatalf("e.run: %v", err)
+		}
+		if gotErr := testutil.QueueErrorCount(t, "partition-pod-evictor") - beforeErr; gotErr != 0 {
+			t.Fatalf("IncError delta = %v, want 0", gotErr)
+		}
+		for _, line := range logs {
+			if strings.Contains(line, "DEFER:") || strings.Contains(line, "PDB refused") {
+				t.Fatalf("unexpected PDB deferral log on 404: %s", line)
+			}
+		}
+		// pod-00 returned 404 (not deleted from tracker, not counted against cap);
+		// all remaining partitionEvictCap pods (pod-01..pod-08) must be evicted!
+		remaining, err := cs.CoreV1().Pods(partitionPodNS).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(remaining.Items) != 1 || remaining.Items[0].Name != "pod-00" {
+			t.Fatalf("remaining pods = %v, want only pod-00 (all %d other pods evicted without cap burn)",
+				remaining.Items, partitionEvictCap)
+		}
+	})
+
+	t.Run("all-404 refunds both fleet budget and target breaker grants", func(t *testing.T) {
+		heal.ConfigureBudget(1, time.Hour)
+		heal.ConfigureTargetBreaker(1, time.Hour)
+		t.Cleanup(func() {
+			heal.ConfigureBudget(0, 0)
+			heal.ConfigureTargetBreaker(0, 0)
+		})
+
+		objs := append([]runtime.Object{
+			pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute, partitionTaint),
+			pePod("flux-system", "p1", "pod-0"),
+		}, peHealthyNodes("h", 2)...)
+		cs := fake.NewSimpleClientset(objs...)
+		peEmulateEviction(cs)
+
+		var return404 atomic.Bool
+		return404.Store(true)
+		cs.PrependReactor("create", "pods",
+			func(a ktesting.Action) (bool, runtime.Object, error) {
+				if ca, ok := a.(ktesting.CreateAction); ok && ca.GetSubresource() == "eviction" && return404.Load() {
+					return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), "pod-0")
+				}
+				return false, nil, nil
+			})
+
+		now := time.Now()
+		e := &partitionEvictor{
+			cs:    cs,
+			dyn:   testutil.NewDynamicClient(),
+			queue: "partition-pod-evictor",
+			now:   func() time.Time { return now },
+		}
+		// Sweep 1: pod-0 returns 404 -> fleet budget (1) and target breaker (1) must both refund.
+		if err := e.run(ctx); err != nil {
+			t.Fatalf("sweep 1: %v", err)
+		}
+		if !testutil.PodExistsStrict(t, cs, "flux-system", "pod-0") {
+			t.Fatal("pod-0 deleted despite 404")
+		}
+
+		// Sweep 2 with 404 lifted: both fleet budget and target breaker must still allow eviction.
+		return404.Store(false)
+		now = now.Add(time.Minute)
+		if err := e.run(ctx); err != nil {
+			t.Fatalf("sweep 2: %v", err)
+		}
+		if testutil.PodExistsStrict(t, cs, "flux-system", "pod-0") {
+			t.Fatal("pod-0 not evicted on sweep 2 — all-404 sweep did not refund fleet/target grants")
+		}
+	})
 }

@@ -21,6 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	fakediscovery "k8s.io/client-go/discovery/fake"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
@@ -46,8 +48,19 @@ func newTestSweeperAndGuard(t *testing.T, cs *fake.Clientset, objs ...runtime.Ob
 		metrics.CELPolicyCriticalNSExposed.Reset()
 	})
 	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	if cs != nil && cs.Resources == nil {
+		cs.Resources = []*metav1.APIResourceList{{
+			GroupVersion: "example.com/v1",
+			APIResources: []metav1.APIResource{{
+				Name:       "policyparams",
+				Namespaced: true,
+				Kind:       "PolicyParam",
+			}},
+		}}
+	}
 	kinds := maps.Clone(testutil.DynListKinds())
 	kinds[schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "policyparams"}] = "PolicyParamList"
+	kinds[schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "clusterpolicyparams"}] = "ClusterPolicyParamList"
 	dyn := testutil.NewFakeDyn(kinds, objs...)
 	g := &guardstate.Guard{
 		CS:    cs,
@@ -1104,4 +1117,493 @@ func queueErrCount(t *testing.T, queue string) float64 {
 		}
 	}
 	return 0
+}
+
+func TestCELPolicyParamKindIrregularPluralDiscovery(t *testing.T) {
+	gwGVK := schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"}
+	gwGVR := schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}
+
+	t.Run("present irregular-plural param resolves gateways not gatewaies and ignores subresource", func(t *testing.T) {
+		vap := testVAP("vap-gw-present", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		vap.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "gateway.networking.k8s.io/v1", Kind: "Gateway"}
+		vapb := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-gw-present"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-gw-present",
+				ParamRef:   &admissionv1.ParamRef{Name: "gw-cfg", Namespace: "default"},
+			},
+		}
+		gwObj := &unstructured.Unstructured{}
+		gwObj.SetGroupVersionKind(gwGVK)
+		gwObj.SetNamespace("default")
+		gwObj.SetName("gw-cfg")
+
+		cs := fake.NewSimpleClientset(vap, vapb)
+		cs.Resources = []*metav1.APIResourceList{{
+			GroupVersion: "gateway.networking.k8s.io/v1",
+			APIResources: []metav1.APIResource{
+				// Subresource listed first to verify subresource skipping.
+				{Name: "gateways/status", Namespaced: true, Kind: "Gateway"},
+				{Name: "gateways", Namespaced: true, Kind: "Gateway"},
+			},
+		}}
+		s, g, now := newTestSweeperAndGuard(t, cs)
+		s.tripWindow = time.Minute
+		s.minMissingCycles = 1
+		if _, err := testCreateUnstructured(g, gwGVR, gwObj); err != nil {
+			t.Fatal(err)
+		}
+
+		g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("*", "*", func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetResource().Group == "gateway.networking.k8s.io" && a.GetResource().Resource != "gateways" {
+				t.Fatalf("unexpected dynamic resource %q (expected gateways)", a.GetResource().Resource)
+			}
+			return false, nil, nil
+		})
+
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 1: %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 2: %v", err)
+		}
+		got, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-gw-present", metav1.GetOptions{})
+		if *got.Spec.FailurePolicy != admissionv1.Fail {
+			t.Fatalf("healthy irregular-plural Gateway policy tripped: %v", *got.Spec.FailurePolicy)
+		}
+	})
+
+	t.Run("missing irregular-plural param trips via real NotFound on gateways", func(t *testing.T) {
+		vap := testVAP("vap-gw-missing", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		vap.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "gateway.networking.k8s.io/v1", Kind: "Gateway"}
+		vapb := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-gw-missing"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-gw-missing",
+				ParamRef:   &admissionv1.ParamRef{Name: "missing-gw", Namespace: "default"},
+			},
+		}
+		cs := fake.NewSimpleClientset(vap, vapb)
+		cs.Resources = []*metav1.APIResourceList{{
+			GroupVersion: "gateway.networking.k8s.io/v1",
+			APIResources: []metav1.APIResource{
+				{Name: "gateways/status", Namespaced: true, Kind: "Gateway"},
+				{Name: "gateways", Namespaced: true, Kind: "Gateway"},
+			},
+		}}
+		s, g, now := newTestSweeperAndGuard(t, cs)
+		s.tripWindow = time.Minute
+		s.minMissingCycles = 1
+
+		var seenResource string
+		g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("get", "*", func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetResource().Group == "gateway.networking.k8s.io" {
+				seenResource = a.GetResource().Resource
+			}
+			return false, nil, nil
+		})
+
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 1: %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 2: %v", err)
+		}
+		if seenResource != gwGVR.Resource {
+			t.Fatalf("queried resource = %q, want %q", seenResource, gwGVR.Resource)
+		}
+		got, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-gw-missing", metav1.GetOptions{})
+		if *got.Spec.FailurePolicy != admissionv1.Ignore {
+			t.Fatalf("expected Ignore after missing Gateway paramRef, got %v", *got.Spec.FailurePolicy)
+		}
+	})
+}
+
+func TestCELPolicyNamespacedParamRefWithoutNamespace(t *testing.T) {
+	t.Run("Name without Namespace skips cluster-scoped Get and recovers after PromQL trip", func(t *testing.T) {
+		firing := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if firing && strings.Contains(r.FormValue("query"), "apiserver_validating_admission_policy_check_total") {
+				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"policy":"vap-per-ns"},"value":[1700000000,"0.5"]}]}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+		}))
+		defer srv.Close()
+
+		vap := testVAP("vap-per-ns", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		vap.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "example.com/v1", Kind: "PolicyParam"}
+		vapb := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-per-ns"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-per-ns",
+				ParamRef:   &admissionv1.ParamRef{Name: "per-ns-cfg", Namespace: ""},
+			},
+		}
+		cs := fake.NewSimpleClientset(vap, vapb)
+		s, g, now := newTestSweeperAndGuard(t, cs)
+		s.tripWindow = time.Minute
+		s.minMissingCycles = 1
+		g.PromEndpoint = srv.URL + "/api/v1/query"
+		g.PromClient = promq.Client{HTTP: srv.Client(), Timeout: time.Second}
+
+		g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("*", "policyparams", func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetNamespace() == "" {
+				t.Fatalf("unexpected cluster-scoped %s on namespaced PolicyParam", a.GetVerb())
+			}
+			return false, nil, nil
+		})
+
+		// Healthy across > tripWindow: stays Fail.
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 1: %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 2: %v", err)
+		}
+		got, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-per-ns", metav1.GetOptions{})
+		if *got.Spec.FailurePolicy != admissionv1.Fail {
+			t.Fatalf("per-ns binding tripped falsely: %v", *got.Spec.FailurePolicy)
+		}
+
+		// Trip via PromQL error storm.
+		firing = true
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 3 (storm 1): %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 4 (storm 2): %v", err)
+		}
+		got, _ = cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-per-ns", metav1.GetOptions{})
+		if *got.Spec.FailurePolicy != admissionv1.Ignore {
+			t.Fatalf("expected Ignore after PromQL storm, got %v", *got.Spec.FailurePolicy)
+		}
+
+		// Clear PromQL storm: 2 clean cycles must restore to Fail (not stuck unverifiable!).
+		firing = false
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 5 (clean 1): %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 6 (clean 2): %v", err)
+		}
+		got, _ = cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-per-ns", metav1.GetOptions{})
+		if *got.Spec.FailurePolicy != admissionv1.Fail {
+			t.Fatalf("per-ns binding failed to auto-restore after PromQL storm cleared: %v", *got.Spec.FailurePolicy)
+		}
+	})
+
+	t.Run("Selector without Namespace skips cluster-scoped List", func(t *testing.T) {
+		vap := testVAP("vap-per-ns-sel", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		vap.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "example.com/v1", Kind: "PolicyParam"}
+		vapb := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-per-ns-sel"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-per-ns-sel",
+				ParamRef: &admissionv1.ParamRef{
+					Namespace: "",
+					Selector:  &metav1.LabelSelector{MatchLabels: map[string]string{"app": "guard"}},
+				},
+			},
+		}
+		cs := fake.NewSimpleClientset(vap, vapb)
+		s, g, now := newTestSweeperAndGuard(t, cs)
+		s.tripWindow = time.Minute
+		s.minMissingCycles = 1
+
+		g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("*", "policyparams", func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetNamespace() == "" {
+				t.Fatalf("unexpected cluster-scoped %s on namespaced PolicyParam", a.GetVerb())
+			}
+			return false, nil, nil
+		})
+
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 1: %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 2: %v", err)
+		}
+		got, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-per-ns-sel", metav1.GetOptions{})
+		if *got.Spec.FailurePolicy != admissionv1.Fail {
+			t.Fatalf("per-ns selector binding tripped falsely: %v", *got.Spec.FailurePolicy)
+		}
+	})
+}
+
+func TestCELPolicyDiscoveryMissingAndCRDAbsentFailClosed(t *testing.T) {
+	t.Run("missing GroupVersion in discovery stays Fail with 0 dyn calls and 0 IncError", func(t *testing.T) {
+		vap := testVAP("vap-missing-gv", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		vap.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "missing.example.com/v1", Kind: "MissingParam"}
+		vapb := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-missing-gv"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-missing-gv",
+				ParamRef:   &admissionv1.ParamRef{Name: "cfg", Namespace: "default"},
+			},
+		}
+		cs := fake.NewSimpleClientset(vap, vapb)
+		cs.Resources = []*metav1.APIResourceList{} // explicitly non-nil empty
+		s, g, now := newTestSweeperAndGuard(t, cs)
+		g.Queue = "test-celpolicy-disc-missing-gv"
+		s.tripWindow = time.Minute
+		s.minMissingCycles = 1
+
+		var dynCalls int
+		g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("*", "*", func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetResource().Group == "missing.example.com" {
+				dynCalls++
+			}
+			return false, nil, nil
+		})
+
+		beforeErrs := queueErrCount(t, g.Queue)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 1: %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 2: %v", err)
+		}
+		if dynCalls != 0 {
+			t.Fatalf("dynCalls = %d, want 0", dynCalls)
+		}
+		if afterErrs := queueErrCount(t, g.Queue); afterErrs != beforeErrs {
+			t.Fatalf("IncError incremented on absent GV discovery: %v -> %v", beforeErrs, afterErrs)
+		}
+		got, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-missing-gv", metav1.GetOptions{})
+		if *got.Spec.FailurePolicy != admissionv1.Fail {
+			t.Fatalf("expected Fail on missing GV discovery, got %v", *got.Spec.FailurePolicy)
+		}
+	})
+
+	t.Run("GroupVersion without Kind stays Fail with 0 dyn calls and 0 IncError", func(t *testing.T) {
+		vap := testVAP("vap-missing-kind", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		vap.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "example.com/v1", Kind: "OtherKind"}
+		vapb := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-missing-kind"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-missing-kind",
+				ParamRef:   &admissionv1.ParamRef{Name: "cfg", Namespace: "default"},
+			},
+		}
+		cs := fake.NewSimpleClientset(vap, vapb)
+		s, g, now := newTestSweeperAndGuard(t, cs) // seeds only PolicyParam
+		g.Queue = "test-celpolicy-disc-missing-kind"
+		s.tripWindow = time.Minute
+		s.minMissingCycles = 1
+
+		var dynCalls int
+		g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("*", "*", func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetResource().Group == "example.com" {
+				dynCalls++
+			}
+			return false, nil, nil
+		})
+
+		beforeErrs := queueErrCount(t, g.Queue)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 1: %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 2: %v", err)
+		}
+		if dynCalls != 0 {
+			t.Fatalf("dynCalls = %d, want 0", dynCalls)
+		}
+		if afterErrs := queueErrCount(t, g.Queue); afterErrs != beforeErrs {
+			t.Fatalf("IncError incremented on missing Kind discovery: %v -> %v", beforeErrs, afterErrs)
+		}
+		got, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-missing-kind", metav1.GetOptions{})
+		if *got.Spec.FailurePolicy != admissionv1.Fail {
+			t.Fatalf("expected Fail on missing Kind discovery, got %v", *got.Spec.FailurePolicy)
+		}
+	})
+
+	t.Run("discovery 500 error fails closed (neither trips nor restores) and increments IncError", func(t *testing.T) {
+		unbroken := testVAP("vap-disc-unbroken", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		unbroken.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "example.com/v1", Kind: "PolicyParam"}
+		unbrokenB := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-disc-unbroken"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-disc-unbroken",
+				ParamRef:   &admissionv1.ParamRef{Name: "cfg", Namespace: "default"},
+			},
+		}
+		broken := testVAP("vap-disc-broken", ptr.To(admissionv1.Ignore), critNSExcludedSelector())
+		broken.Annotations = map[string]string{kube.AnnoCircuitBrokenCELPolicy: "2026-11-21T12:00:00Z missing_param_ref"}
+		broken.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "example.com/v1", Kind: "PolicyParam"}
+		brokenB := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-disc-broken"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-disc-broken",
+				ParamRef:   &admissionv1.ParamRef{Name: "cfg", Namespace: "default"},
+			},
+		}
+
+		cs := fake.NewSimpleClientset(unbroken, unbrokenB, broken, brokenB)
+		cs.Discovery().(*fakediscovery.FakeDiscovery).PrependReactor("get", "resource", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(errors.New("discovery 500"))
+		})
+		s, g, now := newTestSweeperAndGuard(t, cs)
+		g.Queue = "test-celpolicy-disc-500"
+		s.tripWindow = time.Minute
+		s.minMissingCycles = 1
+
+		beforeErrs := queueErrCount(t, g.Queue)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 1: %v", err)
+		}
+		*now = now.Add(6 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 2: %v", err)
+		}
+		if afterErrs := queueErrCount(t, g.Queue); afterErrs <= beforeErrs {
+			t.Fatalf("expected IncError on 500 discovery error, got %v -> %v", beforeErrs, afterErrs)
+		}
+		gotUnbroken, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-disc-unbroken", metav1.GetOptions{})
+		if *gotUnbroken.Spec.FailurePolicy != admissionv1.Fail {
+			t.Fatalf("unbroken policy tripped during discovery 500: %v", *gotUnbroken.Spec.FailurePolicy)
+		}
+		gotBroken, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-disc-broken", metav1.GetOptions{})
+		if *gotBroken.Spec.FailurePolicy != admissionv1.Ignore {
+			t.Fatalf("broken policy restored during discovery 500 (must fail closed): %v", *gotBroken.Spec.FailurePolicy)
+		}
+	})
+
+	t.Run("Selector List CRD-absent and Get NoMatch fail closed without tripping", func(t *testing.T) {
+		vapSel := testVAP("vap-list-nomatch", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		vapSel.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "example.com/v1", Kind: "PolicyParam"}
+		vapbSel := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-list-nomatch"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-list-nomatch",
+				ParamRef: &admissionv1.ParamRef{
+					Namespace: "default",
+					Selector:  &metav1.LabelSelector{MatchLabels: map[string]string{"app": "guard"}},
+				},
+			},
+		}
+		vapGet := testVAP("vap-get-nomatch", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+		vapGet.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "example.com/v1", Kind: "PolicyParam"}
+		vapbGet := &admissionv1.ValidatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "vapb-get-nomatch"},
+			Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+				PolicyName: "vap-get-nomatch",
+				ParamRef:   &admissionv1.ParamRef{Name: "cfg", Namespace: "default"},
+			},
+		}
+		cs := fake.NewSimpleClientset(vapSel, vapbSel, vapGet, vapbGet)
+		s, g, now := newTestSweeperAndGuard(t, cs)
+		g.Queue = "test-celpolicy-nomatch"
+		s.tripWindow = time.Minute
+		s.minMissingCycles = 1
+
+		noMatch := &meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "policyparams"}}
+		g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("list", "policyparams", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, noMatch
+		})
+		g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("get", "policyparams", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, noMatch
+		})
+
+		beforeErrs := queueErrCount(t, g.Queue)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 1: %v", err)
+		}
+		*now = now.Add(2 * time.Minute)
+		if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+			t.Fatalf("Sweep 2: %v", err)
+		}
+		if afterErrs := queueErrCount(t, g.Queue); afterErrs != beforeErrs {
+			t.Fatalf("IncError incremented on CRD-absent NoMatch: %v -> %v", beforeErrs, afterErrs)
+		}
+		for _, name := range []string{"vap-list-nomatch", "vap-get-nomatch"} {
+			got, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, name, metav1.GetOptions{})
+			if *got.Spec.FailurePolicy != admissionv1.Fail {
+				t.Fatalf("%s tripped on CRD-absent NoMatch: %v", name, *got.Spec.FailurePolicy)
+			}
+		}
+	})
+}
+
+func TestCELPolicyClusterScopedParamKind(t *testing.T) {
+	paramGVK := schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "ClusterPolicyParam"}
+	paramGVR := schema.GroupVersionResource{Group: "example.com", Version: "v1", Resource: "clusterpolicyparams"}
+
+	vap := testVAP("vap-cluster-param", ptr.To(admissionv1.Fail), critNSExcludedSelector())
+	vap.Spec.ParamKind = &admissionv1.ParamKind{APIVersion: "example.com/v1", Kind: "ClusterPolicyParam"}
+	vapb := &admissionv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "vapb-cluster-param"},
+		Spec: admissionv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName: "vap-cluster-param",
+			ParamRef:   &admissionv1.ParamRef{Name: "missing-global", Namespace: ""},
+		},
+	}
+
+	cs := fake.NewSimpleClientset(vap, vapb)
+	cs.Resources = []*metav1.APIResourceList{{
+		GroupVersion: "example.com/v1",
+		APIResources: []metav1.APIResource{{
+			Name:       "clusterpolicyparams",
+			Namespaced: false,
+			Kind:       "ClusterPolicyParam",
+		}},
+	}}
+	s, g, now := newTestSweeperAndGuard(t, cs)
+	s.tripWindow = time.Minute
+	s.minMissingCycles = 1
+
+	var getNamespace string
+	var getCalls int
+	g.Dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("get", "clusterpolicyparams", func(a ktesting.Action) (bool, runtime.Object, error) {
+		getCalls++
+		getNamespace = a.GetNamespace()
+		return false, nil, nil
+	})
+
+	if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+		t.Fatalf("Sweep 1: %v", err)
+	}
+	*now = now.Add(2 * time.Minute)
+	if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+		t.Fatalf("Sweep 2: %v", err)
+	}
+	if getCalls == 0 || getNamespace != "" {
+		t.Fatalf("expected cluster-scoped Get (calls=%d ns=%q)", getCalls, getNamespace)
+	}
+	got, _ := cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-cluster-param", metav1.GetOptions{})
+	if *got.Spec.FailurePolicy != admissionv1.Ignore {
+		t.Fatalf("expected Ignore for missing cluster-scoped ParamKind, got %v", *got.Spec.FailurePolicy)
+	}
+
+	// Create cluster-scoped param object -> 2 clean cycles restore to Fail.
+	paramObj := &unstructured.Unstructured{}
+	paramObj.SetGroupVersionKind(paramGVK)
+	paramObj.SetName("missing-global")
+	if _, err := g.Dyn.Resource(paramGVR).Create(ctx, paramObj, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(2 * time.Minute)
+	if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+		t.Fatalf("Sweep 3 (clean 1): %v", err)
+	}
+	*now = now.Add(2 * time.Minute)
+	if err := s.Sweep(ctx, makeSnap(ctx, g)); err != nil {
+		t.Fatalf("Sweep 4 (clean 2): %v", err)
+	}
+	got, _ = cs.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-cluster-param", metav1.GetOptions{})
+	if *got.Spec.FailurePolicy != admissionv1.Fail {
+		t.Fatalf("expected Fail after cluster-scoped param created, got %v", *got.Spec.FailurePolicy)
+	}
 }

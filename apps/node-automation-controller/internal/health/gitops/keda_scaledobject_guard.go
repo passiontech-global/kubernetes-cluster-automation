@@ -285,16 +285,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	if kube.IsIntentionallyDownscaled(annotations, replicas) {
 		return // downscaler-managed zero — the workload is asleep on purpose
 	}
-	// spec.replicas is Git-owned on Flux-managed targets — gate the
-	// write so a Git-vs-heal ping-pong cannot storm the apiserver.
-	if targetObj != nil && !heal.FluxPatchGate(strings.ToLower(kind),
-		targetObj, ns+"/"+target, now) {
-		log.Info("SKIP: keda zero-rescue blocked by flux conflict gate",
-			"target", kind+" "+ns+"/"+target)
-		return
-	}
-
-	ck := probefw.SelfHealKey(CheckNameKedaScaledObjectGuard, ns+"/"+target)
+	ck := probefw.SelfHealKey(CheckNameKedaScaledObjectGuard, ns+"/"+kind+"/"+target)
 	proceed, unverifiable := p.HealAllowed(ctx, log,
 		&p.Heals, ck, kedaRescueCooldown, now)
 	if unverifiable {
@@ -302,6 +293,15 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		return
 	}
 	if !proceed {
+		return
+	}
+	// spec.replicas is Git-owned on Flux-managed targets — gate the
+	// write so a Git-vs-heal ping-pong cannot storm the apiserver.
+	if targetObj != nil && !heal.FluxPatchGate(strings.ToLower(kind),
+		targetObj, CheckNameKedaScaledObjectGuard+":"+ns+"/"+kind+"/"+target, now) {
+		heal.RefundGrant(now) // Flux gate denied — no patch attempted
+		log.Info("SKIP: keda zero-rescue blocked by flux conflict gate",
+			"target", kind+" "+ns+"/"+target)
 		return
 	}
 	// metadata.resourceVersion pins the write — a legitimate

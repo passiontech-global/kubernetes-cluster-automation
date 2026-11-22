@@ -7,6 +7,7 @@ package linkerd
 import (
 	"errors"
 	"maps"
+	"reflect"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
@@ -413,4 +415,162 @@ func TestPatchTemplatePortsMergesExistingCoverage(t *testing.T) {
 				got.Spec.Template.Annotations["config.linkerd.io/opaque-ports"], want)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// mergeTemplateAnnos — all 6 workload shapes, edge cases & map non-mutation
+// ---------------------------------------------------------------------------
+
+func TestMergeTemplateAnnos(t *testing.T) {
+	readTemplateAnnos := func(obj metav1.Object) map[string]string {
+		switch w := obj.(type) {
+		case *appsv1.Deployment:
+			return w.Spec.Template.Annotations
+		case *appsv1.StatefulSet:
+			return w.Spec.Template.Annotations
+		case *appsv1.DaemonSet:
+			return w.Spec.Template.Annotations
+		case *batchv1.Job:
+			return w.Spec.Template.Annotations
+		case *batchv1.CronJob:
+			return w.Spec.JobTemplate.Spec.Template.Annotations
+		case *unstructured.Unstructured:
+			m, _ := kube.NestedStringMap(w.Object, "spec", "template", "metadata", "annotations")
+			return m
+		default:
+			return nil
+		}
+	}
+
+	makeWorkload := func(kind string, initial map[string]string) (metav1.Object, map[string]string) {
+		var orig map[string]string
+		if initial != nil {
+			orig = maps.Clone(initial)
+		}
+		switch kind {
+		case "Deployment":
+			d := emptyDeployment("apps", "web", nil, nil)
+			d.Spec.Template.Annotations = initial
+			return d, orig
+		case "StatefulSet":
+			s := emptyStatefulSet("apps", "db")
+			s.Spec.Template.Annotations = initial
+			return s, orig
+		case "DaemonSet":
+			ds := emptyDaemonSet("apps", "agent")
+			ds.Spec.Template.Annotations = initial
+			return ds, orig
+		case "Job":
+			j := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "etl"},
+				Spec: batchv1.JobSpec{
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Annotations: initial},
+					},
+				},
+			}
+			return j, orig
+		case "CronJob":
+			cj := &batchv1.CronJob{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "nightly"},
+				Spec: batchv1.CronJobSpec{
+					JobTemplate: batchv1.JobTemplateSpec{
+						Spec: batchv1.JobSpec{
+							Template: corev1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{Annotations: initial},
+							},
+						},
+					},
+				},
+			}
+			return cj, orig
+		case "Unstructured":
+			u := &unstructured.Unstructured{
+				Object: map[string]any{
+					"apiVersion": "argoproj.io/v1alpha1",
+					"kind":       "Rollout",
+					"metadata":   map[string]any{"namespace": "apps", "name": "api"},
+					"spec":       map[string]any{"template": map[string]any{"metadata": map[string]any{}}},
+				},
+			}
+			if initial != nil {
+				_ = unstructured.SetNestedStringMap(u.Object, initial, "spec", "template", "metadata", "annotations")
+			}
+			return u, orig
+		case "Pod":
+			return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "bare", Annotations: initial}}, orig
+		default:
+			t.Fatalf("unknown kind %q", kind)
+			return nil, nil
+		}
+	}
+
+	kinds := []string{"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Unstructured"}
+	for _, kind := range kinds {
+		t.Run(kind+"/nil_template_map", func(t *testing.T) {
+			obj, _ := makeWorkload(kind, nil)
+			anno := map[string]string{linkerdOpaquePortsAnno: "5432"}
+			mergeTemplateAnnos(obj, anno)
+			anno["mutated-after"] = "bad"
+			got := readTemplateAnnos(obj)
+			want := map[string]string{linkerdOpaquePortsAnno: "5432"}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s nil map merge = %v, want %v", kind, got, want)
+			}
+		})
+
+		t.Run(kind+"/preserve_overwrite_empty_value_and_non_mutation", func(t *testing.T) {
+			origRef := map[string]string{
+				"keep":                 "1",
+				linkerdOpaquePortsAnno: "6379",
+			}
+			origSnapshot := maps.Clone(origRef)
+			obj, _ := makeWorkload(kind, origRef)
+			anno := map[string]string{
+				linkerdOpaquePortsAnno: "5432,6379",
+				"empty-val":            "",
+			}
+			mergeTemplateAnnos(obj, anno)
+			// Mutate input anno after call; obj and origRef must be unaffected.
+			anno[linkerdOpaquePortsAnno] = "9999"
+			anno["after-call"] = "leak"
+
+			if !reflect.DeepEqual(origRef, origSnapshot) {
+				t.Fatalf("%s mutated original template map: got %v, want %v", kind, origRef, origSnapshot)
+			}
+			got := readTemplateAnnos(obj)
+			want := map[string]string{
+				"keep":                 "1",
+				linkerdOpaquePortsAnno: "5432,6379",
+				"empty-val":            "",
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s merge = %v, want %v", kind, got, want)
+			}
+		})
+
+		t.Run(kind+"/empty_and_nil_anno", func(t *testing.T) {
+			obj1, want1 := makeWorkload(kind, map[string]string{"keep": "1"})
+			mergeTemplateAnnos(obj1, nil)
+			if got := readTemplateAnnos(obj1); !reflect.DeepEqual(got, want1) {
+				t.Fatalf("%s nil anno = %v, want %v", kind, got, want1)
+			}
+
+			obj2, want2 := makeWorkload(kind, map[string]string{"keep": "1"})
+			mergeTemplateAnnos(obj2, map[string]string{})
+			if got := readTemplateAnnos(obj2); !reflect.DeepEqual(got, want2) {
+				t.Fatalf("%s empty anno = %v, want %v", kind, got, want2)
+			}
+		})
+	}
+
+	t.Run("unsupported_pod_and_nil_obj_noop", func(t *testing.T) {
+		podObj, want := makeWorkload("Pod", map[string]string{"keep": "1"})
+		mergeTemplateAnnos(podObj, map[string]string{linkerdOpaquePortsAnno: "5432"})
+		if !reflect.DeepEqual(podObj.(*corev1.Pod).Annotations, want) {
+			t.Fatalf("unsupported *corev1.Pod mutated: %v", podObj.(*corev1.Pod).Annotations)
+		}
+		// Must not panic on nil metav1.Object.
+		mergeTemplateAnnos(nil, map[string]string{linkerdOpaquePortsAnno: "5432"})
+	})
 }

@@ -4,20 +4,33 @@
 package gateway
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // ---------------------------------------------------------------------------
@@ -589,5 +602,863 @@ func TestGatewayRouteCarryRouteSignature(t *testing.T) {
 	p.carryRouteSignature("HTTPRoute", "apps", "r2", "accepted_false", live, zeroNow)
 	if len(live) != 2 || len(zeroNow) != 1 {
 		t.Fatalf("non-zero carry should not copy zeroLast: live=%v zeroNow=%v", live, zeroNow)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R6-K4: GatewayClass, Gateway, TLSRoute, 403/404 skip & controller bounce
+// ---------------------------------------------------------------------------
+
+func gatewayClassFixture(name, controllerName string, conds ...map[string]any) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "gateway.networking.k8s.io/v1",
+		"kind":       "GatewayClass",
+		"metadata":   map[string]any{"name": name},
+		"spec":       map[string]any{"controllerName": controllerName},
+	}}
+	if len(conds) > 0 {
+		anyConds := make([]any, 0, len(conds))
+		for _, c := range conds {
+			anyConds = append(anyConds, c)
+		}
+		_ = unstructured.SetNestedSlice(u.Object, anyConds, "status", "conditions")
+	}
+	return u
+}
+
+func gatewayFixture(ns, name, className string, created time.Time, conds ...map[string]any) *unstructured.Unstructured {
+	metaMap := map[string]any{"namespace": ns, "name": name}
+	if !created.IsZero() {
+		metaMap["creationTimestamp"] = created.UTC().Format(time.RFC3339)
+	}
+	obj := map[string]any{
+		"apiVersion": "gateway.networking.k8s.io/v1",
+		"kind":       "Gateway",
+		"metadata":   metaMap,
+	}
+	if className != "" {
+		obj["spec"] = map[string]any{"gatewayClassName": className}
+	}
+	if len(conds) > 0 {
+		anyConds := make([]any, 0, len(conds))
+		for _, c := range conds {
+			anyConds = append(anyConds, c)
+		}
+		obj["status"] = map[string]any{"conditions": anyConds}
+	}
+	return &unstructured.Unstructured{Object: obj}
+}
+
+func gwCondAt(condType, status, reason string, ltt time.Time) map[string]any {
+	m := map[string]any{"type": condType, "status": status}
+	if reason != "" {
+		m["reason"] = reason
+	}
+	if !ltt.IsZero() {
+		m["lastTransitionTime"] = ltt.UTC().Format(time.RFC3339)
+	}
+	return m
+}
+
+// gwOpDyn seeds non-Gateway objects through probetest.OpDyn and adds
+// Gateway objects under kube.GVRGateway ("gateways") explicitly —
+// client-go's NewSimpleDynamicClientWithCustomListKinds otherwise
+// seeds Gateway via UnsafeGuessKindToResource ("gatewaies").
+func gwOpDyn(t *testing.T, objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
+	t.Helper()
+	var nonGW []runtime.Object
+	var gws []*unstructured.Unstructured
+	for _, o := range objs {
+		if u, ok := o.(*unstructured.Unstructured); ok && u.GetKind() == "Gateway" {
+			gws = append(gws, u)
+			continue
+		}
+		nonGW = append(nonGW, o)
+	}
+	dyn := probetest.OpDyn(nonGW...)
+	for _, gw := range gws {
+		if err := dyn.Tracker().Create(kube.GVRGateway, gw, gw.GetNamespace()); err != nil {
+			t.Fatalf("seed gateway %s/%s: %v", gw.GetNamespace(), gw.GetName(), err)
+		}
+	}
+	return dyn
+}
+
+func TestGatewayAuditMissingClassAndConditions(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name           string
+		objs           []runtime.Object
+		driveThreeStep bool
+		wantPass       bool
+		wantKind       string
+		wantNS         string
+		wantObjName    string
+		wantReason     string
+	}{
+		{
+			name: "missing_class_old_creation_fails_first_sweep",
+			objs: []runtime.Object{
+				gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute))),
+				gatewayFixture("apps", "gw-noclass", "", now.Add(-20*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-20*time.Minute)),
+					gwCondAt("Programmed", "True", "", now.Add(-20*time.Minute))),
+			},
+			wantPass:    false,
+			wantKind:    "Gateway",
+			wantNS:      "apps",
+			wantObjName: "gw-noclass",
+			wantReason:  gwReasonClassMissing,
+		},
+		{
+			name: "nonexistent_class_fresh_creation_needs_10m_window",
+			objs: []runtime.Object{
+				gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute))),
+				gatewayFixture("apps", "gw-badclass", "does-not-exist", now.Add(-1*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-1*time.Minute)),
+					gwCondAt("Programmed", "True", "", now.Add(-1*time.Minute))),
+			},
+			driveThreeStep: true,
+			wantPass:       false,
+			wantKind:       "Gateway",
+			wantNS:         "apps",
+			wantObjName:    "gw-badclass",
+			wantReason:     gwReasonClassMissing,
+		},
+		{
+			name: "gateway_accepted_false_old_ltt_first_sweep",
+			objs: []runtime.Object{
+				gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute))),
+				gatewayFixture("apps", "gw-acc-false", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "False", "Invalid", now.Add(-15*time.Minute)),
+					gwCondAt("Programmed", "True", "", now.Add(-15*time.Minute))),
+			},
+			wantPass:    false,
+			wantKind:    "Gateway",
+			wantNS:      "apps",
+			wantObjName: "gw-acc-false",
+			wantReason:  routeReasonAcceptedFalse,
+		},
+		{
+			name: "gateway_programmed_false_old_ltt_first_sweep",
+			objs: []runtime.Object{
+				gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute))),
+				gatewayFixture("apps", "gw-prog-false", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-15*time.Minute))),
+			},
+			wantPass:    false,
+			wantKind:    "Gateway",
+			wantNS:      "apps",
+			wantObjName: "gw-prog-false",
+			wantReason:  gwReasonProgrammedFalse,
+		},
+		{
+			name: "gateway_programmed_false_zero_ltt_persisted_10m",
+			objs: []runtime.Object{
+				gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute))),
+				gatewayFixture("apps", "gw-prog-zero", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", time.Time{})),
+			},
+			driveThreeStep: true,
+			wantPass:       false,
+			wantKind:       "Gateway",
+			wantNS:         "apps",
+			wantObjName:    "gw-prog-zero",
+			wantReason:     gwReasonProgrammedFalse,
+		},
+		{
+			name: "gatewayclass_accepted_false_old_ltt_first_sweep",
+			objs: []runtime.Object{
+				gatewayClassFixture("bad-gc", "io.cilium/gateway-controller", gwCondAt("Accepted", "False", "InvalidParams", now.Add(-20*time.Minute))),
+			},
+			wantPass:    false,
+			wantKind:    "GatewayClass",
+			wantNS:      "",
+			wantObjName: "bad-gc",
+			wantReason:  routeReasonAcceptedFalse,
+		},
+		{
+			name: "healthy_gateway_passes",
+			objs: []runtime.Object{
+				gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute))),
+				gatewayFixture("apps", "gw-ok", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "True", "", now.Add(-30*time.Minute))),
+			},
+			wantPass: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantKind != "" {
+				testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, tc.wantKind, tc.wantNS, tc.wantObjName, tc.wantReason)
+			}
+			p := testProberDyn(fake.NewSimpleClientset(), gwOpDyn(t, tc.objs...))
+			chk := probetest.MustCheck[*gatewayRouteHealthCheck](t, p)
+			var res probefw.Result
+			if tc.driveThreeStep {
+				res = driveRouteCheck(t, p, now)
+			} else {
+				probetest.FreezeNow(p.Deps, now)
+				res = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+			}
+			if res.Pass != tc.wantPass {
+				t.Fatalf("Pass = %v (Why=%q), want %v", res.Pass, res.Why, tc.wantPass)
+			}
+			if !tc.wantPass {
+				m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy", map[string]string{
+					"kind": tc.wantKind, "namespace": tc.wantNS, "name": tc.wantObjName, "reason": tc.wantReason,
+				})
+				if m == nil || m.GetGauge().GetValue() != 1 {
+					t.Fatalf("expected unhealthy metric %s/%s/%s/%s=1, got %v", tc.wantKind, tc.wantNS, tc.wantObjName, tc.wantReason, m)
+				}
+			}
+		})
+	}
+
+	t.Run("gateway_resolution_clears_gauge", func(t *testing.T) {
+		testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, "Gateway", "apps", "gw-heal", gwReasonProgrammedFalse)
+		gw := gatewayFixture("apps", "gw-heal", "cilium", now.Add(-30*time.Minute),
+			gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+			gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+		gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+		dyn := gwOpDyn(t, gc, gw)
+		p := testProberDyn(fake.NewSimpleClientset(), dyn)
+		chk := probetest.MustCheck[*gatewayRouteHealthCheck](t, p)
+		probetest.FreezeNow(p.Deps, now)
+
+		if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
+			t.Fatal("expected initial Programmed=False to fail")
+		}
+		_ = unstructured.SetNestedSlice(gw.Object, []any{
+			gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+			gwCondAt("Programmed", "True", "", now),
+		}, "status", "conditions")
+		if _, err := dyn.Resource(kube.GVRGateway).Namespace("apps").UpdateStatus(ctx, gw, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		probetest.FreezeNow(p.Deps, now.Add(time.Minute))
+		if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+			t.Fatalf("healed gateway must pass: %+v", res)
+		}
+		if m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy", map[string]string{
+			"kind": "Gateway", "namespace": "apps", "name": "gw-heal", "reason": gwReasonProgrammedFalse,
+		}); m != nil {
+			t.Fatalf("gauge not cleared after gateway healed: %v", m)
+		}
+	})
+}
+
+func TestGatewayCrossNamespaceCertRefGrant(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	makeGWWithCert := func(ns, name, secretNS, secretName string) *unstructured.Unstructured {
+		gw := gatewayFixture(ns, name, "cilium", now.Add(-30*time.Minute),
+			gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+			gwCondAt("Programmed", "True", "", now.Add(-30*time.Minute)))
+		_ = unstructured.SetNestedSlice(gw.Object, []any{map[string]any{
+			"name": "https",
+			"tls": map[string]any{
+				"certificateRefs": []any{map[string]any{
+					"kind": "Secret", "namespace": secretNS, "name": secretName,
+				}},
+			},
+		}}, "spec", "listeners")
+		return gw
+	}
+
+	cases := []struct {
+		name     string
+		gwName   string
+		grants   []runtime.Object
+		wantPass bool
+	}{
+		{
+			name:     "missing_reference_grant_flags_ref_not_permitted",
+			gwName:   "gw-no-grant",
+			grants:   nil,
+			wantPass: false,
+		},
+		{
+			name:   "wrong_from_kind_flags_ref_not_permitted",
+			gwName: "gw-wrong-from",
+			grants: []runtime.Object{
+				referenceGrantFixture("certs", "g1", "HTTPRoute", "edge", "Secret", "tls-cert"),
+			},
+			wantPass: false,
+		},
+		{
+			name:   "wrong_secret_name_flags_ref_not_permitted",
+			gwName: "gw-wrong-sec",
+			grants: []runtime.Object{
+				referenceGrantFixture("certs", "g1", "Gateway", "edge", "Secret", "other-cert"),
+			},
+			wantPass: false,
+		},
+		{
+			name:   "permitted_v1_grant_passes",
+			gwName: "gw-ok-v1",
+			grants: []runtime.Object{
+				referenceGrantFixture("certs", "g-v1", "Gateway", "edge", "Secret", "tls-cert"),
+			},
+			wantPass: true,
+		},
+		{
+			name:   "permitted_v1alpha2_grant_passes",
+			gwName: "gw-ok-v1alpha2",
+			grants: []runtime.Object{
+				func() *unstructured.Unstructured {
+					u := referenceGrantFixture("certs", "g-v1a2", "Gateway", "edge", "Secret", "tls-cert")
+					u.SetAPIVersion("gateway.networking.k8s.io/v1alpha2")
+					return u
+				}(),
+			},
+			wantPass: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, "Gateway", "edge", tc.gwName, routeReasonRefNotPermitted)
+			objs := []runtime.Object{
+				gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute))),
+				makeGWWithCert("edge", tc.gwName, "certs", "tls-cert"),
+			}
+			objs = append(objs, tc.grants...)
+			// Set permitted_v1_grant_passes to explicitly use v1 apiVersion.
+			if tc.name == "permitted_v1_grant_passes" {
+				objs[2].(*unstructured.Unstructured).SetAPIVersion("gateway.networking.k8s.io/v1")
+			}
+			p := testProberDyn(fake.NewSimpleClientset(), gwOpDyn(t, objs...))
+			res := driveRouteCheck(t, p, now)
+			if res.Pass != tc.wantPass {
+				t.Fatalf("Pass = %v (Why=%q), want %v", res.Pass, res.Why, tc.wantPass)
+			}
+			m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy", map[string]string{
+				"kind": "Gateway", "namespace": "edge", "name": tc.gwName, "reason": routeReasonRefNotPermitted,
+			})
+			if !tc.wantPass && (m == nil || m.GetGauge().GetValue() != 1) {
+				t.Fatalf("expected ref_not_permitted metric=1, got %v", m)
+			}
+			if tc.wantPass && m != nil {
+				t.Fatalf("unexpected ref_not_permitted metric: %v", m)
+			}
+		})
+	}
+}
+
+func TestTLSRouteAudit(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	tlsRoute := func(apiVersion, ns, name string) *unstructured.Unstructured {
+		u := routeFixture("TLSRoute", ns, name)
+		u.SetAPIVersion(apiVersion)
+		return u
+	}
+
+	cases := []struct {
+		name       string
+		routeName  string
+		build      func() (*unstructured.Unstructured, []runtime.Object, []runtime.Object)
+		wantPass   bool
+		wantReason string
+	}{
+		{
+			name:      "v1_accepted_false",
+			routeName: "tls-acc",
+			build: func() (*unstructured.Unstructured, []runtime.Object, []runtime.Object) {
+				r := tlsRoute("gateway.networking.k8s.io/v1", "apps", "tls-acc")
+				setRouteParents(r, routeCond("Accepted", "False"))
+				return r, nil, nil
+			},
+			wantPass:   false,
+			wantReason: routeReasonAcceptedFalse,
+		},
+		{
+			name:      "v1alpha2_resolved_refs_false",
+			routeName: "tls-res",
+			build: func() (*unstructured.Unstructured, []runtime.Object, []runtime.Object) {
+				r := tlsRoute("gateway.networking.k8s.io/v1alpha2", "apps", "tls-res")
+				setRouteParents(r, routeCond("Accepted", "True"), routeCond("ResolvedRefs", "False"))
+				return r, nil, nil
+			},
+			wantPass:   false,
+			wantReason: routeReasonResolvedRefsFalse,
+		},
+		{
+			name:      "v1alpha2_missing_reference_grant",
+			routeName: "tls-xns",
+			build: func() (*unstructured.Unstructured, []runtime.Object, []runtime.Object) {
+				r := tlsRoute("gateway.networking.k8s.io/v1alpha2", "apps", "tls-xns")
+				setRouteBackends(r, map[string]any{"name": "tcp-svc", "namespace": "backend", "port": int64(80)})
+				setRouteParents(r, routeCond("Accepted", "True"), routeCond("ResolvedRefs", "True"))
+				return r, []runtime.Object{clusterIPService("backend", "tcp-svc", map[string]string{"app": "tcp"})}, nil
+			},
+			wantPass:   false,
+			wantReason: routeReasonRefNotPermitted,
+		},
+		{
+			name:      "v1_backend_unresolved",
+			routeName: "tls-unres",
+			build: func() (*unstructured.Unstructured, []runtime.Object, []runtime.Object) {
+				r := tlsRoute("gateway.networking.k8s.io/v1", "apps", "tls-unres")
+				setRouteBackends(r, map[string]any{"name": "missing-svc", "port": int64(80)})
+				setRouteParents(r, routeCond("Accepted", "True"))
+				return r, nil, nil
+			},
+			wantPass:   false,
+			wantReason: routeReasonBackendUnresolved,
+		},
+		{
+			name:      "v1_backend_zero_endpoints",
+			routeName: "tls-zero",
+			build: func() (*unstructured.Unstructured, []runtime.Object, []runtime.Object) {
+				r := tlsRoute("gateway.networking.k8s.io/v1", "apps", "tls-zero")
+				setRouteBackends(r, map[string]any{"name": "tcp-svc", "port": int64(80)})
+				setRouteParents(r, routeCond("Accepted", "True"))
+				return r, []runtime.Object{clusterIPService("apps", "tcp-svc", map[string]string{"app": "tcp"})}, nil
+			},
+			wantPass:   false,
+			wantReason: routeReasonZeroEndpoints,
+		},
+		{
+			name:      "v1_healthy_tlsroute_passes",
+			routeName: "tls-ok",
+			build: func() (*unstructured.Unstructured, []runtime.Object, []runtime.Object) {
+				r := tlsRoute("gateway.networking.k8s.io/v1", "apps", "tls-ok")
+				setRouteBackends(r, map[string]any{"name": "tcp-svc", "port": int64(80)})
+				setRouteParents(r, routeCond("Accepted", "True"), routeCond("ResolvedRefs", "True"))
+				return r, []runtime.Object{
+					clusterIPService("apps", "tcp-svc", map[string]string{"app": "tcp"}),
+					probetest.EndpointSliceForService("apps", "tcp-svc", "10.244.0.10"),
+				}, nil
+			},
+			wantPass: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantReason != "" {
+				testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, "TLSRoute", "apps", tc.routeName, tc.wantReason)
+			}
+			r, csObjs, extraDyn := tc.build()
+			dynObjs := append([]runtime.Object{r}, extraDyn...)
+			dyn := probetest.OpDyn(dynObjs...)
+			// Simulate cluster serving v1alpha2 only when fixture uses v1alpha2.
+			if r.GetAPIVersion() == "gateway.networking.k8s.io/v1alpha2" {
+				dyn.PrependReactor("list", "tlsroutes", func(a ktesting.Action) (bool, runtime.Object, error) {
+					gvr := a.(ktesting.ListAction).GetResource()
+					if gvr.Version == "v1" || gvr.Version == "v1alpha3" {
+						return true, nil, apierrors.NewNotFound(gvr.GroupResource(), "")
+					}
+					return false, nil, nil
+				})
+			}
+			p := testProberDyn(fake.NewSimpleClientset(csObjs...), dyn)
+			res := driveRouteCheck(t, p, now)
+			if res.Pass != tc.wantPass {
+				t.Fatalf("Pass = %v (Why=%q), want %v", res.Pass, res.Why, tc.wantPass)
+			}
+			if !tc.wantPass {
+				m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy", map[string]string{
+					"kind": "TLSRoute", "namespace": "apps", "name": tc.routeName, "reason": tc.wantReason,
+				})
+				if m == nil || m.GetGauge().GetValue() != 1 {
+					t.Fatalf("expected TLSRoute unhealthy metric=1 for reason %q, got %v", tc.wantReason, m)
+				}
+			}
+		})
+	}
+}
+
+func TestGatewayCRDAbsentAnd403AutoSkip(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name  string
+		setup func() (*fake.Clientset, []runtime.Object)
+	}{
+		{
+			name: "all_crds_absent_404_and_nomatch",
+			setup: func() (*fake.Clientset, []runtime.Object) {
+				return fake.NewSimpleClientset(), nil
+			},
+		},
+		{
+			name: "tlsroute_404_while_httproute_present",
+			setup: func() (*fake.Clientset, []runtime.Object) {
+				r := routeFixture("HTTPRoute", "apps", "ok")
+				setRouteParents(r, routeCond("Accepted", "True"), routeCond("ResolvedRefs", "True"))
+				return fake.NewSimpleClientset(), []runtime.Object{r}
+			},
+		},
+		{
+			name: "forbidden_403_across_gateway_resources_and_referencegrants",
+			setup: func() (*fake.Clientset, []runtime.Object) {
+				r := routeFixture("HTTPRoute", "apps", "xns")
+				setRouteBackends(r, map[string]any{"name": "svc", "namespace": "other", "port": int64(80)})
+				return fake.NewSimpleClientset(), []runtime.Object{r}
+			},
+		},
+		{
+			name: "gatewayclass_404_does_not_false_flag_missing_class",
+			setup: func() (*fake.Clientset, []runtime.Object) {
+				gw := gatewayFixture("apps", "gw-with-class", "foo", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "True", "", now.Add(-30*time.Minute)))
+				return fake.NewSimpleClientset(), []runtime.Object{gw}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs, objs := tc.setup()
+			dyn := gwOpDyn(t, objs...)
+			switch tc.name {
+			case "all_crds_absent_404_and_nomatch":
+				for _, res := range []string{"gatewayclasses", "gateways", "httproutes", "grpcroutes"} {
+					r := res
+					dyn.PrependReactor("list", r, func(a ktesting.Action) (bool, runtime.Object, error) {
+						return true, nil, apierrors.NewNotFound(a.GetResource().GroupResource(), "")
+					})
+				}
+				dyn.PrependReactor("list", "tlsroutes", func(a ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "gateway.networking.k8s.io", Kind: "TLSRoute"}}
+				})
+			case "tlsroute_404_while_httproute_present":
+				dyn.PrependReactor("list", "tlsroutes", func(a ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewNotFound(a.GetResource().GroupResource(), "")
+				})
+			case "forbidden_403_across_gateway_resources_and_referencegrants":
+				for _, res := range []string{"gatewayclasses", "gateways", "tlsroutes", "referencegrants"} {
+					r := res
+					dyn.PrependReactor("list", r, func(a ktesting.Action) (bool, runtime.Object, error) {
+						return true, nil, apierrors.NewForbidden(a.GetResource().GroupResource(), "", errors.New("rbac"))
+					})
+				}
+			case "gatewayclass_404_does_not_false_flag_missing_class":
+				dyn.PrependReactor("list", "gatewayclasses", func(a ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewNotFound(a.GetResource().GroupResource(), "")
+				})
+			}
+
+			p := testProberDyn(cs, dyn)
+			chk := probetest.MustCheck[*gatewayRouteHealthCheck](t, p)
+			probetest.FreezeNow(p.Deps, now)
+			beforeErr := probetest.CounterSnapshot(t, p.Name)
+
+			res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+			if !res.Pass || res.Infra != nil {
+				t.Fatalf("expected clean auto-skip Pass=true Infra=nil, got %+v", res)
+			}
+			probetest.AssertCounterDelta(t, p.Name, beforeErr, 0)
+			if tc.name == "gatewayclass_404_does_not_false_flag_missing_class" {
+				if m := probetest.FindMetric(t, "node_automation_gateway_route_unhealthy", map[string]string{
+					"kind": "Gateway", "namespace": "apps", "name": "gw-with-class", "reason": gwReasonClassMissing,
+				}); m != nil {
+					t.Fatalf("unexpected gateway_class_missing metric when GatewayClass CRD absent: %v", m)
+				}
+			}
+		})
+	}
+}
+
+// TestGatewayControllerPodBounce verifies all safety guards and EvictPodV
+// behavior when a Gateway has Programmed=False >= 10m.
+// Non-parallel: mutates global heal.ConfigureBudget and shared counters.
+func TestGatewayControllerPodBounce(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	makeControllerPod := func(ns, name string, labels map[string]string, age time.Duration, nodeName string, owned bool) *corev1.Pod {
+		p := probetest.PodWithPhase(ns, name, corev1.PodRunning, true, age)
+		p.CreationTimestamp = metav1.NewTime(now.Add(-age))
+		p.Labels = labels
+		p.Spec.NodeName = nodeName
+		if owned {
+			p.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: name + "-rs",
+				UID: types.UID("uid-" + name + "-rs"), Controller: ptr.To(true),
+			}}
+		}
+		return p
+	}
+
+	healthyRouteAndBackend := func() ([]runtime.Object, []runtime.Object) {
+		r := routeFixture("HTTPRoute", "apps", "ok-route")
+		_ = unstructured.SetNestedSlice(r.Object, []any{map[string]any{"name": "gw-stuck"}}, "spec", "parentRefs")
+		setRouteBackends(r, map[string]any{"name": "web-svc", "port": int64(80)})
+		setRouteParents(r, routeCond("Accepted", "True"), routeCond("ResolvedRefs", "True"))
+		csObjs := []runtime.Object{
+			clusterIPService("apps", "web-svc", map[string]string{"app": "web"}),
+			probetest.EndpointSliceForService("apps", "web-svc", "10.244.0.12"),
+		}
+		return csObjs, []runtime.Object{r}
+	}
+
+	cases := []struct {
+		name              string
+		configureBudget   bool
+		setup             func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod)
+		wantEvicted       bool
+		wantHealDelta     float64
+		wantErrDelta      float64
+		wantCooldownStamp bool
+		wantGrantRefunded bool
+	}{
+		{
+			name: "bounces_cilium_operator_pod_on_programmed_false",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("kube-system", "cilium-operator-abc", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				cs := fake.NewSimpleClientset(append(csObjs, ctrlPod, node)...)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw)...)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+			wantEvicted:       true,
+			wantHealDelta:     1,
+			wantCooldownStamp: true,
+		},
+		{
+			name: "bounces_per_gateway_labeled_pod",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("envoy", "custom.example/gw", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "envoy", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("apps", "gw-stuck-envoy-0", map[string]string{"gateway.networking.k8s.io/gateway-name": "gw-stuck"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				cs := fake.NewSimpleClientset(append(csObjs, ctrlPod, node)...)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw)...)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+			wantEvicted:       true,
+			wantHealDelta:     1,
+			wantCooldownStamp: true,
+		},
+		{
+			name: "suppressed_when_accepted_false",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "False", "Invalid", now.Add(-20*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("kube-system", "cilium-operator-abc", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				cs := fake.NewSimpleClientset(append(csObjs, ctrlPod, node)...)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw)...)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+		},
+		{
+			name: "suppressed_when_gateway_class_missing",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "missing", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("kube-system", "cilium-operator-abc", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				cs := fake.NewSimpleClientset(append(csObjs, ctrlPod, node)...)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw)...)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+		},
+		{
+			name: "suppressed_when_attached_route_has_zero_endpoints",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				r := routeFixture("HTTPRoute", "apps", "bad-route")
+				_ = unstructured.SetNestedSlice(r.Object, []any{map[string]any{"name": "gw-stuck"}}, "spec", "parentRefs")
+				setRouteBackends(r, map[string]any{"name": "web-svc", "port": int64(80)})
+				setRouteParents(r, routeCond("Accepted", "True"), routeCond("ResolvedRefs", "True"))
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("kube-system", "cilium-operator-abc", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				cs := fake.NewSimpleClientset(clusterIPService("apps", "web-svc", map[string]string{"app": "web"}), ctrlPod, node)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, gc, gw, r)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+		},
+		{
+			name: "suppressed_when_pod_young_node_notready_or_unowned",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				youngPod := makeControllerPod("kube-system", "cilium-operator-young", map[string]string{"io.cilium/app": "operator"}, 2*time.Minute, "w1", true)
+				unownedPod := makeControllerPod("kube-system", "cilium-operator-static", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", false)
+				notReadyPod := makeControllerPod("kube-system", "cilium-operator-nr", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w2", true)
+				node1 := probetest.ReadyWorkerNode("w1", "", 0, false)
+				node2 := testutil.Node("w2", corev1.ConditionFalse, nil)
+				cs := fake.NewSimpleClientset(append(csObjs, youngPod, unownedPod, notReadyPod, node1, node2)...)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw)...)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, youngPod
+			},
+		},
+		{
+			name: "suppressed_on_cooldown_and_maintenance_hold",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("kube-system", "cilium-operator-abc", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				plan := &unstructured.Unstructured{Object: map[string]any{
+					"apiVersion": "autopilot.k0sproject.io/v1beta2",
+					"kind":       "Plan",
+					"metadata":   map[string]any{"name": "autopilot"},
+					"status":     map[string]any{"state": "Executing"},
+				}}
+				cs := fake.NewSimpleClientset(append(csObjs, ctrlPod, node)...)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw, plan)...)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+		},
+		{
+			name: "unverifiable_maintenance_incerrors_and_skips",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("kube-system", "cilium-operator-abc", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				cs := fake.NewSimpleClientset(append(csObjs, ctrlPod, node)...)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw)...)
+				dyn.PrependReactor("list", "plans", func(ktesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("autopilot api unavailable")
+				})
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+			wantErrDelta: 1,
+		},
+		{
+			name:            "pdb_429_refusal_refunds_budget_and_skips_cooldown",
+			configureBudget: true,
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "Pending", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("kube-system", "cilium-operator-abc", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				cs := fake.NewSimpleClientset(append(csObjs, ctrlPod, node)...)
+				cs.PrependReactor("create", "pods", func(a ktesting.Action) (bool, runtime.Object, error) {
+					if a.GetSubresource() == "eviction" {
+						return true, nil, apierrors.NewTooManyRequests("pdb busy", 1)
+					}
+					return false, nil, nil
+				})
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw)...)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+			wantGrantRefunded: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+			if tc.configureBudget {
+				heal.ConfigureBudget(1, time.Hour)
+			} else {
+				heal.ConfigureBudget(0, 0)
+			}
+			testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, "Gateway", "apps", "gw-stuck", gwReasonProgrammedFalse)
+			testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, "Gateway", "apps", "gw-stuck", routeReasonAcceptedFalse)
+			testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, "Gateway", "apps", "gw-stuck", gwReasonClassMissing)
+
+			p, chk, cs, targetPod := tc.setup(t)
+			errBefore := probetest.CounterSnapshot(t, p.Name)
+			healBefore := promtestutil.ToFloat64(metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameGatewayRouteHealth))
+
+			_ = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+
+			probetest.AssertCounterDelta(t, p.Name, errBefore, tc.wantErrDelta)
+			healDelta := promtestutil.ToFloat64(metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameGatewayRouteHealth)) - healBefore
+			if healDelta != tc.wantHealDelta {
+				t.Fatalf("ControlPlanePodHealsTotal delta = %v, want %v", healDelta, tc.wantHealDelta)
+			}
+			_, podErr := cs.CoreV1().Pods(targetPod.Namespace).Get(ctx, targetPod.Name, metav1.GetOptions{})
+			if tc.wantEvicted && !apierrors.IsNotFound(podErr) {
+				t.Fatalf("expected controller pod %s/%s to be evicted, got err=%v", targetPod.Namespace, targetPod.Name, podErr)
+			}
+			if !tc.wantEvicted && podErr != nil {
+				t.Fatalf("expected controller pod %s/%s to survive, got err=%v", targetPod.Namespace, targetPod.Name, podErr)
+			}
+			ck := probefw.SelfHealKey(CheckNameGatewayRouteHealth, "gw-controller/"+kube.PodControllerKey(targetPod))
+			_, stamped := chk.Heals.Last(ck)
+			if stamped != tc.wantCooldownStamp {
+				t.Fatalf("Heals.Last(%q) = %v, want %v", ck, stamped, tc.wantCooldownStamp)
+			}
+			if tc.wantCooldownStamp {
+				// Second sweep within 1h cooldown must not evict a recreated pod.
+				recreated := targetPod.DeepCopy()
+				recreated.Name = targetPod.Name + "-new"
+				recreated.UID = "uid-recreated"
+				if _, err := cs.CoreV1().Pods(recreated.Namespace).Create(ctx, recreated, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				probetest.FreezeNow(p.Deps, now.Add(10*time.Minute))
+				_ = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+				if _, err := cs.CoreV1().Pods(recreated.Namespace).Get(ctx, recreated.Name, metav1.GetOptions{}); err != nil {
+					t.Fatalf("cooldown failed to suppress second eviction: %v", err)
+				}
+			}
+			if tc.wantGrantRefunded {
+				proceed, unverifiable := heal.Gate(ctx, logr.Discard(), p.Maintenance, p.CS, p.Dyn, "after-pdb-429", now.Add(time.Second))
+				if !proceed || unverifiable {
+					t.Fatalf("Gate after PDB 429 = (%v,%v), want (true,false) — grant not refunded", proceed, unverifiable)
+				}
+			}
+		})
 	}
 }

@@ -164,6 +164,11 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: watchdogs.CheckNameWorkloadAdmissionBlockGuard, New: watchdogs.NewWorkloadAdmissionBlockGuardCheck},
 		{Name: gitops.CheckNameGitOpsMassPruneGuard, New: gitops.NewGitOpsMassPruneGuardCheck},
 		{Name: nodehealth.CheckNameImageResilienceAuditor, New: nodehealth.NewImageResilienceAuditorCheck},
+		// Wave 5 checks — appended at end of healthRows.
+		{Name: pvc.CheckNameVolumeSnapshotLifecycleGuard, New: pvc.NewVolumeSnapshotLifecycleGuardCheck},
+		{Name: nodehealth.CheckNameDRAClaimWedgeGuard, New: nodehealth.NewDRAClaimWedgeGuardCheck},
+		{Name: watchdogs.CheckNamePodResizeWedgeGuard, New: watchdogs.NewPodResizeWedgeGuardCheck},
+		{Name: watchdogs.CheckNameIngressNginxRetirementGuard, New: watchdogs.NewIngressNginxRetirementGuardCheck},
 	}
 }
 
@@ -305,8 +310,19 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// Bringing fleetCheckRegs to full 68-check parity adds the 8 newly
 	// registered checks that census pods or query Prometheus -> thirty-eight total.
 	// Wave 4C image-resilience-auditor reads AllPods -> thirty-nine total.
-	if got := errCount() - before; got != 39 {
-		t.Fatalf("run errors delta = %v, want 39", got)
+	// M4.3 switched deployment-rollout-wedge from eager AllPods in Run()
+	// to lazy per-namespace PodsIn(ctx, ns) inside unwedgeDeployment(),
+	// so an empty cluster with 0 wedged Deployments no longer lists pods
+	// (PodsIn infra-error propagation is covered by
+	// TestRolloutWedgeAllTypedReplicaSetsAndLazyPodsIn in
+	// Internal/health/watchdogs/deployment_rollout_wedge_test.go) ->
+	// thirty-eight total.
+	// Wave 5 checks added to fleetCheckRegs(): pod-resize-wedge-guard and
+	// ingress-nginx-retirement-guard unconditionally call AllPods (+1 each),
+	// while volumesnapshot-lifecycle-guard and dra-claim-wedge-guard return
+	// early on empty OpDyn() (+0) -> forty total.
+	if got := errCount() - before; got != 40 {
+		t.Fatalf("run errors delta = %v, want 40", got)
 	}
 }
 
@@ -655,24 +671,31 @@ func TestRunDeadlineExceededIncErrorVsCanceled(t *testing.T) {
 	}
 
 	// Verify Periodic.RunTimeout hits DeadlineExceeded and increments
-	// run_errors exactly once (no double-counting).
+	// run_errors exactly once (no double-counting). Guarantee stop()
+	// runs after the first invocation even if RunTimeout expires before
+	// runCheckIsolated enters check.Run under heavy -race load.
 	beforePeriodic := runErrs()
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
 	per := &shared.Periodic{
 		Name:       p.Name,
-		Interval:   time.Hour,
-		RunTimeout: 15 * time.Millisecond,
-		Fn:         p.run,
+		Interval:   time.Second,
+		RunTimeout: 50 * time.Millisecond,
+		Fn: func(c context.Context) error {
+			defer stop()
+			return p.run(c)
+		},
 	}
-	ctx, stop := context.WithCancel(t.Context())
 	p.checks = []checkEntry{{
 		name: "slow-periodic-deadline",
 		check: funcCheck{fn: func(c context.Context) probefw.Result {
 			<-c.Done()
-			stop()
 			return probefw.Result{Pass: true}
 		}},
 	}}
-	_ = per.Start(ctx)
+	if err := per.Start(ctx); err != nil {
+		t.Fatalf("Periodic.Start: %v", err)
+	}
 	if delta := runErrs() - beforePeriodic; delta != 1 {
 		t.Fatalf("Periodic RunTimeout run_errors delta = %v, want 1 (no double-count)", delta)
 	}

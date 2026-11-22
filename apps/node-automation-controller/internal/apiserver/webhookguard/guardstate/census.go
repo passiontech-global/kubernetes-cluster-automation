@@ -58,7 +58,8 @@ const (
 	// probeWorkers bounds the brownout probe's concurrency — at most
 	// four TCP+TLS handshakes in flight per sweep, no matter how many
 	// webhook backends the cluster carries.
-	probeWorkers = 4
+	probeWorkers    = 4
+	tlsProbeTimeout = 2 * time.Second
 )
 
 // EndpointCensus is the endpoint-census dual ready-endpoint count: raw counts
@@ -125,14 +126,21 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	// flap) yields an empty probeSet — the census still counts, the
 	// breaker just sees no probe data (unresponsive stays false).
 	probeSet := webhookBackendServices(snap)
+	if len(probeSet) == 0 {
+		// No webhook backends: the census has no consumed keys —
+		// skip the list entirely rather than walk every slice for
+		// data nobody reads.
+		return ready, nil
+	}
 	// The EndpointSlice a webhook backend fronts can carry several
 	// ports (HTTPS webhook + HTTP metrics), so Ports[0] is not a
 	// safe probe target — resolve each probe service's preferred
-	// port set ONCE (one Service Get per backend, before the paged
+	// port set ONCE (via an O(S) Service index, before the paged
 	// slice walk) for collectProbeCandidates to pick against.
+	svcIndex := indexServices(snap.Services)
 	probePrefs := make(map[string]slicePortPref, len(probeSet))
 	for key, svcPorts := range probeSet {
-		probePrefs[key] = resolveSlicePortPref(snap, key, svcPorts)
+		probePrefs[key] = resolveSlicePortPref(svcIndex, key, svcPorts)
 	}
 	// Targeted census: every consumer looks up ns/name keys that
 	// only webhook-backend Services can produce, so the slice walk
@@ -142,12 +150,6 @@ func (g *Guard) readyEndpointCounts(ctx context.Context, snap *Snapshot) (Endpoi
 	// name-only selector — harmless: their rows land under their
 	// own ns/name keys no consumer reads.
 	sel, filtered := backendSliceSelector(probeSet)
-	if len(probeSet) == 0 {
-		// No webhook backends: the census has no consumed keys —
-		// skip the list entirely rather than walk every slice for
-		// data nobody reads.
-		return ready, nil
-	}
 	// filtered==false with a NON-empty probeSet means the selector
 	// could not express the backend set (>64 distinct service
 	// names, or unparseable keys) — fall back to the unfiltered
@@ -341,6 +343,17 @@ type slicePortPref struct {
 // too, and probing THAT reads a hung webhook as healthy.
 var webhookPortNames = map[string]bool{"https": true, "webhook": true, "tls": true}
 
+// indexServices builds a once-per-census lookup table of "namespace/name" -> *Service
+// so resolveSlicePortPref runs in O(1) per webhook backend instead of O(N*M).
+func indexServices(services []corev1.Service) map[string]*corev1.Service {
+	idx := make(map[string]*corev1.Service, len(services))
+	for i := range services {
+		s := &services[i]
+		idx[s.Namespace+"/"+s.Name] = s
+	}
+	return idx
+}
+
 // resolveSlicePortPref builds the acceptable-port set for one probe
 // service: the conventional webhook port names, plus — resolved
 // through the Service's spec.ports — the port name and targetPort
@@ -348,27 +361,19 @@ var webhookPortNames = map[string]bool{"https": true, "webhook": true, "tls": tr
 // port is the SERVICE port; the slice carries TARGET ports, so the
 // Service object is the only honest translation). An unresolvable
 // Service degrades to name matching alone.
-func resolveSlicePortPref(snap *Snapshot,
+func resolveSlicePortPref(svcIndex map[string]*corev1.Service,
 	key string, svcPorts []int32) slicePortPref {
 	pref := slicePortPref{names: map[string]bool{}, numbers: map[int32]bool{}}
 	for n := range webhookPortNames {
 		pref.names[n] = true
 	}
-	ns, name, ok := strings.Cut(key, "/")
-	if !ok {
+	if _, _, ok := strings.Cut(key, "/"); !ok {
 		return pref
 	}
-	// The snapshot's paged Services census replaces the per-backend
+	// The snapshot's indexed Services census replaces the per-backend
 	// Get — a missing service or a failed census degrades to name
 	// matching alone, same as the old Get-error path.
-	var svc *corev1.Service
-	for i := range snap.Services {
-		if snap.Services[i].Namespace == ns &&
-			snap.Services[i].Name == name {
-			svc = &snap.Services[i]
-			break
-		}
-	}
+	svc := svcIndex[key]
 	if svc == nil {
 		return pref // cannot resolve — the named-port preference still applies
 	}
@@ -496,11 +501,13 @@ func tcpTLSEndpointProber(ctx context.Context, ip string, port int32) bool {
 	if err := ctx.Err(); err != nil {
 		return false
 	}
+	probeCtx, cancel := context.WithTimeout(ctx, tlsProbeTimeout)
+	defer cancel()
 	d := &tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: 2 * time.Second},
+		NetDialer: &net.Dialer{Timeout: tlsProbeTimeout},
 		Config:    &tls.Config{InsecureSkipVerify: true}, // liveness probe only
 	}
-	conn, err := d.DialContext(ctx, "tcp",
+	conn, err := d.DialContext(probeCtx, "tcp",
 		net.JoinHostPort(ip, strconv.Itoa(int(port))))
 	if err != nil {
 		return false

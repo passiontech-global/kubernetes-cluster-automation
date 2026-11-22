@@ -222,7 +222,6 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 		return rep.Result(&p.emitted, subPathConfigDriftGauge.DeleteLabelValues,
 			"subpath config drift: ", ", ")
 	}
-	p.lastScan = now
 
 	// Phase 1 — workload census: the typed lists carry the pod
 	// template the signature is computed from.
@@ -327,8 +326,7 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 
 	seenKeys := map[string]bool{}
 	reloads := 0
-	var pods []corev1.Pod
-	podsLoaded := false
+	podsByNS := map[string][]*corev1.Pod{}
 	for _, w := range active {
 		key := w.kind + "/" + w.ns + "/" + w.name
 		sig := p.subPathContentHash(w.podSpec, w.ns, cmData, secretData)
@@ -362,14 +360,15 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 		// resolutions ahead of them. Past the cap the drift stays
 		// armed (driftSince untouched) for the next scan.
 		mayPatch := reloads < subPathMaxReloadsPerScan
-		if !podsLoaded {
-			// Pod census loads lazily — only a confirmed drift
-			// pays for it, and only once per scan.
-			pods, err = p.AllPods(ctx)
+		pods, ok := podsByNS[w.ns]
+		if !ok {
+			// Pod census loads lazily per namespace — only a confirmed
+			// drift pays for it, and only once per namespace per scan.
+			pods, err = p.PodsIn(ctx, w.ns)
 			if err != nil {
 				return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 			}
-			podsLoaded = true
+			podsByNS[w.ns] = pods
 		}
 		resolved, spent := p.reloadWorkload(ctx, log, w, pods,
 			p.driftSince[key], now, mayPatch)
@@ -394,6 +393,7 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 			delete(p.driftSince, k)
 		}
 	}
+	p.lastScan = now
 	p.emitDriftEvent(ctx, log, rep.Findings(), now)
 	return rep.Result(&p.emitted, subPathConfigDriftGauge.DeleteLabelValues,
 		"subpath config drift: ", ", ")
@@ -504,13 +504,12 @@ func subPathReferencedObjects(podSpec *corev1.PodSpec) (cms, secs []string) {
 // at container start, so a pod born post-drift already carries the
 // new keys and the restart nudge would be a no-op roll. Returns
 // (fresh, total): fresh only counts when total > 0.
-func subPathFreshPods(w subPathWorkload, pods []corev1.Pod,
+func subPathFreshPods(w subPathWorkload, pods []*corev1.Pod,
 	driftStart time.Time) (bool, int) {
 
 	sel := labels.SelectorFromSet(w.template)
 	total, fresh := 0, 0
-	for i := range pods {
-		p := &pods[i]
+	for _, p := range pods {
 		if p.Namespace != w.ns || p.DeletionTimestamp != nil ||
 			p.Status.Phase == corev1.PodSucceeded ||
 			p.Status.Phase == corev1.PodFailed {
@@ -553,7 +552,7 @@ func subPathGateKind(kind string) string {
 // mayPatch=false (cap reached) still allows the free fresh-pod
 // resolution but skips every gate and the patch itself.
 func (p *subpathConfigDriftCheck) reloadWorkload(ctx context.Context,
-	log logr.Logger, w subPathWorkload, pods []corev1.Pod,
+	log logr.Logger, w subPathWorkload, pods []*corev1.Pod,
 	driftStart, now time.Time, mayPatch bool) (bool, bool) {
 
 	key := w.kind + "/" + w.ns + "/" + w.name
@@ -565,13 +564,6 @@ func (p *subpathConfigDriftCheck) reloadWorkload(ctx context.Context,
 	if !mayPatch {
 		return false, false // cap reached — drift stays armed
 	}
-	// Git-owned objects ping-pong a template nudge every reconcile
-	// — the drift belongs in Git, not in a patch.
-	if !heal.FluxPatchGate(subPathGateKind(w.kind), w.obj, key, now) {
-		log.Info("SKIP: subpath drift nudge — Flux Heal-Revert Loop",
-			"workload", key)
-		return false, false
-	}
 	ck := probefw.SelfHealKey(CheckNameSubPathConfigDrift, key)
 	proceed, unverifiable := p.HealAllowedPersisted(ctx, log,
 		&p.reloadHeals, w.obj, kube.AnnoLastSubPathReload, ck,
@@ -581,6 +573,22 @@ func (p *subpathConfigDriftCheck) reloadWorkload(ctx context.Context,
 		return false, false
 	}
 	if !proceed {
+		return false, false
+	}
+	wKey := w.ns + "/" + w.kind + "/" + w.name
+	if !kube.TryReserveWorkloadKey(ctx, wKey) {
+		heal.RefundGrant(now)
+		log.Info("SKIP: subpath drift nudge — workload already disrupted this sweep",
+			"workload", key)
+		return false, false
+	}
+	// Git-owned objects ping-pong a template nudge every reconcile
+	// — the drift belongs in Git, not in a patch.
+	if !heal.FluxPatchGate(subPathGateKind(w.kind), w.obj, CheckNameSubPathConfigDrift+":"+key, now) {
+		kube.ReleaseWorkloadKey(ctx, wKey)
+		heal.RefundGrant(now)
+		log.Info("SKIP: subpath drift nudge — Flux Heal-Revert Loop",
+			"workload", key)
 		return false, false
 	}
 	patch := kube.RestartTemplatePatch(now)
@@ -606,6 +614,7 @@ func (p *subpathConfigDriftCheck) reloadWorkload(ctx context.Context,
 		}
 	}
 	if err != nil {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		metrics.IncError(p.Name)
 		log.Error(err, "subpath drift restart-template patch failed",
 			"workload", key)

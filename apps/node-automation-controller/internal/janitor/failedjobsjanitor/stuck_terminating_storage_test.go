@@ -2,6 +2,8 @@ package failedjobsjanitor
 
 import (
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -438,4 +440,332 @@ func hookRunErrorCount(t *testing.T, queue string) float64 {
 		}
 	}
 	return 0
+}
+
+// VolumeAttachments (full typed list) and Nodes are cached once per
+// sweep across multiple stuck Terminating PVCs and PVs, while a fresh
+// sweep observes updated cluster state.
+func TestAuditStuckTerminatingCachesVolumeAttachmentsAndNodesPerSweep(t *testing.T) {
+	metrics.StuckTerminatingResources.Reset()
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	oldDel := metav1.NewTime(now.Add(-3 * time.Hour))
+
+	objs := []runtime.Object{
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "ready-node"},
+			Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+		},
+	}
+	for i := range 3 {
+		pvcName := fmt.Sprintf("stuck-pvc-%d", i)
+		pvName := fmt.Sprintf("bound-pv-%d", i)
+		objs = append(objs, &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         "apps",
+				Name:              pvcName,
+				ResourceVersion:   fmt.Sprintf("%d", 10+i),
+				DeletionTimestamp: &oldDel,
+				Finalizers:        []string{pvcProtectionFinalizer},
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+		})
+	}
+	for i := range 2 {
+		objs = append(objs, &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              fmt.Sprintf("stuck-pv-%d", i),
+				ResourceVersion:   fmt.Sprintf("%d", 20+i),
+				DeletionTimestamp: &oldDel,
+				Finalizers:        []string{pvProtectionFinalizer},
+			},
+			Spec: corev1.PersistentVolumeSpec{
+				ClaimRef: &corev1.ObjectReference{
+					Namespace: "apps",
+					Name:      fmt.Sprintf("gone-pvc-%d", i),
+				},
+			},
+		})
+	}
+
+	cs := fake.NewSimpleClientset(objs...)
+	var vaLists, nodeLists atomic.Int32
+	cs.PrependReactor("list", "volumeattachments", func(k8stesting.Action) (bool, runtime.Object, error) {
+		vaLists.Add(1)
+		return false, nil, nil
+	})
+	cs.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		nodeLists.Add(1)
+		return false, nil, nil
+	})
+
+	j := &failedJobsJanitor{
+		cs:    cs,
+		dyn:   testutil.NewDynamicClient(),
+		now:   func() time.Time { return now },
+		queue: "stuck-cache-sweep-test",
+	}
+	if err := j.auditStuckTerminating(ctx, nil); err != nil {
+		t.Fatalf("sweep 1: %v", err)
+	}
+	// 1 metadata-only audit VA list (fallback on cs because meta==nil)
+	// + at most 1 full VA list in census.listVolumeAttachments across 3 PVCs + 2 PVs = 2 total.
+	if got := vaLists.Load(); got != 2 {
+		t.Fatalf("volumeattachments list count = %d, want 2 (1 audit + 1 cached across 5 candidates)", got)
+	}
+	if got := nodeLists.Load(); got != 1 {
+		t.Fatalf("nodes list count = %d, want 1 (cached across 5 candidates)", got)
+	}
+	for i := range 3 {
+		pvc, err := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, fmt.Sprintf("stuck-pvc-%d", i), metav1.GetOptions{})
+		if err != nil || len(pvc.Finalizers) != 0 {
+			t.Fatalf("stuck-pvc-%d finalizers = %v (err=%v), want stripped", i, pvc.Finalizers, err)
+		}
+	}
+	for i := range 2 {
+		pv, err := cs.CoreV1().PersistentVolumes().Get(ctx, fmt.Sprintf("stuck-pv-%d", i), metav1.GetOptions{})
+		if err != nil || len(pv.Finalizers) != 0 {
+			t.Fatalf("stuck-pv-%d finalizers = %v (err=%v), want stripped", i, pv.Finalizers, err)
+		}
+	}
+
+	// Second sweep: add a new stuck PVC whose PV now has an attached VA
+	// and a new stuck PV whose ClaimRef is held by a Failed pod on a newly
+	// added dead node — proves per-sweep lifetime (fresh state observed).
+	attachedPV := "fresh-pv-attached"
+	freshPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "apps",
+			Name:              "fresh-stuck-pvc",
+			ResourceVersion:   "30",
+			DeletionTimestamp: &oldDel,
+			Finalizers:        []string{pvcProtectionFinalizer},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: attachedPV},
+	}
+	freshVA := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "fresh-va"},
+		Spec:       storagev1.VolumeAttachmentSpec{Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &attachedPV}},
+		Status:     storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	freshPV := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "fresh-stuck-pv",
+			ResourceVersion:   "31",
+			DeletionTimestamp: &oldDel,
+			Finalizers:        []string{pvProtectionFinalizer},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{Namespace: "apps", Name: "dead-pod-pvc"},
+		},
+	}
+	deadNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "new-dead-node"},
+		Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}},
+	}
+	deadPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "dead-pod"},
+		Spec: corev1.PodSpec{
+			NodeName: "new-dead-node",
+			Volumes: []corev1.Volume{{
+				Name:         "v",
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "dead-pod-pvc"}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+	for _, obj := range []runtime.Object{freshPVC, freshVA, freshPV, deadNode, deadPod} {
+		if err := cs.Tracker().Add(obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := j.auditStuckTerminating(ctx, nil); err != nil {
+		t.Fatalf("sweep 2: %v", err)
+	}
+	if got := vaLists.Load(); got != 4 {
+		t.Fatalf("volumeattachments list count after 2 sweeps = %d, want 4", got)
+	}
+	if got := nodeLists.Load(); got != 2 {
+		t.Fatalf("nodes list count after 2 sweeps = %d, want 2", got)
+	}
+	gotFreshPVC, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "fresh-stuck-pvc", metav1.GetOptions{})
+	if len(gotFreshPVC.Finalizers) != 1 {
+		t.Fatalf("fresh-stuck-pvc must keep finalizer due to new VA, got %v", gotFreshPVC.Finalizers)
+	}
+	gotFreshPV, _ := cs.CoreV1().PersistentVolumes().Get(ctx, "fresh-stuck-pv", metav1.GetOptions{})
+	if len(gotFreshPV.Finalizers) != 1 {
+		t.Fatalf("fresh-stuck-pv must keep finalizer due to new dead-node pod, got %v", gotFreshPV.Finalizers)
+	}
+}
+
+// When the cached VolumeAttachment or Node list fails, every stuck PVC
+// and PV fails closed (retains its protection finalizer) while
+// metrics.IncError increments exactly once per broken list.
+func TestAuditStuckTerminatingCachedVAAndNodeListErrorsFailClosedOnce(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	oldDel := metav1.NewTime(now.Add(-3 * time.Hour))
+
+	makeObjs := func() []runtime.Object {
+		var objs []runtime.Object
+		for i := range 2 {
+			objs = append(objs, &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:         "apps",
+					Name:              fmt.Sprintf("err-pvc-%d", i),
+					ResourceVersion:   fmt.Sprintf("%d", 10+i),
+					DeletionTimestamp: &oldDel,
+					Finalizers:        []string{pvcProtectionFinalizer},
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{VolumeName: fmt.Sprintf("bound-pv-%d", i)},
+			})
+			objs = append(objs, &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              fmt.Sprintf("err-pv-%d", i),
+					ResourceVersion:   fmt.Sprintf("%d", 20+i),
+					DeletionTimestamp: &oldDel,
+					Finalizers:        []string{pvProtectionFinalizer},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					ClaimRef: &corev1.ObjectReference{
+						Namespace: "apps",
+						Name:      fmt.Sprintf("gone-pvc-%d", i),
+					},
+				},
+			})
+		}
+		return objs
+	}
+
+	t.Run("VolumeAttachments list error fails closed and IncErrors once", func(t *testing.T) {
+		metrics.StuckTerminatingResources.Reset()
+		cs := fake.NewSimpleClientset(makeObjs()...)
+		var vaCalls atomic.Int32
+		cs.PrependReactor("list", "volumeattachments", func(k8stesting.Action) (bool, runtime.Object, error) {
+			// 1st call is auditStuckTerminating's metadata list; 2nd is census.listVolumeAttachments.
+			if vaCalls.Add(1) >= 2 {
+				return true, nil, errors.New("va list failed")
+			}
+			return false, nil, nil
+		})
+		const queue = "stuck-va-err-once-test"
+		before := hookRunErrorCount(t, queue)
+		j := &failedJobsJanitor{
+			cs:    cs,
+			dyn:   testutil.NewDynamicClient(),
+			now:   func() time.Time { return now },
+			queue: queue,
+		}
+		if err := j.auditStuckTerminating(ctx, nil); err != nil {
+			t.Fatalf("auditStuckTerminating: %v", err)
+		}
+		if got := vaCalls.Load(); got != 2 {
+			t.Fatalf("vaCalls = %d, want 2 (1 audit + 1 cached census list)", got)
+		}
+		if after := hookRunErrorCount(t, queue); after-before != 1 {
+			t.Fatalf("IncError delta = %v, want 1 across 4 candidates", after-before)
+		}
+		for i := range 2 {
+			pvc, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, fmt.Sprintf("err-pvc-%d", i), metav1.GetOptions{})
+			if len(pvc.Finalizers) != 1 {
+				t.Fatalf("err-pvc-%d lost finalizer on VA error: %v", i, pvc.Finalizers)
+			}
+			pv, _ := cs.CoreV1().PersistentVolumes().Get(ctx, fmt.Sprintf("err-pv-%d", i), metav1.GetOptions{})
+			if len(pv.Finalizers) != 1 {
+				t.Fatalf("err-pv-%d lost finalizer on VA error: %v", i, pv.Finalizers)
+			}
+		}
+	})
+
+	t.Run("Nodes list error fails closed and IncErrors once", func(t *testing.T) {
+		metrics.StuckTerminatingResources.Reset()
+		cs := fake.NewSimpleClientset(makeObjs()...)
+		var nodeCalls atomic.Int32
+		cs.PrependReactor("list", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+			nodeCalls.Add(1)
+			return true, nil, errors.New("nodes list failed")
+		})
+		const queue = "stuck-nodes-err-once-test"
+		before := hookRunErrorCount(t, queue)
+		j := &failedJobsJanitor{
+			cs:    cs,
+			dyn:   testutil.NewDynamicClient(),
+			now:   func() time.Time { return now },
+			queue: queue,
+		}
+		if err := j.auditStuckTerminating(ctx, nil); err != nil {
+			t.Fatalf("auditStuckTerminating: %v", err)
+		}
+		if got := nodeCalls.Load(); got != 1 {
+			t.Fatalf("nodeCalls = %d, want 1", got)
+		}
+		if after := hookRunErrorCount(t, queue); after-before != 1 {
+			t.Fatalf("IncError delta = %v, want 1 across 4 candidates", after-before)
+		}
+		for i := range 2 {
+			pvc, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, fmt.Sprintf("err-pvc-%d", i), metav1.GetOptions{})
+			if len(pvc.Finalizers) != 1 {
+				t.Fatalf("err-pvc-%d lost finalizer on Nodes error: %v", i, pvc.Finalizers)
+			}
+			pv, _ := cs.CoreV1().PersistentVolumes().Get(ctx, fmt.Sprintf("err-pv-%d", i), metav1.GetOptions{})
+			if len(pv.Finalizers) != 1 {
+				t.Fatalf("err-pv-%d lost finalizer on Nodes error: %v", i, pv.Finalizers)
+			}
+		}
+	})
+}
+
+// Direct single-call (nil-census) wrappers work standalone as documented
+// for direct unit testing of pvcMountThreatenable, failedPodOnDeadNode,
+// unstickPVProtection, and clusterPodUsesClaimRef.
+func TestStuckTerminatingSingleCallWrappers(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	oldDel := metav1.NewTime(now.Add(-3 * time.Hour))
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "apps", Name: "claim-1", ResourceVersion: "1",
+			DeletionTimestamp: &oldDel, Finalizers: []string{pvcProtectionFinalizer},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "pv-1"},
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pv-1", ResourceVersion: "2",
+			DeletionTimestamp: &oldDel, Finalizers: []string{pvProtectionFinalizer},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			ClaimRef: &corev1.ObjectReference{Namespace: "apps", Name: "gone-claim"},
+		},
+	}
+	deadNode := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "dead-n"},
+		Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}},
+	}
+	deadPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "dead-p"},
+		Spec: corev1.PodSpec{
+			NodeName: "dead-n",
+			Volumes: []corev1.Volume{{
+				Name:         "v",
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "claim-1"}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+
+	cs := fake.NewSimpleClientset(pvc, pv, deadNode, deadPod)
+	j := &failedJobsJanitor{cs: cs, now: func() time.Time { return now }, queue: "stuck-wrappers-test"}
+
+	if got, err := j.failedPodOnDeadNode(ctx, "apps", "claim-1"); err != nil || got != "dead-p" {
+		t.Fatalf("failedPodOnDeadNode = (%q, %v), want (dead-p, nil)", got, err)
+	}
+	if !j.pvcMountThreatenable(ctx, unstickPVCMeta(pvc)) {
+		t.Fatal("pvcMountThreatenable expected true when failed pod sits on dead node")
+	}
+	if inUse, err := j.clusterPodUsesClaimRef(ctx, &corev1.ObjectReference{Namespace: "apps", Name: "claim-1"}); err != nil || !inUse {
+		t.Fatalf("clusterPodUsesClaimRef = (%v, %v), want (true, nil)", inUse, err)
+	}
+	if !j.unstickPVProtection(ctx, pv) {
+		t.Fatal("unstickPVProtection expected true for orphan pv-1")
+	}
 }

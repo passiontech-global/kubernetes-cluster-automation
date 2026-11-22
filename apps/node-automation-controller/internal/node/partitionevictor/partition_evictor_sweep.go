@@ -424,22 +424,20 @@ func (s *partitionSweep) evictPods(ctx context.Context) {
 			// kill the replacement. NotFound is already the goal
 			// state (another actor finished the eviction first) —
 			// tolerated, no error accounting.
-			delivered, refused, err := heal.EvictPod(ctx, s.e.cs, nil, name, p, s.now)
+			delivered, refused, notFound, err := heal.EvictPodNotFound(ctx, s.e.cs, nil, name, p, s.now)
 			switch {
+			case notFound:
+				// Already gone (404 between list and evict) — goal state
+				// reached; quiet continue without PDB-refusal log,
+				// IncError, or burning the per-sweep cap.
+				continue
 			case refused:
-				// HTTP 429 — a PDB with disruptionsAllowed==0 refused
-				// the eviction. A deferral, never an error: no
-				// IncError, and the attempt must NOT consume the cap
-				// — it made no progress, and spending the cap on
-				// refusals would starve the real victims queued
-				// behind them. The next sweep retries once
-				// disruptions free up.
+				// HTTP 429 (PDB), 409 (UID precondition conflict), L1 hold,
+				// or sweep quorum deferral: no mutation, no IncError, no
+				// cap spend. The next sweep retries once disruptions/holds
+				// free up.
 				s.log.Info("DEFER: PDB refused eviction — pod stays until disruptions free up",
 					"pod", p.Namespace+"/"+p.Name, "node", name)
-				continue
-			case apierrors.IsNotFound(err) || apierrors.IsConflict(err):
-				// Already gone or UID precondition fired (replaced) — no
-				// mutation by us, and don't burn the per-sweep cap.
 				continue
 			case err != nil:
 				errN++

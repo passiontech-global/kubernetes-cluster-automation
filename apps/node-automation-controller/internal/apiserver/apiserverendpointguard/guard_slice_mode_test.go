@@ -121,12 +121,37 @@ func TestEndpointGuardSliceModeReaddsRecovered(t *testing.T) {
 		"10.0.0.2": apiHealthyProbe(1000),
 	}
 	g := newEndpointGuard(cs, dyn, probes)
-	for range endpointGuardRecoverCyc {
-		if err := g.run(ctx); err != nil {
-			t.Fatal(err)
-		}
+
+	// Cycle 1: okStreak = 1 (< 2) -> re-listed quarantined 10.0.0.1 is pulled
+	// back out of the slice while the quarantine annotation holds.
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
 	}
 	eps := getKubeSlice(t, cs)
+	if sliceAddrSet(eps)["10.0.0.1"] {
+		t.Fatalf("re-listed quarantined backend left in slice before recovery: %v", sliceAddrSet(eps))
+	}
+	if eps.Annotations[endpointGuardAnno] != "10.0.0.1" {
+		t.Fatalf("annotation dropped early: %q", eps.Annotations[endpointGuardAnno])
+	}
+
+	// Simulate the apiserver endpoint reconciler re-listing 10.0.0.1
+	// before Cycle 2 reaches endpointGuardRecoverCyc (2).
+	eps = eps.DeepCopy()
+	ready := true
+	eps.Endpoints = append(eps.Endpoints, discoveryv1.Endpoint{
+		Addresses:  []string{"10.0.0.1"},
+		Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+	})
+	if _, err := cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+		Update(ctx, eps, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	eps = getKubeSlice(t, cs)
 	if !sliceAddrSet(eps)["10.0.0.1"] {
 		t.Fatalf("recovered backend not re-added to slice: %v", sliceAddrSet(eps))
 	}

@@ -90,6 +90,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
@@ -185,8 +186,12 @@ type apiServerEndpointGuard struct {
 	// into building duplicate http.Transport TLS pools (and trip the
 	// race detector on the g.rt/g.client reads).
 	clientMu sync.Mutex
-	backends map[string]*backendProbeState
-	log      logr.Logger
+	// inClusterConfigFn builds the in-cluster *rest.Config used by
+	// transport() — nil in production calls rest.InClusterConfig; tests
+	// inject a config carrying a test CA and bearer token.
+	inClusterConfigFn func() (*rest.Config, error)
+	backends          map[string]*backendProbeState
+	log               logr.Logger
 	// interval/quarantineInterval are the test seam for Start's
 	// adaptive cadence — <=0 (production, unset) resolves to the
 	// endpointGuardInterval/endpointGuardQuarantineInterval consts;

@@ -4,8 +4,11 @@
 package sprawl
 
 import (
+	"errors"
 	"fmt"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +25,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
@@ -610,5 +614,88 @@ func TestSprawlGCKineCRDSizeFromInformerTable(t *testing.T) {
 	}
 	if v != float64(tableSize) {
 		t.Fatalf("gauge = %v, want the table-recorded %d — a live measure served the census", v, tableSize)
+	}
+}
+
+func TestSprawlGCPodOwnerLookupViaPodIndex(t *testing.T) {
+	livePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "live-pod", UID: "pod-uid-live"},
+	}
+	ownerLive := &metav1.OwnerReference{Kind: "Pod", Name: "live-pod", UID: "pod-uid-live", Controller: ptr.To(true)}
+	ownerUIDMismatch := &metav1.OwnerReference{Kind: "Pod", Name: "live-pod", UID: "pod-uid-old", Controller: ptr.To(true)}
+	ownerMissing := &metav1.OwnerReference{Kind: "Pod", Name: "gone-pod", UID: "pod-uid-gone", Controller: ptr.To(true)}
+
+	repLive := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport", "apps", "vr-pod-live", 3*time.Hour, ownerLive)
+	repMismatch := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport", "apps", "vr-pod-mismatch", 3*time.Hour, ownerUIDMismatch)
+	repMissing := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport", "apps", "vr-pod-missing", 3*time.Hour, ownerMissing)
+
+	cs := fake.NewSimpleClientset(livePod)
+	var podLists int
+	cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		podLists++
+		return false, nil, nil
+	})
+	p := testProberDyn(cs, sprawlDyn(repLive, repMismatch, repMissing))
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatalf("expected failing verdict for orphaned Pod reports: %+v", res)
+	}
+	if podLists != 1 {
+		t.Fatalf("pods list count = %d, want 1 via sweep snapshot p.Pod", podLists)
+	}
+	if _, err := p.Dyn.Resource(kube.GVRVulnerabilityReport).Namespace("apps").Get(ctx, "vr-pod-live", metav1.GetOptions{}); err != nil {
+		t.Fatalf("live-pod report must survive: %v", err)
+	}
+	for _, gone := range []string{"vr-pod-mismatch", "vr-pod-missing"} {
+		if _, err := p.Dyn.Resource(kube.GVRVulnerabilityReport).Namespace("apps").Get(ctx, gone, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("orphaned report %s should be deleted, err=%v", gone, err)
+		}
+	}
+
+	// Pod census error fails closed (owner presumed alive).
+	csErr := fake.NewSimpleClientset()
+	csErr.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("pods list failed")
+	})
+	repErr := sprawlReport(kube.GVRVulnerabilityReport, "VulnerabilityReport", "apps", "vr-pod-err", 3*time.Hour, ownerMissing)
+	pErr := testProberDyn(csErr, sprawlDyn(repErr))
+	chkErr := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, pErr)
+	if chkErr.reportOwnerGone(probetest.SweepCtx(ctx, pErr.Deps), repErr) {
+		t.Fatal("reportOwnerGone must fail closed on p.Pod error")
+	}
+}
+
+func TestSprawlGCReportAndCICensusUseRV0(t *testing.T) {
+	gotRVs := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		rv := r.URL.Query().Get("resourceVersion")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/vulnerabilityreports"):
+			gotRVs["vulnerabilityreports"] = rv
+			_, _ = w.Write([]byte(`{"apiVersion":"aquasecurity.github.io/v1alpha1","kind":"VulnerabilityReportList","items":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/pipelineruns"):
+			gotRVs["pipelineruns"] = rv
+			_, _ = w.Write([]byte(`{"apiVersion":"tekton.dev/v1","kind":"PipelineRunList","items":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	dyn, err := dynamic.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := testProberDyn(fake.NewSimpleClientset(), dyn)
+	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if !res.Pass || res.Infra != nil {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	for _, resName := range []string{"vulnerabilityreports", "pipelineruns"} {
+		if got := gotRVs[resName]; got != "0" {
+			t.Fatalf("%s resourceVersion = %q, want \"0\"", resName, got)
+		}
 	}
 }

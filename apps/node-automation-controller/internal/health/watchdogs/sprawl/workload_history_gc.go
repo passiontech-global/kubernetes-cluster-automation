@@ -67,6 +67,11 @@ func init() {
 	)
 }
 
+type historyCarry struct {
+	kind  string
+	count int
+}
+
 type historyGCTarget struct {
 	kind      string
 	ns        string
@@ -103,17 +108,28 @@ func (p *apiObjectSprawlReportGCCheck) gcWorkloadHistorySprawl(
 	now time.Time,
 	objects, historyRep *probefw.SweepReport,
 ) error {
-	rsTargets, err := p.collectZeroReplicaSetTargets(ctx, log, now, historyRep)
+	carry403 := map[string]bool{}
+
+	rsTargets, rsForbidden, err := p.collectZeroReplicaSetTargets(ctx, log, now, historyRep)
 	if err != nil {
 		return err
 	}
-	crTargets, err := p.collectOrphanControllerRevisions(ctx, log, now, historyRep)
+	if rsForbidden {
+		carry403[sprawlKindReplicaSetZero] = true
+	}
+	crTargets, crForbidden, err := p.collectOrphanControllerRevisions(ctx, log, now, historyRep)
 	if err != nil {
 		return err
 	}
-	saTargets, err := p.collectOrphanSATokenSecrets(ctx, log, now, historyRep)
+	if crForbidden {
+		carry403[sprawlKindControllerRevOrphan] = true
+	}
+	saTargets, saForbidden, err := p.collectOrphanSATokenSecrets(ctx, log, now, historyRep)
 	if err != nil {
 		return err
+	}
+	if saForbidden {
+		carry403[sprawlKindSATokenOrphan] = true
 	}
 
 	kindBatches := []struct {
@@ -136,67 +152,88 @@ func (p *apiObjectSprawlReportGCCheck) gcWorkloadHistorySprawl(
 		allTargets = append(allTargets, b.targets...)
 	}
 
-	if !p.historyGCEnabled || len(allTargets) == 0 {
-		return nil
+	deletedByKind := map[string]int{}
+	if p.historyGCEnabled && len(allTargets) > 0 {
+		_, _, capped := reap.Sweep(ctx, log, allTargets, reap.Options[historyGCTarget]{
+			Cap: sprawlMaxHistoryDeletes,
+			Less: func(a, b historyGCTarget) bool {
+				if !a.createdAt.Equal(b.createdAt) {
+					return a.createdAt.Before(b.createdAt)
+				}
+				if c := strings.Compare(a.kind, b.kind); c != 0 {
+					return c < 0
+				}
+				if c := strings.Compare(a.ns, b.ns); c != 0 {
+					return c < 0
+				}
+				if c := strings.Compare(a.name, b.name); c != 0 {
+					return c < 0
+				}
+				return a.uid < b.uid
+			},
+			LogTarget: func(log logr.Logger, t historyGCTarget) {
+				log.Info("DELETE: extended sprawl GC",
+					"kind", t.kind, "object", t.ns+"/"+t.name, "uid", t.uid)
+			},
+			Delete: func(ctx context.Context, t historyGCTarget) error {
+				opts := kube.UIDDeleteOptions(t.uid, "")
+				var derr error
+				switch t.kind {
+				case sprawlKindReplicaSetZero:
+					derr = p.CS.AppsV1().ReplicaSets(t.ns).Delete(ctx, t.name, opts)
+				case sprawlKindControllerRevOrphan:
+					derr = p.CS.AppsV1().ControllerRevisions(t.ns).Delete(ctx, t.name, opts)
+				case sprawlKindSATokenOrphan:
+					derr = p.CS.CoreV1().Secrets(t.ns).Delete(ctx, t.name, opts)
+				default:
+					return fmt.Errorf("unknown sprawl history target kind %q", t.kind)
+				}
+				if derr == nil {
+					deletedByKind[t.kind]++
+					sprawlHistoryDeletedTotal.WithLabelValues(t.kind).Inc()
+				}
+				return derr
+			},
+			OnError: func(log logr.Logger, t historyGCTarget, err error) {
+				switch {
+				case apierrors.IsNotFound(err):
+					deletedByKind[t.kind]++
+					log.Info("SKIP: "+t.kind+" already gone", "object", t.ns+"/"+t.name)
+				case apierrors.IsConflict(err):
+					log.Info("SKIP: "+t.kind+" recreated since list — UID precondition fired", "object", t.ns+"/"+t.name)
+				case apierrors.IsForbidden(err):
+					log.Info("WARN: "+t.kind+" delete forbidden (RBAC pending)", "object", t.ns+"/"+t.name)
+				default:
+					metrics.IncError(p.Name)
+					log.Error(err, t.kind+" delete failed", "object", t.ns+"/"+t.name)
+				}
+			},
+		})
+		if capped {
+			log.Info("extended sprawl GC hit per-sweep delete cap",
+				"cap", sprawlMaxHistoryDeletes, "candidates", len(allTargets))
+		}
+		if deletedByKind[sprawlKindReplicaSetZero] > 0 {
+			p.InvalidateReplicaSets(ctx)
+		}
 	}
 
-	_, _, capped := reap.Sweep(ctx, log, allTargets, reap.Options[historyGCTarget]{
-		Cap: sprawlMaxHistoryDeletes,
-		Less: func(a, b historyGCTarget) bool {
-			if !a.createdAt.Equal(b.createdAt) {
-				return a.createdAt.Before(b.createdAt)
-			}
-			if c := strings.Compare(a.kind, b.kind); c != 0 {
-				return c < 0
-			}
-			if c := strings.Compare(a.ns, b.ns); c != 0 {
-				return c < 0
-			}
-			if c := strings.Compare(a.name, b.name); c != 0 {
-				return c < 0
-			}
-			return a.uid < b.uid
-		},
-		LogTarget: func(log logr.Logger, t historyGCTarget) {
-			log.Info("DELETE: extended sprawl GC",
-				"kind", t.kind, "object", t.ns+"/"+t.name, "uid", t.uid)
-		},
-		Delete: func(ctx context.Context, t historyGCTarget) error {
-			opts := kube.UIDDeleteOptions(t.uid, "")
-			var derr error
-			switch t.kind {
-			case sprawlKindReplicaSetZero:
-				derr = p.CS.AppsV1().ReplicaSets(t.ns).Delete(ctx, t.name, opts)
-			case sprawlKindControllerRevOrphan:
-				derr = p.CS.AppsV1().ControllerRevisions(t.ns).Delete(ctx, t.name, opts)
-			case sprawlKindSATokenOrphan:
-				derr = p.CS.CoreV1().Secrets(t.ns).Delete(ctx, t.name, opts)
-			default:
-				return fmt.Errorf("unknown sprawl history target kind %q", t.kind)
-			}
-			if derr == nil {
-				sprawlHistoryDeletedTotal.WithLabelValues(t.kind).Inc()
-			}
-			return derr
-		},
-		OnError: func(log logr.Logger, t historyGCTarget, err error) {
-			switch {
-			case apierrors.IsNotFound(err):
-				log.Info("SKIP: "+t.kind+" already gone", "object", t.ns+"/"+t.name)
-			case apierrors.IsConflict(err):
-				log.Info("SKIP: "+t.kind+" recreated since list — UID precondition fired", "object", t.ns+"/"+t.name)
-			case apierrors.IsForbidden(err):
-				log.Info("WARN: "+t.kind+" delete forbidden (RBAC pending)", "object", t.ns+"/"+t.name)
-			default:
-				metrics.IncError(p.Name)
-				log.Error(err, t.kind+" delete failed", "object", t.ns+"/"+t.name)
-			}
-		},
-	})
-	if capped {
-		log.Info("extended sprawl GC hit per-sweep delete cap",
-			"cap", sprawlMaxHistoryDeletes, "candidates", len(allTargets))
+	var lastCarry []historyCarry
+	var lastFindings []string
+	for _, b := range kindBatches {
+		rem := len(b.targets) - deletedByKind[b.kind]
+		if rem > 0 {
+			lastCarry = append(lastCarry, historyCarry{
+				kind:  b.kind,
+				count: rem,
+			})
+			lastFindings = append(lastFindings,
+				fmt.Sprintf("%d %s sprawl", rem, b.kind))
+		}
 	}
+	p.historyLastCarry = lastCarry
+	p.historyLastFindings = lastFindings
+	p.historyCarry403 = carry403
 	return nil
 }
 
@@ -205,17 +242,15 @@ func (p *apiObjectSprawlReportGCCheck) collectZeroReplicaSetTargets(
 	log logr.Logger,
 	now time.Time,
 	historyRep *probefw.SweepReport,
-) ([]historyGCTarget, error) {
-	rss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
-		kube.ReplicaSets(p.CS, metav1.NamespaceAll))
+) ([]historyGCTarget, bool, error) {
+	rss, err := p.AllTypedReplicaSets(ctx)
 	switch {
 	case apierrors.IsForbidden(err):
 		log.V(1).Info("WARN: replicaset sprawl list skipped (403)", "error", err)
 		p.carryHistoryKind(historyRep, sprawlKindReplicaSetZero)
-		return nil, nil
+		return nil, true, nil
 	case err != nil:
-		return nil, fmt.Errorf("list replicasets: %w", err)
+		return nil, false, fmt.Errorf("list replicasets: %w", err)
 	}
 
 	type depGroup struct {
@@ -243,18 +278,22 @@ func (p *apiObjectSprawlReportGCCheck) collectZeroReplicaSetTargets(
 		depKey := rs.Namespace + "/" + ref.Name
 		dl, cached := depCache[depKey]
 		if !cached {
-			dep, gerr := p.CS.AppsV1().Deployments(rs.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
-			switch {
-			case apierrors.IsNotFound(gerr):
-				dl = depLookup{}
-			case apierrors.IsForbidden(gerr):
-				log.V(1).Info("WARN: deployment get skipped (403)", "deployment", depKey, "error", gerr)
-				dl = depLookup{forbidden: true}
-			case gerr != nil:
-				log.V(1).Info("WARN: deployment get failed — fail closed", "deployment", depKey, "error", gerr)
-				dl = depLookup{err: gerr}
-			default:
+			if dep, serr := p.Deployment(ctx, rs.Namespace, ref.Name); serr == nil && dep != nil {
 				dl = depLookup{found: true, dep: dep}
+			} else {
+				dep, gerr := p.CS.AppsV1().Deployments(rs.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+				switch {
+				case apierrors.IsNotFound(gerr):
+					dl = depLookup{}
+				case apierrors.IsForbidden(gerr):
+					log.V(1).Info("WARN: deployment get skipped (403)", "deployment", depKey, "error", gerr)
+					dl = depLookup{forbidden: true}
+				case gerr != nil:
+					log.V(1).Info("WARN: deployment get failed — fail closed", "deployment", depKey, "error", gerr)
+					dl = depLookup{err: gerr}
+				default:
+					dl = depLookup{found: true, dep: dep}
+				}
 			}
 			depCache[depKey] = dl
 		}
@@ -319,7 +358,7 @@ func (p *apiObjectSprawlReportGCCheck) collectZeroReplicaSetTargets(
 		}
 	}
 
-	return targets, nil
+	return targets, false, nil
 }
 
 func (p *apiObjectSprawlReportGCCheck) collectOrphanControllerRevisions(
@@ -327,20 +366,23 @@ func (p *apiObjectSprawlReportGCCheck) collectOrphanControllerRevisions(
 	log logr.Logger,
 	now time.Time,
 	historyRep *probefw.SweepReport,
-) ([]historyGCTarget, error) {
+) ([]historyGCTarget, bool, error) {
 	crs, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		metav1.ListOptions{
+			Limit:           probefw.HealthListPageSize,
+			ResourceVersion: "0",
+		},
 		kube.ControllerRevisions(p.CS, metav1.NamespaceAll))
 	switch {
 	case apierrors.IsForbidden(err):
 		log.V(1).Info("WARN: controllerrevision sprawl list skipped (403)", "error", err)
 		p.carryHistoryKind(historyRep, sprawlKindControllerRevOrphan)
-		return nil, nil
+		return nil, true, nil
 	case apierrors.IsNotFound(err):
 		log.V(1).Info("WARN: controllerrevision endpoint not found (404)", "error", err)
-		return nil, nil
+		return nil, false, nil
 	case err != nil:
-		return nil, fmt.Errorf("list controllerrevisions: %w", err)
+		return nil, false, fmt.Errorf("list controllerrevisions: %w", err)
 	}
 
 	ownerCache := map[string]ownerUIDLookup{}
@@ -363,32 +405,47 @@ func (p *apiObjectSprawlReportGCCheck) collectOrphanControllerRevisions(
 		ol, cached := ownerCache[cacheKey]
 		if !cached {
 			var ownerUID types.UID
-			var gerr error
+			var snapFound bool
 			switch ref.Kind {
 			case "StatefulSet":
-				sts, err := p.CS.AppsV1().StatefulSets(cr.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
-				if err == nil {
-					ownerUID = sts.UID
+				if sts, serr := p.StatefulSet(ctx, cr.Namespace, ref.Name); serr == nil && sts != nil {
+					ownerUID, snapFound = sts.UID, true
 				}
-				gerr = err
 			case "DaemonSet":
-				ds, err := p.CS.AppsV1().DaemonSets(cr.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
-				if err == nil {
-					ownerUID = ds.UID
+				if ds, derr := p.DaemonSet(ctx, cr.Namespace, ref.Name); derr == nil && ds != nil {
+					ownerUID, snapFound = ds.UID, true
 				}
-				gerr = err
 			}
-			switch {
-			case apierrors.IsNotFound(gerr):
-				ol = ownerUIDLookup{notFound: true}
-			case apierrors.IsForbidden(gerr):
-				log.V(1).Info("WARN: controllerrevision owner get skipped (403)", "owner", cacheKey, "error", gerr)
-				ol = ownerUIDLookup{forbidden: true}
-			case gerr != nil:
-				log.V(1).Info("WARN: controllerrevision owner get failed — fail closed", "owner", cacheKey, "error", gerr)
-				ol = ownerUIDLookup{err: gerr}
-			default:
+			if snapFound {
 				ol = ownerUIDLookup{uid: ownerUID}
+			} else {
+				var gerr error
+				switch ref.Kind {
+				case "StatefulSet":
+					sts, err := p.CS.AppsV1().StatefulSets(cr.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+					if err == nil {
+						ownerUID = sts.UID
+					}
+					gerr = err
+				case "DaemonSet":
+					ds, err := p.CS.AppsV1().DaemonSets(cr.Namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+					if err == nil {
+						ownerUID = ds.UID
+					}
+					gerr = err
+				}
+				switch {
+				case apierrors.IsNotFound(gerr):
+					ol = ownerUIDLookup{notFound: true}
+				case apierrors.IsForbidden(gerr):
+					log.V(1).Info("WARN: controllerrevision owner get skipped (403)", "owner", cacheKey, "error", gerr)
+					ol = ownerUIDLookup{forbidden: true}
+				case gerr != nil:
+					log.V(1).Info("WARN: controllerrevision owner get failed — fail closed", "owner", cacheKey, "error", gerr)
+					ol = ownerUIDLookup{err: gerr}
+				default:
+					ol = ownerUIDLookup{uid: ownerUID}
+				}
 			}
 			ownerCache[cacheKey] = ol
 		}
@@ -407,7 +464,7 @@ func (p *apiObjectSprawlReportGCCheck) collectOrphanControllerRevisions(
 		}
 	}
 
-	return targets, nil
+	return targets, false, nil
 }
 
 func (p *apiObjectSprawlReportGCCheck) collectOrphanSATokenSecrets(
@@ -415,14 +472,18 @@ func (p *apiObjectSprawlReportGCCheck) collectOrphanSATokenSecrets(
 	log logr.Logger,
 	now time.Time,
 	historyRep *probefw.SweepReport,
-) ([]historyGCTarget, error) {
+) ([]historyGCTarget, bool, error) {
 	saCache := map[string]ownerUIDLookup{}
+	var saUIDs map[string]types.UID
+	saListed := false
+	saListOK := false
 	var targets []historyGCTarget
 
 	err := kube.ListEach(ctx,
 		metav1.ListOptions{
-			Limit:         probefw.HealthListPageSize,
-			FieldSelector: "type=" + string(corev1.SecretTypeServiceAccountToken),
+			Limit:           probefw.HealthListPageSize,
+			ResourceVersion: "0",
+			FieldSelector:   "type=" + string(corev1.SecretTypeServiceAccountToken),
 		},
 		kube.Secrets(p.CS, metav1.NamespaceAll),
 		func(items []corev1.Secret) error {
@@ -445,18 +506,41 @@ func (p *apiObjectSprawlReportGCCheck) collectOrphanSATokenSecrets(
 				cacheKey := s.Namespace + "/" + saName
 				ol, cached := saCache[cacheKey]
 				if !cached {
-					sa, gerr := p.CS.CoreV1().ServiceAccounts(s.Namespace).Get(ctx, saName, metav1.GetOptions{})
-					switch {
-					case apierrors.IsNotFound(gerr):
-						ol = ownerUIDLookup{notFound: true}
-					case apierrors.IsForbidden(gerr):
-						log.V(1).Info("WARN: serviceaccount get skipped (403)", "serviceaccount", cacheKey, "error", gerr)
-						ol = ownerUIDLookup{forbidden: true}
-					case gerr != nil:
-						log.V(1).Info("WARN: serviceaccount get failed — fail closed", "serviceaccount", cacheKey, "error", gerr)
-						ol = ownerUIDLookup{err: gerr}
-					default:
-						ol = ownerUIDLookup{uid: sa.UID}
+					if !saListed {
+						saListed = true
+						sas, lerr := kube.ListAll(ctx,
+							metav1.ListOptions{
+								Limit:           probefw.HealthListPageSize,
+								ResourceVersion: "0",
+							},
+							kube.ServiceAccounts(p.CS, metav1.NamespaceAll))
+						if lerr == nil {
+							saListOK = true
+							saUIDs = make(map[string]types.UID, len(sas))
+							for j := range sas {
+								sa := &sas[j]
+								saUIDs[sa.Namespace+"/"+sa.Name] = sa.UID
+							}
+						} else {
+							log.V(1).Info("WARN: serviceaccount snapshot list failed — falling back to live get", "error", lerr)
+						}
+					}
+					if uid, ok := saUIDs[cacheKey]; saListOK && ok {
+						ol = ownerUIDLookup{uid: uid}
+					} else {
+						sa, gerr := p.CS.CoreV1().ServiceAccounts(s.Namespace).Get(ctx, saName, metav1.GetOptions{})
+						switch {
+						case apierrors.IsNotFound(gerr):
+							ol = ownerUIDLookup{notFound: true}
+						case apierrors.IsForbidden(gerr):
+							log.V(1).Info("WARN: serviceaccount get skipped (403)", "serviceaccount", cacheKey, "error", gerr)
+							ol = ownerUIDLookup{forbidden: true}
+						case gerr != nil:
+							log.V(1).Info("WARN: serviceaccount get failed — fail closed", "serviceaccount", cacheKey, "error", gerr)
+							ol = ownerUIDLookup{err: gerr}
+						default:
+							ol = ownerUIDLookup{uid: sa.UID}
+						}
 					}
 					saCache[cacheKey] = ol
 				}
@@ -481,10 +565,10 @@ func (p *apiObjectSprawlReportGCCheck) collectOrphanSATokenSecrets(
 	case apierrors.IsForbidden(err):
 		log.V(1).Info("WARN: sa-token secret sprawl list skipped (403)", "error", err)
 		p.carryHistoryKind(historyRep, sprawlKindSATokenOrphan)
-		return nil, nil
+		return nil, true, nil
 	case err != nil:
-		return nil, fmt.Errorf("list service-account-token secrets: %w", err)
+		return nil, false, fmt.Errorf("list service-account-token secrets: %w", err)
 	}
 
-	return targets, nil
+	return targets, false, nil
 }

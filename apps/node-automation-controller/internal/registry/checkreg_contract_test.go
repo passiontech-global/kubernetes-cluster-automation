@@ -154,6 +154,11 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		// Wave 4C checks — appended at end of healthRows.
 		"gitops-mass-prune-guard",
 		"image-resilience-auditor",
+		// Wave 5 checks — appended at end of healthRows.
+		"volumesnapshot-lifecycle-guard",
+		"dra-claim-wedge-guard",
+		"pod-resize-wedge-guard",
+		"ingress-nginx-retirement-guard",
 	}
 	var got []string
 	for _, m := range Modules {

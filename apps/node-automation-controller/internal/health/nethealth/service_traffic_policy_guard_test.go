@@ -6,6 +6,7 @@
 package nethealth
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -21,7 +22,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	networkingv1client "k8s.io/client-go/kubernetes/typed/networking/v1"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
@@ -541,5 +544,53 @@ func TestServiceTrafficPolicyDualStackSingleReplicaNoFalsePositive(t *testing.T)
 	}
 	if _, ok := trafficPolicyDegradedSeries(t, "prod", "dual-lb", "single_node_concentration"); ok {
 		t.Fatal("stale single_node_concentration series not deleted after spread")
+	}
+}
+
+type stpListOptsCS struct {
+	kubernetes.Interface
+	ingOpts []metav1.ListOptions
+}
+
+func (r *stpListOptsCS) NetworkingV1() networkingv1client.NetworkingV1Interface {
+	return &stpNetworkingV1{NetworkingV1Interface: r.Interface.NetworkingV1(), r: r}
+}
+
+type stpNetworkingV1 struct {
+	networkingv1client.NetworkingV1Interface
+	r *stpListOptsCS
+}
+
+func (n *stpNetworkingV1) Ingresses(ns string) networkingv1client.IngressInterface {
+	return &stpIngresses{IngressInterface: n.NetworkingV1Interface.Ingresses(ns), r: n.r}
+}
+
+type stpIngresses struct {
+	networkingv1client.IngressInterface
+	r *stpListOptsCS
+}
+
+func (i *stpIngresses) List(ctx context.Context, opts metav1.ListOptions) (*networkingv1.IngressList, error) {
+	i.r.ingOpts = append(i.r.ingOpts, opts)
+	return i.IngressInterface.List(ctx, opts)
+}
+
+func TestServiceTrafficPolicyGuardIngressListUsesResourceVersionZero(t *testing.T) {
+	rawCS := fake.NewSimpleClientset()
+	rec := &stpListOptsCS{Interface: rawCS}
+	d := probetest.NewDeps(rec, probetest.OpDyn())
+	chk := NewServiceTrafficPolicyGuardCheck(d)
+	res := chk.Run(probetest.SweepCtx(ctx, d))
+	if !res.Pass || res.Infra != nil {
+		t.Fatalf("unexpected check result: %+v", res)
+	}
+	if len(rec.ingOpts) != 1 {
+		t.Fatalf("ingresses List call count = %d, want 1", len(rec.ingOpts))
+	}
+	if rec.ingOpts[0].ResourceVersion != "0" {
+		t.Fatalf("ingresses List ResourceVersion = %q, want \"0\"", rec.ingOpts[0].ResourceVersion)
+	}
+	if rec.ingOpts[0].Limit != 0 {
+		t.Fatalf("ingresses List Limit = %d, want 0 (cleared by kube.pageOpts when RV=0)", rec.ingOpts[0].Limit)
 	}
 }

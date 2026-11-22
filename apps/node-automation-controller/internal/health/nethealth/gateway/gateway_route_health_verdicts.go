@@ -11,22 +11,12 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
-
-// referenceGrantGVRs are the served ReferenceGrant versions — v1beta1
-// on the current gateway-api channel, v1alpha2 on older installs —
-// probed in order like the ExternalSecret version ladder (declared
-// local to the check, the endpointsGVR precedent: a CRD the kube
-// GVR registry does not cover).
-var referenceGrantGVRs = []schema.GroupVersionResource{
-	{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "referencegrants"},
-	{Group: "gateway.networking.k8s.io", Version: "v1alpha2", Resource: "referencegrants"},
-}
 
 // ---------------------------------------------------------------------------
 // backend verdicts — unresolved vs zero-endpoints
@@ -92,14 +82,14 @@ func (p *gatewayRouteHealthCheck) loadGrants(ctx context.Context,
 		return
 	}
 	c.grantsTried = true
-	for _, gvr := range referenceGrantGVRs {
+	for _, gvr := range kube.ReferenceGrantGVRs {
 		// The per-sweep unstructured snapshot memoizes one LIST per
-		// GVR; the raw error keeps the NoMatch/NotFound = "this
-		// version is not served" interpretation.
+		// GVR; the raw error keeps the NoMatch/NotFound/Forbidden =
+		// "this version is not served / readable" interpretation.
 		l, err := p.AllUnstructured(ctx, gvr)
 		switch {
-		case kube.IsCRDAbsent(err):
-			continue // this version is not served on the cluster
+		case kube.IsCRDAbsent(err) || apierrors.IsForbidden(err):
+			continue // this version is not served or not readable on the cluster
 		case err != nil:
 			c.grantsErr = true
 			metrics.IncError(p.Name)
@@ -124,12 +114,22 @@ func (p *gatewayRouteHealthCheck) backendRefGranted(ctx context.Context,
 	log logr.Logger, c *gatewayRouteCensus, routeKind, routeNS string,
 	b routeBackendRef) (granted, conclusive bool) {
 
+	return p.refGranted(ctx, log, c, routeKind, routeNS, b.ns, "", "Service", b.name)
+}
+
+// refGranted reports whether any ReferenceGrant in toNS permits a
+// reference from (gateway.networking.k8s.io, fromKind, fromNS) to
+// (toGroup, toKind, toName).
+func (p *gatewayRouteHealthCheck) refGranted(ctx context.Context,
+	log logr.Logger, c *gatewayRouteCensus, fromKind, fromNS, toNS,
+	toGroup, toKind, toName string) (granted, conclusive bool) {
+
 	p.loadGrants(ctx, log, c)
 	if c.grantsErr {
 		return false, false
 	}
 	for _, g := range c.grants {
-		if g.ns == b.ns && g.permits(routeKind, routeNS, b.name) {
+		if g.ns == toNS && g.permitsRef("gateway.networking.k8s.io", fromKind, fromNS, toGroup, toKind, toName) {
 			return true, true
 		}
 	}

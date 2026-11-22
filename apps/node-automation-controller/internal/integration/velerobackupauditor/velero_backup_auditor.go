@@ -284,6 +284,12 @@ type veleroBackupAuditor struct {
 	seenWedgedPVB   state.GaugeLedger[pausedKey]
 	// seenWedgedPVR is the velero-restore-wedge-audit restore-side twin of seenWedgedPVB.
 	seenWedgedPVR state.GaugeLedger[pausedKey]
+	// seenStuckRestore, restoreEventSent, and restoreHealed drive R6-K9a
+	// velero.io/v1 Restore stuck-InProgress detection, event dedup, and
+	// server-pod bounce cooldowns.
+	seenStuckRestore state.GaugeLedger[pausedKey]
+	restoreEventSent state.CooldownSet
+	restoreHealed    state.CooldownSet
 	// pvbHealed: "<ns>/<name>" -> last wedged-PVB cleanup time —
 	// the per-object cooldown that stops a still-broken node-agent
 	// from being delete-looped every sweep.
@@ -354,6 +360,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	a.seenWedgedPVB.Begin()    // drop any aborted sweep's leftover emissions
 	a.seenWedgedPVR.Begin()    // drop any aborted sweep's leftover emissions
 	a.seenDataMovement.Begin() // drop any aborted sweep's leftover emissions
+	a.seenStuckRestore.Begin() // drop any aborted sweep's leftover emissions
 	log := logf.FromContext(ctx)
 
 	// backup-posture-audit — the Everest DB-backup audit is independent of Velero:
@@ -367,16 +374,20 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	cnpgErr := a.auditCNPGBackups(ctx)
 	dbErr := errors.Join(everestErr, cnpgErr)
 
+	// R6-K9a Restore audit runs independently of Schedule CRDs (auto-skips
+	// when velero.io/v1 Restore CRD is absent and self-prunes seenStuckRestore).
+	restoreErr := a.auditRestores(ctx)
+
 	// Stream the Backup census once, keeping only the newest Backup
 	// per Schedule (for the rot checks) and the in-flight-phase subset
 	// (for the wedge audit) instead of a whole UnstructuredList.
 	latest, stuckBackups, err := a.collectBackups(ctx)
 	if err != nil {
-		return errors.Join(dbErr, err)
+		return errors.Join(dbErr, restoreErr, err)
 	}
 	present, scheduleCount, err := a.auditSchedules(ctx, latest, log)
 	if err != nil {
-		return errors.Join(dbErr, err)
+		return errors.Join(dbErr, restoreErr, err)
 	}
 	if !present {
 		// Clusters without Velero have no CRDs — quiet skip, same
@@ -402,17 +413,17 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 		a.firstSeenPaused.Prune(func(string) bool { return false })
 		a.firstSeenRepoNotReady.Prune(func(string) bool { return false })
 		log.Info("skip: velero CRDs not installed")
-		return dbErr
+		return errors.Join(dbErr, restoreErr)
 	}
 
 	// velero-bsl-audit + backup-health — the storage-side audits run
 	// after the schedule checks; a list failure short-circuits the
 	// remaining audits exactly as the inline code did.
 	if err := a.auditBSLs(ctx, log); err != nil {
-		return errors.Join(dbErr, err)
+		return errors.Join(dbErr, restoreErr, err)
 	}
 	if err := a.auditBackupRepositories(ctx, log); err != nil {
-		return errors.Join(dbErr, err)
+		return errors.Join(dbErr, restoreErr, err)
 	}
 
 	// velero-inflight-audit — in-flight transfer audit: mark Backups/PVBs wedged
@@ -432,7 +443,7 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	log.Info("sweep done", "schedules", scheduleCount,
 		"paused", len(a.seenPaused.Last()), "badBackups", len(a.seenBad.Last()),
 		"bslUnavailable", len(a.seenBSL.Last()))
-	return errors.Join(dbErr, stuckErr, dmErr)
+	return errors.Join(dbErr, restoreErr, stuckErr, dmErr)
 }
 
 // collectBackups streams the Backup census once, keeping ONLY the

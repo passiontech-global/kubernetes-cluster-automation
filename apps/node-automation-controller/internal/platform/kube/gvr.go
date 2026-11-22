@@ -138,6 +138,10 @@ var (
 	// velero-backup-auditor's backup-health repo health/maintenance scan.
 	GVVeleroBackupRepository = schema.GroupVersionResource{
 		Group: "velero.io", Version: "v1", Resource: "backuprepositories"}
+	// GVVeleroRestore is the velero.io/v1 Restore — velero-backup-auditor's
+	// stuck InProgress Restore scan.
+	GVVeleroRestore = schema.GroupVersionResource{
+		Group: "velero.io", Version: "v1", Resource: "restores"}
 
 	// ---------------------------------------------------------------
 	// Percona Everest operator (velero-backup-auditor backup-posture-audit) and the
@@ -288,6 +292,24 @@ var (
 		Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}
 	GVRGRPCRoute = schema.GroupVersionResource{
 		Group: "gateway.networking.k8s.io", Version: "v1", Resource: "grpcroutes"}
+	GVRTLSRouteV1 = schema.GroupVersionResource{
+		Group: "gateway.networking.k8s.io", Version: "v1", Resource: "tlsroutes"}
+	GVRTLSRouteV1Alpha3 = schema.GroupVersionResource{
+		Group: "gateway.networking.k8s.io", Version: "v1alpha3", Resource: "tlsroutes"}
+	GVRTLSRouteV1Alpha2 = schema.GroupVersionResource{
+		Group: "gateway.networking.k8s.io", Version: "v1alpha2", Resource: "tlsroutes"}
+	// TLSRouteGVRs is the probe order: GA v1 first, then legacy experimental versions.
+	TLSRouteGVRs = []schema.GroupVersionResource{
+		GVRTLSRouteV1, GVRTLSRouteV1Alpha3, GVRTLSRouteV1Alpha2}
+	GVRReferenceGrantV1 = schema.GroupVersionResource{
+		Group: "gateway.networking.k8s.io", Version: "v1", Resource: "referencegrants"}
+	GVRReferenceGrantV1Beta1 = schema.GroupVersionResource{
+		Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "referencegrants"}
+	GVRReferenceGrantV1Alpha2 = schema.GroupVersionResource{
+		Group: "gateway.networking.k8s.io", Version: "v1alpha2", Resource: "referencegrants"}
+	// ReferenceGrantGVRs is the probe order: GA v1 first, then v1beta1 and v1alpha2.
+	ReferenceGrantGVRs = []schema.GroupVersionResource{
+		GVRReferenceGrantV1, GVRReferenceGrantV1Beta1, GVRReferenceGrantV1Alpha2}
 
 	// ---------------------------------------------------------------
 	// Trivy operator report CRDs + Policy Reporter (api-object-sprawl-
@@ -340,4 +362,10 @@ var (
 		Group: "snapshot.storage.k8s.io", Version: "v1", Resource: "volumesnapshots"}
 	GVRVolumeSnapshotContent = schema.GroupVersionResource{
 		Group: "snapshot.storage.k8s.io", Version: "v1", Resource: "volumesnapshotcontents"}
+
+	// ---------------------------------------------------------------
+	// Dynamic Resource Allocation (dra-claim-wedge-guard).
+	// ---------------------------------------------------------------
+	GVRResourceClaim = schema.GroupVersionResource{
+		Group: "resource.k8s.io", Version: "v1", Resource: "resourceclaims"}
 )

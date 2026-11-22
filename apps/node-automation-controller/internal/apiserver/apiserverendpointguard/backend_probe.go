@@ -12,6 +12,7 @@ package apiserverendpointguard
 import (
 	"context"
 	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,12 +24,26 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// endpointGuardProbeBudget is the per-backend probe budget under
-// parallel probing — the probe issues up to three sequential
-// requests (live_rv, cache_rv, jwks) each bounded by the shared
-// client's endpointGuardProbeTO, so one hung backend can never
-// outlive the runCtx it used to share with healthy siblings.
-const endpointGuardProbeBudget = 3 * endpointGuardProbeTO
+const (
+	// endpointGuardProbeBudget is the per-backend probe budget under
+	// parallel probing — the probe issues up to three sequential
+	// requests (live_rv, cache_rv, jwks) each bounded by the shared
+	// client's endpointGuardProbeTO, so one hung backend can never
+	// outlive the runCtx it used to share with healthy siblings.
+	endpointGuardProbeBudget = 3 * endpointGuardProbeTO
+
+	// endpointGuardTLSServerName pins TLS peer verification for raw-IP
+	// backend dials to the Kubernetes service SAN present on every
+	// apiserver serving certificate, preserving CA + SAN checks without
+	// failing on raw backend IPs or leaking the SA bearer token.
+	endpointGuardTLSServerName = "kubernetes.default.svc"
+
+	// endpointGuardMaxBodyBytes bounds JSON probe responses (4 MiB).
+	endpointGuardMaxBodyBytes = 4 << 20
+	// endpointGuardMaxDrainBytes bounds deferred body drain for keep-alive
+	// reuse on oversized or non-200 responses (64 KiB).
+	endpointGuardMaxDrainBytes = 64 << 10
+)
 
 // apiProbeResult is one backend probe outcome: the quorum (etcd) list
 // RV, the watch-cache list RV, the sorted JWKS kid set, or the
@@ -130,20 +145,15 @@ func (g *apiServerEndpointGuard) transport() (http.RoundTripper, error) {
 	if g.rt != nil {
 		return g.rt, nil
 	}
-	cfg, err := rest.InClusterConfig()
+	cfgFn := g.inClusterConfigFn
+	if cfgFn == nil {
+		cfgFn = rest.InClusterConfig
+	}
+	cfg, err := cfgFn()
 	if err != nil {
 		return nil, err
 	}
-	// TLS peer verification is impossible by design here: probes hit
-	// raw addresses — backend IPs, the LB VIP (103.186.101.x), WAN
-	// controllers — that are NOT in the apiserver serving cert's SANs
-	// (the cert carries node IPs + 10.96.0.1 + nebula IPs only). The
-	// incumbent shell guard used `curl -sk` for the same reason. The
-	// probe only needs liveness + resourceVersion, never peer
-	// identity; apiserver-side auth is still enforced via the SA
-	// bearer token that TransportFor wires in.
-	cfg.TLSClientConfig = rest.TLSClientConfig{Insecure: true}
-	rt, err := rest.TransportFor(cfg)
+	rt, err := probeTransportFromConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -151,12 +161,42 @@ func (g *apiServerEndpointGuard) transport() (http.RoundTripper, error) {
 	return rt, nil
 }
 
+// probeTransportFromConfig builds the backend-probe RoundTripper from cfg
+// while preserving its cluster CA (CAFile/CAData) and client credentials.
+// Probes dial raw backend IPs rather than 10.96.0.1, so ServerName is
+// pinned to kubernetes.default.svc (present in every apiserver serving
+// cert's SANs) with Insecure=false so an MITM cannot capture the SA JWT.
+func probeTransportFromConfig(cfg *rest.Config) (http.RoundTripper, error) {
+	if cfg == nil {
+		return nil, errors.New("nil rest.Config")
+	}
+	c := *cfg
+	c.TLSClientConfig.Insecure = false
+	c.TLSClientConfig.ServerName = endpointGuardTLSServerName
+	return rest.TransportFor(&c)
+}
+
+type cappedProbeReader struct {
+	r   io.Reader
+	n   int64
+	max int64
+}
+
+func (c *cappedProbeReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	if c.n > c.max {
+		return n, fmt.Errorf("probe response body exceeds %d bytes", c.max)
+	}
+	return n, err
+}
+
 // fetchJSON is the ONE owner of the raw-backend GET skeleton: build
 // the request, send it over the shared probe client, drain the body
-// before close (an unread body makes the connection unreusable, which
-// silently defeated keep-alive on the shared transport — new TCP+TLS
-// handshake per probe), treat any non-2xx as a wedge signal, and
-// decode the JSON body into out.
+// (bounded) before close (an unread body makes the connection
+// unreusable, which silently defeated keep-alive on the shared
+// transport — new TCP+TLS handshake per probe), treat any non-2xx as
+// a wedge signal, and decode the JSON body (bounded) into out.
 func fetchJSON(ctx context.Context, client *http.Client, ip, path, accept string, out any) error {
 	url := "https://" + net.JoinHostPort(ip, endpointGuardPort) + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -171,13 +211,23 @@ func fetchJSON(ctx context.Context, client *http.Client, ip, path, accept string
 		return err
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, endpointGuardMaxDrainBytes))
 		_ = resp.Body.Close()
 	}()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return json.UnmarshalRead(resp.Body, out)
+	cr := &cappedProbeReader{
+		r:   io.LimitReader(resp.Body, endpointGuardMaxBodyBytes+1),
+		max: endpointGuardMaxBodyBytes,
+	}
+	if err := json.UnmarshalRead(cr, out); err != nil {
+		return err
+	}
+	if cr.n > endpointGuardMaxBodyBytes {
+		return fmt.Errorf("probe response body exceeds %d bytes", endpointGuardMaxBodyBytes)
+	}
+	return nil
 }
 
 // fetchListRV GETs a core-API list path on one backend and returns the

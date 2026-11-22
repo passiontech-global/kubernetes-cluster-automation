@@ -624,17 +624,23 @@ func (c *topologySpreadZoneDeadlockCheck) relaxDeployment(ctx context.Context, l
 		}
 		return
 	}
-	if !kube.TryReserveWorkloadKey(ctx, wKey) ||
-		!heal.FluxPatchGate("deployment", dep, dep.Namespace+"/"+dep.Name, now) {
+	if !kube.TryReserveWorkloadKey(ctx, wKey) {
+		heal.RefundGrant(now)
+		return
+	}
+	if !heal.FluxPatchGate("deployment", dep, CheckNameTopologyZoneDeadlock+":"+wKey, now) {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		heal.RefundGrant(now)
 		return
 	}
 	payload, _, ok := relaxZoneConstraintsPatch(dep.Spec.Template.Spec.TopologySpreadConstraints, deadZones)
 	if !ok {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		heal.RefundGrant(now)
 		return
 	}
 	if _, err := c.CS.AppsV1().Deployments(dep.Namespace).Patch(ctx, dep.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		rep.InfraErr(fmt.Errorf("topology zone relax Deployment %s: %w", wKey, err))
 		log.Error(err, "topology zone relax Deployment patch failed", "workload", wKey)
 		return
@@ -659,17 +665,23 @@ func (c *topologySpreadZoneDeadlockCheck) relaxStatefulSet(ctx context.Context, 
 		}
 		return
 	}
-	if !kube.TryReserveWorkloadKey(ctx, wKey) ||
-		!heal.FluxPatchGate("statefulset", sts, sts.Namespace+"/"+sts.Name, now) {
+	if !kube.TryReserveWorkloadKey(ctx, wKey) {
+		heal.RefundGrant(now)
+		return
+	}
+	if !heal.FluxPatchGate("statefulset", sts, CheckNameTopologyZoneDeadlock+":"+wKey, now) {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		heal.RefundGrant(now)
 		return
 	}
 	payload, _, ok := relaxZoneConstraintsPatch(sts.Spec.Template.Spec.TopologySpreadConstraints, deadZones)
 	if !ok {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		heal.RefundGrant(now)
 		return
 	}
 	if _, err := c.CS.AppsV1().StatefulSets(sts.Namespace).Patch(ctx, sts.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		rep.InfraErr(fmt.Errorf("topology zone relax StatefulSet %s: %w", wKey, err))
 		log.Error(err, "topology zone relax StatefulSet patch failed", "workload", wKey)
 		return
@@ -704,12 +716,17 @@ func (c *topologySpreadZoneDeadlockCheck) restoreRelaxedWorkloads(ctx context.Co
 			}
 			continue
 		}
-		if !kube.TryReserveWorkloadKey(ctx, wKey) ||
-			!heal.FluxPatchGate("deployment", dep, dep.Namespace+"/"+dep.Name, now) {
+		if !kube.TryReserveWorkloadKey(ctx, wKey) {
+			heal.RefundGrant(now)
+			continue
+		}
+		if !heal.FluxPatchGate("deployment", dep, CheckNameTopologyZoneDeadlock+":"+wKey, now) {
+			kube.ReleaseWorkloadKey(ctx, wKey)
 			heal.RefundGrant(now)
 			continue
 		}
 		if _, err := c.CS.AppsV1().Deployments(dep.Namespace).Patch(ctx, dep.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+			kube.ReleaseWorkloadKey(ctx, wKey)
 			rep.InfraErr(fmt.Errorf("topology zone restore Deployment %s: %w", wKey, err))
 			log.Error(err, "topology zone restore Deployment patch failed", "workload", wKey)
 			continue
@@ -739,12 +756,17 @@ func (c *topologySpreadZoneDeadlockCheck) restoreRelaxedWorkloads(ctx context.Co
 			}
 			continue
 		}
-		if !kube.TryReserveWorkloadKey(ctx, wKey) ||
-			!heal.FluxPatchGate("statefulset", sts, sts.Namespace+"/"+sts.Name, now) {
+		if !kube.TryReserveWorkloadKey(ctx, wKey) {
+			heal.RefundGrant(now)
+			continue
+		}
+		if !heal.FluxPatchGate("statefulset", sts, CheckNameTopologyZoneDeadlock+":"+wKey, now) {
+			kube.ReleaseWorkloadKey(ctx, wKey)
 			heal.RefundGrant(now)
 			continue
 		}
 		if _, err := c.CS.AppsV1().StatefulSets(sts.Namespace).Patch(ctx, sts.Name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+			kube.ReleaseWorkloadKey(ctx, wKey)
 			rep.InfraErr(fmt.Errorf("topology zone restore StatefulSet %s: %w", wKey, err))
 			log.Error(err, "topology zone restore StatefulSet patch failed", "workload", wKey)
 			continue

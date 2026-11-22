@@ -151,6 +151,11 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	// Wave 4C checks — appended at end.
 	{"gitops-mass-prune-guard", "health"},
 	{"image-resilience-auditor", "health"},
+	// Wave 5 checks — appended at end.
+	{"volumesnapshot-lifecycle-guard", "health"},
+	{"dra-claim-wedge-guard", "health"},
+	{"pod-resize-wedge-guard", "health"},
+	{"ingress-nginx-retirement-guard", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -353,6 +358,14 @@ var goldenMetricFamilies = []string{
 	"node_automation_gitops_mass_prune_alert",
 	"node_automation_gitops_mass_prune_suspends_total",
 	"node_automation_workload_image_resilience_risk",
+	// Wave 5 metrics.
+	"node_automation_pod_resize_wedged",
+	"node_automation_ingress_nginx_retirement_detected",
+	"node_automation_volumesnapshot_stuck",
+	"node_automation_imagepull_missing_secret",
+	"node_automation_dra_claim_wedged",
+	"node_automation_dra_claim_heals_total",
+	"node_automation_velero_restore_stuck",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key

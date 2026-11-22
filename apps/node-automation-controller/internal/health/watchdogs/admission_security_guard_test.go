@@ -2,7 +2,10 @@ package watchdogs
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +18,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
@@ -480,9 +486,9 @@ func TestAdmissionSecurityGuard403And404GracefulSkip(t *testing.T) {
 		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "cilium.io", Resource: "ciliumclusterwidenetworkpolicies"}, "", errors.New("forbidden"))
 	})
 
-	p := testProberDyn(cs, dyn)
-	chk := probetest.MustCheck[*admissionSecurityGuardCheck](t, p)
-	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	d := probetest.NewDeps(cs, dyn)
+	chk := NewAdmissionSecurityGuardCheck(d)
+	res := chk.Run(probetest.SweepCtx(ctx, d))
 	if !res.Pass || res.Infra != nil {
 		t.Fatalf("expected PASS with no Infra error on 403/404 graceful skip, got %+v", res)
 	}
@@ -491,5 +497,58 @@ func TestAdmissionSecurityGuard403And404GracefulSkip(t *testing.T) {
 		"namespace": "ns1", "service": "wh-svc", "reason": "webhook_no_networkpolicy",
 	}); m != nil {
 		t.Fatalf("false-flagged webhook_no_networkpolicy on 403: %v", m)
+	}
+}
+
+func TestAdmissionSecurityGuardListsUseRV0(t *testing.T) {
+	gotRVs := map[string]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		rv := r.URL.Query().Get("resourceVersion")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/validatingwebhookconfigurations"):
+			_, _ = w.Write([]byte(`{"apiVersion":"admissionregistration.k8s.io/v1","kind":"ValidatingWebhookConfigurationList","items":[{"metadata":{"name":"vwc-1"},"webhooks":[{"name":"h.example.com","clientConfig":{"service":{"namespace":"ns1","name":"wh-svc"}}}]}]}`))
+		case strings.HasSuffix(r.URL.Path, "/mutatingwebhookconfigurations"):
+			_, _ = w.Write([]byte(`{"apiVersion":"admissionregistration.k8s.io/v1","kind":"MutatingWebhookConfigurationList","items":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/customresourcedefinitions"):
+			gotRVs["customresourcedefinitions"] = rv
+			_, _ = w.Write([]byte(`{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinitionList","items":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/services"):
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"ServiceList","items":[{"metadata":{"namespace":"ns1","name":"wh-svc"},"spec":{"type":"ClusterIP","selector":{"app":"wh-svc"}}}]}`))
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"PodList","items":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/networkpolicies"):
+			gotRVs["networkpolicies"] = rv
+			_, _ = w.Write([]byte(`{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicyList","items":[{"metadata":{"namespace":"ns1","name":"np-1"},"spec":{"podSelector":{"matchLabels":{"app":"wh-svc"}},"policyTypes":["Ingress"]}}]}`))
+		case strings.HasSuffix(r.URL.Path, "/clusterrolebindings"):
+			gotRVs["clusterrolebindings"] = rv
+			_, _ = w.Write([]byte(`{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"ClusterRoleBindingList","items":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/rolebindings"):
+			gotRVs["rolebindings"] = rv
+			_, _ = w.Write([]byte(`{"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBindingList","items":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cs, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dyn, err := dynamic.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := probetest.NewDeps(cs, dyn)
+	chk := NewAdmissionSecurityGuardCheck(d)
+	res := chk.Run(probetest.SweepCtx(ctx, d))
+	if !res.Pass || res.Infra != nil {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	for _, resName := range []string{"customresourcedefinitions", "networkpolicies", "clusterrolebindings", "rolebindings"} {
+		if got := gotRVs[resName]; got != "0" {
+			t.Fatalf("%s resourceVersion = %q, want \"0\"", resName, got)
+		}
 	}
 }

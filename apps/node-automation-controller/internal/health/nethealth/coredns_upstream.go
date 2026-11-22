@@ -328,7 +328,10 @@ func (p *coreDNSUpstreamCheck) corednsReadinessFallback(ctx context.Context,
 		detail := flagged[key]
 		parts := strings.SplitN(key, "/", 2)
 		ns, name := parts[0], parts[1]
-		pod := probefw.PodFromList(pods, ns, name)
+		pod, err := p.Pod(ctx, ns, name)
+		if err != nil {
+			return probefw.Result{Infra: fmt.Errorf("lookup pod %s/%s: %w", ns, name, err)}
+		}
 		if pod == nil {
 			continue
 		}

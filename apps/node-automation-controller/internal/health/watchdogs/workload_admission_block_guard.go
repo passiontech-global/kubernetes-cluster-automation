@@ -19,7 +19,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -104,10 +103,9 @@ func (c *workloadAdmissionBlockGuardCheck) Run(ctx context.Context) probefw.Resu
 
 	holdKinds := map[string]bool{}
 
-	// Full typed ReplicaSet list (AllReplicaSets is PartialObjectMetadata-only).
-	rss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.ReplicaSets(c.CS, metav1.NamespaceAll))
+	// Full typed ReplicaSet list (AllReplicaSets is PartialObjectMetadata-only;
+	// AllTypedReplicaSets uses ResourceVersion="0" and memoizes per sweep).
+	rss, err := c.AllTypedReplicaSets(ctx)
 	if err != nil {
 		if apierrors.IsForbidden(err) {
 			log.V(1).Info("WARN: ReplicaSet list skipped (403)", "error", err)

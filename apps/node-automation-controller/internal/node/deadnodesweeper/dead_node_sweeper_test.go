@@ -1437,3 +1437,88 @@ func TestDeadNodeSweeperStatefulHoldersFieldSelector(t *testing.T) {
 		t.Fatalf("pod list selectors = %v, want [%q, %q]", selectors, want, want)
 	}
 }
+
+// Bound PVCs whose PV is absent from pvModes or has empty AccessModes
+// must fail closed in nodeHasStatefulHolders (vetoing the fence, same
+// contract as volumeAttachmentRWO), while an RWX-only PV permits fencing.
+func TestDeadNodeSweeperBoundPVMissingOrEmptyModesFailsClosed(t *testing.T) {
+	pvcPod := func(ns, name, nodeName, claimName string) *corev1.Pod {
+		p := stuckTerminatingPod(ns, name, nodeName, 20*time.Minute)
+		p.Spec.Volumes = []corev1.Volume{{
+			Name: "data",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: claimName,
+				},
+			},
+		}}
+		return p
+	}
+	boundPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "claim-x"},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pv-x"},
+	}
+
+	for _, tc := range []struct {
+		name       string
+		pv         *corev1.PersistentVolume
+		wantTaint  bool
+		wantSkip   float64
+		wantHasVol string
+	}{
+		{
+			name:      "missing-pv",
+			pv:        nil,
+			wantTaint: false,
+			wantSkip:  1,
+		},
+		{
+			name: "empty-access-modes",
+			pv: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: "pv-x"},
+				Spec:       corev1.PersistentVolumeSpec{AccessModes: nil},
+			},
+			wantTaint: false,
+			wantSkip:  1,
+		},
+		{
+			name: "rwx-only",
+			pv: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: "pv-x"},
+				Spec: corev1.PersistentVolumeSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+				},
+			},
+			wantTaint:  true,
+			wantSkip:   0,
+			wantHasVol: "false",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testutil.CleanupMetric(t, metrics.DeadNodeUnfencedStatefulSkipped, "w1")
+			if tc.wantHasVol != "" {
+				testutil.CleanupMetric(t, metrics.DeadNodeFencedWithoutSNRTotal, "w1", tc.wantHasVol)
+			}
+			objs := []runtime.Object{
+				unknownNode("w1", 45*time.Minute),
+				pvcPod("apps", "worker-0", "w1", "claim-x"),
+				boundPVC.DeepCopy(),
+			}
+			if tc.pv != nil {
+				objs = append(objs, tc.pv)
+			}
+			cs := fake.NewSimpleClientset(objs...)
+			s := deadNodeSweeperFor(cs, deadNodeDynFake(), deadProbe)
+			if err := s.run(ctx); err != nil {
+				t.Fatalf("s.run: %v", err)
+			}
+			gotTaint := kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintNodeOutOfService)
+			if gotTaint != tc.wantTaint {
+				t.Fatalf("HasTaint = %v, want %v", gotTaint, tc.wantTaint)
+			}
+			if gotSkip := ptestutil.ToFloat64(metrics.DeadNodeUnfencedStatefulSkipped.WithLabelValues("w1")); gotSkip != tc.wantSkip {
+				t.Fatalf("DeadNodeUnfencedStatefulSkipped = %v, want %v", gotSkip, tc.wantSkip)
+			}
+		})
+	}
+}

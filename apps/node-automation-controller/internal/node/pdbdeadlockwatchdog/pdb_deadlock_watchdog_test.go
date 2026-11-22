@@ -978,3 +978,181 @@ func TestPDBWatchdogPodListErrorNoDoubleIncError(t *testing.T) {
 		t.Fatalf("queue error delta = %v, want 1 (no double IncError)", got)
 	}
 }
+
+func TestPodInReliefErrorState(t *testing.T) {
+	errReasons := []string{
+		"CrashLoopBackOff",
+		"ImagePullBackOff",
+		"ErrImagePull",
+		"CreateContainerConfigError",
+		"CreateContainerError",
+		"InvalidImageName",
+	}
+	benignReasons := []string{
+		"ContainerCreating",
+		"PodInitializing",
+		"",
+		"Unknown",
+		"crashloopbackoff",
+		"imagepullbackoff",
+	}
+
+	makeWaiting := func(reason string) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:  "c",
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+		}
+	}
+
+	type testCase struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}
+
+	cases := []testCase{
+		{
+			name: "empty pod status slices",
+			pod:  &corev1.Pod{},
+			want: false,
+		},
+		{
+			name: "running container only",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{{
+						Name:  "app",
+						State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+					}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "terminated non-zero exit code Error",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{{
+						Name: "app",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+						},
+					}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "terminated OOMKilled without Waiting state",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{{
+						Name: "app",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled"},
+						},
+					}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "running with LastTerminationState.Terminated only",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{{
+						Name:  "app",
+						State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+						LastTerminationState: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled"},
+						},
+					}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "mixed multi-container: container 0 running + container 1 waiting CreateContainerConfigError",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{Name: "sidecar", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+						makeWaiting("CreateContainerConfigError"),
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "mixed init containers: init 0 exited 0 + init 1 ImagePullBackOff",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					InitContainerStatuses: []corev1.ContainerStatus{
+						{Name: "init-0", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+						makeWaiting("ImagePullBackOff"),
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "mixed init/container/ephemeral: benign init+container + ephemeral InvalidImageName",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					InitContainerStatuses:      []corev1.ContainerStatus{makeWaiting("PodInitializing")},
+					ContainerStatuses:          []corev1.ContainerStatus{makeWaiting("ContainerCreating")},
+					EphemeralContainerStatuses: []corev1.ContainerStatus{makeWaiting("InvalidImageName")},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, r := range errReasons {
+		cases = append(cases,
+			testCase{
+				name: "ContainerStatuses/" + r,
+				pod:  &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{makeWaiting(r)}}},
+				want: true,
+			},
+			testCase{
+				name: "InitContainerStatuses/" + r,
+				pod:  &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{makeWaiting(r)}}},
+				want: true,
+			},
+			testCase{
+				name: "EphemeralContainerStatuses/" + r,
+				pod:  &corev1.Pod{Status: corev1.PodStatus{EphemeralContainerStatuses: []corev1.ContainerStatus{makeWaiting(r)}}},
+				want: true,
+			},
+		)
+	}
+
+	for _, r := range benignReasons {
+		cases = append(cases,
+			testCase{
+				name: "benign/ContainerStatuses/" + r,
+				pod:  &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{makeWaiting(r)}}},
+				want: false,
+			},
+			testCase{
+				name: "benign/InitContainerStatuses/" + r,
+				pod:  &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{makeWaiting(r)}}},
+				want: false,
+			},
+			testCase{
+				name: "benign/EphemeralContainerStatuses/" + r,
+				pod:  &corev1.Pod{Status: corev1.PodStatus{EphemeralContainerStatuses: []corev1.ContainerStatus{makeWaiting(r)}}},
+				want: false,
+			},
+		)
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := podInReliefErrorState(tc.pod); got != tc.want {
+				t.Fatalf("podInReliefErrorState() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

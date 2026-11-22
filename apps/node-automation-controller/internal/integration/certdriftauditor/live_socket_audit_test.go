@@ -5,16 +5,20 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"math/big"
 	"net"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -30,6 +34,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -718,5 +723,791 @@ func TestLiveSocketAuditEarlyListErrorDoesNotPruneStreakOrMetric(t *testing.T) {
 	}
 	if got := a.liveDriftStreak.Count(streakKey); got != 0 {
 		t.Fatalf("after clean sweep streak = %d, want 0 (pruned)", got)
+	}
+}
+
+func TestMaybeRolloutWorkloadFluxGateAndReservation(t *testing.T) {
+	isCtrl := true
+	wKey := "apps/Deployment/wh-app"
+
+	newTargetAndObjs := func(mgr string) (*liveProbeTarget, *appsv1.Deployment, []runtime.Object) {
+		dep := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "wh-app", UID: "dep-1"},
+			Spec: appsv1.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "wh-pod"}}},
+			},
+		}
+		if mgr != "" {
+			dep.ManagedFields = []metav1.ManagedFieldsEntry{{
+				Manager:   mgr,
+				Operation: metav1.ManagedFieldsOperationApply,
+			}}
+		}
+		rs := &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "apps", Name: "wh-app-rs",
+				OwnerReferences: []metav1.OwnerReference{{Kind: "Deployment", Name: "wh-app", Controller: &isCtrl}},
+			},
+		}
+		pod := makeReadyTLSPod("apps", "wh-pod", "10.0.0.1", "wh-tls",
+			metav1.OwnerReference{Kind: "ReplicaSet", Name: "wh-app-rs", Controller: &isCtrl})
+		target := &liveProbeTarget{
+			svc: corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "wh-svc"}},
+			pod: pod,
+			secret: tlsSecretMeta{
+				name: "wh-tls",
+			},
+		}
+		return target, dep, []runtime.Object{dep, rs, pod}
+	}
+
+	cases := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			name: "FluxPatchGate_denies",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				heal.ConfigureFluxConflictLoop(2, 30*time.Minute)
+				t.Cleanup(func() {
+					heal.ConfigureBudget(0, 0)
+					heal.ConfigureFluxConflictLoop(0, 0)
+				})
+
+				fixedNow := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+				target, dep, objs := newTargetAndObjs("kustomize-controller")
+				cs := fake.NewSimpleClientset(objs...)
+				a := &certDriftAuditor{cs: cs, dyn: cdaDyn(), queue: "live-flux-deny-test"}
+				sctx := kube.WithSweepOverlay(ctx)
+				rolled := map[string]bool{}
+
+				if !heal.FluxPatchGate("deployment", dep, "live-socket-audit:"+wKey, fixedNow) {
+					t.Fatal("pre-warm sighting unexpectedly denied")
+				}
+				before := testutil.QueueErrorCount(t, a.queue)
+				a.maybeRolloutWorkload(sctx, logr.Discard(), target, rolled, fixedNow)
+
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 0 {
+					t.Fatalf("queue error delta = %v, want 0", got)
+				}
+				gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+				if gotDep.Spec.Template.Annotations[kube.RestartedAtAnno] != "" {
+					t.Fatalf("RestartedAtAnno=%q, want empty on FluxPatchGate denial", gotDep.Spec.Template.Annotations[kube.RestartedAtAnno])
+				}
+				if rolled[wKey] {
+					t.Fatal("rolled[wKey] = true, want false")
+				}
+				if !kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("ownerDisrupt key leaked on FluxPatchGate denial")
+				}
+				if proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(), "after-flux-deny", fixedNow); !proceed || unverifiable {
+					t.Fatalf("Gate after FluxPatchGate denial = (%v,%v), want (true,false)", proceed, unverifiable)
+				}
+			},
+		},
+		{
+			name: "Duty_key_isolation_across_duties_and_kinds",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(2, time.Hour)
+				heal.ConfigureFluxConflictLoop(2, 30*time.Minute)
+				t.Cleanup(func() {
+					heal.ConfigureBudget(0, 0)
+					heal.ConfigureFluxConflictLoop(0, 0)
+				})
+
+				fixedNow := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+				target, dep, objs := newTargetAndObjs("kustomize-controller")
+				sts := &appsv1.StatefulSet{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "apps", Name: "wh-app",
+						Annotations:   map[string]string{kube.AnnoCertDriftReloadOptIn: "true"},
+						ManagedFields: dep.ManagedFields,
+					},
+				}
+				stsPod := makeReadyTLSPod("apps", "sts-pod", "10.0.0.2", "wh-tls",
+					metav1.OwnerReference{Kind: "StatefulSet", Name: "wh-app", Controller: &isCtrl})
+				stsTarget := &liveProbeTarget{
+					svc:    corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "sts-svc"}},
+					pod:    stsPod,
+					secret: tlsSecretMeta{name: "wh-tls"},
+				}
+				cs := fake.NewSimpleClientset(append(objs, sts, stsPod)...)
+				a := &certDriftAuditor{cs: cs, dyn: cdaDyn(), queue: "live-duty-iso-test"}
+				sctx := kube.WithSweepOverlay(ctx)
+				rolled := map[string]bool{}
+
+				// Exhaust sibling duty key and bare ns/name key.
+				heal.FluxPatchGate("deployment", dep, "tls-secret-audit:"+wKey, fixedNow)
+				heal.FluxPatchGate("deployment", dep, "tls-secret-audit:"+wKey, fixedNow)
+				heal.FluxPatchGate("deployment", dep, "apps/wh-app", fixedNow)
+				heal.FluxPatchGate("deployment", dep, "apps/wh-app", fixedNow)
+				// Also exhaust Deployment key twice and verify same-name StatefulSet is isolated by kind.
+				heal.FluxPatchGate("statefulset", sts, "live-socket-audit:apps/StatefulSet/wh-app", fixedNow)
+				heal.FluxPatchGate("statefulset", sts, "live-socket-audit:apps/StatefulSet/wh-app", fixedNow)
+
+				a.maybeRolloutWorkload(sctx, logr.Discard(), target, rolled, fixedNow)
+				gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+				if gotDep.Spec.Template.Annotations[kube.RestartedAtAnno] == "" {
+					t.Fatal("Deployment rollout blocked despite duty/kind key isolation")
+				}
+				if !rolled[wKey] {
+					t.Fatal("expected rolled[wKey] == true")
+				}
+				if kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("wKey must stay reserved after successful rollout")
+				}
+
+				// Same-name StatefulSet is denied because its own kind-scoped key was exhausted.
+				a.maybeRolloutWorkload(sctx, logr.Discard(), stsTarget, rolled, fixedNow)
+				gotSts, _ := cs.AppsV1().StatefulSets("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+				if gotSts.Spec.Template.Annotations[kube.RestartedAtAnno] != "" {
+					t.Fatal("StatefulSet rollout should be denied by its own exhausted kind-scoped key")
+				}
+			},
+		},
+		{
+			name: "Patch_API_error_releases_key_keeps_grant_spent",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+				fixedNow := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+				target, _, objs := newTargetAndObjs("")
+				cs := fake.NewSimpleClientset(objs...)
+				cs.PrependReactor("patch", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewInternalError(errors.New("boom"))
+				})
+				a := &certDriftAuditor{cs: cs, dyn: cdaDyn(), queue: "live-patch-500-test"}
+				sctx := kube.WithSweepOverlay(ctx)
+				rolled := map[string]bool{}
+
+				before := testutil.QueueErrorCount(t, a.queue)
+				a.maybeRolloutWorkload(sctx, logr.Discard(), target, rolled, fixedNow)
+
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 1 {
+					t.Fatalf("queue error delta = %v, want 1", got)
+				}
+				gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+				if gotDep.Spec.Template.Annotations[kube.RestartedAtAnno] != "" {
+					t.Fatalf("RestartedAtAnno=%q, want empty on 500 Patch", gotDep.Spec.Template.Annotations[kube.RestartedAtAnno])
+				}
+				if rolled[wKey] {
+					t.Fatal("rolled[wKey] = true on 500 Patch")
+				}
+				if !kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("ownerDisrupt key leaked on 500 Patch failure")
+				}
+				if proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(), "after-500", fixedNow); proceed || unverifiable {
+					t.Fatalf("Gate after 500 Patch = (%v,%v), want (false,false) — grant must stay spent", proceed, unverifiable)
+				}
+			},
+		},
+		{
+			name: "Patch_404_releases_key_and_refunds_grant",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+				fixedNow := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+				target, _, objs := newTargetAndObjs("")
+				cs := fake.NewSimpleClientset(objs...)
+				cs.PrependReactor("patch", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewNotFound(
+						schema.GroupResource{Group: "apps", Resource: "deployments"}, "wh-app")
+				})
+				a := &certDriftAuditor{cs: cs, dyn: cdaDyn(), queue: "live-patch-404-test"}
+				sctx := kube.WithSweepOverlay(ctx)
+				rolled := map[string]bool{}
+
+				before := testutil.QueueErrorCount(t, a.queue)
+				a.maybeRolloutWorkload(sctx, logr.Discard(), target, rolled, fixedNow)
+
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 0 {
+					t.Fatalf("queue error delta = %v, want 0", got)
+				}
+				gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+				if gotDep.Spec.Template.Annotations[kube.RestartedAtAnno] != "" {
+					t.Fatalf("RestartedAtAnno=%q, want empty on 404 Patch", gotDep.Spec.Template.Annotations[kube.RestartedAtAnno])
+				}
+				if rolled[wKey] {
+					t.Fatal("rolled[wKey] = true on 404 Patch")
+				}
+				if !kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("ownerDisrupt key leaked on 404 Patch failure")
+				}
+				if proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(), "after-404", fixedNow); !proceed || unverifiable {
+					t.Fatalf("Gate after 404 Patch = (%v,%v), want (true,false) — grant not refunded", proceed, unverifiable)
+				}
+			},
+		},
+		{
+			name: "Pre_reserved_workload_defers_and_refunds_grant",
+			run: func(t *testing.T) {
+				heal.ConfigureBudget(1, time.Hour)
+				t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+				fixedNow := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+				target, _, objs := newTargetAndObjs("")
+				cs := fake.NewSimpleClientset(objs...)
+				a := &certDriftAuditor{cs: cs, dyn: cdaDyn(), queue: "live-prereserved-test"}
+				sctx := kube.WithSweepOverlay(ctx)
+				if !kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("pre-reserve failed")
+				}
+				rolled := map[string]bool{}
+
+				before := testutil.QueueErrorCount(t, a.queue)
+				a.maybeRolloutWorkload(sctx, logr.Discard(), target, rolled, fixedNow)
+
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 0 {
+					t.Fatalf("queue error delta = %v, want 0", got)
+				}
+				gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+				if gotDep.Spec.Template.Annotations[kube.RestartedAtAnno] != "" {
+					t.Fatalf("RestartedAtAnno=%q, want empty when workload pre-reserved", gotDep.Spec.Template.Annotations[kube.RestartedAtAnno])
+				}
+				if rolled[wKey] {
+					t.Fatal("rolled[wKey] = true when workload pre-reserved")
+				}
+				if proceed, unverifiable := heal.Gate(ctx, logr.Discard(), nil, cs, cdaDyn(), "after-prereserve", fixedNow); !proceed || unverifiable {
+					t.Fatalf("Gate after pre-reserve deferral = (%v,%v), want (true,false)", proceed, unverifiable)
+				}
+			},
+		},
+		{
+			name: "AllowedVPersisted_precedes_FluxPatchGate",
+			run: func(t *testing.T) {
+				heal.ConfigureFluxConflictLoop(2, 30*time.Minute)
+				var hookCalls int
+				heal.SetFluxConflictHook(func(heal.FluxConflictSignal) { hookCalls++ })
+				t.Cleanup(func() {
+					heal.ConfigureFluxConflictLoop(0, 0)
+					heal.SetFluxConflictHook(nil)
+				})
+
+				fixedNow := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+				target, _, objs := newTargetAndObjs("helm-controller")
+				cs := fake.NewSimpleClientset(append(objs, cordonedNode("worker-0"))...)
+				a := &certDriftAuditor{cs: cs, dyn: cdaDyn(), queue: "live-maint-order-test"}
+				rolled := map[string]bool{}
+
+				for i := range 2 {
+					a.maybeRolloutWorkload(kube.WithSweepOverlay(ctx), logr.Discard(), target, rolled, fixedNow)
+					gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+					if gotDep.Spec.Template.Annotations[kube.RestartedAtAnno] != "" {
+						t.Fatalf("held call %d stamped RestartedAtAnno", i+1)
+					}
+					if rolled[wKey] {
+						t.Fatalf("held call %d marked rolled", i+1)
+					}
+				}
+				if hookCalls != 0 {
+					t.Fatalf("FluxConflictHook fired %d times while maintenance held, want 0", hookCalls)
+				}
+
+				if err := cs.CoreV1().Nodes().Delete(ctx, "worker-0", metav1.DeleteOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				a.maybeRolloutWorkload(kube.WithSweepOverlay(ctx), logr.Discard(), target, rolled, fixedNow)
+				gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+				if gotDep.Spec.Template.Annotations[kube.RestartedAtAnno] == "" || !rolled[wKey] {
+					t.Fatal("post-maintenance call failed — phantom sightings recorded during hold")
+				}
+			},
+		},
+		{
+			name: "StampPersisted_error_keeps_wKey_reserved",
+			run: func(t *testing.T) {
+				fixedNow := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+				target, _, objs := newTargetAndObjs("")
+				cs := fake.NewSimpleClientset(objs...)
+				patchCalls := 0
+				cs.PrependReactor("patch", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+					patchCalls++
+					if patchCalls == 2 { // 1st is RestartTemplatePatch, 2nd is StampPersisted
+						return true, nil, apierrors.NewInternalError(errors.New("stamp failed"))
+					}
+					return false, nil, nil
+				})
+				a := &certDriftAuditor{cs: cs, dyn: cdaDyn(), queue: "live-stamp-err-test"}
+				sctx := kube.WithSweepOverlay(ctx)
+				rolled := map[string]bool{}
+
+				before := testutil.QueueErrorCount(t, a.queue)
+				a.maybeRolloutWorkload(sctx, logr.Discard(), target, rolled, fixedNow)
+
+				if got := testutil.QueueErrorCount(t, a.queue) - before; got != 1 {
+					t.Fatalf("queue error delta = %v, want 1", got)
+				}
+				gotDep, _ := cs.AppsV1().Deployments("apps").Get(ctx, "wh-app", metav1.GetOptions{})
+				if gotDep.Spec.Template.Annotations[kube.RestartedAtAnno] == "" || !rolled[wKey] {
+					t.Fatal("expected rollout to succeed when 1st patch succeeded")
+				}
+				if kube.TryReserveWorkloadKey(sctx, wKey) {
+					t.Fatal("wKey must NOT be released when patchFn succeeded and only StampPersisted failed")
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, tc.run)
+	}
+}
+
+func genTLSTestCert(t *testing.T, serial int64, cn string, isCA bool, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) ([]byte, *ecdsa.PrivateKey, *x509.Certificate) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		DNSNames:              []string{cn},
+		BasicConstraintsValid: true,
+		IsCA:                  isCA,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+	}
+	if isCA {
+		tmpl.KeyUsage |= x509.KeyUsageCertSign
+	} else {
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
+	signerCert := tmpl
+	signerKey := priv
+	if parent != nil && parentKey != nil {
+		signerCert = parent
+		signerKey = parentKey
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, signerCert, &priv.PublicKey, signerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der, priv, parsed
+}
+
+func startLoopbackTLSServer(t *testing.T, cfg *tls.Config) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		_ = ln.Close()
+		wg.Wait()
+	})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer wg.Done()
+				defer func() { _ = c.Close() }()
+				tc := tls.Server(c, cfg)
+				_ = tc.Handshake()
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestDefaultLiveCertProber exercises loopback TLS/TCP dialing, leaf
+// extraction from a chain, SNI propagation, closed-port errors,
+// non-TLS/EOF listeners, and context handshake timeouts.
+func TestDefaultLiveCertProber(t *testing.T) {
+	leafDER, leafKey, _ := genTLSTestCert(t, 101, "leaf.apps.svc", false, nil, nil)
+	leafTLSCert := tls.Certificate{
+		Certificate: [][]byte{leafDER},
+		PrivateKey:  leafKey,
+	}
+
+	caDER, caKey, caCert := genTLSTestCert(t, 900, "test-root-ca", true, nil, nil)
+	chainLeafDER, chainLeafKey, _ := genTLSTestCert(t, 102, "chain-leaf.apps.svc", false, caCert, caKey)
+	chainTLSCert := tls.Certificate{
+		Certificate: [][]byte{chainLeafDER, caDER},
+		PrivateKey:  chainLeafKey,
+	}
+
+	cases := []struct {
+		name         string
+		setup        func(t *testing.T) (addr, serverName string, probeCtx context.Context, verify func(t *testing.T, cert *x509.Certificate, err error))
+		wantDuration time.Duration
+	}{
+		{
+			name: "valid_self_signed_leaf",
+			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
+				addr := startLoopbackTLSServer(t, &tls.Config{Certificates: []tls.Certificate{leafTLSCert}})
+				return addr, "leaf.apps.svc", ctx, func(t *testing.T, got *x509.Certificate, err error) {
+					if err != nil {
+						t.Fatalf("unexpected err: %v", err)
+					}
+					if got == nil || got.SerialNumber.Int64() != 101 || got.Subject.CommonName != "leaf.apps.svc" {
+						t.Fatalf("got cert = %+v, want serial=101 CN=leaf.apps.svc", got)
+					}
+				}
+			},
+		},
+		{
+			name: "cert_chain_returns_leaf_not_ca",
+			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
+				addr := startLoopbackTLSServer(t, &tls.Config{Certificates: []tls.Certificate{chainTLSCert}})
+				return addr, "chain-leaf.apps.svc", ctx, func(t *testing.T, got *x509.Certificate, err error) {
+					if err != nil {
+						t.Fatalf("unexpected err: %v", err)
+					}
+					if got == nil || got.SerialNumber.Int64() != 102 || got.Subject.CommonName != "chain-leaf.apps.svc" {
+						t.Fatalf("got cert = %+v, want leaf serial=102 CN=chain-leaf.apps.svc (not CA 900)", got)
+					}
+				}
+			},
+		},
+		{
+			name: "sni_server_name_propagated",
+			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
+				var mu sync.Mutex
+				var gotSNI string
+				addr := startLoopbackTLSServer(t, &tls.Config{
+					GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+						mu.Lock()
+						gotSNI = chi.ServerName
+						mu.Unlock()
+						return &leafTLSCert, nil
+					},
+				})
+				return addr, "webhook.apps.svc", ctx, func(t *testing.T, got *x509.Certificate, err error) {
+					if err != nil {
+						t.Fatalf("unexpected err: %v", err)
+					}
+					mu.Lock()
+					sni := gotSNI
+					mu.Unlock()
+					if sni != "webhook.apps.svc" {
+						t.Fatalf("got SNI = %q, want %q", sni, "webhook.apps.svc")
+					}
+					if got == nil || got.SerialNumber.Int64() != 101 {
+						t.Fatalf("got cert = %+v, want serial 101", got)
+					}
+				}
+			},
+		},
+		{
+			name: "empty_sni_allowed",
+			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
+				var mu sync.Mutex
+				gotSNI := "unset"
+				addr := startLoopbackTLSServer(t, &tls.Config{
+					GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+						mu.Lock()
+						gotSNI = chi.ServerName
+						mu.Unlock()
+						return &leafTLSCert, nil
+					},
+				})
+				return addr, "", ctx, func(t *testing.T, got *x509.Certificate, err error) {
+					if err != nil {
+						t.Fatalf("unexpected err: %v", err)
+					}
+					mu.Lock()
+					sni := gotSNI
+					mu.Unlock()
+					if sni != "" {
+						t.Fatalf("got SNI = %q, want empty", sni)
+					}
+					if got == nil || got.SerialNumber.Int64() != 101 {
+						t.Fatalf("got cert = %+v, want serial 101", got)
+					}
+				}
+			},
+		},
+		{
+			name: "dial_error_closed_port",
+			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				addr := ln.Addr().String()
+				_ = ln.Close()
+				return addr, "closed.apps.svc", ctx, func(t *testing.T, got *x509.Certificate, err error) {
+					if err == nil || got != nil {
+						t.Fatalf("expected dial error on closed port, got cert=%+v err=%v", got, err)
+					}
+				}
+			},
+		},
+		{
+			name: "non_tls_plaintext_server",
+			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var wg sync.WaitGroup
+				t.Cleanup(func() {
+					_ = ln.Close()
+					wg.Wait()
+				})
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						c, err := ln.Accept()
+						if err != nil {
+							return
+						}
+						_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+						_ = c.Close()
+					}
+				}()
+				return ln.Addr().String(), "plain.apps.svc", ctx, func(t *testing.T, got *x509.Certificate, err error) {
+					if err == nil || got != nil {
+						t.Fatalf("expected TLS error on plaintext server, got cert=%+v err=%v", got, err)
+					}
+				}
+			},
+		},
+		{
+			name: "eof_immediate_close",
+			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var wg sync.WaitGroup
+				t.Cleanup(func() {
+					_ = ln.Close()
+					wg.Wait()
+				})
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						c, err := ln.Accept()
+						if err != nil {
+							return
+						}
+						_ = c.Close()
+					}
+				}()
+				return ln.Addr().String(), "eof.apps.svc", ctx, func(t *testing.T, got *x509.Certificate, err error) {
+					if err == nil || got != nil {
+						t.Fatalf("expected EOF error on immediate close, got cert=%+v err=%v", got, err)
+					}
+				}
+			},
+		},
+		{
+			name:         "handshake_timeout_via_context",
+			wantDuration: 500 * time.Millisecond,
+			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				stop := make(chan struct{})
+				var wg sync.WaitGroup
+				t.Cleanup(func() {
+					close(stop)
+					_ = ln.Close()
+					wg.Wait()
+				})
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						c, err := ln.Accept()
+						if err != nil {
+							return
+						}
+						wg.Add(1)
+						go func(conn net.Conn) {
+							defer wg.Done()
+							<-stop
+							_ = conn.Close()
+						}(c)
+					}
+				}()
+				pctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+				t.Cleanup(cancel)
+				return ln.Addr().String(), "stall.apps.svc", pctx, func(t *testing.T, got *x509.Certificate, err error) {
+					if !errors.Is(err, context.DeadlineExceeded) || got != nil {
+						t.Fatalf("expected DeadlineExceeded and nil cert, got cert=%+v err=%v", got, err)
+					}
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, sni, pctx, verify := tc.setup(t)
+			start := time.Now()
+			got, err := defaultLiveCertProber(pctx, addr, sni)
+			if tc.wantDuration > 0 && time.Since(start) >= tc.wantDuration {
+				t.Fatalf("probe elapsed = %v, want < %v", time.Since(start), tc.wantDuration)
+			}
+			verify(t, got, err)
+		})
+	}
+}
+
+func TestAddMutatingWebhookRefs(t *testing.T) {
+	portPtr := func(p int32) *int32 { return &p }
+	strPtr := func(s string) *string { return &s }
+
+	cases := []struct {
+		name string
+		ws   []admissionv1.MutatingWebhook
+		want map[string]int32
+	}{
+		{
+			name: "nil_webhooks",
+			ws:   nil,
+			want: map[string]int32{},
+		},
+		{
+			name: "empty_webhooks",
+			ws:   []admissionv1.MutatingWebhook{},
+			want: map[string]int32{},
+		},
+		{
+			name: "url_only_ignored",
+			ws: []admissionv1.MutatingWebhook{{
+				Name:         "ext.webhook.io",
+				ClientConfig: admissionv1.WebhookClientConfig{URL: strPtr("https://ext.example/mutate")},
+			}},
+			want: map[string]int32{},
+		},
+		{
+			name: "service_with_port_and_path",
+			ws: []admissionv1.MutatingWebhook{{
+				Name: "svc.webhook.io",
+				ClientConfig: admissionv1.WebhookClientConfig{
+					Service: &admissionv1.ServiceReference{
+						Namespace: "apps", Name: "wh-svc", Port: portPtr(8443), Path: strPtr("/mutate"),
+					},
+				},
+			}},
+			want: map[string]int32{"apps/wh-svc": 8443},
+		},
+		{
+			name: "service_nil_port_stores_zero",
+			ws: []admissionv1.MutatingWebhook{{
+				Name: "nilport.webhook.io",
+				ClientConfig: admissionv1.WebhookClientConfig{
+					Service: &admissionv1.ServiceReference{
+						Namespace: "apps", Name: "wh-svc", Port: nil,
+					},
+				},
+			}},
+			want: map[string]int32{"apps/wh-svc": 0},
+		},
+		{
+			name: "empty_namespace_or_name_skipped",
+			ws: []admissionv1.MutatingWebhook{
+				{
+					Name: "no-ns.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "", Name: "svc", Port: portPtr(443)},
+					},
+				},
+				{
+					Name: "no-name.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "apps", Name: "", Port: portPtr(443)},
+					},
+				},
+			},
+			want: map[string]int32{},
+		},
+		{
+			name: "dedup_zero_upgraded_by_nonzero_port",
+			ws: []admissionv1.MutatingWebhook{
+				{
+					Name: "first.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "apps", Name: "wh", Port: nil},
+					},
+				},
+				{
+					Name: "second.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "apps", Name: "wh", Port: portPtr(9443)},
+					},
+				},
+			},
+			want: map[string]int32{"apps/wh": 9443},
+		},
+		{
+			name: "dedup_nonzero_preserved_over_nil_and_later_nonzero",
+			ws: []admissionv1.MutatingWebhook{
+				{
+					Name: "first.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "apps", Name: "wh", Port: portPtr(8443)},
+					},
+				},
+				{
+					Name: "second.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "apps", Name: "wh", Port: nil},
+					},
+				},
+				{
+					Name: "third.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "apps", Name: "wh", Port: portPtr(9443)},
+					},
+				},
+			},
+			want: map[string]int32{"apps/wh": 8443},
+		},
+		{
+			name: "multiple_services_mixed_url_and_service",
+			ws: []admissionv1.MutatingWebhook{
+				{
+					Name:         "url.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{URL: strPtr("https://ext.example/mutate")},
+				},
+				{
+					Name: "svc1.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "ns1", Name: "s1", Port: portPtr(443)},
+					},
+				},
+				{
+					Name: "svc2.webhook.io",
+					ClientConfig: admissionv1.WebhookClientConfig{
+						Service: &admissionv1.ServiceReference{Namespace: "ns2", Name: "s2", Port: nil},
+					},
+				},
+			},
+			want: map[string]int32{"ns1/s1": 443, "ns2/s2": 0},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			refs := map[string]int32{}
+			addMutatingWebhookRefs(refs, tc.ws)
+			if !reflect.DeepEqual(refs, tc.want) {
+				t.Fatalf("refs = %v, want %v", refs, tc.want)
+			}
+		})
 	}
 }

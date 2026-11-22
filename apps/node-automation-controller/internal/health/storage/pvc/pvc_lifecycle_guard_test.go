@@ -7,6 +7,10 @@ package pvc
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +21,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
@@ -452,4 +458,45 @@ func TestPVCLifecycleSkipsPodListOnEmptyCluster(t *testing.T) {
 	if !res.Pass || res.Infra != nil {
 		t.Fatalf("empty cluster must pass without touching pods: %+v", res)
 	}
+}
+
+func TestPVCLifecycleStorageClassListUsesRV0(t *testing.T) {
+	now := time.Now().UTC()
+	var scRV string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/persistentvolumeclaims"):
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"apiVersion":"v1","kind":"PersistentVolumeClaimList","items":[{"metadata":{"namespace":"apps","name":"pvc-pend","creationTimestamp":%q},"spec":{"storageClassName":"fast"},"status":{"phase":"Pending"}}]}`,
+				now.Add(-15*time.Minute).Format(time.RFC3339))))
+		case strings.HasSuffix(r.URL.Path, "/pods"):
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"PodList","items":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/events"):
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"EventList","items":[]}`))
+		case strings.HasSuffix(r.URL.Path, "/storageclasses"):
+			scRV = r.URL.Query().Get("resourceVersion")
+			_, _ = w.Write([]byte(`{"apiVersion":"storage.k8s.io/v1","kind":"StorageClassList","items":[{"metadata":{"name":"fast"}}]}`))
+		case strings.HasSuffix(r.URL.Path, "/persistentvolumes"):
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"PersistentVolumeList","items":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cs, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := probetest.NewDeps(cs, nil)
+	probetest.FreezeNow(d, now)
+	chk := NewPVCLifecycleGuardCheck(d)
+	res := chk.Run(probetest.SweepCtx(ctx, d))
+	if res.Infra != nil {
+		t.Fatalf("unexpected Infra error: %+v", res)
+	}
+	if scRV != "0" {
+		t.Fatalf("storageclasses resourceVersion = %q, want \"0\"", scRV)
+	}
+	pvcPendingDeadlockGauge.DeleteLabelValues("apps", "pvc-pend", pvcDeadlockPendingTimeout)
 }

@@ -229,6 +229,12 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 			delete(g.backends, ip)
 		}
 	}
+	for ip := range g.peerHighWater {
+		if !slices.Contains(allIPs, ip) {
+			delete(g.peerHighWater, ip)
+			delete(g.peerNodeIPs, ip)
+		}
+	}
 
 	// ---- Quarantine expiry ------------------------------------------
 	// Decided BEFORE the min-backends gate: the expiry only shrinks
@@ -237,6 +243,10 @@ func (g *apiServerEndpointGuard) evaluateBackends(ctx context.Context,
 	// bookkeeping can never deadlock behind the early return.
 	toExpire := expireQuarantine(log, g.backends, activeIPs, quarantinedIPs)
 	if len(toExpire) > 0 {
+		for _, ip := range toExpire {
+			delete(g.peerHighWater, ip)
+			delete(g.peerNodeIPs, ip)
+		}
 		g.memQuarantine = maps.Clone(quarantinedIPs)
 		g.quarantineActive = len(quarantinedIPs) > 0
 	}
@@ -276,7 +286,9 @@ func (g *apiServerEndpointGuard) decideQuarantine(log logr.Logger,
 		}
 	}
 	for _, ip := range activeIPs { // activeIPs is sorted
-		if !results[ip].wedged {
+		relistedQuarantined := quarantinedIPs[ip] &&
+			(g.backends[ip] == nil || g.backends[ip].okStreak < endpointGuardRecoverCyc)
+		if !results[ip].wedged && !relistedQuarantined {
 			continue
 		}
 		if healthyActive < 1 {

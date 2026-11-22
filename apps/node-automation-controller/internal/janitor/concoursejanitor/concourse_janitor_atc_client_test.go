@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -297,6 +298,127 @@ func TestATCClientReLoginFailureErrors(t *testing.T) {
 	if s.tokenPOSTs != 2 || len(s.workerCalls) != 1 {
 		t.Fatalf("token POSTs = %d, worker calls = %d; want 2/1 (no retry after failed re-login)",
 			s.tokenPOSTs, len(s.workerCalls))
+	}
+}
+
+// OAuth2 token responses are bounded to maxATCTokenBytes (64 KiB): an
+// exact 64 KiB payload succeeds, while 64 KiB + 1 (even with a valid
+// JSON prefix followed by trailing whitespace or extra data) is rejected.
+func TestATCClientTokenReadCap(t *testing.T) {
+	padTo := func(prefix string, target int) string {
+		if len(prefix) > target {
+			t.Fatalf("prefix %d > target %d", len(prefix), target)
+		}
+		return prefix + strings.Repeat(" ", target-len(prefix))
+	}
+	baseToken := `{"access_token":"tok-cap","token_type":"Bearer"}`
+
+	t.Run("exact 64 KiB passes", func(t *testing.T) {
+		rec := &atcRecorder{
+			tokenCode: http.StatusOK,
+			tokenBody: padTo(baseToken, maxATCTokenBytes),
+		}
+		srv := httptest.NewServer(rec.handler())
+		defer srv.Close()
+		c := newATCClient(srv.URL, srv.Client())
+		if err := c.login(ctx, "admin", "pw"); err != nil {
+			t.Fatalf("exact limit login failed: %v", err)
+		}
+		if c.token != "Bearer tok-cap" {
+			t.Fatalf("token = %q, want Bearer tok-cap", c.token)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"valid JSON prefix + trailing whitespace at limit+1", padTo(baseToken, maxATCTokenBytes+1)},
+		{"valid JSON prefix + trailing token at limit+1", padTo(baseToken, maxATCTokenBytes) + "{}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &atcRecorder{
+				tokenCode: http.StatusOK,
+				tokenBody: tc.body,
+			}
+			srv := httptest.NewServer(rec.handler())
+			defer srv.Close()
+			c := newATCClient(srv.URL, srv.Client())
+			err := c.login(ctx, "admin", "pw")
+			if err == nil {
+				t.Fatal("expected oversized token response to be rejected")
+			}
+			if !strings.Contains(err.Error(), "limit") {
+				t.Fatalf("expected size-limit error, got %v", err)
+			}
+		})
+	}
+}
+
+// ATC API JSON responses are bounded to maxATCAPIBytes (4 MiB): an
+// exact 4 MiB payload succeeds, while 4 MiB + 1 (even with a valid JSON
+// prefix) fails cleanly without triggering a 401 re-login.
+func TestATCClientAPIReadCap(t *testing.T) {
+	padTo := func(prefix string, target int) string {
+		if len(prefix) > target {
+			t.Fatalf("prefix %d > target %d", len(prefix), target)
+		}
+		return prefix + strings.Repeat(" ", target-len(prefix))
+	}
+	baseWorkers := `[{"name":"w1","state":"landed"}]`
+
+	t.Run("exact 4 MiB passes", func(t *testing.T) {
+		rec := &atcRecorder{
+			tokenCode: http.StatusOK,
+			tokenBody: `{"access_token":"tok-ok","token_type":"Bearer"}`,
+			workers:   padTo(baseWorkers, maxATCAPIBytes),
+		}
+		srv := httptest.NewServer(rec.handler())
+		defer srv.Close()
+		c := newATCClient(srv.URL, srv.Client())
+		if err := c.login(ctx, "admin", "pw"); err != nil {
+			t.Fatal(err)
+		}
+		st, err := c.workerState(ctx, "w1")
+		if err != nil || st != "landed" {
+			t.Fatalf("workerState at exact limit = (%q, %v), want (landed, nil)", st, err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"valid JSON prefix + trailing whitespace at limit+1", padTo(baseWorkers, maxATCAPIBytes+1)},
+		{"valid JSON prefix + extra element at limit+1", strings.Repeat(" ", maxATCAPIBytes-len(baseWorkers)+1) + baseWorkers},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var tokenPOSTs atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				switch req.URL.Path {
+				case "/sky/issuer/token":
+					tokenPOSTs.Add(1)
+					_, _ = w.Write([]byte(`{"access_token":"tok-ok","token_type":"Bearer"}`))
+				case "/api/v1/workers":
+					_, _ = w.Write([]byte(tc.body))
+				}
+			}))
+			defer srv.Close()
+			c := newATCClient(srv.URL, srv.Client())
+			if err := c.login(ctx, "admin", "pw"); err != nil {
+				t.Fatal(err)
+			}
+			_, err := c.workerState(ctx, "w1")
+			if err == nil {
+				t.Fatal("expected oversized API response to be rejected")
+			}
+			if !strings.Contains(err.Error(), "limit") {
+				t.Fatalf("expected size-limit error, got %v", err)
+			}
+			if got := tokenPOSTs.Load(); got != 1 {
+				t.Fatalf("tokenPOSTs = %d, want 1 (oversized 200 must not trigger 401 re-login)", got)
+			}
+		})
 	}
 }
 

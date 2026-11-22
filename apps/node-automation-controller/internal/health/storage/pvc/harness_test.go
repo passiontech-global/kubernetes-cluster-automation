@@ -21,6 +21,7 @@ var ctx = context.Background()
 var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewPVCResizeStallGuardCheck,
 	NewPVCLifecycleGuardCheck,
+	NewVolumeSnapshotLifecycleGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

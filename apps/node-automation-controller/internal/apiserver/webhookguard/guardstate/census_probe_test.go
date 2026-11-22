@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -185,37 +186,59 @@ func TestWebhookBackendServices(t *testing.T) {
 }
 
 func TestResolveSlicePortPref(t *testing.T) {
-	svc := func(name string, ports ...corev1.ServicePort) *corev1.Service {
+	svc := func(ns, name string, ports ...corev1.ServicePort) *corev1.Service {
 		return &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name},
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
 			Spec:       corev1.ServiceSpec{Ports: ports},
 		}
 	}
 	snap := &Snapshot{Services: []corev1.Service{
-		*svc("webhook",
+		*svc("ns", "webhook",
 			corev1.ServicePort{Name: "Webhook", Port: 8443, TargetPort: intstr.FromInt32(9443)},
 			corev1.ServicePort{Name: "metrics", Port: 9090, TargetPort: intstr.FromInt32(9090)}),
-		*svc("str", corev1.ServicePort{Port: 8443, TargetPort: intstr.FromString("tls-svc")}),
+		*svc("ns2", "webhook",
+			corev1.ServicePort{Name: "alt-tls", Port: 8443, TargetPort: intstr.FromInt32(10443)}),
+		*svc("ns", "str", corev1.ServicePort{Port: 8443, TargetPort: intstr.FromString("tls-svc")}),
 	}}
-	pref := resolveSlicePortPref(snap, "ns/webhook", []int32{8443})
+	svcIndex := indexServices(snap.Services)
+	pref := resolveSlicePortPref(svcIndex, "ns/webhook", []int32{8443})
 	if !pref.names["https"] || !pref.names["webhook"] || !pref.names["tls"] {
 		t.Fatalf("conventional names missing: %v", pref.names)
 	}
 	if !pref.names["webhook"] || !pref.numbers[9443] {
 		t.Fatalf("declared port mapping missing: names=%v numbers=%v", pref.names, pref.numbers)
 	}
-	if pref.numbers[9090] {
-		t.Fatalf("undeclared port leaked into pref: names=%v numbers=%v", pref.names, pref.numbers)
+	if pref.numbers[9090] || pref.numbers[10443] {
+		t.Fatalf("undeclared or cross-namespace port leaked into pref: names=%v numbers=%v", pref.names, pref.numbers)
+	}
+	// Same-named Service in another namespace resolves independently.
+	pref2 := resolveSlicePortPref(svcIndex, "ns2/webhook", []int32{8443})
+	if !pref2.names["alt-tls"] || !pref2.numbers[10443] || pref2.numbers[9443] {
+		t.Fatalf("cross-namespace service lookup mismatch: names=%v numbers=%v", pref2.names, pref2.numbers)
 	}
 	// String targetPort resolves to a name.
-	pref = resolveSlicePortPref(snap, "ns/str", []int32{8443})
+	pref = resolveSlicePortPref(svcIndex, "ns/str", []int32{8443})
 	if !pref.names["tls-svc"] {
 		t.Fatalf("string targetPort not resolved into names: %v", pref.names)
 	}
 	// Unresolvable Service degrades to name matching alone.
-	pref = resolveSlicePortPref(snap, "ns/missing", []int32{8443})
+	pref = resolveSlicePortPref(svcIndex, "ns/missing", []int32{8443})
 	if len(pref.numbers) != 0 || len(pref.names) != len(webhookPortNames) {
 		t.Fatalf("unresolvable service pref = %v/%v, want names-only", pref.names, pref.numbers)
+	}
+	// Malformed key (missing "/") and nil index degrade cleanly.
+	for _, tc := range []struct {
+		name string
+		idx  map[string]*corev1.Service
+		key  string
+	}{
+		{"malformed key", svcIndex, "bogus"},
+		{"nil index", nil, "ns/webhook"},
+	} {
+		p := resolveSlicePortPref(tc.idx, tc.key, []int32{8443})
+		if len(p.numbers) != 0 || len(p.names) != len(webhookPortNames) {
+			t.Fatalf("%s: pref = %v/%v, want names-only", tc.name, p.names, p.numbers)
+		}
 	}
 }
 
@@ -323,6 +346,87 @@ func TestTCPTLSEndpointProber(t *testing.T) {
 	cancel()
 	if tcpTLSEndpointProber(ctx, host, port) {
 		t.Fatal("probe with cancelled context must fail")
+	}
+}
+
+// A pod whose TCP Accept() succeeds but never answers the TLS ClientHello
+// (hung event loop / brownout) must still time out at tlsProbeTimeout (2s)
+// even when the parent context has no short deadline, and readyEndpointCounts
+// must record the service as Probed=true, Responsive=false.
+func TestTCPTLSEndpointProberHandshakeTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+	})
+	go func() {
+		for {
+			c, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+
+	host, portStr, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var port int32
+	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	ok := tcpTLSEndpointProber(t.Context(), host, port)
+	elapsed := time.Since(start)
+	if ok {
+		t.Fatal("expected stalled TLS handshake to return false")
+	}
+	if elapsed >= 4*time.Second {
+		t.Fatalf("stalled TLS handshake took %s, expected <= 2s timeout", elapsed)
+	}
+
+	// Verify end-to-end recording through readyEndpointCounts with default prober.
+	up := true
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns", Name: "stalled-slice",
+			Labels: map[string]string{discoveryv1.LabelServiceName: "svc"},
+		},
+		Ports: []discoveryv1.EndpointPort{{Port: new(port), Name: new("https")}},
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{host},
+			Conditions: discoveryv1.EndpointConditions{Ready: &up},
+		}},
+	}
+	g := &Guard{CS: fake.NewSimpleClientset(slice)}
+	snap := &Snapshot{
+		G:              g,
+		Ctx:            t.Context(),
+		MWC:            gsInjMWC("hook.example.com", nil, "ns", "svc", ""),
+		VWC:            &admissionv1.ValidatingWebhookConfigurationList{},
+		UnhealthyNodes: map[string]bool{},
+	}
+	ready, err := g.readyEndpointCounts(t.Context(), snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ready.Probed["ns/svc"] || ready.Responsive["ns/svc"] {
+		t.Fatalf("stalled listener recording = Probed:%v Responsive:%v, want Probed:true Responsive:false",
+			ready.Probed["ns/svc"], ready.Responsive["ns/svc"])
 	}
 }
 

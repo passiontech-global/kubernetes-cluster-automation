@@ -250,17 +250,7 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 	if kube.IsIntentionallyDownscaled(annotations, replicas) {
 		return false
 	}
-	// spec.replicas is Git-owned on Flux-managed workloads. Writing
-	// it here without the loop gate would ping-pong with Flux every
-	// sweep on a workload Git intentionally parked at zero.
-	if targetObj != nil && !heal.FluxPatchGate(strings.ToLower(kind),
-		targetObj, ns+"/"+target, now) {
-		log.Info("SKIP: hpa cold-start rescue blocked by flux conflict gate",
-			"target", kind+" "+ns+"/"+target)
-		return false
-	}
-
-	ck := probefw.SelfHealKey(CheckNameHPAScalingGuard, "rescue/"+ns+"/"+target)
+	ck := probefw.SelfHealKey(CheckNameHPAScalingGuard, "rescue/"+ns+"/"+kind+"/"+target)
 	proceed, unverifiable := p.HealAllowed(ctx, log,
 		&p.Heals, ck, hpaRescueCooldown, now)
 	if unverifiable {
@@ -272,6 +262,16 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 	}
 	// The gate consumed the grant — from here on every clean bailout
 	// must hand it back (below), otherwise it stays spent.
+	// spec.replicas is Git-owned on Flux-managed workloads. Writing
+	// it here without the loop gate would ping-pong with Flux every
+	// sweep on a workload Git intentionally parked at zero.
+	if targetObj != nil && !heal.FluxPatchGate(strings.ToLower(kind),
+		targetObj, CheckNameHPAScalingGuard+":"+ns+"/"+kind+"/"+target, now) {
+		heal.RefundGrant(now) // Flux gate denied — no patch attempted
+		log.Info("SKIP: hpa cold-start rescue blocked by flux conflict gate",
+			"target", kind+" "+ns+"/"+target)
+		return false
+	}
 	// metadata.resourceVersion pins the write — a legitimate
 	// scale-up landing between the census read and this patch
 	// becomes a 409 instead of a silent revert to the rescue floor.

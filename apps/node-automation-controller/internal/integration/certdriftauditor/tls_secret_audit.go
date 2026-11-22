@@ -226,15 +226,18 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	case !proceed:
 		return
 	}
-	// Quorum guard + SSA ping-pong defense, same pairing as every
-	// workload restart: the slot keeps a sibling pod-delete check
-	// from double-booking linkerd-identity this sweep, and the Flux
-	// gate keeps a GitOps-owned Deployment from being fought —
+	// SSA ping-pong defense + quorum guard, same pairing as every
+	// workload restart: the Flux gate keeps a GitOps-owned Deployment
+	// from being fought (before reserving the sweep slot so a denial
+	// cannot leak ownerDisrupt), and the slot keeps a sibling
+	// pod-delete check from double-booking linkerd-identity this sweep —
 	// either denial refunds the heal grant (no mutation executed).
-	if !kube.TryReserveWorkloadKey(ctx,
-		kube.LinkerdNS+"/Deployment/"+kube.LinkerdIdentityName) ||
-		!heal.FluxPatchGate("deployment", deploy,
-			kube.LinkerdNS+"/"+kube.LinkerdIdentityName, now) {
+	wKey := kube.LinkerdNS + "/Deployment/" + kube.LinkerdIdentityName
+	if !heal.FluxPatchGate("deployment", deploy, "tls-secret-audit:"+wKey, now) {
+		heal.RefundGrant(now)
+		return
+	}
+	if !kube.TryReserveWorkloadKey(ctx, wKey) {
 		heal.RefundGrant(now)
 		return
 	}
@@ -246,6 +249,7 @@ func (a *certDriftAuditor) auditLinkerdIssuer(ctx context.Context, s *corev1.Sec
 	if _, err := a.cs.AppsV1().Deployments(kube.LinkerdNS).Patch(ctx, kube.LinkerdIdentityName,
 		types.StrategicMergePatchType, kube.RestartTemplatePatch(now),
 		metav1.PatchOptions{}); err != nil {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		if apierrors.IsNotFound(err) {
 			// The Deployment vanished between the Get above and this
 			// Patch: no mutation landed, so the maintenance/budget

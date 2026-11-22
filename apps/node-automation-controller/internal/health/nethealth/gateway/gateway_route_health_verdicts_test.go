@@ -17,6 +17,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -118,8 +119,8 @@ func TestGatewayLoadGrantsMemoizesPerCensus(t *testing.T) {
 	c := newGatewayRouteCensus()
 	chk.loadGrants(ctx, logr.Discard(), c)
 	chk.loadGrants(ctx, logr.Discard(), c)
-	if lists != len(referenceGrantGVRs) {
-		t.Fatalf("referencegrants listed %d times, want %d — once per served version", lists, len(referenceGrantGVRs))
+	if lists != len(kube.ReferenceGrantGVRs) {
+		t.Fatalf("referencegrants listed %d times, want %d — once per served version", lists, len(kube.ReferenceGrantGVRs))
 	}
 }
 

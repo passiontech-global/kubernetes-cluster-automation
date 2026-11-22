@@ -122,9 +122,12 @@ func WithSweepOverlay(ctx context.Context) context.Context {
 }
 
 // sweepOverlay resolves the ctx-carried overlay, or nil outside a
-// sweep — every public helper branches on this so the no-overlay
-// path costs one ctx lookup and nothing else.
+// sweep (or when ctx is nil) — every public helper branches on this so
+// the no-overlay path costs one ctx lookup and nothing else.
 func sweepOverlay(ctx context.Context) *SweepOverlay {
+	if ctx == nil {
+		return nil
+	}
 	if ov, ok := ctx.Value(sweepOverlayCtxKey{}).(*SweepOverlay); ok {
 		return ov
 	}
@@ -622,6 +625,26 @@ func TryReserveWorkloadKey(ctx context.Context, key string) bool {
 	}
 	ov.ownerDisrupt[key] = struct{}{}
 	return true
+}
+
+// ReleaseWorkloadKey is the key-addressed twin of
+// ReleaseWorkloadDisruption: it releases a workload disruption slot
+// previously claimed by TryReserveWorkloadKey when the caller aborts
+// before executing a mutation (e.g., FluxPatchGate denial or a failed
+// Patch call). No-op when ctx is nil, outside a sweep, for key == "",
+// or when key is absent. Callers must only invoke this on failure paths
+// where their own TryReserveWorkloadKey call returned true.
+func ReleaseWorkloadKey(ctx context.Context, key string) {
+	if ctx == nil || key == "" {
+		return
+	}
+	ov := sweepOverlay(ctx)
+	if ov == nil {
+		return
+	}
+	ov.mu.Lock()
+	delete(ov.ownerDisrupt, key)
+	ov.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------

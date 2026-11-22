@@ -15,6 +15,25 @@ import (
 	"strings"
 )
 
+const (
+	maxATCTokenBytes = 64 << 10 // 64 KiB OAuth2 token response cap
+	maxATCAPIBytes   = 4 << 20  // 4 MiB ATC API response cap
+)
+
+// decodeBoundedJSON reads at most maxBytes+1 bytes from r so an
+// oversized payload (even one with a valid JSON prefix) is rejected
+// explicitly rather than silently truncated or allowed to OOM.
+func decodeBoundedJSON(r io.Reader, maxBytes int64, out any) error {
+	body, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) > maxBytes {
+		return fmt.Errorf("response body exceeds %d byte limit", maxBytes)
+	}
+	return json.Unmarshal(body, out)
+}
+
 // atcClient is the production atcIface.
 type atcClient struct {
 	base  string
@@ -77,7 +96,7 @@ func (c *atcClient) login(ctx context.Context, user, pass string) error {
 	var tok struct {
 		AccessToken string `json:"access_token"`
 	}
-	if err := json.UnmarshalRead(resp.Body, &tok); err != nil {
+	if err := decodeBoundedJSON(resp.Body, maxATCTokenBytes, &tok); err != nil {
 		return fmt.Errorf("atc token decode: %w", err)
 	}
 	if tok.AccessToken == "" {
@@ -178,5 +197,5 @@ func (c *atcClient) atcDo(ctx context.Context, method, endpoint string, out any)
 	if out == nil {
 		return resp.StatusCode, nil
 	}
-	return resp.StatusCode, json.UnmarshalRead(resp.Body, out)
+	return resp.StatusCode, decodeBoundedJSON(resp.Body, maxATCAPIBytes, out)
 }

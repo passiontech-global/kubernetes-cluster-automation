@@ -201,7 +201,10 @@ func (c *pvcLifecycleGuardCheck) scanPVCsAndFSGroup(
 	scKnown := false
 	if len(pendingPVCs) > 0 {
 		scs, scErr := kube.ListAll(ctx,
-			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			metav1.ListOptions{
+				Limit:           kube.DefaultListPageSize,
+				ResourceVersion: "0",
+			},
 			kube.StorageClasses(c.CS))
 		switch {
 		case scErr == nil:

@@ -5,11 +5,25 @@ package apiserverendpointguard
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/rest"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -359,4 +373,290 @@ func TestTransportReturnsCachedRT(t *testing.T) {
 	if rt != cached {
 		t.Fatal("transport() rebuilt the RoundTripper instead of returning the cached one")
 	}
+}
+
+func TestEndpointGuardTransportTLS(t *testing.T) {
+	newCA := func(cn string) (*x509.Certificate, *ecdsa.PrivateKey, []byte) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(1),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		return cert, key, caPEM
+	}
+
+	newLeaf := func(ca *x509.Certificate, caKey *ecdsa.PrivateKey, dnsNames []string, ips []net.IP) tls.Certificate {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(2),
+			Subject:      pkix.Name{CommonName: "kube-apiserver"},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			DNSNames:     dnsNames,
+			IPAddresses:  ips,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyDER, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+		tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tlsCert
+	}
+
+	trustedCA, trustedKey, trustedCAPEM := newCA("trusted-cluster-ca")
+	rogueCA, rogueKey, _ := newCA("rogue-mitm-ca")
+
+	startTLS := func(cert tls.Certificate, gotAuth *string, hits *int) *httptest.Server {
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			*hits++
+			*gotAuth = r.Header.Get("Authorization")
+			_, _ = w.Write([]byte(testutil.ProbeRVJSON(99)))
+		}))
+		srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+		srv.StartTLS()
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	t.Run("valid CA and kubernetes.default.svc SAN on raw IP dial", func(t *testing.T) {
+		var gotAuth string
+		var hits int
+		// Serving cert has ONLY kubernetes.default.svc (no 127.0.0.1 IP SAN).
+		cert := newLeaf(trustedCA, trustedKey, []string{"kubernetes.default.svc"}, nil)
+		srv := startTLS(cert, &gotAuth, &hits)
+
+		g := &apiServerEndpointGuard{
+			inClusterConfigFn: func() (*rest.Config, error) {
+				return &rest.Config{
+					Host:        srv.URL,
+					BearerToken: "sa-secret",
+					// Pre-set Insecure=true to prove transport() forces Insecure=false.
+					TLSClientConfig: rest.TLSClientConfig{
+						Insecure: true,
+						CAData:   trustedCAPEM,
+					},
+				}, nil
+			},
+		}
+		rt, err := g.transport()
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		client := &http.Client{Transport: rt, Timeout: 5 * time.Second}
+		resp, err := client.Get(srv.URL + "/apis/coordination.k8s.io/v1/leases?limit=1")
+		if err != nil {
+			t.Fatalf("TLS request failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if hits != 1 || gotAuth != "Bearer sa-secret" {
+			t.Fatalf("hits=%d gotAuth=%q, want 1 and Bearer sa-secret", hits, gotAuth)
+		}
+	})
+
+	t.Run("CAFile preserved from InClusterConfig", func(t *testing.T) {
+		var gotAuth string
+		var hits int
+		cert := newLeaf(trustedCA, trustedKey, []string{"kubernetes.default.svc"}, nil)
+		srv := startTLS(cert, &gotAuth, &hits)
+		caPath := filepath.Join(t.TempDir(), "ca.crt")
+		if err := os.WriteFile(caPath, trustedCAPEM, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		g := &apiServerEndpointGuard{
+			inClusterConfigFn: func() (*rest.Config, error) {
+				return &rest.Config{
+					Host:        srv.URL,
+					BearerToken: "sa-file-secret",
+					TLSClientConfig: rest.TLSClientConfig{
+						Insecure: true,
+						CAFile:   caPath,
+					},
+				}, nil
+			},
+		}
+		rt, err := g.transport()
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		resp, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Get(srv.URL)
+		if err != nil {
+			t.Fatalf("TLS request with CAFile failed: %v", err)
+		}
+		_ = resp.Body.Close()
+		if hits != 1 || gotAuth != "Bearer sa-file-secret" {
+			t.Fatalf("hits=%d gotAuth=%q, want 1 and Bearer sa-file-secret", hits, gotAuth)
+		}
+	})
+
+	t.Run("untrusted CA rejected without sending Bearer token", func(t *testing.T) {
+		var gotAuth string
+		var hits int
+		rogueCert := newLeaf(rogueCA, rogueKey, []string{"kubernetes.default.svc"}, []net.IP{net.ParseIP("127.0.0.1")})
+		srv := startTLS(rogueCert, &gotAuth, &hits)
+
+		g := &apiServerEndpointGuard{
+			inClusterConfigFn: func() (*rest.Config, error) {
+				return &rest.Config{
+					Host:            srv.URL,
+					BearerToken:     "sa-secret-never-leak",
+					TLSClientConfig: rest.TLSClientConfig{CAData: trustedCAPEM},
+				}, nil
+			},
+		}
+		rt, err := g.transport()
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		if _, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Get(srv.URL); err == nil {
+			t.Fatal("expected TLS verification error against untrusted CA")
+		}
+		if hits != 0 || gotAuth != "" {
+			t.Fatalf("bearer token leaked to untrusted server: hits=%d auth=%q", hits, gotAuth)
+		}
+	})
+
+	t.Run("wrong SAN rejected even under trusted CA", func(t *testing.T) {
+		var gotAuth string
+		var hits int
+		wrongSANCert := newLeaf(trustedCA, trustedKey, []string{"evil.example.com"}, []net.IP{net.ParseIP("127.0.0.1")})
+		srv := startTLS(wrongSANCert, &gotAuth, &hits)
+
+		g := &apiServerEndpointGuard{
+			inClusterConfigFn: func() (*rest.Config, error) {
+				return &rest.Config{
+					Host:            srv.URL,
+					BearerToken:     "sa-secret-never-leak",
+					TLSClientConfig: rest.TLSClientConfig{CAData: trustedCAPEM},
+				}, nil
+			},
+		}
+		rt, err := g.transport()
+		if err != nil {
+			t.Fatalf("transport: %v", err)
+		}
+		if _, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Get(srv.URL); err == nil {
+			t.Fatal("expected TLS SAN verification error when kubernetes.default.svc missing")
+		}
+		if hits != 0 || gotAuth != "" {
+			t.Fatalf("bearer token leaked on wrong SAN: hits=%d auth=%q", hits, gotAuth)
+		}
+	})
+
+	t.Run("nil config fails closed", func(t *testing.T) {
+		if _, err := probeTransportFromConfig(nil); err == nil {
+			t.Fatal("expected error for nil config")
+		}
+	})
+}
+
+func TestFetchJSONBounds(t *testing.T) {
+	t.Run("200 oversized JSON object rejected within byte bound", func(t *testing.T) {
+		oversized := `{"metadata":{"resourceVersion":"1"},"pad":"` +
+			strings.Repeat("a", endpointGuardMaxBodyBytes+128<<10) + `"}`
+		body := &testutil.TrackingBody{R: strings.NewReader(oversized)}
+		rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: body, Header: http.Header{}}, nil
+		}}
+		if _, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x"); err == nil {
+			t.Fatal("expected oversized response body error")
+		}
+		if !body.Closed {
+			t.Fatal("oversized response body never closed")
+		}
+		maxRead := endpointGuardMaxBodyBytes + 1 + endpointGuardMaxDrainBytes
+		if body.N > maxRead {
+			t.Fatalf("read %d bytes > bound %d", body.N, maxRead)
+		}
+	})
+
+	t.Run("200 valid JSON with oversized trailing data rejected", func(t *testing.T) {
+		prefix := testutil.ProbeRVJSON(42)
+		payload := prefix + strings.Repeat(" ", endpointGuardMaxBodyBytes+128<<10)
+		body := &testutil.TrackingBody{R: strings.NewReader(payload)}
+		rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: body, Header: http.Header{}}, nil
+		}}
+		if _, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x"); err == nil {
+			t.Fatal("expected oversized trailing-data error")
+		}
+		if !body.Closed {
+			t.Fatal("response body never closed")
+		}
+		maxRead := endpointGuardMaxBodyBytes + 1 + endpointGuardMaxDrainBytes
+		if body.N > maxRead {
+			t.Fatalf("read %d bytes > bound %d", body.N, maxRead)
+		}
+	})
+
+	t.Run("200 exact 4 MiB body accepted", func(t *testing.T) {
+		prefix := testutil.ProbeRVJSON(42)
+		payload := prefix + strings.Repeat(" ", endpointGuardMaxBodyBytes-len(prefix))
+		body := &testutil.TrackingBody{R: strings.NewReader(payload)}
+		rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: body, Header: http.Header{}}, nil
+		}}
+		rv, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x")
+		if err != nil {
+			t.Fatalf("exact 4 MiB body rejected: %v", err)
+		}
+		if rv != 42 {
+			t.Fatalf("rv = %d, want 42", rv)
+		}
+		if !body.Closed {
+			t.Fatal("response body never closed")
+		}
+	})
+
+	t.Run("non-200 drain capped at 64 KiB", func(t *testing.T) {
+		payload := strings.Repeat("x", 1<<20) // 1 MiB error body
+		body := &testutil.TrackingBody{R: strings.NewReader(payload)}
+		rt := &testutil.StubTransport{Fn: func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusInternalServerError, Body: body, Header: http.Header{}}, nil
+		}}
+		_, err := fetchListRV(ctx, &http.Client{Transport: rt}, "10.0.0.1", "/x")
+		if err == nil || !strings.Contains(err.Error(), "HTTP 500") {
+			t.Fatalf("expected HTTP 500 error, got %v", err)
+		}
+		if !body.Closed {
+			t.Fatal("response body never closed")
+		}
+		if body.N != endpointGuardMaxDrainBytes {
+			t.Fatalf("drained %d bytes on 500 response, want %d", body.N, endpointGuardMaxDrainBytes)
+		}
+	})
 }

@@ -7,6 +7,8 @@ package watchdogs
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +18,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
@@ -600,6 +604,63 @@ func TestWorkloadAdmissionBlockGuard403GracefulSkipAndHoldSeries(t *testing.T) {
 		}
 		if v, ok := admissionBlockedSeries(t, "team-403-mix", "ReplicaSet", "rs-nots", admissionReasonQuotaExceeded); !ok || v != 1 {
 			t.Fatalf("preserved firstSeen should flag rs-nots at t=6m: v=%v ok=%v", v, ok)
+		}
+	})
+}
+
+func TestWorkloadAdmissionBlockGuardAllTypedReplicaSetsMemoAndRV0(t *testing.T) {
+	t.Run("memoizes AllTypedReplicaSets within a sweep", func(t *testing.T) {
+		cs := fake.NewSimpleClientset()
+		var rsLists int
+		cs.PrependReactor("list", "replicasets", func(ktesting.Action) (bool, runtime.Object, error) {
+			rsLists++
+			return false, nil, nil
+		})
+		p := testProber(cs)
+		chk := probetest.MustCheck[*workloadAdmissionBlockGuardCheck](t, p)
+		sctx := probetest.SweepCtx(ctx, chk.Deps)
+
+		res := chk.Run(sctx)
+		if !res.Pass || res.Infra != nil {
+			t.Fatalf("expected clean pass, got %+v", res)
+		}
+		if _, err := chk.Deps.AllTypedReplicaSets(sctx); err != nil {
+			t.Fatalf("AllTypedReplicaSets in same sweep: %v", err)
+		}
+		if rsLists != 1 {
+			t.Fatalf("replicasets list count = %d, want 1", rsLists)
+		}
+	})
+
+	t.Run("wire request uses ResourceVersion=0", func(t *testing.T) {
+		var rsRV string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/replicasets"):
+				rsRV = r.URL.Query().Get("resourceVersion")
+				_, _ = w.Write([]byte(`{"apiVersion":"apps/v1","kind":"ReplicaSetList","items":[]}`))
+			case strings.HasSuffix(r.URL.Path, "/statefulsets"):
+				_, _ = w.Write([]byte(`{"apiVersion":"apps/v1","kind":"StatefulSetList","items":[]}`))
+			case strings.HasSuffix(r.URL.Path, "/daemonsets"):
+				_, _ = w.Write([]byte(`{"apiVersion":"apps/v1","kind":"DaemonSetList","items":[]}`))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+		cs, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := probetest.NewDeps(cs, nil)
+		chk := NewWorkloadAdmissionBlockGuardCheck(d)
+		res := chk.Run(probetest.SweepCtx(ctx, d))
+		if !res.Pass || res.Infra != nil {
+			t.Fatalf("unexpected result: %+v", res)
+		}
+		if rsRV != "0" {
+			t.Fatalf("replicasets resourceVersion = %q, want \"0\"", rsRV)
 		}
 	})
 }

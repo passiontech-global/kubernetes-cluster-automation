@@ -4,6 +4,7 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -184,4 +185,136 @@ func TestReadPodLogTextZeroBoundsAndScanWorkers(t *testing.T) {
 	if len(res) != 1 || res[0].Err != nil || res[0].Value != "p1" {
 		t.Fatalf("ScanPodLogs(workers=0) = %+v, want [{Value:p1 Err:<nil>}]", res)
 	}
+}
+
+type errAfterReader struct {
+	data []byte
+	off  int
+	err  error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if r.off < len(r.data) {
+		n := copy(p, r.data[r.off:])
+		r.off += n
+		return n, nil
+	}
+	return 0, r.err
+}
+
+// DefaultPodLogMaxBytes caps ReadPodLogText when MaxBytes <= 0 so an
+// unbounded GetLogs stream cannot OOM the controller: ==1 MiB passes
+// verbatim, >1 MiB tail-truncates to <=1 MiB keeping the newest complete
+// timestamped lines, MaxBytes=-1 defaults identically, and explicit
+// positive MaxBytes overrides the default.
+func TestReadPodLogTextDefaultMaxBytes(t *testing.T) {
+	const line = "2024-01-01T00:00:00Z log line padding for 64 byte test record!!\n" // 64 bytes
+	if len(line) != 64 {
+		t.Fatalf("test fixture line len = %d, want 64", len(line))
+	}
+	exactPayload := strings.Repeat(line, int(DefaultPodLogMaxBytes)/len(line))
+	if int64(len(exactPayload)) != DefaultPodLogMaxBytes {
+		t.Fatalf("exactPayload len = %d, want %d", len(exactPayload), DefaultPodLogMaxBytes)
+	}
+	overLine := "2024-01-01T00:00:01Z newest tail line that must survive truncation\n"
+	overPayload := exactPayload + strings.Repeat(overLine, 64)
+
+	for _, tc := range []struct {
+		name      string
+		payload   string
+		maxBytes  int64
+		wantExact bool
+		wantTail  string
+	}{
+		{
+			name:      "zero MaxBytes at exact 1 MiB boundary",
+			payload:   exactPayload,
+			maxBytes:  0,
+			wantExact: true,
+		},
+		{
+			name:     "zero MaxBytes over 1 MiB truncates head and keeps newest lines",
+			payload:  overPayload,
+			maxBytes: 0,
+			wantTail: overLine,
+		},
+		{
+			name:     "negative MaxBytes defaults to 1 MiB and caps",
+			payload:  overPayload,
+			maxBytes: -1,
+			wantTail: overLine,
+		},
+		{
+			name:     "explicit positive MaxBytes overrides default",
+			payload:  strings.Repeat(line, 4) + overLine,
+			maxBytes: int64(len(overLine) + 10),
+			wantTail: overLine,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(logTailPod())
+			cs.PrependReactor("get", "pods", testhelp.ProbeLogReactor(tc.payload, nil))
+			got, err := ReadPodLogText(t.Context(), cs, logTailPod(), PodLogOpts{
+				MaxBytes:   tc.maxBytes,
+				Timestamps: true,
+			})
+			if err != nil {
+				t.Fatalf("ReadPodLogText: %v", err)
+			}
+			if tc.wantExact {
+				if got != tc.payload {
+					t.Fatalf("len(got)=%d, want exact %d", len(got), len(tc.payload))
+				}
+				return
+			}
+			limit := tc.maxBytes
+			if limit <= 0 {
+				limit = DefaultPodLogMaxBytes
+			}
+			if int64(len(got)) > limit {
+				t.Fatalf("len(got)=%d exceeds cap %d", len(got), limit)
+			}
+			if !strings.HasSuffix(got, tc.wantTail) {
+				t.Fatalf("tail missing newest line %q", tc.wantTail)
+			}
+			for _, l := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+				if _, ok := PodLogLineTS(l); !ok {
+					t.Fatalf("retained partial line without timestamp: %q", l)
+				}
+			}
+		})
+	}
+}
+
+func TestReadPodLogTailBytesBoundaryCutAndErrors(t *testing.T) {
+	t.Run("exact maxBytes without newline returns full payload", func(t *testing.T) {
+		payload := bytes.Repeat([]byte("a"), 128)
+		got, err := readPodLogTailBytes(bytes.NewReader(payload), 128)
+		if err != nil || got != string(payload) {
+			t.Fatalf("got (len=%d, err=%v), want (len=128, nil)", len(got), err)
+		}
+	})
+
+	t.Run("over maxBytes without newline drops cut fragment", func(t *testing.T) {
+		payload := bytes.Repeat([]byte("a"), 129)
+		got, err := readPodLogTailBytes(bytes.NewReader(payload), 128)
+		if err != nil || got != "" {
+			t.Fatalf("got (%q, %v), want (\"\", nil)", got, err)
+		}
+	})
+
+	t.Run("defensive clamp when maxBytes <= 0", func(t *testing.T) {
+		got, err := readPodLogTailBytes(strings.NewReader("line1\nline2\n"), -5)
+		if err != nil || got != "line1\nline2\n" {
+			t.Fatalf("got (%q, %v), want (line1\\nline2\\n, nil)", got, err)
+		}
+	})
+
+	t.Run("stream error propagates unchanged", func(t *testing.T) {
+		boom := errors.New("stream reset")
+		got, err := readPodLogTailBytes(&errAfterReader{data: []byte("partial\n"), err: boom}, 1024)
+		if !errors.Is(err, boom) || got != "" {
+			t.Fatalf("got (%q, %v), want (\"\", %v)", got, err, boom)
+		}
+	})
 }

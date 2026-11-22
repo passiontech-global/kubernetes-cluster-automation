@@ -132,7 +132,6 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 	// namespace still reference it, the finalizer is stripped. The
 	// per-namespace reference scan rides the run-shared census — the
 	// orphan-PVC pass runs the identical pod scan in the same run.
-	nsClaims := census.claims()
 	for i := range pvcs {
 		p := &pvcs[i]
 		// va-stuck-terminating: a PVC wedged past the threshold whose ONLY finalizer is
@@ -147,7 +146,7 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 		if p.DeletionTimestamp != nil &&
 			now.Sub(p.DeletionTimestamp.Time) > stuckTerminatingMaxAge &&
 			len(p.Finalizers) == 1 && p.Finalizers[0] == pvcProtectionFinalizer &&
-			j.unstickPVCProtection(ctx, p, nsClaims) {
+			j.unstickPVCProtectionWithCensus(ctx, p, census) {
 			continue
 		}
 		mark("PersistentVolumeClaim", p.Namespace, p.Name, p.DeletionTimestamp, p.Finalizers)
@@ -161,7 +160,7 @@ func (j *failedJobsJanitor) auditStuckTerminating(ctx context.Context,
 		mark("VolumeAttachment", "", v.Name, v.DeletionTimestamp, v.Finalizers)
 	}
 	vas = nil
-	j.processStuckStorage(ctx, storageLists, now, mark)
+	j.processStuckStorage(ctx, storageLists, now, census, mark)
 
 	// Hygiene: series for resources that finished terminating are
 	// deleted, not zeroed — a Set(0) leaves the label triple in
@@ -193,10 +192,16 @@ type pvcUseProbe struct {
 // of full claim bodies. A nil census (a test driving a single duty)
 // builds a private one — same reads, just unshared.
 type pvcCensus struct {
-	pvcs     []metav1.PartialObjectMetadata
-	pvcsErr  error
-	pvcsSet  bool
-	nsClaims map[string]pvcUseProbe
+	pvcs         []metav1.PartialObjectMetadata
+	pvcsErr      error
+	pvcsSet      bool
+	nsClaims     map[string]pvcUseProbe
+	vas          []storagev1.VolumeAttachment
+	vasErr       error
+	vasSet       bool
+	nodeReady    map[string]bool
+	nodeReadyErr error
+	nodeReadySet bool
 }
 
 // listPVCs returns the shared cluster-wide PVC metadata census,
@@ -211,6 +216,45 @@ func (c *pvcCensus) listPVCs(ctx context.Context,
 			metav1.ListOptions{Limit: kube.DefaultListPageSize})
 	}
 	return c.pvcs, c.pvcsErr
+}
+
+// listVolumeAttachments returns the shared cluster-wide VolumeAttachment
+// census (quorum ListAll, no ResourceVersion="0"), listing on first call
+// only. cached reports whether this call hit the memoized result so
+// callers meter list errors once per sweep.
+func (c *pvcCensus) listVolumeAttachments(ctx context.Context,
+	j *failedJobsJanitor) ([]storagev1.VolumeAttachment, error, bool) {
+	cached := c.vasSet
+	if !c.vasSet {
+		c.vasSet = true
+		c.vas, c.vasErr = kube.ListAll(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			kube.VolumeAttachments(j.cs))
+	}
+	return c.vas, c.vasErr, cached
+}
+
+// readyNodes returns the shared node-name -> NodeReady map (quorum
+// ListNodes, no ResourceVersion="0"), listing on first call only. cached
+// reports whether this call hit the memoized result so callers meter
+// list errors once per sweep.
+func (c *pvcCensus) readyNodes(ctx context.Context,
+	j *failedJobsJanitor) (map[string]bool, error, bool) {
+	cached := c.nodeReadySet
+	if !c.nodeReadySet {
+		c.nodeReadySet = true
+		nodes, err := kube.ListNodes(ctx, j.cs)
+		if err != nil {
+			c.nodeReadyErr = err
+		} else {
+			ready := make(map[string]bool, len(nodes))
+			for i := range nodes {
+				ready[nodes[i].Name] = kube.NodeReady(&nodes[i])
+			}
+			c.nodeReady = ready
+		}
+	}
+	return c.nodeReady, c.nodeReadyErr, cached
 }
 
 // claims returns the shared per-namespace claims-probe cache.
@@ -240,6 +284,15 @@ func (c *pvcCensus) claims() map[string]pvcUseProbe {
 // uses it to skip the stuck gauge for a PVC that is now draining.
 func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	pvc *metav1.PartialObjectMetadata, cache map[string]pvcUseProbe) bool {
+	return j.unstickPVCProtectionWithCensus(ctx, pvc, &pvcCensus{nsClaims: cache})
+}
+
+func (j *failedJobsJanitor) unstickPVCProtectionWithCensus(ctx context.Context,
+	pvc *metav1.PartialObjectMetadata, census *pvcCensus) bool {
+	if census == nil {
+		census = &pvcCensus{}
+	}
+	cache := census.claims()
 	log := logf.FromContext(ctx)
 	pr, ok := cache[pvc.Namespace]
 	if !ok {
@@ -275,7 +328,7 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 	// pod on a node that stopped reporting can still hold the mount,
 	// and an attached VolumeAttachment on the claim's PV proves the
 	// volume outlives the pod scan. Either keeps the finalizer.
-	if j.pvcMountThreatenable(ctx, pvc) {
+	if j.pvcMountThreatenableWithCensus(ctx, pvc, census) {
 		return false
 	}
 	log.Info("PATCH-FINALIZER: stuck PVC unreferenced by every live pod — removing pvc-protection",
@@ -327,6 +380,14 @@ func (j *failedJobsJanitor) unstickPVCProtection(ctx context.Context,
 //     attached proves the kubelet-side mount outlives the pod scan.
 func (j *failedJobsJanitor) pvcMountThreatenable(ctx context.Context,
 	pvc *metav1.PartialObjectMetadata) bool {
+	return j.pvcMountThreatenableWithCensus(ctx, pvc, nil)
+}
+
+func (j *failedJobsJanitor) pvcMountThreatenableWithCensus(ctx context.Context,
+	pvc *metav1.PartialObjectMetadata, census *pvcCensus) bool {
+	if census == nil {
+		census = &pvcCensus{}
+	}
 	log := logf.FromContext(ctx)
 
 	// Resolve the bound PV — metadata-only census objects carry no
@@ -348,11 +409,13 @@ func (j *failedJobsJanitor) pvcMountThreatenable(ctx context.Context,
 	// VolumeAttachment check: any VA bound to the PV that still
 	// reports attached keeps the mount alive.
 	if pvName != "" {
-		attached, err := j.vaAttachedToPV(ctx, pvName)
+		attached, err, cached := j.vaAttachedToPVWithCensus(ctx, census, pvName)
 		if err != nil {
-			metrics.IncError(j.queue)
+			if !cached {
+				metrics.IncError(j.queue)
+			}
 			log.Error(err, "volumeattachment list failed — keeping pvc-protection finalizer (fail closed)",
-				"pvc", pvc.Namespace+"/"+pvc.Name, "pv", pvName)
+				"pvc", pvc.Namespace+"/"+pvc.Name, "pv", pvName, "cached", cached)
 			return true
 		}
 		if attached {
@@ -364,11 +427,13 @@ func (j *failedJobsJanitor) pvcMountThreatenable(ctx context.Context,
 
 	// Failed pods on dead nodes: terminal phase does not prove the
 	// kubelet released the mount when the node itself is gone.
-	dead, err := j.failedPodOnDeadNode(ctx, pvc.Namespace, pvc.Name)
+	dead, err, cached := j.failedPodOnDeadNodeWithCensus(ctx, census, pvc.Namespace, pvc.Name)
 	if err != nil {
-		metrics.IncError(j.queue)
+		if !cached {
+			metrics.IncError(j.queue)
+		}
 		log.Error(err, "dead-node pod scan failed — keeping pvc-protection finalizer (fail closed)",
-			"pvc", pvc.Namespace+"/"+pvc.Name)
+			"pvc", pvc.Namespace+"/"+pvc.Name, "cached", cached)
 		return true
 	}
 	if dead != "" {
@@ -384,11 +449,18 @@ func (j *failedJobsJanitor) pvcMountThreatenable(ctx context.Context,
 // unknown while the VA is not terminating — fail closed).
 func (j *failedJobsJanitor) vaAttachedToPV(ctx context.Context,
 	pvName string) (bool, error) {
-	vas, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.VolumeAttachments(j.cs))
+	attached, err, _ := j.vaAttachedToPVWithCensus(ctx, nil, pvName)
+	return attached, err
+}
+
+func (j *failedJobsJanitor) vaAttachedToPVWithCensus(ctx context.Context,
+	census *pvcCensus, pvName string) (bool, error, bool) {
+	if census == nil {
+		census = &pvcCensus{}
+	}
+	vas, err, cached := census.listVolumeAttachments(ctx, j)
 	if err != nil {
-		return false, err
+		return false, err, cached
 	}
 	for i := range vas {
 		v := &vas[i]
@@ -397,15 +469,15 @@ func (j *failedJobsJanitor) vaAttachedToPV(ctx context.Context,
 			continue
 		}
 		if v.Status.Attached {
-			return true, nil
+			return true, nil, cached
 		}
 		// Unknown attach state on a live VA: the attacher has not
 		// confirmed detach — treat as still mounted.
 		if v.DeletionTimestamp == nil {
-			return true, nil
+			return true, nil, cached
 		}
 	}
-	return false, nil
+	return false, nil, cached
 }
 
 // failedPodOnDeadNode returns the name of a Failed pod in ns that
@@ -413,15 +485,20 @@ func (j *failedJobsJanitor) vaAttachedToPV(ctx context.Context,
 // entirely). Returns "" when no such pod exists.
 func (j *failedJobsJanitor) failedPodOnDeadNode(ctx context.Context,
 	ns, pvcName string) (string, error) {
+	pod, err, _ := j.failedPodOnDeadNodeWithCensus(ctx, nil, ns, pvcName)
+	return pod, err
+}
+
+func (j *failedJobsJanitor) failedPodOnDeadNodeWithCensus(ctx context.Context,
+	census *pvcCensus, ns, pvcName string) (string, error, bool) {
+	if census == nil {
+		census = &pvcCensus{}
+	}
 	// Nodes first: a pod on a live node released its volumes on
 	// failure, so only unreachable nodes are suspect.
-	nodes, err := kube.ListNodes(ctx, j.cs)
+	ready, err, cached := census.readyNodes(ctx, j)
 	if err != nil {
-		return "", err
-	}
-	ready := map[string]bool{}
-	for i := range nodes {
-		ready[nodes[i].Name] = kube.NodeReady(&nodes[i])
+		return "", err, cached
 	}
 
 	var stuckPod string
@@ -448,9 +525,9 @@ func (j *failedJobsJanitor) failedPodOnDeadNode(ctx context.Context,
 			return nil
 		})
 	if err != nil {
-		return "", err
+		return "", err, false
 	}
-	return stuckPod, nil
+	return stuckPod, nil, false
 }
 
 // nsFinalizerNames renders .spec.finalizers — the list that actually

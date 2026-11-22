@@ -5,6 +5,8 @@
 package kube
 
 import (
+	"context"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -331,5 +333,65 @@ func TestEffectiveAnnosFastPathZeroAllocsAndDelta(t *testing.T) {
 	}
 	if obj.GetAnnotations()["a"] != "1" || obj.GetAnnotations()["b"] != "2" {
 		t.Fatal("EffectiveAnnos mutated base object map")
+	}
+}
+
+func TestReleaseWorkloadKey(t *testing.T) {
+	// Nil ctx, non-sweep ctx, empty key, and missing key are safe no-ops.
+	var nilCtx context.Context
+	ReleaseWorkloadKey(nilCtx, "ns/Deployment/web")
+	ReleaseWorkloadKey(t.Context(), "ns/Deployment/web")
+
+	ctx := WithSweepOverlay(t.Context())
+	if !TryReserveWorkloadKey(ctx, "ns/Deployment/keep") {
+		t.Fatal("initial reserve for keep must succeed")
+	}
+	ReleaseWorkloadKey(ctx, "")
+	ReleaseWorkloadKey(ctx, "ns/Deployment/missing")
+	if TryReserveWorkloadKey(ctx, "ns/Deployment/keep") {
+		t.Fatal("empty/missing release must not clear unrelated reservation")
+	}
+
+	// Reserve -> release -> re-reserve, plus idempotent second release.
+	key := "ns/Deployment/web"
+	if !TryReserveWorkloadKey(ctx, key) {
+		t.Fatal("initial reserve must succeed")
+	}
+	if TryReserveWorkloadKey(ctx, key) {
+		t.Fatal("duplicate reserve must be denied while held")
+	}
+	ReleaseWorkloadKey(ctx, key)
+	ReleaseWorkloadKey(ctx, key) // idempotent
+	if !TryReserveWorkloadKey(ctx, key) {
+		t.Fatal("re-reserve after ReleaseWorkloadKey must succeed")
+	}
+
+	// Cross-path interaction with TryReserveWorkloadDisruption (RS pod normalizes to ns/Deployment/web).
+	rs := controllerRef("ReplicaSet", "web-6d9f8b7c5d")
+	pod := overlayPod("web-0", rs)
+	if TryReserveWorkloadDisruption(ctx, pod) {
+		t.Fatal("RS pod must see Deployment workload-key reservation")
+	}
+	ReleaseWorkloadKey(ctx, key)
+	if !TryReserveWorkloadDisruption(ctx, pod) {
+		t.Fatal("RS pod disruption reserve must succeed after ReleaseWorkloadKey")
+	}
+
+	// Concurrent reserve/release race coverage under -race.
+	raceCtx := WithSweepOverlay(t.Context())
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Go(func() {
+			k := "ns/Deployment/concurrent-" + string(rune('a'+(g%2)))
+			for range 100 {
+				if TryReserveWorkloadKey(raceCtx, k) {
+					ReleaseWorkloadKey(raceCtx, k)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if !TryReserveWorkloadKey(raceCtx, "ns/Deployment/concurrent-a") {
+		t.Fatal("concurrent-a key leaked after symmetric reserve/release")
 	}
 }

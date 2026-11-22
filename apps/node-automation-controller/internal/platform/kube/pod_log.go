@@ -65,11 +65,16 @@ func ResolveDefaultContainer(pod *corev1.Pod, explicit string) string {
 	return ""
 }
 
+// DefaultPodLogMaxBytes bounds ReadPodLogText and readPodLogTailBytes when
+// PodLogOpts.MaxBytes <= 0 so an unbounded GetLogs stream cannot OOM
+// the controller.
+const DefaultPodLogMaxBytes int64 = 1 << 20 // 1 MiB
+
 // PodLogOpts bounds one pod-log read. TailLines/SinceSeconds mirror
 // the PodLogOptions fields; <=0 leaves the bound off the request (the
-// apiserver's own default). MaxBytes caps the streamed body the same
-// io.LimitReader way every scanner previously hand-rolled, and
-// Timeout bounds the whole fetch with a ctx deadline.
+// apiserver's own default). MaxBytes caps the streamed tail (values <=0
+// default to DefaultPodLogMaxBytes, 1 MiB, keeping the newest trailing
+// bytes), and Timeout bounds the whole fetch with a ctx deadline.
 type PodLogOpts struct {
 	// Container targets one container; "" resolves via
 	// ResolveDefaultContainer — required on multi-container pods,
@@ -123,14 +128,11 @@ func ReadPodLogText(ctx context.Context, cs kubernetes.Interface,
 		return "", err
 	}
 	defer func() { _ = stream.Close() }()
-	if o.MaxBytes <= 0 {
-		data, err := io.ReadAll(stream)
-		if err != nil {
-			return "", err
-		}
-		return string(data), nil
+	maxBytes := o.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultPodLogMaxBytes
 	}
-	return readPodLogTailBytes(stream, o.MaxBytes)
+	return readPodLogTailBytes(stream, maxBytes)
 }
 
 // readPodLogTailBytes reads the stream keeping only its LAST
@@ -143,6 +145,9 @@ func ReadPodLogText(ctx context.Context, cs kubernetes.Interface,
 // ring keeps memory bounded at ~2×maxBytes: bytes.Buffer.Next
 // discards from the front after each chunk lands.
 func readPodLogTailBytes(stream io.Reader, maxBytes int64) (string, error) {
+	if maxBytes <= 0 {
+		maxBytes = DefaultPodLogMaxBytes
+	}
 	var buf bytes.Buffer
 	tmp := make([]byte, 32*1024)
 	// headPartial is set while the buffer's first line is a fragment

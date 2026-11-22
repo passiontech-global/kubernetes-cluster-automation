@@ -130,16 +130,11 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 	}
 	// Typed RS census — AllReplicaSets is metadata-only; the wedge
 	// signature needs spec.replicas/status.conditions, so this
-	// check pays its own paged typed LIST once per sweep.
-	rss, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.ReplicaSets(p.CS, metav1.NamespaceAll))
+	// check reads the sweep's lazy AllTypedReplicaSets census
+	// (ResourceVersion="0", memoized once per sweep).
+	rss, err := p.AllTypedReplicaSets(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list replicasets: %w", err)}
-	}
-	pods, err := p.AllPods(ctx)
-	if err != nil {
-		return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
 	}
 
 	// Group RSs under their owning Deployment UID.
@@ -217,7 +212,9 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 		finding := key + "(" + strings.Join(reasons, ",") + ")"
 		findings = append(findings, finding)
 		rep.Find(finding)
-		p.unwedgeDeployment(ctx, log, d, rsList, pods, now)
+		if err := p.unwedgeDeployment(ctx, log, d, rsList, now); err != nil {
+			return probefw.Result{Infra: err}
+		}
 	}
 	p.emitWedgeEvent(ctx, log, findings, now)
 	return rep.Result(&p.emitted, deploymentRolloutWedgeGauge.DeleteLabelValues,
@@ -231,22 +228,22 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 // state instead of stacking a nudge on a just-deleted pod census.
 func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 	log logr.Logger, d *appsv1.Deployment, rsList []rsCensusRow,
-	pods []corev1.Pod, now time.Time) {
+	now time.Time) error {
 
 	ns, name := d.Namespace, d.Name
 	// Stage 1 — terminal pod GC: Failed-phase or Evicted pods owned
 	// by this Deployment's ReplicaSets. Terminal-object GC is
 	// exempt from the maintenance mutex by contract.
+	pods, err := p.PodsIn(ctx, ns)
+	if err != nil {
+		return fmt.Errorf("list pods: %w", err)
+	}
 	rsUIDs := map[types.UID]bool{}
 	for _, rs := range rsList {
 		rsUIDs[rs.uid] = true
 	}
 	deletedPods := 0
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Namespace != ns {
-			continue
-		}
+	for _, pod := range pods {
 		terminal := pod.Status.Phase == corev1.PodFailed ||
 			pod.Status.Reason == "Evicted"
 		if !terminal || pod.DeletionTimestamp != nil {
@@ -281,7 +278,7 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 		// deleted pods in the sweep overlay, and the RS-zeroing /
 		// nudge verdicts below must wait for the next sweep instead of
 		// riding stale ReplicaSet state.
-		return
+		return nil
 	}
 	// Stage 2 — stale ReplicaSet zeroing: old revisions with
 	// spec.replicas>0 but readyReplicas==0 hold ResourceQuota
@@ -313,7 +310,7 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 				ck2, rolloutWedgeRSZeroCooldown, now)
 			if unverifiable2 {
 				metrics.IncError(p.Name)
-				return
+				return nil
 			}
 			if proceed2 {
 				zeroed := 0
@@ -334,8 +331,9 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 				}
 				if zeroed > 0 {
 					p.nudgeHeals.Stamp(ck2, now)
+					p.InvalidateReplicaSets(ctx)
 					// ONE stage per sweep — the quota picture changed.
-					return
+					return nil
 				}
 				heal.RefundGrant(now)
 			}
@@ -346,12 +344,7 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 	// Git-owned objects (a template nudge on a Flux-managed
 	// Deployment ping-pongs the source every reconcile).
 	if kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, d), d.Spec.Replicas) {
-		return
-	}
-	if !heal.FluxPatchGate("deployment", d, ns+"/"+name, now) {
-		log.Info("SKIP: rollout wedge nudge — Flux Heal-Revert Loop",
-			"deployment", ns+"/"+name)
-		return
+		return nil
 	}
 	// Only when the persisted cooldown clears AND the maintenance
 	// gate allows. The wider-of in-RAM+annotation window keeps a
@@ -362,18 +355,33 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 		rolloutWedgeNudgeCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
-		return
+		return nil
 	}
 	if !proceed {
-		return
+		return nil
+	}
+	wKey := ns + "/Deployment/" + name
+	if !kube.TryReserveWorkloadKey(ctx, wKey) {
+		heal.RefundGrant(now)
+		log.Info("SKIP: rollout wedge nudge — workload already disrupted this sweep",
+			"deployment", ns+"/"+name)
+		return nil
+	}
+	if !heal.FluxPatchGate("deployment", d, CheckNameDeploymentRolloutWedge+":"+ns+"/"+name, now) {
+		kube.ReleaseWorkloadKey(ctx, wKey)
+		heal.RefundGrant(now)
+		log.Info("SKIP: rollout wedge nudge — Flux Heal-Revert Loop",
+			"deployment", ns+"/"+name)
+		return nil
 	}
 	patch := kube.RestartTemplatePatch(now)
 	if _, err := p.CS.AppsV1().Deployments(ns).Patch(ctx, name,
 		types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		kube.ReleaseWorkloadKey(ctx, wKey)
 		metrics.IncError(p.Name)
 		log.Error(err, "rollout wedge template nudge failed",
 			"deployment", ns+"/"+name)
-		return
+		return nil
 	}
 	if err := heal.StampPersisted(ctx, d,
 		func(ctx context.Context, data []byte) error {
@@ -388,6 +396,7 @@ func (p *deploymentRolloutWedgeCheck) unwedgeDeployment(ctx context.Context,
 	log.Info("ACTION: deployment rollout wedge template nudge",
 		"deployment", ns+"/"+name)
 	p.InvalidateDeployments(ctx)
+	return nil
 }
 
 // emitWedgeEvent fires ONE deduped Warning event per window naming

@@ -12,7 +12,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
@@ -352,5 +354,47 @@ func TestCoreDNSUpstreamDualMetricQueryAndLegacySupport(t *testing.T) {
 	}
 	if !foundHealthQuery {
 		t.Fatalf("missing modern+legacy CoreDNS healthcheck failure query in %v", seenQueries)
+	}
+}
+
+func TestCoreDNSFallbackUsesSinglePodList(t *testing.T) {
+	owner := []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet",
+		Name: "coredns-7c65d6f9b4", Controller: ptr.To(true),
+	}}
+	bad1 := probetest.PodWithPhase("kube-system", "coredns-bad-1", corev1.PodRunning, false, 15*time.Minute)
+	bad1.OwnerReferences = owner
+	bad1.Spec.NodeName = "node-1"
+	bad2 := probetest.PodWithPhase("kube-system", "coredns-bad-2", corev1.PodRunning, false, 15*time.Minute)
+	bad2.OwnerReferences = owner
+	bad2.Spec.NodeName = "node-2"
+	good := probetest.PodWithPhase("kube-system", "coredns-good", corev1.PodRunning, true, time.Hour)
+	good.OwnerReferences = owner
+	good.Spec.NodeName = "node-3"
+
+	cs := fake.NewSimpleClientset(bad1, bad2, good)
+	podLists := 0
+	cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		podLists++
+		return false, nil, nil
+	})
+	p := testProber(cs) // dead prom URL -> readiness fallback
+	chk := probetest.MustCheck[*coreDNSUpstreamCheck](t, p)
+
+	res := chk.Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatalf("readiness fallback must flag unready dns pods: %+v", res)
+	}
+	if podLists != 1 {
+		t.Fatalf("list pods count = %d, want 1 (p.Pod must reuse AllPods memo)", podLists)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "coredns-bad-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected deterministic heal of coredns-bad-1, err=%v", err)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "coredns-bad-2", metav1.GetOptions{}); err != nil {
+		t.Fatalf("second unready pod coredns-bad-2 must wait for next cycle: %v", err)
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "coredns-good", metav1.GetOptions{}); err != nil {
+		t.Fatalf("healthy sibling coredns-good must survive: %v", err)
 	}
 }

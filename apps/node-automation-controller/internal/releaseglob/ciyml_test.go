@@ -301,3 +301,192 @@ func TestMiseTomlConsumers(t *testing.T) {
 		t.Fatalf("consumers(\"mise.toml\") = %v, want %v", got, appsUnderTest)
 	}
 }
+
+type koDetectArm struct {
+	patterns   []*regexp.Regexp
+	isContinue bool
+	nac        bool
+	wd         bool
+}
+
+func bashCasePatternToRegex(pat string) (*regexp.Regexp, error) {
+	if pat == `""` {
+		return regexp.Compile(`^$`)
+	}
+	var b strings.Builder
+	b.WriteByte('^')
+	for _, r := range pat {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteByte('.')
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteByte('$')
+	return regexp.Compile(b.String())
+}
+
+func parseKoDetectArms(t *testing.T, root string) []koDetectArm {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(root, ciWorkflowRel))
+	if err != nil {
+		t.Fatalf("read %s: %v", ciWorkflowRel, err)
+	}
+	text := string(raw)
+	idIdx := strings.Index(text, "id: ko-detect")
+	if idIdx < 0 {
+		t.Fatalf("id: ko-detect not found in %s", ciWorkflowRel)
+	}
+	sub := text[idIdx:]
+	caseIdx := strings.Index(sub, `case "$p" in`)
+	if caseIdx < 0 {
+		t.Fatalf(`case "$p" in not found under ko-detect in %s`, ciWorkflowRel)
+	}
+	body := sub[caseIdx+len(`case "$p" in`):]
+	esacIdx := strings.Index(body, "esac")
+	if esacIdx < 0 {
+		t.Fatalf("esac not found under ko-detect in %s", ciWorkflowRel)
+	}
+	caseBody := body[:esacIdx]
+
+	var arms []koDetectArm
+	for _, rawArm := range strings.Split(caseBody, ";;") {
+		trimmed := strings.TrimSpace(rawArm)
+		if trimmed == "" {
+			continue
+		}
+		paren := strings.IndexByte(trimmed, ')')
+		if paren < 0 {
+			t.Fatalf("malformed ko-detect case arm %q", trimmed)
+		}
+		patList := strings.TrimSpace(trimmed[:paren])
+		armBody := strings.TrimSpace(trimmed[paren+1:])
+
+		var arm koDetectArm
+		arm.isContinue = strings.Contains(armBody, "continue")
+		arm.nac = strings.Contains(armBody, "nac=true")
+		arm.wd = strings.Contains(armBody, "wd=true")
+		for _, p := range strings.Split(patList, "|") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			re, err := bashCasePatternToRegex(p)
+			if err != nil {
+				t.Fatalf("compile ko-detect pattern %q: %v", p, err)
+			}
+			arm.patterns = append(arm.patterns, re)
+		}
+		if len(arm.patterns) > 0 {
+			arms = append(arms, arm)
+		}
+	}
+	if len(arms) == 0 {
+		t.Fatalf("no ko-detect case arms parsed from %s", ciWorkflowRel)
+	}
+	return arms
+}
+
+func koDetectFor(arms []koDetectArm, path string) (nac, wd bool) {
+	for _, arm := range arms {
+		for _, re := range arm.patterns {
+			if re.MatchString(path) {
+				if arm.isContinue {
+					return false, false
+				}
+				return arm.nac, arm.wd
+			}
+		}
+	}
+	return false, false
+}
+
+// TestKoDetectMatchesCmdDeps asserts ci.yml's inline ko-detect case
+// block triggers nac/wd ko builds in exact agreement with
+// GOWORK=off go list -deps ./cmd/... for both ko-built apps.
+func TestKoDetectMatchesCmdDeps(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Fatalf("go toolchain not in PATH: %v", err)
+	}
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	appDir := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	root := filepath.Dir(filepath.Dir(appDir))
+
+	arms := parseKoDetectArms(t, root)
+	nacLibs := appLibImports(t, root, "node-automation-controller")
+	wdLibs := appLibImports(t, root, "webhook-dispatcher")
+
+	hasHostkit := func(libs map[string]bool) bool {
+		for lib := range libs {
+			if strings.HasPrefix(lib, "libs/hostkit/") {
+				return true
+			}
+		}
+		return false
+	}
+
+	assertKo := func(path string, wantNAC, wantWD bool) {
+		t.Helper()
+		gotNAC, gotWD := koDetectFor(arms, path)
+		if gotNAC != wantNAC || gotWD != wantWD {
+			t.Errorf("ko-detect(%q) = (nac=%v, wd=%v), want (nac=%v, wd=%v)",
+				path, gotNAC, gotWD, wantNAC, wantWD)
+		}
+	}
+
+	// Every libs/hostkit/* subdir on disk must match exact cmd deps.
+	hkEntries, err := os.ReadDir(filepath.Join(root, "libs/hostkit"))
+	if err != nil {
+		t.Fatalf("read libs/hostkit: %v", err)
+	}
+	for _, e := range hkEntries {
+		if !e.IsDir() {
+			continue
+		}
+		lib := "libs/hostkit/" + e.Name()
+		wantNAC := nacLibs[lib]
+		wantWD := wdLibs[lib]
+		assertKo(lib+"/probe.go", wantNAC, wantWD)
+		assertKo(lib+"/sub/probe.go", wantNAC, wantWD)
+		assertKo(lib+"/probe_test.go", false, false)
+	}
+
+	// libs/hostkit/go.{mod,sum} affect every hostkit consumer.
+	for _, mf := range moduleFiles {
+		assertKo(mf, hasHostkit(nacLibs), hasHostkit(wdLibs))
+	}
+
+	// libs/jinja is not imported by either ko-built app.
+	jinjaEntries, err := os.ReadDir(filepath.Join(root, "libs/jinja"))
+	if err != nil {
+		t.Fatalf("read libs/jinja: %v", err)
+	}
+	for _, e := range jinjaEntries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		assertKo("libs/jinja/"+e.Name(), nacLibs["libs/jinja"], wdLibs["libs/jinja"])
+	}
+	assertKo("libs/jinja/probe.go", nacLibs["libs/jinja"], wdLibs["libs/jinja"])
+
+	// App subtrees, non-ko app, mise.toml, and ignored files (*.md, *_test.go).
+	assertKo("apps/node-automation-controller/cmd/manager/main.go", true, false)
+	assertKo("apps/node-automation-controller/go.mod", true, false)
+	assertKo("apps/node-automation-controller/cmd/manager/main_test.go", false, false)
+	assertKo("apps/node-automation-controller/docs/env.md", false, false)
+
+	assertKo("apps/webhook-dispatcher/cmd/dispatcher/main.go", false, true)
+	assertKo("apps/webhook-dispatcher/go.mod", false, true)
+	assertKo("apps/webhook-dispatcher/cmd/dispatcher/main_test.go", false, false)
+	assertKo("apps/webhook-dispatcher/docs/env.md", false, false)
+
+	assertKo("apps/node-host-agent/cmd/agent/main.go", false, false)
+	assertKo("mise.toml", true, true)
+	assertKo("README.md", false, false)
+}

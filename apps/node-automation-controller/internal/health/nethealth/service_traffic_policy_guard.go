@@ -396,7 +396,10 @@ func (c *serviceTrafficPolicyGuardCheck) auditMissingPreStop(
 	}
 
 	ingresses, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		},
 		kube.Ingresses(c.CS, metav1.NamespaceAll))
 	switch {
 	case err == nil:

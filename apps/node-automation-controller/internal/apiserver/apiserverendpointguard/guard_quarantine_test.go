@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/fake"
@@ -181,8 +182,21 @@ func TestEndpointGuardReaddsRecoveredBackend(t *testing.T) {
 	if endpointAddrSet(ep)["10.0.0.1"] {
 		t.Fatal("backend re-added after a single healthy cycle")
 	}
+	if len(subsetAddrs(ep, 0, "notReadyAddresses")) != 0 {
+		t.Fatalf("re-listed quarantined backend not stripped before recovery: %v",
+			subsetAddrs(ep, 0, "notReadyAddresses"))
+	}
 	if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
 		t.Fatalf("annotation dropped too early: %q", ep.GetAnnotations()[endpointGuardAnno])
+	}
+
+	// Simulate the apiserver endpoint reconciler re-listing 10.0.0.1
+	// (notReady copy) before Cycle 2 reaches okStreak == 2.
+	ep = ep.DeepCopy()
+	appendAddr(ep, 0, "notReadyAddresses", "10.0.0.1")
+	if _, err := dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
+		Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
 	}
 
 	if err := g.run(ctx); err != nil {
@@ -237,9 +251,17 @@ func TestEndpointGuardSkipsReaddOfAbsentQuarantinedBackend(t *testing.T) {
 			t.Fatalf("cycle %d: absent backend dropped from annotation early: %q", i+1, ann)
 		}
 		if i+1 < endpointGuardRecoverCyc {
-			// Latch not reached: the listed twin must also stay out.
+			// Latch not reached: the listed twin must stay out (and its
+			// transient re-list is stripped), then the reconciler re-lists
+			// 10.0.0.1 before the next cycle while 10.0.0.3 stays absent.
 			if got["10.0.0.1"] {
 				t.Fatalf("cycle %d: listed backend re-added after a single healthy cycle", i+1)
+			}
+			ep = ep.DeepCopy()
+			appendAddr(ep, 0, "notReadyAddresses", "10.0.0.1")
+			if _, err := dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
+				Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
 			}
 			continue
 		}
@@ -617,4 +639,232 @@ func TestEndpointGuardMemQuarantineSurvivesAnnotationLoss(t *testing.T) {
 	if got := endpointAddrSet(getKubeEndpoints(t, dyn)); got["10.0.0.1"] {
 		t.Fatal("wedged backend back in endpoints while still failing")
 	}
+}
+
+func TestEndpointGuardRemovesRelistedQuarantinedIPBeforeRecovery(t *testing.T) {
+	t.Run("Endpoints mode removes re-listed quarantined IP on okStreak=1 and errStreak=1", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			kubeEndpointSlice([]string{"10.0.0.2"}))
+		// Reconciler re-listed quarantined 10.0.0.1 in addresses.
+		dyn := testutil.NewDynamicClient(
+			kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, []string{"10.0.0.1"}))
+		probes := probeTable{
+			"10.0.0.1": apiHealthyProbe(1000),
+			"10.0.0.2": apiHealthyProbe(1000),
+		}
+		g := newEndpointGuard(cs, dyn, probes)
+
+		// Cycle 1: okStreak = 1 (< 2) -> must strip 10.0.0.1 immediately.
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		ep := getKubeEndpoints(t, dyn)
+		if endpointAddrSet(ep)["10.0.0.1"] {
+			t.Fatal("re-listed quarantined IP stayed in addresses at okStreak=1")
+		}
+		if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
+			t.Fatalf("annotation = %q, want 10.0.0.1", ep.GetAnnotations()[endpointGuardAnno])
+		}
+		if !g.memQuarantine["10.0.0.1"] {
+			t.Fatal("memQuarantine dropped 10.0.0.1 early")
+		}
+
+		// Reconciler re-lists 10.0.0.1 again; 10.0.0.1 errors once (errStreak=1 < 2, okStreak=0).
+		ep = ep.DeepCopy()
+		appendAddr(ep, 0, "addresses", "10.0.0.1")
+		if _, err := dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
+			Update(ctx, ep, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		probes["10.0.0.1"] = &apiProbeResult{err: errors.New("blip")}
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		ep = getKubeEndpoints(t, dyn)
+		if endpointAddrSet(ep)["10.0.0.1"] {
+			t.Fatal("re-listed quarantined IP stayed in addresses at errStreak=1")
+		}
+		if ep.GetAnnotations()[endpointGuardAnno] != "10.0.0.1" {
+			t.Fatalf("annotation = %q, want 10.0.0.1", ep.GetAnnotations()[endpointGuardAnno])
+		}
+	})
+
+	t.Run("EndpointSlice mode removes re-listed quarantined IP before recovery", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			kubeSliceWithQuarantine([]string{"10.0.0.2", "10.0.0.1"}, []string{"10.0.0.1"}))
+		dyn := testutil.NewDynamicClient()
+		fakeServerVersion(cs, "1", "34")
+		probes := probeTable{
+			"10.0.0.1": apiHealthyProbe(1000),
+			"10.0.0.2": apiHealthyProbe(1000),
+		}
+		g := newEndpointGuard(cs, dyn, probes)
+
+		// Cycle 1: okStreak = 1 (< 2) -> must strip 10.0.0.1 from EndpointSlice.
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		eps := getKubeSlice(t, cs)
+		if sliceAddrSet(eps)["10.0.0.1"] {
+			t.Fatal("re-listed quarantined IP stayed in EndpointSlice at okStreak=1")
+		}
+		if eps.Annotations[endpointGuardAnno] != "10.0.0.1" {
+			t.Fatalf("slice annotation = %q, want 10.0.0.1", eps.Annotations[endpointGuardAnno])
+		}
+		if !g.memQuarantine["10.0.0.1"] {
+			t.Fatal("memQuarantine dropped 10.0.0.1 early")
+		}
+
+		// Reconciler re-lists 10.0.0.1; 10.0.0.1 errors once -> must strip again.
+		eps = eps.DeepCopy()
+		ready := true
+		eps.Endpoints = append(eps.Endpoints, discoveryv1.Endpoint{
+			Addresses:  []string{"10.0.0.1"},
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+		})
+		if _, err := cs.DiscoveryV1().EndpointSlices(endpointGuardNS).
+			Update(ctx, eps, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		probes["10.0.0.1"] = &apiProbeResult{err: errors.New("blip")}
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		eps = getKubeSlice(t, cs)
+		if sliceAddrSet(eps)["10.0.0.1"] {
+			t.Fatal("re-listed quarantined IP stayed in EndpointSlice at errStreak=1")
+		}
+		if eps.Annotations[endpointGuardAnno] != "10.0.0.1" {
+			t.Fatalf("slice annotation = %q, want 10.0.0.1", eps.Annotations[endpointGuardAnno])
+		}
+	})
+}
+
+func TestEndpointGuardRelistedQuarantinedIPRespectsLastHealthy(t *testing.T) {
+	t.Run("Endpoints mode fail-closed when only peer is wedged", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			kubeEndpointSlice([]string{"10.0.0.1", "10.0.0.2"}))
+		dyn := testutil.NewDynamicClient(
+			kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, []string{"10.0.0.1"}))
+		probes := probeTable{
+			"10.0.0.1": apiHealthyProbe(1000),
+			"10.0.0.2": {err: errors.New("wedged")},
+		}
+		g := newEndpointGuard(cs, dyn, probes)
+		for range endpointGuardErrCycles {
+			if err := g.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ep := getKubeEndpoints(t, dyn)
+		got := endpointAddrSet(ep)
+		if !got["10.0.0.1"] || !got["10.0.0.2"] {
+			t.Fatalf("fail-closed guard violated — endpoints=%v", got)
+		}
+	})
+
+	t.Run("EndpointSlice mode fail-closed when only peer is wedged", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			kubeSliceWithQuarantine([]string{"10.0.0.1", "10.0.0.2"}, []string{"10.0.0.1"}))
+		dyn := testutil.NewDynamicClient()
+		fakeServerVersion(cs, "1", "34")
+		probes := probeTable{
+			"10.0.0.1": apiHealthyProbe(1000),
+			"10.0.0.2": {err: errors.New("wedged")},
+		}
+		g := newEndpointGuard(cs, dyn, probes)
+		for range endpointGuardErrCycles {
+			if err := g.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got := sliceAddrSet(getKubeSlice(t, cs))
+		if !got["10.0.0.1"] || !got["10.0.0.2"] {
+			t.Fatalf("fail-closed guard violated in slice mode — addrs=%v", got)
+		}
+	})
+}
+
+func TestEndpointGuardPeerHighWaterPrunedOnExpiryAndDeparture(t *testing.T) {
+	t.Run("pruned on quarantine expiry", func(t *testing.T) {
+		// Hosted plane: mirror slice + no CP Node objects.
+		cs := fake.NewSimpleClientset(
+			kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2", "10.0.0.9"}))
+		dyn := testutil.NewDynamicClient(
+			kubeEndpoints([]string{"10.0.0.1", "10.0.0.2", "10.0.0.9"}, nil, nil))
+		fakeServerVersion(cs, "1", "37")
+		probes := probeTable{
+			"10.0.0.1": apiHealthyProbe(1000),
+			"10.0.0.2": apiHealthyProbe(1000),
+			"10.0.0.9": {err: errors.New("connection refused")},
+		}
+		g := newEndpointGuard(cs, dyn, probes)
+
+		// Quarantine 10.0.0.9 (populates peerHighWater["10.0.0.9"]).
+		for range endpointGuardErrCycles {
+			if err := g.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !g.peerHighWater["10.0.0.9"] {
+			t.Fatal("expected peerHighWater to track 10.0.0.9 while active/quarantined")
+		}
+		if endpointAddrSet(getKubeEndpoints(t, dyn))["10.0.0.9"] {
+			t.Fatal("expected 10.0.0.9 to be removed on quarantine")
+		}
+
+		// Run remaining cycles until 10.0.0.9 expires.
+		for range endpointGuardExpireCyc - endpointGuardErrCycles {
+			if err := g.run(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if g.peerHighWater["10.0.0.9"] {
+			t.Fatal("expired IP 10.0.0.9 not pruned from peerHighWater")
+		}
+		if g.peerNodeIPs["10.0.0.9"] {
+			t.Fatal("expired IP 10.0.0.9 not pruned from peerNodeIPs")
+		}
+		if peers := g.ssotPeerIPs(ctx, []string{"10.0.0.1", "10.0.0.2"}); peers["10.0.0.9"] {
+			t.Fatalf("expired IP 10.0.0.9 still returned by ssotPeerIPs: %v", peers)
+		}
+	})
+
+	t.Run("pruned on clean departure", func(t *testing.T) {
+		cs := fake.NewSimpleClientset(
+			kubeMirrorSlice("kubernetes-89b87", []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}))
+		dyn := testutil.NewDynamicClient(
+			kubeEndpoints([]string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}, nil, nil))
+		fakeServerVersion(cs, "1", "37")
+		probes := probeTable{
+			"10.0.0.1": apiHealthyProbe(1000),
+			"10.0.0.2": apiHealthyProbe(1000),
+			"10.0.0.3": apiHealthyProbe(1000),
+		}
+		g := newEndpointGuard(cs, dyn, probes)
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !g.peerHighWater["10.0.0.3"] {
+			t.Fatal("expected peerHighWater to record 10.0.0.3")
+		}
+
+		// Cleanly scale down / remove 10.0.0.3 without quarantine.
+		if _, err := dyn.Resource(endpointsGVR).Namespace(endpointGuardNS).
+			Update(ctx, kubeEndpoints([]string{"10.0.0.1", "10.0.0.2"}, nil, nil), metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if g.peerHighWater["10.0.0.3"] {
+			t.Fatal("departed IP 10.0.0.3 not pruned from peerHighWater")
+		}
+		if g.peerNodeIPs["10.0.0.3"] {
+			t.Fatal("departed IP 10.0.0.3 not pruned from peerNodeIPs")
+		}
+		if !g.peerHighWater["10.0.0.1"] || !g.peerHighWater["10.0.0.2"] {
+			t.Fatalf("active IPs unexpectedly pruned from peerHighWater: %v", g.peerHighWater)
+		}
+	})
 }

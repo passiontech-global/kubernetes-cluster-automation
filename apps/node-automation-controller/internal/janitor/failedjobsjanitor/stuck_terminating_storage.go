@@ -93,14 +93,18 @@ func (j *failedJobsJanitor) processStuckStorage(
 	ctx context.Context,
 	lists stuckStorageLists,
 	now time.Time,
+	census *pvcCensus,
 	mark func(kind, ns, name string, terminatingSince *metav1.Time, finalizers []string),
 ) {
+	if census == nil {
+		census = &pvcCensus{}
+	}
 	for i := range lists.pvs {
 		pv := &lists.pvs[i]
 		if pv.DeletionTimestamp != nil &&
 			now.Sub(pv.DeletionTimestamp.Time) > stuckTerminatingMaxAge &&
 			len(pv.Finalizers) == 1 && pv.Finalizers[0] == pvProtectionFinalizer &&
-			j.unstickPVProtection(ctx, pv) {
+			j.unstickPVProtectionWithCensus(ctx, pv, census) {
 			continue
 		}
 		mark("PersistentVolume", "", pv.Name, pv.DeletionTimestamp, pv.Finalizers)
@@ -136,6 +140,13 @@ func (j *failedJobsJanitor) processStuckStorage(
 }
 
 func (j *failedJobsJanitor) unstickPVProtection(ctx context.Context, pv *corev1.PersistentVolume) bool {
+	return j.unstickPVProtectionWithCensus(ctx, pv, nil)
+}
+
+func (j *failedJobsJanitor) unstickPVProtectionWithCensus(ctx context.Context, pv *corev1.PersistentVolume, census *pvcCensus) bool {
+	if census == nil {
+		census = &pvcCensus{}
+	}
 	log := logf.FromContext(ctx)
 
 	// Gate 3: a PV WITHOUT a fully populated ClaimRef is not an orphan —
@@ -163,10 +174,13 @@ func (j *failedJobsJanitor) unstickPVProtection(ctx context.Context, pv *corev1.
 	}
 
 	// Gate 4: no VolumeAttachment attached (or unconfirmed detach) for this PV.
-	attached, err := j.vaAttachedToPV(ctx, pv.Name)
+	attached, err, cached := j.vaAttachedToPVWithCensus(ctx, census, pv.Name)
 	if err != nil {
-		metrics.IncError(j.queue)
-		log.Error(err, "volumeattachment check failed — keeping pv-protection (fail closed)", "pv", pv.Name)
+		if !cached {
+			metrics.IncError(j.queue)
+		}
+		log.Error(err, "volumeattachment check failed — keeping pv-protection (fail closed)",
+			"pv", pv.Name, "cached", cached)
 		return false
 	}
 	if attached {
@@ -175,10 +189,13 @@ func (j *failedJobsJanitor) unstickPVProtection(ctx context.Context, pv *corev1.
 	}
 
 	// Gate 5: cluster-wide Pod scan confirms no live pod or dead-node failed pod uses the PVC.
-	inUse, err := j.clusterPodUsesClaimRef(ctx, pv.Spec.ClaimRef)
+	inUse, err, cached := j.clusterPodUsesClaimRefWithCensus(ctx, pv.Spec.ClaimRef, census)
 	if err != nil {
-		metrics.IncError(j.queue)
-		log.Error(err, "cluster pod scan failed — keeping pv-protection (fail closed)", "pv", pv.Name)
+		if !cached {
+			metrics.IncError(j.queue)
+		}
+		log.Error(err, "cluster pod scan failed — keeping pv-protection (fail closed)",
+			"pv", pv.Name, "cached", cached)
 		return false
 	}
 	if inUse {
@@ -219,16 +236,20 @@ func (j *failedJobsJanitor) unstickPVProtection(ctx context.Context, pv *corev1.
 }
 
 func (j *failedJobsJanitor) clusterPodUsesClaimRef(ctx context.Context, ref *corev1.ObjectReference) (bool, error) {
+	inUse, err, _ := j.clusterPodUsesClaimRefWithCensus(ctx, ref, nil)
+	return inUse, err
+}
+
+func (j *failedJobsJanitor) clusterPodUsesClaimRefWithCensus(ctx context.Context, ref *corev1.ObjectReference, census *pvcCensus) (bool, error, bool) {
 	if ref == nil || ref.Namespace == "" || ref.Name == "" {
-		return false, nil
+		return false, nil, false
 	}
-	nodes, err := kube.ListNodes(ctx, j.cs)
+	if census == nil {
+		census = &pvcCensus{}
+	}
+	ready, err, cached := census.readyNodes(ctx, j)
 	if err != nil {
-		return true, err
-	}
-	ready := make(map[string]bool, len(nodes))
-	for i := range nodes {
-		ready[nodes[i].Name] = kube.NodeReady(&nodes[i])
+		return true, err, cached
 	}
 
 	inUse := false
@@ -254,7 +275,7 @@ func (j *failedJobsJanitor) clusterPodUsesClaimRef(ctx context.Context, ref *cor
 			}
 			return nil
 		})
-	return inUse, err
+	return inUse, err, false
 }
 
 func (j *failedJobsJanitor) unstickVolumeSnapshot(ctx context.Context, vs *unstructured.Unstructured, finalizers []string) (bool, []string) {

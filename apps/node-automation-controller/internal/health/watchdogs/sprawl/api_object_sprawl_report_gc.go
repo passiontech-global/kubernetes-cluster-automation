@@ -65,6 +65,14 @@ type apiObjectSprawlReportGCCheck struct {
 	// emittedHistorySprawl tracks node_automation_api_object_sprawl_count
 	// tuples by kind so resolved sprawl kinds prune cleanly.
 	emittedHistorySprawl state.GaugeLedger[string]
+	// historyCycle / historyLastCarry / historyLastFindings / historyCarry403
+	// gate gcWorkloadHistorySprawl on probefw.HeavyScanCycles (~30m) and
+	// carry only remaining (un-deleted) counts/findings + 403 holds across
+	// skipped cycles 2..HeavyScanCycles.
+	historyCycle        uint64
+	historyLastCarry    []historyCarry
+	historyLastFindings []string
+	historyCarry403     map[string]bool
 }
 
 // NewAPIObjectSprawlReportGCCheck builds the sprawl-gc check — its
@@ -206,7 +214,10 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		// IsNotFound/NoMatch interpretation stays here.
 		items, err := kube.ListPartialOrFallback(ctx, p.Meta, p.CS, p.Dyn,
 			rk.gvr, metav1.NamespaceAll,
-			metav1.ListOptions{Limit: probefw.HealthListPageSize})
+			metav1.ListOptions{
+				Limit:           probefw.HealthListPageSize,
+				ResourceVersion: "0",
+			})
 		switch {
 		case kube.IsCRDAbsent(err):
 			continue // report CRD absent on this cluster — no census, no GC
@@ -256,7 +267,10 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			// metadata-endpoint read as the report census above.
 			items, err := kube.ListPartialOrFallback(ctx, p.Meta, p.CS,
 				p.Dyn, rk.gvr, metav1.NamespaceAll,
-				metav1.ListOptions{Limit: probefw.HealthListPageSize})
+				metav1.ListOptions{
+					Limit:           probefw.HealthListPageSize,
+					ResourceVersion: "0",
+				})
 			switch {
 			case kube.IsCRDAbsent(err):
 				continue // CRD absent on this cluster — skip silently
@@ -333,8 +347,23 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: err}
 	}
 
-	if err := p.gcWorkloadHistorySprawl(ctx, log, now, &objects, &historyRep); err != nil {
-		return probefw.Result{Infra: err}
+	p.historyCycle++
+	if p.historyCycle%probefw.HeavyScanCycles == 1 {
+		if err := p.gcWorkloadHistorySprawl(ctx, log, now, &objects, &historyRep); err != nil {
+			p.historyCycle--
+			return probefw.Result{Infra: err}
+		}
+	} else {
+		for kind := range p.historyCarry403 {
+			p.carryHistoryKind(&historyRep, kind)
+		}
+		for _, c := range p.historyLastCarry {
+			historyRep.Set(apiObjectSprawlCountGauge, float64(c.count),
+				c.kind, []string{c.kind})
+		}
+		for _, f := range p.historyLastFindings {
+			objects.Find(f)
+		}
 	}
 
 	// Kine large-object census — cluster-wide ConfigMap/Secret size
@@ -418,11 +447,10 @@ func (p *apiObjectSprawlReportGCCheck) reportOwnerGone(ctx context.Context,
 		// same-name pod carrying a different UID is a different
 		// incarnation — the referenced pod IS gone (the
 		// OwnerGone UID-match contract, applied to the census).
-		pods, err := p.AllPods(ctx)
+		pod, err := p.Pod(ctx, obj.GetNamespace(), ref.Name)
 		if err != nil {
 			gone = false
 		} else {
-			pod := probefw.PodFromList(pods, obj.GetNamespace(), ref.Name)
 			gone = pod == nil ||
 				(ref.UID != "" && pod.UID != "" && pod.UID != ref.UID)
 		}

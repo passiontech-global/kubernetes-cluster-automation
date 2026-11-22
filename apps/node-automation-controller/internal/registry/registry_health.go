@@ -147,4 +147,9 @@ var healthRows = []shared.Module{
 	// Wave 4C checks — appended at end of healthRows.
 	{Name: "gitops-mass-prune-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_GITOPS_MASS_PRUNE_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: gitops.CheckNameGitOpsMassPruneGuard, New: gitops.NewGitOpsMassPruneGuardCheck}},
 	{Name: "image-resilience-auditor", Group: groupHealth, GateEnv: "NODE_AUTOMATION_IMAGE_RESILIENCE_AUDITOR_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameImageResilienceAuditor, New: nodehealth.NewImageResilienceAuditorCheck}},
+	// Wave 5 checks — appended at end of healthRows.
+	{Name: "volumesnapshot-lifecycle-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_VOLUMESNAPSHOT_LIFECYCLE_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: pvc.CheckNameVolumeSnapshotLifecycleGuard, New: pvc.NewVolumeSnapshotLifecycleGuardCheck}},
+	{Name: "dra-claim-wedge-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_DRA_CLAIM_WEDGE_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameDRAClaimWedgeGuard, New: nodehealth.NewDRAClaimWedgeGuardCheck}},
+	{Name: "pod-resize-wedge-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_POD_RESIZE_WEDGE_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNamePodResizeWedgeGuard, New: watchdogs.NewPodResizeWedgeGuardCheck}},
+	{Name: "ingress-nginx-retirement-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_INGRESS_NGINX_RETIREMENT_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameIngressNginxRetirementGuard, New: watchdogs.NewIngressNginxRetirementGuardCheck}},
 }

@@ -1000,12 +1000,22 @@ func (a *certDriftAuditor) maybeRolloutWorkload(ctx context.Context, log interfa
 		}
 		return
 	}
-	if !kube.TryReserveWorkloadKey(ctx, wKey) ||
-		!heal.FluxPatchGate(fluxKind, obj, ns+"/"+name, now) {
+	if !heal.FluxPatchGate(fluxKind, obj, "live-socket-audit:"+wKey, now) {
+		heal.RefundGrant(now)
+		return
+	}
+	if !kube.TryReserveWorkloadKey(ctx, wKey) {
 		heal.RefundGrant(now)
 		return
 	}
 	if err := patchFn(ctx, kube.RestartTemplatePatch(now)); err != nil {
+		kube.ReleaseWorkloadKey(ctx, wKey)
+		if apierrors.IsNotFound(err) {
+			heal.RefundGrant(now)
+			log.Info("skip tls live-socket drift rollout: workload vanished mid-patch — grant refunded",
+				"workload", wKey, "secret", t.secret.name)
+			return
+		}
 		metrics.IncError(a.queue)
 		log.Error(err, "tls live-socket drift rollout failed", "workload", wKey, "secret", t.secret.name)
 		return

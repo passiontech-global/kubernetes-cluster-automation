@@ -192,11 +192,9 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 					if !ok {
 						continue // unbound claim — no volume to split yet
 					}
-					for _, mode := range pvModes[pvName] {
-						if mode == corev1.ReadWriteOnce ||
-							mode == corev1.ReadWriteOncePod {
-							stsPod = true
-						}
+					if pvSingleWriter(pvName, pvModes) {
+						stsPod = true
+						break
 					}
 				}
 			}
@@ -206,6 +204,31 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 		return false, fmt.Errorf("list pods: %w", err)
 	}
 	return stsPod, nil
+}
+
+// modesSingleWriter reports whether modes includes a single-writer
+// access mode (ReadWriteOnce or ReadWriteOncePod), failing closed
+// when modes is empty (unknown safety).
+func modesSingleWriter(modes []corev1.PersistentVolumeAccessMode) bool {
+	if len(modes) == 0 {
+		return true // empty AccessModes is no evidence either way — fail closed
+	}
+	for _, mode := range modes {
+		if mode == corev1.ReadWriteOnce || mode == corev1.ReadWriteOncePod {
+			return true
+		}
+	}
+	return false
+}
+
+// pvSingleWriter resolves pvName against pvModes, failing closed
+// when the PV is absent from the census or has empty AccessModes.
+func pvSingleWriter(pvName string, pvModes map[string][]corev1.PersistentVolumeAccessMode) bool {
+	modes, ok := pvModes[pvName]
+	if !ok {
+		return true // PV absent from the census — fail closed
+	}
+	return modesSingleWriter(modes)
 }
 
 // volumeAttachmentRWO reports whether the attachment's volume carries
@@ -221,25 +244,11 @@ func (s *deadNodeSweeper) nodeHasStatefulHolders(ctx context.Context, nodeName s
 // corruption), so unknown reads as single-writer and vetoes.
 func volumeAttachmentRWO(va *storagev1.VolumeAttachment,
 	pvModes map[string][]corev1.PersistentVolumeAccessMode) bool {
-	singleWriter := func(modes []corev1.PersistentVolumeAccessMode) bool {
-		for _, mode := range modes {
-			if mode == corev1.ReadWriteOnce || mode == corev1.ReadWriteOncePod {
-				return true
-			}
-		}
-		return false
-	}
 	if va.Spec.Source.InlineVolumeSpec != nil {
-		modes := va.Spec.Source.InlineVolumeSpec.AccessModes
-		// Empty AccessModes is no evidence either way — fail closed.
-		return len(modes) == 0 || singleWriter(modes)
+		return modesSingleWriter(va.Spec.Source.InlineVolumeSpec.AccessModes)
 	}
 	if name := va.Spec.Source.PersistentVolumeName; name != nil {
-		modes, ok := pvModes[*name]
-		if !ok || len(modes) == 0 {
-			return true // PV absent from the census or mode-less
-		}
-		return singleWriter(modes)
+		return pvSingleWriter(*name, pvModes)
 	}
 	return true // no resolvable volume source — fail closed
 }

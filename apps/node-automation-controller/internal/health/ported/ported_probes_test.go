@@ -17,7 +17,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
@@ -273,5 +275,26 @@ func TestProbeResourceQuota(t *testing.T) {
 	p = testProber(fake.NewSimpleClientset(quota("a", "q", "", "1")))
 	if res := probetest.MustCheck[*resourceQuotaCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
 		t.Fatal("absent Used entry must pass")
+	}
+
+	// Wire request carries ResourceVersion=0.
+	var rqRV string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rqRV = r.URL.Query().Get("resourceVersion")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"ResourceQuotaList","items":[]}`))
+	}))
+	defer srv.Close()
+	cs, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := probetest.NewDeps(cs, nil)
+	chk := NewResourceQuotaCheck(d)
+	if res := chk.Run(probetest.SweepCtx(ctx, d)); !res.Pass || res.Infra != nil {
+		t.Fatalf("expected clean pass, got %+v", res)
+	}
+	if rqRV != "0" {
+		t.Fatalf("resourcequotas resourceVersion = %q, want \"0\"", rqRV)
 	}
 }

@@ -33,6 +33,7 @@ package orphanendpointslicecleaner
 
 import (
 	"context"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -41,6 +42,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -99,6 +101,10 @@ type orphanEndpointSliceCleaner struct {
 	// UID is part of the key so a recreated slice never inherits
 	// another object's streak.
 	absentStreak state.StreakLedger
+	// ghostStreak counts consecutive cycles a Pod-backed endpoint
+	// inside a live-Service EndpointSlice has referenced a missing or
+	// UID-mismatched Pod ("ghost:<ns>/<slice>/<sliceUID>/<podUID>").
+	ghostStreak state.StreakLedger
 }
 
 // Setup registers the 15-minute sweep.
@@ -140,16 +146,14 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	}
 
 	// Server-side label filter; the in-code check stays because
-	// fake clientsets ignore ListOptions selectors. Metadata-only:
-	// the candidate pass reads labels, deletion/creation timestamps,
-	// ns/name/UID — all ObjectMeta.
-	slices, err := kube.ListPartialOrFallback(ctx, c.meta, c.cs, c.dyn,
-		discoveryv1.SchemeGroupVersion.WithResource("endpointslices"),
-		metav1.NamespaceAll, metav1.ListOptions{
-			LabelSelector:   discoveryv1.LabelServiceName,
-			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
-		})
+	// fake clientsets ignore ListOptions selectors. Full typed objects
+	// are needed here (RV="0" watch-cache) so Track 2 can inspect
+	// s.Endpoints[].TargetRef without losing endpoint payloads.
+	slices, err := kube.ListAll(ctx, metav1.ListOptions{
+		LabelSelector:   discoveryv1.LabelServiceName,
+		Limit:           kube.DefaultListPageSize,
+		ResourceVersion: "0",
+	}, kube.EndpointSlices(c.cs, metav1.NamespaceAll))
 	if err != nil {
 		return fmt.Errorf("list endpointslices: %w", err)
 	}
@@ -165,6 +169,7 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 		uid                    types.UID
 	}
 	var targets []target
+	var podSlices []discoveryv1.EndpointSlice
 	for i := range slices {
 		s := &slices[i]
 		if s.DeletionTimestamp != nil {
@@ -180,6 +185,9 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 			continue // control-plane Service — never touched
 		}
 		if services[s.Namespace+"/"+svcName] {
+			if sliceHasPodTargetRef(s) {
+				podSlices = append(podSlices, *s)
+			}
 			continue // parent Service alive
 		}
 		key := s.Namespace + "/" + s.Name + "/" + string(s.UID)
@@ -261,6 +269,274 @@ func (c *orphanEndpointSliceCleaner) run(ctx context.Context) error {
 	// back — "consecutive" means any cycle with the Service present
 	// resets the count to zero.
 	c.absentStreak.Prune(func(k string) bool { return absentNow[k] })
-	log.Info("sweep done", "absent", len(absentNow), "deleted", deleted)
+
+	// Track 2: ghost Pod UID detection & remediation on live-Service slices.
+	ghostRemediated, err := c.sweepGhostPodEndpoints(ctx, log, now, podSlices)
+	if err != nil {
+		return err
+	}
+	log.Info("sweep done", "absent", len(absentNow), "deleted", deleted, "ghostRemediated", ghostRemediated)
 	return nil
+}
+
+type ghostCandidate struct {
+	podNS, podName, key string
+	podUID              types.UID
+}
+
+type ghostPlan struct {
+	live        *discoveryv1.EndpointSlice
+	remaining   []discoveryv1.Endpoint
+	removedKeys []string
+	deleteWhole bool
+}
+
+type ghostTarget struct {
+	ns, name   string
+	uid        types.UID
+	candidates []ghostCandidate
+	plan       *ghostPlan
+}
+
+func isPodTargetRef(ref *corev1.ObjectReference) bool {
+	return ref != nil && ref.Kind == "Pod" && ref.Name != "" && ref.UID != ""
+}
+
+func sliceHasPodTargetRef(s *discoveryv1.EndpointSlice) bool {
+	for i := range s.Endpoints {
+		if isPodTargetRef(s.Endpoints[i].TargetRef) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *orphanEndpointSliceCleaner) sweepGhostPodEndpoints(ctx context.Context,
+	log logr.Logger, now time.Time, podSlices []discoveryv1.EndpointSlice) (int, error) {
+	if len(podSlices) == 0 {
+		c.ghostStreak.Prune(func(string) bool { return false })
+		return 0, nil
+	}
+
+	pods, err := kube.ListPartialOrFallback(ctx, c.meta, c.cs, c.dyn,
+		corev1.SchemeGroupVersion.WithResource("pods"),
+		metav1.NamespaceAll,
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		})
+	if err != nil {
+		// Fail closed without pruning ghostStreak so transient API flaps
+		// preserve accumulated streaks (Track 1 already completed above).
+		return 0, fmt.Errorf("list pods (API flap): %w", err)
+	}
+
+	podUIDByKey := make(map[string]types.UID, len(pods))
+	for i := range pods {
+		podUIDByKey[pods[i].Namespace+"/"+pods[i].Name] = pods[i].UID
+	}
+
+	ghostNow := map[string]bool{}
+	var ghostTargets []ghostTarget
+	for i := range podSlices {
+		s := &podSlices[i]
+		seenInSlice := map[string]bool{}
+		var candidates []ghostCandidate
+		for j := range s.Endpoints {
+			ref := s.Endpoints[j].TargetRef
+			if !isPodTargetRef(ref) {
+				continue
+			}
+			refNS := ref.Namespace
+			if refNS == "" {
+				refNS = s.Namespace
+			}
+			if liveUID, ok := podUIDByKey[refNS+"/"+ref.Name]; ok && liveUID == ref.UID {
+				continue
+			}
+			gkey := "ghost:" + s.Namespace + "/" + s.Name + "/" + string(s.UID) + "/" + string(ref.UID)
+			if seenInSlice[gkey] {
+				continue
+			}
+			seenInSlice[gkey] = true
+			ghostNow[gkey] = true
+			streak := c.ghostStreak.Hit(gkey)
+			if streak < orphanEndpointSliceStreak {
+				log.Info("ghost endpoint candidate: Pod UID missing — tracking",
+					"endpointslice", s.Namespace+"/"+s.Name,
+					"pod", refNS+"/"+ref.Name,
+					"podUID", string(ref.UID),
+					"streak", streak)
+				continue
+			}
+			if now.Sub(s.CreationTimestamp.Time) < orphanEndpointSliceMinAge {
+				continue // too fresh — pod/slice propagation may still be landing
+			}
+			candidates = append(candidates, ghostCandidate{
+				podNS:   refNS,
+				podName: ref.Name,
+				podUID:  ref.UID,
+				key:     gkey,
+			})
+		}
+		if len(candidates) > 0 {
+			ghostTargets = append(ghostTargets, ghostTarget{
+				ns:         s.Namespace,
+				name:       s.Name,
+				uid:        s.UID,
+				candidates: candidates,
+				plan:       &ghostPlan{},
+			})
+		}
+	}
+
+	remediated, _, _ := reap.Sweep(ctx, log, ghostTargets, reap.Options[ghostTarget]{
+		Less: func(a, b ghostTarget) bool {
+			if a.ns != b.ns {
+				return a.ns < b.ns
+			}
+			return a.name < b.name
+		},
+		Cap: orphanEndpointSliceDeleteCap,
+		Confirm: func(ctx context.Context, t ghostTarget) (bool, error) {
+			live, getErr := c.cs.DiscoveryV1().EndpointSlices(t.ns).
+				Get(ctx, t.name, metav1.GetOptions{})
+			if apierrors.IsNotFound(getErr) {
+				for _, cand := range t.candidates {
+					c.ghostStreak.Reset(cand.key)
+					delete(ghostNow, cand.key)
+				}
+				return false, nil
+			}
+			if getErr != nil {
+				log.Info("WARN: endpointslice confirm failed — slice kept (fail closed)",
+					"endpointslice", t.ns+"/"+t.name, "error", getErr)
+				metrics.IncError(c.queue)
+				return false, nil
+			}
+			if live.UID != t.uid || live.DeletionTimestamp != nil {
+				for _, cand := range t.candidates {
+					c.ghostStreak.Reset(cand.key)
+					delete(ghostNow, cand.key)
+				}
+				return false, nil
+			}
+
+			type podLookupResult struct {
+				pod *corev1.Pod
+				err error
+			}
+			podCache := make(map[string]podLookupResult, len(t.candidates))
+			confirmedGhostUIDs := make(map[types.UID]string, len(t.candidates))
+			for _, cand := range t.candidates {
+				podKey := cand.podNS + "/" + cand.podName
+				res, cached := podCache[podKey]
+				if !cached {
+					p, pErr := c.cs.CoreV1().Pods(cand.podNS).
+						Get(ctx, cand.podName, metav1.GetOptions{})
+					res = podLookupResult{pod: p, err: pErr}
+					podCache[podKey] = res
+				}
+				gone, confirmErr := kube.ConfirmAbsent(res.err)
+				switch {
+				case gone:
+					confirmedGhostUIDs[cand.podUID] = cand.key
+				case confirmErr != nil:
+					if !cached {
+						log.Info("WARN: ghost pod confirm failed — endpoint kept (fail closed)",
+							"endpointslice", t.ns+"/"+t.name,
+							"pod", podKey, "error", confirmErr)
+						metrics.IncError(c.queue)
+					}
+				default:
+					if res.pod.UID == cand.podUID {
+						c.ghostStreak.Reset(cand.key)
+						ghostNow[cand.key] = false
+					} else {
+						confirmedGhostUIDs[cand.podUID] = cand.key
+					}
+				}
+			}
+			if len(confirmedGhostUIDs) == 0 {
+				return false, nil
+			}
+
+			remaining := make([]discoveryv1.Endpoint, 0, len(live.Endpoints))
+			removedSet := make(map[string]bool, len(confirmedGhostUIDs))
+			var removedKeys []string
+			for i := range live.Endpoints {
+				ep := &live.Endpoints[i]
+				if isPodTargetRef(ep.TargetRef) {
+					if gkey, isGhost := confirmedGhostUIDs[ep.TargetRef.UID]; isGhost {
+						if !removedSet[gkey] {
+							removedSet[gkey] = true
+							removedKeys = append(removedKeys, gkey)
+						}
+						continue
+					}
+				}
+				remaining = append(remaining, *ep)
+			}
+			if len(removedKeys) == 0 {
+				return false, nil
+			}
+			*t.plan = ghostPlan{
+				live:        live,
+				remaining:   remaining,
+				removedKeys: removedKeys,
+				deleteWhole: len(remaining) == 0,
+			}
+			return true, nil
+		},
+		LogTarget: func(log logr.Logger, t ghostTarget) {
+			if t.plan.deleteWhole {
+				log.Info("DELETE: ghost-only EndpointSlice (all Pod UIDs gone)",
+					"endpointslice", t.ns+"/"+t.name,
+					"removed", len(t.plan.removedKeys))
+				return
+			}
+			log.Info("PATCH: stripped ghost Pod endpoints from EndpointSlice",
+				"endpointslice", t.ns+"/"+t.name,
+				"removed", len(t.plan.removedKeys),
+				"remaining", len(t.plan.remaining))
+		},
+		Delete: func(ctx context.Context, t ghostTarget) error {
+			if t.plan.deleteWhole {
+				if err := c.cs.DiscoveryV1().EndpointSlices(t.ns).
+					Delete(ctx, t.name, kube.UIDDeleteOptions(t.plan.live.UID, "")); err != nil {
+					return err
+				}
+				for _, k := range t.plan.removedKeys {
+					c.ghostStreak.Reset(k)
+					delete(ghostNow, k)
+				}
+				metrics.OrphanEndpointSlicesCleanedTotal.WithLabelValues(t.ns).Inc()
+				return nil
+			}
+			payload, err := json.Marshal(map[string]any{
+				"metadata": map[string]any{
+					"resourceVersion": t.plan.live.ResourceVersion,
+				},
+				"endpoints": t.plan.remaining,
+			})
+			if err != nil {
+				return err
+			}
+			if _, err := c.cs.DiscoveryV1().EndpointSlices(t.ns).Patch(
+				ctx, t.name, types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+				return err
+			}
+			for _, k := range t.plan.removedKeys {
+				c.ghostStreak.Reset(k)
+				delete(ghostNow, k)
+			}
+			return nil
+		},
+		OnError: reap.DeleteErrorHandler("endpointslice",
+			func(t ghostTarget) string { return t.ns + "/" + t.name },
+			func() { metrics.IncError(c.queue) }),
+	})
+
+	c.ghostStreak.Prune(func(k string) bool { return ghostNow[k] })
+	return remediated, nil
 }

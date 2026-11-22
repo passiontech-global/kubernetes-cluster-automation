@@ -362,10 +362,11 @@ type sweepSnapshot struct {
 	// spec fields. Declared here so InvalidateSweep drops them with
 	// the rest — a mid-sweep workload mutation must not leave a
 	// stale census behind for the next check.
-	replicaSets memo[[]metav1.PartialObjectMetadata]
-	cronJobs    memo[[]batchv1.CronJob]
-	jobs        memo[[]batchv1.Job]
-	pdbs        memo[[]policyv1.PodDisruptionBudget]
+	replicaSets      memo[[]metav1.PartialObjectMetadata]
+	typedReplicaSets memo[[]appsv1.ReplicaSet]
+	cronJobs         memo[[]batchv1.CronJob]
+	jobs             memo[[]batchv1.Job]
+	pdbs             memo[[]policyv1.PodDisruptionBudget]
 	// Webhook configurations — cluster-scoped admission objects the
 	// apiserver-reachability heal reads to map webhook backends onto
 	// dark nodes; memoized so N checks pay one LIST pair per sweep.
@@ -499,7 +500,7 @@ func newSweepSnapshot(ctx context.Context, nowFn func() time.Time) *sweepSnapsho
 		&s.services, &s.namespaces, &s.events,
 		&s.pvcs, &s.pvs, &s.statefulSets, &s.deployments,
 		&s.daemonSets, &s.leases,
-		&s.replicaSets, &s.cronJobs, &s.jobs, &s.pdbs,
+		&s.replicaSets, &s.typedReplicaSets, &s.cronJobs, &s.jobs, &s.pdbs,
 		&s.validatingWebhooks, &s.mutatingWebhooks,
 		&s.nodeZones, &s.podNodes, &s.nodeByName,
 		&s.leaseIndex, &s.serviceIndex,

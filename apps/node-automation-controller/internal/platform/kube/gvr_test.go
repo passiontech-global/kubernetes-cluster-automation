@@ -23,7 +23,7 @@ var registryGVRs = []schema.GroupVersionResource{
 	GVRCiliumNetworkPolicy, GVRCiliumClusterwideNetworkPolicy,
 	GVRCiliumBGPNodeConfigV2, GVRCiliumBGPNodeConfigV2Alpha1,
 	GVVeleroSchedule, GVVeleroBackup, GVVeleroBackupStorageLocation,
-	GVVeleroPodVolumeBackup,
+	GVVeleroPodVolumeBackup, GVVeleroRestore,
 	GVREverestDatabaseCluster, GVREverestDatabaseClusterBackup,
 	GVRPerconaXtraDBCluster, GVRPerconaPGCluster, GVRPerconaServerMongoDB,
 	GVRNodeHealthCheck, GVRSelfNodeRemediation, GVRFenceAgentsRemediation,
@@ -34,6 +34,10 @@ var registryGVRs = []schema.GroupVersionResource{
 	GVRTektonPipelineRun, GVRKedaScaledObject,
 	GVROLMClusterServiceVersion, GVROLMSubscription,
 	GVRGatewayClass, GVRGateway, GVRHTTPRoute, GVRGRPCRoute,
+	GVRTLSRouteV1, GVRTLSRouteV1Alpha3, GVRTLSRouteV1Alpha2,
+	GVRReferenceGrantV1, GVRReferenceGrantV1Beta1, GVRReferenceGrantV1Alpha2,
+	GVRVolumeSnapshot, GVRVolumeSnapshotContent,
+	GVRResourceClaim,
 }
 
 // TestGVRRegistrySanity: every entry must carry a version and a
@@ -82,6 +86,8 @@ func TestGVRRegistrySlices(t *testing.T) {
 		"ClusterSecretStoreGVRs":  ClusterSecretStoreGVRs,
 		"PerconaClusterGVRs":      PerconaClusterGVRs,
 		"CiliumBGPNodeConfigGVRs": CiliumBGPNodeConfigGVRs,
+		"TLSRouteGVRs":            TLSRouteGVRs,
+		"ReferenceGrantGVRs":      ReferenceGrantGVRs,
 	} {
 		if len(s) == 0 {
 			t.Errorf("%s is empty", name)
@@ -94,12 +100,18 @@ func TestGVRRegistrySlices(t *testing.T) {
 		}
 	}
 	// Preferred version first: v1 before v1beta1 for external-secrets,
-	// v2 before v2alpha1 for CiliumBGPNodeConfig.
+	// v2 before v2alpha1 for CiliumBGPNodeConfig, v1 first for Gateway API.
 	if ExternalSecretGVRs[0].Version != "v1" {
 		t.Fatalf("ExternalSecretGVRs order = %v", ExternalSecretGVRs)
 	}
 	if CiliumBGPNodeConfigGVRs[0].Version != "v2" {
 		t.Fatalf("CiliumBGPNodeConfigGVRs order = %v", CiliumBGPNodeConfigGVRs)
+	}
+	if TLSRouteGVRs[0].Version != "v1" {
+		t.Fatalf("TLSRouteGVRs order = %v", TLSRouteGVRs)
+	}
+	if ReferenceGrantGVRs[0].Version != "v1" {
+		t.Fatalf("ReferenceGrantGVRs order = %v", ReferenceGrantGVRs)
 	}
 }
 

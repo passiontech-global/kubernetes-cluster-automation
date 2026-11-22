@@ -178,6 +178,17 @@ func (d *Deps) InvalidateDaemonSets(ctx context.Context) {
 	}
 }
 
+// InvalidateReplicaSets drops the ReplicaSet censuses (both
+// metadata-only and typed) and the by-namespace index — a spec/delete
+// patch mid-sweep must be visible to later checks.
+func (d *Deps) InvalidateReplicaSets(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.replicaSets.reset()
+		s.replicaSetsIdx.reset()
+		s.typedReplicaSets.reset()
+	}
+}
+
 // InvalidateCronJobs is the CronJob twin — a suspend/spec patch
 // mid-sweep must be visible to later schedule audits.
 func (d *Deps) InvalidateCronJobs(ctx context.Context) {

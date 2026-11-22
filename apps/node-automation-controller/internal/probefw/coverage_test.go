@@ -154,5 +154,6 @@ func TestSnapshotClusterNodesPVsUnstructuredAndInvalidations(t *testing.T) {
 	d.InvalidateDeployments(ctx)
 	d.InvalidateStatefulSets(ctx)
 	d.InvalidateCronJobs(ctx)
+	d.InvalidateReplicaSets(ctx)
 	d.InvalidateUnstructured(ctx)
 }

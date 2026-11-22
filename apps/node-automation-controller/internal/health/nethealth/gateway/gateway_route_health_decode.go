@@ -98,15 +98,14 @@ type routeGrantFrom struct{ group, kind, namespace string }
 // what may be referenced.
 type routeGrantTo struct{ group, kind, name string }
 
-// permits reports whether the grant lets a route of kind routeKind in
-// routeNS reference the Service svcName in the grant's own namespace —
-// the ReferenceGrant contract: from must name the route's group/kind/
-// namespace, to must name core Service (name absent = any Service).
-func (g routeGrant) permits(routeKind, routeNS, svcName string) bool {
+// permitsRef reports whether the grant permits a cross-namespace
+// reference from (fromGroup, fromKind, fromNS) to (toGroup, toKind, toName)
+// in the grant's own namespace. Core group matches both "" and "core".
+func (g routeGrant) permitsRef(fromGroup, fromKind, fromNS, toGroup, toKind, toName string) bool {
 	fromOK := false
 	for _, f := range g.from {
-		if f.group == "gateway.networking.k8s.io" && f.kind == routeKind &&
-			f.namespace == routeNS {
+		if f.group == fromGroup && f.kind == fromKind &&
+			f.namespace == fromNS {
 			fromOK = true
 		}
 	}
@@ -114,10 +113,10 @@ func (g routeGrant) permits(routeKind, routeNS, svcName string) bool {
 		return false
 	}
 	for _, t := range g.to {
-		// Core-group Services spell the group "" or "core" —
-		// both are the same reference target.
-		if (t.group == "" || t.group == "core") && t.kind == "Service" &&
-			(t.name == "" || t.name == svcName) {
+		groupMatch := t.group == toGroup ||
+			((toGroup == "" || toGroup == "core") && (t.group == "" || t.group == "core"))
+		if groupMatch && t.kind == toKind &&
+			(t.name == "" || t.name == toName) {
 			return true
 		}
 	}
@@ -238,4 +237,98 @@ func routeParentConditionReasons(route *unstructured.Unstructured) map[string]bo
 		}
 	}
 	return reasons
+}
+
+// routeParentGatewayRefs returns "ns/name" keys for every spec.parentRefs
+// entry targeting a Gateway (defaulting empty group/kind to Gateway API
+// Gateway and empty namespace to the route's own namespace).
+func routeParentGatewayRefs(route *unstructured.Unstructured) []string {
+	refs, found := kube.NestedSlice(route.Object, "spec", "parentRefs")
+	if !found {
+		return nil
+	}
+	var out []string
+	for _, r := range refs {
+		rm, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		group, _ := kube.NestedString(rm, "group")
+		kind, _ := kube.NestedString(rm, "kind")
+		if (group != "" && group != "gateway.networking.k8s.io") ||
+			(kind != "" && kind != "Gateway") {
+			continue
+		}
+		name, _ := kube.NestedString(rm, "name")
+		if name == "" {
+			continue
+		}
+		ns, _ := kube.NestedString(rm, "namespace")
+		if ns == "" {
+			ns = route.GetNamespace()
+		}
+		out = append(out, ns+"/"+name)
+	}
+	return out
+}
+
+// gatewayCertRef is one cross-namespace core Secret ref under a
+// Gateway's spec.listeners[*].tls.certificateRefs.
+type gatewayCertRef struct {
+	ns   string
+	name string
+}
+
+// gatewayCrossNSCertSecretRefs extracts every cross-namespace core
+// Secret reference from spec.listeners[*].tls.certificateRefs.
+func gatewayCrossNSCertSecretRefs(gw *unstructured.Unstructured) []gatewayCertRef {
+	listeners, found := kube.NestedSlice(gw.Object, "spec", "listeners")
+	if !found {
+		return nil
+	}
+	gwNS := gw.GetNamespace()
+	var out []gatewayCertRef
+	for _, l := range listeners {
+		lm, ok := l.(map[string]any)
+		if !ok {
+			continue
+		}
+		refs, _ := kube.NestedSlice(lm, "tls", "certificateRefs")
+		for _, r := range refs {
+			rm, ok := r.(map[string]any)
+			if !ok {
+				continue
+			}
+			group, _ := kube.NestedString(rm, "group")
+			kind, _ := kube.NestedString(rm, "kind")
+			if (group != "" && group != "core") || (kind != "" && kind != "Secret") {
+				continue
+			}
+			name, _ := kube.NestedString(rm, "name")
+			ns, _ := kube.NestedString(rm, "namespace")
+			if name == "" || ns == "" || ns == gwNS {
+				continue
+			}
+			out = append(out, gatewayCertRef{ns: ns, name: name})
+		}
+	}
+	return out
+}
+
+// gatewayListenerConditions returns every condition under
+// status.listeners[*].conditions on a Gateway.
+func gatewayListenerConditions(gw *unstructured.Unstructured) []kube.Condition {
+	listeners, found := kube.NestedSlice(gw.Object, "status", "listeners")
+	if !found {
+		return nil
+	}
+	var out []kube.Condition
+	for _, l := range listeners {
+		lm, ok := l.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, kube.Conditions(lm, "conditions")...)
+	}
+	return out
 }

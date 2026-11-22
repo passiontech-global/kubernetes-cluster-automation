@@ -226,7 +226,10 @@ func (p *podStatusCheck) Run(ctx context.Context) probefw.Result {
 // A resource absent from Status.Used counts as 0.
 func (p *resourceQuotaCheck) Run(ctx context.Context) probefw.Result {
 	quotas, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: kube.DefaultListPageSize},
+		metav1.ListOptions{
+			Limit:           kube.DefaultListPageSize,
+			ResourceVersion: "0",
+		},
 		kube.ResourceQuotas(p.CS, metav1.NamespaceAll))
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list resourcequotas: %w", err)}
