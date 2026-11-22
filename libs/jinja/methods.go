@@ -373,15 +373,52 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 	// Mappings compare order-insensitively across *OMap,
 	// map[string]any and map[string]string — a vars-file OMap and a
 	// Go-native map with the same entries are the same value.
-	if lm, lok := asMapping(l); lok {
-		// The right side only answers per-key lookups — mapLookup
-		// skips the sorted view asMapping would build for it.
+	// Iterate directly without asMapping's sorted-key copy so equality
+	// stays allocation-free.
+	switch lt := l.(type) {
+	case *OMap:
 		rn, rok := mappingLen(r)
-		if !rok || lm.n != rn {
+		if !rok || lt.Len() != rn {
 			return false
 		}
-		for _, k := range lm.keys {
-			lv, _ := lm.get(k)
+		for _, k := range lt.Keys() {
+			lv, _ := lt.Get(k)
+			rv, ok := mapLookup(r, k)
+			if !ok || !deepEqAt(lv, rv, depth+1, steps) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		rn, rok := mappingLen(r)
+		if !rok || len(lt) != rn {
+			return false
+		}
+		for k, lv := range lt {
+			rv, ok := mapLookup(r, k)
+			if !ok || !deepEqAt(lv, rv, depth+1, steps) {
+				return false
+			}
+		}
+		return true
+	case map[string]string:
+		rn, rok := mappingLen(r)
+		if !rok || len(lt) != rn {
+			return false
+		}
+		if rt, ok := r.(map[string]string); ok {
+			for k, lv := range lt {
+				if stepBudgetExhausted(steps) || depth+1 > walkMaxDepth {
+					return false
+				}
+				rv, ok := rt[k]
+				if !ok || lv != rv {
+					return false
+				}
+			}
+			return true
+		}
+		for k, lv := range lt {
 			rv, ok := mapLookup(r, k)
 			if !ok || !deepEqAt(lv, rv, depth+1, steps) {
 				return false
@@ -392,36 +429,64 @@ func deepEqAt(l, r any, depth int, steps *int) bool {
 	if isMappingValue(r) {
 		return false
 	}
-	// []string is the Go-native string-slice shape — normalize to
-	// []any once so sequence equality covers all three list
-	// representations element-wise instead of falling to the
-	// Stringify compare.
-	if ss, ok := l.([]string); ok {
-		cv := make([]any, len(ss))
-		for i, x := range ss {
-			cv[i] = x
-		}
-		l = cv
-	}
-	if ss, ok := r.([]string); ok {
-		cv := make([]any, len(ss))
-		for i, x := range ss {
-			cv[i] = x
-		}
-		r = cv
-	}
 	switch lt := l.(type) {
 	case []any:
-		rt, ok := r.([]any)
-		if !ok || len(lt) != len(rt) {
-			return false
-		}
-		for i := range lt {
-			if !deepEqAt(lt[i], rt[i], depth+1, steps) {
+		switch rt := r.(type) {
+		case []any:
+			if len(lt) != len(rt) {
 				return false
 			}
+			for i := range lt {
+				if !deepEqAt(lt[i], rt[i], depth+1, steps) {
+					return false
+				}
+			}
+			return true
+		case []string:
+			if len(lt) != len(rt) {
+				return false
+			}
+			for i := range lt {
+				if !deepEqAt(lt[i], rt[i], depth+1, steps) {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
 		}
-		return true
+	case []string:
+		switch rt := r.(type) {
+		case []string:
+			if len(lt) != len(rt) {
+				return false
+			}
+			for i := range lt {
+				if stepBudgetExhausted(steps) || depth+1 > walkMaxDepth {
+					return false
+				}
+				if lt[i] != rt[i] {
+					return false
+				}
+			}
+			return true
+		case []any:
+			if len(lt) != len(rt) {
+				return false
+			}
+			for i := range lt {
+				if !deepEqAt(lt[i], rt[i], depth+1, steps) {
+					return false
+				}
+			}
+			return true
+		default:
+			return false
+		}
+	}
+	switch r.(type) {
+	case []any, []string:
+		return false
 	}
 	if IsNilOrUndef(l) || IsNilOrUndef(r) {
 		return IsNilOrUndef(l) && IsNilOrUndef(r)

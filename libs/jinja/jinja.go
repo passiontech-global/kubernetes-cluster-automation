@@ -85,6 +85,17 @@ const maxStringBytes = 16 << 20
 // maxStringBytes (rangeMaxOut already covers range() itself).
 const maxSeqElems = 1_000_000
 
+// maxLoopSteps bounds cumulative {% for %} iterations across a single
+// Render/RenderScoped call — nested or sequential zero-output / filtered
+// loops never grow the output strings.Builder and would otherwise spin
+// unboundedly on CPU.
+const maxLoopSteps = 1_000_000
+
+// maxSeqCompareOps bounds cumulative deepEq comparisons in sequence set
+// filters (unique, difference, union) when inputs fall off the O(N)
+// hash-set fast paths, turning O(N^2) scans into a prompt error.
+const maxSeqCompareOps = 1_000_000
+
 // Env carries render-time hooks.
 type Env struct {
 	// FileLookup resolves lookup('file'|'ansible.builtin.file', path).
@@ -104,7 +115,7 @@ func Render(text string, ctx map[string]any, env *Env) (string, error) {
 	if vars == nil {
 		vars = map[string]any{}
 	}
-	s := &scope{vars: vars, env: env}
+	s := &scope{vars: vars, env: env, loopSteps: new(int)}
 	var b strings.Builder
 	if err := renderNodes(nodes, s, &b); err != nil {
 		return "", err
@@ -125,7 +136,7 @@ func RenderScoped(text string, env *Env, lookup func(name string) any) (string, 
 	if err != nil {
 		return "", err
 	}
-	s := &scope{vars: map[string]any{}, env: env, lookup: lookup}
+	s := &scope{vars: map[string]any{}, env: env, lookup: lookup, loopSteps: new(int)}
 	var b strings.Builder
 	if err := renderNodes(nodes, s, &b); err != nil {
 		return "", err

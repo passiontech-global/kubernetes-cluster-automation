@@ -181,28 +181,72 @@ func parsedTemplate(src string) ([]tnode, error) {
 	return templateCache.putIfAbsent(src, nodes), nil
 }
 
-// regexCache memoizes compiled patterns for the regex_* filters and
-// the `is search` test — templates reuse a handful of fixed patterns
-// and regexp.Compile parsed and NFA-built per call. Patterns
-// normally originate in vendored template files (a bounded set), but
-// a template can build a pattern from data (regex_replace on a
-// user-controlled string), so the cache is capped like logx's logger
-// cache: past the cap the clock hand evicts the coldest pattern —
-// caching continues instead of degrading to compile-per-call.
-var regexCache = newClockCache[*regexp.Regexp](regexCacheCap)
+type regexClass struct {
+	mode         int
+	lit          string
+	isLit        bool
+	isEmpty      bool
+	isLinePrefix bool
+}
+
+type regexEntry struct {
+	re         *regexp.Regexp
+	noExpand   regexClass
+	withExpand regexClass
+	litCapture string
+	hasLitCap  bool
+}
+
+// regexCache memoizes compiled patterns (and their precomputed syntax
+// classifications) for the regex_* filters and the `is search` test —
+// templates reuse a handful of fixed patterns and regexp.Compile +
+// syntax.Parse would otherwise re-run per call. Patterns normally
+// originate in vendored template files (a bounded set), but a template
+// can build a pattern from data (regex_replace on a user-controlled
+// string), so the cache is capped like logx's logger cache: past the
+// cap the clock hand evicts the coldest pattern — caching continues
+// instead of degrading to compile-per-call.
+var regexCache = newClockCache[*regexEntry](regexCacheCap)
 
 // regexCacheCap bounds regexCache's live entries.
 const regexCacheCap = 512
 
-func cachedRegexp(pattern string) (*regexp.Regexp, error) {
-	if re, ok := regexCache.get(pattern); ok {
-		return re, nil
+func classifyRegexClass(pat string, hasExpand bool) regexClass {
+	mode, lit, isLit, isEmpty, isLinePrefix := classifyRegexReplace(pat, hasExpand)
+	return regexClass{
+		mode:         mode,
+		lit:          lit,
+		isLit:        isLit,
+		isEmpty:      isEmpty,
+		isLinePrefix: isLinePrefix,
+	}
+}
+
+func cachedRegexpEntry(pattern string) (*regexEntry, error) {
+	if entry, ok := regexCache.get(pattern); ok {
+		return entry, nil
 	}
 	compiled, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, err
 	}
+	entry := &regexEntry{
+		re:         compiled,
+		noExpand:   classifyRegexClass(pattern, false),
+		withExpand: classifyRegexClass(pattern, true),
+	}
+	if compiled.NumSubexp() == 1 {
+		entry.litCapture, entry.hasLitCap = singleLiteralCapture(pattern)
+	}
 	// Compile failures stay uncached (they re-error identically);
 	// putIfAbsent keeps the first of any racing duplicates.
-	return regexCache.putIfAbsent(pattern, compiled), nil
+	return regexCache.putIfAbsent(pattern, entry), nil
+}
+
+func cachedRegexp(pattern string) (*regexp.Regexp, error) {
+	entry, err := cachedRegexpEntry(pattern)
+	if err != nil {
+		return nil, err
+	}
+	return entry.re, nil
 }

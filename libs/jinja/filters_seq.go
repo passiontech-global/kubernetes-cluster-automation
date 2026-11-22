@@ -13,11 +13,14 @@ import "fmt"
 func filterUnique(v any) (any, error) {
 	items := ToIter(v)
 	if allPlainStrings(items) {
-		seen := make(map[string]struct{}, len(items))
+		seen := make(map[string]struct{}, min(len(items), maxSeqElems))
 		var out []any
 		for _, it := range items {
 			s := it.(string)
 			if _, dup := seen[s]; !dup {
+				if len(out) >= maxSeqElems {
+					return nil, fmt.Errorf("unique: output exceeds %d elements", maxSeqElems)
+				}
 				seen[s] = struct{}{}
 				out = append(out, it)
 			}
@@ -25,18 +28,25 @@ func filterUnique(v any) (any, error) {
 		return &List{out}, nil
 	}
 	if allPlainInts(items) {
-		seen := make(map[int64]struct{}, len(items))
+		seen := make(map[int64]struct{}, min(len(items), maxSeqElems))
 		var out []any
 		for _, it := range items {
 			i := it.(int64)
 			if _, dup := seen[i]; !dup {
+				if len(out) >= maxSeqElems {
+					return nil, fmt.Errorf("unique: output exceeds %d elements", maxSeqElems)
+				}
 				seen[i] = struct{}{}
 				out = append(out, it)
 			}
 		}
 		return &List{out}, nil
 	}
-	return &List{appendUnique(nil, items)}, nil
+	out, err := appendUniqueBudget(nil, items, maxSeqElems, "unique", new(int))
+	if err != nil {
+		return nil, err
+	}
+	return &List{out}, nil
 }
 
 // filterDifference drops every element that deep-equals a member of
@@ -57,6 +67,9 @@ func filterDifference(v any, args []any) (any, error) {
 		var out []any
 		for _, it := range items {
 			if _, hit := drop[it.(string)]; !hit {
+				if len(out) >= maxSeqElems {
+					return nil, fmt.Errorf("difference: output exceeds %d elements", maxSeqElems)
+				}
 				out = append(out, it)
 			}
 		}
@@ -70,14 +83,25 @@ func filterDifference(v any, args []any) (any, error) {
 		var out []any
 		for _, it := range items {
 			if _, hit := drop[it.(int64)]; !hit {
+				if len(out) >= maxSeqElems {
+					return nil, fmt.Errorf("difference: output exceeds %d elements", maxSeqElems)
+				}
 				out = append(out, it)
 			}
 		}
 		return &List{out}, nil
 	}
+	ops := 0
 	var out []any
 	for _, it := range items {
-		if !containsDeepEq(excl, it) {
+		hit, err := containsDeepEqBudget(excl, it, &ops, "difference")
+		if err != nil {
+			return nil, err
+		}
+		if !hit {
+			if len(out) >= maxSeqElems {
+				return nil, fmt.Errorf("difference: output exceeds %d elements", maxSeqElems)
+			}
 			out = append(out, it)
 		}
 	}
@@ -103,44 +127,67 @@ func filterUnion(v any, args []any) (any, error) {
 		}
 	}
 	if allInts {
-		seen := make(map[int64]struct{}, len(seed))
+		seen := make(map[int64]struct{}, min(len(seed), maxSeqElems))
 		var out []any
-		add := func(items []any) {
+		add := func(items []any) error {
 			for _, it := range items {
 				i := it.(int64)
 				if _, dup := seen[i]; !dup {
+					if len(out) >= maxSeqElems {
+						return fmt.Errorf("union: output exceeds %d elements", maxSeqElems)
+					}
 					seen[i] = struct{}{}
 					out = append(out, it)
 				}
 			}
+			return nil
 		}
-		add(seed)
+		if err := add(seed); err != nil {
+			return nil, err
+		}
 		for _, items := range rest {
-			add(items)
+			if err := add(items); err != nil {
+				return nil, err
+			}
 		}
 		return &List{out}, nil
 	}
 	if allStrings {
-		seen := make(map[string]struct{}, len(seed))
+		seen := make(map[string]struct{}, min(len(seed), maxSeqElems))
 		var out []any
-		add := func(items []any) {
+		add := func(items []any) error {
 			for _, it := range items {
 				s := it.(string)
 				if _, dup := seen[s]; !dup {
+					if len(out) >= maxSeqElems {
+						return fmt.Errorf("union: output exceeds %d elements", maxSeqElems)
+					}
 					seen[s] = struct{}{}
 					out = append(out, it)
 				}
 			}
+			return nil
 		}
-		add(seed)
+		if err := add(seed); err != nil {
+			return nil, err
+		}
 		for _, items := range rest {
-			add(items)
+			if err := add(items); err != nil {
+				return nil, err
+			}
 		}
 		return &List{out}, nil
 	}
-	out := appendUnique(nil, seed)
+	ops := 0
+	out, err := appendUniqueBudget(nil, seed, maxSeqElems, "union", &ops)
+	if err != nil {
+		return nil, err
+	}
 	for _, items := range rest {
-		out = appendUnique(out, items)
+		out, err = appendUniqueBudget(out, items, maxSeqElems, "union", &ops)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &List{out}, nil
 }
@@ -178,23 +225,47 @@ func allPlainInts(items []any) bool {
 // out, preserving first-occurrence order — the shared core of
 // unique/union (the three filters used to spell the same nested
 // deepEq loop out three times).
-func appendUnique(out, items []any) []any {
+func appendUnique(out, items []any, limit int, filter string) ([]any, error) {
+	return appendUniqueBudget(out, items, limit, filter, new(int))
+}
+
+func appendUniqueBudget(out, items []any, limit int, filter string, ops *int) ([]any, error) {
 	for _, it := range items {
-		if !containsDeepEq(out, it) {
+		hit, err := containsDeepEqBudget(out, it, ops, filter)
+		if err != nil {
+			return nil, err
+		}
+		if !hit {
+			if limit > 0 && len(out) >= limit {
+				return nil, fmt.Errorf("%s: output exceeds %d elements", filter, limit)
+			}
 			out = append(out, it)
 		}
 	}
-	return out
+	return out, nil
 }
 
-// containsDeepEq reports whether v deep-equals any element of list.
-func containsDeepEq(list []any, v any) bool {
+// containsDeepEqBudget reports whether v deep-equals any element of list,
+// charging each comparison and its deepEq walk steps against ops and
+// failing cleanly once maxSeqCompareOps is exceeded.
+func containsDeepEqBudget(list []any, v any, ops *int, filter string) (bool, error) {
 	for _, e := range list {
-		if deepEq(v, e) {
-			return true
+		if ops != nil && *ops >= maxSeqCompareOps {
+			return false, fmt.Errorf("%s: comparison budget exceeded (%d ops)", filter, maxSeqCompareOps)
+		}
+		callSteps := 0
+		eq := deepEqAt(v, e, 0, &callSteps)
+		if ops != nil {
+			*ops += 1 + callSteps
+			if *ops > maxSeqCompareOps {
+				return false, fmt.Errorf("%s: comparison budget exceeded (%d ops)", filter, maxSeqCompareOps)
+			}
+		}
+		if eq {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // filterDict2Items renders a mapping as [key,value] pair items —

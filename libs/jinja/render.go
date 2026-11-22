@@ -8,10 +8,19 @@ import (
 )
 
 type scope struct {
-	vars   map[string]any
-	parent *scope
-	env    *Env
-	lookup func(name string) any // external var resolver (checked after local scope chain)
+	vars      map[string]any
+	parent    *scope
+	env       *Env
+	lookup    func(name string) any // external var resolver (checked after local scope chain)
+	loopSteps *int                  // render-scoped cumulative {% for %} step counter
+}
+
+func burnLoopStep(steps *int) error {
+	*steps++
+	if *steps > maxLoopSteps {
+		return fmt.Errorf("for: loop iterations exceed %d", maxLoopSteps)
+	}
+	return nil
 }
 
 // builtinLookup/builtinRange are the two name-bound builtins
@@ -205,10 +214,15 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	if len(items) == 0 {
 		return nil
 	}
+	steps := s.loopSteps
+	if steps == nil {
+		steps = new(int)
+	}
 	inner := &scope{
-		vars:   make(map[string]any, len(n.names)+2),
-		parent: s,
-		env:    s.env,
+		vars:      make(map[string]any, len(n.names)+2),
+		parent:    s,
+		env:       s.env,
+		loopSteps: steps,
 	}
 	// Apply the `if` filters first: the loop var is bound for each
 	// candidate and every condition must be Truthy for the item to
@@ -226,6 +240,9 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 		kept = slices.Clone(items)
 	} else {
 		for _, it := range items {
+			if err := burnLoopStep(steps); err != nil {
+				return err
+			}
 			if err := n.bind(inner, it); err != nil {
 				return err
 			}
@@ -259,6 +276,9 @@ func (n forNode) render(s *scope, b *strings.Builder) error {
 	// known up front — no grow-realloc on first Set.
 	loop := NewOMapCap(7)
 	for i, it := range kept {
+		if err := burnLoopStep(steps); err != nil {
+			return err
+		}
 		if err := n.bind(inner, it); err != nil {
 			return err
 		}

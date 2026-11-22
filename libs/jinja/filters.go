@@ -415,7 +415,7 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if len(args) < 2 {
 			return v, nil
 		}
-		re, err := cachedRegexp(Stringify(args[0]))
+		entry, err := cachedRegexpEntry(Stringify(args[0]))
 		if err != nil {
 			return nil, err
 		}
@@ -424,16 +424,16 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if len(s) > maxStringBytes {
 			return nil, fmt.Errorf("regex_replace: input exceeds %d bytes", maxStringBytes)
 		}
-		return regexReplaceBounded(re, s, repl)
+		return regexReplaceBounded(entry, s, repl)
 	case "regex_findall":
 		if len(args) == 0 {
 			return &List{}, nil
 		}
-		re, err := cachedRegexp(Stringify(args[0]))
+		entry, err := cachedRegexpEntry(Stringify(args[0]))
 		if err != nil {
 			return nil, err
 		}
-		return regexFindallBounded(re, Stringify(v))
+		return regexFindallBounded(entry, Stringify(v))
 	case "regex_search":
 		if len(args) == 0 {
 			return Undefined{"regex_search"}, nil
@@ -487,7 +487,15 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		if err != nil {
 			return nil, err
 		}
-		b, err := yaml3.Marshal(node)
+		lw := yamlLimitWriter{max: maxStringBytes}
+		enc := yaml3.NewEncoder(&lw)
+		err = enc.Encode(node)
+		if err == nil {
+			err = enc.Close()
+		}
+		if lw.overflow {
+			return nil, fmt.Errorf("to_yaml: output exceeds %d bytes", maxStringBytes)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -495,10 +503,10 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		// the string cap (quotes, indentation, line breaks). Fail
 		// instead of returning an unbounded document — the same
 		// contract |join / |regex_replace / ~ already honor.
-		if err := outputSizeCap(len(b), "to_yaml"); err != nil {
+		if err := outputSizeCap(lw.b.Len(), "to_yaml"); err != nil {
 			return nil, err
 		}
-		return string(b), nil
+		return lw.b.String(), nil
 	case "b64decode":
 		raw := strings.TrimSpace(Stringify(v))
 		maxEnc := base64.StdEncoding.EncodedLen(maxStringBytes)
@@ -809,11 +817,32 @@ func replaceLinePrefixLiteralBounded(s, lit, repl string) (string, error) {
 	return b.String(), nil
 }
 
+var errYAMLSizeCap = errors.New("to_yaml: output size cap exceeded")
+
+type yamlLimitWriter struct {
+	b        strings.Builder
+	max      int
+	overflow bool
+}
+
+func (w *yamlLimitWriter) Write(p []byte) (int, error) {
+	if w.b.Len()+len(p) > w.max {
+		w.overflow = true
+		return 0, errYAMLSizeCap
+	}
+	return w.b.Write(p)
+}
+
 // regexReplaceBounded replaces matches incrementally without materializing an
 // unbounded [][]int match slice, enforcing maxStringBytes before writes.
-func regexReplaceBounded(re *regexp.Regexp, s, repl string) (string, error) {
+func regexReplaceBounded(entry *regexEntry, s, repl string) (string, error) {
+	re := entry.re
 	hasExpand := strings.ContainsRune(repl, '$')
-	mode, lit, isLit, isEmpty, isLinePrefix := classifyRegexReplace(re.String(), hasExpand)
+	cls := entry.noExpand
+	if hasExpand {
+		cls = entry.withExpand
+	}
+	mode, lit, isLit, isEmpty, isLinePrefix := cls.mode, cls.lit, cls.isLit, cls.isEmpty, cls.isLinePrefix
 	if isLit {
 		return replaceLiteralBounded(s, lit, repl)
 	}
@@ -964,8 +993,9 @@ func regexReplaceBounded(re *regexp.Regexp, s, repl string) (string, error) {
 
 // regexFindallBounded evaluates |regex_findall while rejecting match counts >
 // maxSeqElems without allocating 1,000,001 per-match []string submatch slices.
-func regexFindallBounded(re *regexp.Regexp, s string) (*List, error) {
-	mode, lit, isLit, isEmpty, _ := classifyRegexReplace(re.String(), false)
+func regexFindallBounded(entry *regexEntry, s string) (*List, error) {
+	re := entry.re
+	mode, lit, isLit, isEmpty := entry.noExpand.mode, entry.noExpand.lit, entry.noExpand.isLit, entry.noExpand.isEmpty
 	if re.NumSubexp() == 0 {
 		if isLit {
 			n := strings.Count(s, lit)
@@ -1041,7 +1071,8 @@ func regexFindallBounded(re *regexp.Regexp, s string) (*List, error) {
 	}
 
 	if re.NumSubexp() == 1 {
-		if lit, ok := singleLiteralCapture(re.String()); ok {
+		if entry.hasLitCap {
+			lit := entry.litCapture
 			n := strings.Count(s, lit)
 			if n > maxSeqElems {
 				return nil, fmt.Errorf("regex_findall: match count exceeds %d", maxSeqElems)
