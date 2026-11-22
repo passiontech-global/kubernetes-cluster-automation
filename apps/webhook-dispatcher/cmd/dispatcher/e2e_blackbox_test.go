@@ -404,25 +404,47 @@ func TestE2EDispatcher(t *testing.T) {
 		atc.waitForWebhookCalls(t, 1, 3*time.Second)
 
 		// Verify /metrics and /debug/pprof/ on METRICS_ADDR.
-		resp, err := client.Get("http://" + rd.metricsAddr + "/metrics")
-		if err != nil {
-			t.Fatalf("GET /metrics failed: %v", err)
-		}
-		metricsBody, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("GET /metrics status = %d, want 200", resp.StatusCode)
-		}
-		for _, metricName := range []string{
+		// Poll /metrics until fanout completes and updates fanout_total/fanout_duration_seconds:
+		// mock ATC records the request before CheckWebhook returns to handler/dispatch.go.
+		wantMetrics := []string{
 			"webhook_dispatcher_deliveries_total",
 			"webhook_dispatcher_fanout_total",
 			"webhook_dispatcher_fanout_duration_seconds",
 			"webhook_dispatcher_concourse_index_last_refresh_timestamp_seconds",
 			"webhook_dispatcher_concourse_index_fetch_errors_total",
-		} {
-			if !strings.Contains(string(metricsBody), metricName) {
-				t.Fatalf("/metrics missing %q", metricName)
+		}
+		metricsDeadline := time.Now().Add(5 * time.Second)
+		var lastMetricsErr error
+		for {
+			var missing string
+			resp, err := client.Get("http://" + rd.metricsAddr + "/metrics")
+			if err != nil {
+				lastMetricsErr = fmt.Errorf("GET /metrics failed: %v", err)
+			} else {
+				metricsBody, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if readErr != nil {
+					lastMetricsErr = fmt.Errorf("read /metrics body: %v", readErr)
+				} else if resp.StatusCode != http.StatusOK {
+					lastMetricsErr = fmt.Errorf("GET /metrics status = %d, want 200", resp.StatusCode)
+				} else {
+					bodyStr := string(metricsBody)
+					for _, metricName := range wantMetrics {
+						if !strings.Contains(bodyStr, metricName) {
+							missing = metricName
+							break
+						}
+					}
+					if missing == "" {
+						break
+					}
+					lastMetricsErr = fmt.Errorf("/metrics missing %q", missing)
+				}
 			}
+			if time.Now().After(metricsDeadline) {
+				t.Fatalf("timed out waiting for /metrics series: %v", lastMetricsErr)
+			}
+			time.Sleep(25 * time.Millisecond)
 		}
 
 		pprofResp, err := client.Get("http://" + rd.metricsAddr + "/debug/pprof/")

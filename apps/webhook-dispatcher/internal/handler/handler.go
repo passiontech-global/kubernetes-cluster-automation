@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -65,7 +66,16 @@ const (
 	// vector. Over the cap the delivery gets an immediate 503
 	// (GitHub retries) instead of queueing thousands of goroutines.
 	maxInflightRequests = 128
+	// maxPreAuthRequests and maxPreAuthBytes bound concurrent
+	// pre-verification buffered reads on handled events so an
+	// unauthenticated flood of valid-format bogus signatures cannot
+	// bypass reqSem and OOM the process, while keeping reqSem isolated
+	// for verified deliveries.
+	maxPreAuthRequests = 256
+	maxPreAuthBytes    = 32 << 20 // 32 MiB
 )
+
+var errPreAuthBudget = errors.New("pre-auth body byte budget exceeded")
 
 // bodyPool recycles the request-body buffers of the four handled
 // event types — each delivery can hold up to maxBodyBytes, and
@@ -85,10 +95,12 @@ var bodyPool = sync.Pool{
 
 // cappedBodyWriter appends read chunks into buf without doubling
 // capacity past max (maxBodyBytes), preventing 8 MiB -> 16 MiB buffer
-// amplification.
+// amplification, and charges capacity growth against reserve when set.
 type cappedBodyWriter struct {
-	buf []byte
-	max int
+	buf      []byte
+	max      int
+	reserved int64
+	reserve  func(int64) bool
 }
 
 func (w *cappedBodyWriter) Write(p []byte) (int, error) {
@@ -97,6 +109,15 @@ func (w *cappedBodyWriter) Write(p []byte) (int, error) {
 		newCap := max(cap(w.buf)*2, need)
 		if w.max > 0 && newCap > w.max {
 			newCap = max(w.max, need)
+		}
+		if w.reserve != nil {
+			delta := int64(newCap) - w.reserved
+			if delta > 0 {
+				if !w.reserve(delta) {
+					return 0, errPreAuthBudget
+				}
+				w.reserved += delta
+			}
 		}
 		grown := make([]byte, len(w.buf), newCap)
 		copy(grown, w.buf)
@@ -202,6 +223,11 @@ type Handler struct {
 	budget time.Duration
 	// reqSem bounds concurrent admitted requests (maxInflightRequests).
 	reqSem chan struct{}
+	// preAuthSem and preAuthBytes bound concurrent pre-auth buffered
+	// reads on handled events before reqSem admission.
+	preAuthSem      chan struct{}
+	preAuthBytes    atomic.Int64
+	preAuthMaxBytes int64
 	// drainMu guards draining + the request-scope wg.Add: Wait sets
 	// draining under this lock, and admit() takes the same lock to
 	// register — so once draining flips, no new request can slip a
@@ -218,11 +244,28 @@ type Handler struct {
 // fanning out through b.
 func New(secret string, b Backend) *Handler {
 	return &Handler{
-		secret:  secret,
-		backend: b,
-		sem:     make(chan struct{}, fanoutWorkers),
-		budget:  fanoutBudget,
-		reqSem:  make(chan struct{}, maxInflightRequests),
+		secret:          secret,
+		backend:         b,
+		sem:             make(chan struct{}, fanoutWorkers),
+		budget:          fanoutBudget,
+		reqSem:          make(chan struct{}, maxInflightRequests),
+		preAuthSem:      make(chan struct{}, maxPreAuthRequests),
+		preAuthMaxBytes: maxPreAuthBytes,
+	}
+}
+
+func (h *Handler) tryReservePreAuthBytes(n int64) bool {
+	if n <= 0 {
+		return true
+	}
+	for {
+		cur := h.preAuthBytes.Load()
+		if cur+n > h.preAuthMaxBytes {
+			return false
+		}
+		if h.preAuthBytes.CompareAndSwap(cur, cur+n) {
+			return true
+		}
 	}
 }
 
@@ -365,10 +408,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The four handled events DO parse the payload — borrow a
-	// MaxBytesReader-bounded buffer from the pool and hash+buffer in
-	// a single streaming pass so 8 MiB bodies never double to 16 MiB
-	// and slow-loris requests only hold 16 KiB until ReadTimeout.
+	// The four handled events DO parse the payload — bound pre-auth
+	// concurrency and aggregate buffered bytes before borrowing from
+	// bodyPool and streaming through SignatureTee so an unauthenticated
+	// flood cannot OOM the process, while keeping reqSem isolated.
+	select {
+	case h.preAuthSem <- struct{}{}:
+	default:
+		h.refuseAdmission(w, r, delivery, eventMetric, false)
+		return
+	}
+
 	bp := bodyPool.Get().(*[]byte)
 	cw := cappedBodyWriter{buf: (*bp)[:0], max: maxBodyBytes}
 	releaseBuf := func() {
@@ -388,9 +438,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer releaseBuf()
 
+	initCap := int64(cap(cw.buf))
+	if !h.tryReservePreAuthBytes(initCap) {
+		<-h.preAuthSem
+		h.refuseAdmission(w, r, delivery, eventMetric, false)
+		return
+	}
+	cw.reserved = initCap
+	cw.reserve = h.tryReservePreAuthBytes
+	preAuthHeld := true
+	releasePreAuth := func() {
+		if !preAuthHeld {
+			return
+		}
+		preAuthHeld = false
+		if cw.reserved > 0 {
+			h.preAuthBytes.Add(-cw.reserved)
+			cw.reserved = 0
+		}
+		<-h.preAuthSem
+	}
+	defer releasePreAuth()
+
 	matched, err := verify.SignatureTee(h.secret,
 		http.MaxBytesReader(w, r.Body, maxBodyBytes), &cw, sig)
 	if err != nil {
+		if errors.Is(err, errPreAuthBudget) {
+			h.refuseAdmission(w, r, delivery, eventMetric, false)
+			return
+		}
 		h.failBodyRead(w, r, delivery, event, eventMetric, err)
 		return
 	}
@@ -412,9 +488,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		jsontext.AllowInvalidUTF8(true),
 		jsontext.AllowDuplicateNames(true),
 	)
-	// Return the pooled buffer immediately once JSON decode finishes
-	// so it is never held across h.accept()'s 7s index wait.
+	// Return the pooled buffer and release pre-auth budget immediately
+	// once JSON decode finishes so neither is held across h.accept()'s
+	// 7s index wait.
 	releaseBuf()
+	releasePreAuth()
 	if err != nil {
 		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
 		logger().Warn("webhook rejected: malformed JSON payload",

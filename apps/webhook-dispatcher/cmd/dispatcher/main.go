@@ -47,6 +47,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -143,13 +144,28 @@ func usersSeparatorAhead(s string, i int) bool {
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, os.Args[1:]); err != nil {
+		if !errors.Is(err, flag.ErrHelp) {
+			os.Exit(1)
+		}
+	}
+}
+
+func run(ctx context.Context, args []string) error {
 	var showVersion bool
-	flag.BoolVar(&showVersion, "version", false, "print version and exit")
-	flag.Parse()
+	fs := flag.NewFlagSet("webhook-dispatcher", flag.ContinueOnError)
+	fs.BoolVar(&showVersion, "version", false, "print version and exit")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	if showVersion {
 		fmt.Printf("webhook-dispatcher %s\n", version)
-		return
+		return nil
 	}
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
@@ -166,7 +182,7 @@ func main() {
 	}
 	if len(missing) > 0 {
 		logger().Error("missing required environment variables", "vars", missing)
-		os.Exit(1)
+		return fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
 
 	// LOCAL_USERS carries Concourse basic auth as "user:password" —
@@ -175,7 +191,7 @@ func main() {
 	user, password, ok := parseLocalUsersEnv(os.Getenv("LOCAL_USERS"))
 	if !ok {
 		logger().Error("LOCAL_USERS must be in 'user:password' form")
-		os.Exit(1)
+		return errors.New("LOCAL_USERS must be in 'user:password' form")
 	}
 
 	// Connection pool tuned for the fan-out shape: 16 check-webhook
@@ -247,10 +263,6 @@ func main() {
 	listenAddr := envx.String("LISTEN_ADDR", ":8080")
 	metricsAddr := envx.String("METRICS_ADDR", ":9115")
 
-	ctx, stop := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	// Bind BEFORE entering the wait-on-signal loop: a port collision
 	// or typo'd address must abort boot (log + exit), not surface
 	// asynchronously from a goroutine after readiness. httpx.New does
@@ -274,7 +286,7 @@ func main() {
 	})
 	if err != nil {
 		logger().Error("binding public listener", "addr", listenAddr, "error", err)
-		os.Exit(1)
+		return fmt.Errorf("binding public listener %q: %w", listenAddr, err)
 	}
 	// Internal listener (metrics + pprof): loopback-only peers, so the
 	// hostile-peer posture is lighter — but still bound header read
@@ -287,7 +299,8 @@ func main() {
 	})
 	if err != nil {
 		logger().Error("binding metrics listener", "addr", metricsAddr, "error", err)
-		os.Exit(1)
+		_ = publicSrv.Close()
+		return fmt.Errorf("binding metrics listener %q: %w", metricsAddr, err)
 	}
 
 	// Serve both. A serve-loop failure (accept error) is fatal — same
@@ -301,19 +314,23 @@ func main() {
 	ready.Store(true)
 
 	logger().Info("starting webhook-dispatcher",
-		"version", version, "addr", listenAddr,
+		"version", version, "addr", publicSrv.Addr(),
 		"routes", "POST /webhook, GET /healthz, GET /readyz",
-		"metrics_addr", metricsAddr,
+		"metrics_addr", internalSrv.Addr(),
 		"internal_routes", "GET /metrics, /debug/pprof/*",
 		"concourse_url", client.SafeBaseURL(), "concourse_team", client.Team)
 
 	select {
 	case err := <-publicErr:
 		logger().Error("public server exited", "error", err)
-		os.Exit(1)
+		_ = publicSrv.Close()
+		_ = internalSrv.Close()
+		return fmt.Errorf("public server exited: %w", err)
 	case err := <-internalErr:
 		logger().Error("metrics server exited", "error", err)
-		os.Exit(1)
+		_ = publicSrv.Close()
+		_ = internalSrv.Close()
+		return fmt.Errorf("metrics server exited: %w", err)
 	case <-ctx.Done():
 	}
 
@@ -356,4 +373,5 @@ func main() {
 	// connections the ATC client pooled during dispatch so the process
 	// exits without lingering sockets.
 	client.HTTP.CloseIdleConnections()
+	return nil
 }

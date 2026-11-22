@@ -1337,3 +1337,296 @@ func TestPayloadAllowsInvalidUTF8AndDuplicateNames(t *testing.T) {
 		}
 	})
 }
+
+type panicReadCloser struct{}
+
+func (panicReadCloser) Read([]byte) (int, error) { panic("boom") }
+func (panicReadCloser) Close() error             { return nil }
+
+func TestPreAuthConcurrencyCapRejectsWith503(t *testing.T) {
+	b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+	h := New(testSecret, b)
+
+	overloadedBefore := testutil.ToFloat64(deliveriesTotal.WithLabelValues("push", "overloaded"))
+
+	pipes := make([]*io.PipeWriter, maxPreAuthRequests)
+	codes := make([]int, maxPreAuthRequests)
+	var slowWG sync.WaitGroup
+	var readingWG sync.WaitGroup
+	readingWG.Add(maxPreAuthRequests)
+
+	for i := range maxPreAuthRequests {
+		pr, pw := io.Pipe()
+		pipes[i] = pw
+		req := httptest.NewRequest(http.MethodPost, "/webhook", pr)
+		req.Header.Set("X-GitHub-Event", "push")
+		req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+		slowWG.Go(func() {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			codes[i] = rec.Code
+		})
+		go func() {
+			defer readingWG.Done()
+			_, _ = pw.Write([]byte("{"))
+		}()
+	}
+	readingWG.Wait()
+
+	if got := len(h.reqSem); got != 0 {
+		t.Fatalf("len(h.reqSem)=%d want 0 (pre-auth slow bodies must not touch reqSem)", got)
+	}
+
+	// 257th handled-event request must be rejected 503 immediately.
+	extraReq := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(pushBody))
+	extraReq.Header.Set("X-GitHub-Event", "push")
+	extraReq.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+	extraRec := httptest.NewRecorder()
+	h.ServeHTTP(extraRec, extraReq)
+	if extraRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("257th request status=%d want 503", extraRec.Code)
+	}
+	if got := testutil.ToFloat64(deliveriesTotal.WithLabelValues("push", "overloaded")); got != overloadedBefore+1 {
+		t.Fatalf("overloaded metric=%v want %v", got, overloadedBefore+1)
+	}
+
+	// Unhandled event (ping) streams without preAuthSem and still succeeds.
+	pingRec := httptest.NewRecorder()
+	h.ServeHTTP(pingRec, signedRequest(t, "ping", `{}`))
+	if pingRec.Code != http.StatusAccepted {
+		t.Fatalf("ping status=%d want 202 while preAuthSem saturated", pingRec.Code)
+	}
+
+	for _, pw := range pipes {
+		_ = pw.Close()
+	}
+	slowWG.Wait()
+	for i, code := range codes {
+		if code != http.StatusUnauthorized {
+			t.Fatalf("slow probe[%d] status=%d want 401", i, code)
+		}
+	}
+	if got := len(h.preAuthSem); got != 0 {
+		t.Fatalf("len(h.preAuthSem)=%d want 0 after release", got)
+	}
+	if got := h.preAuthBytes.Load(); got != 0 {
+		t.Fatalf("h.preAuthBytes=%d want 0 after release", got)
+	}
+
+	// Subsequent valid delivery succeeds.
+	okRec := httptest.NewRecorder()
+	h.ServeHTTP(okRec, signedRequest(t, "push", pushBody))
+	if okRec.Code != http.StatusAccepted {
+		t.Fatalf("post-drain valid push status=%d want 202", okRec.Code)
+	}
+	if dropped := h.Wait(t.Context()); dropped != 0 {
+		t.Fatalf("dropped=%d want 0", dropped)
+	}
+}
+
+func TestPreAuthByteBudgetCapsLargeBogusPayloadsWithoutOOM(t *testing.T) {
+	b := &fakeBackend{resources: testIndex(), status: http.StatusCreated}
+	h := New(testSecret, b)
+	if h.preAuthMaxBytes != maxPreAuthBytes {
+		t.Fatalf("default preAuthMaxBytes=%d want %d", h.preAuthMaxBytes, maxPreAuthBytes)
+	}
+	// Shrink budget for deterministic unit test (512 KiB > maxPooledBodyCap 64 KiB).
+	h.preAuthMaxBytes = 512 << 10
+
+	overloadedBefore := testutil.ToFloat64(deliveriesTotal.WithLabelValues("push", "overloaded"))
+
+	pr, pw := io.Pipe()
+	req1 := httptest.NewRequest(http.MethodPost, "/webhook", pr)
+	req1.Header.Set("X-GitHub-Event", "push")
+	req1.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+
+	var wg sync.WaitGroup
+	var code1 int
+	wg.Go(func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req1)
+		code1 = rec.Code
+	})
+
+	// Write 200 KiB (grows cw.buf capacity to 256 KiB), then 1 more byte
+	// so SignatureTee has definitely completed dst.Write for the 200 KiB.
+	if _, err := pw.Write(bytes.Repeat([]byte("a"), 200<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pw.Write([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := h.preAuthBytes.Load(); got < 256<<10 {
+		t.Fatalf("preAuthBytes=%d want >= %d", got, 256<<10)
+	}
+	if got := len(h.reqSem); got != 0 {
+		t.Fatalf("len(h.reqSem)=%d want 0", got)
+	}
+
+	// Second unauthenticated 300 KiB payload needs 512 KiB cap, exceeding 512 KiB budget.
+	req2 := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("x", 300<<10)))
+	req2.Header.Set("X-GitHub-Event", "push")
+	req2.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("budget-exceeding request status=%d want 503", rec2.Code)
+	}
+	if got := testutil.ToFloat64(deliveriesTotal.WithLabelValues("push", "overloaded")); got != overloadedBefore+1 {
+		t.Fatalf("overloaded metric=%v want %v", got, overloadedBefore+1)
+	}
+	if got := h.preAuthBytes.Load(); got > h.preAuthMaxBytes {
+		t.Fatalf("preAuthBytes=%d exceeded preAuthMaxBytes=%d", got, h.preAuthMaxBytes)
+	}
+
+	_ = pw.Close()
+	wg.Wait()
+	if code1 != http.StatusUnauthorized {
+		t.Fatalf("stalled request status=%d want 401", code1)
+	}
+	if got := len(h.preAuthSem); got != 0 {
+		t.Fatalf("len(h.preAuthSem)=%d want 0 after release", got)
+	}
+	if got := h.preAuthBytes.Load(); got != 0 {
+		t.Fatalf("h.preAuthBytes=%d want 0 after release", got)
+	}
+
+	okRec := httptest.NewRecorder()
+	h.ServeHTTP(okRec, signedRequest(t, "push", pushBody))
+	if okRec.Code != http.StatusAccepted {
+		t.Fatalf("post-release valid push status=%d want 202", okRec.Code)
+	}
+	h.Wait(t.Context())
+}
+
+func TestPreAuthBudgetNeverLeaks(t *testing.T) {
+	assertClean := func(t *testing.T, h *Handler) {
+		t.Helper()
+		if got := len(h.preAuthSem); got != 0 {
+			t.Fatalf("leaked preAuthSem slots: %d", got)
+		}
+		if got := h.preAuthBytes.Load(); got != 0 {
+			t.Fatalf("leaked preAuthBytes: %d", got)
+		}
+	}
+
+	t.Run("202_valid_and_released_before_accept", func(t *testing.T) {
+		var inAcceptPreAuthBytes int64 = -1
+		var inAcceptPreAuthSem = -1
+		var h *Handler
+		b := &fakeBackend{
+			resources: testIndex(),
+			status:    http.StatusCreated,
+			ensureFn: func(context.Context) error {
+				inAcceptPreAuthBytes = h.preAuthBytes.Load()
+				inAcceptPreAuthSem = len(h.preAuthSem)
+				return nil
+			},
+		}
+		h = New(testSecret, b)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status=%d want 202", rec.Code)
+		}
+		h.Wait(t.Context())
+		if inAcceptPreAuthBytes != 0 || inAcceptPreAuthSem != 0 {
+			t.Fatalf("pre-auth held into accept: bytes=%d sem=%d", inAcceptPreAuthBytes, inAcceptPreAuthSem)
+		}
+		assertClean(t, h)
+	})
+
+	t.Run("401_small_and_large_bogus_sig", func(t *testing.T) {
+		h := New(testSecret, &fakeBackend{})
+		for _, sz := range []int{32, 128 << 10} {
+			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("z", sz)))
+			req.Header.Set("X-GitHub-Event", "push")
+			req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("size %d: status=%d want 401", sz, rec.Code)
+			}
+			assertClean(t, h)
+		}
+	})
+
+	t.Run("413_declared_and_chunked", func(t *testing.T) {
+		h := New(testSecret, &fakeBackend{})
+		reqDecl := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader("x"))
+		reqDecl.ContentLength = maxBodyBytes + 1
+		reqDecl.Header.Set("X-GitHub-Event", "push")
+		reqDecl.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+		recDecl := httptest.NewRecorder()
+		h.ServeHTTP(recDecl, reqDecl)
+		if recDecl.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("declared 413 status=%d", recDecl.Code)
+		}
+		assertClean(t, h)
+
+		reqChunked := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("x", maxBodyBytes+1)))
+		reqChunked.ContentLength = -1
+		reqChunked.Header.Set("X-GitHub-Event", "push")
+		reqChunked.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+		recChunked := httptest.NewRecorder()
+		h.ServeHTTP(recChunked, reqChunked)
+		if recChunked.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("chunked 413 status=%d", recChunked.Code)
+		}
+		assertClean(t, h)
+	})
+
+	t.Run("400_read_error_and_bad_json", func(t *testing.T) {
+		h := New(testSecret, &fakeBackend{})
+		reqErr := httptest.NewRequest(http.MethodPost, "/webhook", &errReader{})
+		reqErr.Header.Set("X-GitHub-Event", "push")
+		reqErr.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+		recErr := httptest.NewRecorder()
+		h.ServeHTTP(recErr, reqErr)
+		if recErr.Code != http.StatusBadRequest {
+			t.Fatalf("read err status=%d want 400", recErr.Code)
+		}
+		assertClean(t, h)
+
+		recJSON := httptest.NewRecorder()
+		h.ServeHTTP(recJSON, signedRequest(t, "push", "{not-json"))
+		if recJSON.Code != http.StatusBadRequest {
+			t.Fatalf("bad json status=%d want 400", recJSON.Code)
+		}
+		assertClean(t, h)
+	})
+
+	t.Run("503_reqSem_full", func(t *testing.T) {
+		h := New(testSecret, &fakeBackend{})
+		for range maxInflightRequests {
+			h.reqSem <- struct{}{}
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want 503", rec.Code)
+		}
+		for range maxInflightRequests {
+			<-h.reqSem
+		}
+		assertClean(t, h)
+	})
+
+	t.Run("panic_in_body_read", func(t *testing.T) {
+		h := New(testSecret, &fakeBackend{})
+		req := httptest.NewRequest(http.MethodPost, "/webhook", panicReadCloser{})
+		req.Header.Set("X-GitHub-Event", "push")
+		req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+		rec := httptest.NewRecorder()
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic from body read")
+				}
+			}()
+			h.ServeHTTP(rec, req)
+		}()
+		assertClean(t, h)
+	})
+}
