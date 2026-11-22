@@ -1029,3 +1029,60 @@ func TestWave4LatchEvents(t *testing.T) {
 		})
 	}
 }
+
+// TestWave5LatchEvents verifies that STATE-ENTER lines for both Wave 5
+// latches emit Warning Events with reason nodecond.Cond* and bump
+// problem_counter, and STATE-EXIT lines emit Normal Events with the matching
+// CondDefs DefaultReason.
+func TestWave5LatchEvents(t *testing.T) {
+	cases := []struct {
+		latch         string
+		condType      string
+		defaultReason string
+	}{
+		{
+			latch:         latchdefs.LatchK8s135ReadinessDrift,
+			condType:      nodecond.CondK8s135ReadinessDrift,
+			defaultReason: "K8s135ReadinessOk",
+		},
+		{
+			latch:         latchdefs.LatchKMSv2Unhealthy,
+			condType:      nodecond.CondKMSv2Unhealthy,
+			defaultReason: "KMSv2Healthy",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.latch, func(t *testing.T) {
+			e := fixture(t)
+			e.appendLog(t, latchdefs.StateEnterPrefix+tc.latch+" detail=wave5-test")
+			e.cycle()
+
+			if got := e.counter(tc.condType); got != 1 {
+				t.Fatalf("problem_counter{%s} = %v, want 1", tc.condType, got)
+			}
+			enterEvs := eventsByReason(t, e, tc.condType)
+			if len(enterEvs) != 1 {
+				t.Fatalf("%s events = %d, want 1", tc.condType, len(enterEvs))
+			}
+			if enterEvs[0].Type != "Warning" || !strings.Contains(enterEvs[0].Note, "detail=wave5-test") {
+				t.Fatalf("entry event = %s/%q, want Warning with detail=wave5-test",
+					enterEvs[0].Type, enterEvs[0].Note)
+			}
+
+			e.appendLog(t, latchdefs.StateExitPrefix+tc.latch)
+			e.cycle()
+
+			if got := e.counter(tc.defaultReason); got != 1 {
+				t.Fatalf("problem_counter{%s} = %v, want 1", tc.defaultReason, got)
+			}
+			exitEvs := eventsByReason(t, e, tc.defaultReason)
+			if len(exitEvs) != 1 {
+				t.Fatalf("%s events = %d, want 1", tc.defaultReason, len(exitEvs))
+			}
+			if exitEvs[0].Type != "Normal" {
+				t.Fatalf("exit event type = %s, want Normal", exitEvs[0].Type)
+			}
+		})
+	}
+}

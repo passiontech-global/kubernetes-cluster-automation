@@ -42,7 +42,7 @@ func TestCtrMethodsBuildArgv(t *testing.T) {
 		want []string
 	}{
 		{"RmImage", func() error { return e.D.Cfg.Seams.Ctr.RmImage(ctx, "img:tag") },
-			[]string{"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", "img:tag"}},
+			[]string{"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", "--", "img:tag"}},
 		{"RmIngest", func() error { return e.D.Cfg.Seams.Ctr.RmIngest(ctx, "sha256:abc") },
 			[]string{"k0s", "ctr", "-n", "k8s.io", "content", "ingest", "rm", "sha256:abc"}},
 		{"PruneContent", func() error { return e.D.Cfg.Seams.Ctr.PruneContent(ctx) },
@@ -64,6 +64,21 @@ func TestCtrMethodsBuildArgv(t *testing.T) {
 	e.D.Cfg.Seams.Ctr.Exec = func(context.Context, ...string) error { return wantErr }
 	if err := e.D.Cfg.Seams.Ctr.RmImage(ctx, "img:tag"); !errors.Is(err, wantErr) {
 		t.Fatalf("RmImage error=%v want %v", err, wantErr)
+	}
+
+	// Empty or leading-'-' image refs are rejected before Exec runs.
+	execCalled := false
+	e.D.Cfg.Seams.Ctr.Exec = func(context.Context, ...string) error {
+		execCalled = true
+		return nil
+	}
+	for _, bad := range []string{"", "-", "--help", "-n", "--namespace=other"} {
+		if err := e.D.Cfg.Seams.Ctr.RmImage(ctx, bad); err == nil {
+			t.Fatalf("RmImage(%q) succeeded, expected error", bad)
+		}
+	}
+	if execCalled {
+		t.Fatal("RmImage invoked Exec for invalid image ref")
 	}
 
 	// Leases reads over ExecOut and parses the table output.

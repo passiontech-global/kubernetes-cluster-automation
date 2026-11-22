@@ -4,10 +4,13 @@
 package k0sconfig
 
 import (
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -245,4 +248,118 @@ func TestScanK0sDriftConfigDefaults(t *testing.T) {
 	if len(scan3.Findings) != 0 {
 		t.Fatalf("gated scan produced findings: %+v", scan3.Findings)
 	}
+}
+
+func TestReadConfigBoundedAndScanAdversarial(t *testing.T) {
+	t.Run("oversized sparse file rejected without bloating memory", func(t *testing.T) {
+		dir := t.TempDir()
+		unit := filepath.Join(dir, "k0scontroller.service")
+		cfgPath := filepath.Join(dir, "k0s.yaml")
+		testutil.WriteFile(t, unit, "[Unit]\n")
+		f, err := os.Create(cfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(256 << 20); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		_ = f.Close()
+
+		start := time.Now()
+		_, err = ReadConfigBounded(cfgPath, MaxConfigBytes)
+		if err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("ReadConfigBounded(256MiB) err = %v, want exceeds error", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("ReadConfigBounded(256MiB) took %s, want <1s", elapsed)
+		}
+
+		scan := ScanK0sDrift(K0sDriftConfig{ConfigFile: cfgPath, UnitFile: unit})
+		if got := findingKeys(scan, "unreadable"); !slices.Equal(got, []string{"k0s.yaml"}) {
+			t.Fatalf("oversized ScanK0sDrift unreadable=%v want [k0s.yaml]", got)
+		}
+	})
+
+	t.Run("named FIFO rejected promptly without blocking", func(t *testing.T) {
+		dir := t.TempDir()
+		unit := filepath.Join(dir, "k0scontroller.service")
+		fifo := filepath.Join(dir, "k0s.yaml")
+		testutil.WriteFile(t, unit, "[Unit]\n")
+		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		start := time.Now()
+		_, err := ReadConfigBounded(fifo, MaxConfigBytes)
+		elapsed := time.Since(start)
+		if err == nil || !strings.Contains(err.Error(), "non-regular") {
+			t.Fatalf("ReadConfigBounded(FIFO) err = %v, want non-regular error", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("ReadConfigBounded(FIFO) took %s, want <1s", elapsed)
+		}
+
+		start = time.Now()
+		scan := ScanK0sDrift(K0sDriftConfig{ConfigFile: fifo, UnitFile: unit})
+		if time.Since(start) > time.Second {
+			t.Fatalf("ScanK0sDrift(FIFO) blocked >1s")
+		}
+		if got := findingKeys(scan, "unreadable"); !slices.Equal(got, []string{"k0s.yaml"}) {
+			t.Fatalf("FIFO ScanK0sDrift unreadable=%v want [k0s.yaml]", got)
+		}
+	})
+
+	t.Run("directory target rejected as non-regular", func(t *testing.T) {
+		dir := t.TempDir()
+		unit := filepath.Join(dir, "k0scontroller.service")
+		cfgDir := filepath.Join(dir, "k0s.yaml")
+		testutil.WriteFile(t, unit, "[Unit]\n")
+		if err := os.Mkdir(cfgDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := ReadConfigBounded(cfgDir, MaxConfigBytes)
+		if err == nil || !strings.Contains(err.Error(), "non-regular") {
+			t.Fatalf("ReadConfigBounded(dir) err = %v, want non-regular error", err)
+		}
+		scan := ScanK0sDrift(K0sDriftConfig{ConfigFile: cfgDir, UnitFile: unit})
+		if got := findingKeys(scan, "unreadable"); !slices.Equal(got, []string{"k0s.yaml"}) {
+			t.Fatalf("dir ScanK0sDrift unreadable=%v want [k0s.yaml]", got)
+		}
+	})
+
+	t.Run("HostRoot symlink confinement", func(t *testing.T) {
+		root := t.TempDir()
+		realHR := filepath.Join(root, "real_hr")
+		evilHR := filepath.Join(root, "real_hr_evil")
+		linkHR := filepath.Join(root, "link_hr")
+		if err := os.MkdirAll(filepath.Join(realHR, "etc", "k0s", "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(evilHR, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realHR, linkHR); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteFile(t, filepath.Join(realHR, "etc", "k0s", "sub", "k0s.yaml"), "spec: {}\n")
+		testutil.WriteFile(t, filepath.Join(evilHR, "secret.yaml"), "spec: {}\n")
+		if err := os.Symlink("sub/k0s.yaml", filepath.Join(realHR, "etc", "k0s", "ok.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(evilHR, "secret.yaml"), filepath.Join(realHR, "etc", "k0s", "escape.yaml")); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := ConfinedHostPath(linkHR, filepath.Join(linkHR, "etc", "k0s", "ok.yaml")); err != nil {
+			t.Fatalf("valid relative symlink inside symlinked HostRoot failed: %v", err)
+		}
+		if _, err := ConfinedHostPath(realHR, filepath.Join(realHR, "etc", "k0s", "escape.yaml")); err == nil || !strings.Contains(err.Error(), "escapes HostRoot") {
+			t.Fatalf("sibling-prefix symlink escape err = %v, want escapes HostRoot", err)
+		}
+		if _, err := ConfinedHostPath(realHR, realHR+"/etc/k0s/../../outside"); err == nil || !strings.Contains(err.Error(), "traversal") {
+			t.Fatalf("traversal err = %v, want traversal error", err)
+		}
+	})
 }

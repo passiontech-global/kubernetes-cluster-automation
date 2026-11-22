@@ -36,7 +36,7 @@ func TestSeamsApplyDefaults(t *testing.T) {
 		t.Fatal("KillFn default missing")
 	}
 	if c.ProbeFn == nil || c.PgWireFn == nil || c.CPHealthFn == nil ||
-		c.KCMMetricsFn == nil || c.TLSCertFn == nil {
+		c.KCMMetricsFn == nil || c.TLSCertFn == nil || c.KMSProbeFn == nil {
 		t.Fatal("probe seam defaults missing")
 	}
 	if c.EvpurgeRunFn == nil || c.EtcdRescueFn == nil {
@@ -199,4 +199,88 @@ func TestKeepKCMetricsLine(t *testing.T) {
 			t.Errorf("keepKCMetricsLine(%q) = %v, want %v", tc.line, got, tc.want)
 		}
 	}
+}
+
+func TestProbeKMSv2Socket(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("immediate close mock succeeds", func(t *testing.T) {
+		sock := filepath.Join(t.TempDir(), "kms.sock")
+		ln, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_ = c.Close()
+			}
+		}()
+		if err := probeKMSv2Socket(ctx, sock); err != nil {
+			t.Fatalf("immediate close mock returned err: %v", err)
+		}
+	})
+
+	t.Run("http2 response succeeds", func(t *testing.T) {
+		sock := filepath.Join(t.TempDir(), "kms.sock")
+		ln, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				_, _ = c.Write([]byte("\x00\x00\x00\x04\x00\x00\x00\x00\x00"))
+				_ = c.Close()
+			}
+		}()
+		if err := probeKMSv2Socket(ctx, sock); err != nil {
+			t.Fatalf("http2 response mock returned err: %v", err)
+		}
+	})
+
+	t.Run("hung socket times out non-blocking", func(t *testing.T) {
+		sock := filepath.Join(t.TempDir(), "kms.sock")
+		ln, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		held := make(chan net.Conn, 1)
+		go func() {
+			c, err := ln.Accept()
+			if err == nil {
+				held <- c
+			}
+		}()
+		defer func() {
+			select {
+			case c := <-held:
+				_ = c.Close()
+			default:
+			}
+		}()
+		start := time.Now()
+		err = probeKMSv2Socket(ctx, sock)
+		if err == nil {
+			t.Fatal("expected timeout error on hung unix socket")
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("hung probe took too long: %s", elapsed)
+		}
+	})
+
+	t.Run("missing socket errors", func(t *testing.T) {
+		if err := probeKMSv2Socket(ctx, filepath.Join(t.TempDir(), "missing.sock")); err == nil {
+			t.Fatal("expected error for missing socket")
+		}
+	})
 }

@@ -97,6 +97,15 @@ func (c *LocalPVQuotaCheck) localPVQuota(ctx context.Context, e *wdeps.CycleEnv)
 			}
 		}
 	}
+	present := make(map[string]bool, len(candidates))
+	for _, dir := range candidates {
+		present[dir] = true
+	}
+	for dir := range c.localPVThrottled {
+		if !present[dir] {
+			delete(c.localPVThrottled, dir)
+		}
+	}
 	if len(candidates) == 0 {
 		return true // nothing on disk can match a PV — skip the API entirely
 	}

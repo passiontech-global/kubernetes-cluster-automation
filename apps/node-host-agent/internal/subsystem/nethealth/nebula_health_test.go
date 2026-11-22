@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -759,5 +760,42 @@ func TestNebulaCoordHoldsEmergencyHealAndStampsRemediation(t *testing.T) {
 	}
 	if stamped < 2 {
 		t.Fatalf("expected StampLocalRemediation for both timesyncd and nebula restarts, got %d", stamped)
+	}
+}
+
+func TestProbeNebulaOverlayDeduplicatesTargets(t *testing.T) {
+	e := fixture(t, nil)
+	e.n.cfg.Watchdog = &watchdogconf.Config{
+		OverlayProbeTargets: []string{"10.8.0.1", "10.8.0.2", "10.8.0.1"},
+		OverlayProbeMarkers: []string{"10.8.0.2", "10.8.1.1"},
+		OverlaySiteMarkers:  []string{"10.8.1.1", "", "10.9.0.1"},
+	}
+	var mu sync.Mutex
+	counts := map[string]int{}
+	e.n.cfg.ping = func(_ context.Context, ip string, _, _ int, _ bool) (bool, float64) {
+		mu.Lock()
+		counts[ip]++
+		mu.Unlock()
+		return true, 5.0
+	}
+	targets, results := e.n.probeNebulaOverlay(context.Background(), e.n.cfg.Watchdog)
+	wantTargets := []string{"10.8.0.1", "10.8.0.2", "10.8.1.1", "10.9.0.1"}
+	if !slices.Equal(targets, wantTargets) {
+		t.Fatalf("targets=%v want %v", targets, wantTargets)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, ip := range wantTargets {
+		if counts[ip] != 1 {
+			t.Fatalf("ip %s pinged %d times want 1 (counts=%v)", ip, counts[ip], counts)
+		}
+	}
+	if len(results) != len(wantTargets) {
+		t.Fatalf("results len=%d want %d", len(results), len(wantTargets))
+	}
+	// AggregateNebulaOverlay still tallies full per-class slice counts.
+	st := aggregateNebulaOverlay(e.n.cfg.Watchdog, results)
+	if st == nil {
+		t.Fatal("nil stats")
 	}
 }

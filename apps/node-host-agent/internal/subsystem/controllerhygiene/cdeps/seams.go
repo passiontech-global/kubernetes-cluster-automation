@@ -22,8 +22,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -65,6 +67,10 @@ type Probe struct {
 	// presents. nil → tlsDialCert (InsecureSkipVerify — only the
 	// presented cert is wanted, chain trust is irrelevant).
 	TLSCertFn func(ctx context.Context, addr string) (*x509.Certificate, error)
+	// KMSProbeFn probes a KMSv2 gRPC Unix socket with a bounded
+	// non-blocking connect + HTTP/2 preface exchange. nil →
+	// probeKMSv2Socket.
+	KMSProbeFn func(ctx context.Context, sockPath string) error
 }
 
 // Host holds the host-primitive seams — the calls that touch the
@@ -272,6 +278,9 @@ func (s *Seams) applyDefaults(c *Config) {
 	if s.TLSCertFn == nil {
 		s.TLSCertFn = tlsDialCert
 	}
+	if s.KMSProbeFn == nil {
+		s.KMSProbeFn = probeKMSv2Socket
+	}
 }
 
 // kcmMetricsPrefixes are the exposition families the two
@@ -407,4 +416,44 @@ func statfsFreeBytes(path string) (freeBytes, totalBytes int64, err error) {
 	}
 	return st.Bsize * int64(st.Bfree),
 		st.Bsize * int64(st.Blocks), nil
+}
+
+const kmsSocketProbeTimeout = 500 * time.Millisecond
+
+// http2ClientPreface is the RFC 9113 client connection preface followed by an
+// empty SETTINGS frame so compliant gRPC/HTTP2 KMSv2 plugins respond promptly.
+var http2ClientPreface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+
+func probeKMSv2Socket(ctx context.Context, sockPath string) error {
+	deadline := time.Now().Add(kmsSocketProbeTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	var dialer net.Dialer
+	dialer.Timeout = max(time.Until(deadline), 0)
+	conn, err := dialer.DialContext(ctx, "unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("dial unix %s: %w", sockPath, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_ = conn.SetDeadline(deadline)
+	if _, werr := conn.Write(http2ClientPreface); werr != nil {
+		if errors.Is(werr, syscall.EPIPE) || errors.Is(werr, syscall.ECONNRESET) || errors.Is(werr, io.EOF) {
+			return nil
+		}
+		return fmt.Errorf("write preface %s: %w", sockPath, werr)
+	}
+	var buf [64]byte
+	n, rerr := conn.Read(buf[:])
+	if n > 0 {
+		return nil
+	}
+	if errors.Is(rerr, io.EOF) || errors.Is(rerr, syscall.EPIPE) || errors.Is(rerr, syscall.ECONNRESET) {
+		return nil
+	}
+	if rerr != nil {
+		return fmt.Errorf("read unix %s: %w", sockPath, rerr)
+	}
+	return nil
 }

@@ -73,6 +73,32 @@ func (c *CtrTasksCheck) shimReadInconclusive(pid int) bool {
 	return procFileReadNonENOENT(c.d.Proc.File(pid, "cmdline"))
 }
 
+// verifyHostRootShim confirms fail-closed that a containerd-shim candidate
+// belongs to the host root namespace (never inside a kubepods cgroup) and
+// runs as root (real and effective UID 0). Non-ENOENT read errors mark the
+// scan inconclusive so sandbox reaping and latch release hold off.
+func verifyHostRootShim(d *wdeps.Deps, pid int) (ok, inconclusive bool) {
+	cgData, err := os.ReadFile(d.Proc.File(pid, "cgroup"))
+	if err != nil {
+		return false, !os.IsNotExist(err)
+	}
+	cg := strings.TrimSpace(string(cgData))
+	if cg == "" || strings.Contains(cg, podCgroupSubstr) {
+		return false, false
+	}
+	stData, err := os.ReadFile(d.Proc.File(pid, "status"))
+	if err != nil {
+		return false, !os.IsNotExist(err)
+	}
+	for line := range strings.SplitSeq(string(stData), "\n") {
+		if rest, found := strings.CutPrefix(line, "Uid:"); found {
+			fields := strings.Fields(rest)
+			return len(fields) >= 2 && fields[0] == "0" && fields[1] == "0", false
+		}
+	}
+	return false, false
+}
+
 // CtrTasksCheck cleans wedged containerd task dirs and orphan shims —
 // the filesystem port of the shell's ctr-based checks (no ctr socket
 // needed in the agent pod):
@@ -209,6 +235,16 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 		}
 		if !inScope {
+			continue
+		}
+		shimOK, shimInc := verifyHostRootShim(c.d, pid)
+		if shimInc {
+			shimScanInconclusive = true
+		}
+		if !shimOK {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: containerd-shim candidate pid=%d id=%.12s failed host-root verification — skipped",
+				pid, sid))
 			continue
 		}
 		shimIDs[sid] = true

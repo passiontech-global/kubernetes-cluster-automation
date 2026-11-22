@@ -99,6 +99,7 @@ func TestCtrTasksSandboxWithShimOrTaskKept(t *testing.T) {
 	e.MkProc(t, 9400, "S",
 		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+shimSID+
 			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9400)
 	// taskSID still has a task dir under CtrTaskRoot.
 	if err := os.MkdirAll(filepath.Join(e.CtrDir, taskSID), 0o755); err != nil {
 		t.Fatal(err)

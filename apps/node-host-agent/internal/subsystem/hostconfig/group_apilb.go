@@ -75,6 +75,10 @@ func (c *cyc) groupAPILB() {
 		// watchdog state dir is mounted rw in the DS and already
 		// ensured by groupWatchdog; on standalone hp() is identity.
 		debFile := c.v("api_lb_haproxy_deb_file")
+		if !validStagedBasename(debFile) {
+			c.err("T12: unsafe haproxy deb filename — refusing install", "file", debFile)
+			return
+		}
 		hostDeb := "/var/lib/node-watchdog/" + debFile
 		local := r.hp(hostDeb)
 		_ = r.ensureDir("/var/lib/node-watchdog", 0o755)

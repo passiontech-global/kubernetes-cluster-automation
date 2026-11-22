@@ -219,6 +219,9 @@ var logRules = []logRule{
 	{nodecond.CondSystemdOOMDKill, latchdefs.StateEnterRe(latchdefs.LatchSystemdOOMDKill)},
 	{nodecond.CondNetworkMountHung, latchdefs.StateEnterRe(latchdefs.LatchNetworkMountHung)},
 	{nodecond.CondNodeLocalDNSNoTrackDrift, latchdefs.StateEnterRe(latchdefs.LatchNodeLocalDNSNoTrackDrift)},
+	// --- wave-5 self-healing latch→event surface ---
+	{nodecond.CondK8s135ReadinessDrift, latchdefs.StateEnterRe(latchdefs.LatchK8s135ReadinessDrift)},
+	{nodecond.CondKMSv2Unhealthy, latchdefs.StateEnterRe(latchdefs.LatchKMSv2Unhealthy)},
 }
 
 // exitLogRules — STATE-EXIT lines that earn an informational (Normal)
@@ -245,4 +248,7 @@ var exitLogRules = []logRule{
 	{"SystemdOOMDHealthy", latchdefs.StateExitRe(latchdefs.LatchSystemdOOMDKill)},
 	{"NetworkMountsHealthy", latchdefs.StateExitRe(latchdefs.LatchNetworkMountHung)},
 	{"NodeLocalDNSNoTrackOk", latchdefs.StateExitRe(latchdefs.LatchNodeLocalDNSNoTrackDrift)},
+	// Wave-5 self-healing recovery events (DefaultReason spellings).
+	{"K8s135ReadinessOk", latchdefs.StateExitRe(latchdefs.LatchK8s135ReadinessDrift)},
+	{"KMSv2Healthy", latchdefs.StateExitRe(latchdefs.LatchKMSv2Unhealthy)},
 }

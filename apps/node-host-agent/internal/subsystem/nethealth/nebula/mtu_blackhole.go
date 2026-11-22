@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -197,6 +198,7 @@ func (n *Deps) CheckNebulaMTUBlackhole(ctx context.Context,
 	if wd == nil || wd.NebulaNet == "" ||
 		!n.UnitEnabledActive(ctx, "nebula@"+wd.NebulaNet) ||
 		wd.OverlayActive != "nebula" {
+		n.clearAlivePeers()
 		reset()
 		return
 	}
@@ -205,32 +207,9 @@ func (n *Deps) CheckNebulaMTUBlackhole(ctx context.Context,
 	// independent of this cycle's DF ping verdict (a healthy neb1
 	// must still catch cilium_wg0 sized against the underlay).
 	n.CheckCiliumWGMTUInvariant(ctx, dev, st)
-	// Peer fanout: the overlay probe sets are the known nebula
-	// endpoints — same source checkNebulaHealth pings. The first
-	// peer answering the SMALL ping is this cycle's DF target, so
-	// "small ok + DF fail" is measured on ONE path, not averaged.
-	targets := append(append(append([]string{},
-		wd.OverlayProbeTargets...),
-		wd.OverlayProbeMarkers...),
-		wd.OverlaySiteMarkers...)
-	peer := ""
-	for _, t := range targets {
-		if ok, _ := n.Ping(ctx, t, 2, 2, false); ok {
-			peer = t
-			break
-		}
-	}
-	if peer == "" {
-		// Total overlay failure — NOT a PMTU signature. Release a
-		// held latch: the isolated/degraded verdict owns the node.
-		reset()
-		return
-	}
-	out, err := n.RunHostCmd(ctx, []string{
-		"ping", "-c", mtuDFCount, "-W", mtuDFWait,
-		"-M", "do", "-s", mtuDFSize, peer})
-	st.Mu.Lock()
-	if err != nil {
+
+	recordDFFail := func(peer, out string, err error) {
+		st.Mu.Lock()
 		st.MTUFails++
 		fails := st.MTUFails
 		st.Mu.Unlock()
@@ -253,11 +232,172 @@ func (n *Deps) CheckNebulaMTUBlackhole(ctx context.Context,
 			}
 			n.MaybeClampNebulaMSS(ctx, wd, st)
 		}
+	}
+
+	dfPing := func(peer string) (string, error) {
+		return n.RunHostCmd(ctx, []string{
+			"ping", "-c", mtuDFCount, "-W", mtuDFWait,
+			"-M", "do", "-s", mtuDFSize, peer})
+	}
+
+	// Peer fanout: use the deduplicated probe target list, checking the
+	// alive-peer cache first so steady-state healthy cycles run the DF
+	// ping directly (0 small-ping forks). On DF failure, always verify
+	// small ping on the same peer before counting a blackhole.
+	targets := uniqueProbeTargets(wd)
+	cachedPeer := n.cachedAlivePeer(targets)
+	if cachedPeer != "" {
+		out, err := dfPing(cachedPeer)
+		if err == nil {
+			n.markAlivePeer(cachedPeer)
+			st.Mu.Lock()
+			st.MTUFails = 0
+			st.Mu.Unlock()
+			reset()
+			return
+		}
+		if ok, _ := n.Ping(ctx, cachedPeer, 2, 2, false); ok {
+			n.markAlivePeer(cachedPeer)
+			recordDFFail(cachedPeer, out, err)
+			return
+		}
+		// Cached peer is no longer reachable via small ping — evict it
+		// and fall through to scan remaining targets (skipping it).
+		n.evictAlivePeer(cachedPeer)
+	}
+
+	peer := ""
+	for _, t := range targets {
+		if t == cachedPeer {
+			continue
+		}
+		if ok, _ := n.Ping(ctx, t, 2, 2, false); ok {
+			peer = t
+			break
+		}
+	}
+	if peer == "" {
+		// Total overlay failure — NOT a PMTU signature. Release a
+		// held latch: the isolated/degraded verdict owns the node.
+		n.clearAlivePeers()
+		reset()
 		return
 	}
+	n.markAlivePeer(peer)
+	out, err := dfPing(peer)
+	if err != nil {
+		recordDFFail(peer, out, err)
+		return
+	}
+	st.Mu.Lock()
 	st.MTUFails = 0
 	st.Mu.Unlock()
 	reset()
+}
+
+func (n *Deps) nowTime() time.Time {
+	if n.Clock != nil {
+		if c := n.Clock(); c != nil {
+			return c.Now()
+		}
+	}
+	return time.Now()
+}
+
+func (n *Deps) alivePeerTTL() time.Duration {
+	var iv time.Duration
+	if n.Interval != nil {
+		iv = n.Interval()
+	}
+	if iv <= 0 {
+		return 2 * time.Minute
+	}
+	ttl := 2 * iv
+	if ttl > 5*time.Minute {
+		ttl = 5 * time.Minute
+	}
+	return ttl
+}
+
+func (n *Deps) setAlivePeers(peers []string) {
+	cp := append([]string(nil), peers...)
+	now := n.nowTime()
+	n.aliveMu.Lock()
+	n.alivePeers = cp
+	if len(cp) == 0 {
+		n.aliveAt = time.Time{}
+	} else {
+		n.aliveAt = now
+	}
+	n.aliveMu.Unlock()
+}
+
+func (n *Deps) clearAlivePeers() {
+	n.aliveMu.Lock()
+	n.alivePeers = nil
+	n.aliveAt = time.Time{}
+	n.aliveMu.Unlock()
+}
+
+func (n *Deps) cachedAlivePeer(targets []string) string {
+	now := n.nowTime()
+	ttl := n.alivePeerTTL()
+	targetSet := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		targetSet[t] = struct{}{}
+	}
+	n.aliveMu.Lock()
+	defer n.aliveMu.Unlock()
+	if len(n.alivePeers) == 0 || n.aliveAt.IsZero() {
+		return ""
+	}
+	age := now.Sub(n.aliveAt)
+	if age < 0 || age >= ttl {
+		n.alivePeers = nil
+		n.aliveAt = time.Time{}
+		return ""
+	}
+	for _, p := range n.alivePeers {
+		if _, ok := targetSet[p]; ok {
+			return p
+		}
+	}
+	// None of the cached peers match current config targets.
+	n.alivePeers = nil
+	n.aliveAt = time.Time{}
+	return ""
+}
+
+func (n *Deps) markAlivePeer(peer string) {
+	if peer == "" {
+		return
+	}
+	now := n.nowTime()
+	ttl := n.alivePeerTTL()
+	n.aliveMu.Lock()
+	defer n.aliveMu.Unlock()
+	age := now.Sub(n.aliveAt)
+	if n.aliveAt.IsZero() || age < 0 || age >= ttl {
+		n.alivePeers = []string{peer}
+		n.aliveAt = now
+		return
+	}
+	if !slices.Contains(n.alivePeers, peer) {
+		n.alivePeers = append(n.alivePeers, peer)
+	}
+	n.aliveAt = now
+}
+
+func (n *Deps) evictAlivePeer(peer string) {
+	n.aliveMu.Lock()
+	defer n.aliveMu.Unlock()
+	if len(n.alivePeers) == 0 {
+		return
+	}
+	n.alivePeers = slices.DeleteFunc(n.alivePeers, func(p string) bool { return p == peer })
+	if len(n.alivePeers) == 0 {
+		n.aliveAt = time.Time{}
+	}
 }
 
 // MaybeClampNebulaMSS installs the TCPMSS clamp on the overlay dev —

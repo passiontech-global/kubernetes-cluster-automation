@@ -209,6 +209,10 @@ const (
 	LatchSystemdOOMDKill           = "systemd-oomd-kill"            // #9 workerhygiene systemd-oomd pod/k0s slice kill within 30m
 	LatchNetworkMountHung          = "network-mount-hung"           // #10 workerhygiene hung NFS/CIFS/FUSE/CephFS mount statfs probe
 	LatchNodeLocalDNSNoTrackDrift  = "nodelocaldns-notrack-drift"   // #12 nethealth NodeLocalDNS raw NOTRACK iptables rule drift
+
+	// Wave-5 self-healing latches.
+	LatchK8s135ReadinessDrift = "k8s135-readiness-drift" // K5 hostmetrics cgroup v2 & kubelet/k0s 1.35+ readiness audit
+	LatchKMSv2Unhealthy       = "kmsv2-unhealthy"        // K10 controllerhygiene KMSv2 encryption socket & healthz guard
 )
 
 // LatchDef is one registry entry: the latch's <name> suffix, the
@@ -372,6 +376,10 @@ var LatchDefs = []LatchDef{
 	{Name: LatchSystemdOOMDKill, Owner: "workerhygiene"},
 	{Name: LatchNetworkMountHung, Owner: "workerhygiene"},
 	{Name: LatchNodeLocalDNSNoTrackDrift, Owner: "nethealth"},
+
+	// Wave-5 self-healing latches.
+	{Name: LatchK8s135ReadinessDrift, Owner: "hostmetrics"},
+	{Name: LatchKMSv2Unhealthy, Owner: "controllerhygiene"},
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},

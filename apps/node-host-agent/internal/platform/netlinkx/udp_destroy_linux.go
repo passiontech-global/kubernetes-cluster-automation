@@ -33,12 +33,14 @@ func dumpConnectedUDPInNS() ([]ConnectedUDPSocket, error) {
 		return nil, err
 	}
 	defer func() { _ = unix.Close(fd) }()
-	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
 
 	bufp := diagBufPool.Get().(*[]byte)
 	defer diagBufPool.Put(bufp)
-	buf := *bufp
+	return dumpConnectedUDPWithFD(fd, *bufp)
+}
 
+func dumpConnectedUDPWithFD(fd int, buf []byte) ([]ConnectedUDPSocket, error) {
+	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
 	var out []ConnectedUDPSocket
 	seq := uint32(200)
 	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
@@ -63,6 +65,33 @@ func dumpConnectedUDPInNS() ([]ConnectedUDPSocket, error) {
 	return out, nil
 }
 
+// DumpConnectedAndBoundUDP dumps both connected UDP sockets and (when at least
+// one connected UDP socket exists) UNCONN bound UDP ports inside a single
+// InNetNS + diagSock scope.
+func DumpConnectedAndBoundUDP(pid int) ([]ConnectedUDPSocket, map[uint16]bool, error) {
+	var socks []ConnectedUDPSocket
+	var bound map[uint16]bool
+	err := InNetNS(pid, func() error {
+		fd, err := diagSock()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = unix.Close(fd) }()
+
+		bufp := diagBufPool.Get().(*[]byte)
+		defer diagBufPool.Put(bufp)
+		buf := *bufp
+
+		socks, err = dumpConnectedUDPWithFD(fd, buf)
+		if err != nil || len(socks) == 0 {
+			return err
+		}
+		bound = map[uint16]bool{}
+		return udpBoundPortsWithFD(fd, buf, bound)
+	})
+	return socks, bound, err
+}
+
 // UDPBoundPorts returns the UDP ports with a socket bound in pid's
 // netns — the `ss -lun` UNCONN rows (UDP has no LISTEN state, so every
 // UDP socket with sport != 0 counts). This is the "is this port a
@@ -81,12 +110,14 @@ func udpBoundPortsDump(out map[uint16]bool) error {
 		return err
 	}
 	defer func() { _ = unix.Close(fd) }()
-	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
 
 	bufp := diagBufPool.Get().(*[]byte)
 	defer diagBufPool.Put(bufp)
-	buf := *bufp
+	return udpBoundPortsWithFD(fd, *bufp, out)
+}
 
+func udpBoundPortsWithFD(fd int, buf []byte, out map[uint16]bool) error {
+	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
 	seq := uint32(300)
 	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
 		seq++
@@ -192,15 +223,47 @@ func destroyUDPSocketInNS(family uint8, id [48]byte) (bool, error) {
 		return false, err
 	}
 	defer func() { _ = unix.Close(fd) }()
-	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
 
 	bufp := diagBufPool.Get().(*[]byte)
 	defer diagBufPool.Put(bufp)
-	buf := *bufp
+	return destroyUDPSocketWithFD(fd, *bufp, 1, family, id)
+}
 
+// DestroyUDPSockets sends NETLINK_SOCK_DIAG SOCK_DESTROY for every target in
+// pid's netns over a single InNetNS + diagSock scope.
+func DestroyUDPSockets(pid int, targets []UDPSocketTarget) ([]UDPDestroyResult, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	results := make([]UDPDestroyResult, len(targets))
+	err := InNetNS(pid, func() error {
+		fd, err := diagSock()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = unix.Close(fd) }()
+
+		bufp := diagBufPool.Get().(*[]byte)
+		defer diagBufPool.Put(bufp)
+		buf := *bufp
+
+		for i, t := range targets {
+			destroyed, derr := destroyUDPSocketWithFD(fd, buf, uint32(1+i), t.Family, t.ID)
+			results[i] = UDPDestroyResult{Destroyed: destroyed, Err: derr}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func destroyUDPSocketWithFD(fd int, buf []byte, seq uint32, family uint8, id [48]byte) (bool, error) {
+	sa := &unix.SockaddrNetlink{Family: unix.AF_NETLINK}
 	var sid [sockidLen]byte
 	copy(sid[:], id[:])
-	req := diagRequestProto(1, family, unix.IPPROTO_UDP,
+	req := diagRequestProto(seq, family, unix.IPPROTO_UDP,
 		1<<tcpStateEstablished, &sid,
 		unix.SOCK_DESTROY, unix.NLM_F_REQUEST|unix.NLM_F_ACK)
 	if err := unix.Sendto(fd, req, 0, sa); err != nil {

@@ -137,6 +137,7 @@ func TestR11CtrTasksUnreadableFilesPreserveLiveTasksAndMarkers(t *testing.T) {
 		id := "deadc0de" + strings.Repeat("a", 56)
 		taskDir := filepath.Join(e.CtrDir, id)
 		e.MkStatProc(t, 9106, "containerd-shim", "S", "")
+		seedHostRootShim(t, e, 9106)
 		wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "9106", "cmdline"),
 			"containerd-shim-runc-v2\x00-id\x00"+id+"\x00-namespace\x00k8s.io\x00-address\x00/run/k0s/containerd.sock\x00")
 		e.MkProc(t, 9107, "S", "app", "")
@@ -222,6 +223,7 @@ func TestR11CtrTasksDZShimFdAndSShimCmdlineEACCES(t *testing.T) {
 		sid := strings.Repeat("d", 64)
 		wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "9400", "stat"),
 			"9400 (containerd-shim) D 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n")
+		seedHostRootShim(t, e, 9400)
 		fdDir := filepath.Join(e.ProcDir, "9400", "fd")
 		if err := os.MkdirAll(fdDir, 0o755); err != nil {
 			t.Fatal(err)

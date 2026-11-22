@@ -468,8 +468,8 @@ func TestDownloadSweepsTmpOnShaMismatch(t *testing.T) {
 		strings.Repeat("0", 64), 0o644); err == nil {
 		t.Fatal("expected sha256 mismatch")
 	}
-	if hostExists(r, "/dl/x.tgz.dl") {
-		t.Fatal("partial .dl left behind")
+	if left, _ := filepath.Glob(filepath.Join(filepath.Dir(dst), ".dl-*")); len(left) != 0 {
+		t.Fatalf("partial .dl-* left behind: %v", left)
 	}
 	if hostExists(r, "/dl/x.tgz") {
 		t.Fatal("mismatched payload promoted")

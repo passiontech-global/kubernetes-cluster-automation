@@ -5,7 +5,9 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"maps"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -114,5 +116,148 @@ func TestDiskBloatOwnedByStatefulSet(t *testing.T) {
 		metav1.OwnerReference{Kind: "StatefulSet"})
 	if !wdeps.OwnedByStatefulSet(p) {
 		t.Fatal("StatefulSet owner must be true")
+	}
+}
+
+func TestSnapshotMountIDs(t *testing.T) {
+	cases := []struct {
+		name     string
+		ctrRoot  string
+		sbRoot   string
+		snapRoot string
+		envFn    func(t *testing.T, d *wdeps.Deps) *wdeps.CycleEnv
+		want     map[string]string
+	}{
+		{
+			name:     "read_mountinfo_error_via_once",
+			ctrRoot:  "/host/run/k0s/tasks",
+			sbRoot:   "/host/run/k0s/sandboxes",
+			snapRoot: "/host/var/lib/k0s/snaps",
+			envFn: func(_ *testing.T, _ *wdeps.Deps) *wdeps.CycleEnv {
+				return &wdeps.CycleEnv{
+					MountinfoOnce: func() ([]byte, error) {
+						return nil, errors.New("mountinfo err")
+					},
+				}
+			},
+			want: nil,
+		},
+		{
+			name:     "read_mountinfo_error_missing_file",
+			ctrRoot:  "/host/run/k0s/tasks",
+			sbRoot:   "/host/run/k0s/sandboxes",
+			snapRoot: "/host/var/lib/k0s/snaps",
+			envFn: func(t *testing.T, d *wdeps.Deps) *wdeps.CycleEnv {
+				d.Cfg.MountinfoFile = filepath.Join(t.TempDir(), "missing-mountinfo")
+				return nil
+			},
+			want: nil,
+		},
+		{
+			name:     "malformed_lines_ignored",
+			ctrRoot:  "/host/run/k0s/tasks",
+			sbRoot:   "/host/run/k0s/sandboxes",
+			snapRoot: "/host/var/lib/k0s/snaps",
+			envFn: func(_ *testing.T, _ *wdeps.Deps) *wdeps.CycleEnv {
+				body := strings.Join([]string{
+					"no separator line",
+					"1 2 3 /run/k0s/tasks/t1/rootfs - overlay overlay rw,upperdir=/var/lib/k0s/snaps/100/fs",
+					"",
+				}, "\n")
+				return &wdeps.CycleEnv{
+					MountinfoOnce: func() ([]byte, error) { return []byte(body), nil },
+				}
+			},
+			want: map[string]string{},
+		},
+		{
+			name:     "unescaped_octal_040_paths",
+			ctrRoot:  "/host/run/my tasks",
+			sbRoot:   "/host/run/k0s/sandboxes",
+			snapRoot: "/host/var/lib/my snaps",
+			envFn: func(_ *testing.T, _ *wdeps.Deps) *wdeps.CycleEnv {
+				line := `10 1 0:50 / /run/my\040tasks/cid-space/rootfs rw,relatime - overlay overlay rw,lowerdir=/a,upperdir=/var/lib/my\040snaps/42/fs,workdir=/w` + "\n"
+				return &wdeps.CycleEnv{
+					MountinfoOnce: func() ([]byte, error) { return []byte(line), nil },
+				}
+			},
+			want: map[string]string{"42": "cid-space"},
+		},
+		{
+			name:     "ctr_task_and_sandbox_ctl_roots",
+			ctrRoot:  "/host/run/k0s/tasks",
+			sbRoot:   "/host/run/k0s/sandboxes",
+			snapRoot: "/host/var/lib/k0s/snaps",
+			envFn: func(_ *testing.T, _ *wdeps.Deps) *wdeps.CycleEnv {
+				body := strings.Join([]string{
+					"11 1 0:51 / /run/k0s/tasks/t1/rootfs rw - overlay overlay rw,upperdir=/var/lib/k0s/snaps/101/fs",
+					"12 1 0:52 / /run/k0s/sandboxes/s1/rootfs rw - overlay overlay rw,upperdir=/var/lib/k0s/snaps/102/fs",
+				}, "\n")
+				return &wdeps.CycleEnv{
+					MountinfoOnce: func() ([]byte, error) { return []byte(body), nil },
+				}
+			},
+			want: map[string]string{"101": "t1", "102": "s1"},
+		},
+		{
+			name:     "non_matching_roots_ignored",
+			ctrRoot:  "/host/run/k0s/tasks",
+			sbRoot:   "/host/run/k0s/sandboxes",
+			snapRoot: "/host/var/lib/k0s/snaps",
+			envFn: func(_ *testing.T, _ *wdeps.Deps) *wdeps.CycleEnv {
+				body := strings.Join([]string{
+					"13 1 0:53 / /var/lib/kubelet/pods/p1/rootfs rw - overlay overlay rw,upperdir=/var/lib/k0s/snaps/103/fs",
+					"14 1 0:54 / /run/k0s/tasks/t1/other rw - overlay overlay rw,upperdir=/var/lib/k0s/snaps/104/fs",
+					"15 1 0:55 / /run/k0s/tasks/t2/rootfs rw - overlay overlay rw,upperdir=/other/snaps/105/fs",
+				}, "\n")
+				return &wdeps.CycleEnv{
+					MountinfoOnce: func() ([]byte, error) { return []byte(body), nil },
+				}
+			},
+			want: map[string]string{},
+		},
+		{
+			name:     "missing_upperdir_ignored",
+			ctrRoot:  "/host/run/k0s/tasks",
+			sbRoot:   "/host/run/k0s/sandboxes",
+			snapRoot: "/host/var/lib/k0s/snaps",
+			envFn: func(_ *testing.T, _ *wdeps.Deps) *wdeps.CycleEnv {
+				line := "16 1 0:56 / /run/k0s/tasks/t1/rootfs rw - overlay overlay rw,lowerdir=/a,workdir=/w\n"
+				return &wdeps.CycleEnv{
+					MountinfoOnce: func() ([]byte, error) { return []byte(line), nil },
+				}
+			},
+			want: map[string]string{},
+		},
+		{
+			name:     "nested_slash_and_non_fs_rejected",
+			ctrRoot:  "/host/run/k0s/tasks",
+			sbRoot:   "/host/run/k0s/sandboxes",
+			snapRoot: "/host/var/lib/k0s/snaps",
+			envFn: func(_ *testing.T, _ *wdeps.Deps) *wdeps.CycleEnv {
+				body := strings.Join([]string{
+					"17 1 0:57 / /run/k0s/tasks/t1/rootfs rw - overlay overlay rw,upperdir=/var/lib/k0s/snaps/nested/104/fs",
+					"18 1 0:58 / /run/k0s/tasks/t2/rootfs rw - overlay overlay rw,upperdir=/var/lib/k0s/snaps/105/work",
+				}, "\n")
+				return &wdeps.CycleEnv{
+					MountinfoOnce: func() ([]byte, error) { return []byte(body), nil },
+				}
+			},
+			want: map[string]string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _ := rtDeps(t)
+			d.Cfg.CtrTaskRoot = tc.ctrRoot
+			d.Cfg.SandboxCtlRoot = tc.sbRoot
+			d.Cfg.Disk.WLayerSnapshotsDir = tc.snapRoot
+			e := tc.envFn(t, d)
+			got := snapshotMountIDs(d, e)
+			if (tc.want == nil) != (got == nil) || !maps.Equal(got, tc.want) {
+				t.Fatalf("snapshotMountIDs=%#v want %#v", got, tc.want)
+			}
+		})
 	}
 }

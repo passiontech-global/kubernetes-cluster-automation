@@ -7,6 +7,8 @@ package cilium_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,13 +77,81 @@ func TestParseCiliumBPFMapsShapes(t *testing.T) {
 			want: map[string][2]int64{},
 		},
 		{
+			name: "cache before name + precedence",
+			body: `[{"cache":[{},{"x":[1,2]}],"count":10,"used":900.0,"maxSize":1200,"name":"cilium_ct4_global"}]`,
+			want: map[string][2]int64{"cilium_ct4_global": {900, 1200}},
+		},
+		{
+			name: "numeric entries precedence over cache array",
+			body: `[{"name":"cilium_lxc","entries":42,"cache":[{},{}],"capacity":100}]`,
+			want: map[string][2]int64{"cilium_lxc": {42, 100}},
+		},
+		{
+			name: "nested dynamicMaps and staticMaps",
+			body: `{"dynamicMaps":[{"name":"cilium_ct4_global","used":5,"max":10}],"staticMaps":{"inner":[{"name":"cilium_lxc","used":7,"size":14}]}}`,
+			want: map[string][2]int64{"cilium_ct4_global": {5, 10}, "cilium_lxc": {7, 14}},
+		},
+		{
+			name: "empty array returns non-nil empty map",
+			body: `[]`,
+			want: map[string][2]int64{},
+		},
+		{
+			name: "empty object returns non-nil empty map",
+			body: `{}`,
+			want: map[string][2]int64{},
+		},
+		{
+			name: "empty body → nil",
+			body: ``,
+			want: nil,
+		},
+		{
+			name: "trailing garbage → nil",
+			body: `[] trailing`,
+			want: nil,
+		},
+		{
 			name: "garbage body → nil",
 			body: `not json`,
+			want: nil,
+		},
+		{
+			name: "huge float 1e20 saturates to MaxInt64",
+			body: `[{"name":"cilium_ct4_global","used":1e20,"max":1000}]`,
+			want: map[string][2]int64{"cilium_ct4_global": {math.MaxInt64, 1000}},
+		},
+		{
+			name: "exact 2^63 float boundary saturates to MaxInt64",
+			body: `[{"name":"cilium_ct4_global","used":9223372036854775808.0,"max":1000}]`,
+			want: map[string][2]int64{"cilium_ct4_global": {math.MaxInt64, 1000}},
+		},
+		{
+			name: "huge negative float -1e20 saturates to MinInt64",
+			body: `[{"name":"cilium_ct4_global","used":-1e20,"max":1000}]`,
+			want: map[string][2]int64{"cilium_ct4_global": {math.MinInt64, 1000}},
+		},
+		{
+			name: "float64 overflow max=1e309 → nil",
+			body: `[{"name":"cilium_ct4_global","used":10,"max":1e309}]`,
+			want: nil,
+		},
+		{
+			name: "float64 overflow used=1e309 → nil",
+			body: `[{"name":"cilium_ct4_global","used":1e309,"max":1000}]`,
+			want: nil,
+		},
+		{
+			name: "float64 overflow in array → nil",
+			body: `[1e309]`,
 			want: nil,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := cilium.ParseCiliumBPFMaps([]byte(tc.body))
+			if (got == nil) != (tc.want == nil) {
+				t.Fatalf("ParseCiliumBPFMaps nil=%v, want nil=%v (got=%v)", got == nil, tc.want == nil, got)
+			}
 			if len(got) != len(tc.want) {
 				t.Fatalf("ParseCiliumBPFMaps=%v want %v", got, tc.want)
 			}
@@ -306,5 +376,62 @@ func TestCiliumCheckBPFMapsCorruptJSONAbortsPreservingLatch(t *testing.T) {
 	}
 	if e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
 		t.Fatal("valid {} /v1/map payload should exit LatchCiliumBPFMapPressure")
+	}
+}
+
+// TestCiliumCheckBPFMapsHugeFloatPreservesLatch verifies that huge
+// JSON float counts (>= 2^63, e.g. 1e20) saturate positively rather
+// than wrapping to MinInt64 and falsely clearing LatchCiliumBPFMapPressure,
+// and that float64-overflowing numbers (1e309) abort without clearing.
+func TestCiliumCheckBPFMapsHugeFloatPreservesLatch(t *testing.T) {
+	e := fixture(t)
+	e.MkCiliumTask(t, 9317)
+	c := wdepstest.Check[*cilium.CiliumCheck](e.H, wdeps.CheckCilium)
+	cycle := &wdeps.CycleEnv{WorkerActive: true}
+	ctx := context.Background()
+
+	e.UnixBody = []byte(`[{"name":"cilium_ct4_global","used":9500,"max":10000}]`)
+	c.Run(ctx, cycle)
+	if !e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
+		t.Fatal("setup: LatchCiliumBPFMapPressure not armed")
+	}
+
+	e.UnixBody = []byte(`[{"name":"cilium_ct4_global","used":1e20,"max":1000}]`)
+	c.Run(ctx, cycle)
+	if !e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
+		t.Fatal("used=1e20, max=1000 falsely cleared LatchCiliumBPFMapPressure")
+	}
+	if strings.Contains(e.LogLines(t), "STATE-EXIT: cilium-bpf-map-pressure") {
+		t.Fatalf("unexpected STATE-EXIT on used=1e20:\n%s", e.LogLines(t))
+	}
+
+	e.UnixBody = []byte(`[{"name":"cilium_ct4_global","used":10,"max":1e309}]`)
+	c.Run(ctx, cycle)
+	if !e.H.State.Exists(latchdefs.LatchCiliumBPFMapPressure) {
+		t.Fatal("max=1e309 falsely cleared LatchCiliumBPFMapPressure")
+	}
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckCiliumBPF, "abort")); got != 1 {
+		t.Fatalf("abort cycles=%v want 1 on max=1e309", got)
+	}
+}
+
+var sinkBPFMaps map[string][2]int64
+
+func BenchmarkParseCiliumBPFMaps(b *testing.B) {
+	var sb strings.Builder
+	sb.WriteString(`[{"name":"cilium_ct4_global","max":65536,"cache":[`)
+	for i := range 5000 {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, `{"key":"k%d","value":"v%d"}`, i, i)
+	}
+	sb.WriteString(`]},{"name":"cilium_lxc","used":120,"max":1024}]`)
+	body := []byte(sb.String())
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for b.Loop() {
+		sinkBPFMaps = cilium.ParseCiliumBPFMaps(body)
 	}
 }

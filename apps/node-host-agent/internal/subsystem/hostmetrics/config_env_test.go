@@ -55,6 +55,12 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.KeyUsersFile != "/proc/key-users" {
 		t.Fatalf("KeyUsersFile = %q", cfg.KeyUsersFile)
 	}
+	if cfg.MountinfoFile != "/proc/1/mountinfo" {
+		t.Fatalf("MountinfoFile = %q", cfg.MountinfoFile)
+	}
+	if cfg.CgroupRoot != "/host/sys/fs/cgroup" {
+		t.Fatalf("CgroupRoot = %q", cfg.CgroupRoot)
+	}
 	if cfg.LatchInterval != 30*time.Second {
 		t.Fatalf("LatchInterval = %v", cfg.LatchInterval)
 	}
@@ -99,6 +105,8 @@ func TestConfigFromEnvOverrides(t *testing.T) {
 	t.Setenv(envnames.EnvCPUDeliveredInterval, "5m")
 	t.Setenv(envnames.EnvConntrackStatFile, "/ctstat")
 	t.Setenv(envnames.EnvArpTableFile, "/arp")
+	t.Setenv(envnames.EnvMountinfoFile, "/mi")
+	t.Setenv(envnames.EnvCgroupRoot, "/cg2")
 	t.Setenv(envnames.EnvCgroupMemUnits, "u1, u2")
 	t.Setenv(envnames.EnvFilesystemTargets, "/f1, /f2")
 	t.Setenv(envnames.EnvKernelDriftHeal, "false")
@@ -116,7 +124,9 @@ func TestConfigFromEnvOverrides(t *testing.T) {
 		cfg.NebulaCertFile != "/cert.crt" ||
 		cfg.PSIFile != "/psi" ||
 		cfg.ConntrackStatFile != "/ctstat" ||
-		cfg.ARPTableFile != "/arp" {
+		cfg.ARPTableFile != "/arp" ||
+		cfg.MountinfoFile != "/mi" ||
+		cfg.CgroupRoot != "/cg2" {
 		t.Fatalf("env string/duration knobs not applied: %+v", cfg)
 	}
 	if cfg.LatchInterval != 45*time.Second {
@@ -155,6 +165,9 @@ func TestConfigFromEnvStandalonePaths(t *testing.T) {
 	}
 	if cfg.NebulaCertFile != "/etc/nebula/interdc/host.crt" {
 		t.Fatalf("NebulaCertFile = %q", cfg.NebulaCertFile)
+	}
+	if cfg.CgroupRoot != "/sys/fs/cgroup" {
+		t.Fatalf("CgroupRoot = %q", cfg.CgroupRoot)
 	}
 	wantFS := []string{"/etc", "/var/lib/k0s", "/var/openebs/local"}
 	if !slices.Equal(cfg.FilesystemTargets, wantFS) {

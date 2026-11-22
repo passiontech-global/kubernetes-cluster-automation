@@ -11,11 +11,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/kinedb/kdeps"
 )
+
+var backupTmpDirRe = regexp.MustCompile(`^/tmp/kine-backup\.[A-Za-z0-9]{6,}$`)
 
 const (
 	// backupMinFreeRatio — creation requires this much free space
@@ -82,13 +86,13 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 		note("backup-skipped-low-free")
 		return
 	}
-	// Dump inside the container to its /tmp, verify with
-	// pg_restore -l, then cp to the host dir — streaming the
-	// dump through stdout would hit the runner capture cap.
+	// Dump inside a private 0700 temp dir inside the container with
+	// umask 077, verify with pg_restore -l, then cp to the host dir —
+	// streaming the dump through stdout would hit the runner capture cap.
 	// pg_dump runs under the LONG budget: a bloated kine table
 	// outlasts the 2-minute ExecEnv cap (same class of work as
-	// VACUUM/REINDEX).
-	tmp := "/tmp/kine-backup.dump"
+	// VACUUM/REINDEX). Cleanup runs under WithoutCancel so a cancelled
+	// caller ctx never leaks the container dump.
 	g.d.MaintMu.Lock()
 	release, held, herr := g.d.HoldAdvisoryLock(ctx, pg, user, pass,
 		kdeps.AppNameCompact, 30*time.Second)
@@ -102,10 +106,32 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 		note("backup skipped: advisory lock busy")
 		return
 	}
+	tmpDirOut, mkErr := g.d.Exec(ctx, []string{g.d.Cfg.Runtime, "exec", pg,
+		"mktemp", "-d", "/tmp/kine-backup.XXXXXX"}, "")
+	if mkErr != nil {
+		release()
+		g.d.MaintMu.Unlock()
+		note(fmt.Sprintf("backup-mktemp-fail: %v", mkErr))
+		return
+	}
+	tmpDir := strings.TrimSpace(tmpDirOut)
+	if !backupTmpDirRe.MatchString(tmpDir) {
+		release()
+		g.d.MaintMu.Unlock()
+		note(fmt.Sprintf("backup-mktemp-invalid: %q", tmpDir))
+		return
+	}
+	defer func() {
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer rcancel()
+		_, _ = g.d.Exec(rctx, []string{g.d.Cfg.Runtime, "exec", pg, "rm", "-rf", tmpDir}, "")
+	}()
+	tmp := tmpDir + "/kine.dump"
 	t0 := g.d.Cfg.Clock.Now()
 	_, dumpErr := g.d.ExecLongEnv(ctx, kdeps.PsqlPassEnv(pass, kdeps.AppNameCompact), []string{g.d.Cfg.Runtime,
 		"exec", "-e", "PGPASSWORD", "-e", "PGAPPNAME", pg,
-		"pg_dump", "-Fc", "-U", user, "-d", "postgres", "-f", tmp}, "")
+		"sh", "-c", `umask 077 && exec pg_dump -Fc -U "$1" -d postgres -f "$2"`,
+		"pg_dump", user, tmp}, "")
 	release()
 	g.d.MaintMu.Unlock()
 	if dumpErr != nil {
@@ -115,15 +141,11 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 			rcancel()
 		}
 		note(fmt.Sprintf("pg_dump-fail: %v", dumpErr))
-		// A failed pg_dump can leave a partial file in the
-		// container — drop it like the validate-fail path does.
-		_, _ = g.d.Exec(ctx, []string{g.d.Cfg.Runtime, "exec", pg, "rm", "-f", tmp}, "")
 		return
 	}
 	if _, err := g.d.Exec(ctx, []string{g.d.Cfg.Runtime, "exec", pg,
 		"pg_restore", "-l", tmp}, ""); err != nil {
 		note(fmt.Sprintf("pg_restore-validate-fail: %v", err))
-		_, _ = g.d.Exec(ctx, []string{g.d.Cfg.Runtime, "exec", pg, "rm", "-f", tmp}, "")
 		return
 	}
 	dest := filepath.Join(g.d.Cfg.BackupDir,
@@ -159,7 +181,6 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 		// would fill the backup fs — keep only the newest few.
 		pruneDumps(g.d.Cfg.BackupDir)
 	}
-	_, _ = g.d.Exec(ctx, []string{g.d.Cfg.Runtime, "exec", pg, "rm", "-f", tmp}, "")
 }
 
 // pruneDumps deletes all but the newest backupKeepDumps *.dump

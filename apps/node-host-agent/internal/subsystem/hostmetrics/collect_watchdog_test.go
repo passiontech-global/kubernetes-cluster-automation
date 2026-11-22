@@ -383,3 +383,52 @@ func TestWatchdogPrefixRAMEpochsNeverOnDisk(t *testing.T) {
 		t.Fatalf("cleared RAM prefix latch node_watchdog_state=%v ok=%v want 0", v, ok)
 	}
 }
+
+func TestWatchdogSkipsRedundantExistsWithRealStore(t *testing.T) {
+	cfg, _ := fixture(t)
+	if cfg.latchExistsFn != nil || cfg.ramLatchesFn != nil {
+		t.Fatal("fixture unexpectedly pre-populated latch test seams")
+	}
+	c := New(cfg)
+	if c.state == nil {
+		t.Fatal("expected New(cfg) to attach real hoststate.Store")
+	}
+
+	// Disk latch created via real hoststate.Store emits 1 and clears to 0
+	// without needing the redundant Exists fallback loop.
+	c.state.Enter(latchdefs.LatchFilesystemReadonly, "disk")
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": latchdefs.LatchFilesystemReadonly}); !ok || v != 1 {
+		t.Fatalf("disk latch watchdog_state=%v ok=%v want 1", v, ok)
+	}
+	c.state.Exit(latchdefs.LatchFilesystemReadonly, nil)
+	if v, ok := metricValue(t, c, "node_host_agent_watchdog_state",
+		map[string]string{"node": "node-a", "state": latchdefs.LatchFilesystemReadonly}); !ok || v != 0 {
+		t.Fatalf("cleared disk latch watchdog_state=%v ok=%v want 0", v, ok)
+	}
+
+	// Fixed + prefix RAM latches enumerated via ramLatchesFn work with latchExistsFn == nil.
+	ramActive := true
+	dynLatch := latchdefs.LatchCiliumIPAMPrefix + "10-0-0-2"
+	cfg2, _ := fixture(t)
+	cfg2.ramLatchesFn = func() []string {
+		if !ramActive {
+			return nil
+		}
+		return []string{latchdefs.LatchKubeletRuntimeStall, dynLatch}
+	}
+	c2 := New(cfg2)
+	for _, st := range []string{latchdefs.LatchKubeletRuntimeStall, dynLatch} {
+		if v, ok := metricValue(t, c2, "node_host_agent_watchdog_state",
+			map[string]string{"node": "node-a", "state": st}); !ok || v != 1 {
+			t.Fatalf("RAM latch %s=%v ok=%v want 1", st, v, ok)
+		}
+	}
+	ramActive = false
+	for _, st := range []string{latchdefs.LatchKubeletRuntimeStall, dynLatch} {
+		if v, ok := metricValue(t, c2, "node_host_agent_watchdog_state",
+			map[string]string{"node": "node-a", "state": st}); !ok || v != 0 {
+			t.Fatalf("cleared RAM latch %s=%v ok=%v want 0", st, v, ok)
+		}
+	}
+}

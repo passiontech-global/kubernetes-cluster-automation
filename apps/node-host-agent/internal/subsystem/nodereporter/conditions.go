@@ -131,6 +131,10 @@ var conditionOrder = []string{
 	latchdefs.LatchSystemdOOMDKill,
 	latchdefs.LatchNetworkMountHung,
 	latchdefs.LatchNodeLocalDNSNoTrackDrift,
+	// Wave-5 self-healing wave — appended at the tail so the 67
+	// existing conditions keep their rendered order.
+	latchdefs.LatchK8s135ReadinessDrift,
+	latchdefs.LatchKMSv2Unhealthy,
 }
 
 // staleConditionDef is WatchdogStale's def — the one condition whose

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -198,8 +199,8 @@ func TestDownloadFile(t *testing.T) {
 		if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
 			t.Error("dst must not exist after a failed pin")
 		}
-		if _, serr := os.Stat(dst + ".dl"); !os.IsNotExist(serr) {
-			t.Error("staged .dl must be swept after a failed pin")
+		if left, _ := filepath.Glob(filepath.Join(dir, ".dl-*")); len(left) != 0 {
+			t.Errorf("staged .dl-* must be swept after a failed pin: %v", left)
 		}
 	})
 
@@ -389,8 +390,8 @@ func TestDownloadFileArtifactCap(t *testing.T) {
 	if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
 		t.Error("dst must not exist when the artifact breaches the cap")
 	}
-	if _, serr := os.Stat(dst + ".dl"); !os.IsNotExist(serr) {
-		t.Error("staged .dl must be swept after a cap failure")
+	if left, _ := filepath.Glob(filepath.Join(dir, ".dl-*")); len(left) != 0 {
+		t.Errorf("staged .dl-* must be swept after a cap failure: %v", left)
 	}
 
 	// Boundary: exactly the cap downloads fine.
@@ -434,7 +435,7 @@ func TestDownloadFileFailures(t *testing.T) {
 		}
 	})
 
-	t.Run(".dl squatter fails the stage", func(t *testing.T) {
+	t.Run("predictable .dl squatter does not block or hijack CreateTemp stage", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(payload))
 		}))
@@ -444,8 +445,11 @@ func TestDownloadFileFailures(t *testing.T) {
 		if err := os.Mkdir(dst+".dl", 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := DownloadFile(ctx, srv.URL, dst, "", 0o644, 5*time.Second); err == nil {
-			t.Fatal("expected stage-create error")
+		if err := DownloadFile(ctx, srv.URL, dst, "", 0o644, 5*time.Second); err != nil {
+			t.Fatalf("CreateTemp should ignore predictable .dl squatter: %v", err)
+		}
+		if got := testutil.ReadFile(t, dst); got != payload {
+			t.Fatalf("content = %q, want %q", got, payload)
 		}
 	})
 
@@ -462,8 +466,8 @@ func TestDownloadFileFailures(t *testing.T) {
 		if err := DownloadFile(ctx, srv.URL, dst, "", 0o644, 5*time.Second); err == nil {
 			t.Fatal("expected rename error onto a directory")
 		}
-		if _, serr := os.Stat(dst + ".dl"); !os.IsNotExist(serr) {
-			t.Fatal("staged .dl not swept after rename failure")
+		if left, _ := filepath.Glob(filepath.Join(dir, ".dl-*")); len(left) != 0 {
+			t.Fatalf("staged .dl-* not swept after rename failure: %v", left)
 		}
 	})
 }
@@ -481,4 +485,154 @@ func TestUntarInstallDstIsDir(t *testing.T) {
 	if err := UntarInstall(tgz, "tool", dst, 0o755); err == nil {
 		t.Fatal("expected rename error onto a directory")
 	}
+}
+
+func TestUntarInstallVerified(t *testing.T) {
+	dir := t.TempDir()
+	tgz := filepath.Join(dir, "bundle.tar.gz")
+	writeTarGz(t, tgz, map[string]string{"bin/tool": "verified-bytes"})
+	raw, err := os.ReadFile(tgz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	goodHex := hex.EncodeToString(sum[:])
+
+	dstOK := filepath.Join(t.TempDir(), "tool-ok")
+	if err := UntarInstallVerified(tgz, strings.ToUpper(goodHex), "tool", dstOK, 0o755); err != nil {
+		t.Fatalf("UntarInstallVerified(good) failed: %v", err)
+	}
+	if got := testutil.ReadFile(t, dstOK); got != "verified-bytes" {
+		t.Fatalf("content = %q, want verified-bytes", got)
+	}
+
+	dstBad := filepath.Join(t.TempDir(), "tool-bad")
+	err = UntarInstallVerified(tgz, strings.Repeat("0", 64), "tool", dstBad, 0o755)
+	if err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("UntarInstallVerified(bad) err = %v, want sha256 mismatch", err)
+	}
+	if _, serr := os.Stat(dstBad); !os.IsNotExist(serr) {
+		t.Fatal("dst created despite sha256 mismatch")
+	}
+	if left, _ := filepath.Glob(dstBad + ".tmp-*"); len(left) != 0 {
+		t.Fatalf("tmp left behind: %v", left)
+	}
+
+	dstEmpty := filepath.Join(t.TempDir(), "tool-empty")
+	if err := UntarInstallVerified(tgz, "", "tool", dstEmpty, 0o755); err == nil {
+		t.Fatal("UntarInstallVerified with empty pin must fail closed")
+	}
+}
+
+func TestDownloadFileConcurrentCreateTemp(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("payload-" + r.URL.Path))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for i := range 4 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			name := string(rune('a' + idx))
+			dst := filepath.Join(dir, name+".bin")
+			errs <- DownloadFile(context.Background(), srv.URL+"/"+name, dst, "", 0o644, 5*time.Second)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent DownloadFile failed: %v", err)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".dl-*")); len(left) != 0 {
+		t.Fatalf("stale .dl-* files left behind: %v", left)
+	}
+}
+
+func TestUntarInstallRejectsNonRegularMembers(t *testing.T) {
+	writeRawTarGz := func(t *testing.T, path string, headers []*tar.Header, bodies [][]byte) {
+		t.Helper()
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gz := gzip.NewWriter(f)
+		tw := tar.NewWriter(gz)
+		for i, hd := range headers {
+			if err := tw.WriteHeader(hd); err != nil {
+				t.Fatal(err)
+			}
+			if len(bodies[i]) > 0 {
+				if _, err := tw.Write(bodies[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		typeflag byte
+		linkname string
+	}{
+		{name: "symlink", typeflag: tar.TypeSymlink, linkname: "/etc/passwd"},
+		{name: "hardlink", typeflag: tar.TypeLink, linkname: "/etc/shadow"},
+		{name: "fifo", typeflag: tar.TypeFifo},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tgz := filepath.Join(dir, "bad.tar.gz")
+			writeRawTarGz(t, tgz,
+				[]*tar.Header{{
+					Name:     "tool",
+					Mode:     0o755,
+					Typeflag: tc.typeflag,
+					Linkname: tc.linkname,
+				}},
+				[][]byte{nil},
+			)
+			dst := filepath.Join(t.TempDir(), "tool")
+			err := UntarInstall(tgz, "tool", dst, 0o755)
+			if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("err = %v, want non-regular member rejection", err)
+			}
+			if _, serr := os.Stat(dst); !os.IsNotExist(serr) {
+				t.Fatal("dst must not exist when non-regular member is rejected")
+			}
+		})
+	}
+
+	t.Run("skips matching dir and installs following regular file", func(t *testing.T) {
+		dir := t.TempDir()
+		tgz := filepath.Join(dir, "dir-then-reg.tar.gz")
+		body := []byte("real-binary")
+		writeRawTarGz(t, tgz,
+			[]*tar.Header{
+				{Name: "tool/", Mode: 0o755, Typeflag: tar.TypeDir},
+				{Name: "tool/tool", Mode: 0o755, Typeflag: tar.TypeReg, Size: int64(len(body))},
+			},
+			[][]byte{nil, body},
+		)
+		dst := filepath.Join(t.TempDir(), "tool")
+		if err := UntarInstall(tgz, "tool", dst, 0o755); err != nil {
+			t.Fatalf("UntarInstall failed: %v", err)
+		}
+		if got := testutil.ReadFile(t, dst); got != "real-binary" {
+			t.Fatalf("content = %q, want real-binary", got)
+		}
+	})
 }

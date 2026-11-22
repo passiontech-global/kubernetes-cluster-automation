@@ -32,6 +32,7 @@ const (
 	CheckKineStorage = "kine-storage"
 	CheckPKIDrift    = "cp-cert-drift" // pki-cert-drift PKI reload drift
 	CheckKubeCert    = "kubeconfig-cert"
+	CheckKMSv2       = "kmsv2-guard" // K10 KMSv2 encryption plugin socket & healthz guard
 	// CheckJournal is the pseudo-check label the journal-unreadable
 	// blindness accounting counts under — journald readability is a
 	// cross-cutting witness, not one of the gated checks.
@@ -77,6 +78,9 @@ const (
 	// stuck learner (>EtcdLearnerMaxAge), lost leader, leader-change
 	// storm, or sustained WAL fsync p99 > FsyncP99MaxSeconds.
 	StateEtcdQuorumDegraded = latchdefs.LatchEtcdQuorumDegraded
+	// StateKMSv2Unhealthy latches when the KMSv2 unix socket is hung/
+	// unreachable or /healthz/kms-provider-* reports unhealthy.
+	StateKMSv2Unhealthy = latchdefs.LatchKMSv2Unhealthy
 )
 
 // On-disk bookkeeping file names under WatchdogStateDir — same names

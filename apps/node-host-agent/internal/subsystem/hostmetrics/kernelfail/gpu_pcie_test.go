@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -160,5 +161,67 @@ func TestGPUPCIPromGauges(t *testing.T) {
 	}
 	if !strings.Contains(body, "node_agent_gpu_pcie_devices_expected 1") {
 		t.Fatalf("expected gauge missing/wrong:\n%s", body)
+	}
+}
+
+func TestGPUPCIeZeroGPUCacheThrottleAndTTL(t *testing.T) {
+	f := kfixture(t)
+	now := time.Unix(1700000000, 0)
+	f.r.deps.Clock.Set(func() time.Time { return now })
+	devDir := filepath.Join(f.deps.HostRoot, "sys", "bus", "pci", "devices")
+	if err := os.MkdirAll(devDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedGPUPCI(t, f.deps.HostRoot, "0000:00:01.0", "0x8086", "0x060000", true)
+
+	// Tick 1: scans sysfs, finds 0 GPUs, caches result.
+	f.r.updateGPUPCIe()
+	if !f.r.gpuPCI.ok || len(f.r.gpuPCI.devs) != 0 {
+		t.Fatalf("expected cached 0 GPUs, got %+v", f.r.gpuPCI)
+	}
+
+	// Add a GPU to sysfs while inside gpuPCIScanTTL: 2nd tick uses 0-GPU cache.
+	seedGPUPCI(t, f.deps.HostRoot, "0000:01:00.0", "0x10de", "0x030000", false)
+	now = now.Add(gpuPCIScanTTL - time.Minute)
+	f.r.updateGPUPCIe()
+	if _, ok := gpuAcute(f, "gpu:pcie-unbound"); ok {
+		t.Fatal("expected 0-GPU cache hit within TTL to skip sysfs scan")
+	}
+
+	// Advance past gpuPCIScanTTL: 3rd tick rescans and discovers the unbound GPU.
+	now = now.Add(2 * time.Minute)
+	f.r.updateGPUPCIe()
+	if _, ok := gpuAcute(f, "gpu:pcie-unbound"); !ok {
+		t.Fatal("expected sysfs rescan after TTL expiry to discover unbound GPU")
+	}
+	if len(f.r.gpuPCI.devs) != 1 {
+		t.Fatalf("expected cached devs len=1 after rescan, got %d", len(f.r.gpuPCI.devs))
+	}
+}
+
+func TestGPUPCIeExpectedNonZeroBypassesZeroCache(t *testing.T) {
+	f := kfixture(t)
+	now := time.Unix(1700000000, 0)
+	f.r.deps.Clock.Set(func() time.Time { return now })
+	devDir := filepath.Join(f.deps.HostRoot, "sys", "bus", "pci", "devices")
+	if err := os.MkdirAll(devDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f.r.deps.GPUExpectedCount = 1
+
+	f.r.updateGPUPCIe()
+	if _, ok := gpuAcute(f, "gpu:pcie-loss"); !ok {
+		t.Fatal("expected pcie-loss when GPUExpectedCount=1 and 0 GPUs")
+	}
+
+	// Add the GPU and run immediately (0 clock advance): GPUExpectedCount > 0 must bypass 0-cache.
+	seedGPUPCI(t, f.deps.HostRoot, "0000:01:00.0", "0x10de", "0x030000", true)
+	f.r.hw.acute = map[string]hwAcute{}
+	f.r.updateGPUPCIe()
+	if _, ok := gpuAcute(f, "gpu:pcie-loss"); ok {
+		t.Fatal("expected 0-cache bypassed when GPUExpectedCount > 0")
+	}
+	if len(f.r.gpuPCI.devs) != 1 {
+		t.Fatalf("expected devs len=1, got %d", len(f.r.gpuPCI.devs))
 	}
 }

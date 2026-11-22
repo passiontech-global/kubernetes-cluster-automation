@@ -182,19 +182,40 @@ tasks:
       cache: false
 
   image-push:
-    # Pushes the tags image-build just loaded into the local daemon.
+    # Builds and pushes directly via docker buildx --push (avoiding
+    # --load into the local daemon followed by a separate docker push).
     # Login is the caller's job; this task never authenticates itself.
-    deps:
-      - 'image-build'
     script: |
       set -eu
+      : "${KO_DOCKER_REPO:?KO_DOCKER_REPO unset}"
+      args=""
       for t in $(echo "${TAGS:-latest}" | tr ',' ' '); do
-        docker push "${KO_DOCKER_REPO:?KO_DOCKER_REPO unset}:$t"
+        args="$args -t ${KO_DOCKER_REPO}:$t"
       done
+      cache_args=""
+      if [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ] &&
+         { [ -n "${ACTIONS_CACHE_URL:-}" ] || [ -n "${ACTIONS_RESULTS_URL:-}" ]; }; then
+        cache_args="--cache-from type=gha,scope=node-host-agent --cache-to type=gha,scope=node-host-agent,mode=max,ignore-error=true"
+      fi
+      docker buildx build --push $cache_args --build-arg "VERSION=${VERSION:-dev}" $args -f "$PWD/Dockerfile" "$PWD/../.."
     toolchains: 'system'
     inputs:
       - '$TAGS'
       - '$KO_DOCKER_REPO'
+      - 'cmd/**/*.go'
+      - 'internal/**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - '/.dockerignore'
+      - '/libs/hostkit/**/*.go'
+      - '/libs/hostkit/go.mod'
+      - '/libs/hostkit/go.sum'
+      - '/libs/jinja/**/*.go'
+      - '/libs/jinja/go.mod'
+      - '/libs/jinja/go.sum'
+      - 'internal/subsystem/hostconfig/templates/**'
+      - '/mise.toml'
     options:
       # script is a multi-line shell snippet — must run via shell.
       shell: true

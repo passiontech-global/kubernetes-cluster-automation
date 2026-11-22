@@ -32,8 +32,8 @@
 //	BodyOK                 — plain GET, trimmed body must be exactly
 //	                         "ok" (kubelet :10248 contract) — the
 //	                         status code is deliberately not checked.
-//	UnixGet                — GET over a unix socket, per-call
-//	                         transport with keep-alives off.
+//	UnixGet                — GET over a unix socket, socket-keyed
+//	                         pooled keep-alive transport.
 //	UnixDial               — connect+close proves the socket accepts
 //	                         (containerd-socket hang probe).
 //	DNSQuery               — one hand-rolled UDP A-record query; any
@@ -47,9 +47,10 @@
 // probe. Every HTTP probe also accepts an optional trailing
 // *http.Client (variadic, nil/absent → the probe's package default)
 // for callers that need a bespoke transport; existing callers are
-// unchanged. UnixGet is the deliberate exception: its transport is
-// per-call with DisableKeepAlives, because a kept-alive unix conn
-// pins the transport read/write goroutines.
+// unchanged. UnixGet/UnixDelete pool one keep-alive *http.Client per
+// cleaned socket path (90s IdleConnTimeout) so multiple queries per
+// cycle reuse a single unix socket connection without cross-socket
+// connection misrouting.
 package probee
 
 import (

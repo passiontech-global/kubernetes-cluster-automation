@@ -121,24 +121,39 @@ func (d *Deps) PGBContainerName(ctx context.Context) string {
 // memo entry simply carries whichever name that returned.
 func (d *Deps) memoizedContainerName(ctx context.Context, key string,
 	fn func(context.Context) string) string {
+	now := d.Cfg.Clock.Now()
 	d.nameMu.Lock()
-	defer d.nameMu.Unlock()
 	if d.nameCache != nil {
 		if m, ok := d.nameCache[key]; ok {
-			age := d.Cfg.Clock.Now().Sub(m.at)
+			age := now.Sub(m.at)
 			if age >= 0 && age < nameMemoTTL {
+				d.nameMu.Unlock()
 				return m.name
 			}
 		}
 	}
+	d.nameMu.Unlock()
+
 	name := fn(ctx)
-	if name == "" {
-		return name // a failed discovery must not pin for the TTL
+	if name == "" || ctx.Err() != nil {
+		return name // a failed or cancelled discovery must not pin for the TTL
 	}
+
+	storeNow := d.Cfg.Clock.Now()
+	d.nameMu.Lock()
 	if d.nameCache == nil {
 		d.nameCache = map[string]nameMemo{}
 	}
-	d.nameCache[key] = nameMemo{name: name, at: d.Cfg.Clock.Now()}
+	if m, ok := d.nameCache[key]; ok {
+		age := storeNow.Sub(m.at)
+		if age >= 0 && age < nameMemoTTL {
+			cached := m.name
+			d.nameMu.Unlock()
+			return cached
+		}
+	}
+	d.nameCache[key] = nameMemo{name: name, at: storeNow}
+	d.nameMu.Unlock()
 	return name
 }
 

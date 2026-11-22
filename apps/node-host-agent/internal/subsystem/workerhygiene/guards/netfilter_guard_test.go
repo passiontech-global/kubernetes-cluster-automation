@@ -23,6 +23,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
@@ -426,5 +427,165 @@ func TestNetfilterGuardPidsOKFalseAndProcErrorPreserveStreak(t *testing.T) {
 	c.Run(ctx, nfEnv(6210))
 	if len(f.Kills) != 1 || f.Kills[0].PID != 6210 {
 		t.Fatalf("kills=%+v want SIGKILL on 6210 on preserved streak=2", f.Kills)
+	}
+}
+
+func TestNetfilterGuardUsesStatsOnceAndKeepsTOCTOU(t *testing.T) {
+	d, f := gDeps(t)
+	d.Cfg.Wave2.NetfilterGuardStuckCycles = 1
+	d.Cfg.Wave2.NetfilterGuardHungCmdSec = 1
+	mkNetfilterProcStart(t, d, 6302, "iptables", "S", nil, 2*time.Minute, 100)
+
+	statsCalls := 0
+	statsSnap := map[int]procfs.Stat{
+		6301: {HasComm: true, Comm: "bash", Fields: []string{"S", "1"}}, // no /proc/6301/stat on disk
+		6302: {HasComm: true, Comm: "iptables", Fields: []string{"S", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "100"}},
+	}
+	c := nfCheck(t, d)
+	// Mutate /proc/6302/stat starttime between scanStuck and KillFn to confirm live TOCTOU check.
+	d.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return f.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			mkNetfilterProcStart(t, d, 6302, "iptables", "S", nil, 2*time.Minute, 200)
+			return map[string]string{}, nil
+		},
+	}
+	c.Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		PidsOnce:     func() []int { return []int{6301, 6302} },
+		PidsOK:       func() bool { return true },
+		StatsOnce: func() map[int]procfs.Stat {
+			statsCalls++
+			return statsSnap
+		},
+	})
+	if statsCalls != 1 {
+		t.Fatalf("StatsOnce called %d times, want 1", statsCalls)
+	}
+	if len(f.Kills) != 0 {
+		t.Fatalf("live TOCTOU must abort kill on starttime change even with StatsOnce; kills=%+v", f.Kills)
+	}
+
+	// Verify StatsOnce omitting a 0o000 stat PID still aborts via statNonENOENT.
+	if os.Geteuid() != 0 {
+		mkNetfilterProcStart(t, d, 6303, "iptables", "S", nil, 2*time.Minute, 300)
+		stat6303 := filepath.Join(f.ProcDir, "6303", "stat")
+		if err := os.Chmod(stat6303, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(stat6303, 0o644) })
+		c.Run(context.Background(), &wdeps.CycleEnv{
+			WorkerActive: true,
+			PidsOnce:     func() []int { return []int{6301, 6303} },
+			PidsOK:       func() bool { return true },
+			StatsOnce: func() map[int]procfs.Stat {
+				statsCalls++
+				return statsSnap
+			},
+		})
+		if statsCalls != 2 {
+			t.Fatalf("StatsOnce called %d times, want 2", statsCalls)
+		}
+		if got := testutil.ToFloat64(d.Cycles.WithLabelValues(wdeps.CheckNetfilterGuard, "abort")); got != 1 {
+			t.Fatalf("abort=%v want 1 when StatsOnce omits 0o000 stat PID", got)
+		}
+	}
+}
+
+func TestProbeLegacyRules(t *testing.T) {
+	cases := []struct {
+		name    string
+		initial int64
+		setup   func(t *testing.T, d *wdeps.Deps, f *wdepstest.Fixture, namesPath string)
+		want    int64
+	}{
+		{
+			name:    "enoent_sets_zero",
+			initial: 7,
+			setup:   func(_ *testing.T, _ *wdeps.Deps, _ *wdepstest.Fixture, _ string) {},
+			want:    0,
+		},
+		{
+			name:    "non_enoent_read_error_preserves_gauge",
+			initial: 7,
+			setup: func(t *testing.T, _ *wdeps.Deps, _ *wdepstest.Fixture, namesPath string) {
+				// Directory at namesPath fails os.ReadFile with EISDIR even when running as root.
+				if err := os.MkdirAll(namesPath, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: 7,
+		},
+		{
+			name:    "whitespace_only_names_sets_zero",
+			initial: 7,
+			setup: func(_ *testing.T, _ *wdeps.Deps, _ *wdepstest.Fixture, namesPath string) {
+				wdepstest.WriteFile(t, namesPath, "  \n\t \n")
+			},
+			want: 0,
+		},
+		{
+			name:    "systemd_nil_preserves_gauge",
+			initial: 7,
+			setup: func(_ *testing.T, d *wdeps.Deps, _ *wdepstest.Fixture, namesPath string) {
+				wdepstest.WriteFile(t, namesPath, "filter\n")
+				d.Cfg.Systemd = nil
+			},
+			want: 7,
+		},
+		{
+			name:    "exec_bounded_error_preserves_gauge",
+			initial: 7,
+			setup: func(_ *testing.T, _ *wdeps.Deps, _ *wdepstest.Fixture, namesPath string) {
+				wdepstest.WriteFile(t, namesPath, "filter\n")
+				// iptables-legacy-save omitted from f.SDReply -> returns ENOENT error.
+			},
+			want: 7,
+		},
+		{
+			name:    "counts_dash_a_lines_ignoring_chains_comments_counters",
+			initial: 7,
+			setup: func(_ *testing.T, _ *wdeps.Deps, f *wdepstest.Fixture, namesPath string) {
+				wdepstest.WriteFile(t, namesPath, "filter\nnat\n")
+				f.SDReply["iptables-legacy-save"] = strings.Join([]string{
+					"# Generated by iptables-save",
+					"*filter",
+					":INPUT ACCEPT [12:345]",
+					":KUBE-SERVICES - [0:0]",
+					"[0:0] -A COUNTER_PREFIX",
+					"  -A INDENTED_NOT_COUNTED",
+					"-A INPUT -j ACCEPT",
+					"-A FORWARD -j KUBE-SERVICES",
+					"COMMIT",
+					"*nat",
+					"-A PREROUTING -j KUBE-SERVICES",
+					"COMMIT",
+				}, "\n")
+			},
+			want: 3,
+		},
+		{
+			name:    "valid_output_without_rules_resets_to_zero",
+			initial: 7,
+			setup: func(_ *testing.T, _ *wdeps.Deps, f *wdepstest.Fixture, namesPath string) {
+				wdepstest.WriteFile(t, namesPath, "filter\n")
+				f.SDReply["iptables-legacy-save"] = "*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n"
+			},
+			want: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, f := gDeps(t)
+			c := nfCheck(t, d)
+			d.Series.IPTablesLegacyLeakedRules = tc.initial
+			namesPath := filepath.Join(d.Cfg.ProcRoot, "1", "net", "ip_tables_names")
+			tc.setup(t, d, f, namesPath)
+			c.probeLegacyRules(context.Background())
+			if got := d.Series.IPTablesLegacyLeakedRules; got != tc.want {
+				t.Fatalf("IPTablesLegacyLeakedRules=%d want %d", got, tc.want)
+			}
+		})
 	}
 }

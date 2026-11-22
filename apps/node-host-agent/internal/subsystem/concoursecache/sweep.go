@@ -1,11 +1,12 @@
 // sweep.go — the sweep orchestration: the pvc-*/shared-cache walk,
 // the per-cache prune order, fs-pressure escalation (statfs →
 // high/crit tightened limits) and the one-level ownership/perm
-// invariant enforced before pruning.
+// invariant enforced before pruning, all pinned via *os.Root.
 package concoursecache
 
 import (
 	"context"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -19,10 +20,10 @@ import (
 // openebsRoot. The name check is the orphan sweeper's strict
 // pvc-<uuid> belt (pvcNameRe) — a hand-made pvc-* dir or a stray
 // pvc-* file is not a worker volume and gets no chown/chmod/prune.
-// Non-matching dirs and pvc dirs without a shared-cache are skipped
-// (the script's `[ -d "$SC" ] || exit 0`).
+// Non-matching dirs, symlinked pvc/shared-cache dirs, and pvc dirs
+// without a shared-cache are skipped (the script's `[ -d "$SC" ] || exit 0`).
 func (p *Pruner) Sweep(ctx context.Context, openebsRoot string) error {
-	entries, err := os.ReadDir(openebsRoot)
+	root, err := openDirRootNoSymlink(openebsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
 			p.cycles.WithLabelValues("ok").Inc()
@@ -31,56 +32,67 @@ func (p *Pruner) Sweep(ctx context.Context, openebsRoot string) error {
 		p.cycles.WithLabelValues("abort").Inc()
 		return err
 	}
+	defer func() { _ = root.Close() }()
+
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		p.cycles.WithLabelValues("abort").Inc()
+		return err
+	}
 	for _, e := range entries {
 		if err := ctx.Err(); err != nil {
 			p.cycles.WithLabelValues("abort").Inc()
 			return err
 		}
-		if !e.IsDir() || !pvcNameRe.MatchString(e.Name()) {
+		if !e.IsDir() || e.Type()&fs.ModeSymlink != 0 || !pvcNameRe.MatchString(e.Name()) {
 			continue
 		}
-		p.pruneSharedCache(ctx,
+		pvcRoot, err := openSubRootNoSymlink(root, e.Name())
+		if err != nil {
+			continue
+		}
+		scRoot, err := openSubRootNoSymlink(pvcRoot, concourse.SharedCacheName)
+		_ = pvcRoot.Close()
+		if err != nil {
+			continue
+		}
+		p.pruneSharedCacheRoot(ctx, scRoot,
 			filepath.Join(openebsRoot, e.Name(), concourse.SharedCacheName))
+		_ = scRoot.Close()
 	}
 	p.cycles.WithLabelValues("ok").Inc()
 	return nil
 }
 
-// pruneSharedCache applies every bucket rule to one shared-cache dir,
-// in the script's order. All helpers are best-effort (the script's
-// `2>/dev/null || true`) — only ctx cancellation aborts mid-flight.
-func (p *Pruner) pruneSharedCache(ctx context.Context, sc string) {
-	log := logger().With("subsystem", "concourse-cache", "dir", sc)
-	if !isDir(sc) {
-		return // init-rm not done yet — nothing to prune
-	}
-	p.enforcePerms(sc, log)
-	eff := p.escalatedLimits(sc, log)
+func (p *Pruner) pruneSharedCacheRoot(ctx context.Context, scRoot *os.Root, scDisplay string) {
+	log := logger().With("subsystem", "concourse-cache", "dir", scDisplay)
+	p.enforcePermsRoot(scRoot, scDisplay, log)
+	eff := p.escalatedLimits(scDisplay, log)
 
 	// go-build: stale entries + its own size cap.
-	p.pruneGoBuild(ctx, sc, eff, log)
+	p.pruneGoBuildRoot(ctx, scRoot, eff, log)
 
 	// Artifact bus: 24h files + empty dirs, then the build <key> cap.
 	for _, b := range []string{"build", "coverage"} {
-		p.pruneAgeBucket(ctx, sc, b, eff.ArtifactMaxAge, true, log)
+		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.ArtifactMaxAge, true, log)
 	}
-	p.capTopLevelDirs(ctx, sc, "build",
+	p.capTopLevelDirsRoot(ctx, scRoot, "build",
 		eff.BuildHighMark, eff.BuildLowMark, false, log)
 
 	// affected + ytt: 48h files, no dir cleanup.
 	for _, b := range []string{"affected", "ytt"} {
-		p.pruneAgeBucket(ctx, sc, b, eff.StaleMaxAge, false, log)
+		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.StaleMaxAge, false, log)
 	}
 	// nx + moon task-graph caches: 7d files + empty dirs.
 	for _, b := range []string{"nx", "moon"} {
-		p.pruneAgeBucket(ctx, sc, b, eff.GraphMaxAge, true, log)
+		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.GraphMaxAge, true, log)
 	}
 	// Scanner/tool caches: 14d files + empty dirs.
 	for _, b := range []string{"trivy", "sonar", "golangci-lint",
 		"uv", "pip", "bin", "py-tools", "bun"} {
-		p.pruneAgeBucket(ctx, sc, b, eff.ToolMaxAge, true, log)
+		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.ToolMaxAge, true, log)
 	}
-	p.pruneNodeDeps(ctx, sc, eff, log)
+	p.pruneNodeDepsRoot(ctx, scRoot, eff, log)
 }
 
 // fsPressure returns the used percent of the filesystem holding
@@ -160,39 +172,40 @@ func (p *Pruner) escalatedLimits(sc string, log *slog.Logger) Config {
 // a silently unenforced ownership invariant is how cache writes
 // start landing as root.
 func (p *Pruner) enforcePerms(sc string, log *slog.Logger) {
-	targets := []string{sc}
-	if entries, err := os.ReadDir(sc); err == nil {
+	scRoot, err := openDirRootNoSymlink(sc)
+	if err != nil {
+		log.Debug("cannot open shared-cache root — perms not enforced",
+			"dir", sc, "error", err)
+		return
+	}
+	defer func() { _ = scRoot.Close() }()
+	p.enforcePermsRoot(scRoot, sc, log)
+}
+
+func (p *Pruner) enforcePermsRoot(scRoot *os.Root, scDisplay string, log *slog.Logger) {
+	targets := []string{"."}
+	if entries, err := fs.ReadDir(scRoot.FS(), "."); err == nil {
 		for _, e := range entries {
-			p := filepath.Join(sc, e.Name())
-			// Lstat each candidate — os.Chown/os.Chmod below
-			// dereference symlinks onto host paths outside the
-			// cache, and DirEntry.Type() is ZERO on filesystems
-			// reporting DT_UNKNOWN (XFS ftype=0, overlayfs, NFS),
-			// so a Type()-only guard would let a container-planted
-			// `<entry> -> /etc/...` slip through as a privilege
-			// gadget (concourseinit/worker_init.go parity). Only
-			// real directories get the top-level perm invariant —
-			// chmod 0777 on a regular file would be world-
-			// writable AND executable.
-			fi, err := os.Lstat(p)
+			name := e.Name()
+			// Lstat each candidate relative to scRoot — only real
+			// directories get the top-level perm invariant.
+			fi, err := scRoot.Lstat(name)
 			if err != nil {
 				continue // raced away between ReadDir and Lstat
 			}
 			if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 				continue
 			}
-			targets = append(targets, p)
+			targets = append(targets, name)
 		}
 	} else {
 		log.Debug("cannot list shared-cache — perms enforced on root only",
-			"dir", sc, "error", err)
+			"dir", scDisplay, "error", err)
 	}
 	for _, t := range targets {
-		// fd-based: open O_NOFOLLOW + Fchown/Fchmod on the held fd —
-		// the Lstat above only proved no symlink AT CHECK TIME;
-		// os.Chown/os.Chmod would re-resolve the path and follow a
-		// swapped-in link.
-		if err := enforceDirPermsFD(t, p.cfg.OwnerUID, p.cfg.OwnerGID, p.cfg.Mode); err != nil {
+		// fd-based: open O_NOFOLLOW relative to scRoot + Fchown/Fchmod
+		// on the held fd — blocks both escaping and intra-root symlinks.
+		if err := enforceDirPermsRootFD(scRoot, t, p.cfg.OwnerUID, p.cfg.OwnerGID, p.cfg.Mode); err != nil {
 			log.Debug("perm invariant not enforced",
 				"path", t, "error", err)
 		}

@@ -190,11 +190,9 @@ func (c *Collector) collectWatchdog(ch chan<- prometheus.Metric, sc scrapeCtx) {
 	// Fold RAM-only ramEpochs latches (ENOSPC/EROFS fallback in hoststate.Store)
 	// into present so Prometheus watchdog metrics reflect active latches even
 	// when no state-* file could be written to WatchdogStateDir.
-	existsFn := c.cfg.latchExistsFn
-	if existsFn == nil && c.state != nil && c.state.Dir == c.cfg.WatchdogStateDir {
-		existsFn = c.state.Exists
-	}
-	if existsFn != nil {
+	// When latchExistsFn is nil, c.state.RAMLatches() below already enumerates
+	// every fixed and prefix RAM latch under WatchdogStateDir without N os.Stats.
+	if existsFn := c.cfg.latchExistsFn; existsFn != nil {
 		for _, d := range latchdefs.LatchDefs {
 			if !d.Prefix && !present[d.Name] && existsFn(d.Name) {
 				present[d.Name] = true

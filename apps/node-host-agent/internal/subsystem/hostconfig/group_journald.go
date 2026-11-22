@@ -7,9 +7,9 @@ package hostconfig
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -101,32 +101,46 @@ func (c *cyc) ensureJournalDir() bool {
 	return created
 }
 
+var machineIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
 // journaldOrphanFold moves *.journal files stranded under stale
-// machine-id dirs into the live one — same mv-with-rename dance as
-// ansible (incident 2026-10-09 cloned-image journals).
+// machine-id dirs into the live one — Go-native rename without shell
+// interpolation (incident 2026-10-09 cloned-image journals).
 func (c *cyc) journaldOrphanFold() {
-	r, ctx := c.r, c.ctx
+	r := c.r
 	mid := r.machineID()
 	if mid == "" {
 		return
 	}
-	// sh -c runs in the host namespaces via the Runner — unjoined
-	// host paths, not HostRoot-prefixed.
-	_, _ = r.run(ctx, "sh", "-c", fmt.Sprintf(`mid=%q
-for f in /var/log/journal/*/*.journal; do
-  [ -e "$f" ] || continue
-  case "$f" in "/var/log/journal/$mid/"*) continue ;; esac
-  base=$(basename "$f")
-  dest="/var/log/journal/$mid/$base"
-  [ -e "$dest" ] && dest="/var/log/journal/$mid/orphan-$base"
-  mv "$f" "$dest" || echo "WARN: could not move $f"
-done`, mid))
+	liveDir := r.hp("/var/log/journal/" + mid)
+	matches, err := filepath.Glob(r.hp("/var/log/journal/*/*.journal"))
+	if err != nil {
+		return
+	}
+	for _, src := range matches {
+		if filepath.Base(filepath.Dir(src)) == mid {
+			continue
+		}
+		base := filepath.Base(src)
+		dest := filepath.Join(liveDir, base)
+		if _, err := os.Lstat(dest); err == nil {
+			dest = filepath.Join(liveDir, "orphan-"+base)
+		}
+		if err := os.Rename(src, dest); err != nil {
+			logger().Warn("journald: could not fold orphan journal",
+				"src", src, "dest", dest, "error", err)
+		}
+	}
 }
 
-// machineID reads the host machine-id — the journal storage dir name.
+// machineID reads and validates the host machine-id (32 lowercase hex
+// chars per systemd machine-id(5)) — the journal storage dir name.
 func (r *Reconciler) machineID() string {
 	if b, err := os.ReadFile(r.hp("/etc/machine-id")); err == nil {
-		return strings.TrimSpace(string(b))
+		mid := strings.TrimSpace(string(b))
+		if machineIDRe.MatchString(mid) {
+			return mid
+		}
 	}
 	return ""
 }

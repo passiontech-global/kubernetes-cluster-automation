@@ -76,7 +76,7 @@ interdc_nexp_deb_file: "nexp.deb"
 	}
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupHubMetricsFW()
-	if len(sr.CallsMatching("apt-get install -y /tmp/nexp.deb")) > 0 {
+	if len(sr.CallsMatching("apt-get install -y /var/lib/node-watchdog/downloads/nexp.deb")) > 0 {
 		t.Fatalf("deb install ran despite matching version: %v",
 			sr.CallsMatching("apt-get"))
 	}
@@ -131,7 +131,7 @@ interdc_nexp_deb_url: "%s/nexp.deb"
 interdc_nexp_deb_sha256: "%x"
 `, srv.URL, sum))
 	// dpkg-query empty (package absent) → download → sha256 verify →
-	// apt-get install /tmp/<basename> (deb_file defaults to the URL
+	// apt-get install /var/lib/node-watchdog/downloads/<basename> (deb_file defaults to the URL
 	// basename, ansible `| basename` parity).
 	sr := newScripted(nil, nil)
 	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
@@ -141,10 +141,10 @@ interdc_nexp_deb_sha256: "%x"
 	}
 	c := loadCyc(t, r, vars, "node-a")
 	c.groupHubMetricsFW()
-	if len(sr.CallsMatching("apt-get install -y /tmp/nexp.deb")) == 0 {
+	if len(sr.CallsMatching("apt-get install -y /var/lib/node-watchdog/downloads/nexp.deb")) == 0 {
 		t.Fatalf("deb install not invoked: %v", sr.CallsMatching("apt"))
 	}
-	staged := filepath.Join(r.cfg.HostRoot, "/tmp/nexp.deb")
+	staged := filepath.Join(r.cfg.HostRoot, "/var/lib/node-watchdog/downloads/nexp.deb")
 	got, err := os.ReadFile(staged)
 	if err != nil || sha256.Sum256(got) != sum {
 		t.Fatalf("staged deb missing/corrupt: %v", err)
@@ -246,7 +246,7 @@ interdc_nexp_deb_file: "node-exporter.deb"
 `, url, sum)
 	vars := writeVarsDir(t, cluster)
 	sr := newScripted(nil, nil)
-	sr.FailOn("apt-get install -y /tmp/node-exporter.deb", nil)
+	sr.FailOn("apt-get install -y /var/lib/node-watchdog/downloads/node-exporter.deb", nil)
 	r, err := New(Config{NodeName: "hub-vm", HostRoot: t.TempDir(),
 		VarsDir: vars, NebulaCertsDir: t.TempDir(), Standalone: true, Runner: sr}, nil)
 	if err != nil {

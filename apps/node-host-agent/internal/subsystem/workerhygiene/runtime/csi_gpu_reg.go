@@ -269,6 +269,7 @@ func (c *CSIGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// exists — no sockets AND no CSI pods is the zero-CSI node.
 	pods := c.csiPluginPods(e)
 	if len(socks) == 0 && len(pods) == 0 {
+		clear(c.refused)
 		c.d.State.Exit(latchdefs.LatchCSIRegistrationWedged, nil)
 		c.d.CycleResult(wdeps.CheckCSIGuard, "ok")
 		return
@@ -280,6 +281,11 @@ func (c *CSIGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if !dok {
 		c.d.CycleResult(wdeps.CheckCSIGuard, "inconclusive")
 		return
+	}
+	for drv := range c.refused {
+		if _, hasSock := socks[drv]; !hasSock || drivers[drv] {
+			delete(c.refused, drv)
+		}
 	}
 
 	// Orphan sockets: present on disk, absent from CSINode.
@@ -433,14 +439,19 @@ func (c *CSIGuardCheck) bounceStaleCSIPods(ctx context.Context,
 	return bounced
 }
 
+const gpuPCIZeroRescanTTL = 10 * time.Minute
+
 // GPUGuardCheck is the P2.12 plugin half: it compares the node's
 // nvidia.com/gpu allocatable against the device-plugin pod's
 // health and bounces a wedged plugin. The hardware/sysfs evidence
 // is kernelfail's job (gpu_pcie.go → GPUHardwareError); this
 // check owns only the Kubernetes registration surface.
 type GPUGuardCheck struct {
-	d           *wdeps.Deps
-	desyncSince time.Time
+	d              *wdeps.Deps
+	desyncSince    time.Time
+	zeroPCIDir     string
+	zeroPCIModTime time.Time
+	zeroPCIAt      time.Time
 }
 
 // NewGPUGuard builds the check.
@@ -528,11 +539,22 @@ func (c *GPUGuardCheck) nodeGPUCapacity(ctx context.Context) (gpuNodeCapacity, b
 // standalone /sys both resolve without a second path knob.
 // ok=false when sysfs is unreadable — inconclusive, never "zero
 // GPUs" (a missing mount must not fabricate a desync verdict).
-func (c *GPUGuardCheck) liveGPUs() (int, bool) {
+// On 0-GPU CPU-only nodes (allowZeroCache=true), caches the 0 result
+// for gpuPCIZeroRescanTTL as long as pciDir mtime is unchanged.
+func (c *GPUGuardCheck) liveGPUs(allowZeroCache bool) (int, bool) {
 	pciDir := filepath.Join(c.d.Cfg.SysClassNet,
 		"..", "..", "bus", "pci", "devices")
+	now := c.d.Cfg.Seams.Host.Clock.Now()
+	if allowZeroCache && c.zeroPCIDir == pciDir && !c.zeroPCIAt.IsZero() {
+		if age := now.Sub(c.zeroPCIAt); age >= 0 && age < gpuPCIZeroRescanTTL {
+			if st, err := os.Stat(pciDir); err == nil && st.ModTime().Equal(c.zeroPCIModTime) {
+				return 0, true
+			}
+		}
+	}
 	ents, err := os.ReadDir(pciDir)
 	if err != nil {
+		c.zeroPCIAt = time.Time{}
 		return 0, false
 	}
 	live := 0
@@ -549,6 +571,7 @@ func (c *GPUGuardCheck) liveGPUs() (int, bool) {
 		vendor, err := os.ReadFile(filepath.Join(dir, "vendor"))
 		if err != nil {
 			if !os.IsNotExist(err) {
+				c.zeroPCIAt = time.Time{}
 				return 0, false
 			}
 			continue
@@ -559,6 +582,7 @@ func (c *GPUGuardCheck) liveGPUs() (int, bool) {
 		class, err := os.ReadFile(filepath.Join(dir, "class"))
 		if err != nil {
 			if !os.IsNotExist(err) {
+				c.zeroPCIAt = time.Time{}
 				return 0, false
 			}
 			continue
@@ -571,6 +595,15 @@ func (c *GPUGuardCheck) liveGPUs() (int, bool) {
 			strings.HasPrefix(cls, "0x0302") {
 			live++
 		}
+	}
+	if live == 0 {
+		if st, serr := os.Stat(pciDir); serr == nil {
+			c.zeroPCIDir = pciDir
+			c.zeroPCIModTime = st.ModTime()
+			c.zeroPCIAt = now
+		}
+	} else {
+		c.zeroPCIAt = time.Time{}
 	}
 	return live, true
 }
@@ -588,8 +621,8 @@ func (c *GPUGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckGPUGuard, "abort")
 		return
 	}
-	live, liveOK := c.liveGPUs()
 	pods := c.devicePluginPods(e)
+	live, liveOK := c.liveGPUs(len(pods) == 0)
 	if !liveOK && len(pods) == 0 {
 		// Sysfs unreadable AND no plugin pods — nothing to compare
 		// against; inconclusive rather than a fabricated desync.

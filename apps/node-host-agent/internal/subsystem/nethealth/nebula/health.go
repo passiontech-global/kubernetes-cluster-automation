@@ -103,6 +103,7 @@ func (n *Deps) CheckNebulaHealth(ctx context.Context) {
 	wd := n.Watchdog()
 	net := wd.NebulaNet
 	if !n.UnitEnabledActive(ctx, "nebula@"+net) {
+		n.clearAlivePeers()
 		// Nebula disabled/left mesh → drop ONLY this module's 5 states
 		// via State.Exit (logs STATE-EXIT:, clears last-suspect-* and
 		// ramEpochs, and avoids clobbering hostmetrics's
@@ -139,6 +140,9 @@ func (n *Deps) CheckNebulaHealth(ctx context.Context) {
 		targets, results := n.ProbeNebulaOverlay(ctx, wd)
 		reason, dpFail = n.evalNebulaOverlay(ctx, wd, targets, results)
 	} else {
+		if wd.OverlayActive != "nebula" {
+			n.clearAlivePeers()
+		}
 		// overlay != nebula (or no probe config): don't probe through
 		// the other overlay — clear leftover dataplane states.
 		n.NebulaDeg = 0

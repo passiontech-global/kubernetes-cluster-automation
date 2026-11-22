@@ -360,6 +360,10 @@ func (c *cyc) corednsInstallBinary() bool {
 		return false
 	}
 	tgz := c.v("interdc_coredns_tgz")
+	if !validStagedBasename(tgz) {
+		c.err("T9: unsafe coredns tgz filename — refusing install", "file", tgz)
+		return false
+	}
 	sum := c.v("interdc_coredns_sha256")
 	url := c.v("interdc_coredns_url")
 	installed := false
@@ -370,9 +374,10 @@ func (c *cyc) corednsInstallBinary() bool {
 			out, err := c.r.run(c.ctx, "/usr/local/bin/coredns", "-version")
 			return err == nil && strings.Contains(out, "CoreDNS-"+ver)
 		},
-		url:    url,
-		sum:    sum,
-		staged: filepath.Join(c.r.cfg.DownloadDir, tgz),
+		url:            url,
+		sum:            sum,
+		staged:         filepath.Join(c.r.downloadDir(), tgz),
+		stagingDirMode: 0o700,
 		// ansible: sha256sum -c every run when outdated.
 		refuseBadStaged: true,
 		downloadLine:    "T9: coredns download",

@@ -82,3 +82,95 @@ func TestDefaultChownFD(t *testing.T) {
 		t.Fatal("expected error for invalid fd -1")
 	}
 }
+
+func TestWithNoFollowRootFDRejectsSymlinksAndFIFO(t *testing.T) {
+	outside := t.TempDir()
+	outsideDir := filepath.Join(outside, "dir")
+	if err := os.Mkdir(outsideDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outside, "file")
+	if err := os.WriteFile(outsideFile, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rootDir := t.TempDir()
+	realDir := filepath.Join(rootDir, "real")
+	if err := os.MkdirAll(filepath.Join(realDir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	realFile := filepath.Join(realDir, "reg")
+	if err := os.WriteFile(realFile, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Escaping leaf symlink, intra-root leaf symlink, escaping intermediate, intra-root intermediate.
+	if err := os.Symlink(outsideDir, filepath.Join(rootDir, "escape-leaf")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(rootDir, "intra-leaf")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(rootDir, "escape-mid")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(rootDir, "intra-mid")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real/reg", filepath.Join(rootDir, "intra-file")); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	for _, rel := range []string{"escape-leaf", "intra-leaf", "escape-mid/dir", "intra-mid/sub", "../outside"} {
+		if err := EnforcePermsRootFD(root, rel, false, -1, -1, CachePerm, nil); err == nil {
+			t.Fatalf("EnforcePermsRootFD(%q) succeeded, expected symlink/escape rejection", rel)
+		}
+	}
+	if err := EnforcePermsRootFD(root, "intra-file", true, -1, -1, 0o644, nil); err == nil {
+		t.Fatal("EnforcePermsRootFD on intra-root file symlink succeeded, expected rejection")
+	}
+
+	// Real targets unchanged for rejected links, updated for real targets.
+	if fi, err := os.Stat(outsideDir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("outsideDir perm changed: %v %v", fi, err)
+	}
+	if fi, err := os.Stat(realDir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("realDir perm changed via intra-root link: %v %v", fi, err)
+	}
+
+	if err := EnforcePermsRootFD(root, "real/sub", false, -1, -1, 0o755, nil); err != nil {
+		t.Fatalf("real/sub failed: %v", err)
+	}
+	if fi, err := os.Stat(filepath.Join(realDir, "sub")); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("real/sub perm=%v want 0755", fi)
+	}
+	if err := EnforcePermsRootFD(root, "real/reg", true, -1, -1, 0o640, nil); err != nil {
+		t.Fatalf("real/reg failed: %v", err)
+	}
+	if fi, err := os.Stat(realFile); err != nil || fi.Mode().Perm() != 0o640 {
+		t.Fatalf("real/reg perm=%v want 0640", fi)
+	}
+
+	// FIFO rejection without blocking.
+	fifo := filepath.Join(rootDir, "pipe")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("FIFO not supported: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- WithNoFollowRootFD(root, "pipe", true, func(int, *unix.Stat_t) error { return nil })
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a dir or regular file") {
+			t.Fatalf("FIFO error = %v, want type error", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WithNoFollowRootFD blocked on FIFO")
+	}
+}

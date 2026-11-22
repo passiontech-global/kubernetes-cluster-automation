@@ -486,8 +486,8 @@ func downloadFile(ctx context.Context, url, dst, wantSHA256 string,
 	return converge.DownloadFile(ctx, url, dst, wantSHA256, mode, timeout)
 }
 
-// untarInstall extracts member name from a .tar.gz and atomically
-// installs to dst.
-func untarInstall(tgz, member, dst string, mode os.FileMode) error {
-	return converge.UntarInstall(tgz, member, dst, mode)
+// untarInstallVerified verifies wantSHA256 and extracts member name
+// from the same open .tar.gz fd, atomically installing to dst.
+func untarInstallVerified(tgz, wantSHA256, member, dst string, mode os.FileMode) error {
+	return converge.UntarInstallVerified(tgz, wantSHA256, member, dst, mode)
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -702,5 +703,79 @@ func TestMemoizedContainerNameBackwardClockStep(t *testing.T) {
 	now = now.Add(-5 * time.Second)
 	if got := d.memoizedContainerName(context.Background(), "pg", fn); got != "pg-new" || calls != 2 {
 		t.Fatalf("backward clock step kept stale memo: got=%q calls=%d", got, calls)
+	}
+}
+
+func TestMemoizedContainerNameDoesNotBlockAcrossKeysOrCallers(t *testing.T) {
+	d, _, _ := fixture(t, nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	doneA := make(chan string, 1)
+
+	go func() {
+		doneA <- d.memoizedContainerName(context.Background(), "pg", func(context.Context) string {
+			close(started)
+			<-release
+			return "pg-slow"
+		})
+	}()
+	<-started
+
+	// Different key ("pgb") resolves immediately without waiting on "pg".
+	if got := d.memoizedContainerName(context.Background(), "pgb", func(context.Context) string {
+		return "pgb-fast"
+	}); got != "pgb-fast" {
+		t.Fatalf("pgb=%q want pgb-fast", got)
+	}
+
+	// Concurrent caller for the same key ("pg") also resolves immediately.
+	if got := d.memoizedContainerName(context.Background(), "pg", func(context.Context) string {
+		return "pg-fast"
+	}); got != "pg-fast" {
+		t.Fatalf("pg=%q want pg-fast", got)
+	}
+
+	close(release)
+	// Double-check under lock returns the fresher cached entry "pg-fast".
+	if gotA := <-doneA; gotA != "pg-fast" {
+		t.Fatalf("slow caller got=%q want fresher cached pg-fast", gotA)
+	}
+
+	// Verify concurrent callers under -race.
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 10 {
+				_ = d.memoizedContainerName(context.Background(), "pg", func(context.Context) string {
+					return "pg-fast"
+				})
+				_ = d.memoizedContainerName(context.Background(), "pgb", func(context.Context) string {
+					return "pgb-fast"
+				})
+			}
+		})
+	}
+	wg.Wait()
+}
+
+func TestMemoizedContainerNameCancelledCtxNotCached(t *testing.T) {
+	d, _, _ := fixture(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	got1 := d.memoizedContainerName(ctx, "pg", func(context.Context) string {
+		calls++
+		cancel()
+		return "kine-postgres-fallback"
+	})
+	if got1 != "kine-postgres-fallback" {
+		t.Fatalf("first call=%q want fallback", got1)
+	}
+	// Active ctx on next call must NOT receive the cancelled-ctx fallback from cache.
+	got2 := d.memoizedContainerName(context.Background(), "pg", func(context.Context) string {
+		calls++
+		return "kine-postgres-real"
+	})
+	if got2 != "kine-postgres-real" || calls != 2 {
+		t.Fatalf("cancelled ctx result was cached: got2=%q calls=%d", got2, calls)
 	}
 }

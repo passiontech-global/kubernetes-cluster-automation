@@ -157,7 +157,7 @@ func (c *HubCheck) Run(ctx context.Context) {
 }
 
 func (c *HubCheck) checkCacheStale(ctx context.Context, now time.Time) int {
-	jout, jerr := c.d.JournalText(ctx, now.Add(-6*time.Minute))
+	jout, jerr := c.d.JournalTextGrep(ctx, now.Add(-6*time.Minute), cacheErrRe.String())
 	if jerr != nil {
 		// Journal unreadable → inconclusive: keep the existing
 		// latch verdict instead of clearing it on "0 hits".
@@ -200,8 +200,11 @@ func (c *HubCheck) probeSelfAndPeerRV(ctx context.Context) rvProbe {
 	// still is not wedge evidence) or rv_now is unmeasurable.
 	if okC {
 		prev := c.d.ReadState(cdeps.FileLastRVC)
-		c.d.State.WriteEpochFile(filepath.Join(c.d.State.Dir, cdeps.FileLastRVC), p.rvC)
-		if p.gapKnown && prev == strconv.FormatInt(p.rvC, 10) && p.rvN > p.rvC {
+		cur := strconv.FormatInt(p.rvC, 10)
+		if prev != cur {
+			c.d.State.WriteEpochFileNoSync(filepath.Join(c.d.State.Dir, cdeps.FileLastRVC), p.rvC)
+		}
+		if p.gapKnown && prev == cur && p.rvN > p.rvC {
 			p.frn = c.d.State.Incr(cdeps.FileCtrFrozen)
 			if p.frn >= c.d.StreakCycles(c.d.Cfg.Sig13.FrozenCycles) {
 				p.frozen = true
@@ -220,7 +223,9 @@ func (c *HubCheck) probeSelfAndPeerRV(ctx context.Context) rvProbe {
 		if p.prvOK {
 			p.prv = strconv.FormatInt(p.prvRV, 10)
 			prevP := c.d.ReadState(cdeps.FileLastPRVC)
-			c.d.State.WriteEpochFile(filepath.Join(c.d.State.Dir, cdeps.FileLastPRVC), p.prvRV)
+			if prevP != p.prv {
+				c.d.State.WriteEpochFileNoSync(filepath.Join(c.d.State.Dir, cdeps.FileLastPRVC), p.prvRV)
+			}
 			if prevP != "" && prevP == p.prv && p.gapKnown && p.rvN > p.prvRV {
 				p.pfn = c.d.State.Incr(cdeps.FileCtrPeerFrozen)
 				if p.pfn >= c.d.StreakCycles(c.d.Cfg.Sig13.FrozenCycles) {

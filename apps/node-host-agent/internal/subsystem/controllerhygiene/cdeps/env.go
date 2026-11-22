@@ -3,6 +3,7 @@ package cdeps
 import (
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
@@ -68,12 +69,8 @@ func ConfigFromEnv(d EnvDeps) Config {
 			CGroupEventsFile: d.PathJoin("/sys/fs/cgroup/system.slice/" +
 				"k0scontroller.service/memory.events"),
 		},
-		// Admin* + Feeder paths are PathJoin()-derived — NOT the
-		// package defaults, which hardcode the "/host" prefix.
-		AdminKubeconfig: d.PathJoin("/var/lib/k0s/pki/admin.conf"),
-		AdminCert:       d.PathJoin("/var/lib/k0s/pki/admin.crt"),
-		AdminKey:        d.PathJoin("/var/lib/k0s/pki/admin.key"),
-		AdminCA:         d.PathJoin("/var/lib/k0s/pki/ca.crt"),
+		// Admin* paths derive from cfg.K0sDir below (post-envx) so
+		// NODE_HOST_AGENT_K0S_DIR overrides relocate admin.conf / PKI too.
 		// Same contract for the konnectivity UDS root and the kine
 		// cert dir — defaultK0sRunDir ("/host/run/k0s") and the
 		// applyPKIDriftDefaults prefix ("/host/etc/kine/pki") would
@@ -167,5 +164,9 @@ func ConfigFromEnv(d EnvDeps) Config {
 		envx.IntKnob(envnames.EnvTotalControllers, &cfg.TotalControllers, 0),
 		envx.StringKnob(envnames.EnvEtcdSnapshotDir, &cfg.EtcdSnapshotDir, ""),
 	})
+	cfg.AdminKubeconfig = filepath.Join(cfg.K0sDir, "pki", "admin.conf")
+	cfg.AdminCert = filepath.Join(cfg.K0sDir, "pki", "admin.crt")
+	cfg.AdminKey = filepath.Join(cfg.K0sDir, "pki", "admin.key")
+	cfg.AdminCA = filepath.Join(cfg.K0sDir, "pki", "ca.crt")
 	return cfg
 }

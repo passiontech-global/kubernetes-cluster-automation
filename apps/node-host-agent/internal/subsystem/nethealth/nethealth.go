@@ -114,6 +114,15 @@ type NetHealth struct {
 	// state live on it, per-instance like the rest of NetHealth.
 	neb *nebula.Deps
 
+	// fail2ban state cache: skip unchanged fail2ban-banned writes,
+	// skip redundant os.Remove when already known absent, and latch
+	// f2bBannedUnsupported when `fail2ban-client banned` errors while
+	// `fail2ban-client status` succeeds (Fail2Ban < 0.11).
+	f2bLastPath          string
+	f2bLastContent       string
+	f2bLastKnown         bool
+	f2bBannedUnsupported bool
+
 	cycles  *prometheus.CounterVec // check, result
 	actions *prometheus.CounterVec // check, action
 

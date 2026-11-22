@@ -149,14 +149,35 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// pinned to one corrupted image need a single rm, not one each.
 	seen := map[string]bool{}
 	execFmtRefs := map[string]bool{}
+	activeRefs := map[string]bool{}
 	if c.execFormatHealed == nil {
 		c.execFormatHealed = map[string]bool{}
 	}
 	for i := range e.Pods {
 		p := &e.Pods[i]
+		for j := range p.Spec.InitContainers {
+			if img := p.Spec.InitContainers[j].Image; img != "" {
+				activeRefs[NormalizeCRIImageName(img)] = true
+			}
+		}
+		for j := range p.Spec.Containers {
+			if img := p.Spec.Containers[j].Image; img != "" {
+				activeRefs[NormalizeCRIImageName(img)] = true
+			}
+		}
+		for j := range p.Spec.EphemeralContainers {
+			if img := p.Spec.EphemeralContainers[j].Image; img != "" {
+				activeRefs[NormalizeCRIImageName(img)] = true
+			}
+		}
 		statuses := slices.Concat(p.Status.InitContainerStatuses,
 			p.Status.ContainerStatuses, p.Status.EphemeralContainerStatuses)
 		for _, cs := range statuses {
+			for _, spec := range []string{cs.Image, cs.ImageID} {
+				if spec != "" {
+					activeRefs[NormalizeCRIImageName(spec)] = true
+				}
+			}
 			w := cs.State.Waiting
 			if w == nil || !corruptImageWaitingReason(w.Reason) ||
 				!corruptImageRe.MatchString(w.Message) {
@@ -182,6 +203,13 @@ func (c *CtrImagesCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				}
 				seen[ref] = true
 			}
+		}
+	}
+	// Prune execFormatHealed entries for images no longer referenced by any
+	// pod on this node so deleted pods do not leak entries indefinitely.
+	for ref := range c.execFormatHealed {
+		if !activeRefs[ref] {
+			delete(c.execFormatHealed, ref)
 		}
 	}
 	if len(seen) == 0 {

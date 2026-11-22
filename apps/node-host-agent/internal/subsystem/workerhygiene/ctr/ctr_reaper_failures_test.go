@@ -76,6 +76,7 @@ func TestCtrTasksOrphanShimKillFailureLogged(t *testing.T) {
 	e.MkProc(t, 9350, "S",
 		"containerd-shim-runc-v2\x00-id\x00"+sid+
 			"\x00-namespace\x00k8s.io\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9350)
 	old := e.Now.Add(-10 * time.Minute)
 	if err := os.Chtimes(filepath.Join(e.ProcDir, "9350"), old, old); err != nil {
 		t.Fatal(err)
@@ -106,6 +107,7 @@ func TestCtrTasksOrphanShimDStateEscalates(t *testing.T) {
 	e.MkProc(t, 9360, "D",
 		"containerd-shim-runc-v2\x00-id\x00"+sid+
 			"\x00-namespace\x00k8s.io\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9360)
 	// D-state cmdline is unreadable (mm->mmap_lock) — the fd
 	// table carries the task-dir evidence for the orphan check.
 	fdDir := filepath.Join(e.ProcDir, "9360", "fd")
@@ -265,6 +267,7 @@ func TestCtrTasksShimKillCap(t *testing.T) {
 		e.MkProc(t, pid, "S",
 			"containerd-shim-runc-v2\x00-id\x00"+sid+
 				"\x00-namespace\x00k8s.io\x00-address\x00/run/k0s/containerd.sock\x00", "")
+		seedHostRootShim(t, e, pid)
 		if err := os.Chtimes(filepath.Join(e.ProcDir, strconv.Itoa(pid)), old, old); err != nil {
 			t.Fatal(err)
 		}
@@ -286,6 +289,7 @@ func TestCtrTasksLeftoverHolderKilled(t *testing.T) {
 	e.MkProc(t, 9399, "S",
 		"containerd-shim-runc-v2\x00-id\x00"+id+
 			"\x00-namespace\x00k8s.io\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9399)
 	e.H.Cycle(context.Background()) // marker
 	e.Now = e.Now.Add(6 * time.Minute)
 	e.H.Cycle(context.Background()) // confirm → kill holder + rm

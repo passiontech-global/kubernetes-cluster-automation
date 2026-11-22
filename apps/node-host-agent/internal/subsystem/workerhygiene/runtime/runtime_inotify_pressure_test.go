@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
 )
@@ -730,5 +731,62 @@ func TestInotifyColdSharedFDCacheProcChmod0111ImmediateRecovery(t *testing.T) {
 	chk.Run(context.Background(), &wdeps.CycleEnv{WorkerActive: true, APIOK: true})
 	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "ok")); got != 1 {
 		t.Fatalf("ok cycles=%v want 1 at +10s recovery (pinned in abort by negative FDCache?)", got)
+	}
+}
+
+func TestInotifyUsesSharedFDCacheWithoutPerPIDFDAndFDInfoLoops(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 0000 does not block root")
+	}
+	e := fixture(t)
+	e.H.Cfg.Pressure.InotifyMaxInstancesCeiling = 100
+	e.H.Cfg.Pressure.InotifyEvictRunawayPod = false
+	writeInotifySysctls(t, e, 100, 8192)
+	mkInotifyPID(t, e, 100, 5, 2, "")
+
+	// Warm SharedFDCache with a clean, complete snapshot (ProcOK && !Partial).
+	snap := procfs.SharedFDCache(e.ProcDir, func() time.Time { return e.Now }).Snapshot(60 * time.Second)
+	if snap == nil || !snap.ProcOK || snap.Partial {
+		t.Fatalf("failed to warm clean SharedFDCache: %+v", snap)
+	}
+
+	// Make PID 100's fdinfo unreadable and add PID 200 with unreadable fd dir:
+	// while using the valid cached snapshot within TTL, InotifyPressureCheck
+	// must NOT re-open /proc/<pid>/fd or fdinfo/<fd>.
+	fdinfo1 := filepath.Join(e.ProcDir, "100", "fdinfo", "1")
+	if err := os.Chmod(fdinfo1, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(fdinfo1, 0o644) })
+	fd200 := filepath.Join(e.ProcDir, "200", "fd")
+	if err := os.MkdirAll(fd200, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(fd200, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(fd200, 0o755) })
+
+	chk := e.H.Check(wdeps.CheckInotifyHygiene)
+	ce := &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		PidsOnce:     wdepstest.PidsOf(100, 200),
+		PidsOK:       func() bool { return true },
+	}
+	chk.Run(context.Background(), ce)
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "ok")); got != 1 {
+		t.Fatalf("ok=%v want 1 (cached SharedFDCache snapshot should avoid redundant fd/fdinfo syscalls)", got)
+	}
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "abort")); got != 0 {
+		t.Fatalf("abort=%v want 0", got)
+	}
+
+	// When LatchInotifyPressure is armed and maxRatio < inotifyLatchRatio,
+	// forceDirect verification (:165) must still run and abort on unreadable fd/.
+	e.H.State.Enter("inotify-pressure", "armed")
+	chk.Run(context.Background(), ce)
+	if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckInotifyHygiene, "abort")); got != 1 {
+		t.Fatalf("abort=%v want 1 on forceDirect check before clearing armed latch", got)
 	}
 }

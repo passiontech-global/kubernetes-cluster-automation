@@ -5,8 +5,11 @@ package apiserver_test
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -485,5 +488,97 @@ func TestDeadFallbackDryRunRespectsExistingCooldown(t *testing.T) {
 	}
 	if !strings.Contains(e.LogLines(), "in restart cooldown") {
 		t.Fatalf("expected cooldown skip log:\n%s", e.LogLines())
+	}
+}
+
+func TestHubCheckUsesJournalTextGrep(t *testing.T) {
+	e := fixture(t)
+	var journalArgv []string
+	origExec := e.H.Cfg.HostExecFn
+	e.H.Cfg.HostExecFn = func(ctx context.Context, combined bool, timeout time.Duration,
+		name string, args ...string) (string, error) {
+		if name == "journalctl" && len(args) > 0 && args[0] == "-u" {
+			journalArgv = append([]string{name}, args...)
+		}
+		return origExec(ctx, combined, timeout, name, args...)
+	}
+	var b strings.Builder
+	for range 15 {
+		b.WriteString("Cache consistency check error on /registry/x\n")
+	}
+	e.Journal = b.String()
+	cdepstest.Check[*apiserver.HubCheck](e.H, cdeps.CheckHub).
+		Run(context.Background())
+
+	if !slices.Contains(journalArgv, "-u") ||
+		!slices.Contains(journalArgv, "--since") ||
+		!slices.Contains(journalArgv, "--no-pager") {
+		t.Fatalf("journalctl argv missing expected flags: %v", journalArgv)
+	}
+	hasGrep := false
+	for _, a := range journalArgv {
+		if strings.HasPrefix(a, "--grep=") && strings.Contains(a, "Cache consistency check error") {
+			hasGrep = true
+			break
+		}
+	}
+	if !hasGrep {
+		t.Fatalf("journalctl argv missing --grep=<cacheErrRe>: %v", journalArgv)
+	}
+	if !e.HasState(cdeps.StateCacheStale) {
+		t.Fatal("apiserver-cache-stale not latched when matching lines returned")
+	}
+}
+
+func TestHubCheckLastRVCWritesAndSkipsUnchanged(t *testing.T) {
+	e := fixture(t)
+	self := "127.0.0.1:6443"
+	peer := "10.0.0.2:6443"
+	e.SetRV(self, false, 20000, true)
+	e.SetRV(self, true, 5000, true)
+	e.SetRV(peer, true, 19900, true)
+
+	e.H.Cycle(context.Background())
+
+	rvcPath := filepath.Join(e.State, cdeps.FileLastRVC)
+	prvcPath := filepath.Join(e.State, cdeps.FileLastPRVC)
+	if got := e.H.ReadState(cdeps.FileLastRVC); got != "5000" {
+		t.Fatalf("last-rvc=%q want 5000", got)
+	}
+	if got := e.H.ReadState(cdeps.FileLastPRVC); got != "19900" {
+		t.Fatalf("last-prvc=%q want 19900", got)
+	}
+	fiR1, err := os.Stat(rvcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fiP1, err := os.Stat(prvcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inoR1 := fiR1.Sys().(*syscall.Stat_t).Ino
+	inoP1 := fiP1.Sys().(*syscall.Stat_t).Ino
+
+	// Cycle 2 with unchanged rv_cache and peer rv_cache (rv_now advances):
+	// frozen detection still advances while unchanged last-rvc/last-prvc skip rewrites.
+	e.SetRV(self, false, 20100, true)
+	e.H.Cycle(context.Background())
+
+	fiR2, err := os.Stat(rvcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fiP2, err := os.Stat(prvcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inoR2 := fiR2.Sys().(*syscall.Stat_t).Ino; inoR2 != inoR1 {
+		t.Fatalf("last-rvc rewritten despite unchanged rv_cache: inode %d -> %d", inoR1, inoR2)
+	}
+	if inoP2 := fiP2.Sys().(*syscall.Stat_t).Ino; inoP2 != inoP1 {
+		t.Fatalf("last-prvc rewritten despite unchanged peer rv_cache: inode %d -> %d", inoP1, inoP2)
+	}
+	if !e.HasState(cdeps.StateCacheWedged) {
+		t.Fatal("frozen wedge detection failed when last-rvc rewrite skipped")
 	}
 }

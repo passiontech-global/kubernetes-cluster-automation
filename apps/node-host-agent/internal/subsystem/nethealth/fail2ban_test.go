@@ -6,7 +6,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
@@ -211,5 +213,158 @@ func TestFail2banNoJailsRemovesMetricFile(t *testing.T) {
 	e.n.Cycle(context.Background())
 	if _, err := os.Stat(banned); !os.IsNotExist(err) {
 		t.Fatal("banned file kept with no jails")
+	}
+}
+
+func TestParseFail2banBannedFormats(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		want   []string
+		wantOK bool
+	}{
+		{"python repr multi", "[{'sshd': ['192.0.2.1', '192.0.2.2']}, {'recidive': []}]\n", []string{"sshd=2", "recidive=0"}, true},
+		{"json double quoted", `[{"sshd": ["192.0.2.1"]}, {"nginx-http-auth": ["198.51.100.1", "2001:db8::1"]}]`, []string{"sshd=1", "nginx-http-auth=2"}, true},
+		{"empty list", "[]\n", nil, true},
+		{"multi keys in one dict", `[{"sshd": ["1.1.1.1"], "recidive": []}]`, []string{"sshd=1", "recidive=0"}, true},
+		{"escaped quote in jail", `[{'a\'b': ['1.1.1.1']}]`, []string{"a'b=1"}, true},
+		{"empty string", "", nil, false},
+		{"unparseable text", "Status\n`- Jail list:\tsshd\n", nil, false},
+		{"truncated", "[{'sshd': ['1.2.3.4'", nil, false},
+		{"trailing junk", "[] junk", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseFail2banBanned(tc.in)
+			if ok != tc.wantOK || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("parseFail2banBanned(%q) = (%v, %v) want (%v, %v)",
+					tc.in, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestFail2banCoalescedBannedCommand(t *testing.T) {
+	e := fixture(t, nil)
+	e.sd.On("LoadState --value fail2ban.service", "loaded\n")
+	e.sd.On("is-active fail2ban.service", "active\n")
+	e.host.On("fail2ban-client banned",
+		"[{'sshd': ['192.0.2.1', '192.0.2.2']}, {'recidive': []}]\n")
+
+	e.n.Cycle(context.Background())
+
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned")); got != "sshd=2 recidive=0" {
+		t.Fatalf("banned=%q want %q", got, "sshd=2 recidive=0")
+	}
+	var f2bCmds []string
+	for _, c := range e.host.Cmds() {
+		j := strings.Join(c, " ")
+		if strings.Contains(j, "fail2ban-client") {
+			f2bCmds = append(f2bCmds, j)
+		}
+	}
+	if len(f2bCmds) != 1 || !strings.Contains(f2bCmds[0], "fail2ban-client banned") {
+		t.Fatalf("expected 1 fail2ban-client banned fork, got %v", f2bCmds)
+	}
+
+	// Empty list `[]` removes pre-existing fail2ban-banned file.
+	e.host.On("fail2ban-client banned", "[]\n")
+	e.n.Cycle(context.Background())
+	if _, err := os.Stat(filepath.Join(e.state, "fail2ban-banned")); !os.IsNotExist(err) {
+		t.Fatal("fail2ban-banned kept after empty banned list")
+	}
+}
+
+func TestFail2banBannedFallbackAndLatchUnsupported(t *testing.T) {
+	// Case 1: `banned` fails while `status` succeeds -> fallback + latch unsupported.
+	e := fixture(t, nil)
+	e.sd.On("LoadState --value fail2ban.service", "loaded\n")
+	e.sd.On("is-active fail2ban.service", "active\n")
+	e.host.FailOn("fail2ban-client banned", errCmdFail)
+	e.host.On("fail2ban-client status", "Status\n`- Jail list:\tsshd\n")
+	e.host.On("fail2ban-client status sshd", "Currently banned:\t4\n")
+
+	e.n.Cycle(context.Background())
+	if got := fsx.ReadTrimmed(filepath.Join(e.state, "fail2ban-banned")); got != "sshd=4" {
+		t.Fatalf("fallback banned=%q want sshd=4", got)
+	}
+	if !e.n.f2bBannedUnsupported {
+		t.Fatal("f2bBannedUnsupported not latched after banned error + status success")
+	}
+
+	// Subsequent cycle skips `fail2ban-client banned`.
+	e.host.ClearLog()
+	e.n.Cycle(context.Background())
+	if e.host.Ran("fail2ban-client banned") {
+		t.Fatalf("fail2ban-client banned still forked after unsupported latch: %v", e.host.Cmds())
+	}
+
+	// Case 2: transient failure (both banned and status fail) does NOT latch unsupported.
+	e2 := fixture(t, nil)
+	e2.sd.On("LoadState --value fail2ban.service", "loaded\n")
+	e2.sd.On("is-active fail2ban.service", "active\n")
+	e2.host.FailOn("fail2ban-client", errCmdFail)
+	e2.n.Cycle(context.Background())
+	if e2.n.f2bBannedUnsupported {
+		t.Fatal("f2bBannedUnsupported latched on transient failure when status also failed")
+	}
+	// Once daemon recovers, `banned` succeeds cleanly.
+	e2.host.Clear("fail2ban-client")
+	e2.host.On("fail2ban-client banned", "[{'sshd': ['192.0.2.9']}]\n")
+	e2.n.Cycle(context.Background())
+	if got := fsx.ReadTrimmed(filepath.Join(e2.state, "fail2ban-banned")); got != "sshd=1" {
+		t.Fatalf("recovered banned=%q want sshd=1", got)
+	}
+}
+
+func TestFail2banSkipsUnchangedWriteAndRemove(t *testing.T) {
+	e := fixture(t, nil)
+	e.sd.On("LoadState --value fail2ban.service", "loaded\n")
+	e.sd.On("is-active fail2ban.service", "active\n")
+	e.host.On("fail2ban-client banned", "[{'sshd': ['192.0.2.1', '192.0.2.2']}]\n")
+
+	banned := filepath.Join(e.state, "fail2ban-banned")
+	e.n.Cycle(context.Background())
+	fi1, err := os.Stat(banned)
+	if err != nil {
+		t.Fatalf("stat cycle 1: %v", err)
+	}
+	ino1 := fi1.Sys().(*syscall.Stat_t).Ino
+
+	// Cycle 2 with identical content skips atomic rewrite (inode unchanged).
+	e.n.Cycle(context.Background())
+	fi2, err := os.Stat(banned)
+	if err != nil {
+		t.Fatalf("stat cycle 2: %v", err)
+	}
+	if ino2 := fi2.Sys().(*syscall.Stat_t).Ino; ino2 != ino1 {
+		t.Fatalf("unchanged content rewrote file: inode %d -> %d", ino1, ino2)
+	}
+
+	// External deletion between cycles is detected by os.Stat and recreates file.
+	if err := os.Remove(banned); err != nil {
+		t.Fatal(err)
+	}
+	e.n.Cycle(context.Background())
+	if got := fsx.ReadTrimmed(banned); got != "sshd=2" {
+		t.Fatalf("deleted file not recreated: got=%q", got)
+	}
+
+	// Transition to empty jails removes file and caches absent state.
+	e.host.On("fail2ban-client banned", "[]\n")
+	e.n.Cycle(context.Background())
+	if _, err := os.Stat(banned); !os.IsNotExist(err) {
+		t.Fatal("fail2ban-banned not removed on empty jails")
+	}
+	if !e.n.f2bLastKnown || e.n.f2bLastContent != "" {
+		t.Fatalf("absent cache not recorded: known=%v content=%q",
+			e.n.f2bLastKnown, e.n.f2bLastContent)
+	}
+	// Because removeFail2banBanned skips os.Remove when known absent, a
+	// file planted only to probe whether os.Remove runs stays untouched.
+	testutil.WriteFile(t, banned, "sentinel\n")
+	e.n.Cycle(context.Background())
+	if got := fsx.ReadTrimmed(banned); got != "sentinel" {
+		t.Fatalf("expected redundant os.Remove to be skipped, got=%q", got)
 	}
 }

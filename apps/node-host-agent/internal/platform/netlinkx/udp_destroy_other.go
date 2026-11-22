@@ -8,9 +8,19 @@ func DumpConnectedUDP(int) ([]ConnectedUDPSocket, error) {
 	return nil, errNotLinux
 }
 
+// DumpConnectedAndBoundUDP refuses off Linux.
+func DumpConnectedAndBoundUDP(int) ([]ConnectedUDPSocket, map[uint16]bool, error) {
+	return nil, nil, errNotLinux
+}
+
 // DestroyUDPSocket refuses off Linux. destroyed is always false.
 func DestroyUDPSocket(int, uint8, [48]byte) (bool, error) {
 	return false, errNotLinux
+}
+
+// DestroyUDPSockets refuses off Linux.
+func DestroyUDPSockets(int, []UDPSocketTarget) ([]UDPDestroyResult, error) {
+	return nil, errNotLinux
 }
 
 // UDPBoundPorts refuses off Linux.

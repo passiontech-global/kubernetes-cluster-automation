@@ -68,6 +68,10 @@ func (c *SubprocOOMCheck) Name() string { return wdeps.CheckSubprocOOM }
 // the same way; its pid1 is pause, which the same logic covers).
 func containerScopeDirsChecked(podDir string) ([]string, error) {
 	entries, err := os.ReadDir(podDir)
+	return containerScopeDirsFromEntries(podDir, entries, err)
+}
+
+func containerScopeDirsFromEntries(podDir string, entries []os.DirEntry, err error) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +153,33 @@ func oomMemStatMiB(scopeDir string) string {
 		mib("anon"), mib("shmem"), mib("file"))
 }
 
+// readSubprocOOMEvents reads memory.events once and extracts oom_kill
+// and oom_group_kill counters. A non-ENOENT read error reports readErr=true.
+func readSubprocOOMEvents(path string) (kill int64, hasKill bool, groupKill int64, readErr bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false, 0, !os.IsNotExist(err)
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		switch f[0] {
+		case "oom_kill":
+			if v, perr := strconv.ParseInt(f[1], 10, 64); perr == nil {
+				kill = v
+				hasKill = true
+			}
+		case "oom_group_kill":
+			if v, perr := strconv.ParseInt(f[1], 10, 64); perr == nil {
+				groupKill = v
+			}
+		}
+	}
+	return kill, hasKill, groupKill, false
+}
+
 // Run executes one subproc-oom round.
 func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckSubprocOOM) {
@@ -161,13 +192,21 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckSubprocOOM, "abort")
 		return
 	}
-	dirs, err := podSliceDirsChecked(kubepods)
-	if err != nil {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"suspect: subproc-oom read %s failed: %v — inconclusive, keeping state",
-			kubepods, err))
-		c.d.CycleResult(wdeps.CheckSubprocOOM, "abort")
-		return
+	var dirs []string
+	var dirEnts map[string]cachedDirRead
+	if cached, ok := takePodSliceCache(c.d, kubepods); ok {
+		dirs = cached.dirs
+		dirEnts = cached.dirEnts
+	} else {
+		var err error
+		dirs, err = podSliceDirsChecked(kubepods)
+		if err != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: subproc-oom read %s failed: %v — inconclusive, keeping state",
+				kubepods, err))
+			c.d.CycleResult(wdeps.CheckSubprocOOM, "abort")
+			return
+		}
 	}
 	if c.scopes == nil {
 		c.scopes = map[string]*oomScope{}
@@ -179,7 +218,17 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	hadReadErr := false
 	for _, podDir := range dirs {
 		uid := podUIDFromSlice(podDir)
-		scopes, serr := containerScopeDirsChecked(podDir)
+		var scopes []string
+		var serr error
+		if dirEnts != nil {
+			if cachedDir, ok := dirEnts[podDir]; ok {
+				scopes, serr = containerScopeDirsFromEntries(podDir, cachedDir.ents, cachedDir.err)
+			} else {
+				scopes, serr = containerScopeDirsChecked(podDir)
+			}
+		} else {
+			scopes, serr = containerScopeDirsChecked(podDir)
+		}
 		if serr != nil {
 			if !os.IsNotExist(serr) {
 				unreadablePods = append(unreadablePods, podDir)
@@ -190,17 +239,13 @@ func (c *SubprocOOMCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		for _, scope := range scopes {
 			seen[scope] = true
 			evPath := filepath.Join(scope, "memory.events")
-			kill, ok := cgroupEventsValue(evPath, "oom_kill")
+			kill, ok, groupKill, evErr := readSubprocOOMEvents(evPath)
 			if !ok {
-				if _, err := os.ReadFile(evPath); err != nil && !os.IsNotExist(err) {
+				if evErr {
 					hadReadErr = true
 				}
 				continue
 			}
-			// oom_group_kill rides the same file — a missing key
-			// (pre-5.x kernels, partial cgroupfs) just yields 0 and
-			// the group-kill half stays silent.
-			groupKill, _ := cgroupEventsValue(evPath, "oom_group_kill")
 			pid1, pidOK, pidErr := cgroupInitPIDChecked(scope)
 			if pidErr {
 				hadReadErr = true

@@ -29,12 +29,8 @@
 package runtime
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -380,27 +376,6 @@ func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv, instLimit, watchLi
 			return inotifyScan{}, false, false
 		}
 	}
-	if len(pids) > 0 {
-		// SharedFDCache / ScanFDs skips EACCES/ENOTDIR on /proc/<pid>/fd
-		// while still setting ProcOK=true. Inspect ALL pids so a single
-		// readable /proc/1/fd cannot mask EACCES/ENOTDIR on another PID's
-		// /proc/<pid>/fd (still ignoring ENOENT for exited PIDs).
-		for _, pid := range pids {
-			fdDir := c.d.Proc.File(pid, "fd")
-			f, err := os.Open(fdDir)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					return inotifyScan{}, false, false
-				}
-				continue
-			}
-			_, rerr := f.Readdirnames(1)
-			_ = f.Close()
-			if rerr != nil && !errors.Is(rerr, io.EOF) && !os.IsNotExist(rerr) {
-				return inotifyScan{}, false, false
-			}
-		}
-	}
 
 	var allowed map[int]bool
 	if e != nil && e.PidsOnce != nil {
@@ -433,32 +408,7 @@ func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv, instLimit, watchLi
 		if allowed != nil && !allowed[entry.PID] {
 			continue
 		}
-		// When serving a cached SharedFDCache snapshot within inotifyFDTTL,
-		// verify fdinfo/<fd> readability and refresh Watches==0 entries so
-		// transient fdinfo changes within the TTL window are observed.
-		// Direct ScanFDs(pids) walks (!usedCache) already read every
-		// fdinfo/<fd> to EOF and set snap.Partial on any read error.
 		watches := entry.Watches
-		if usedCache {
-			fdinfoPath := c.d.Proc.File(entry.PID, "fdinfo", strconv.Itoa(entry.FD))
-			if f, err := os.Open(fdinfoPath); err != nil {
-				if !os.IsNotExist(err) {
-					return inotifyScan{}, false, false
-				}
-			} else {
-				var rerr error
-				if watches == 0 {
-					watches, rerr = countInotifyWatchesFromFile(f)
-				} else {
-					var b [1]byte
-					_, rerr = f.Read(b[:])
-				}
-				_ = f.Close()
-				if rerr != nil && !errors.Is(rerr, io.EOF) && !os.IsNotExist(rerr) {
-					return inotifyScan{}, false, false
-				}
-			}
-		}
 		meta, seenMeta := metaByPID[entry.PID]
 		if !seenMeta {
 			ruid, _ := procRealUID(c.d, entry.PID) // -1 bucket on unreadable
@@ -554,31 +504,6 @@ func (c *InotifyPressureCheck) scanInotify(e *wdeps.CycleEnv, instLimit, watchLi
 		}
 	}
 	return scan, usedCache, true
-}
-
-func countInotifyWatchesFromFile(f *os.File) (int64, error) {
-	const maxFDInfoBytes = 64 << 20
-	wdPrefix := []byte("inotify wd:")
-	br := bufio.NewReaderSize(io.LimitReader(f, maxFDInfoBytes), 4096)
-	var count int64
-	atLineStart := true
-	for {
-		line, err := br.ReadSlice('\n')
-		if atLineStart && bytes.HasPrefix(line, wdPrefix) {
-			count++
-		}
-		if err == bufio.ErrBufferFull {
-			atLineStart = false
-			continue
-		}
-		atLineStart = true
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return count, nil
-			}
-			return count, err
-		}
-	}
 }
 
 func ruidNeedsKCMP(tot inotifyTotals, instLimit, watchLimit int64) bool {

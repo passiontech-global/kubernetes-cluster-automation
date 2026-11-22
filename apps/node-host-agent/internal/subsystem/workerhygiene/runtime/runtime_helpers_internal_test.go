@@ -134,6 +134,32 @@ func TestSubprocOOMParsers(t *testing.T) {
 	if got := oomMemStatMiB(scope); got != "anon=2MiB shmem=1MiB file=0MiB" {
 		t.Fatalf("oomMemStatMiB=%q want rounded breakdown", got)
 	}
+
+	// readSubprocOOMEvents: single-pass parse for oom_kill + oom_group_kill.
+	evPath := filepath.Join(scope, "memory.events")
+	if _, hasKill, _, readErr := readSubprocOOMEvents(evPath); hasKill || readErr {
+		t.Fatalf("missing memory.events: hasKill=%v readErr=%v, want false,false", hasKill, readErr)
+	}
+	wdepstest.WriteFile(t, evPath, "low 0\nhigh 3\noom_kill 5\noom_group_kill 2\n")
+	kill, hasKill, groupKill, readErr := readSubprocOOMEvents(evPath)
+	if !hasKill || readErr || kill != 5 || groupKill != 2 {
+		t.Fatalf("readSubprocOOMEvents=(%d,%v,%d,%v) want (5,true,2,false)", kill, hasKill, groupKill, readErr)
+	}
+	wdepstest.WriteFile(t, evPath, "oom_group_kill 7\n")
+	_, hasKill, _, readErr = readSubprocOOMEvents(evPath)
+	if hasKill || readErr {
+		t.Fatalf("missing oom_kill: hasKill=%v readErr=%v, want false,false", hasKill, readErr)
+	}
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(evPath, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(evPath, 0o644) })
+		_, hasKill, _, readErr = readSubprocOOMEvents(evPath)
+		if hasKill || !readErr {
+			t.Fatalf("unreadable memory.events: hasKill=%v readErr=%v, want false,true", hasKill, readErr)
+		}
+	}
 }
 
 // --- runtime_cgroup_throttle.go parsers ---

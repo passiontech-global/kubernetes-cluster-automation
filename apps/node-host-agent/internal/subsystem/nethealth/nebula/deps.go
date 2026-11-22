@@ -11,6 +11,7 @@ package nebula
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -71,6 +72,14 @@ type Deps struct {
 	// mtu_blackhole.go) — per-instance, so its lifetime is the
 	// parent NetHealth's own and no global keyed map is needed.
 	MTU MTUProbeState
+
+	// aliveMu guards alivePeers/aliveAt — cached alive overlay peers
+	// populated by ProbeNebulaOverlay and consumed by
+	// CheckNebulaMTUBlackhole to skip redundant small-ping forks on
+	// healthy DF probes.
+	aliveMu    sync.Mutex
+	alivePeers []string
+	aliveAt    time.Time
 
 	// Config values — closures over the parent Config so post-New
 	// edits (tests assign cfg.Watchdog, cfg.Systemd, ...) stay live.

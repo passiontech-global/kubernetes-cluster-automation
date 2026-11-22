@@ -49,6 +49,7 @@ func (h *Hygiene) initChecks() {
 	h.checks = append(h.checks, storage, kubecert)
 	add(apiserver.NewFreeze(h.Deps, storage, kubecert), &ungated)
 	add(pki.NewDrift(h.Deps), &ungated)
+	add(apiserver.NewKMSv2(h.Deps), &ungated)
 
 	// Group 2 — WD_REQUIRES: uptime unit:k0scontroller — the
 	// 20min post-boot grace before the destructive wedge/TTL

@@ -56,6 +56,10 @@ func (c *cyc) etcdctlInstallBinary() {
 		c.err("etcdctl: missing etcdctl_version+etcdctl_tgz_{url,sha256} pins — not converging")
 		return
 	}
+	if !validStagedBasename(tgz) {
+		c.err("etcdctl: unsafe tgz filename — refusing install", "file", tgz)
+		return
+	}
 	bin := "/var/lib/k0s/bin/etcdctl"
 	c.installManagedBinary(managedBinarySpec{
 		name:     "etcdctl",
@@ -64,9 +68,10 @@ func (c *cyc) etcdctlInstallBinary() {
 			out, err := c.r.run(c.ctx, bin, "version")
 			return err == nil && strings.Contains(out, ver)
 		},
-		url:    url,
-		sum:    sum,
-		staged: filepath.Join(c.r.cfg.DownloadDir, tgz),
+		url:            url,
+		sum:            sum,
+		staged:         filepath.Join(c.r.downloadDir(), tgz),
+		stagingDirMode: 0o700,
 		// same contract as T5b/T9: verify the STAGED file every run —
 		// a corrupted/operator-swapped tarball must not install.
 		refuseBadStaged: true,

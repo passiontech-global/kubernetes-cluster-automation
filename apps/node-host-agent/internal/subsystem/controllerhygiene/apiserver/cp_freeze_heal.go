@@ -223,16 +223,16 @@ func (c *FreezeCheck) loadKCMSnapshot() *KCMQueueSnapshot {
 }
 
 // saveKCMSnapshot persists the scrape atomically — the
-// fsx.WriteFileAtomic contract (a torn JSON just reads as
-// "no baseline" next cycle; the shared primitive adds the payload
-// fsync + dir sync the hand-rolled tmp+rename lacked).
+// fsx.WriteFileAtomicNoSync contract (ephemeral per-cycle snapshot
+// rewritten next cycle; tmp+rename prevents torn reads without
+// per-cycle fsync/dirsync).
 func (c *FreezeCheck) saveKCMSnapshot(s *KCMQueueSnapshot) {
 	b, err := json.Marshal(s)
 	if err != nil {
 		return
 	}
 	path := filepath.Join(c.d.State.Dir, cdeps.FileKCMQueueSnap)
-	if err := fsx.WriteFileAtomicBytes(path, b); err != nil {
+	if err := fsx.WriteFileAtomicNoSync(path, string(b)); err != nil {
 		c.d.State.AppendLogWarn(fmt.Sprintf(
 			"kcm snapshot write failed path=%s error=%v", path, err))
 	}

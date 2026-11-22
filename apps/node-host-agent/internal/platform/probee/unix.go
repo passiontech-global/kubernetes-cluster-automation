@@ -10,26 +10,58 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
+	"sync"
 	"time"
 )
 
-// UnixGet GETs path over the unix socket and returns the body — the
-// cilium-agent API contract (a non-200 means the endpoint verdict is
-// unreadable, not "zero"). The transport is built per call with
-// DisableKeepAlives on purpose: a kept-alive unix conn would pin the
-// transport readLoop/writeLoop goroutines for IdleConnTimeout, and
-// with keep-alives off the conn closes on Body.Close. 4MiB cap.
-//
-// Mirrors workerhygiene's unixGet seam default.
-func UnixGet(ctx context.Context, socket, path string) ([]byte, error) {
+const maxUnixClients = 64
+
+var (
+	unixClientsMu sync.Mutex
+	unixClients   = map[string]*http.Client{}
+)
+
+// unixClient returns a pooled keep-alive *http.Client bound exclusively to
+// filepath.Clean(socket) so repeated UnixGet/UnixDelete probes to the same
+// socket reuse persistent connections while distinct sockets stay isolated.
+func unixClient(socket string) *http.Client {
+	key := filepath.Clean(socket)
+	unixClientsMu.Lock()
+	defer unixClientsMu.Unlock()
+	if cl, ok := unixClients[key]; ok {
+		return cl
+	}
+	if len(unixClients) >= maxUnixClients {
+		for k, old := range unixClients {
+			old.CloseIdleConnections()
+			delete(unixClients, k)
+			break
+		}
+	}
 	tr := &http.Transport{
-		DisableKeepAlives: true,
+		MaxIdleConns:        4,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
 		DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(dctx, "unix", socket)
+			return d.DialContext(dctx, "unix", key)
 		},
 	}
 	cl := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	unixClients[key] = cl
+	return cl
+}
+
+// UnixGet GETs path over the unix socket and returns the body — the
+// cilium-agent API contract (a non-200 means the endpoint verdict is
+// unreadable, not "zero"). Uses a socket-keyed pooled keep-alive
+// transport (90s IdleConnTimeout) so repeated per-cycle probes reuse
+// one connection. 4MiB cap.
+//
+// Mirrors workerhygiene's unixGet seam default.
+func UnixGet(ctx context.Context, socket, path string) ([]byte, error) {
+	cl := unixClient(socket)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		"http://localhost"+path, nil)
 	if err != nil {
@@ -59,9 +91,8 @@ func UnixGet(ctx context.Context, socket, path string) ([]byte, error) {
 }
 
 // UnixDelete sends HTTP DELETE for path over the unix socket (e.g.
-// Cilium's DELETE /v1/endpoint/{id}). Mirrors UnixGet's per-call
-// DisableKeepAlives transport and timeouts so unix connections never
-// linger in idle pools.
+// Cilium's DELETE /v1/endpoint/{id}), sharing UnixGet's socket-keyed
+// pooled keep-alive transport.
 //
 // Cilium's DELETE /v1/endpoint/{id} returns:
 //   - 200 OK / 204 No Content: endpoint deleted cleanly.
@@ -73,14 +104,7 @@ func UnixGet(ctx context.Context, socket, path string) ([]byte, error) {
 // All four statuses return nil; any other status fails closed with an
 // error.
 func UnixDelete(ctx context.Context, socket, path string) error {
-	tr := &http.Transport{
-		DisableKeepAlives: true,
-		DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(dctx, "unix", socket)
-		},
-	}
-	cl := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	cl := unixClient(socket)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
 		"http://localhost"+path, nil)
 	if err != nil {

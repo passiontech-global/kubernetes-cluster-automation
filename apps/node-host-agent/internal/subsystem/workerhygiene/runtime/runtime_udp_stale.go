@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -76,6 +77,20 @@ type UDPStaleCheck struct {
 	// candidate scan while alive, so its ip:port would otherwise never
 	// enter everSeenUDP and a later blackhole could not be recognised.
 	everSeenSeeded bool
+
+	// Internal batch seams used when wdeps host seams match the unstubbed
+	// netlinkx package functions (overridable in internal package tests).
+	dumpCombinedFn func(pid int) ([]netlinkx.ConnectedUDPSocket, map[uint16]bool, error)
+	destroyBatchFn func(pid int, targets []netlinkx.UDPSocketTarget) ([]netlinkx.UDPDestroyResult, error)
+}
+
+func sameFuncPtr(a, b any) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	return va.Kind() == reflect.Func && vb.Kind() == reflect.Func &&
+		!va.IsNil() && !vb.IsNil() && va.Pointer() == vb.Pointer()
 }
 
 // ipPort is the destination identity a Socket points at. A port being
@@ -323,9 +338,28 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 
 	var rawCandidates []udpCandidate
+	boundByPID := map[int]map[uint16]bool{}
+	boundOK := map[int]bool{}
+	combinedDump := sameFuncPtr(c.d.Cfg.Seams.Host.DumpConnectedUDPFn, netlinkx.DumpConnectedUDP) &&
+		sameFuncPtr(c.d.Cfg.Seams.Host.UDPBoundPortsFn, netlinkx.UDPBoundPorts)
+	dumpCombined := c.dumpCombinedFn
+	if dumpCombined == nil {
+		dumpCombined = netlinkx.DumpConnectedAndBoundUDP
+	}
 	reps, dumpErr := c.podNetnsReps(pids)
 	for _, rep := range reps {
-		socks, err := c.d.Cfg.Seams.Host.DumpConnectedUDPFn(rep.pid)
+		var socks []netlinkx.ConnectedUDPSocket
+		var err error
+		if combinedDump {
+			var bound map[uint16]bool
+			socks, bound, err = dumpCombined(rep.pid)
+			if err == nil && len(socks) > 0 {
+				boundByPID[rep.pid] = bound
+				boundOK[rep.pid] = true
+			}
+		} else {
+			socks, err = c.d.Cfg.Seams.Host.DumpConnectedUDPFn(rep.pid)
+		}
 		if err != nil {
 			dumpErr = true
 			continue
@@ -481,8 +515,6 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// netns is a server replying to a client, not a blackhole. One
 	// low-level dump per implicated netns, cached across candidates;
 	// an inconclusive dump suppresses every kill in that netns.
-	boundByPID := map[int]map[uint16]bool{}
-	boundOK := map[int]bool{}
 	boundPortsFor := func(pid int) (map[uint16]bool, bool) {
 		if ports, ok := boundByPID[pid]; ok {
 			return ports, boundOK[pid]
@@ -546,31 +578,99 @@ func (c *UDPStaleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			maxKills = 16
 		}
 		killed := 0
-		for _, cand := range confirmed {
-			if killed >= maxKills {
-				break
+		if sameFuncPtr(c.d.Cfg.Seams.Host.DestroyUDPSocketFn, netlinkx.DestroyUDPSocket) {
+			destroyBatch := c.destroyBatchFn
+			if destroyBatch == nil {
+				destroyBatch = netlinkx.DestroyUDPSockets
 			}
-			destroyed, err := c.d.Cfg.Seams.Host.DestroyUDPSocketFn(
-				cand.repPID, cand.sock.Family, cand.sock.ID)
-			if err != nil {
-				c.d.State.AppendLog(fmt.Sprintf(
-					"suspect: udp-stale-socket SOCK_DESTROY pid=%d dst=%s:%d failed: %v",
-					cand.repPID, cand.dstIPStr, cand.sock.DstPort, err))
-				continue
+			type pidGroup struct {
+				pid   int
+				cands []udpCandidate
 			}
-			if !destroyed {
-				// Kernel answered ENOENT — the socket was already
-				// gone. Idempotent success, but NOT a kill we did.
+			var groups []pidGroup
+			groupIdx := make(map[int]int)
+			for _, cand := range confirmed {
+				idx, ok := groupIdx[cand.repPID]
+				if !ok {
+					idx = len(groups)
+					groupIdx[cand.repPID] = idx
+					groups = append(groups, pidGroup{pid: cand.repPID})
+				}
+				groups[idx].cands = append(groups[idx].cands, cand)
+			}
+			for _, g := range groups {
+				for idx := 0; idx < len(g.cands) && killed < maxKills; {
+					end := min(idx+maxKills-killed, len(g.cands))
+					chunk := g.cands[idx:end]
+					targets := make([]netlinkx.UDPSocketTarget, len(chunk))
+					for j, cand := range chunk {
+						targets[j] = netlinkx.UDPSocketTarget{
+							Family: cand.sock.Family,
+							ID:     cand.sock.ID,
+						}
+					}
+					results, err := destroyBatch(g.pid, targets)
+					if err != nil {
+						for _, cand := range chunk {
+							c.d.State.AppendLog(fmt.Sprintf(
+								"suspect: udp-stale-socket SOCK_DESTROY pid=%d dst=%s:%d failed: %v",
+								cand.repPID, cand.dstIPStr, cand.sock.DstPort, err))
+						}
+						break
+					}
+					for j, cand := range chunk {
+						var res netlinkx.UDPDestroyResult
+						if j < len(results) {
+							res = results[j]
+						}
+						if res.Err != nil {
+							c.d.State.AppendLog(fmt.Sprintf(
+								"suspect: udp-stale-socket SOCK_DESTROY pid=%d dst=%s:%d failed: %v",
+								cand.repPID, cand.dstIPStr, cand.sock.DstPort, res.Err))
+							continue
+						}
+						if !res.Destroyed {
+							c.streaks.Reset(cand.key)
+							continue
+						}
+						killed++
+						c.streaks.Reset(cand.key)
+						c.d.Series.UDPStaleDestroyed++
+						c.d.Actions.WithLabelValues(wdeps.CheckUDPStale, "sock_destroy").Inc()
+						c.d.State.AppendLog(fmt.Sprintf(
+							"ACTION: udp-stale-socket SOCK_DESTROY netns=%s pid=%d src_port=%d dst=%s:%d",
+							cand.netnsLink, cand.repPID, cand.sock.SrcPort, cand.dstIPStr, cand.sock.DstPort))
+					}
+					idx = end
+				}
+			}
+		} else {
+			for _, cand := range confirmed {
+				if killed >= maxKills {
+					break
+				}
+				destroyed, err := c.d.Cfg.Seams.Host.DestroyUDPSocketFn(
+					cand.repPID, cand.sock.Family, cand.sock.ID)
+				if err != nil {
+					c.d.State.AppendLog(fmt.Sprintf(
+						"suspect: udp-stale-socket SOCK_DESTROY pid=%d dst=%s:%d failed: %v",
+						cand.repPID, cand.dstIPStr, cand.sock.DstPort, err))
+					continue
+				}
+				if !destroyed {
+					// Kernel answered ENOENT — the socket was already
+					// gone. Idempotent success, but NOT a kill we did.
+					c.streaks.Reset(cand.key)
+					continue
+				}
+				killed++
 				c.streaks.Reset(cand.key)
-				continue
+				c.d.Series.UDPStaleDestroyed++
+				c.d.Actions.WithLabelValues(wdeps.CheckUDPStale, "sock_destroy").Inc()
+				c.d.State.AppendLog(fmt.Sprintf(
+					"ACTION: udp-stale-socket SOCK_DESTROY netns=%s pid=%d src_port=%d dst=%s:%d",
+					cand.netnsLink, cand.repPID, cand.sock.SrcPort, cand.dstIPStr, cand.sock.DstPort))
 			}
-			killed++
-			c.streaks.Reset(cand.key)
-			c.d.Series.UDPStaleDestroyed++
-			c.d.Actions.WithLabelValues(wdeps.CheckUDPStale, "sock_destroy").Inc()
-			c.d.State.AppendLog(fmt.Sprintf(
-				"ACTION: udp-stale-socket SOCK_DESTROY netns=%s pid=%d src_port=%d dst=%s:%d",
-				cand.netnsLink, cand.repPID, cand.sock.SrcPort, cand.dstIPStr, cand.sock.DstPort))
 		}
 	}
 

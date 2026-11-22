@@ -245,6 +245,10 @@ func (c *cyc) nebulaInstallBinary() bool {
 		return false
 	}
 	tgzFile := c.v("interdc_nebula_tgz_file")
+	if !validStagedBasename(tgzFile) {
+		c.err("T5b: unsafe nebula tgz filename — refusing install", "file", tgzFile)
+		return false
+	}
 	sum := c.v("interdc_nebula_tgz_sha256")
 	url := c.v("interdc_nebula_tgz_url")
 	installed := false
@@ -255,9 +259,10 @@ func (c *cyc) nebulaInstallBinary() bool {
 			out, err := c.r.run(c.ctx, "/usr/local/bin/nebula", "-version")
 			return err == nil && strings.Contains(out, ver)
 		},
-		url:    url,
-		sum:    sum,
-		staged: filepath.Join(c.r.cfg.DownloadDir, tgzFile),
+		url:            url,
+		sum:            sum,
+		staged:         filepath.Join(c.r.downloadDir(), tgzFile),
+		stagingDirMode: 0o700,
 		// ansible: sha256sum -c on the STAGED file every run — a
 		// corrupted/operator-swapped tarball must not install.
 		refuseBadStaged: true,

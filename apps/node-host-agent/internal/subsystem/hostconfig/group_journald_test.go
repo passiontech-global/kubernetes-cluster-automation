@@ -26,7 +26,7 @@ func standaloneJournaldEnv(t *testing.T, res map[string]string, errs map[string]
 		t.Fatal(err)
 	}
 	hostWrite(t, r, "/etc/hosts", "127.0.0.1 localhost\n")
-	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890\n")
+	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890abcdef1234567890\n")
 	return loadCyc(t, r, vars, "node-a"), r, sr
 }
 
@@ -40,11 +40,11 @@ func TestJournaldPersistenceStandaloneConverge(t *testing.T) {
 	if !strings.Contains(jd, "[Journal]") || !strings.Contains(jd, "Storage=persistent") {
 		t.Fatalf("bad journald drop-in:\n%s", jd)
 	}
-	fi, err := os.Stat(filepath.Join(r.cfg.HostRoot, "/var/log/journal/abcdef1234567890"))
+	fi, err := os.Stat(filepath.Join(r.cfg.HostRoot, "/var/log/journal/abcdef1234567890abcdef1234567890"))
 	if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o755 || fi.Mode()&os.ModeSetgid == 0 {
 		t.Fatalf("journal dir missing/wrong mode (want 02755): fi=%v err=%v", fi.Mode(), err)
 	}
-	if len(sr.CallsMatching("chgrp systemd-journal /var/log/journal/abcdef1234567890")) == 0 {
+	if len(sr.CallsMatching("chgrp systemd-journal /var/log/journal/abcdef1234567890abcdef1234567890")) == 0 {
 		t.Fatalf("journal dir not chgrp'd: %v", sr.CallsMatching("chgrp"))
 	}
 	// First converge: drop-in write + fresh dir → exactly one restart.
@@ -107,7 +107,7 @@ func TestJournalDirCreateFailureWarns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890\n")
+	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890abcdef1234567890\n")
 	hostWrite(t, r, "/var/log/journal", "not a dir\n")
 	c := loadCyc(t, r, vars, "node-b")
 	created := c.ensureJournalDir()
@@ -130,13 +130,13 @@ func TestJournalDirChgrpFailureWarns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890\n")
+	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890abcdef1234567890\n")
 	c := loadCyc(t, r, vars, "node-b")
 	c.ensureJournalDir()
 	if c.errs != 0 {
 		t.Fatalf("errs = %d — chgrp failure is a warning", c.errs)
 	}
-	if !hostExists(r, "/var/log/journal/abcdef1234567890") {
+	if !hostExists(r, "/var/log/journal/abcdef1234567890abcdef1234567890") {
 		t.Fatal("journal dir not created despite the chgrp failure")
 	}
 }
@@ -164,5 +164,82 @@ func TestJournaldRotateRemedyFailureCounts(t *testing.T) {
 	c.groupBase()
 	if len(sr.CallsMatching("journalctl --rotate")) != 0 {
 		t.Fatal("rotate re-issued inside the cooldown window")
+	}
+}
+
+func TestMachineIDValidation(t *testing.T) {
+	badIDs := []struct {
+		name    string
+		content string
+		missing bool
+	}{
+		{"missing", "", true},
+		{"empty", "\n", false},
+		{"too_short_16", "abcdef1234567890\n", false},
+		{"too_long_33", "abcdef1234567890abcdef1234567890a\n", false},
+		{"uppercase_hex", "ABCDEF1234567890ABCDEF1234567890\n", false},
+		{"shell_injection", "$(id);touch /tmp/pwn\n", false},
+		{"path_traversal", "../../etc/cron.d/pwn\n", false},
+		{"embedded_newline", "abcdef1234567890\nabcdef1234567890\n", false},
+	}
+	for _, tc := range badIDs {
+		t.Run(tc.name, func(t *testing.T) {
+			vars := writeVarsDir(t, "")
+			sr := newScripted(nil, nil)
+			r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+				VarsDir: vars, Standalone: true, Runner: sr}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.missing {
+				hostWrite(t, r, "/etc/machine-id", tc.content)
+			}
+			if got := r.machineID(); got != "" {
+				t.Fatalf("machineID(%q) = %q, want empty", tc.content, got)
+			}
+			c := loadCyc(t, r, vars, "node-a")
+			if c.ensureJournalDir() {
+				t.Fatal("ensureJournalDir created dir on invalid machine-id")
+			}
+			c.journaldOrphanFold()
+			if len(sr.CallsMatching("chgrp")) != 0 || len(sr.CallsMatching("sh -c")) != 0 {
+				t.Fatalf("unexpected commands on invalid machine-id: %v", sr.Calls())
+			}
+		})
+	}
+}
+
+func TestJournaldOrphanFold(t *testing.T) {
+	const mid = "0123456789abcdef0123456789abcdef"
+	const oldMid = "fedcba9876543210fedcba9876543210"
+	vars := writeVarsDir(t, "")
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Standalone: true, Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostWrite(t, r, "/etc/machine-id", mid+"\n")
+	hostWrite(t, r, "/var/log/journal/"+mid+"/system.journal", "live")
+	hostWrite(t, r, "/var/log/journal/"+oldMid+"/system.journal", "orphan-collision")
+	hostWrite(t, r, "/var/log/journal/"+oldMid+"/user.journal", "orphan-unique")
+
+	c := loadCyc(t, r, vars, "node-a")
+	c.journaldOrphanFold()
+
+	if len(sr.CallsMatching("sh -c")) != 0 {
+		t.Fatalf("journaldOrphanFold unexpectedly forked sh: %v", sr.Calls())
+	}
+	if got := hostRead(t, r, "/var/log/journal/"+mid+"/system.journal"); got != "live" {
+		t.Fatalf("live journal overwritten: %q", got)
+	}
+	if got := hostRead(t, r, "/var/log/journal/"+mid+"/orphan-system.journal"); got != "orphan-collision" {
+		t.Fatalf("colliding orphan not renamed to orphan-: %q", got)
+	}
+	if got := hostRead(t, r, "/var/log/journal/"+mid+"/user.journal"); got != "orphan-unique" {
+		t.Fatalf("unique orphan not folded: %q", got)
+	}
+	if hostExists(r, "/var/log/journal/"+oldMid+"/user.journal") {
+		t.Fatal("source orphan journal still present after fold")
 	}
 }

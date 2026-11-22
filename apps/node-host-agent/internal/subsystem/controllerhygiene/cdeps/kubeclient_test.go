@@ -466,3 +466,130 @@ func TestListRVNoClient(t *testing.T) {
 		t.Fatalf("ListRV without a client=(%d,%v) want (0,false)", rv, ok)
 	}
 }
+
+type trackBody struct {
+	r         io.Reader
+	bytesRead int64
+	closed    bool
+}
+
+func (b *trackBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.bytesRead += int64(n)
+	return n, err
+}
+
+func (b *trackBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+type trackRT struct {
+	code int
+	body *trackBody
+}
+
+func (rt *trackRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: rt.code,
+		Header:     make(http.Header),
+		Body:       rt.body,
+		Request:    req,
+	}, nil
+}
+
+func TestListRVStreamingEdges(t *testing.T) {
+	t.Run("exact maxListRVBody valid json succeeds", func(t *testing.T) {
+		head := `{"metadata":{"resourceVersion":"42"}}`
+		payload := head + strings.Repeat(" ", maxListRVBody-len(head))
+		if len(payload) != maxListRVBody {
+			t.Fatalf("len=%d want %d", len(payload), maxListRVBody)
+		}
+		tb := &trackBody{r: strings.NewReader(payload)}
+		d := newKubeDeps(t)
+		c := &http.Client{Transport: &trackRT{code: http.StatusOK, body: tb}}
+		d.Cfg.HTTPClient, d.Client = c, c
+		rv, ok := d.ListRV(context.Background(), "127.0.0.1:6443", true)
+		if !ok || rv != 42 {
+			t.Fatalf("ListRV(exact max)=(%d,%v) want (42,true)", rv, ok)
+		}
+		if !tb.closed {
+			t.Fatal("body not closed")
+		}
+	})
+
+	t.Run("oversize maxListRVBody+1 padded json rejected", func(t *testing.T) {
+		head := `{"metadata":{"resourceVersion":"42"}}`
+		payload := head + strings.Repeat(" ", maxListRVBody+1-len(head))
+		tb := &trackBody{r: strings.NewReader(payload)}
+		d := newKubeDeps(t)
+		c := &http.Client{Transport: &trackRT{code: http.StatusOK, body: tb}}
+		d.Cfg.HTTPClient, d.Client = c, c
+		rv, ok := d.ListRV(context.Background(), "127.0.0.1:6443", true)
+		if ok || rv != 0 {
+			t.Fatalf("ListRV(max+1 padded)=(%d,%v) want (0,false)", rv, ok)
+		}
+		if !tb.closed {
+			t.Fatal("body not closed")
+		}
+	})
+
+	t.Run("oversize truncated items > maxListRVBody rejected", func(t *testing.T) {
+		head := `{"metadata":{"resourceVersion":"42"},"items":["`
+		payload := head + strings.Repeat("a", maxListRVBody) + `"]}`
+		tb := &trackBody{r: strings.NewReader(payload)}
+		d := newKubeDeps(t)
+		c := &http.Client{Transport: &trackRT{code: http.StatusOK, body: tb}}
+		d.Cfg.HTTPClient, d.Client = c, c
+		rv, ok := d.ListRV(context.Background(), "127.0.0.1:6443", true)
+		if ok || rv != 0 {
+			t.Fatalf("ListRV(oversize items)=(%d,%v) want (0,false)", rv, ok)
+		}
+		if !tb.closed {
+			t.Fatal("body not closed")
+		}
+	})
+
+	t.Run("trailing garbage rejected", func(t *testing.T) {
+		rt := &capRT{code: http.StatusOK, body: `{"metadata":{"resourceVersion":"42"}}garbage`}
+		listRVCase(t, rt, true, 0, false)
+	})
+
+	t.Run("lenient json lone surrogate and duplicate keys succeed", func(t *testing.T) {
+		rt := &capRT{
+			code: http.StatusOK,
+			body: `{"metadata":{"resourceVersion":"987"},"items":[{"msg":"\uD83D","dup":1,"dup":2}]}`,
+		}
+		listRVCase(t, rt, true, 987, true)
+	})
+
+	t.Run("non-200 drains at most 64KiB and closes", func(t *testing.T) {
+		payload := strings.Repeat("e", 128<<10)
+		tb := &trackBody{r: strings.NewReader(payload)}
+		d := newKubeDeps(t)
+		c := &http.Client{Transport: &trackRT{code: http.StatusInternalServerError, body: tb}}
+		d.Cfg.HTTPClient, d.Client = c, c
+		rv, ok := d.ListRV(context.Background(), "127.0.0.1:6443", true)
+		if ok || rv != 0 {
+			t.Fatalf("ListRV(500)=(%d,%v) want (0,false)", rv, ok)
+		}
+		if !tb.closed || tb.bytesRead != 64<<10 {
+			t.Fatalf("closed=%v bytesRead=%d want true, %d", tb.closed, tb.bytesRead, 64<<10)
+		}
+	})
+
+	t.Run("200 with trailing whitespace drains to EOF before close", func(t *testing.T) {
+		payload := `{"metadata":{"resourceVersion":"42"}}   ` + "\n"
+		tb := &trackBody{r: strings.NewReader(payload)}
+		d := newKubeDeps(t)
+		c := &http.Client{Transport: &trackRT{code: http.StatusOK, body: tb}}
+		d.Cfg.HTTPClient, d.Client = c, c
+		rv, ok := d.ListRV(context.Background(), "127.0.0.1:6443", true)
+		if !ok || rv != 42 {
+			t.Fatalf("ListRV(ws)=(%d,%v) want (42,true)", rv, ok)
+		}
+		if !tb.closed || tb.bytesRead != int64(len(payload)) {
+			t.Fatalf("closed=%v bytesRead=%d want true, %d", tb.closed, tb.bytesRead, len(payload))
+		}
+	})
+}

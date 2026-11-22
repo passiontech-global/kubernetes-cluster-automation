@@ -536,3 +536,113 @@ func TestKonnectivityDryRunHealResetsStreak(t *testing.T) {
 			"(streak must restart after each action):\n%s", n, e.LogLines())
 	}
 }
+
+type konnTrackBody struct {
+	r         io.Reader
+	bytesRead int64
+	closed    bool
+}
+
+func (b *konnTrackBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.bytesRead += int64(n)
+	return n, err
+}
+
+func (b *konnTrackBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+type konnRTFunc func(*http.Request) (*http.Response, error)
+
+func (f konnRTFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type konnTrackRT struct {
+	status int
+	body   *konnTrackBody
+}
+
+func (rt *konnTrackRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status:     fmt.Sprintf("%d", rt.status),
+		StatusCode: rt.status,
+		Header:     make(http.Header),
+		Body:       rt.body,
+		Request:    req,
+	}, nil
+}
+
+func TestKonnectivityReadyWorkersDrainsBody(t *testing.T) {
+	validJSON := `{"items":[{"metadata":{"labels":{}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}`
+	cases := []struct {
+		name        string
+		status      int
+		payload     string
+		maxRead     int64
+		minRead     int64
+		wantCleared bool
+	}{
+		{
+			name:        "200 with trailing whitespace drained to EOF",
+			status:      http.StatusOK,
+			payload:     validJSON + strings.Repeat(" ", 128),
+			minRead:     int64(len(validJSON) + 128),
+			maxRead:     int64(len(validJSON) + 128),
+			wantCleared: false, // 1 ready worker keeps streak (triggers heal check)
+		},
+		{
+			name:        "200 malformed json with 128KiB tail bounded drain",
+			status:      http.StatusOK,
+			payload:     "{oops" + strings.Repeat("x", 128<<10),
+			minRead:     5,
+			maxRead:     (64 << 10) + 4096,
+			wantCleared: true,
+		},
+		{
+			name:        "500 with 128KiB error body skips json decode and drains 64KiB",
+			status:      http.StatusInternalServerError,
+			payload:     strings.Repeat("e", 128<<10),
+			minRead:     64 << 10,
+			maxRead:     64 << 10,
+			wantCleared: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			e.H.Cfg.K0sRunDir = t.TempDir()
+			e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+				if url == "http://127.0.0.1:8091/metrics" {
+					return "konnectivity_network_proxy_server_ready_backend_connections 0\n", nil
+				}
+				return "", errors.New("unexpected scrape " + url)
+			}
+			tb := &konnTrackBody{r: strings.NewReader(tc.payload)}
+			// Drive 3 bad cycles; on cycle 3 readyWorkers runs on tb.
+			calls := 0
+			e.H.Client = &http.Client{Transport: konnRTFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					return (&konnTrackRT{status: tc.status, body: tb}).RoundTrip(req)
+				}
+				return rawTransport{body: "{}"}.RoundTrip(req)
+			})}
+			for range 3 {
+				e.H.Cycle(context.Background())
+			}
+			if !tb.closed {
+				t.Fatal("response body was not closed")
+			}
+			if tb.bytesRead < tc.minRead || tb.bytesRead > tc.maxRead {
+				t.Fatalf("bytesRead=%d want in [%d, %d]", tb.bytesRead, tc.minRead, tc.maxRead)
+			}
+			if tc.wantCleared && len(e.Kills) != 0 {
+				t.Fatalf("expected 0 kills on 0 ready workers, got %v", e.Kills)
+			}
+		})
+	}
+}

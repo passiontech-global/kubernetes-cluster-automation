@@ -77,6 +77,14 @@ func (c *GuardCheck) savePreMaintSnapshot(ctx context.Context) bool {
 			d.Cfg.EtcdBackupDir, err))
 		return false
 	}
+	// MkdirAll does not tighten an existing 0755 dir — force 0700
+	// before any snapshot (containing cluster Secrets) lands in it.
+	if err := os.Chmod(d.Cfg.EtcdBackupDir, 0o700); err != nil {
+		d.State.AppendLogWarn(fmt.Sprintf(
+			"etcdguard: pre-maintenance snapshot dir chmod %s: %v — compact+defrag aborted",
+			d.Cfg.EtcdBackupDir, err))
+		return false
+	}
 	// Headroom gate before every attempt — the incoming save tracks
 	// the live db size, which the newest existing snapshot estimates.
 	freeB, totalB, ferr := d.Cfg.StatFSFn(d.Cfg.EtcdBackupDir)
@@ -105,14 +113,14 @@ func (c *GuardCheck) savePreMaintSnapshot(ctx context.Context) bool {
 	if d.State.RateOK(cdeps.FileRateEtcdPreMaintSnap, etcdPreMaintSnapInterval) {
 		name := filepath.Join(d.Cfg.EtcdBackupDir, fmt.Sprintf(
 			"premaint-%d.db", d.Cfg.Clock.Now().Unix()))
+		tmpName := name + ".tmp"
 		d.State.RateSpend(cdeps.FileRateEtcdPreMaintSnap)
-		if _, err := d.Cfg.EtcdctlFn(ctx, "snapshot", "save", name); err != nil {
+		if _, err := d.Cfg.EtcdctlFn(ctx, "snapshot", "save", tmpName); err != nil {
 			d.State.AppendLogWarn(fmt.Sprintf(
 				"etcdguard: pre-maintenance snapshot save failed: %v — compact+defrag aborted", err))
 			// A failed save can leave a partial/truncated snapshot —
-			// never leave it behind as a fake rollback point (the
-			// freshness check reuses the newest premaint-*.db).
-			if rmErr := os.Remove(name); rmErr != nil && !os.IsNotExist(rmErr) {
+			// never leave it behind.
+			if rmErr := os.Remove(tmpName); rmErr != nil && !os.IsNotExist(rmErr) {
 				d.State.AppendLogWarn(fmt.Sprintf(
 					"etcdguard: failed pre-maintenance snapshot cleanup: %v", rmErr))
 			}
@@ -120,33 +128,38 @@ func (c *GuardCheck) savePreMaintSnapshot(ctx context.Context) bool {
 		}
 		// etcdctl writes as the invoking user with the process umask —
 		// the snapshot embeds the full etcd keyspace (every Secret in
-		// the cluster) and must not inherit a group/world-readable
-		// mode.
-		if err := os.Chmod(name, 0o600); err != nil {
+		// the cluster) and must be 0600 BEFORE Rename publishes it.
+		if err := os.Chmod(tmpName, 0o600); err != nil {
 			d.State.AppendLogWarn(fmt.Sprintf(
 				"etcdguard: pre-maintenance snapshot chmod failed: %v — compact+defrag aborted", err))
-			_ = os.Remove(name)
+			_ = os.Remove(tmpName)
 			return false
 		}
 		// Verify what was actually written — etcdctl can exit 0 on a
 		// truncated stream. `snapshot status` parses the file; the
 		// size check catches a zero-byte artifact either way.
-		if fi, err := os.Stat(name); err != nil || fi.Size() == 0 {
+		if fi, err := os.Stat(tmpName); err != nil || fi.Size() == 0 {
 			d.State.AppendLogWarn(fmt.Sprintf(
-				"etcdguard: pre-maintenance snapshot %s missing/empty — compact+defrag aborted", name))
-			_ = os.Remove(name)
+				"etcdguard: pre-maintenance snapshot %s missing/empty — compact+defrag aborted", tmpName))
+			_ = os.Remove(tmpName)
 			return false
 		}
-		if _, err := d.Cfg.EtcdctlFn(ctx, "snapshot", "status", name); err != nil {
+		if _, err := d.Cfg.EtcdctlFn(ctx, "snapshot", "status", tmpName); err != nil {
 			d.State.AppendLogWarn(fmt.Sprintf(
 				"etcdguard: pre-maintenance snapshot %s failed verification: %v — compact+defrag aborted",
-				name, err))
-			// Failed verification = partial garbage. Delete it so the
-			// next attempt cannot ride it as the "fresh" snapshot.
-			if rmErr := os.Remove(name); rmErr != nil {
+				tmpName, err))
+			// Failed verification = partial garbage. Delete it so no
+			// partial artifact lingers.
+			if rmErr := os.Remove(tmpName); rmErr != nil {
 				d.State.AppendLogWarn(fmt.Sprintf(
 					"etcdguard: failed pre-maintenance snapshot cleanup: %v", rmErr))
 			}
+			return false
+		}
+		if err := os.Rename(tmpName, name); err != nil {
+			d.State.AppendLogWarn(fmt.Sprintf(
+				"etcdguard: pre-maintenance snapshot rename failed: %v — compact+defrag aborted", err))
+			_ = os.Remove(tmpName)
 			return false
 		}
 		d.State.AppendLog(
@@ -187,16 +200,23 @@ func (c *GuardCheck) savePreMaintSnapshot(ctx context.Context) bool {
 	return true
 }
 
-// prunePremaint deletes all but the newest etcdPremaintKeep
-// premaint-*.db snapshots under dir — oldest first by name — and
-// returns how many were removed. Best-effort: an unremovable file is
-// skipped, never fatal to the guard.
+// prunePremaint deletes stale *.tmp partials and all but the newest
+// etcdPremaintKeep premaint-*.db snapshots under dir — oldest first
+// by name — and returns how many were removed. Best-effort: an
+// unremovable file is skipped, never fatal to the guard.
 func prunePremaint(dir string) int {
+	removed := 0
+	if tmps, err := filepath.Glob(filepath.Join(dir, "*.tmp")); err == nil {
+		for _, f := range tmps {
+			if err := os.Remove(f); err == nil {
+				removed++
+			}
+		}
+	}
 	snaps := premaintSnapshots(dir)
 	if len(snaps) <= etcdPremaintKeep {
-		return 0
+		return removed
 	}
-	removed := 0
 	for _, f := range snaps[etcdPremaintKeep:] {
 		if err := os.Remove(f); err == nil {
 			removed++

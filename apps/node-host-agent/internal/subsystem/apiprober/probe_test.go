@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strings"
@@ -604,4 +605,72 @@ func TestDecodeListRVTokenWalk(t *testing.T) {
 			t.Fatalf("decodeListRV(empty rv)=%v want errBadPayload", err)
 		}
 	})
+}
+
+func TestListRVNon200DrainsBodyBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		bodyLen  int
+		wantRead int64
+		wantFC   failClass
+	}{
+		{"503 small 256B", http.StatusServiceUnavailable, 256, 256, failStatus},
+		{"401 small 256B", http.StatusUnauthorized, 256, 256, failAuth},
+		{"503 capped 256KiB", http.StatusServiceUnavailable, 256 << 10, 64 << 10, failStatus},
+		{"401 capped 256KiB", http.StatusUnauthorized, 256 << 10, 64 << 10, failAuth},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := strings.Repeat("x", tc.bodyLen)
+			tracker := &readTracker{r: strings.NewReader(payload)}
+			p, err := New(Config{
+				HTTPClient: &http.Client{Transport: rtFunc(
+					func(*http.Request) (*http.Response, error) {
+						return &http.Response{
+							StatusCode:    tc.status,
+							Header:        make(http.Header),
+							Body:          tracker,
+							ContentLength: int64(len(payload)),
+						}, nil
+					})},
+			}, prometheus.NewRegistry())
+			if err != nil {
+				t.Fatal(err)
+			}
+			rv, fc, _ := p.listRV(context.Background(), "127.0.0.1:6443", "/x")
+			if rv != 0 || fc != tc.wantFC {
+				t.Fatalf("listRV = (%d, %v) want (0, %v)", rv, fc, tc.wantFC)
+			}
+			if tracker.total != tc.wantRead {
+				t.Fatalf("drained %d bytes, want %d", tracker.total, tc.wantRead)
+			}
+		})
+	}
+
+	// Keep-alive connection reuse across consecutive 503 responses.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"message":"apiserver unavailable"}`)
+	}))
+	defer srv.Close()
+	p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reused []bool
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			reused = append(reused, info.Reused)
+		},
+	}
+	addr := strings.TrimPrefix(srv.URL, "https://")
+	for range 2 {
+		ctx := httptrace.WithClientTrace(context.Background(), trace)
+		if rv, fc, _ := p.listRV(ctx, addr, "/x"); rv != 0 || fc != failStatus {
+			t.Fatalf("listRV(503) = (%d, %v) want (0, failStatus)", rv, fc)
+		}
+	}
+	if len(reused) != 2 || reused[0] || !reused[1] {
+		t.Fatalf("expected keep-alive reuse on 2nd 503 request, GotConn reused=%v", reused)
+	}
 }

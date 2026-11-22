@@ -1,6 +1,7 @@
 package apiprober
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -50,6 +51,24 @@ type backendState struct {
 	// RAM-only — it dedupes LOG lines, carries no verdict state, and
 	// a restart re-logging one line is correct behavior.
 	probeErr string
+
+	// On-disk witness sync state populated by loadState and kept in
+	// sync by saveState so healthy steady-state cycles skip redundant
+	// os.Remove syscalls and unchanged WriteFileAtomicBytes writes.
+	diskDir   string
+	diskQfail diskFileState
+	diskFroz  diskFileState
+	diskFail  diskFileState
+	diskOK    diskFileState
+	diskPrev  diskFileState
+	diskDrain diskFileState
+}
+
+type diskFileState struct {
+	known   bool
+	present bool
+	val     int64
+	hasVal  bool
 }
 
 func (p *Prober) stateFor(name string) *backendState {
@@ -295,20 +314,33 @@ func (p *Prober) loadState(dir, name string, st *backendState) {
 		return
 	}
 	key := stateFileKey(name)
-	st.qfail = stateCounter(filepath.Join(dir, "apibe-qfail-"+key))
-	st.frozen = stateCounter(filepath.Join(dir, "apibe-frozen-"+key))
-	st.fail = stateCounter(filepath.Join(dir, "apibe-fail-"+key))
-	st.ok = stateCounter(filepath.Join(dir, "apibe-ok-"+key))
-	if v, ok := readStateInt(filepath.Join(dir, "apibe-prevcache-"+key)); ok {
+	st.diskDir = dir
+	var v int64
+	v, st.diskQfail = readStateFile(filepath.Join(dir, "apibe-qfail-"+key))
+	st.qfail = int(v)
+	v, st.diskFroz = readStateFile(filepath.Join(dir, "apibe-frozen-"+key))
+	st.frozen = int(v)
+	v, st.diskFail = readStateFile(filepath.Join(dir, "apibe-fail-"+key))
+	st.fail = int(v)
+	v, st.diskOK = readStateFile(filepath.Join(dir, "apibe-ok-"+key))
+	st.ok = int(v)
+	pv, pstate := readStateFile(filepath.Join(dir, "apibe-prevcache-"+key))
+	st.diskPrev = pstate
+	if pstate.hasVal {
 		// Without the persisted baseline the first post-restart
 		// cycle runs hasPrev=false — the frozen else-branch would
 		// zero a streak that was mid-accumulation on disk.
-		st.prevCache, st.hasPrev = v, true
+		st.prevCache, st.hasPrev = pv, true
 	}
 	// The drained marker is presence-only — content (the epoch the
 	// drain latched) is informational.
 	if _, err := os.Stat(filepath.Join(dir, "apibe-drained-"+key)); err == nil {
 		st.drained = true
+		st.diskDrain = diskFileState{known: true, present: true}
+	} else if errors.Is(err, os.ErrNotExist) {
+		st.diskDrain = diskFileState{known: true, present: false}
+	} else {
+		st.diskDrain = diskFileState{known: true, present: true}
 	}
 	st.loaded = true
 }
@@ -321,31 +353,48 @@ func (p *Prober) loadState(dir, name string, st *backendState) {
 // exists only while hasPrev holds. Best-effort like writeGapFile —
 // a failure is Warn'd, never fatal.
 func (p *Prober) saveState(dir, name string, st *backendState) {
+	if st.diskDir != dir {
+		st.diskDir = dir
+		st.diskQfail = diskFileState{}
+		st.diskFroz = diskFileState{}
+		st.diskFail = diskFileState{}
+		st.diskOK = diskFileState{}
+		st.diskPrev = diskFileState{}
+		st.diskDrain = diskFileState{}
+	}
 	key := stateFileKey(name)
-	p.writeStateCounter(filepath.Join(dir, "apibe-qfail-"+key), int64(st.qfail))
-	p.writeStateCounter(filepath.Join(dir, "apibe-frozen-"+key), int64(st.frozen))
-	p.writeStateCounter(filepath.Join(dir, "apibe-fail-"+key), int64(st.fail))
-	p.writeStateCounter(filepath.Join(dir, "apibe-ok-"+key), int64(st.ok))
+	p.syncStateInt(filepath.Join(dir, "apibe-qfail-"+key), st.qfail > 0, int64(st.qfail), &st.diskQfail)
+	p.syncStateInt(filepath.Join(dir, "apibe-frozen-"+key), st.frozen > 0, int64(st.frozen), &st.diskFroz)
+	p.syncStateInt(filepath.Join(dir, "apibe-fail-"+key), st.fail > 0, int64(st.fail), &st.diskFail)
+	p.syncStateInt(filepath.Join(dir, "apibe-ok-"+key), st.ok > 0, int64(st.ok), &st.diskOK)
 	prev := filepath.Join(dir, "apibe-prevcache-"+key)
 	// The baseline only earns a restart witness while a verdict is
 	// in flight — it exists to resume a frozen/gap/fail streak or a
 	// drain recovery. A fully-healthy backend's rv_cache advances
 	// every cycle, so persisting it was a tmp+rename+fsync every
 	// 30s for nothing (the "healthy run leaves no litter" rule).
-	if st.hasPrev && (st.qfail > 0 || st.frozen > 0 || st.fail > 0 ||
-		st.ok > 0 || st.drained) {
-		p.writeStateFile(prev, strconv.FormatInt(st.prevCache, 10))
-	} else {
-		p.removeStateFile(prev)
-	}
+	wantPrev := st.hasPrev && (st.qfail > 0 || st.frozen > 0 || st.fail > 0 ||
+		st.ok > 0 || st.drained)
+	p.syncStateInt(prev, wantPrev, st.prevCache, &st.diskPrev)
 	drained := filepath.Join(dir, "apibe-drained-"+key)
 	if st.drained {
-		if _, err := os.Stat(drained); err != nil {
-			p.writeStateFile(drained,
-				strconv.FormatInt(p.cfg.Clock.Now().Unix(), 10))
+		if !st.diskDrain.known || !st.diskDrain.present {
+			if _, err := os.Stat(drained); err == nil {
+				st.diskDrain = diskFileState{known: true, present: true}
+			} else if p.writeStateFile(drained, strconv.FormatInt(p.cfg.Clock.Now().Unix(), 10)) {
+				st.diskDrain = diskFileState{known: true, present: true}
+			} else {
+				st.diskDrain = diskFileState{known: true, present: false}
+			}
 		}
 	} else {
-		p.removeStateFile(drained)
+		if !st.diskDrain.known || st.diskDrain.present {
+			if p.removeStateFile(drained) {
+				st.diskDrain = diskFileState{known: true, present: false}
+			} else {
+				st.diskDrain = diskFileState{known: true, present: true}
+			}
+		}
 	}
 }
 
@@ -368,54 +417,67 @@ func (p *Prober) removeStateFiles(dir, name string) {
 	}
 }
 
-// stateCounter reads an int counter file — absent/garbage → 0.
-func stateCounter(path string) int {
-	v, _ := readStateInt(path)
-	return int(v)
-}
-
-// readStateInt reads an int64 file, reporting (value, parsed) —
-// callers that key on presence use the bool (prevcache's hasPrev);
-// counters ignore it.
-func readStateInt(path string) (int64, bool) {
+// readStateFile reads an int64 state file and records whether a file
+// exists on disk (including "0\n" or unparseable garbage so saveState
+// cleans up pre-existing litter on cycle 1).
+func readStateFile(path string) (int64, diskFileState) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, false
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, diskFileState{known: true, present: false}
+		}
+		return 0, diskFileState{known: true, present: true}
 	}
-	v, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil {
-		return 0, false
+	v, perr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if perr != nil {
+		return 0, diskFileState{known: true, present: true}
 	}
-	return v, true
+	return v, diskFileState{known: true, present: true, val: v, hasVal: true}
+}
+
+func (p *Prober) syncStateInt(path string, wantPresent bool, val int64, df *diskFileState) {
+	if !wantPresent {
+		if df.known && !df.present {
+			return
+		}
+		if p.removeStateFile(path) {
+			*df = diskFileState{known: true, present: false}
+		} else {
+			*df = diskFileState{known: true, present: true}
+		}
+		return
+	}
+	if df.known && df.present && df.hasVal && df.val == val {
+		return
+	}
+	if p.writeStateFile(path, strconv.FormatInt(val, 10)) {
+		*df = diskFileState{known: true, present: true, val: val, hasVal: true}
+	} else {
+		*df = diskFileState{known: true, present: df.present}
+	}
 }
 
 // writeStateFile mirrors one apibe-* file through the atomic
 // tmp+rename contract — best-effort: a failed write only costs a
 // restart some streak context.
-func (p *Prober) writeStateFile(path, content string) {
+func (p *Prober) writeStateFile(path, content string) bool {
 	if err := fsx.WriteFileAtomicBytes(path,
 		[]byte(content+"\n")); err != nil {
 		logger().Warn("apiprober state file write failed",
 			"file", path, "error", err,
 		)
+		return false
 	}
-}
-
-// writeStateCounter writes a counter file, or deletes it at zero —
-// absent IS zero on the read side, so a "0" file is pure litter.
-func (p *Prober) writeStateCounter(path string, n int64) {
-	if n <= 0 {
-		p.removeStateFile(path)
-		return
-	}
-	p.writeStateFile(path, strconv.FormatInt(n, 10))
+	return true
 }
 
 // removeStateFile deletes one apibe-* file — not-exist is fine.
-func (p *Prober) removeStateFile(path string) {
+func (p *Prober) removeStateFile(path string) bool {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		logger().Warn("apiprober state file remove failed",
 			"file", path, "error", err,
 		)
+		return false
 	}
+	return true
 }

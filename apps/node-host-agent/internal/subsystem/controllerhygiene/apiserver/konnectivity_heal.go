@@ -260,7 +260,11 @@ func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
 			} `json:"items"`
 		}
 		statusOK := resp.StatusCode/100 == 2
-		decErr := json.UnmarshalRead(io.LimitReader(resp.Body, 8<<20), &list)
+		var decErr error
+		if statusOK {
+			decErr = json.UnmarshalRead(io.LimitReader(resp.Body, 8<<20), &list)
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		_ = resp.Body.Close()
 		cancel()
 		if !statusOK || decErr != nil {

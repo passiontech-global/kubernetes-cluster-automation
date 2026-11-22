@@ -1118,3 +1118,72 @@ func TestEtcdGuardSnapshotFallbackVerifyFailAborts(t *testing.T) {
 		t.Fatalf("fallback verify failure not logged:\n%s", e.LogLines())
 	}
 }
+
+func TestEtcdGuardSnapshotHardeningDir0700AndAtomicTmp(t *testing.T) {
+	e := fixture(t)
+	bdir := filepath.Join(filepath.Dir(e.State), "etcd-backups")
+	if err := os.MkdirAll(bdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleTmp := filepath.Join(bdir, "premaint-1.db.tmp")
+	if err := os.WriteFile(staleTmp, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
+	}
+	e.wireEtcdGuard(t, g)
+	e.H.Cfg.EtcdBackupDir = bdir
+
+	var saveTarget, statusTarget string
+	var saveTmpPermBeforeStatus os.FileMode
+	e.H.Cfg.EtcdctlFn = func(_ context.Context, args ...string) ([]byte, error) {
+		j := strings.Join(args, " ")
+		switch {
+		case strings.Contains(j, "endpoint status"):
+			return []byte(g.status), nil
+		case strings.Contains(j, "alarm list"):
+			return []byte(""), nil
+		case strings.Contains(j, "snapshot save"):
+			saveTarget = args[len(args)-1]
+			// Simulate world-readable umask artifact — savePreMaintSnapshot must Chmod 0600.
+			if err := os.WriteFile(saveTarget, []byte("snap-bytes"), 0o644); err != nil {
+				return nil, err
+			}
+			return []byte(`{"hash":1}`), nil
+		case strings.Contains(j, "snapshot status"):
+			statusTarget = args[len(args)-1]
+			if fi, err := os.Stat(statusTarget); err == nil {
+				saveTmpPermBeforeStatus = fi.Mode().Perm()
+			}
+			return []byte(`{"hash":1}`), nil
+		}
+		return nil, fmt.Errorf("unexpected etcdctl %q", j)
+	}
+
+	e.H.Cycle(context.Background())
+
+	if fi, err := os.Stat(bdir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("EtcdBackupDir mode = %v, want 0700", fi)
+	}
+	if !strings.HasSuffix(saveTarget, ".db.tmp") || statusTarget != saveTarget {
+		t.Fatalf("snapshot save/status did not stage to .tmp: save=%q status=%q", saveTarget, statusTarget)
+	}
+	if saveTmpPermBeforeStatus != 0o600 {
+		t.Fatalf(".tmp mode at snapshot status = %o, want 0600", saveTmpPermBeforeStatus)
+	}
+	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
+		t.Fatal("stale *.tmp not swept by prunePremaint")
+	}
+	published := strings.TrimSuffix(saveTarget, ".tmp")
+	if fi, err := os.Stat(published); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("published snapshot %s missing/wrong mode: %v %v", published, fi, err)
+	}
+	if _, err := os.Stat(saveTarget); !os.IsNotExist(err) {
+		t.Fatal(".tmp left behind after rename")
+	}
+}

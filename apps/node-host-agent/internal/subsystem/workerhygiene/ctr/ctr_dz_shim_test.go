@@ -30,6 +30,7 @@ func TestCtrTasksUnkillableShimEscalates(t *testing.T) {
 			e := fixture(t)
 			sid := strings.Repeat("d", 64)
 			e.MkStatProc(t, 9400, "containerd-shim-runc-v2", state, "")
+			seedHostRootShim(t, e, 9400)
 			wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "9400", "cmdline"),
 				"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+
 					sid+"\x00-address\x00/run/k0s/containerd.sock\x00")
@@ -83,6 +84,7 @@ func TestCtrTasksRunnableShimStillKilled(t *testing.T) {
 	e := fixture(t)
 	sid := strings.Repeat("e", 64)
 	e.MkStatProc(t, 9401, "containerd-shim-runc-v2", "S", "")
+	seedHostRootShim(t, e, 9401)
 	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "9401", "cmdline"),
 		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+
 			sid+"\x00-address\x00/run/k0s/containerd.sock\x00")

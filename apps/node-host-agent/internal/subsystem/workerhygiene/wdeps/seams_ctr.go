@@ -31,10 +31,14 @@ type Ctr struct {
 
 // RmImage removes one image from the k8s.io containerd namespace —
 // the corrupted-layer remedy (37), `k0s ctr --namespace k8s.io
-// images rm --sync <image>` over the Exec seam.
+// images rm --sync -- <image>` over the Exec seam. Rejects empty or
+// leading-'-' image refs to block flag injection.
 func (s *Ctr) RmImage(ctx context.Context, image string) error {
+	if image == "" || strings.HasPrefix(image, "-") {
+		return errors.New("wdeps: invalid image ref for ctr images rm")
+	}
 	return s.Exec(ctx,
-		"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", image)
+		"k0s", "ctr", "--namespace", "k8s.io", "images", "rm", "--sync", "--", image)
 }
 
 // RmIngest removes one stale ingest ref — `k0s ctr -n k8s.io

@@ -172,8 +172,8 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 // latch keys, a present latch flips the condition True with the
 // problem reason, and a removed latch flips it back to False.
 func TestCiliumLatchConditions(t *testing.T) {
-	if len(conditionDefs) != 67 {
-		t.Fatalf("conditionDefs has %d defs, want 67 (50 prior + 5 self-healing wave + 4 wave-2 + 3 wave-3 + 5 wave-4 latch→condition surface)",
+	if len(conditionDefs) != 69 {
+		t.Fatalf("conditionDefs has %d defs, want 69 (50 prior + 5 self-healing wave + 4 wave-2 + 3 wave-3 + 5 wave-4 + 2 wave-5 latch→condition surface)",
 			len(conditionDefs))
 	}
 	// The cilium pair sits before the inode-pressure + W21 tail —
@@ -353,6 +353,78 @@ func TestWave4LatchConditions(t *testing.T) {
 			defaultReason: "NodeLocalDNSNoTrackOk",
 			defaultMsg:    "NodeLocalDNS raw NOTRACK iptables rules present on 169.254.20.10:53",
 			problemReason: "NodeLocalDNSNoTrackDriftDetected",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.latch, func(t *testing.T) {
+			e := fixture(t)
+			e.cycle()
+
+			c := e.cond(t, corev1.NodeConditionType(tc.condType))
+			if c.Status != corev1.ConditionFalse || c.Reason != tc.defaultReason || c.Message != tc.defaultMsg {
+				t.Fatalf("baseline %s = {%s %q %q}, want {False %q %q}",
+					tc.condType, c.Status, c.Reason, c.Message, tc.defaultReason, tc.defaultMsg)
+			}
+			if g := e.gauge(tc.condType, tc.problemReason); g != 0 {
+				t.Fatalf("baseline problem_gauge = %v, want 0", g)
+			}
+
+			e.writeFile(latchdefs.LatchFilePrefix+tc.latch, "1700000001\n")
+			e.cycle()
+
+			c = e.cond(t, corev1.NodeConditionType(tc.condType))
+			wantMsg := "watchdog state " + tc.latch + " active since 1700000001"
+			if c.Status != corev1.ConditionTrue || c.Reason != tc.problemReason || c.Message != wantMsg {
+				t.Fatalf("latched %s = {%s %q %q}, want {True %q %q}",
+					tc.condType, c.Status, c.Reason, c.Message, tc.problemReason, wantMsg)
+			}
+			if g := e.gauge(tc.condType, tc.problemReason); g != 1 {
+				t.Fatalf("latched problem_gauge = %v, want 1", g)
+			}
+
+			if err := os.Remove(filepath.Join(e.dir, latchdefs.LatchFilePrefix+tc.latch)); err != nil {
+				t.Fatal(err)
+			}
+			e.cycle()
+
+			c = e.cond(t, corev1.NodeConditionType(tc.condType))
+			if c.Status != corev1.ConditionFalse || c.Reason != tc.defaultReason || c.Message != tc.defaultMsg {
+				t.Fatalf("cleared %s = {%s %q %q}, want {False %q %q}",
+					tc.condType, c.Status, c.Reason, c.Message, tc.defaultReason, tc.defaultMsg)
+			}
+			if g := e.gauge(tc.condType, tc.problemReason); g != 0 {
+				t.Fatalf("cleared problem_gauge = %v, want 0", g)
+			}
+		})
+	}
+}
+
+// TestWave5LatchConditions verifies the 2 Wave 5 latch-to-condition contracts:
+// baseline False with DefaultReason/DefaultMessage, state-<latch> flips the
+// corresponding nodecond.Cond* to True with ProblemReason and gauge=1, and
+// removing the latch flips back to False with DefaultReason and gauge=0.
+func TestWave5LatchConditions(t *testing.T) {
+	cases := []struct {
+		latch         string
+		condType      string
+		defaultReason string
+		defaultMsg    string
+		problemReason string
+	}{
+		{
+			latch:         latchdefs.LatchK8s135ReadinessDrift,
+			condType:      nodecond.CondK8s135ReadinessDrift,
+			defaultReason: "K8s135ReadinessOk",
+			defaultMsg:    "cgroup v2 and kubelet/k0s configuration ready for Kubernetes 1.35+",
+			problemReason: "K8s135ReadinessDriftDetected",
+		},
+		{
+			latch:         latchdefs.LatchKMSv2Unhealthy,
+			condType:      nodecond.CondKMSv2Unhealthy,
+			defaultReason: "KMSv2Healthy",
+			defaultMsg:    "KMSv2 encryption provider socket and /healthz/kms-provider-* probes healthy",
+			problemReason: "KMSv2UnhealthyDetected",
 		},
 	}
 

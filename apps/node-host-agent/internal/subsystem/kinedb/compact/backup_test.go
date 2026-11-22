@@ -47,11 +47,12 @@ func TestEmitGuardChurn(t *testing.T) {
 
 func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 	rules := []testutil.ExecRule{
+		{Substr: "mktemp -d", Out: "/tmp/kine-backup.AbC123\n"},
 		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump", Out: ""},
 		{Substr: "pg_restore", Out: "; Archive created\n"},
 		{Substr: "cp pg:", Out: ""},
-		{Substr: "rm -f", Out: ""},
+		{Substr: "rm -rf", Out: ""},
 	}
 	k, fr, dir := fixture(t, rules)
 	bdir := filepath.Join(dir, "backups")
@@ -139,6 +140,7 @@ func TestBackupVerifyFreshDumpSkips(t *testing.T) {
 // age to the next interval — backupVerify recreates immediately.
 func TestBackupVerifyInvalidYoungDumpRecreates(t *testing.T) {
 	rules := []testutil.ExecRule{
+		{Substr: "mktemp -d", Out: "/tmp/kine-backup.AbC123\n"},
 		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump -Fc", Out: "dumped\n"},
 		{Substr: "pg_restore -l", Out: "ok\n"},
@@ -233,6 +235,7 @@ func TestBackupVerifyLowFreeSkips(t *testing.T) {
 // /tmp file, and publishes nothing.
 func TestBackupVerifyDumpFails(t *testing.T) {
 	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "mktemp -d", Out: "/tmp/kine-backup.AbC123\n"},
 		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump -Fc", Err: errors.New("out of memory")},
 	})
@@ -249,11 +252,11 @@ func TestBackupVerifyDumpFails(t *testing.T) {
 	if len(notes) != 1 || !strings.Contains(notes[0], "pg_dump-fail") {
 		t.Fatalf("notes=%v", notes)
 	}
-	// The partial container-side file is rm'd, and no pg_restore
+	// The partial container-side dir is rm -rf'd, and no pg_restore
 	// validation or cp followed.
 	j := fr.Joined()
-	if !fr.Ran("rm -f /tmp/kine-backup.dump") {
-		t.Fatalf("partial dump not cleaned:\n%s", j)
+	if !fr.Ran("rm -rf /tmp/kine-backup.AbC123") {
+		t.Fatalf("partial dump dir not cleaned:\n%s", j)
 	}
 	if strings.Contains(j, "pg_restore") || strings.Contains(j, "cp pg:") {
 		t.Fatalf("pipeline continued past the dump failure:\n%s", j)
@@ -263,6 +266,7 @@ func TestBackupVerifyDumpFails(t *testing.T) {
 // A failed pg_restore -l listing rejects the dump — no host copy.
 func TestBackupVerifyValidateFails(t *testing.T) {
 	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "mktemp -d", Out: "/tmp/kine-backup.AbC123\n"},
 		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump -Fc", Out: "dumped\n"},
 		{Substr: "pg_restore -l", Err: errors.New("invalid header")},
@@ -280,8 +284,8 @@ func TestBackupVerifyValidateFails(t *testing.T) {
 	if len(notes) != 1 || !strings.Contains(notes[0], "pg_restore-validate-fail") {
 		t.Fatalf("notes=%v", notes)
 	}
-	if !fr.Ran("rm -f /tmp/kine-backup.dump") {
-		t.Fatalf("container dump not cleaned:\n%s", fr.Joined())
+	if !fr.Ran("rm -rf /tmp/kine-backup.AbC123") {
+		t.Fatalf("container dump dir not cleaned:\n%s", fr.Joined())
 	}
 	if strings.Contains(fr.Joined(), "cp pg:") {
 		t.Fatal("invalid dump was copied to the host")
@@ -292,6 +296,7 @@ func TestBackupVerifyValidateFails(t *testing.T) {
 // nothing — the next cycle re-runs the whole pipeline.
 func TestBackupVerifyCpFails(t *testing.T) {
 	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "mktemp -d", Out: "/tmp/kine-backup.AbC123\n"},
 		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump -Fc", Out: "dumped\n"},
 		{Substr: "pg_restore -l", Out: "ok\n"},
@@ -419,6 +424,8 @@ func TestBackupVerifyPassesPGAppNameAndReleasesLock(t *testing.T) {
 	k.d.Cfg.Run = func(ctx context.Context, env, argv []string, stdin string) (string, error) {
 		joined := strings.Join(argv, " ")
 		switch {
+		case strings.Contains(joined, "mktemp -d"):
+			return "/tmp/kine-backup.AbC123\n", nil
 		case strings.Contains(stdin, "pg_try_advisory_lock"):
 			<-ctx.Done()
 			return "", ctx.Err()
@@ -516,6 +523,8 @@ func TestBackupVerifyReleasesLockAndReapsOrphanOnDumpTimeout(t *testing.T) {
 	k.d.Cfg.Run = func(ctx context.Context, _ []string, argv []string, stdin string) (string, error) {
 		joined := strings.Join(argv, " ")
 		switch {
+		case strings.Contains(joined, "mktemp -d"):
+			return "/tmp/kine-backup.AbC123\n", nil
 		case strings.Contains(stdin, "pg_try_advisory_lock"):
 			<-ctx.Done()
 			return "", ctx.Err()
@@ -554,6 +563,7 @@ func TestBackupVerifyReleasesLockAndReapsOrphanOnDumpTimeout(t *testing.T) {
 func TestBackupVerifyFutureMtimeSelfHeals(t *testing.T) {
 	now := time.Unix(1700000000, 0)
 	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "mktemp -d", Out: "/tmp/kine-backup.AbC123\n"},
 		{Substr: "pg_locks", Out: "1\n"},
 		{Substr: "pg_dump", Out: ""},
 		{Substr: "pg_restore", Out: "; Archive created\n"},
@@ -635,4 +645,85 @@ func TestBackupVerifyLockHoldFail(t *testing.T) {
 		t.Fatal("MaintMu left locked on backup-lock-hold-fail")
 	}
 	k.d.MaintMu.Unlock()
+}
+
+func TestBackupVerifyRejectsInvalidMktempAndUsesUmaskAndWithoutCancelCleanup(t *testing.T) {
+	t.Run("invalid_mktemp_output_rejected", func(t *testing.T) {
+		for _, bad := range []string{"", "/etc", "/tmp/kine-backup.ab", "/tmp/kine-backup.123456;rm -rf /", "/tmp/other.123456"} {
+			k, fr, dir := fixture(t, []testutil.ExecRule{
+				{Substr: "pg_locks", Out: "1\n"},
+				{Substr: "mktemp -d", Out: bad + "\n"},
+				{Substr: "pg_dump", Err: errors.New("must not run")},
+			})
+			k.d.Cfg.BackupDir = filepath.Join(dir, "backups")
+			k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+
+			var notes []string
+			k.backupVerify(context.Background(), "pg", "postgres", "secret", &Result{}, func(s string) {
+				notes = append(notes, s)
+			})
+			if len(notes) != 1 || !strings.Contains(notes[0], "backup-mktemp-invalid") {
+				t.Fatalf("bad=%q notes=%v", bad, notes)
+			}
+			if strings.Contains(fr.Joined(), "pg_dump") || strings.Contains(fr.Joined(), "rm -rf") {
+				t.Fatalf("bad=%q unexpectedly ran pg_dump/rm:\n%s", bad, fr.Joined())
+			}
+		}
+	})
+
+	t.Run("umask077_positional_args_and_without_cancel_cleanup", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		k, _, dir := fixture(t, nil)
+		k.d.Cfg.BackupDir = filepath.Join(dir, "backups")
+		k.d.Cfg.StatFSFn = func(string) (float64, error) { return 0.9, nil }
+
+		var dumpArgv []string
+		var rmRan, rmCtxAlive bool
+		var rmTarget string
+		k.d.Cfg.Run = func(cctx context.Context, _ []string, argv []string, stdin string) (string, error) {
+			joined := strings.Join(argv, " ")
+			switch {
+			case strings.Contains(joined, "mktemp -d"):
+				return "/tmp/kine-backup.XyZ789\n", nil
+			case strings.Contains(stdin, "pg_try_advisory_lock"):
+				<-cctx.Done()
+				return "", cctx.Err()
+			case strings.Contains(joined, "pg_locks"):
+				return "1\n", nil
+			case strings.Contains(joined, "sh -c") && strings.Contains(joined, "pg_dump -Fc"):
+				dumpArgv = append([]string(nil), argv...)
+				// Cancel caller ctx right during pg_dump failure so defer cleanup
+				// must use context.WithoutCancel.
+				cancel()
+				return "", context.Canceled
+			case strings.Contains(joined, "rm -rf"):
+				rmRan = true
+				rmCtxAlive = cctx.Err() == nil
+				_, hasDL := cctx.Deadline()
+				if !hasDL {
+					t.Error("rm -rf cleanup ctx missing timeout")
+				}
+				rmTarget = argv[len(argv)-1]
+				return "", nil
+			default:
+				return "", nil
+			}
+		}
+
+		k.backupVerify(ctx, "pg", "user$1", "secret", &Result{}, func(string) {})
+
+		if len(dumpArgv) == 0 {
+			t.Fatal("pg_dump command did not run")
+		}
+		joined := strings.Join(dumpArgv, " ")
+		if !strings.Contains(joined, "umask 077 && exec pg_dump -Fc") {
+			t.Fatalf("pg_dump missing umask 077 positional invocation: %v", dumpArgv)
+		}
+		if dumpArgv[len(dumpArgv)-2] != "user$1" || dumpArgv[len(dumpArgv)-1] != "/tmp/kine-backup.XyZ789/kine.dump" {
+			t.Fatalf("pg_dump positional args = %v", dumpArgv)
+		}
+		if !rmRan || !rmCtxAlive || rmTarget != "/tmp/kine-backup.XyZ789" {
+			t.Fatalf("cleanup rmRan=%v rmCtxAlive=%v rmTarget=%q", rmRan, rmCtxAlive, rmTarget)
+		}
+	})
 }

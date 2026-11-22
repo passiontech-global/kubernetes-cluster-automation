@@ -1,12 +1,16 @@
 // fsutil.go — the du/find equivalents the buckets are built on:
-// Lstat'd dir checks, allocated-block disk usage (du -sk semantics),
-// oldest-first candidate listings and the chmod -R u+w walker.
+// *os.Root-pinned dir checks (no symlink escape), allocated-block
+// disk usage (du -sk semantics), oldest-first candidate listings,
+// O_NOFOLLOW unlink/rmdir and the chmod -R u+w walker.
 package concoursecache
 
 import (
 	"cmp"
 	"context"
+	"fmt"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,20 +22,75 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/concourse"
 )
 
-func enforceDirPermsFD(path string, uid, gid int, mode os.FileMode) error {
-	return concourse.EnforcePermsFD(path, false, uid, gid, mode, nil)
+// openDirRootNoSymlink verifies via Lstat + OpenRoot + SameFile that
+// dirPath is a real directory (never a symlink) and returns a handle
+// pinned to that inode.
+func openDirRootNoSymlink(dirPath string) (*os.Root, error) {
+	lfi, err := os.Lstat(dirPath)
+	if err != nil {
+		return nil, err
+	}
+	if lfi.Mode()&os.ModeSymlink != 0 || !lfi.IsDir() {
+		return nil, fmt.Errorf("%s: not a real directory", dirPath)
+	}
+	root, err := os.OpenRoot(dirPath)
+	if err != nil {
+		return nil, err
+	}
+	rfi, err := root.Stat(".")
+	if err != nil || !os.SameFile(lfi, rfi) {
+		_ = root.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%s: directory swapped during open", dirPath)
+	}
+	return root, nil
 }
 
-// isDir is the script's `[ -d "$d" ]` guard — but Lstat, not Stat:
-// unlike the worker-container original, this pruner resolves on the
-// HOST fs, so a CI task planting `<bucket> -> /etc/...` must not turn
-// root chown/chmod/rm into a host-file takeover gadget.
-func isDir(path string) bool {
-	fi, err := os.Lstat(path)
-	return err == nil && fi.IsDir()
+// openSubRootNoSymlink opens rel inside parent without following an
+// escaping OR intra-root symlink at rel (Lstat + OpenRoot + SameFile).
+func openSubRootNoSymlink(parent *os.Root, rel string) (*os.Root, error) {
+	lfi, err := parent.Lstat(rel)
+	if err != nil {
+		return nil, err
+	}
+	if lfi.Mode()&os.ModeSymlink != 0 || !lfi.IsDir() {
+		return nil, fmt.Errorf("%s: not a real directory", rel)
+	}
+	sub, err := parent.OpenRoot(rel)
+	if err != nil {
+		return nil, err
+	}
+	rfi, err := sub.Stat(".")
+	if err != nil || !os.SameFile(lfi, rfi) {
+		_ = sub.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%s: directory swapped during open", rel)
+	}
+	return sub, nil
 }
 
-// cacheFile is one prune candidate: path + mtime + apparent size.
+func enforceDirPermsRootFD(root *os.Root, rel string, uid, gid int, mode os.FileMode) error {
+	return concourse.EnforcePermsRootFD(root, rel, false, uid, gid, mode, nil)
+}
+
+// unlinkRootNoFollow removes rel inside root without following ANY
+// symlink in intermediate components or at the leaf.
+func unlinkRootNoFollow(root *os.Root, rel string, flags int) error {
+	clean := path.Clean(filepath.ToSlash(rel))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+		return fmt.Errorf("invalid relative path %q", rel)
+	}
+	dir, base := path.Dir(clean), path.Base(clean)
+	return concourse.WithNoFollowRootFD(root, dir, false, func(parentFd int, _ *unix.Stat_t) error {
+		return unix.Unlinkat(parentFd, base, flags)
+	})
+}
+
+// cacheFile is one prune candidate: path (root-relative) + mtime + allocated blocks.
 type cacheFile struct {
 	path    string
 	size    int64
@@ -54,21 +113,30 @@ func entryBlocks(info os.FileInfo) uint64 {
 // diskUsage is du -sk×1024: allocated blocks (st_blocks×512) summed
 // over the tree INCLUDING the directories themselves — never apparent
 // size, so sparse files measure like du does.
-func diskUsage(ctx context.Context, root string) uint64 {
+func diskUsage(ctx context.Context, rootPath string) uint64 {
+	root, err := openDirRootNoSymlink(rootPath)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = root.Close() }()
+	return diskUsageRoot(ctx, root)
+}
+
+func diskUsageRoot(ctx context.Context, root *os.Root) uint64 {
 	var total uint64
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	_ = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
 		if err != nil {
 			logger().Debug("du: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		info, err := d.Info()
 		if err != nil {
 			logger().Debug("du: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		total += entryBlocks(info)
@@ -81,30 +149,40 @@ func diskUsage(ctx context.Context, root string) uint64 {
 // split the size caps need — one tree walk instead of a du per
 // <key>/<cksum> dir. perDir is keyed by the component NAME under
 // root (dirs AND loose files count; the caps only look up dirs).
-func diskUsageByTopDir(ctx context.Context, root string) (total uint64, perDir map[string]uint64) {
+func diskUsageByTopDir(ctx context.Context, rootPath string) (total uint64, perDir map[string]uint64) {
+	root, err := openDirRootNoSymlink(rootPath)
+	if err != nil {
+		return 0, map[string]uint64{}
+	}
+	defer func() { _ = root.Close() }()
+	return diskUsageByTopDirRoot(ctx, root)
+}
+
+func diskUsageByTopDirRoot(ctx context.Context, root *os.Root) (total uint64, perDir map[string]uint64) {
 	perDir = map[string]uint64{}
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	_ = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
 		if err != nil {
 			logger().Debug("du: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		info, err := d.Info()
 		if err != nil {
 			logger().Debug("du: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		sz := entryBlocks(info)
 		total += sz
-		if rel, rerr := filepath.Rel(root, path); rerr == nil && rel != "." {
-			if i := strings.IndexByte(rel, os.PathSeparator); i >= 0 {
-				rel = rel[:i]
+		if rel != "." {
+			top := rel
+			if i := strings.IndexByte(top, '/'); i >= 0 {
+				top = top[:i]
 			}
-			perDir[rel] += sz
+			perDir[top] += sz
 		}
 		return nil
 	})
@@ -117,15 +195,24 @@ func diskUsageByTopDir(ctx context.Context, root string) (total uint64, perDir m
 // it against diskUsage totals and the size marks, which are all du-style
 // st_blocks×512 — mixing units would let sparse files (huge apparent
 // size, tiny footprint) blow the cap math and misreport bytesFreed.
-func filesByAge(ctx context.Context, root string) []cacheFile {
+func filesByAge(ctx context.Context, rootPath string) []cacheFile {
+	root, err := openDirRootNoSymlink(rootPath)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = root.Close() }()
+	return filesByAgeRoot(ctx, root)
+}
+
+func filesByAgeRoot(ctx context.Context, root *os.Root) []cacheFile {
 	var out []cacheFile
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	_ = fs.WalkDir(root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
 		if err != nil {
 			logger().Debug("find: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		if d.IsDir() || !d.Type().IsRegular() {
@@ -133,7 +220,7 @@ func filesByAge(ctx context.Context, root string) []cacheFile {
 		}
 		if info, err := d.Info(); err == nil {
 			out = append(out, cacheFile{
-				path:    path,
+				path:    rel,
 				size:    int64(entryBlocks(info)),
 				modTime: info.ModTime(),
 			})
@@ -148,16 +235,25 @@ func filesByAge(ctx context.Context, root string) []cacheFile {
 
 // topLevelDirsByAge lists first-level dirs sorted oldest-first —
 // `find -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -n`.
-func topLevelDirsByAge(root string) []cacheFile {
+func topLevelDirsByAge(rootPath string) []cacheFile {
+	root, err := openDirRootNoSymlink(rootPath)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = root.Close() }()
+	return topLevelDirsByAgeRoot(root)
+}
+
+func topLevelDirsByAgeRoot(root *os.Root) []cacheFile {
 	var out []cacheFile
-	if entries, err := os.ReadDir(root); err == nil {
+	if entries, err := fs.ReadDir(root.FS(), "."); err == nil {
 		for _, e := range entries {
-			if !e.IsDir() {
+			if !e.IsDir() || e.Type()&fs.ModeSymlink != 0 {
 				continue
 			}
 			if info, err := e.Info(); err == nil {
 				out = append(out, cacheFile{
-					path:    filepath.Join(root, e.Name()),
+					path:    e.Name(),
 					modTime: info.ModTime(),
 				})
 			}
@@ -175,45 +271,61 @@ func topLevelDirsByAge(root string) []cacheFile {
 // when removal FAILS does it walk once, u+w-ing DIRECTORIES only
 // (removal permission lives on the containing dir — a file's own
 // mode never matters for rm), then retries RemoveAll once.
-func removeTree(root string) error {
-	if err := os.RemoveAll(root); err == nil {
+func removeTree(targetPath string) error {
+	parent, err := openDirRootNoSymlink(filepath.Dir(targetPath))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Close() }()
+	return removeTreeRoot(parent, filepath.Base(targetPath))
+}
+
+func removeTreeRoot(parent *os.Root, rel string) error {
+	if err := parent.RemoveAll(rel); err == nil {
 		return nil
 	}
-	makeWritableDirs(root)
-	return os.RemoveAll(root)
+	makeWritableDirsRoot(parent, rel)
+	return parent.RemoveAll(rel)
 }
 
 // makeWritableDirs adds u+w to every DIRECTORY under root —
 // node-deps subdirs can be read-only (bun install chmod a-w), which
-// defeats rm -rf. DirEntry.IsDir is Lstat-based and WalkDir never
-// descends into symlinked dirs, so links and their targets are
-// never touched: os.Chmod follows links, and running as root in a
-// CI-owned tree makes a planted `dir -> /etc` a host-chmod gadget.
-// Files are skipped — their mode is irrelevant to removal.
-func makeWritableDirs(root string) {
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+// defeats rm -rf. WalkDir over *os.Root never descends into symlinked
+// dirs, and chmodDirWritableRootFD opens each dir via O_NOFOLLOW
+// relative to the pinned root so neither escaping nor intra-root
+// symlinks can ever be followed or chmodded.
+func makeWritableDirs(rootPath string) {
+	parent, err := openDirRootNoSymlink(filepath.Dir(rootPath))
+	if err != nil {
+		return
+	}
+	defer func() { _ = parent.Close() }()
+	makeWritableDirsRoot(parent, filepath.Base(rootPath))
+}
+
+func makeWritableDirsRoot(parent *os.Root, rel string) {
+	sub, err := openSubRootNoSymlink(parent, rel)
+	if err != nil {
+		return
+	}
+	defer func() { _ = sub.Close() }()
+	_ = fs.WalkDir(sub.FS(), ".", func(subRel string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil //nolint:nilerr // unreadable entries are skipped, never fatal
 		}
 		if !d.IsDir() {
 			return nil
 		}
-		chmodDirWritableFD(path)
+		chmodDirWritableRootFD(sub, subRel)
 		return nil
 	})
 }
 
-// chmodDirWritableFD adds u+w to a directory WITHOUT re-resolving
-// the path — the path-based os.Chmod had a swap window: on a
-// CI-controlled 0777 tree an actor can replace a verified entry
-// with `<entry> -> /etc` between WalkDir's Lstat and the chmod,
-// turning the root perm pass into a host-file privilege gadget
-// (the same class enforceDirPermsFD closes for the perm pass). The
-// dir is opened O_NOFOLLOW (a swapped-in symlink fails the open),
-// fstat'd to confirm the fd still is a plain directory, then
-// Fchmod'd — only the held inode's mode ever changes.
-func chmodDirWritableFD(path string) {
-	_ = concourse.WithNoFollowFD(path, false, func(fd int, st *unix.Stat_t) error {
+// chmodDirWritableRootFD adds u+w to a directory WITHOUT re-resolving
+// the path or following any symlink (escaping or intra-root) via
+// concourse.WithNoFollowRootFD + unix.Fchmod.
+func chmodDirWritableRootFD(root *os.Root, rel string) {
+	_ = concourse.WithNoFollowRootFD(root, rel, false, func(fd int, st *unix.Stat_t) error {
 		return unix.Fchmod(fd, (st.Mode&0o7777)|0o200)
 	})
 }

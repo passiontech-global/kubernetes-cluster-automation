@@ -122,11 +122,11 @@ func downloadFileBounded(ctx context.Context, url, dst, wantSHA256 string,
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	tmp := dst + ".dl"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(filepath.Dir(dst), ".dl-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	h := sha256.New()
 	// One byte past the cap: n > max means the artifact is over the
 	// budget (the extra byte is discarded with the swept tmp, never
@@ -172,7 +172,22 @@ func UntarInstall(tgz, member, dst string, mode os.FileMode) error {
 	return untarInstallBounded(tgz, member, dst, mode, defaultMaxArtifactBytes)
 }
 
+// UntarInstallVerified opens tgz once, verifies its SHA-256 against
+// wantSHA256 on that open *os.File fd, seeks back to offset 0, and
+// extracts member to dst atomically — closing the hash-to-untar TOCTOU
+// window.
+func UntarInstallVerified(tgz, wantSHA256, member, dst string, mode os.FileMode) error {
+	if wantSHA256 == "" {
+		return fmt.Errorf("untar %s: missing sha256 pin", tgz)
+	}
+	return untarInstallVerifiedBounded(tgz, wantSHA256, member, dst, mode, defaultMaxArtifactBytes)
+}
+
 func untarInstallBounded(tgz, member, dst string, mode os.FileMode, maxBytes int64) error {
+	return untarInstallVerifiedBounded(tgz, "", member, dst, mode, maxBytes)
+}
+
+func untarInstallVerifiedBounded(tgz, wantSHA256, member, dst string, mode os.FileMode, maxBytes int64) error {
 	f, err := os.Open(tgz)
 	if err != nil {
 		return err
@@ -180,6 +195,18 @@ func untarInstallBounded(tgz, member, dst string, mode os.FileMode, maxBytes int
 	// Drop the archive's read-behind pages on the way out — the tgz
 	// is only scanned once per install.
 	defer func() { pagecache.Drop(f); _ = f.Close() }()
+	if wantSHA256 != "" {
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			return err
+		}
+		if !strings.EqualFold(wantSHA256, hex.EncodeToString(h.Sum(nil))) {
+			return fmt.Errorf("untar %s: sha256 mismatch", tgz)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+	}
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return err
@@ -192,6 +219,12 @@ func untarInstallBounded(tgz, member, dst string, mode os.FileMode, maxBytes int
 			return fmt.Errorf("%s not found in %s", member, tgz)
 		}
 		if filepath.Base(hd.Name) == member {
+			if hd.Typeflag == tar.TypeDir {
+				continue
+			}
+			if hd.Typeflag != tar.TypeReg {
+				return fmt.Errorf("untar %s: member %s is not a regular file (type %q)", tgz, member, hd.Typeflag)
+			}
 			return installMember(tr, dst, mode, maxBytes)
 		}
 	}

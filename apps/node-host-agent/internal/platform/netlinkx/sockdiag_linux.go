@@ -182,6 +182,8 @@ func walkNLMsgs(buf []byte, destroyCtx bool, onPayload func(payload []byte)) (se
 }
 
 func parseDiagCensus(buf []byte, out *TCPCensus) (bool, error) {
+	var counts4 map[[6]byte]int
+	var counts6 map[[18]byte]int
 	_, done, err := walkNLMsgs(buf, false, func(payload []byte) {
 		// inet_diag_msg: family@0, state@1, sockid@4 —
 		// dport (BE) at sockid+2, daddr at sockid+20 (4 bytes
@@ -191,20 +193,38 @@ func parseDiagCensus(buf []byte, out *TCPCensus) (bool, error) {
 		if len(payload) < diagMsg {
 			return
 		}
-		if payload[0] == unix.AF_INET || payload[0] == unix.AF_INET6 {
+		switch payload[0] {
+		case unix.AF_INET:
+			out.States[payload[1]]++
+			var kb [6]byte
+			copy(kb[:4], payload[24:28])
+			copy(kb[4:], payload[6:8])
+			if counts4 == nil {
+				counts4 = make(map[[6]byte]int, 32)
+			}
+			counts4[kb]++
+		case unix.AF_INET6:
 			out.States[payload[1]]++
 			var kb [18]byte
-			k := kb[:6]
-			if payload[0] == unix.AF_INET6 {
-				k = kb[:18]
-				copy(kb[:16], payload[24:40])
-			} else {
-				copy(kb[:4], payload[24:28])
+			copy(kb[:16], payload[24:40])
+			copy(kb[16:], payload[6:8])
+			if counts6 == nil {
+				counts6 = make(map[[18]byte]int, 16)
 			}
-			copy(k[len(k)-2:], payload[6:8])
-			out.PerTuple[string(k)]++
+			counts6[kb]++
 		}
 	})
+	if len(counts4) > 0 || len(counts6) > 0 {
+		if out.PerTuple == nil {
+			out.PerTuple = make(map[string]int, len(counts4)+len(counts6))
+		}
+		for k, n := range counts4 {
+			out.PerTuple[string(k[:])] += n
+		}
+		for k, n := range counts6 {
+			out.PerTuple[string(k[:])] += n
+		}
+	}
 	return done, err
 }
 

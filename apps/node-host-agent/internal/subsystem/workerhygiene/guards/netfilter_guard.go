@@ -50,6 +50,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -175,14 +176,24 @@ type stuckNetfilterProc struct {
 // process parked on flock() shows S, not D) + age >= HungCmdSec.
 // unreadable marks PIDs whose stat or cmdline failed with !ENOENT so
 // callers preserve their confirmation streaks and abort.
-func (c *NetfilterGuardCheck) scanStuck(now time.Time,
+func (c *NetfilterGuardCheck) scanStuck(e *wdeps.CycleEnv, now time.Time,
 	pids []int) (out []stuckNetfilterProc, unreadable map[int]bool, inconclusive bool) {
 	minAge := time.Duration(c.d.Cfg.Wave2.NetfilterGuardHungCmdSec) * time.Second
 	if minAge <= 0 {
 		minAge = 60 * time.Second
 	}
+	var statsSnap map[int]procfs.Stat
+	if e != nil && e.StatsOnce != nil {
+		statsSnap = e.StatsOnce()
+	}
 	for _, pid := range pids {
-		st, ok := c.d.Proc.Stat(pid)
+		var st procfs.Stat
+		var ok bool
+		if statsSnap != nil {
+			st, ok = statsSnap[pid]
+		} else {
+			st, ok = c.d.Proc.Stat(pid)
+		}
 		if !ok {
 			if statNonENOENT(c.d, pid) {
 				if unreadable == nil {
@@ -328,7 +339,7 @@ func (c *NetfilterGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if interval > 0 {
 		c.lastScan = scanNow
 	}
-	stuck, unreadable, scanInconclusive := c.scanStuck(c.d.Cfg.Seams.Host.Clock.Now(), pids)
+	stuck, unreadable, scanInconclusive := c.scanStuck(e, c.d.Cfg.Seams.Host.Clock.Now(), pids)
 	held, lockOK := c.lockHeld()
 
 	// Per-pid consecutive-cycle confirmation — a pid must qualify

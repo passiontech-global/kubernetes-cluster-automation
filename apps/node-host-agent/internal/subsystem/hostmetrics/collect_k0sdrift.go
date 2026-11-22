@@ -25,30 +25,46 @@ import (
 type k0sDriftCache struct {
 	mu     sync.Mutex
 	loaded bool
+	path   string
 	mtime  time.Time
 	size   int64
+	mode   os.FileMode
 	data   []byte
 	parsed map[string]any
 	ok     bool
 }
 
 // get returns the raw bytes and parsed form of the k0s.yaml at
-// path, re-reading only when the file's mtime+size changed since
-// the last call. ok=false means the file was unreadable or
-// unparseable at read time — the caller keeps the old drift=1
-// "unreadable" finding.
-func (s *k0sDriftCache) get(path string) (data []byte,
+// path, re-reading only when the file's path/mtime/size/mode changed
+// since the last call. ok=false means the file was unreadable,
+// non-regular, oversized, escaped HostRoot, or unparseable — the
+// caller keeps the old drift=1 "unreadable" finding. File open/read/
+// parse happens outside s.mu so slow/failing I/O never stalls readers.
+func (s *k0sDriftCache) get(hostRoot, path string) (data []byte,
 	parsed map[string]any, ok bool) {
-	fi, err := os.Stat(path)
+	resolved, err := k0sconfig.ConfinedHostPath(hostRoot, path)
+	if err != nil {
+		logger().Debug("hostmetrics: k0s config path rejected — "+
+			"drift reports {unreadable,k0s.yaml}",
+			"path", path,
+			"error", err)
+		return nil, nil, false
+	}
+	fi, err := os.Stat(resolved)
 	if err != nil {
 		return nil, nil, false // gone/un-statable → never serve cache
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.loaded && fi.ModTime().Equal(s.mtime) && fi.Size() == s.size {
-		return s.data, s.parsed, s.ok
+	if s.loaded && s.path == resolved &&
+		fi.ModTime().Equal(s.mtime) && fi.Size() == s.size &&
+		fi.Mode() == s.mode {
+		data, parsed, ok = s.data, s.parsed, s.ok
+		s.mu.Unlock()
+		return data, parsed, ok
 	}
-	data, err = os.ReadFile(path)
+	s.mu.Unlock()
+
+	data, err = k0sconfig.ReadConfigBounded(resolved, k0sconfig.MaxConfigBytes)
 	var p map[string]any
 	var uerr error
 	if err == nil {
@@ -60,19 +76,26 @@ func (s *k0sDriftCache) get(path string) (data []byte,
 		if cause == nil {
 			cause = uerr
 		}
-		// Cached per mtime+size — this fires once per file change,
+		data = nil
+		p = nil
+		// Cached per mtime+size+mode — this fires once per file change,
 		// not once per scrape.
 		logger().Debug("hostmetrics: k0s config unreadable/unparseable — "+
 			"drift reports {unreadable,k0s.yaml}",
-			"path", path,
+			"path", resolved,
 			"error", cause)
 	}
+
+	s.mu.Lock()
 	s.loaded = true
+	s.path = resolved
 	s.mtime = fi.ModTime()
 	s.size = fi.Size()
+	s.mode = fi.Mode()
 	s.data = data
 	s.parsed = p
 	s.ok = ok
+	s.mu.Unlock()
 	return data, p, ok
 }
 
@@ -92,7 +115,7 @@ func (c *Collector) collectK0sDrift(ch chan<- prometheus.Metric) {
 	if _, err := os.Stat(c.cfg.K0sUnitFile); err != nil {
 		return // not a k0s controller → no series
 	}
-	data, parsed, ok := c.k0s.get(c.cfg.K0sConfigFile)
+	data, parsed, ok := c.k0s.get(c.cfg.HostRoot, c.cfg.K0sConfigFile)
 	findings := k0sconfig.Scan(data, parsed, ok, c.removedFlagRe,
 		c.expectedKCM, c.cfg.ExpectedKCMArgs)
 	if len(findings) == 0 {

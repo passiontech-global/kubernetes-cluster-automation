@@ -5,9 +5,13 @@
 package cilium
 
 import (
+	"bytes"
 	"context"
-	json "encoding/json/v2"
+	"encoding/json/jsontext"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -144,60 +148,199 @@ var ciliumBPFMapCritical = map[string]bool{
 // with no readable used+max pair is skipped — pressure can only be
 // claimed on both numbers.
 func ParseCiliumBPFMaps(body []byte) map[string][2]int64 {
-	var top any
-	if json.Unmarshal(body, &top) != nil {
+	dec := jsontext.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.ReadToken()
+	if err != nil {
 		return nil
 	}
-	numOf := func(m map[string]any, keys ...string) (int64, bool) {
-		for _, k := range keys {
-			if f, ok := m[k].(float64); ok {
-				return int64(f), true
+	out := map[string][2]int64{}
+	if err := walkBPFMapsValue(dec, tok, out); err != nil {
+		return nil
+	}
+	if _, err := dec.ReadToken(); !errors.Is(err, io.EOF) {
+		return nil
+	}
+	return out
+}
+
+func jsonTokenInt64(tok jsontext.Token) (int64, error) {
+	if tok.Kind() != '0' {
+		return 0, fmt.Errorf("unexpected JSON token kind %v", tok.Kind())
+	}
+	if v, err := tok.Int(); err == nil {
+		return v, nil
+	}
+	f, err := tok.Float()
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, fmt.Errorf("non-finite JSON number %v", f)
+	}
+	// 0x1p63 == float64(math.MaxInt64) because IEEE-754 float64 rounds
+	// 2^63-1 up to 2^63; int64(0x1p63) wraps to math.MinInt64. Clamp
+	// outside (-2^63, 2^63) so saturation never flips sign.
+	const maxInt64Float = 0x1p63
+	if f >= maxInt64Float {
+		return math.MaxInt64, nil
+	}
+	if f <= -maxInt64Float {
+		return math.MinInt64, nil
+	}
+	return int64(f), nil
+}
+
+func countJSONArray(dec *jsontext.Decoder) (int64, error) {
+	var count int64
+	for dec.PeekKind() != ']' {
+		if err := dec.SkipValue(); err != nil {
+			return 0, err
+		}
+		count++
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func walkBPFMapsValue(dec *jsontext.Decoder, tok jsontext.Token, out map[string][2]int64) error {
+	switch tok.Kind() {
+	case '[':
+		for dec.PeekKind() != ']' {
+			elemTok, err := dec.ReadToken()
+			if err != nil {
+				return err
+			}
+			if err := walkBPFMapsValue(dec, elemTok, out); err != nil {
+				return err
 			}
 		}
-		return 0, false
-	}
-	out := map[string][2]int64{}
-	var walk func(n any)
-	walk = func(n any) {
-		switch t := n.(type) {
-		case []any:
-			for _, e := range t {
-				walk(e)
+		_, err := dec.ReadToken()
+		return err
+	case '{':
+		var name, path string
+		var usedVal, entriesNumVal, countVal int64
+		var hasUsed, hasEntriesNum, hasCount bool
+		var cacheLen, entriesArrLen int64
+		var hasCacheArr, hasEntriesArr bool
+		var maxVal, maxSizeVal, maxDashVal, capVal, sizeVal int64
+		var hasMax, hasMaxSize, hasMaxDash, hasCap, hasSize bool
+
+		for dec.PeekKind() != '}' {
+			keyTok, err := dec.ReadToken()
+			if err != nil {
+				return err
 			}
-		case map[string]any:
-			name, _ := t["name"].(string)
-			if name == "" {
-				if p, _ := t["path"].(string); p != "" {
-					name = filepath.Base(p)
-				}
+			key := keyTok.String()
+			valTok, err := dec.ReadToken()
+			if err != nil {
+				return err
 			}
-			if name != "" && ciliumBPFMapCritical[name] {
-				used, uok := numOf(t, "used", "entries", "count")
-				if !uok {
-					// Entry arrays carry the live count as their
-					// length ("cache" on the /v1/map wire;
-					// "entries" on some dumps).
-					for _, k := range []string{"cache", "entries"} {
-						if arr, ok := t[k].([]any); ok {
-							used, uok = int64(len(arr)), true
-							break
-						}
+			switch valTok.Kind() {
+			case '[':
+				switch key {
+				case "cache":
+					n, err := countJSONArray(dec)
+					if err != nil {
+						return err
+					}
+					cacheLen, hasCacheArr = n, true
+				case "entries":
+					n, err := countJSONArray(dec)
+					if err != nil {
+						return err
+					}
+					entriesArrLen, hasEntriesArr = n, true
+				default:
+					if err := walkBPFMapsValue(dec, valTok, out); err != nil {
+						return err
 					}
 				}
-				max, mok := numOf(t, "max", "maxSize", "max-size", "capacity", "size")
-				if uok && mok && max > 0 {
-					out[name] = [2]int64{used, max}
+			case '{':
+				if err := walkBPFMapsValue(dec, valTok, out); err != nil {
+					return err
+				}
+			case '"':
+				switch key {
+				case "name":
+					name = valTok.String()
+				case "path":
+					path = valTok.String()
+				}
+			case '0':
+				n, err := jsonTokenInt64(valTok)
+				if err != nil {
+					return err
+				}
+				switch key {
+				case "used":
+					usedVal, hasUsed = n, true
+				case "entries":
+					entriesNumVal, hasEntriesNum = n, true
+				case "count":
+					countVal, hasCount = n, true
+				case "max":
+					maxVal, hasMax = n, true
+				case "maxSize":
+					maxSizeVal, hasMaxSize = n, true
+				case "max-size":
+					maxDashVal, hasMaxDash = n, true
+				case "capacity":
+					capVal, hasCap = n, true
+				case "size":
+					sizeVal, hasSize = n, true
 				}
 			}
-			// Map collections may be nested under "maps"/
-			// "dynamicMaps"/"staticMaps" keys.
-			for _, v := range t {
-				walk(v)
+		}
+		if _, err := dec.ReadToken(); err != nil {
+			return err
+		}
+		if name == "" && path != "" {
+			name = filepath.Base(path)
+		}
+		if name != "" && ciliumBPFMapCritical[name] {
+			var used int64
+			var uok bool
+			switch {
+			case hasUsed:
+				used, uok = usedVal, true
+			case hasEntriesNum:
+				used, uok = entriesNumVal, true
+			case hasCount:
+				used, uok = countVal, true
+			case hasCacheArr:
+				used, uok = cacheLen, true
+			case hasEntriesArr:
+				used, uok = entriesArrLen, true
+			}
+			var maxCap int64
+			var mok bool
+			switch {
+			case hasMax:
+				maxCap, mok = maxVal, true
+			case hasMaxSize:
+				maxCap, mok = maxSizeVal, true
+			case hasMaxDash:
+				maxCap, mok = maxDashVal, true
+			case hasCap:
+				maxCap, mok = capVal, true
+			case hasSize:
+				maxCap, mok = sizeVal, true
+			}
+			if uok && mok && maxCap > 0 {
+				out[name] = [2]int64{used, maxCap}
 			}
 		}
+		return nil
+	default:
+		if tok.Kind() == '0' {
+			if _, err := jsonTokenInt64(tok); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	walk(top)
-	return out
 }
 
 // CheckBPFMaps reads the map fill ratios off the agent socket

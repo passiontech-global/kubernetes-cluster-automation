@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/apiserver"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
@@ -283,5 +284,32 @@ func TestKCMSnapshotNaNMarshalSkips(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"depth_sum":0`) {
 		t.Fatalf("NaN sample leaked into snapshot: %s", b)
+	}
+}
+
+func TestKCMSnapshotRoundTripTriggersStall(t *testing.T) {
+	e := fixture(t)
+	e.H.Cfg.CPHealthFn = func(context.Context, string) bool { return true }
+	e.H.Cfg.KCMMetricsFn = func(context.Context, string) (string, error) {
+		return stalledKCMBody, nil
+	}
+	e.Alive["https://10.0.0.2:6443/readyz"] = true
+
+	// Cycle 1 persists snapshot via WriteFileAtomicNoSync.
+	e.H.Cycle(context.Background())
+	if e.HasState(cdeps.StateCPComponentFrozen) {
+		t.Fatal("frozen latched on initial baseline snapshot")
+	}
+
+	// Cycle 2 loads snapshot and compares against stalled metrics (arms kcmQuietSince).
+	e.Now = e.Now.Add(time.Minute)
+	e.H.Cycle(context.Background())
+	// Advance past QuietFor (10m) in <= 15m steps so consecutive snapshots stay valid.
+	e.Now = e.Now.Add(6 * time.Minute)
+	e.H.Cycle(context.Background())
+	e.Now = e.Now.Add(6 * time.Minute)
+	e.H.Cycle(context.Background())
+	if !e.HasState(cdeps.StateCPComponentFrozen) {
+		t.Fatal("cp-component-frozen not latched after NoSync snapshot round-trip")
 	}
 }

@@ -498,6 +498,108 @@ func TestLocalPVQuotaThrottle(t *testing.T) {
 	}
 }
 
+func TestLocalPVQuotaPrunesThrottledOnDirRemoval(t *testing.T) {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-prune1"},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: resource.MustParse("1Gi"),
+			},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+		Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: "pvc-prune1"},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "hog", Namespace: "default", UID: types.UID(wdepstest.UIDA)},
+		Spec: corev1.PodSpec{
+			NodeName: "node-a",
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	e := fixture(t, pv, pvc, pod)
+	h := e.H
+	ctx := context.Background()
+	prov := t.TempDir()
+	h.Cfg.Disk.LocalPVQuotaDir = prov
+	pvcDir := filepath.Join(prov, "pvc-prune1")
+	mkOverQuota := func() {
+		if err := os.MkdirAll(pvcDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		bf, err := os.Create(filepath.Join(pvcDir, "big.bin"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := bf.Truncate(1717986918); err != nil {
+			t.Fatal(err)
+		}
+		_ = bf.Close()
+	}
+	mkOverQuota()
+	e.Live[7777] = true
+	e.MkTask(t, wdepstest.UIDA, "hog", 7777)
+	e.DiskUsed = 0.85
+	tasks, _ := h.BuildTaskMap()
+	ce := &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		Pods:         []corev1.Pod{*pod},
+		TasksOnce:    func() (map[string][]wdeps.CtrTask, bool) { return tasks, true },
+	}
+	chk := wdepstest.Check[*runtime.LocalPVQuotaCheck](h, wdeps.CheckLocalPVQuota)
+
+	// Cycle 1: throttles pvc-prune1 once.
+	chk.Run(ctx, ce)
+	if h.LocalPVQuotaThrottled != 1 {
+		t.Fatalf("throttled=%d want 1", h.LocalPVQuotaThrottled)
+	}
+
+	// Cycle 2: unpressured while dir exists -> ledger kept, no re-throttle on next pressured run.
+	e.DiskUsed = 0.50
+	chk.Run(ctx, ce)
+	e.DiskUsed = 0.85
+	chk.Run(ctx, ce)
+	if h.LocalPVQuotaThrottled != 1 {
+		t.Fatalf("throttled=%d want 1 while pvc dir remained", h.LocalPVQuotaThrottled)
+	}
+
+	// Cycle 3 (non-root): EACCES on root aborts BEFORE pruning, preserving ledger.
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(prov, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		chk.Run(ctx, ce)
+		if err := os.Chmod(prov, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		chk.Run(ctx, ce)
+		if h.LocalPVQuotaThrottled != 1 {
+			t.Fatalf("throttled=%d want 1 (ReadDir EACCES must not prune)", h.LocalPVQuotaThrottled)
+		}
+	}
+
+	// Cycle 4: pvc-prune1 removed (len(candidates)==0) -> prunes ledger.
+	if err := os.RemoveAll(pvcDir); err != nil {
+		t.Fatal(err)
+	}
+	chk.Run(ctx, ce)
+
+	// Cycle 5: recreated pvc-prune1 over quota -> throttled again.
+	mkOverQuota()
+	chk.Run(ctx, ce)
+	if h.LocalPVQuotaThrottled != 2 {
+		t.Fatalf("throttled=%d want 2 after pvc dir removal pruned ledger", h.LocalPVQuotaThrottled)
+	}
+}
+
 // TestLocalPVQuotaNoDirsSkipsAPI — no pvc-* dir under the scan
 // roots → the cluster-wide PV/PVC lists never fire (sweeper parity).
 func TestLocalPVQuotaNoDirsSkipsAPI(t *testing.T) {

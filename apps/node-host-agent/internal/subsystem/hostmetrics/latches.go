@@ -101,6 +101,8 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 	if ratio, ok := c.kernelKeysUsedRatio(); ok {
 		l.updateKernelKeysLatch(ratio)
 	}
+	// K5: K8s 1.35+ cgroup v2 & kubelet/k0s.yaml readiness audit.
+	c.updateK8s135ReadinessLatch()
 	// Host sysctl writes (clocksource kvm-clock restore, aio-max-nr
 	// bump) — scrape-independent by design: Collect only READS, this
 	// 30s tick owns every host mutation (mutex + per-target
@@ -152,6 +154,9 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 		latchdefs.LatchNeighborPressure,
 		latchdefs.LatchHostNetworkProblems,
 		latchdefs.LatchHostKernelDrift,
+		// Wave-5 latches — K5 readiness drift and K10 KMSv2 unhealthy.
+		latchdefs.LatchK8s135ReadinessDrift,
+		latchdefs.LatchKMSv2Unhealthy,
 	} {
 		p := c.state.Path(name)
 		if fi, err := os.Stat(p); err == nil {

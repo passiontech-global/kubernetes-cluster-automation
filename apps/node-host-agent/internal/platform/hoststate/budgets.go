@@ -50,7 +50,24 @@ func (s *Store) Epoch(path string) int64 {
 // tmp+rename contract and reports whether the file landed. The
 // leading dot keeps the tmp name out of hostmetrics' state-* scan.
 func (s *Store) WriteEpochFile(path string, epoch int64) bool {
-	if err := writeEpochFile(path, epoch); err != nil {
+	return s.writeEpochFileWith(path, epoch, false)
+}
+
+// WriteEpochFileNoSync is WriteEpochFile minus the durability fsyncs
+// (tmp+rename atomicity and ENOSPC/EROFS RAM fallback preserved).
+// Reserved for ephemeral per-cycle stamps (last-rvc, last-prvc).
+func (s *Store) WriteEpochFileNoSync(path string, epoch int64) bool {
+	return s.writeEpochFileWith(path, epoch, true)
+}
+
+func (s *Store) writeEpochFileWith(path string, epoch int64, noSync bool) bool {
+	var err error
+	if noSync {
+		err = writeEpochFileNoSync(path, epoch)
+	} else {
+		err = writeEpochFile(path, epoch)
+	}
+	if err != nil {
 		// ENOSPC/EROFS: the disk cannot take the write but the
 		// state still has to work in-process — park the epoch in
 		// the RAM fallback table so Epoch/Exists keep answering.
@@ -266,15 +283,46 @@ func (s *Store) ConfirmMarker(marker string, minAge time.Duration) (firstSeen, c
 	return false, s.RateOK(marker, minAge)
 }
 
-// PruneMarkers clears any `<prefix>*` marker files whose extracted id
-// fails keep(id).
+// PruneMarkers clears any `<prefix>*` marker files (and RAM-only
+// lastSpent / ramEpochs entries) whose extracted id fails keep(id).
 func (s *Store) PruneMarkers(prefix string, keep func(id string) bool) {
-	ms, err := filepath.Glob(filepath.Join(s.Dir, prefix+"*"))
-	if err != nil {
+	if s == nil || s.shared == nil {
 		return
 	}
-	for _, m := range ms {
-		base := filepath.Base(m)
+	cleanDir := filepath.Clean(s.Dir)
+	candidates := map[string]struct{}{}
+	if ents, err := os.ReadDir(s.Dir); err == nil {
+		for _, ent := range ents {
+			if ent.IsDir() {
+				continue
+			}
+			name := ent.Name()
+			if strings.HasPrefix(name, prefix) {
+				candidates[name] = struct{}{}
+			}
+		}
+	}
+	spendPrefix := rateSpendKey(cleanDir, prefix)
+	s.shared.mu.Lock()
+	for k := range s.shared.lastSpent {
+		if id, ok := strings.CutPrefix(k, spendPrefix); ok {
+			candidates[prefix+id] = struct{}{}
+		}
+	}
+	s.shared.mu.Unlock()
+
+	s.shared.ramMu.RLock()
+	for k := range s.shared.ramEpochs {
+		if filepath.Dir(k) == cleanDir {
+			base := filepath.Base(k)
+			if base != "." && base != ".." && strings.HasPrefix(base, prefix) {
+				candidates[base] = struct{}{}
+			}
+		}
+	}
+	s.shared.ramMu.RUnlock()
+
+	for base := range candidates {
 		id := strings.TrimPrefix(base, prefix)
 		if keep != nil && keep(id) {
 			continue

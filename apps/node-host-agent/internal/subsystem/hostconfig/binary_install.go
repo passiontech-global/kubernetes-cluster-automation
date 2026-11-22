@@ -10,6 +10,8 @@ package hostconfig
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 // managedBinarySpec pins one downloaded artifact for
@@ -58,6 +60,12 @@ type managedBinarySpec struct {
 	// timeout floor); nil = r.download (Config.HTTPTimeout).
 	download func(ctx context.Context, url, dst, wantSHA256 string,
 		mode os.FileMode) error
+
+	// stagingDirMode, when non-zero, enforces MkdirAll + Chmod on
+	// filepath.Dir(staged) before checking/downloading into it (0o700
+	// for download staging dirs; MUST stay 0 for in-place targets like
+	// /usr/local/bin/kine or shared dirs like /var/lib/node-watchdog).
+	stagingDirMode os.FileMode
 
 	// downloadMode is the permission bits the STAGED file lands with
 	// (converge.DownloadFile pins the final mode before the rename).
@@ -120,6 +128,23 @@ type managedBinarySpec struct {
 	onInstalled func(c *cyc, local string)
 }
 
+func validStagedBasename(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") || strings.ContainsRune(name, '\x00') {
+		return false
+	}
+	return filepath.Base(name) == name
+}
+
+func ensureStagingDir(dir string, mode os.FileMode) error {
+	if err := os.MkdirAll(dir, mode); err != nil {
+		return err
+	}
+	return os.Chmod(dir, mode)
+}
+
 // installManagedBinary runs the shared sha256-pinned artifact flow:
 // version probe → staged sha256 check → download → install. A staged
 // copy matching the pin skips the download entirely; whether a bad
@@ -136,6 +161,12 @@ func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 		return false, true
 	}
 	local := sp.staged
+	if sp.stagingDirMode != 0 && fileExistsNoRoot(local) {
+		if err := ensureStagingDir(filepath.Dir(local), sp.stagingDirMode); err != nil {
+			c.err(sp.name+": ensure staging dir", "dir", filepath.Dir(local), "error", err)
+			return false, false
+		}
+	}
 	stagedOK := fileExistsNoRoot(local) && sha256FileOK(local, sp.sum)
 	if !stagedOK && sp.refuseBadStaged && fileExistsNoRoot(local) {
 		c.err(sp.name+": staged "+sp.artifact+" sha256 mismatch — not installing",
@@ -159,6 +190,12 @@ func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 			}
 			return false, false
 		}
+		if sp.stagingDirMode != 0 {
+			if err := ensureStagingDir(filepath.Dir(local), sp.stagingDirMode); err != nil {
+				c.err(sp.name+": ensure staging dir", "dir", filepath.Dir(local), "error", err)
+				return false, false
+			}
+		}
 		changed = true
 	}
 	if sp.prepare != nil && !sp.prepare(c) {
@@ -179,7 +216,7 @@ func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 			return changed, false
 		}
 	case sp.member != "":
-		mainErr := untarInstall(local, sp.member, c.r.hp(sp.dest), sp.mode)
+		mainErr := untarInstallVerified(local, sp.sum, sp.member, c.r.hp(sp.dest), sp.mode)
 		if mainErr != nil {
 			sp.installErr(c, local, mainErr)
 		}
@@ -187,7 +224,7 @@ func (c *cyc) installManagedBinary(sp managedBinarySpec) (changed, ok bool) {
 		// pre-extraction nebula flow returned after a failed main
 		// extraction instead of trying nebula-cert from a bad tarball.
 		if mainErr == nil && sp.companionMember != "" {
-			if err := untarInstall(local, sp.companionMember,
+			if err := untarInstallVerified(local, sp.sum, sp.companionMember,
 				c.r.hp(sp.companionDest), sp.mode); err != nil {
 				// Best-effort companion binary — the main binary is
 				// already installed; a missing key only errors when

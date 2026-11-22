@@ -3,11 +3,14 @@
 package netlinkx
 
 import (
+	"encoding/binary"
 	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestParseSockstatV4(t *testing.T) {
@@ -121,5 +124,69 @@ func TestInNetNSRunsFN(t *testing.T) {
 	}
 	if ran != 1 {
 		t.Fatalf("fn ran %d times", ran)
+	}
+}
+
+func TestParseDiagCensusMultiBatchAndMixedFamilies(t *testing.T) {
+	mkV4 := func(ip [4]byte, port uint16, state uint8) []byte {
+		m := inetDiagMsg(unix.AF_INET, state, 12345, port)
+		copy(m[16+24:16+28], ip[:])
+		return m
+	}
+	mkV6 := func(ip [16]byte, port uint16, state uint8) []byte {
+		m := inetDiagMsg(unix.AF_INET6, state, 12345, port)
+		copy(m[16+24:16+40], ip[:])
+		return m
+	}
+
+	// Build an IPv6 address whose trailing 12 bytes + port are all 0, plus an
+	// IPv4 address sharing the first 4 bytes + port 0: 6-byte vs 18-byte keys
+	// must never collide.
+	v4IP := [4]byte{10, 0, 0, 1}
+	v6ZeroTail := [16]byte{10, 0, 0, 1}
+
+	var trunc [16 + 10]byte
+	binary.LittleEndian.PutUint32(trunc[0:4], uint32(len(trunc)))
+	trunc[4] = 20 // non-DONE/ERROR type, short payload
+
+	var batch1 []byte
+	batch1 = append(batch1, mkV4(v4IP, 0, 1)...)
+	batch1 = append(batch1, mkV6(v6ZeroTail, 0, 1)...)
+	batch1 = append(batch1, trunc[:]...)
+
+	var batch2 []byte
+	batch2 = append(batch2, mkV4(v4IP, 0, 1)...)
+	batch2 = append(batch2, mkV4([4]byte{192, 168, 1, 2}, 443, 2)...)
+	batch2 = append(batch2, mkV6(v6ZeroTail, 0, 1)...)
+
+	out := TCPCensus{States: map[uint8]int{}, PerTuple: map[string]int{}}
+	done1, err := parseDiagCensus(batch1, &out)
+	if err != nil || done1 {
+		t.Fatalf("batch1=(%v,%v) want (false,nil)", done1, err)
+	}
+	done2, err := parseDiagCensus(batch2, &out)
+	if err != nil || done2 {
+		t.Fatalf("batch2=(%v,%v) want (false,nil)", done2, err)
+	}
+
+	if out.States[1] != 4 || out.States[2] != 1 {
+		t.Fatalf("States=%v want {1:4, 2:1}", out.States)
+	}
+	if len(out.PerTuple) != 3 {
+		t.Fatalf("PerTuple len=%d (%v) want 3 distinct endpoints", len(out.PerTuple), out.PerTuple)
+	}
+
+	gotEndpoints := map[string]int{}
+	for k, n := range out.PerTuple {
+		gotEndpoints[DiagEndpoint(k)] += n
+	}
+	if gotEndpoints["10.0.0.1:0"] != 2 {
+		t.Fatalf("v4 10.0.0.1:0 count=%d want 2", gotEndpoints["10.0.0.1:0"])
+	}
+	if gotEndpoints["[a00:1::]:0"] != 2 {
+		t.Fatalf("v6 [a00:1::]:0 count=%d want 2 (endpoints=%v)", gotEndpoints["[a00:1::]:0"], gotEndpoints)
+	}
+	if gotEndpoints["192.168.1.2:443"] != 1 {
+		t.Fatalf("v4 192.168.1.2:443 count=%d want 1", gotEndpoints["192.168.1.2:443"])
 	}
 }

@@ -21,9 +21,15 @@ package k0sconfig
 
 import (
 	"cmp"
+	"errors"
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
+	"syscall"
 
 	"sigs.k8s.io/yaml"
 )
@@ -37,6 +43,10 @@ const (
 	// at all (a worker's k0s.yaml has no controllerManager block, so
 	// an un-gated run would report every expected key as missing).
 	DefaultUnitFile = "/etc/systemd/system/k0scontroller.service"
+	// MaxConfigBytes caps host YAML config reads (k0s.yaml,
+	// kubelet/config.yaml) so oversized/sparse files cannot bloat RSS
+	// (matches kmsv2_guard.go's 1 MiB cap).
+	MaxConfigBytes int64 = 1 << 20
 )
 
 // DefaultRemovedFlags are k0s config keys removed upstream whose
@@ -126,7 +136,7 @@ func ScanK0sDrift(cfg K0sDriftConfig) K0sDriftScan {
 		scan.NotController = true
 		return scan
 	}
-	data, err := os.ReadFile(cfg.ConfigFile)
+	data, err := ReadConfigBounded(cfg.ConfigFile, MaxConfigBytes)
 	var parsed map[string]any
 	parseOK := err == nil && yaml.Unmarshal(data, &parsed) == nil
 
@@ -199,4 +209,114 @@ func Scan(data []byte, parsed map[string]any, parseOK bool,
 		return cmp.Compare(a.Key, b.Key)
 	})
 	return findings
+}
+
+// ReadConfigBounded opens path non-blockingly (O_NONBLOCK so a named
+// FIFO never stalls the caller), verifies via fstat that the fd refers
+// to a regular file of at most maxBytes, and reads at most maxBytes+1
+// bytes through io.LimitReader.
+func ReadConfigBounded(path string, maxBytes int64) ([]byte, error) {
+	if path == "" || strings.ContainsRune(path, 0) {
+		return nil, errors.New("empty or NUL config path")
+	}
+	if maxBytes < 0 {
+		return nil, fmt.Errorf("invalid maxBytes %d", maxBytes)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("non-regular file %s (mode %s)", path, fi.Mode())
+	}
+	if fi.Size() > maxBytes {
+		return nil, fmt.Errorf("file %s exceeds %d bytes (%d bytes)", path, maxBytes, fi.Size())
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("file %s exceeds %d bytes", path, maxBytes)
+	}
+	return data, nil
+}
+
+// ConfinedHostPath validates path against empty/NUL/traversal segments
+// and, when hostRoot is configured (non-empty and not "/") and path
+// is lexically inside hostRoot, verifies via EvalSymlinks that no
+// symlink component escapes hostRoot.
+func ConfinedHostPath(hostRoot, path string) (string, error) {
+	if path == "" || strings.ContainsRune(path, 0) {
+		return "", errors.New("empty or NUL path")
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+		if seg == ".." {
+			return "", fmt.Errorf("path %q contains traversal segment", path)
+		}
+	}
+	cleaned := filepath.Clean(path)
+	if cleaned == "." || cleaned == ".." {
+		return "", fmt.Errorf("invalid path %q", path)
+	}
+	if hostRoot == "" || filepath.Clean(hostRoot) == "/" {
+		return cleaned, nil
+	}
+	hr := filepath.Clean(hostRoot)
+	if !withinDir(hr, cleaned) {
+		return cleaned, nil
+	}
+	hrReal, err := filepath.EvalSymlinks(hr)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return cleaned, nil
+		}
+		return "", fmt.Errorf("resolve HostRoot %q: %w", hr, err)
+	}
+	if err := checkSymlinkConfinement(hrReal, cleaned, path); err != nil {
+		return "", err
+	}
+	return cleaned, nil
+}
+
+func withinDir(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func checkSymlinkConfinement(hrReal, joined, orig string) error {
+	cur := joined
+	for {
+		fi, err := os.Lstat(cur)
+		if err == nil {
+			realCur, rerr := filepath.EvalSymlinks(cur)
+			if rerr != nil {
+				if fi.Mode()&os.ModeSymlink != 0 {
+					return fmt.Errorf("path %q has unresolvable symlink %q: %w", orig, cur, rerr)
+				}
+				return fmt.Errorf("resolve path %q: %w", orig, rerr)
+			}
+			if !withinDir(hrReal, realCur) {
+				return fmt.Errorf("path %q escapes HostRoot via symlink", orig)
+			}
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat path %q: %w", orig, err)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return nil
+		}
+		cur = parent
+	}
 }

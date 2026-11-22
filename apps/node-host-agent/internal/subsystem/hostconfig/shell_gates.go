@@ -20,6 +20,14 @@ func (c *cyc) gate(what, s, msg string, ok func(string) bool) bool {
 	return false
 }
 
+func (c *cyc) gateRedacted(what, s, msg string, ok func(string) bool) bool {
+	if ok(s) {
+		return true
+	}
+	c.err(msg, "what", what, "value", "[REDACTED]")
+	return false
+}
+
 // shToken reports whether a vars-derived value may be interpolated
 // into a host shell command.
 func (c *cyc) shToken(what, s string) bool {
@@ -74,9 +82,10 @@ func (c *cyc) shExecToken(what, s string) bool {
 
 // cfgEnvVal is cfgScalar for systemd EnvironmentFile KEY=value
 // lines — printable ASCII minus the env-file's own quote hazard
-// (kine.env's KINE_ENDPOINT DSN keeps its :/?&=).
+// (kine.env's KINE_ENDPOINT DSN keeps its :/?&=). Failure logs redact
+// the value so DSN credentials never leak.
 func (c *cyc) cfgEnvVal(what, s string) bool {
-	return c.gate(what, s, "hostconfig: unsafe value refused for env-file render", converge.CfgEnvVal)
+	return c.gateRedacted(what, s, "hostconfig: unsafe value refused for env-file render", converge.CfgEnvVal)
 }
 
 // cfgSysctlKey / cfgSysctlVal gate the /etc/sysctl.d pair renders —

@@ -23,6 +23,13 @@ type Mount struct {
 	Opts       string
 }
 
+var mountPathUnescaper = strings.NewReplacer(
+	`\134`, `\`,
+	`\040`, " ",
+	`\011`, "\t",
+	`\012`, "\n",
+)
+
 // UnescapeMountPath decodes the octal escapes the kernel applies to
 // the path fields of /proc/*/mounts and /proc/*/mountinfo (space→
 // \040, tab→\011, newline→\012, backslash→\134) — pod/volume paths
@@ -31,12 +38,10 @@ type Mount struct {
 // never widens it); call sites that need the real path decode
 // through here.
 func UnescapeMountPath(s string) string {
-	return strings.NewReplacer(
-		`\134`, `\`,
-		`\040`, " ",
-		`\011`, "\t",
-		`\012`, "\n",
-	).Replace(s)
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	return mountPathUnescaper.Replace(s)
 }
 
 // HasOpt reports whether the mount's comma-separated option list

@@ -182,9 +182,14 @@ func TestConfigFromEnvWinsOverConf(t *testing.T) {
 	if cfg.InsecureTLS != false || cfg.Feeder.Enabled != false {
 		t.Errorf("bool env knobs: %v %v", cfg.InsecureTLS, cfg.Feeder.Enabled)
 	}
-	// An explicit env K0sDir is used verbatim — NOT PathJoin'd.
-	if cfg.K0sDir != "/k0s-env" {
-		t.Errorf("K0sDir=%s", cfg.K0sDir)
+	// An explicit env K0sDir is used verbatim — NOT PathJoin'd, and
+	// Admin* PKI paths derive from it.
+	if cfg.K0sDir != "/k0s-env" ||
+		cfg.AdminKubeconfig != "/k0s-env/pki/admin.conf" ||
+		cfg.AdminCert != "/k0s-env/pki/admin.crt" ||
+		cfg.AdminKey != "/k0s-env/pki/admin.key" ||
+		cfg.AdminCA != "/k0s-env/pki/ca.crt" {
+		t.Errorf("K0sDir=%s AdminKubeconfig=%s", cfg.K0sDir, cfg.AdminKubeconfig)
 	}
 	if cfg.EtcdGuard.Endpoint != "https://10.1.1.5:2379" ||
 		cfg.EtcdGuard.DBSizeLimit != 999 {

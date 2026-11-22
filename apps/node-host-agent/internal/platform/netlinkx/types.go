@@ -14,6 +14,18 @@ type ConnectedUDPSocket struct {
 	ID      [48]byte // verbatim idiag_sockid for SOCK_DESTROY
 }
 
+// UDPSocketTarget identifies one connected UDP socket for batched SOCK_DESTROY.
+type UDPSocketTarget struct {
+	Family uint8
+	ID     [48]byte
+}
+
+// UDPDestroyResult is the per-target outcome of DestroyUDPSockets.
+type UDPDestroyResult struct {
+	Destroyed bool
+	Err       error
+}
+
 // ProtoCounters is one /proc/net/sockstat protocol row. Absent
 // key/value pairs stay 0 — same convention as procfs.ConntrackStat
 // (the kernel omits fields it does not count).

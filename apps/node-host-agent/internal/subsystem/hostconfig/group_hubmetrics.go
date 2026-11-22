@@ -69,24 +69,28 @@ func (c *cyc) hubMetricsNodeExporter() {
 	if file == "" {
 		file = pathpkg.Base(url)
 	}
-	if ver == "" || url == "" || sum == "" || file == "" || file == "." {
+	if ver == "" || url == "" || sum == "" {
 		return // nothing pinned — nothing to install
+	}
+	if !validStagedBasename(file) {
+		c.err("hub-metrics-fw: unsafe deb filename — refusing install", "file", file)
+		return
 	}
 	if c.dpkgVersionSatisfied(ctx, "prometheus-node-exporter", ver) {
 		return // installed satisfies the pin — ansible skipped the whole chain
 	}
-	// Host path /tmp/<file> (get_url dest). Download to the
+	// Host path /var/lib/node-watchdog/downloads/<file>. Download to the
 	// HostRoot-joined path so the agent fs op lands on the host file
-	// the runner then installs. download() verifies the sha256 as it
-	// streams (the get_url checksum + sha256sum -c tasks folded into
-	// one step); a staged file that already matches the pin is not
-	// re-fetched.
-	local := r.hp("/tmp/" + file)
+	// the runner then installs (preserving DaemonSet host-ns visibility
+	// for nsenter apt-get and HostRoot sandboxing in tests).
+	hostDeb := defaultDownloadDir + "/" + file
+	local := r.hp(hostDeb)
 	if _, ok := c.installManagedBinary(managedBinarySpec{
-		name:   "hub-metrics-fw",
-		url:    url,
-		sum:    sum,
-		staged: local,
+		name:           "hub-metrics-fw",
+		url:            url,
+		sum:            sum,
+		staged:         local,
+		stagingDirMode: 0o700,
 		// nexpDownload floors the client timeout above HTTPTimeout —
 		// the slow-egress infra VMs need minutes for the ~4.5MB deb.
 		download: r.nexpDownload,
@@ -100,12 +104,12 @@ func (c *cyc) hubMetricsNodeExporter() {
 			// runLong: dep resolution on a slow-egress VM outlives the
 			// interactive budget.
 			_, err := c.r.runLong(c.ctx, "env", "DEBIAN_FRONTEND=noninteractive",
-				"apt-get", "install", "-y", "/tmp/"+file)
+				"apt-get", "install", "-y", hostDeb)
 			return err
 		},
 		installErr: func(c *cyc, _ string, err error) {
 			c.err("hub-metrics-fw: node_exporter deb install failed",
-				"deb", "/tmp/"+file, "error", err)
+				"deb", hostDeb, "error", err)
 		},
 	}); !ok {
 		return

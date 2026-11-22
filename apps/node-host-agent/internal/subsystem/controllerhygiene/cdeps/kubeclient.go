@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -16,12 +17,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
-
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 )
 
 // maxListRVBody caps one RV-probe response read. With the
@@ -230,19 +230,28 @@ func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64,
 		return 0, false
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxListRVBody))
-	if err != nil {
-		return 0, false
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		logger().Warn("controllerhygiene: rv probe non-200",
 			"endpoint", endpoint, "cached", cached,
 			"status", resp.StatusCode)
 		return 0, false
 	}
-	rv, ok := probee.ListResourceVersion(body)
-	if !ok {
+	lr := &io.LimitedReader{R: resp.Body, N: maxListRVBody + 1}
+	var list struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
+	}
+	decErr := json.UnmarshalRead(lr, &list,
+		jsontext.AllowInvalidUTF8(true),
+		jsontext.AllowDuplicateNames(true))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	if decErr != nil || lr.N == 0 {
+		return 0, false
+	}
+	rv, err := strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)
+	if err != nil {
 		return 0, false
 	}
 	return rv, true

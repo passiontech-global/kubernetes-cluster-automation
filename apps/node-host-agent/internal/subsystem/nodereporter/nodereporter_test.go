@@ -248,6 +248,9 @@ func TestAllConditionDefaults(t *testing.T) {
 		nodecond.CondSystemdOOMDKill:           {"SystemdOOMDHealthy", "no recent systemd-oomd pod or k0s slice kills"},
 		nodecond.CondNetworkMountHung:          {"NetworkMountsHealthy", "all probed network and FUSE mounts responsive"},
 		nodecond.CondNodeLocalDNSNoTrackDrift:  {"NodeLocalDNSNoTrackOk", "NodeLocalDNS raw NOTRACK iptables rules present on 169.254.20.10:53"},
+		// wave-5 self-healing latch→condition surface.
+		nodecond.CondK8s135ReadinessDrift: {"K8s135ReadinessOk", "cgroup v2 and kubelet/k0s configuration ready for Kubernetes 1.35+"},
+		nodecond.CondKMSv2Unhealthy:       {"KMSv2Healthy", "KMSv2 encryption provider socket and /healthz/kms-provider-* probes healthy"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

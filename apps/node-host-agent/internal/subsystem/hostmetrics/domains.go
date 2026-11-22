@@ -370,6 +370,12 @@ var domainTable = []domainEntry{
 			{descEBPFMaps, "node_host_agent_ebpf_maps_count",
 				"Unique eBPF map_id referenced by proc fdinfo plus bpffs pins."},
 		}},
+	{name: "k8s135-readiness",
+		emit: (*Collector).collectK8s135Readiness,
+		families: []descMeta{
+			{descK8s135ReadinessDrift, "node_host_agent_k8s135_readiness_drift",
+				"Kubernetes 1.35+ upgrade readiness drift finding (1 = drift)."},
+		}},
 }
 
 // descMetaTable maps each desc to its textfile fqName/help — a

@@ -8,7 +8,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -265,6 +268,117 @@ func TestUnixDial(t *testing.T) {
 	if err := UnixDial(context.Background(),
 		filepath.Join(t.TempDir(), "missing.sock"), 2*time.Second); err == nil {
 		t.Fatal("UnixDial: missing socket reported nil error")
+	}
+}
+
+func TestUnixKeepAliveReusesConnection(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "reuse.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("unix listen: %v", err)
+	}
+	var newConns atomic.Int32
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodDelete {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			_, _ = w.Write([]byte(`ok`))
+		}),
+		ConnState: func(_ net.Conn, st http.ConnState) {
+			if st == http.StateNew {
+				newConns.Add(1)
+			}
+		},
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	ctx := context.Background()
+	for range 4 {
+		b, gerr := UnixGet(ctx, socket, "/v1/healthz")
+		if gerr != nil || string(b) != "ok" {
+			t.Fatalf("UnixGet=(%q,%v)", b, gerr)
+		}
+		if derr := UnixDelete(ctx, socket, "/v1/endpoint/1"); derr != nil {
+			t.Fatalf("UnixDelete=%v", derr)
+		}
+	}
+	if got := newConns.Load(); got != 1 {
+		t.Fatalf("expected 1 reused unix connection across 8 sequential requests, got %d new connections", got)
+	}
+}
+
+func TestUnixPoolIsolatedBySocketPath(t *testing.T) {
+	sockA := unixServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("server-A"))
+	}))
+	sockB := unixServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("server-B"))
+	}))
+	ctx := context.Background()
+	for range 3 {
+		a, err := UnixGet(ctx, sockA, "/id")
+		if err != nil || string(a) != "server-A" {
+			t.Fatalf("sockA=(%q,%v)", a, err)
+		}
+		b, err := UnixGet(ctx, sockB, "/id")
+		if err != nil || string(b) != "server-B" {
+			t.Fatalf("sockB=(%q,%v)", b, err)
+		}
+	}
+}
+
+func TestUnixPoolConcurrentAndServerRestart(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "restart.sock")
+	start := func(tag string) *http.Server {
+		_ = os.Remove(socket)
+		ln, err := net.Listen("unix", socket)
+		if err != nil {
+			t.Fatalf("unix listen: %v", err)
+		}
+		srv := &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tag))
+			}),
+		}
+		go func() { _ = srv.Serve(ln) }()
+		return srv
+	}
+
+	srv1 := start("gen1")
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 5 {
+				b, err := UnixGet(context.Background(), socket, "/x")
+				if err != nil || string(b) != "gen1" {
+					t.Errorf("gen1 UnixGet=(%q,%v)", b, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	_ = srv1.Close()
+
+	srv2 := start("gen2")
+	t.Cleanup(func() { _ = srv2.Close() })
+	var got string
+	var err error
+	for range 3 {
+		var b []byte
+		b, err = UnixGet(context.Background(), socket, "/x")
+		if err == nil {
+			got = string(b)
+			break
+		}
+	}
+	if err != nil || got != "gen2" {
+		t.Fatalf("after server restart UnixGet=(%q,%v) want (\"gen2\",nil)", got, err)
 	}
 }
 

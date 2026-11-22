@@ -467,4 +467,17 @@ var CondDefs = map[string]CondDef{
 		DefaultMessage: "NodeLocalDNS raw NOTRACK iptables rules present on 169.254.20.10:53",
 		ProblemReason:  "NodeLocalDNSNoTrackDriftDetected",
 	},
+	// --- wave-5 self-healing wave ---
+	LatchK8s135ReadinessDrift: {
+		Type:           "K8s135ReadinessDrift",
+		DefaultReason:  "K8s135ReadinessOk",
+		DefaultMessage: "cgroup v2 and kubelet/k0s configuration ready for Kubernetes 1.35+",
+		ProblemReason:  "K8s135ReadinessDriftDetected",
+	},
+	LatchKMSv2Unhealthy: {
+		Type:           "KMSv2Unhealthy",
+		DefaultReason:  "KMSv2Healthy",
+		DefaultMessage: "KMSv2 encryption provider socket and /healthz/kms-provider-* probes healthy",
+		ProblemReason:  "KMSv2UnhealthyDetected",
+	},
 }

@@ -35,7 +35,7 @@ func TestAPILBVMConverge(t *testing.T) {
 	hostWrite(t, r, "/opt/haproxy/docker-compose.yml",
 		"services:\n  haproxy:\n    image: haproxy:2.8-alpine\n    volumes:\n"+
 			"      - /opt/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro\n")
-	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890\n")
+	hostWrite(t, r, "/etc/machine-id", "abcdef1234567890abcdef1234567890\n")
 	// pre-seed the admin socket so the wait_for exits immediately
 	hostWrite(t, r, "/run/haproxy-admin/admin.sock", "")
 	// legacy shell guard present

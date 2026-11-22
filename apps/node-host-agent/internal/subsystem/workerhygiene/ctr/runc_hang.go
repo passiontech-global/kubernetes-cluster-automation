@@ -225,14 +225,24 @@ func procFileReadNonENOENT(path string) bool {
 // runtime comm/lifecycle subcommand + S/D state + age >= HungRuncAgeSec.
 // unreadable marks PIDs whose stat or cmdline failed with !ENOENT so
 // callers preserve their confirmation streaks and abort.
-func (c *HungRuncCheck) scanHungRuntimes(now time.Time,
+func (c *HungRuncCheck) scanHungRuntimes(e *wdeps.CycleEnv, now time.Time,
 	pids []int) (out []hungCandidate, unreadable map[int]bool, inconclusive bool) {
 	minAge := time.Duration(c.d.Cfg.Wave2.HungRuncAgeSec) * time.Second
 	if minAge <= 0 {
 		minAge = 3 * time.Minute
 	}
+	var statsSnap map[int]procfs.Stat
+	if e != nil && e.StatsOnce != nil {
+		statsSnap = e.StatsOnce()
+	}
 	for _, pid := range pids {
-		st, ok := c.d.Proc.Stat(pid)
+		var st procfs.Stat
+		var ok bool
+		if statsSnap != nil {
+			st, ok = statsSnap[pid]
+		} else {
+			st, ok = c.d.Proc.Stat(pid)
+		}
 		if !ok {
 			if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) {
 				if unreadable == nil {
@@ -311,7 +321,7 @@ func (c *HungRuncCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.CycleResult(wdeps.CheckHungRunc, "inconclusive")
 		return
 	}
-	cands, unreadable, scanInconclusive := c.scanHungRuntimes(now, pids)
+	cands, unreadable, scanInconclusive := c.scanHungRuntimes(e, now, pids)
 
 	// Consecutive-cycle confirmation keyed on (pid,starttime): a
 	// recycled pid is a NEW process and must re-earn its streak —

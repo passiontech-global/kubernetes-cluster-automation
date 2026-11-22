@@ -1,18 +1,25 @@
 // prune.go — the bucket mechanics: go-build trim, generic age buckets
 // (-mtime +N -delete / empty-dir collapse), the du-style top-level
-// size caps and the node-deps cksum/lock/staging-dir rules.
+// size caps and the node-deps cksum/lock/staging-dir rules. All fs
+// operations run relative to *os.Root handles pinned against symlinks.
 package concoursecache
 
 import (
 	"cmp"
 	"context"
-	"io"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/concourse"
 )
 
 // goBuildIndexLen is the exact record size of a Go build-cache index
@@ -27,7 +34,16 @@ const goBuildIndexLen = 175
 // "go-build-lint-<job>", same layout, same hazards, previously never
 // pruned). Each dir gets the same age+size-cap pass.
 func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *slog.Logger) {
-	entries, err := os.ReadDir(sc)
+	scRoot, err := openDirRootNoSymlink(sc)
+	if err != nil {
+		return
+	}
+	defer func() { _ = scRoot.Close() }()
+	p.pruneGoBuildRoot(ctx, scRoot, cfg, log)
+}
+
+func (p *Pruner) pruneGoBuildRoot(ctx context.Context, scRoot *os.Root, cfg Config, log *slog.Logger) {
+	entries, err := fs.ReadDir(scRoot.FS(), ".")
 	if err != nil {
 		return
 	}
@@ -39,12 +55,17 @@ func (p *Pruner) pruneGoBuild(ctx context.Context, sc string, cfg Config, log *s
 		if name != "go-build" && !strings.HasPrefix(name, "go-build-") {
 			continue
 		}
-		// DirEntry.IsDir is type-bit only — a "go-build*" symlink to a
-		// dir is not a dir here, same as the old isDir(Lstat) guard.
-		if !e.IsDir() {
+		// DirEntry.IsDir is type-bit only — verify via openSubRootNoSymlink
+		// so neither an escaping nor an intra-root symlink is followed.
+		if !e.IsDir() || e.Type()&fs.ModeSymlink != 0 {
 			continue
 		}
-		p.pruneGoBuildDir(ctx, filepath.Join(sc, name), name, cfg, log)
+		dirRoot, err := openSubRootNoSymlink(scRoot, name)
+		if err != nil {
+			continue
+		}
+		p.pruneGoBuildDirRoot(ctx, dirRoot, name, cfg, log)
+		_ = dirRoot.Close()
 	}
 }
 
@@ -62,25 +83,37 @@ func goBuildEntryKind(name string) byte {
 	return 0
 }
 
-// goBuildReferencedOutput parses a "-a" index record and returns the
-// "-d" output path it references inside dir. ok=false for anything
-// that is not a well-formed index entry — Go's own get() treats those
-// as misses, so they protect nothing.
-func goBuildReferencedOutput(dir, indexPath string) (string, bool) {
-	f, err := os.Open(indexPath)
-	if err != nil {
+// goBuildReferencedOutputRoot parses a "-a" index record opened with
+// O_RDONLY|O_NOFOLLOW|O_NONBLOCK + Fstat S_IFREG check inside dirRoot,
+// and returns the root-relative "-d" output path it references.
+// ok=false for symlinks, FIFOs, directories, or malformed records.
+func goBuildReferencedOutputRoot(dirRoot *os.Root, indexRel string) (string, bool) {
+	var buf [goBuildIndexLen + 1]byte
+	n := 0
+	err := concourse.WithNoFollowRootFD(dirRoot, indexRel, true, func(fd int, st *unix.Stat_t) error {
+		if st.Mode&unix.S_IFMT != unix.S_IFREG {
+			return fmt.Errorf("%s: not a regular file", indexRel)
+		}
+		for n < len(buf) {
+			r, rerr := unix.Read(fd, buf[n:])
+			if r > 0 {
+				n += r
+				continue
+			}
+			if rerr == unix.EINTR {
+				continue
+			}
+			if rerr != nil {
+				return rerr
+			}
+			break
+		}
+		return nil
+	})
+	if err != nil || n != goBuildIndexLen {
 		return "", false
 	}
-	defer func() { _ = f.Close() }()
-	rec := make([]byte, goBuildIndexLen)
-	if _, err := io.ReadFull(f, rec); err != nil {
-		return "", false
-	}
-	// A record longer than entrySize is "too long" — a miss in Go too.
-	var extra [1]byte
-	if n, _ := f.Read(extra[:]); n > 0 {
-		return "", false
-	}
+	rec := buf[:goBuildIndexLen]
 	if rec[0] != 'v' || rec[1] != '1' || rec[2] != ' ' ||
 		rec[67] != ' ' || rec[132] != ' ' || rec[153] != ' ' ||
 		rec[174] != '\n' {
@@ -92,37 +125,15 @@ func goBuildReferencedOutput(dir, indexPath string) (string, bool) {
 			return "", false
 		}
 	}
-	return filepath.Join(dir, string(oid[0:2]), string(oid)+"-d"), true
+	return path.Join(string(oid[0:2]), string(oid)+"-d"), true
 }
 
-// pruneGoBuildDir runs one pass over a single Go build cache dir:
+// pruneGoBuildDirRoot runs one pass over a single Go build cache dir:
 // files older than GoBuildMaxAge are deleted while surviving entries
 // accumulate block disk usage (including directories) and size-trim
 // candidates; then if total usage exceeds GoBuildHighMark, oldest
 // files are trimmed until <= GoBuildLowMark.
-//
-// The cache is LIVE: once an action's "-a" index entry resolves an
-// output ID, Go's contract is that the "-d" file exists until the go
-// command exits — `go vet`, `go list -export` consumers (golangci-lint)
-// and friends open those paths directly. Deleting a "-d" a surviving
-// "-a" still references leaves a dangling index entry and fails builds
-// with "open ...-d: no such file or directory" (golang-monorepo
-// ci-main builds 87/88). So "-d" outputs are pruned only when no index
-// entry seen this pass references them; "-a" indexes and every other
-// file prune exactly as before — a missing index is a plain cache
-// miss Go rebuilds, never a dangling reference.
-//
-// On top of that, entries younger than ccGoBuildGraceAge are never
-// pruned at all — the crit-pressure age floor (5min, sized for
-// write-then-done artifacts) would otherwise delete the entire
-// working set of every in-flight build each pass: a resolved "-d"
-// is read for the whole ~1h lint/typecheck phase, far past 5min
-// (ci-main builds 87/88). Young files still count toward `sz` but
-// are neither age-pruned nor size-cap candidates.
-func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Config, log *slog.Logger) {
-	if !isDir(dir) {
-		return
-	}
+func (p *Pruner) pruneGoBuildDirRoot(ctx context.Context, dirRoot *os.Root, bucket string, cfg Config, log *slog.Logger) {
 	now := p.cfg.Clock.Now()
 	var ageDeleted, ageFailed int
 	var ageFreed int64
@@ -133,19 +144,19 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 	var dataFiles []cacheFile // "-d" outputs — deferred until index refs are known
 	var indexFiles []string   // "-a" indexes that survived the age prune
 
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+	_ = fs.WalkDir(dirRoot.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
 		if err != nil {
 			log.Debug("go-build prune: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
 			log.Debug("go-build prune: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil
 		}
 		blocks := entryBlocks(info)
@@ -155,13 +166,13 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 				sz += blocks
 				return nil
 			}
-			cf := cacheFile{path: path, size: int64(blocks), modTime: info.ModTime()}
+			cf := cacheFile{path: rel, size: int64(blocks), modTime: info.ModTime()}
 			switch goBuildEntryKind(d.Name()) {
 			case 'a':
 				// Index entries prune like any other file — but only
 				// survivors may shield their "-d" outputs this pass.
 				if now.Sub(info.ModTime()) > cfg.GoBuildMaxAge {
-					if rerr := os.Remove(path); rerr == nil {
+					if rerr := unlinkRootNoFollow(dirRoot, rel, 0); rerr == nil {
 						ageDeleted++
 						ageFreed += int64(blocks)
 						return nil
@@ -170,7 +181,7 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 						ageErr = rerr
 					}
 				}
-				indexFiles = append(indexFiles, path)
+				indexFiles = append(indexFiles, rel)
 				candidates = append(candidates, cf)
 			case 'd':
 				// Defer: protection depends on surviving index
@@ -178,7 +189,7 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 				dataFiles = append(dataFiles, cf)
 			default:
 				if now.Sub(info.ModTime()) > cfg.GoBuildMaxAge {
-					if rerr := os.Remove(path); rerr == nil {
+					if rerr := unlinkRootNoFollow(dirRoot, rel, 0); rerr == nil {
 						ageDeleted++
 						ageFreed += int64(blocks)
 						return nil
@@ -203,7 +214,7 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 		if cerr := ctx.Err(); cerr != nil {
 			return
 		}
-		if dpath, ok := goBuildReferencedOutput(dir, ip); ok {
+		if dpath, ok := goBuildReferencedOutputRoot(dirRoot, ip); ok {
 			protected[dpath] = struct{}{}
 		}
 	}
@@ -218,7 +229,7 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 			continue
 		}
 		if now.Sub(df.modTime) > cfg.GoBuildMaxAge {
-			if rerr := os.Remove(df.path); rerr == nil {
+			if rerr := unlinkRootNoFollow(dirRoot, df.path, 0); rerr == nil {
 				ageDeleted++
 				ageFreed += df.size
 			} else {
@@ -259,7 +270,7 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 		// units as the high/low marks and the `sz` above — removal
 		// failure does not re-run.
 		acc += f.size
-		if err := os.Remove(f.path); err == nil {
+		if err := unlinkRootNoFollow(dirRoot, f.path, 0); err == nil {
 			freed += f.size
 			p.filesDeleted.WithLabelValues(bucket).Inc()
 			p.bytesFreed.Add(float64(f.size))
@@ -286,16 +297,17 @@ func (p *Pruner) pruneGoBuildDir(ctx context.Context, dir, bucket string, cfg Co
 		"freedGiB", float64(freed)/(1<<30))
 }
 
-// pruneAgeBucket is `find -type f -mtime +N -delete` plus the optional
+// pruneAgeBucketRoot is `find -type f -mtime +N -delete` plus the optional
 // `find -mindepth 1 -type d -empty -delete` some buckets carry.
-func (p *Pruner) pruneAgeBucket(ctx context.Context, sc, bucket string, maxAge time.Duration, emptyDirs bool, log *slog.Logger) {
-	dir := filepath.Join(sc, bucket)
-	if !isDir(dir) {
+func (p *Pruner) pruneAgeBucketRoot(ctx context.Context, scRoot *os.Root, bucket string, maxAge time.Duration, emptyDirs bool, log *slog.Logger) {
+	dirRoot, err := openSubRootNoSymlink(scRoot, bucket)
+	if err != nil {
 		return
 	}
-	p.deleteOldFiles(ctx, dir, bucket, maxAge, log)
+	defer func() { _ = dirRoot.Close() }()
+	p.deleteOldFilesRoot(ctx, dirRoot, bucket, maxAge, log)
 	if emptyDirs {
-		p.deleteEmptyDirs(ctx, dir, log)
+		p.deleteEmptyDirsRoot(ctx, dirRoot, bucket, log)
 	}
 }
 
@@ -303,17 +315,26 @@ func (p *Pruner) pruneAgeBucket(ctx context.Context, sc, bucket string, maxAge t
 // than maxAge (-type f -mtime +N -delete). Errors are skipped like
 // the script's `|| true`; ctx cancellation stops the walk.
 func (p *Pruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge time.Duration, log *slog.Logger) {
+	dirRoot, err := openDirRootNoSymlink(dir)
+	if err != nil {
+		return
+	}
+	defer func() { _ = dirRoot.Close() }()
+	p.deleteOldFilesRoot(ctx, dirRoot, bucket, maxAge, log)
+}
+
+func (p *Pruner) deleteOldFilesRoot(ctx context.Context, dirRoot *os.Root, bucket string, maxAge time.Duration, log *slog.Logger) {
 	now := p.cfg.Clock.Now()
 	var n, failed int
 	var bytes int64
 	var lastErr error
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+	_ = fs.WalkDir(dirRoot.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
 		if err != nil {
 			log.Debug("age prune: unreadable entry skipped",
-				"bucket", bucket, "path", path, "error", err)
+				"bucket", bucket, "path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		if d.IsDir() || !d.Type().IsRegular() {
@@ -322,13 +343,13 @@ func (p *Pruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge 
 		info, err := d.Info()
 		if err != nil {
 			log.Debug("age prune: unreadable entry skipped",
-				"bucket", bucket, "path", path, "error", err)
+				"bucket", bucket, "path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		if now.Sub(info.ModTime()) <= maxAge {
 			return nil
 		}
-		if err := os.Remove(path); err == nil {
+		if err := unlinkRootNoFollow(dirRoot, rel, 0); err == nil {
 			n++
 			bytes += int64(entryBlocks(info))
 		} else {
@@ -354,13 +375,22 @@ func (p *Pruner) deleteOldFiles(ctx context.Context, dir, bucket string, maxAge 
 // that only hold empty dirs collapses to the top. dir itself is
 // never removed (mindepth 1).
 func (p *Pruner) deleteEmptyDirs(ctx context.Context, dir string, log *slog.Logger) {
+	dirRoot, err := openDirRootNoSymlink(dir)
+	if err != nil {
+		return
+	}
+	defer func() { _ = dirRoot.Close() }()
+	p.deleteEmptyDirsRoot(ctx, dirRoot, dir, log)
+}
+
+func (p *Pruner) deleteEmptyDirsRoot(ctx context.Context, dirRoot *os.Root, dirLabel string, log *slog.Logger) {
 	var dirs []string
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+	_ = fs.WalkDir(dirRoot.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		if err == nil && d.IsDir() && path != dir {
-			dirs = append(dirs, path)
+		if err == nil && d.IsDir() && d.Type()&fs.ModeSymlink == 0 && rel != "." {
+			dirs = append(dirs, rel)
 		}
 		return nil
 	})
@@ -374,12 +404,12 @@ func (p *Pruner) deleteEmptyDirs(ctx context.Context, dir string, log *slog.Logg
 		if ctx.Err() != nil {
 			break
 		}
-		if err := os.Remove(d); err == nil {
+		if err := unlinkRootNoFollow(dirRoot, d, unix.AT_REMOVEDIR); err == nil {
 			n++
 		}
 	}
 	if n > 0 {
-		log.Info("empty dirs pruned", "dir", dir, "dirs", n)
+		log.Info("empty dirs pruned", "dir", dirLabel, "dirs", n)
 	}
 }
 
@@ -388,27 +418,37 @@ func (p *Pruner) deleteEmptyDirs(ctx context.Context, dir string, log *slog.Logg
 // at least du-low has been freed. writable adds `chmod -R u+w` before
 // rm (node-deps subdirs can be read-only — bun install chmod a-w).
 func (p *Pruner) capTopLevelDirs(ctx context.Context, sc, bucket string, high, low int64, writable bool, log *slog.Logger) {
-	dir := filepath.Join(sc, bucket)
-	if !isDir(dir) {
+	scRoot, err := openDirRootNoSymlink(sc)
+	if err != nil {
 		return
 	}
+	defer func() { _ = scRoot.Close() }()
+	p.capTopLevelDirsRoot(ctx, scRoot, bucket, high, low, writable, log)
+}
+
+func (p *Pruner) capTopLevelDirsRoot(ctx context.Context, scRoot *os.Root, bucket string, high, low int64, writable bool, log *slog.Logger) {
+	dirRoot, err := openSubRootNoSymlink(scRoot, bucket)
+	if err != nil {
+		return
+	}
+	defer func() { _ = dirRoot.Close() }()
 	// ONE walk gives the bucket du AND every first-level dir's share
 	// — the per-candidate diskUsage calls below used to re-walk each
 	// <key>/<cksum> subtree on top of the bucket walk.
-	sz, perDir := diskUsageByTopDir(ctx, dir)
+	sz, perDir := diskUsageByTopDirRoot(ctx, dirRoot)
 	if ctx.Err() != nil || int64(sz) <= high {
 		return
 	}
 	need := int64(sz) - low
 	var freed int64
-	for _, d := range topLevelDirsByAge(dir) {
+	for _, d := range topLevelDirsByAgeRoot(dirRoot) {
 		if ctx.Err() != nil || freed >= need {
 			break
 		}
-		dsz := int64(perDir[filepath.Base(d.path)])
-		err := os.RemoveAll(d.path)
+		dsz := int64(perDir[d.path])
+		err := dirRoot.RemoveAll(d.path)
 		if writable && err != nil {
-			err = removeTree(d.path)
+			err = removeTreeRoot(dirRoot, d.path)
 		}
 		if err == nil {
 			p.bytesFreed.Add(float64(dsz))
@@ -433,28 +473,41 @@ func (p *Pruner) capTopLevelDirs(ctx context.Context, sc, bucket string, high, l
 // cap. Every rm -rf is preceded by chmod -R u+w (bun install makes
 // trees read-only).
 func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *slog.Logger) {
-	dir := filepath.Join(sc, "node-deps")
-	if !isDir(dir) {
+	scRoot, err := openDirRootNoSymlink(sc)
+	if err != nil {
 		return
 	}
+	defer func() { _ = scRoot.Close() }()
+	p.pruneNodeDepsRoot(ctx, scRoot, cfg, log)
+}
+
+func (p *Pruner) pruneNodeDepsRoot(ctx context.Context, scRoot *os.Root, cfg Config, log *slog.Logger) {
+	dirRoot, err := openSubRootNoSymlink(scRoot, "node-deps")
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Warn("node-deps: cannot list dir — skipped",
+				"dir", filepath.Join(scRoot.Name(), "node-deps"), "error", err)
+		}
+		return
+	}
+	defer func() { _ = dirRoot.Close() }()
 	now := p.cfg.Clock.Now()
 
 	// First-level <cksum> dirs older than the dir cap (-mtime +7 on
 	// the dir itself — content mtimes do not count).
-	if entries, err := os.ReadDir(dir); err == nil {
+	if entries, err := fs.ReadDir(dirRoot.FS(), "."); err == nil {
 		for _, e := range entries {
 			if ctx.Err() != nil {
 				break
 			}
-			if !e.IsDir() {
+			if !e.IsDir() || e.Type()&fs.ModeSymlink != 0 {
 				continue
 			}
 			info, err := e.Info()
 			if err != nil || now.Sub(info.ModTime()) <= cfg.NodeDepsDirMaxAge {
 				continue
 			}
-			dpath := filepath.Join(dir, e.Name())
-			if err := removeTree(dpath); err == nil {
+			if err := removeTreeRoot(dirRoot, e.Name()); err == nil {
 				log.Info("node-deps: aged cksum dir removed", "dir", e.Name())
 			} else {
 				log.Warn("node-deps: cksum dir removal failed",
@@ -463,19 +516,19 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 		}
 	} else {
 		log.Warn("node-deps: cannot list dir — aged cksum dirs not pruned",
-			"dir", dir, "error", err)
+			"dir", "node-deps", "error", err)
 	}
 
 	// Stale .lock-*/.tmp-* FILES at any depth (-mmin +60).
 	var nlocks, lockFailed int
 	var lockErr error
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+	_ = fs.WalkDir(dirRoot.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
 		if err != nil {
 			log.Debug("node-deps: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		if d.IsDir() || !d.Type().IsRegular() {
@@ -488,13 +541,13 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 		info, err := d.Info()
 		if err != nil {
 			log.Debug("node-deps: unreadable entry skipped",
-				"path", path, "error", err)
+				"path", rel, "error", err)
 			return nil // unreadable entries are skipped, never fatal
 		}
 		if now.Sub(info.ModTime()) <= cfg.NodeDepsLockAge {
 			return nil
 		}
-		if err := os.Remove(path); err == nil {
+		if err := unlinkRootNoFollow(dirRoot, rel, 0); err == nil {
 			nlocks++
 			p.filesDeleted.WithLabelValues("node-deps").Inc()
 			// st.Blocks×512, not Size(): bytesFreed is "what the disk
@@ -519,20 +572,19 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 
 	// Crashed <cksum>.tmp-<nanos> staging DIRS at depth 1 (snapshot
 	// save crash — a dir, never empty, so rm -rf not -delete).
-	if entries, err := os.ReadDir(dir); err == nil {
+	if entries, err := fs.ReadDir(dirRoot.FS(), "."); err == nil {
 		for _, e := range entries {
 			if ctx.Err() != nil {
 				break
 			}
-			if !e.IsDir() || !strings.Contains(e.Name(), ".tmp-") {
+			if !e.IsDir() || e.Type()&fs.ModeSymlink != 0 || !strings.Contains(e.Name(), ".tmp-") {
 				continue
 			}
 			info, err := e.Info()
 			if err != nil || now.Sub(info.ModTime()) <= cfg.NodeDepsLockAge {
 				continue
 			}
-			dpath := filepath.Join(dir, e.Name())
-			if err := removeTree(dpath); err == nil {
+			if err := removeTreeRoot(dirRoot, e.Name()); err == nil {
 				log.Info("node-deps: stale staging dir removed", "dir", e.Name())
 			} else {
 				log.Warn("node-deps: staging dir removal failed",
@@ -541,9 +593,9 @@ func (p *Pruner) pruneNodeDeps(ctx context.Context, sc string, cfg Config, log *
 		}
 	} else {
 		log.Warn("node-deps: cannot list dir — stale staging dirs not pruned",
-			"dir", dir, "error", err)
+			"dir", "node-deps", "error", err)
 	}
 
-	p.capTopLevelDirs(ctx, sc, "node-deps",
+	p.capTopLevelDirsRoot(ctx, scRoot, "node-deps",
 		cfg.NodeDepsHighMark, cfg.NodeDepsLowMark, true, log)
 }

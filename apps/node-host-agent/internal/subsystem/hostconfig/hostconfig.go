@@ -56,6 +56,7 @@ const (
 	// HTTPTimeout was wired in — nexpDownload floors at 300s for the
 	// slow-egress infra VMs.
 	defaultHTTPTimeout = 120 * time.Second
+	defaultDownloadDir = watchdogStateDir + "/downloads"
 )
 
 // The exec contract lives in the sibling converge package (it owns the systemd
@@ -207,7 +208,7 @@ func (c *Config) applyDefaults() {
 		c.CmdTimeoutLong = defaultCmdTimeoutLong
 	}
 	if c.DownloadDir == "" {
-		c.DownloadDir = "/tmp/hostconfig"
+		c.DownloadDir = defaultDownloadDir
 	}
 	if c.NodeName == "" {
 		c.NodeName = c.Hostname
@@ -334,6 +335,17 @@ func (r *Reconciler) runCycle(ctx context.Context) {
 // hp joins HostRoot + host path.
 func (r *Reconciler) hp(p string) string {
 	return filepath.Join(r.cfg.HostRoot, p)
+}
+
+// downloadDir returns the process-visible staging dir: when
+// DownloadDir is left at defaultDownloadDir, join through HostRoot
+// so pod mode writes under /host/var/lib/node-watchdog/downloads;
+// custom overrides (e.g. test TempDirs) are used verbatim.
+func (r *Reconciler) downloadDir() string {
+	if r.cfg.DownloadDir == defaultDownloadDir {
+		return r.hp(defaultDownloadDir)
+	}
+	return r.cfg.DownloadDir
 }
 
 // host is the managed-file seam the generic verbs run through —

@@ -239,10 +239,10 @@ func TestCtrImageHealerDefaultSeamUsesSystemdExec(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.H.Cycle(context.Background())
-	if !e.SDRan("k0s ctr --namespace k8s.io images rm --sync registry.local/app:v1") {
+	if !e.SDRan("k0s ctr --namespace k8s.io images rm --sync -- registry.local/app:v1") {
 		t.Fatalf("RmImage did not exec ctr images rm, cmds=%v", e.SDCmds)
 	}
-	if !e.SDRan("k0s ctr --namespace k8s.io images rm --sync registry.local/app@sha256:feed") {
+	if !e.SDRan("k0s ctr --namespace k8s.io images rm --sync -- registry.local/app@sha256:feed") {
 		t.Fatalf("RmImage did not exec ctr images rm on the repoDigest, cmds=%v", e.SDCmds)
 	}
 }

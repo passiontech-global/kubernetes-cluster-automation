@@ -104,6 +104,10 @@ type Config struct {
 	// by.
 	InotifyMaxInstancesFile string
 	InotifyMaxWatchesFile   string
+	// KubeletConfigPaths are the host-side kubelet config.yaml
+	// candidates audited for K8s 1.35+ upgrade readiness. Empty
+	// defaults to the k0s kubelet config paths joined under HostRoot.
+	KubeletConfigPaths []string
 	// CgroupRoot is the cgroup-v2 mount; CgroupPidsSlices are the
 	// cgroup-relative dirs whose pids.current/pids.max feed
 	// node_host_agent_cgroup_pids_used_ratio{slice}.
@@ -237,8 +241,8 @@ type Config struct {
 	maxUserNSFile   string
 	runHostCmd      func(ctx context.Context, argv ...string) (string, error)
 	kmsgDevicePaths func(hostRoot string) []string
-	// latchExistsFn overrides c.state.Exists in collectWatchdog for
-	// hermetic ramEpochs testing (nil in production → c.state.Exists).
+	// latchExistsFn injects a custom latch existence probe in collectWatchdog for
+	// hermetic ramEpochs testing (nil in production; RAM-only latches use RAMLatches).
 	latchExistsFn func(name string) bool
 	// ramLatchesFn overrides c.state.RAMLatches in collectWatchdog for
 	// hermetic ramEpochs enumeration testing (nil in production →
@@ -356,6 +360,13 @@ func (c *Config) applyDefaults() {
 		c.PKICertPaths = make([]string, 0, len(defaultPKIHostPaths))
 		for _, p := range defaultPKIHostPaths {
 			c.PKICertPaths = append(c.PKICertPaths,
+				filepath.Join(c.HostRoot, p))
+		}
+	}
+	if len(c.KubeletConfigPaths) == 0 {
+		c.KubeletConfigPaths = make([]string, 0, len(defaultKubeletConfigPaths))
+		for _, p := range defaultKubeletConfigPaths {
+			c.KubeletConfigPaths = append(c.KubeletConfigPaths,
 				filepath.Join(c.HostRoot, p))
 		}
 	}

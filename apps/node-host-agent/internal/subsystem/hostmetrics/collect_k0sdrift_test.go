@@ -4,7 +4,9 @@ package hostmetrics
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -211,4 +213,114 @@ func TestRemovedFlagsCustom(t *testing.T) {
 	if v, ok := k0sDrift(t, New(cfg), "removed-flag", "some-other-flag"); !ok || v != 1 {
 		t.Fatalf("removed-flag=%v ok=%v want 1 (custom removed flag present)", v, ok)
 	}
+}
+
+func TestK0sDriftBoundedNonBlockingAndConfinement(t *testing.T) {
+	t.Run("oversized sparse k0s.yaml reports unreadable without bloating memory", func(t *testing.T) {
+		cfg, _ := fixture(t)
+		testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+		f, err := os.Create(cfg.K0sConfigFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(256 << 20); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		_ = f.Close()
+
+		start := time.Now()
+		c := New(cfg)
+		if v, ok := k0sDrift(t, c, "unreadable", "k0s.yaml"); !ok || v != 1 {
+			t.Fatalf("oversized k0s.yaml unreadable=(%v,%v), want (1,true)", v, ok)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("oversized k0s.yaml took %s, want <1s", elapsed)
+		}
+	})
+
+	t.Run("named FIFO k0s.yaml returns unreadable promptly without blocking", func(t *testing.T) {
+		cfg, _ := fixture(t)
+		testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+		if err := syscall.Mkfifo(cfg.K0sConfigFile, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		c := New(cfg)
+		start := time.Now()
+		v, ok := k0sDrift(t, c, "unreadable", "k0s.yaml")
+		elapsed := time.Since(start)
+		if !ok || v != 1 {
+			t.Fatalf("FIFO k0s.yaml unreadable=(%v,%v), want (1,true)", v, ok)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("FIFO k0s.yaml took %s, want <1s", elapsed)
+		}
+
+		// Replacing the FIFO with a clean regular file must invalidate the mode-keyed cache.
+		if err := os.Remove(cfg.K0sConfigFile); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteFile(t, cfg.K0sConfigFile, k0sCleanYAML())
+		bumpMtime(t, cfg.K0sConfigFile)
+		if v, ok := k0sDrift(t, c, "none", "none"); !ok || v != 0 {
+			t.Fatalf("recovered k0s.yaml none=(%v,%v), want (0,true)", v, ok)
+		}
+	})
+
+	t.Run("directory target at k0s.yaml reports unreadable", func(t *testing.T) {
+		cfg, _ := fixture(t)
+		testutil.WriteFile(t, cfg.K0sUnitFile, "[Unit]\n")
+		if err := os.Mkdir(cfg.K0sConfigFile, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := k0sDrift(t, New(cfg), "unreadable", "k0s.yaml"); !ok || v != 1 {
+			t.Fatalf("directory k0s.yaml unreadable=(%v,%v), want (1,true)", v, ok)
+		}
+	})
+
+	t.Run("HostRoot symlink confinement allows internal relative symlink and rejects escape", func(t *testing.T) {
+		root := t.TempDir()
+		realHR := filepath.Join(root, "real_hr")
+		evilHR := filepath.Join(root, "real_hr_evil")
+		linkHR := filepath.Join(root, "link_hr")
+		if err := os.MkdirAll(filepath.Join(realHR, "etc", "k0s", "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(realHR, "etc", "systemd", "system"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(evilHR, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(realHR, linkHR); err != nil {
+			t.Fatal(err)
+		}
+		testutil.WriteFile(t, filepath.Join(realHR, "etc", "systemd", "system", "k0scontroller.service"), "[Unit]\n")
+		testutil.WriteFile(t, filepath.Join(realHR, "etc", "k0s", "sub", "k0s.yaml"), k0sCleanYAML())
+		testutil.WriteFile(t, filepath.Join(evilHR, "k0s.yaml"), k0sCleanYAML())
+
+		cfg, _ := fixture(t)
+		cfg.HostRoot = linkHR
+		cfg.K0sUnitFile = filepath.Join(linkHR, "etc", "systemd", "system", "k0scontroller.service")
+		cfg.K0sConfigFile = filepath.Join(linkHR, "etc", "k0s", "k0s.yaml")
+
+		if err := os.Symlink("sub/k0s.yaml", filepath.Join(realHR, "etc", "k0s", "k0s.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		c := New(cfg)
+		if v, ok := k0sDrift(t, c, "none", "none"); !ok || v != 0 {
+			t.Fatalf("valid relative symlink inside HostRoot none=(%v,%v), want (0,true)", v, ok)
+		}
+
+		if err := os.Remove(filepath.Join(realHR, "etc", "k0s", "k0s.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(evilHR, "k0s.yaml"), filepath.Join(realHR, "etc", "k0s", "k0s.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := k0sDrift(t, c, "unreadable", "k0s.yaml"); !ok || v != 1 {
+			t.Fatalf("escaping symlink unreadable=(%v,%v), want (1,true)", v, ok)
+		}
+	})
 }

@@ -146,17 +146,37 @@ func IsDigits(s string) bool {
 	return true
 }
 
-// ParsePSIFull reads a /proc/pressure/* or cgroup *.pressure file and
-// extracts the `full` line's avg60 and avg300 values. ok is true iff
-// `full` and `avg60=` were parsed.
-func ParsePSIFull(path string) (avg60, avg300 float64, ok bool) {
+// PSIMemoryStats holds parsed `some` and `full` averages from a
+// /proc/pressure/* or cgroup *.pressure file.
+type PSIMemoryStats struct {
+	SomeAvg10  float64
+	SomeAvg60  float64
+	SomeAvg300 float64
+	FullAvg10  float64
+	FullAvg60  float64
+	FullAvg300 float64
+	HasSome    bool
+	HasFull    bool
+}
+
+// ParsePSIMemory reads a /proc/pressure/* or cgroup *.pressure file and
+// extracts both `some` and `full` avg10/avg60/avg300 values. HasSome /
+// HasFull are true iff their respective line had a valid `avg60=`;
+// ok is true iff at least one of HasSome or HasFull is true.
+func ParsePSIMemory(path string) (PSIMemoryStats, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, 0, false
+		return PSIMemoryStats{}, false
 	}
+	var st PSIMemoryStats
 	for line := range strings.SplitSeq(string(data), "\n") {
 		f := strings.Fields(line)
-		if len(f) < 3 || f[0] != "full" {
+		if len(f) < 3 {
+			continue
+		}
+		isSome := f[0] == "some"
+		isFull := f[0] == "full"
+		if !isSome && !isFull {
 			continue
 		}
 		for _, kv := range f[1:] {
@@ -168,13 +188,37 @@ func ParsePSIFull(path string) (avg60, avg300 float64, ok bool) {
 			if err != nil {
 				continue
 			}
-			switch k {
-			case "avg60":
-				avg60, ok = x, true
-			case "avg300":
-				avg300 = x
+			if isSome {
+				switch k {
+				case "avg10":
+					st.SomeAvg10 = x
+				case "avg60":
+					st.SomeAvg60, st.HasSome = x, true
+				case "avg300":
+					st.SomeAvg300 = x
+				}
+			} else {
+				switch k {
+				case "avg10":
+					st.FullAvg10 = x
+				case "avg60":
+					st.FullAvg60, st.HasFull = x, true
+				case "avg300":
+					st.FullAvg300 = x
+				}
 			}
 		}
 	}
-	return avg60, avg300, ok
+	return st, st.HasSome || st.HasFull
+}
+
+// ParsePSIFull reads a /proc/pressure/* or cgroup *.pressure file and
+// extracts the `full` line's avg60 and avg300 values. ok is true iff
+// `full` and `avg60=` were parsed.
+func ParsePSIFull(path string) (avg60, avg300 float64, ok bool) {
+	st, parsed := ParsePSIMemory(path)
+	if !parsed || !st.HasFull {
+		return 0, 0, false
+	}
+	return st.FullAvg60, st.FullAvg300, true
 }

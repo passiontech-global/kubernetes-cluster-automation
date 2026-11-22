@@ -353,3 +353,66 @@ func TestHungRuncPidsOKFalseAndProcErrorPreserveStreak(t *testing.T) {
 		t.Fatalf("kills=%v want SIGKILL on 7810 on preserved streak=2", e.Kills)
 	}
 }
+
+func TestHungRuncUsesStatsOnceAndKeepsTOCTOU(t *testing.T) {
+	e := hungEnv(t, 1)
+
+	// PID 9102 is a qualifying runc on disk, aged 5m.
+	writeFullStat(t, e, 9102, "runc", "S", 100)
+	ageProc(t, e, 9102, 5*time.Minute)
+
+	statsCalls := 0
+	statsSnap := map[int]procfs.Stat{
+		9101: {HasComm: true, Comm: "bash", Fields: []string{"S", "1"}}, // no /proc/9101/stat on disk
+		9102: {HasComm: true, Comm: "runc", Fields: []string{"S", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "100"}},
+	}
+	chk := hungCheck(e)
+	// First, test mid-cycle S->D transition caught by live TOCTOU check even when StatsOnce said "S":
+	e.H.Cfg.Coord = &nodecoord.Coord{
+		Now: func() time.Time { return e.Now },
+		GetAnnos: func(context.Context) (map[string]string, error) {
+			writeFullStat(t, e, 9102, "runc", "D", 100)
+			return map[string]string{}, nil
+		},
+	}
+	chk.Run(context.Background(), &wdeps.CycleEnv{
+		WorkerActive: true,
+		PidsOnce:     wdepstest.PidsOf(9101, 9102),
+		PidsOK:       func() bool { return true },
+		StatsOnce: func() map[int]procfs.Stat {
+			statsCalls++
+			return statsSnap
+		},
+	})
+	if statsCalls != 1 {
+		t.Fatalf("StatsOnce called %d times, want 1", statsCalls)
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("live TOCTOU must abort kill on S->D even when StatsOnce reported S; kills=%v", e.Kills)
+	}
+
+	// Verify StatsOnce omitting a 0o000 stat PID still aborts via procFileReadNonENOENT.
+	if os.Geteuid() != 0 {
+		writeFullStat(t, e, 9103, "runc", "S", 200)
+		stat9103 := filepath.Join(e.ProcDir, "9103", "stat")
+		if err := os.Chmod(stat9103, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(stat9103, 0o644) })
+		chk.Run(context.Background(), &wdeps.CycleEnv{
+			WorkerActive: true,
+			PidsOnce:     wdepstest.PidsOf(9101, 9103),
+			PidsOK:       func() bool { return true },
+			StatsOnce: func() map[int]procfs.Stat {
+				statsCalls++
+				return statsSnap
+			},
+		})
+		if statsCalls != 2 {
+			t.Fatalf("StatsOnce called %d times, want 2", statsCalls)
+		}
+		if got := testutil.ToFloat64(e.H.Cycles.WithLabelValues(wdeps.CheckHungRunc, "abort")); got != 1 {
+			t.Fatalf("abort=%v want 1 when StatsOnce omits 0o000 stat PID", got)
+		}
+	}
+}

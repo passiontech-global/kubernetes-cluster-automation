@@ -17,3 +17,6 @@ func NewHub(d *cdeps.Deps) *HubCheck { return &HubCheck{d: d} }
 func NewFreeze(d *cdeps.Deps, storage, kubecert cdeps.Check) *FreezeCheck {
 	return &FreezeCheck{d: d, Storage: storage, KubeCert: kubecert}
 }
+
+// NewKMSv2 returns the KMSv2 encryption plugin socket & /healthz/kms-provider-* guard.
+func NewKMSv2(d *cdeps.Deps) *KMSv2Check { return &KMSv2Check{d: d} }

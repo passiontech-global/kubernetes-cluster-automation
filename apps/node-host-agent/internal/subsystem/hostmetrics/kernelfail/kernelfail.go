@@ -296,6 +296,7 @@ type Runner struct {
 	ebpfLastScanAt    time.Time // stamp of the snapshot the streak last consumed (zero = none)
 	kernelDriftStreak int       // Wave-4 #9 consecutive ticks with THP or rp_filter drift
 	thpVars           thpVarsCache
+	gpuPCI            gpuPCICache
 }
 
 // defaultTickInterval is the latch ticker cadence the warp detector

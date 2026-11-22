@@ -84,6 +84,10 @@ func ConfigFromEnv(d EnvDeps) Config {
 		envx.StringKnob(envnames.EnvClocksourceAvailableFile,
 			&cfg.ClocksourceAvailableFile,
 			hostPath(defaultClocksourceAvailableFile)),
+		envx.StringKnob(envnames.EnvMountinfoFile, &cfg.MountinfoFile,
+			defaultMountinfoFile),
+		envx.StringKnob(envnames.EnvCgroupRoot, &cfg.CgroupRoot,
+			hostPath(defaultCgroupRoot)),
 		envx.ListKnob(envnames.EnvCgroupMemUnits, &cfg.CgroupMemUnits),
 		// envList → default-closure: a set env wins verbatim (even an
 		// empty-looking parse is nil → defaults); unset falls back to

@@ -568,3 +568,14 @@ func TestStopServiceFailureAttribution(t *testing.T) {
 		t.Fatalf("actions{stop} = %v", got)
 	}
 }
+
+func TestDownloadDirDefaultNonTmp(t *testing.T) {
+	cfg := Config{}
+	cfg.applyDefaults()
+	if cfg.DownloadDir != "/var/lib/node-watchdog/downloads" {
+		t.Fatalf("DownloadDir = %q, want /var/lib/node-watchdog/downloads", cfg.DownloadDir)
+	}
+	if strings.HasPrefix(cfg.DownloadDir, "/tmp/") {
+		t.Fatalf("DownloadDir must not live under /tmp: %q", cfg.DownloadDir)
+	}
+}

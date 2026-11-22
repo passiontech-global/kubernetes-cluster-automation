@@ -18,6 +18,15 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
+func seedHostRootShim(t *testing.T, e *env, pid int) {
+	t.Helper()
+	p := fmt.Sprintf("%d", pid)
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, p, "cgroup"),
+		"0::/system.slice/containerd.service\n")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, p, "status"),
+		"Name:\tcontainerd-shim\nUid:\t0\t0\t0\t0\n")
+}
+
 // --- check 6: ctr-tasks (31) ---
 
 // TestCtrTasksUmountsRootfsBeforeRemove: a wedged task
@@ -158,6 +167,7 @@ func TestCtrTasksOrphanShim(t *testing.T) {
 	e.MkProc(t, 9200, "S",
 		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
 			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9200)
 	// Fresh proc mtime — must survive the 5m orphan window.
 	e.H.Cycle(context.Background())
 	if len(e.Kills) != 0 {
@@ -180,6 +190,7 @@ func TestCtrTasksHealthyShimKept(t *testing.T) {
 	e.MkProc(t, 9201, "S",
 		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
 			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9201)
 	// The task dir exists → shim is not an orphan.
 	if err := os.MkdirAll(filepath.Join(e.CtrDir, sid), 0o755); err != nil {
 		t.Fatal(err)
@@ -263,6 +274,7 @@ func TestCtrTasksForeignNsSameSocketKept(t *testing.T) {
 	e.MkProc(t, 9303, "S",
 		"containerd-shim-runc-v2\x00-namespace\x00buildkit\x00-id\x00"+sid+
 			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9303)
 	// Task dir exists under the buildkit namespace root: sibling of
 	// the k8s.io root (filepath.Dir(e.CtrDir)/<ns>/<id>).
 	if err := os.MkdirAll(
@@ -288,6 +300,7 @@ func TestCtrTasksForeignNsSameSocketOrphanKilled(t *testing.T) {
 	e.MkProc(t, 9304, "S",
 		"containerd-shim-runc-v2\x00-namespace\x00buildkit\x00-id\x00"+sid+
 			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9304)
 	old := e.Now.Add(-time.Hour)
 	if err := os.Chtimes(filepath.Join(e.ProcDir, "9304"), old, old); err != nil {
 		t.Fatal(err)
@@ -347,6 +360,7 @@ func TestCtrTasksHoldLocalActionPreservesMarkersAndSkipsKills(t *testing.T) {
 	e.MkProc(t, 9210, "S",
 		"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
 			"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+	seedHostRootShim(t, e, 9210)
 	oldShim := e.Now.Add(-10 * time.Minute)
 	if err := os.Chtimes(filepath.Join(e.ProcDir, "9210"), oldShim, oldShim); err != nil {
 		t.Fatal(err)
@@ -400,6 +414,7 @@ func TestCtrTasksSandboxCtlRootUnreadableAbortsWithoutKillingShims(t *testing.T)
 		e.MkProc(t, 9701, "S",
 			"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
 				"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+		seedHostRootShim(t, e, 9701)
 		old := e.Now.Add(-10 * time.Minute)
 		if err := os.Chtimes(filepath.Join(e.ProcDir, "9701"), old, old); err != nil {
 			t.Fatal(err)
@@ -438,6 +453,7 @@ func TestCtrTasksSandboxCtlRootUnreadableAbortsWithoutKillingShims(t *testing.T)
 		e.MkProc(t, 9702, "S",
 			"containerd-shim-runc-v2\x00-namespace\x00k8s.io\x00-id\x00"+sid+
 				"\x00-address\x00/run/k0s/containerd.sock\x00", "")
+		seedHostRootShim(t, e, 9702)
 		old := e.Now.Add(-10 * time.Minute)
 		if err := os.Chtimes(filepath.Join(e.ProcDir, "9702"), old, old); err != nil {
 			t.Fatal(err)

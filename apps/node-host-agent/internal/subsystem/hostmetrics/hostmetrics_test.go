@@ -234,8 +234,9 @@ func TestDescribe(t *testing.T) {
 	// + 3 A6 descs (per-tuple max + per-tuple hot endpoint +
 	//   TCPTimeWaitOverflow — the sockstat/netstat rows).
 	// + 1 sock_diag per-state census desc (netlinkx TCPStates).
-	if got := len(ch); got != 81 {
-		t.Fatalf("Describe emitted %d descs want 81", got)
+	// + 1 K5 K8s 1.35+ readiness drift desc.
+	if got := len(ch); got != 82 {
+		t.Fatalf("Describe emitted %d descs want 82", got)
 	}
 }
 

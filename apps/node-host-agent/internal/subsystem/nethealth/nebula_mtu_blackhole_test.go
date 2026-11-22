@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -526,4 +528,148 @@ func TestMTUMetricWriteFailuresDegrade(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "node-agent-nebula-mtu.prom")); !os.IsNotExist(err) {
 		t.Fatal("metric file appeared despite a failed write")
 	}
+}
+
+func TestNebulaMTUBlackholeUsesAlivePeerCache(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	n.cfg.Watchdog.OverlayProbeTargets = []string{"10.128.0.1", "10.128.0.2"}
+	e.pingOK["10.128.0.1|false"] = false
+	e.pingOK["10.128.0.2|false"] = true
+
+	ctx := context.Background()
+	n.probeNebulaOverlay(ctx, n.cfg.Watchdog)
+
+	var pingCalls atomic.Int32
+	n.cfg.ping = func(_ context.Context, ip string, _, _ int, marked bool) (bool, float64) {
+		pingCalls.Add(1)
+		return e.pingOK[ip+"|false"], 1.0
+	}
+	e.host.ClearLog()
+	n.checkNebulaMTUBlackhole(ctx, n.mtuState())
+	if got := pingCalls.Load(); got != 0 {
+		t.Fatalf("expected 0 small pings on cached healthy DF probe, got %d", got)
+	}
+	if !e.host.Ran("-M do -s 1252 10.128.0.2") {
+		t.Fatalf("DF ping did not target cached alive peer 10.128.0.2: %v", e.host.Cmds())
+	}
+}
+
+func TestNebulaMTUBlackholeCacheVerifiesSmallOnDFFail(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	n.cfg.Watchdog.OverlayProbeTargets = []string{"10.128.0.1", "10.128.0.2"}
+	e.pingOK["10.128.0.2|false"] = true
+	ctx := context.Background()
+	st := n.mtuState()
+
+	// Seed alive peer cache with 10.128.0.2.
+	n.probeNebulaOverlay(ctx, n.cfg.Watchdog)
+
+	// Now 10.128.0.2 dies completely (both DF and small ping fail) and no other peer is alive.
+	// Pre-arm latch to verify reset() clears held latch on total overlay failure.
+	n.state.Enter("nebula-mtu-blackhole", "pre-existing")
+	e.pingOK["10.128.0.2|false"] = false
+	e.host.FailOn("-M do -s 1252", errCmdFail)
+	var pingMu sync.Mutex
+	var pingTargets []string
+	n.cfg.ping = func(_ context.Context, ip string, _, _ int, _ bool) (bool, float64) {
+		pingMu.Lock()
+		pingTargets = append(pingTargets, ip)
+		pingMu.Unlock()
+		return e.pingOK[ip+"|false"], 1.0
+	}
+	for range nebula.MTUBlackholeNeeded {
+		n.checkNebulaMTUBlackhole(ctx, st)
+	}
+	st.Mu.Lock()
+	fails := st.MTUFails
+	st.Mu.Unlock()
+	if fails != 0 {
+		t.Fatalf("MTUFails=%d want 0 when small ping verification fails", fails)
+	}
+	if stateExists(e, "nebula-mtu-blackhole") {
+		t.Fatal("nebula-mtu-blackhole latch kept on total overlay failure")
+	}
+	pingMu.Lock()
+	firstTarget := ""
+	if len(pingTargets) > 0 {
+		firstTarget = pingTargets[0]
+	}
+	pingMu.Unlock()
+	if firstTarget != "10.128.0.2" {
+		t.Fatalf("expected small ping verification on cached peer first, got %v", pingTargets)
+	}
+
+	// If cached peer dies while another target is alive, evict cached peer and fail over.
+	e.pingOK["10.128.0.1|false"] = true
+	e.pingOK["10.128.0.2|false"] = false
+	n.probeNebulaOverlay(ctx, n.cfg.Watchdog) // caches 10.128.0.1
+	e.pingOK["10.128.0.1|false"] = false
+	e.pingOK["10.128.0.2|false"] = true
+	e.host.Clear("-M do -s 1252")
+	e.host.FailOn("-M do -s 1252 10.128.0.1", errCmdFail)
+	e.host.ClearLog()
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if !e.host.Ran("-M do -s 1252 10.128.0.2") {
+		t.Fatalf("did not fail over DF probe to 10.128.0.2 after cached peer died: %v", e.host.Cmds())
+	}
+}
+
+func TestNebulaMTUBlackholeCacheExpiryAndConcurrency(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	n.cfg.Interval = time.Minute // alivePeerTTL = 2m
+	n.cfg.Watchdog.OverlayProbeTargets = []string{"10.128.0.2"}
+	e.pingOK["10.128.0.2|false"] = true
+	ctx := context.Background()
+	st := n.mtuState()
+
+	var pingCount atomic.Int32
+	n.cfg.ping = func(_ context.Context, ip string, _, _ int, _ bool) (bool, float64) {
+		pingCount.Add(1)
+		return e.pingOK[ip+"|false"], 1.0
+	}
+
+	// Populate cache -> TTL expiry forces re-ping.
+	n.probeNebulaOverlay(ctx, n.cfg.Watchdog)
+	pingCount.Store(0)
+	e.now = e.now.Add(3 * time.Minute)
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if pingCount.Load() == 0 {
+		t.Fatal("expected re-ping after TTL expiry")
+	}
+
+	// Backward clock step invalidates cache immediately.
+	pingCount.Store(0)
+	e.now = e.now.Add(-5 * time.Second)
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if pingCount.Load() == 0 {
+		t.Fatal("expected re-ping after backward clock step")
+	}
+
+	// Config target change invalidates cache.
+	n.cfg.Watchdog.OverlayProbeTargets = []string{"10.128.0.99"}
+	e.pingOK["10.128.0.99|false"] = true
+	pingCount.Store(0)
+	n.checkNebulaMTUBlackhole(ctx, st)
+	if pingCount.Load() == 0 {
+		t.Fatal("expected re-ping after config target mismatch")
+	}
+
+	// Concurrent ProbeNebulaOverlay + CheckNebulaMTUBlackhole under -race.
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for range 20 {
+				n.probeNebulaOverlay(ctx, n.cfg.Watchdog)
+			}
+		})
+		wg.Go(func() {
+			for range 20 {
+				n.checkNebulaMTUBlackhole(ctx, st)
+			}
+		})
+	}
+	wg.Wait()
 }

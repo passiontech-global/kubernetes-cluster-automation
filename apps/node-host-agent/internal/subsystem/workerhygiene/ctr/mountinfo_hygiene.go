@@ -67,8 +67,9 @@ const (
 
 // MountinfoCheck is the mountinfo table hygiene check.
 type MountinfoCheck struct {
-	d     *wdeps.Deps
-	fails int
+	d               *wdeps.Deps
+	fails           int
+	shimWedgeStreak int
 }
 
 // NewMountinfo builds the mountinfo-hygiene check.
@@ -297,7 +298,8 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	pressureOK := c.checkMountPressure(ctx, data)
 	loopOK := c.reapOrphanLoops(ctx, e, data, hostPodsDir, podLive, tasksOnce)
-	if !pressureOK || !loopOK || sawTaskStatErr || sawVolScanErr || sawIncompleteTasks {
+	shimWedgeOK := c.reconcileShimMountWedges(ctx, e, data, hostPodsDir, podLive)
+	if !pressureOK || !loopOK || !shimWedgeOK || sawTaskStatErr || sawVolScanErr || sawIncompleteTasks {
 		c.d.CycleResult(wdeps.CheckMountinfo, "abort")
 		return
 	}

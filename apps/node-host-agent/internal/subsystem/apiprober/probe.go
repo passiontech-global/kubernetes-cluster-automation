@@ -186,6 +186,7 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		fc := failStatus
 		if resp.StatusCode == http.StatusUnauthorized ||
 			resp.StatusCode == http.StatusForbidden {

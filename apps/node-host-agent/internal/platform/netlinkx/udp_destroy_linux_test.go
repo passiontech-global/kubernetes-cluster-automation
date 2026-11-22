@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"os"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -81,5 +82,55 @@ func TestParseConnectedUDPWireFormat(t *testing.T) {
 	}
 	if len(out6) != 1 || !out6[0].DstIP.Equal(dst6) || out6[0].DstPort != 8080 {
 		t.Fatalf("unexpected v6 socket: %+v", out6)
+	}
+}
+
+func TestDumpConnectedAndBoundUDPAndDestroyUDPSockets(t *testing.T) {
+	pid := os.Getpid()
+	boundSock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Skipf("no loopback udp: %v", err)
+	}
+	defer boundSock.Close()
+	boundPort := uint16(boundSock.LocalAddr().(*net.UDPAddr).Port)
+
+	client, err := net.DialUDP("udp",
+		&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)},
+		boundSock.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Skipf("dial udp: %v", err)
+	}
+	defer client.Close()
+	clientPort := uint16(client.LocalAddr().(*net.UDPAddr).Port)
+
+	socks, bound, err := DumpConnectedAndBoundUDP(pid)
+	if err != nil {
+		t.Fatalf("DumpConnectedAndBoundUDP: %v", err)
+	}
+	foundClient := false
+	for _, s := range socks {
+		if s.SrcPort == clientPort && s.DstPort == boundPort {
+			foundClient = true
+			break
+		}
+	}
+	if !foundClient {
+		t.Fatalf("connected client %d->%d not found in DumpConnectedAndBoundUDP: %+v", clientPort, boundPort, socks)
+	}
+	if !bound[boundPort] {
+		t.Fatalf("bound port %d missing from DumpConnectedAndBoundUDP bound map: %v", boundPort, bound)
+	}
+	if bound[clientPort] {
+		t.Fatalf("connected client ephemeral port %d must not appear in bound map", clientPort)
+	}
+
+	// Empty targets is a clean no-op.
+	if res, err := DestroyUDPSockets(pid, nil); err != nil || len(res) != 0 {
+		t.Fatalf("DestroyUDPSockets(nil)=(%v,%v) want (nil,nil)", res, err)
+	}
+
+	// Non-existent PID returns error from InNetNS.
+	if _, err := DestroyUDPSockets(999999999, []UDPSocketTarget{{Family: unix.AF_INET}}); err == nil {
+		t.Fatal("expected error for non-existent PID")
 	}
 }

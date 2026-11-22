@@ -279,7 +279,7 @@ func TestOverlayFSStaleMount(t *testing.T) {
 		t.Fatal("image rm before ConsecNeeded cycles")
 	}
 	wdepstest.Check[*runtime.OverlayFSStaleCheck](h, wdeps.CheckOverlayFSStale).Run(ctx, env)
-	if !e.SDRan("images rm --sync docker.io/library/nginx:1.25") {
+	if !e.SDRan("images rm --sync -- docker.io/library/nginx:1.25") {
 		t.Fatalf("expected normalized image rm, sdcmds=%v", e.SDCmds)
 	}
 	if h.OverlayFSStaleMounts < 1 {

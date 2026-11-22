@@ -10,7 +10,7 @@
 # go.mod `replace ../../libs/hostkit` target resolves inside the
 # context at /src/libs/hostkit. No go.work is copied, so the build
 # runs in plain module mode (the release path).
-FROM golang:1.27.4 AS build
+FROM golang:1.27.4-alpine AS build
 WORKDIR /src
 # Dep manifests first so `go mod download` is a cacheable layer that only
 # busts when go.mod/go.sum (or the hostkit replace target's go.mod) change —
@@ -41,10 +41,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # resolve in the CONTAINER mount namespace:
 #   nsenter (util-linux) — wraps every host-namespace exec
 #     (`nsenter -t 1 -m -u -i -n -p --` and nethealth's `-n`-only form)
-#   ip + ss (iproute2)   — nethealth runHostCmd `nsenter -t 1 -n --`
-#     (net ns only → argv resolves in container fs)
-#   ping (iputils)       — reachability probes incl. -m fwmark pinning
-#   sh + bash            — `sh -c` probe pipelines / fallbacks
+#   ip (iproute2-minimal) + ss (iproute2-ss) — nethealth runHostCmd
+#     `nsenter -t 1 -n --` (net ns only → argv resolves in container fs)
+#   ping (iputils-ping)  — reachability probes incl. -m fwmark pinning
+#   sh (busybox)         — `sh -c` probe pipelines / fallbacks
 #   tzdata               — zoneinfo for systemd timestamps: feeder's
 #     ParseSystemdTimestamp resolves ActiveEnterTimestamp abbrevs
 #     ("CET"/"CEST") via time.LoadLocation — without /usr/share/
@@ -59,7 +59,7 @@ FROM alpine:3.24
 # the floating alpine:3.24 tag would break the build whenever upstream
 # bumps a package.
 # hadolint ignore=DL3018
-RUN apk add --no-cache util-linux iproute2 iputils bash tini tzdata
+RUN apk add --no-cache util-linux iproute2-minimal iproute2-ss iputils-ping tini tzdata
 COPY --from=build /out/node-host-agent /node-host-agent
 USER 65532:65532
 # tini -s: the DaemonSet runs hostPID:true, so tini shares the HOST pid

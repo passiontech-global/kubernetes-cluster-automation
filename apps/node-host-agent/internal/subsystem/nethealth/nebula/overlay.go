@@ -49,10 +49,43 @@ type NebulaOverlayStats struct {
 	siteedge         []string
 }
 
+// uniqueProbeTargets collects OverlayProbeTargets, OverlayProbeMarkers,
+// and OverlaySiteMarkers in first-seen slice order, skipping empty
+// strings and duplicates so ProbeNebulaOverlay and
+// CheckNebulaMTUBlackhole never ping the same target twice per cycle.
+func uniqueProbeTargets(wd *watchdogconf.Config) []string {
+	if wd == nil {
+		return nil
+	}
+	total := len(wd.OverlayProbeTargets) + len(wd.OverlayProbeMarkers) + len(wd.OverlaySiteMarkers)
+	if total == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, total)
+	targets := make([]string, 0, total)
+	for _, list := range [][]string{
+		wd.OverlayProbeTargets,
+		wd.OverlayProbeMarkers,
+		wd.OverlaySiteMarkers,
+	} {
+		for _, t := range list {
+			if t == "" {
+				continue
+			}
+			if _, ok := seen[t]; ok {
+				continue
+			}
+			seen[t] = struct{}{}
+			targets = append(targets, t)
+		}
+	}
+	return targets
+}
+
 // ProbeNebulaOverlay runs the parallel dataplane fanout — serial
 // pings would blow the check budget on a large mesh (wd_ping_fanout
-// parity). Returns the probed target list (PMTU consumes it) and
-// the per-target PingResult map.
+// parity). Returns the deduplicated probed target list (PMTU consumes
+// it) and the per-target PingResult map.
 func (n *Deps) ProbeNebulaOverlay(ctx context.Context,
 	wd *watchdogconf.Config) ([]string, map[string]PingResult) {
 
@@ -64,10 +97,7 @@ func (n *Deps) ProbeNebulaOverlay(ctx context.Context,
 	if wait <= 0 {
 		wait = 4
 	}
-	targets := append(append(append([]string{},
-		wd.OverlayProbeTargets...),
-		wd.OverlayProbeMarkers...),
-		wd.OverlaySiteMarkers...)
+	targets := uniqueProbeTargets(wd)
 	results := map[string]PingResult{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -80,6 +110,13 @@ func (n *Deps) ProbeNebulaOverlay(ctx context.Context,
 		})
 	}
 	wg.Wait()
+	var alive []string
+	for _, t := range targets {
+		if results[t].Ok {
+			alive = append(alive, t)
+		}
+	}
+	n.setAlivePeers(alive)
 	return targets, results
 }
 

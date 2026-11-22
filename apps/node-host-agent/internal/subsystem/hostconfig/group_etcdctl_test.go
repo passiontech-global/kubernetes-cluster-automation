@@ -9,6 +9,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -699,5 +700,87 @@ func TestKineServiceChmodFailureArms(t *testing.T) {
 	c.groupKineService()
 	if c.errs < 2 {
 		t.Fatalf("errs = %d, want the dir + env chmod failures counted", c.errs)
+	}
+}
+
+func TestKinePreservesUsrLocalBinMode(t *testing.T) {
+	bin := []byte("#!/bin/sh\n# fake kine\n")
+	url, sum := rawServer(t, bin)
+	vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]
+kine_endpoint: "sqlite:///var/lib/k0s/db/kine.db"
+kine_bin_url: %q
+kine_bin_sha256: %q
+`, url, sum))
+	sr := newScripted(nil, nil)
+	r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := filepath.Join(r.cfg.HostRoot, "/usr/local/bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-a")
+	c.groupKineService()
+	if c.errs != 0 {
+		t.Fatalf("errs = %d, want 0", c.errs)
+	}
+	if fi, err := os.Stat(binDir); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("/usr/local/bin mode = %v, want 0755 (never 0700!)", fi)
+	}
+	if fi, err := os.Stat(filepath.Join(binDir, "kine")); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("/usr/local/bin/kine mode = %v, want 0755", fi)
+	}
+	if fi, err := os.Stat(filepath.Join(r.cfg.HostRoot, "/etc/kine")); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("/etc/kine mode = %v, want 0700", fi)
+	}
+	if fi, err := os.Stat(filepath.Join(r.cfg.HostRoot, "/etc/kine/kine.env")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("/etc/kine/kine.env mode = %v, want 0600", fi)
+	}
+}
+
+func TestKineEndpointRefusalRedactsCredentials(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	for _, badEP := range []string{
+		"postgres://kineuser:SuperSecretPass123@db.internal:5432/kine\nEVIL=1",
+		"postgres://kineuser:SuperSecretPass123@db.internal:5432/kine\"EVIL=1",
+	} {
+		buf.Reset()
+		vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]
+kine_bin_url: "http://127.0.0.1:1/never"
+kine_bin_sha256: "deadbeef"
+kine_endpoint: %q
+`, badEP))
+		sr := newScripted(nil, nil)
+		r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+			VarsDir: vars, Runner: sr, DownloadDir: t.TempDir()}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := loadCyc(t, r, vars, "node-a")
+		c.groupKineService()
+		if c.errs == 0 {
+			t.Fatalf("expected error on unsafe kine_endpoint %q", badEP)
+		}
+		if hostExists(r, "/etc/kine/kine.env") {
+			t.Fatal("/etc/kine/kine.env written despite unsafe kine_endpoint")
+		}
+		out := buf.String()
+		if !strings.Contains(out, "[REDACTED]") || !strings.Contains(out, "kine_endpoint") {
+			t.Fatalf("expected redacted log for kine_endpoint, got:\n%s", out)
+		}
+		for _, secret := range []string{"SuperSecretPass123", "kineuser", "db.internal"} {
+			if strings.Contains(out, secret) {
+				t.Fatalf("secret %q leaked in log output:\n%s", secret, out)
+			}
+		}
 	}
 }

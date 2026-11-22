@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
@@ -407,6 +408,91 @@ func TestStateFileKeySanitizes(t *testing.T) {
 	} {
 		if got := stateFileKey(in); got != want {
 			t.Fatalf("stateFileKey(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+func TestSaveStateSkipsRedundantRemovesAndWrites(t *testing.T) {
+	stub := newAPIStub(t)
+	ha := newFakeHAProxy(t, [2]string{"hub1", stub.addr()})
+	dir := t.TempDir()
+
+	// Pre-seed "0\n" and "garbage\n" litter files — loadState marks them
+	// present so cycle 1 cleans them up.
+	testutil.WriteFile(t, beFile(dir, "apibe-qfail-", "hub1"), "0\n")
+	testutil.WriteFile(t, beFile(dir, "apibe-ok-", "hub1"), "garbage\n")
+
+	p := fixture(t, ha, ModeDryRun, nil)
+	p.cfg.WatchdogStateDir = dir
+	stub.set(100, 100)
+	p.Cycle(context.Background())
+
+	for _, f := range []string{"apibe-qfail-hub1", "apibe-ok-hub1"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); !os.IsNotExist(err) {
+			t.Fatalf("%s pre-existing litter survived cycle 1", f)
+		}
+	}
+
+	// Cycle 2: healthy steady state — all disk* flags report known+absent.
+	// Plant a probe file directly on disk (bypassing Prober): because
+	// saveState skips redundant os.Remove when known absent, it stays untouched.
+	testutil.WriteFile(t, beFile(dir, "apibe-qfail-", "hub1"), "sentinel\n")
+	p.Cycle(context.Background())
+	if got := fileContent(t, beFile(dir, "apibe-qfail-", "hub1")); got != "sentinel\n" {
+		t.Fatalf("redundant os.Remove ran when already known absent: got=%q", got)
+	}
+	if err := os.Remove(beFile(dir, "apibe-qfail-", "hub1")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Transition 0 -> 1 -> unchanged -> 0:
+	st := p.states["hub1"]
+	st.qfail = 1
+	st.hasPrev = true
+	st.prevCache = 100
+	st.drained = true
+	p.saveState(dir, "hub1", st)
+
+	fiQ, err := os.Stat(beFile(dir, "apibe-qfail-", "hub1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fiP, err := os.Stat(beFile(dir, "apibe-prevcache-", "hub1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fiD, err := os.Stat(beFile(dir, "apibe-drained-", "hub1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inoQ := fiQ.Sys().(*syscall.Stat_t).Ino
+	inoP := fiP.Sys().(*syscall.Stat_t).Ino
+	inoD := fiD.Sys().(*syscall.Stat_t).Ino
+
+	// Unchanged saveState must skip writes and keep exact inodes.
+	p.saveState(dir, "hub1", st)
+	for name, wantIno := range map[string]uint64{
+		"apibe-qfail-hub1":     inoQ,
+		"apibe-prevcache-hub1": inoP,
+		"apibe-drained-hub1":   inoD,
+	} {
+		fi, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotIno := fi.Sys().(*syscall.Stat_t).Ino; gotIno != wantIno {
+			t.Fatalf("%s rewritten despite unchanged value: inode %d -> %d",
+				name, wantIno, gotIno)
+		}
+	}
+
+	// Transition back to 0/false removes the files cleanly.
+	st.qfail = 0
+	st.drained = false
+	p.saveState(dir, "hub1", st)
+	for _, f := range []string{"apibe-qfail-hub1", "apibe-prevcache-hub1", "apibe-drained-hub1"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); !os.IsNotExist(err) {
+			t.Fatalf("%s not removed on transition back to 0/false", f)
 		}
 	}
 }

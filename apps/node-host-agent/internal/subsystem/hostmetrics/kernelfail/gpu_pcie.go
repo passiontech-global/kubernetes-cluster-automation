@@ -38,6 +38,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
@@ -61,12 +62,23 @@ const (
 	// gpuPCIPromName is the textfile drop carrying the live /
 	// expected device gauges.
 	gpuPCIPromName = "node-agent-gpu-pcie.prom"
+	// gpuPCIScanTTL throttles full /sys/bus/pci/devices walks on
+	// steady-state nodes (0-GPU CPU-only nodes or GPU nodes whose
+	// cached GPU device paths all still stat cleanly).
+	gpuPCIScanTTL = 10 * time.Minute
 )
 
 // gpuPCIDevice is one display-class NVIDIA PCI function.
 type gpuPCIDevice struct {
 	name    string // PCI slot name (0000:01:00.0)
 	devPath string // <sys>/bus/pci/devices/<name>
+}
+
+type gpuPCICache struct {
+	scannedAt time.Time
+	hostRoot  string
+	devs      []gpuPCIDevice
+	ok        bool
 }
 
 // scanGPUPCIDevices lists display-class NVIDIA PCI functions under
@@ -164,6 +176,49 @@ func (r *Runner) writeGPUPCIbaseline(n int) {
 	_ = fsx.WriteFileAtomicNoSync(p, strconv.Itoa(n)+"\n")
 }
 
+func (r *Runner) scanGPUPCIDevicesCached(allowZeroCache bool) ([]gpuPCIDevice, bool) {
+	now := time.Now()
+	if r.deps.Clock != nil {
+		now = r.deps.Clock.Now()
+	}
+	hostRoot := r.deps.HostRoot
+	if hostRoot == "" {
+		hostRoot = "/"
+	}
+	if r.gpuPCI.ok && r.gpuPCI.hostRoot == hostRoot {
+		if age := now.Sub(r.gpuPCI.scannedAt); age >= 0 && age < gpuPCIScanTTL {
+			if len(r.gpuPCI.devs) == 0 {
+				if allowZeroCache {
+					return nil, true
+				}
+			} else {
+				allLive := true
+				for _, d := range r.gpuPCI.devs {
+					if _, err := os.Stat(d.devPath); err != nil {
+						allLive = false
+						break
+					}
+				}
+				if allLive {
+					return r.gpuPCI.devs, true
+				}
+			}
+		}
+	}
+	devs, ok := r.scanGPUPCIDevices()
+	if ok {
+		r.gpuPCI = gpuPCICache{
+			scannedAt: now,
+			hostRoot:  hostRoot,
+			devs:      devs,
+			ok:        true,
+		}
+	} else {
+		r.gpuPCI = gpuPCICache{}
+	}
+	return devs, ok
+}
+
 // updateGPUPCIe runs the sysfs census once per latch tick and feeds
 // the GPU-prefixed acute evidence classes — must run BEFORE
 // updateHardwareHealth so the fresh stamps are in the acute map when
@@ -176,7 +231,9 @@ func (r *Runner) updateGPUPCIe() {
 	if r.deps.GPUGuardMode == envx.ModeOff {
 		return
 	}
-	devs, ok := r.scanGPUPCIDevices()
+	baseline, hasBaseline := r.gpuPCIBaseline()
+	allowZeroCache := r.deps.GPUExpectedCount == 0 && (!hasBaseline || baseline == 0)
+	devs, ok := r.scanGPUPCIDevicesCached(allowZeroCache)
 	if !ok {
 		return // inconclusive — contribute nothing
 	}
@@ -198,7 +255,6 @@ func (r *Runner) updateGPUPCIe() {
 	// Device-count baseline — max-seen ever, persisted so an agent
 	// restart can't forget a GPU that died while it was down; a
 	// HIGHER count re-baselines upward (hot-add is not loss).
-	baseline, hasBaseline := r.gpuPCIBaseline()
 	switch {
 	case !hasBaseline:
 		r.writeGPUPCIbaseline(live)
