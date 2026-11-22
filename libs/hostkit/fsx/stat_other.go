@@ -12,6 +12,15 @@ import "fmt"
 // fallback exists for Linux bind mounts only.
 func isBindMountRenameErr(error) bool { return false }
 
+func isBindMountEBUSYErr(error) bool { return false }
+
+type fileIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+func statFileIdentity(string) (fileIdentity, bool) { return fileIdentity{}, false }
+
 // FileStatKey has no syscall.Stat_t to fingerprint on this
 // platform; failing loudly beats a key that cannot detect change.
 func FileStatKey(path string) (string, error) {

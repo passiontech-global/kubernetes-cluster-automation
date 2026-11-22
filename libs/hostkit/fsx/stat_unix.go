@@ -21,6 +21,32 @@ func isBindMountRenameErr(err error) bool {
 	return errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EXDEV)
 }
 
+// isBindMountEBUSYErr reports specifically whether a rename failure
+// is EBUSY (bind-mounted target), which WriteFileAtomic* memoizes so
+// subsequent writes skip the doomed tmp+fsync+rename cycle.
+func isBindMountEBUSYErr(err error) bool {
+	return errors.Is(err, syscall.EBUSY)
+}
+
+type fileIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+// statFileIdentity returns the (dev, ino) pair for path so bind-mount
+// memoization can detect when the target is unlinked/remounted.
+func statFileIdentity(path string) (fileIdentity, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileIdentity{}, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileIdentity{}, false
+	}
+	return fileIdentity{dev: st.Dev, ino: st.Ino}, true
+}
+
 // FileStatKey fingerprints a file's identity+generation WITHOUT
 // reading it: dev, inode, size and mtime. Every writer in this
 // tree stages via atomic rename (WriteAtomic family), which always

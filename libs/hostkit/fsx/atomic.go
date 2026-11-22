@@ -7,6 +7,7 @@ package fsx
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/logx"
@@ -21,10 +22,74 @@ import (
 // growth on hosts with churny target paths).
 const renameFallbackLogCap = 1024
 
+// bindMountMemoCap caps bindMountMemo alongside renameFallbackLogCap.
+const bindMountMemoCap = renameFallbackLogCap
+
+type bindMountEntry struct {
+	renamePtr uintptr
+	id        fileIdentity
+}
+
 var (
 	renameFallbackMu     sync.Mutex
 	renameFallbackLogged = make(map[string]bool)
+
+	bindMountMu   sync.RWMutex
+	bindMountMemo = make(map[string]bindMountEntry)
 )
+
+func currentRenamePtr() uintptr {
+	if RenameFile == nil {
+		return 0
+	}
+	return reflect.ValueOf(RenameFile).Pointer()
+}
+
+func isMemoizedBindMount(cleanPath string, rptr uintptr) bool {
+	bindMountMu.RLock()
+	entry, ok := bindMountMemo[cleanPath]
+	bindMountMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if entry.renamePtr != rptr {
+		bindMountMu.Lock()
+		if cur, still := bindMountMemo[cleanPath]; still && cur == entry {
+			delete(bindMountMemo, cleanPath)
+		}
+		bindMountMu.Unlock()
+		return false
+	}
+	curID, ok := statFileIdentity(cleanPath)
+	if !ok || curID != entry.id {
+		bindMountMu.Lock()
+		if cur, still := bindMountMemo[cleanPath]; still && cur == entry {
+			delete(bindMountMemo, cleanPath)
+		}
+		bindMountMu.Unlock()
+		return false
+	}
+	return true
+}
+
+func memoizeBindMount(cleanPath string, rptr uintptr) {
+	id, ok := statFileIdentity(cleanPath)
+	if !ok {
+		return
+	}
+	bindMountMu.Lock()
+	defer bindMountMu.Unlock()
+	if _, exists := bindMountMemo[cleanPath]; !exists && len(bindMountMemo) >= bindMountMemoCap {
+		return
+	}
+	bindMountMemo[cleanPath] = bindMountEntry{renamePtr: rptr, id: id}
+}
+
+func evictBindMount(cleanPath string) {
+	bindMountMu.Lock()
+	delete(bindMountMemo, cleanPath)
+	bindMountMu.Unlock()
+}
 
 // warnRenameFallback emits the once-per-path fallback warning.
 func warnRenameFallback(path string, err error) {
@@ -71,6 +136,15 @@ func WriteFileAtomic(path, content string) error {
 // EBUSY/EXDEV fallback to a direct fsync'd write. One payload copy,
 // paid only when the caller holds a string.
 func writeFileAtomic(path string, data []byte) error {
+	cleanPath := filepath.Clean(path)
+	rptr := currentRenamePtr()
+	if isMemoizedBindMount(cleanPath, rptr) {
+		if err := writeFileDirectBytes(cleanPath, data); err != nil {
+			evictBindMount(cleanPath)
+			return err
+		}
+		return nil
+	}
 	err := WriteFile(path, data, Opts{
 		Stage:   StageTempPattern(".tmp-" + filepath.Base(path) + "-*"),
 		Mode:    0o644,
@@ -82,8 +156,14 @@ func writeFileAtomic(path string, data []byte) error {
 	if !isBindMountRenameErr(err) {
 		return err
 	}
-	warnRenameFallback(path, err)
-	return writeFileDirectBytes(path, data)
+	warnRenameFallback(cleanPath, err)
+	if derr := writeFileDirectBytes(cleanPath, data); derr != nil {
+		return derr
+	}
+	if isBindMountEBUSYErr(err) {
+		memoizeBindMount(cleanPath, rptr)
+	}
+	return nil
 }
 
 // writeFileDirectBytes is WriteFileDirect for a []byte payload — the
@@ -159,6 +239,18 @@ func WriteFileAtomicBytes(path string, data []byte) error {
 // apibe-gap-*, last-run. A crash can lose the newest content; the
 // file is never torn.
 func WriteFileAtomicNoSync(path, content string) error {
+	cleanPath := filepath.Clean(path)
+	rptr := currentRenamePtr()
+	if isMemoizedBindMount(cleanPath, rptr) {
+		// The fallback must honor NoSync too — WriteFileDirect would
+		// sneak the fsync this family exists to skip back onto every
+		// bind-mounted .prom render.
+		if err := WriteFileDirectNoSync(cleanPath, content); err != nil {
+			evictBindMount(cleanPath)
+			return err
+		}
+		return nil
+	}
 	err := WriteFile(path, []byte(content), Opts{
 		Stage:  StageTempPattern(".tmp-" + filepath.Base(path) + "-*"),
 		Mode:   0o644,
@@ -170,9 +262,15 @@ func WriteFileAtomicNoSync(path, content string) error {
 	if !isBindMountRenameErr(err) {
 		return err
 	}
-	warnRenameFallback(path, err)
+	warnRenameFallback(cleanPath, err)
 	// The fallback must honor NoSync too — WriteFileDirect would
 	// sneak the fsync this family exists to skip back onto every
 	// bind-mounted .prom render.
-	return WriteFileDirectNoSync(path, content)
+	if derr := WriteFileDirectNoSync(cleanPath, content); derr != nil {
+		return derr
+	}
+	if isBindMountEBUSYErr(err) {
+		memoizeBindMount(cleanPath, rptr)
+	}
+	return nil
 }

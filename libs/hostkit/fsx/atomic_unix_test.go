@@ -4,8 +4,10 @@ package fsx
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 )
@@ -134,4 +136,214 @@ func TestWriteFileAtomicNoSyncFallbackAndError(t *testing.T) {
 			t.Fatal("non-fallback error must not install the target")
 		}
 	})
+}
+
+func resetBindMountMemoForTest(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		bindMountMu.Lock()
+		clear(bindMountMemo)
+		bindMountMu.Unlock()
+	})
+}
+
+func TestWriteFileAtomicEBUSYMemoization(t *testing.T) {
+	resetBindMountMemoForTest(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hosts")
+	uncleanPath := filepath.Join(dir, ".", "hosts")
+
+	var renameCalls atomic.Int64
+	orig := RenameFile
+	RenameFile = func(string, string) error {
+		renameCalls.Add(1)
+		return syscall.EBUSY
+	}
+	t.Cleanup(func() { RenameFile = orig })
+
+	if err := WriteFileAtomic(path, "v1\n"); err != nil {
+		t.Fatalf("first WriteFileAtomic: %v", err)
+	}
+	if err := WriteFileAtomic(uncleanPath, "v2\n"); err != nil {
+		t.Fatalf("second WriteFileAtomic: %v", err)
+	}
+	if err := WriteFileAtomicBytes(path, []byte("v3\n")); err != nil {
+		t.Fatalf("WriteFileAtomicBytes: %v", err)
+	}
+	if err := WriteFileAtomicNoSync(path, "v4\n"); err != nil {
+		t.Fatalf("WriteFileAtomicNoSync: %v", err)
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("RenameFile calls = %d, want 1 (EBUSY should be memoized across WriteFileAtomic*)", got)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "v4\n" {
+		t.Fatalf("content = %q, want %q", got, "v4\n")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "hosts" {
+		t.Fatalf("unexpected dir entries: %d", len(entries))
+	}
+
+	// EXDEV must NOT be memoized as a bind-mount EBUSY.
+	exdevPath := filepath.Join(dir, "exdev")
+	var exdevCalls atomic.Int64
+	RenameFile = func(string, string) error {
+		exdevCalls.Add(1)
+		return syscall.EXDEV
+	}
+	if err := WriteFileAtomic(exdevPath, "a"); err != nil {
+		t.Fatalf("EXDEV 1: %v", err)
+	}
+	if err := WriteFileAtomic(exdevPath, "b"); err != nil {
+		t.Fatalf("EXDEV 2: %v", err)
+	}
+	if got := exdevCalls.Load(); got != 2 {
+		t.Fatalf("EXDEV RenameFile calls = %d, want 2 (EXDEV must not memoize)", got)
+	}
+}
+
+func TestWriteFileAtomicEBUSYMemoInvalidatedOnInodeChange(t *testing.T) {
+	resetBindMountMemoForTest(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hosts")
+
+	var renameCalls atomic.Int64
+	orig := RenameFile
+	RenameFile = func(string, string) error {
+		renameCalls.Add(1)
+		return syscall.EBUSY
+	}
+	t.Cleanup(func() { RenameFile = orig })
+
+	if err := WriteFileAtomic(path, "v1\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFileAtomic(path, "v2\n"); err != nil {
+		t.Fatal(err)
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("before inode change: renameCalls = %d, want 1", got)
+	}
+
+	// Unlink and recreate with a new inode.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("new-inode\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteFileAtomic(path, "v3\n"); err != nil {
+		t.Fatal(err)
+	}
+	if got := renameCalls.Load(); got != 2 {
+		t.Fatalf("after inode change: renameCalls = %d, want 2", got)
+	}
+}
+
+func TestWriteFileAtomicEBUSYMemoInvalidatedOnRenameSwap(t *testing.T) {
+	resetBindMountMemoForTest(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hosts")
+
+	orig := RenameFile
+	t.Cleanup(func() { RenameFile = orig })
+
+	RenameFile = func(string, string) error { return syscall.EBUSY }
+	if err := WriteFileAtomic(path, "v1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	RenameFile = func(string, string) error { return syscall.EPERM }
+	if err := WriteFileAtomic(path, "v2\n"); !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("after RenameFile swap: err = %v, want EPERM", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "v1\n" {
+		t.Fatalf("content = %q, want %q", got, "v1\n")
+	}
+}
+
+func TestWriteFileAtomicEBUSYMemoEvictedOnDirectWriteError(t *testing.T) {
+	resetBindMountMemoForTest(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hosts")
+
+	orig := RenameFile
+	RenameFile = func(string, string) error { return syscall.EBUSY }
+	t.Cleanup(func() { RenameFile = orig })
+
+	if err := WriteFileAtomic(path, "v1\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+
+	// Skip when running as root (uid 0 bypasses 0444 write checks).
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; 0444 does not reject O_WRONLY")
+	}
+
+	if err := WriteFileAtomic(path, "v2\n"); err == nil {
+		t.Fatal("expected direct write error on 0444 file")
+	}
+	bindMountMu.RLock()
+	_, exists := bindMountMemo[filepath.Clean(path)]
+	bindMountMu.RUnlock()
+	if exists {
+		t.Fatal("memo entry was not evicted after direct write error")
+	}
+
+	// Also verify WriteFileAtomicNoSync eviction on direct-write error.
+	nsPath := filepath.Join(dir, "metric.prom")
+	if err := WriteFileAtomicNoSync(nsPath, "up 1\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(nsPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(nsPath, 0o644) })
+	if err := WriteFileAtomicNoSync(nsPath, "up 2\n"); err == nil {
+		t.Fatal("expected NoSync direct write error on 0444 file")
+	}
+	bindMountMu.RLock()
+	_, exists = bindMountMemo[filepath.Clean(nsPath)]
+	bindMountMu.RUnlock()
+	if exists {
+		t.Fatal("NoSync memo entry was not evicted after direct write error")
+	}
+}
+
+func TestWriteFileAtomicEBUSYMemoCapBounded(t *testing.T) {
+	resetBindMountMemoForTest(t)
+	dir := t.TempDir()
+
+	orig := RenameFile
+	RenameFile = func(string, string) error { return syscall.EBUSY }
+	t.Cleanup(func() { RenameFile = orig })
+
+	for i := range bindMountMemoCap + 20 {
+		p := filepath.Join(dir, fmt.Sprintf("f-%d", i))
+		if err := WriteFileAtomicNoSync(p, "x"); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	bindMountMu.RLock()
+	n := len(bindMountMemo)
+	bindMountMu.RUnlock()
+	if n > bindMountMemoCap {
+		t.Fatalf("bindMountMemo len = %d > cap %d", n, bindMountMemoCap)
+	}
 }

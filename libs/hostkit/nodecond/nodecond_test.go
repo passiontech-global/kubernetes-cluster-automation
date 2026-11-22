@@ -9,12 +9,12 @@ import (
 // allConditionNames enumerates every exported condition constant BY
 // IDENTIFIER — a renamed or deleted constant breaks this file's
 // compilation instead of silently drifting out of the test's reach.
-// 67 latch-backed + 6 non-heartbeat-owned (4 kubelet/permanent +
+// 69 latch-backed + 6 non-heartbeat-owned (4 kubelet/permanent +
 // ReadonlyFilesystem + the LocalRemediationInProgress coordination
-// condition) = 73. The constant must be enumerated here or it silently
+// condition) = 75. The constant must be enumerated here or it silently
 // escapes every coverage assertion below.
 var allConditionNames = []string{
-	// Latch-backed (67).
+	// Latch-backed (69).
 	NodeOverloaded, WatchdogStale,
 	CiliumAgentDown, CiliumInitStuck,
 	KubeletRuntimeStall, DNSFallbackActive, DNSResolvStale,
@@ -42,6 +42,7 @@ var allConditionNames = []string{
 	CondWorkerKubeletCertExpiring, CondHostKernelDrift,
 	CondSystemdOOMDKill, CondNetworkMountHung,
 	CondNodeLocalDNSNoTrackDrift,
+	CondK8s135ReadinessDrift, CondKMSv2Unhealthy,
 	// Monitor- and kubelet-owned (6) — HostNetworkProblems sits here
 	// by declaration block but IS heartbeat-managed now that the
 	// kernelfail NIC-health guard latches it (see notHeartbeatManaged).
@@ -81,8 +82,8 @@ var legacyControllerSpellings = []string{
 }
 
 func TestConstantsNonEmptyAndUnique(t *testing.T) {
-	if len(allConditionNames) != 73 {
-		t.Fatalf("allConditionNames = %d entries, want 73 (67 latch-backed + 6 non-heartbeat-owned)",
+	if len(allConditionNames) != 75 {
+		t.Fatalf("allConditionNames = %d entries, want 75 (69 latch-backed + 6 non-heartbeat-owned)",
 			len(allConditionNames))
 	}
 	seen := make(map[string]bool, len(allConditionNames))
@@ -204,6 +205,12 @@ var conditionClasses = map[string]conditionClass{
 	CondSystemdOOMDKill:           {stormGate: true},
 	CondNetworkMountHung:          {stormGate: true, networkMountHung: true},
 	CondNodeLocalDNSNoTrackDrift:  {},
+	// Wave-5 self-healing classifications. CondK8s135ReadinessDrift is an
+	// upgrade-readiness posture audit (heartbeat-swept only, never freezes
+	// the descheduler); CondKMSv2Unhealthy gates storms during KMSv2 outage
+	// (matching EtcdQuorumDegraded).
+	CondK8s135ReadinessDrift: {},
+	CondKMSv2Unhealthy:       {stormGate: true},
 }
 
 // TestAllConditionsExplicitlyClassified replaces the old
@@ -323,7 +330,7 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 	if !swept[InodePressure] {
 		t.Error("HeartbeatSweptNames must contain InodePressure (agent inode latch, inode-pressure)")
 	}
-	// Every remaining constant — exactly the 67 latch-backed — in.
+	// Every remaining constant — exactly the 69 latch-backed — in.
 	latchBacked := 0
 	for _, name := range allConditionNames {
 		if name == ReadonlyFilesystem {
@@ -344,8 +351,8 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 			t.Errorf("HeartbeatSweptNames must contain latch-backed condition %q", name)
 		}
 	}
-	if latchBacked != 67 {
-		t.Fatalf("latch-backed constants enumerated = %d, want 67", latchBacked)
+	if latchBacked != 69 {
+		t.Fatalf("latch-backed constants enumerated = %d, want 69", latchBacked)
 	}
 }
 

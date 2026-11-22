@@ -123,6 +123,10 @@ const (
 	CondSystemdOOMDKill           = "SystemdOOMDKill"           // #9: systemd-oomd pod/k0s slice kill within 30m (systemd-oomd-kill latch)
 	CondNetworkMountHung          = "NetworkMountHung"          // #10: NFS/CIFS/FUSE/CephFS mount statfs probe hung (network-mount-hung latch)
 	CondNodeLocalDNSNoTrackDrift  = "NodeLocalDNSNoTrackDrift"  // #12: NodeLocalDNS iptables raw NOTRACK rule missing on 169.254.20.10:53 (nodelocaldns-notrack-drift latch)
+
+	// Wave-5 self-healing additions.
+	CondK8s135ReadinessDrift = "K8s135ReadinessDrift" // K5: cgroup v2 & kubelet/k0s 1.35+ upgrade readiness drift (k8s135-readiness-drift latch)
+	CondKMSv2Unhealthy       = "KMSv2Unhealthy"       // K10: KMSv2 encryption plugin socket or /healthz/kms-provider-* unhealthy (kmsv2-unhealthy latch)
 )
 
 // Node/Pod annotation keys carrying the L1 ↔ L3 cooperative
@@ -178,7 +182,7 @@ const (
 )
 
 // HeartbeatSweptNames is every NodeCondition the nodereporter owns
-// and re-stamps LastHeartbeatTime on each cycle while alive: all 67
+// and re-stamps LastHeartbeatTime on each cycle while alive: all 69
 // latch-backed conditions plus ReadonlyFilesystem (the NPD mount
 // monitor rides the same heartbeat patch). InodePressure is in since
 // inode-pressure: the hostmetrics inode-pressure latch sets/clears it and
@@ -232,6 +236,8 @@ var HeartbeatSweptNames = []string{
 	CondWorkerKubeletCertExpiring, CondHostKernelDrift,
 	CondSystemdOOMDKill, CondNetworkMountHung,
 	CondNodeLocalDNSNoTrackDrift,
+	// Wave-5 self-healing additions.
+	CondK8s135ReadinessDrift, CondKMSv2Unhealthy,
 }
 
 // HangPreCordonNames are the hang-class conditions node-hang-
@@ -378,6 +384,12 @@ var StormGateNames = []string{
 	// CondNodeLocalDNSNoTrackDrift (like DNSResolvStale/DNSFallbackActive)
 	// stay out so they do not freeze the cluster-wide descheduler.
 	CondSystemdOOMDKill, CondNetworkMountHung,
+	// Wave-5 self-healing additions: CondKMSv2Unhealthy indicates
+	// Secret encryption is degraded on a control-plane node (like
+	// EtcdQuorumDegraded) and gates descheduler storms;
+	// CondK8s135ReadinessDrift is an upgrade-readiness posture audit
+	// and stays out so it does not freeze the cluster-wide descheduler.
+	CondKMSv2Unhealthy,
 }
 
 // PartitionNames are the network-partition conditions the
