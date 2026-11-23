@@ -34,6 +34,14 @@ const (
 	// diskWriteAwaitHighMs is the per-cycle mean write await above
 	// which latency-critical IO is queued behind bulk writers.
 	diskWriteAwaitHighMs = 200.0
+	// ioPSIDiskConfirmUtil is the minimum whole-disk utilization
+	// (fraction of the cycle with IO in flight) that corroborates a
+	// high PSI `full` reading as real block-device activity rather
+	// than io_uring in_iowait noise.
+	ioPSIDiskConfirmUtil = 0.10
+	// ioPSIDiskConfirmAwaitMs is the minimum per-disk mean IO await
+	// (ms) that likewise corroborates high PSI as real queueing.
+	ioPSIDiskConfirmAwaitMs = 15.0
 	// diskSlowIOConsecNeeded is the consecutive-cycle count the
 	// disk-slow-io DiskSlowIO gray-failure verdict must persist before
 	// latching — ~10m at the default 2m interval, so a bursty
@@ -303,8 +311,24 @@ func (c *IOPressureCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	if !latched && c.diskSlowFails == 0 && c.inflightFreezeFails == 0 {
 		c.d.State.Exit(latchdefs.LatchDiskSlowIO, nil)
 	}
-	pressure := await > diskWriteAwaitHighMs ||
-		(psiOK && (avg300 > ioPSIFullHigh || avg60 > ioPSIFullHigh))
+	// io_uring quirk (kernel <6.10 — Ubuntu 24.04's 6.8 included):
+	// io_cqring_wait() marks the waiter in_iowait even when it only
+	// sleeps on a TCP socket or timer, so io_uring-heavy daemons
+	// (e.g. Dragonfly Proactor threads) pin /proc/pressure/io `full`
+	// high 24/7 while every block device sits idle. Once a
+	// diskstats delta exists, high PSI alone is not proof of disk
+	// starvation — the PSI branch must be corroborated by real
+	// block activity (utilization, per-disk await, or an
+	// inflight-freeze vote) or the throttler renices/ionices idle
+	// nodes forever. The await>200ms branch is already
+	// diskstats-derived and stays ungated.
+	psiHigh := psiOK && (avg300 > ioPSIFullHigh || avg60 > ioPSIFullHigh)
+	if psiHigh && hadPrev && dtMs > 0 {
+		psiHigh = util >= ioPSIDiskConfirmUtil ||
+			maxAwait >= ioPSIDiskConfirmAwaitMs ||
+			freezeDisks > 0
+	}
+	pressure := await > diskWriteAwaitHighMs || psiHigh
 	if !pressure {
 		c.d.CycleResult(wdeps.CheckIOPressure, "ok")
 		return

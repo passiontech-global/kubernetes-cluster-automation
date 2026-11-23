@@ -372,6 +372,85 @@ func TestIOPressureThrottler(t *testing.T) {
 	}
 }
 
+// TestIOPressurePSINeedsDiskActivity: the Linux <6.10 io_uring quirk
+// (io_cqring_wait marks waiters in_iowait even for socket/timer
+// sleeps) pins /proc/pressure/io `full` high on Dragonfly nodes
+// whose disks are idle. Once a diskstats delta exists, high PSI
+// alone must NOT engage the throttler — the PSI branch needs
+// corroborating block activity (util >= 10%, per-disk await
+// >= 15ms, or an inflight freeze). The await>200ms branch stays
+// ungated.
+func TestIOPressurePSINeedsDiskActivity(t *testing.T) {
+	// One whole-disk row; counters are cumulative so each case's
+	// second row encodes that cycle's deltas.
+	const sdaRow = "   8       0 sda 1000 200 8000 500 %d 100 6000 %d %d %d 5000\n"
+	psiHot := "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n" +
+		"full avg10=1.00 avg60=46.50 avg300=40.00 total=0\n"
+	psiQuiet := "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n" +
+		"full avg10=1.00 avg60=5.00 avg300=3.00 total=0\n"
+	for _, tc := range []struct {
+		name      string
+		psi       string
+		wrIOS     uint64 // second-cycle counters
+		wrTicks   uint64
+		inflight  uint64
+		ioTicks   uint64
+		wantThrot bool
+	}{
+		// The Dragonfly shape: PSI full pinned at 46%/40% while
+		// every diskstats counter is flat — zero deltas mean zero
+		// util, zero await, zero inflight. No throttle.
+		{"psi_only_idle_disk", psiHot, 300, 4000, 0, 2000, false},
+		// Real activity under the 200ms await bar: +7000 ioTicks
+		// over 60s = 11.7% util corroborates the PSI spike even
+		// though pooled write await is only 10ms.
+		{"psi_with_busy_disk", psiHot, 310, 4100, 0, 9000, true},
+		// Queueing corroboration: +200 wrTicks over +10 wrIOS is a
+		// 20ms per-disk await — under the 200ms pressure bar but
+		// over the 15ms PSI-confirm floor.
+		{"psi_with_queued_await", psiHot, 310, 4200, 0, 2000, true},
+		// The ungated branch: 300ms pooled write await with quiet
+		// PSI still throttles — diskstats-derived pressure needs
+		// no PSI at all.
+		{"await_alone_still_throttles", psiQuiet, 400, 34000, 0, 32000, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			h := e.H
+			ctx := context.Background()
+			wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "pressure", "io"), psiQuiet)
+			wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "diskstats"),
+				fmt.Sprintf(sdaRow, 300, 4000, 0, 2000))
+			wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "4242", "comm"), "kopia\n")
+			var reniced []int
+			h.Cfg.Seams.Host.ReniceFn = func(pid int) error {
+				reniced = append(reniced, pid)
+				return nil
+			}
+			h.Cfg.Seams.Host.IoniceIdleFn = func(pid int) error { return nil }
+			env := &wdeps.CycleEnv{
+				WorkerActive: true,
+				PidsOnce:     func() []int { return []int{4242} },
+			}
+			chk := wdepstest.Check[*runtime.IOPressureCheck](h, wdeps.CheckIOPressure)
+			chk.Run(ctx, env) // baseline cycle — seeds diskstats
+			e.Now = e.Now.Add(time.Minute)
+			wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "pressure", "io"), tc.psi)
+			wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "diskstats"),
+				fmt.Sprintf(sdaRow, tc.wrIOS, tc.wrTicks, tc.inflight, tc.ioTicks))
+			chk.Run(ctx, env)
+
+			if got := len(reniced) > 0; got != tc.wantThrot {
+				t.Fatalf("throttled=%v want throttled=%v", reniced, tc.wantThrot)
+			}
+			if got := h.IOThrottledProcs > 0; got != tc.wantThrot {
+				t.Fatalf("IOThrottledProcs=%d want throttled=%v",
+					h.IOThrottledProcs, tc.wantThrot)
+			}
+		})
+	}
+}
+
 // --- conntrack-tcp-liberal-guard ---
 
 func TestConntrackLiberalGuard(t *testing.T) {
