@@ -1254,6 +1254,24 @@ func TestGatewayControllerPodBounce(t *testing.T) {
 			wantCooldownStamp: true,
 		},
 		{
+			name: "suppressed_when_programmed_false_reason_is_address_not_assigned",
+			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
+				csObjs, dynObjs := healthyRouteAndBackend()
+				gc := gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)))
+				gw := gatewayFixture("apps", "gw-stuck", "cilium", now.Add(-30*time.Minute),
+					gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute)),
+					gwCondAt("Programmed", "False", "AddressNotAssigned", now.Add(-20*time.Minute)))
+				ctrlPod := makeControllerPod("kube-system", "cilium-operator-abc", map[string]string{"io.cilium/app": "operator"}, 30*time.Minute, "w1", true)
+				node := probetest.ReadyWorkerNode("w1", "", 0, false)
+				cs := fake.NewSimpleClientset(append(csObjs, ctrlPod, node)...)
+				testutil.EmulateEviction(cs)
+				dyn := gwOpDyn(t, append(dynObjs, gc, gw)...)
+				p := testProberDyn(cs, dyn)
+				probetest.FreezeNow(p.Deps, now)
+				return p, probetest.MustCheck[*gatewayRouteHealthCheck](t, p), cs, ctrlPod
+			},
+		},
+		{
 			name: "suppressed_when_accepted_false",
 			setup: func(t *testing.T) (*probetest.Prober, *gatewayRouteHealthCheck, *fake.Clientset, *corev1.Pod) {
 				csObjs, dynObjs := healthyRouteAndBackend()

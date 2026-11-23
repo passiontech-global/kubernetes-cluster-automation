@@ -486,4 +486,43 @@ func TestVolumeSnapshotLifecycleControllerBounceAndEventDedup(t *testing.T) {
 			t.Fatalf("fallback minAge = %v, want 15m", chk2.minAge)
 		}
 	})
+
+	t.Run("tenant_pod_ignored_and_status_error_does_not_evict_ready_controller", func(t *testing.T) {
+		volumeSnapshotStuckGauge.Reset()
+		// Tenant plants an unready pod masquerading as snapshot-controller; must never be selected or suppress kube-system controller.
+		tenantFake := makeSnapCtrlPod("tenant-a", "snapshot-controller-fake", "uid-fake", false, time.Hour, now,
+			map[string]string{"app": "snapshot-controller"}, "registry.k8s.io/sig-storage/snapshot-controller:v8.0.0")
+		realCtrl := makeSnapCtrlPod("kube-system", "snapshot-controller-0", "uid-real", true, time.Hour, now,
+			map[string]string{"app.kubernetes.io/name": "snapshot-controller"}, "registry.k8s.io/sig-storage/snapshot-controller:v8.0.0")
+
+		// 1) Tenant VolumeSnapshot with status.error only -> FAIL metric, NO eviction of Ready controller.
+		csErr := fake.NewSimpleClientset(tenantFake, realCtrl)
+		evErr := captureEvictions(csErr, nil)
+		dynErr := probetest.OpDyn(makeVSObj("tenant-a", "bad-pvc-snap", &old, nil, nil, false, map[string]any{"message": "PVC not found"}))
+		pErr := testProberDyn(csErr, dynErr)
+		probetest.FreezeNow(pErr.Deps, now)
+		chkErr := probetest.MustCheck[*volumeSnapshotLifecycleGuardCheck](t, pErr)
+		sctxErr := probetest.SweepCtx(ctx, chkErr.Deps)
+		if res := chkErr.Run(sctxErr); res.Pass {
+			t.Fatal("expected FAIL on VolumeSnapshot status_error")
+		}
+		probetest.VerifySweep(sctxErr)
+		if len(*evErr) != 0 {
+			t.Fatalf("tenant status_error must not evict Ready snapshot-controller, got %v", *evErr)
+		}
+
+		// 2) Genuine not_ready wedge -> evicts kube-system controller, ignoring tenant-a unready spoof pod.
+		csWedge := fake.NewSimpleClientset(tenantFake, realCtrl)
+		evWedge := captureEvictions(csWedge, nil)
+		dynWedge := probetest.OpDyn(makeVSObj("apps", "stuck-vs", &old, nil, nil, false, nil))
+		pWedge := testProberDyn(csWedge, dynWedge)
+		probetest.FreezeNow(pWedge.Deps, now)
+		chkWedge := probetest.MustCheck[*volumeSnapshotLifecycleGuardCheck](t, pWedge)
+		sctxWedge := probetest.SweepCtx(ctx, chkWedge.Deps)
+		_ = chkWedge.Run(sctxWedge)
+		probetest.VerifySweep(sctxWedge)
+		if len(*evWedge) != 1 || (*evWedge)[0] != "kube-system/snapshot-controller-0" {
+			t.Fatalf("evicted = %v, want [kube-system/snapshot-controller-0] (tenant pod must be ignored)", *evWedge)
+		}
+	})
 }

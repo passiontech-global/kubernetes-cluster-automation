@@ -102,8 +102,8 @@ func (c *volumeSnapshotLifecycleGuardCheck) Run(ctx context.Context) probefw.Res
 	liveFirstSeen := map[string]bool{}
 	carriedKinds := map[string]bool{}
 
-	vsStuck := c.scanSnapshotKind(ctx, log, now, minAge, kube.GVRVolumeSnapshot, "VolumeSnapshot", &rep, liveFirstSeen, carriedKinds)
-	vscStuck := c.scanSnapshotKind(ctx, log, now, minAge, kube.GVRVolumeSnapshotContent, "VolumeSnapshotContent", &rep, liveFirstSeen, carriedKinds)
+	vsStuck, vsWedge := c.scanSnapshotKind(ctx, log, now, minAge, kube.GVRVolumeSnapshot, "VolumeSnapshot", &rep, liveFirstSeen, carriedKinds)
+	vscStuck, vscWedge := c.scanSnapshotKind(ctx, log, now, minAge, kube.GVRVolumeSnapshotContent, "VolumeSnapshotContent", &rep, liveFirstSeen, carriedKinds)
 
 	c.firstSeen.Prune(func(k string) bool {
 		if liveFirstSeen[k] {
@@ -118,7 +118,7 @@ func (c *volumeSnapshotLifecycleGuardCheck) Run(ctx context.Context) probefw.Res
 	})
 
 	if c.healEnabled && vsStuck+vscStuck > 0 {
-		c.maybeBounceSnapshotController(ctx, log, now)
+		c.maybeBounceSnapshotController(ctx, log, now, vsWedge+vscWedge > 0)
 	}
 
 	return rep.Result(&c.emitted, volumeSnapshotStuckGauge.DeleteLabelValues,
@@ -135,24 +135,25 @@ func (c *volumeSnapshotLifecycleGuardCheck) scanSnapshotKind(
 	rep *probefw.SweepReport,
 	liveFirstSeen map[string]bool,
 	carriedKinds map[string]bool,
-) int {
+) (int, int) {
 	items, err := c.AllUnstructured(ctx, gvr)
 	switch {
 	case kube.IsCRDAbsent(err):
-		return 0
+		return 0, 0
 	case apierrors.IsForbidden(err):
 		log.V(1).Info("snapshot resource list skipped (403)", "kind", kind, "error", err)
 		carriedKinds[kind] = true
 		c.carryKindTuples(kind, rep)
-		return 0
+		return 0, 0
 	case err != nil:
 		rep.InfraErr(fmt.Errorf("list %s: %w", gvr.Resource, err))
 		carriedKinds[kind] = true
 		c.carryKindTuples(kind, rep)
-		return 0
+		return 0, 0
 	}
 
 	stuckCount := 0
+	wedgeCount := 0
 	for i := range items {
 		obj := &items[i]
 		ns, name := obj.GetNamespace(), obj.GetName()
@@ -205,13 +206,21 @@ func (c *volumeSnapshotLifecycleGuardCheck) scanSnapshotKind(
 		}
 
 		stuckCount++
+		// A VolumeSnapshot with status.error is typically a tenant config
+		// mistake (missing PVC / invalid VolumeSnapshotClass) where the
+		// controller IS reconciling. Do not treat it alone as a controller
+		// wedge — only not_ready/terminating_stuck or cluster-scoped VSC
+		// stalls indicate a wedged snapshot-controller.
+		if kind == "VolumeSnapshotContent" || reason != vsReasonStatusError {
+			wedgeCount++
+		}
 		tupleKey := kind + "/" + objID + "/" + reason
 		rep.Emit(volumeSnapshotStuckGauge, tupleKey,
 			[]string{kind, ns, name, reason},
 			fmt.Sprintf("%s/%s (%s)", kind, objID, reason))
 		c.emitStuckEvent(ctx, log, now, kind, obj, objID, reason)
 	}
-	return stuckCount
+	return stuckCount, wedgeCount
 }
 
 func (c *volumeSnapshotLifecycleGuardCheck) carryKindTuples(kind string, rep *probefw.SweepReport) {
@@ -266,6 +275,7 @@ func (c *volumeSnapshotLifecycleGuardCheck) maybeBounceSnapshotController(
 	ctx context.Context,
 	log logr.Logger,
 	now time.Time,
+	hasWedgeSignal bool,
 ) {
 	pods, err := c.AllPods(ctx)
 	if err != nil {
@@ -307,6 +317,12 @@ func (c *volumeSnapshotLifecycleGuardCheck) maybeBounceSnapshotController(
 	})
 
 	pod := candidates[0]
+	// If only tenant VolumeSnapshot status_error exists and the
+	// snapshot-controller itself is Ready, skip eviction so a single
+	// tenant's broken snapshot cannot churn the cluster-wide controller.
+	if !hasWedgeSignal && kube.PodReadyCond(pod) {
+		return
+	}
 	podKey := pod.Namespace + "/" + pod.Name
 	ck := probefw.SelfHealKey(CheckNameVolumeSnapshotLifecycleGuard, kube.PodControllerKey(pod))
 	proceed, unverifiable := c.HealAllowed(ctx, log, &c.Heals, ck, volumeSnapshotControllerCooldown, now)
@@ -346,7 +362,24 @@ func (c *volumeSnapshotLifecycleGuardCheck) maybeBounceSnapshotController(
 	}
 }
 
+// isTrustedSnapshotControllerNS restricts snapshot-controller pod discovery
+// to system/storage infrastructure namespaces so a tenant pod carrying
+// app=snapshot-controller cannot hijack or suppress controller healing.
+func isTrustedSnapshotControllerNS(ns string) bool {
+	switch ns {
+	case "kube-system", "storage-system", "csi-system", "openebs",
+		"ceph-csi", "rook-ceph", "longhorn-system", "democratic-csi",
+		"trident", "snapshot-controller":
+		return true
+	default:
+		return false
+	}
+}
+
 func isSnapshotControllerPod(pod *corev1.Pod) bool {
+	if !isTrustedSnapshotControllerNS(pod.Namespace) {
+		return false
+	}
 	if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
 		return false
 	}

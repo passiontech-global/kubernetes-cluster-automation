@@ -326,6 +326,22 @@ type gwBounceCandidate struct {
 	programmedKey  string
 }
 
+// isNonWedgeProgrammedReason identifies Gateway API Programmed=False
+// condition reasons that reflect user config or LB IP/capacity errors
+// rather than a wedged controller. These still emit the unhealthy
+// metric, but must not evict shared cluster-wide gateway controllers
+// (such as cilium-operator or istiod).
+func isNonWedgeProgrammedReason(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "addressnotassigned", "addressnotusable", "noresources",
+		"invalid", "invalidparameters", "listenersnotvalid",
+		"unsupportedaddress":
+		return true
+	default:
+		return false
+	}
+}
+
 func (p *gatewayRouteHealthCheck) scanGateway(ctx context.Context,
 	log logr.Logger, census *gatewayRouteCensus,
 	gw *unstructured.Unstructured,
@@ -376,6 +392,7 @@ func (p *gatewayRouteHealthCheck) scanGateway(ctx context.Context,
 
 	acceptedFalse := false
 	programmedFalse := false
+	nonWedgeProgrammed := false
 	refErr := false
 	for _, c := range allConds {
 		persistedNow := !c.LastTransitionTime.IsZero() && now.Sub(c.LastTransitionTime) >= gatewayRouteUnhealthyMinAge
@@ -385,6 +402,9 @@ func (p *gatewayRouteHealthCheck) scanGateway(ctx context.Context,
 			flagGW(routeReasonAcceptedFalse, persistedNow)
 		case c.Type == "Programmed" && c.Status == "False":
 			programmedFalse = true
+			if isNonWedgeProgrammedReason(c.Reason) {
+				nonWedgeProgrammed = true
+			}
 			flagGW(gwReasonProgrammedFalse, persistedNow)
 		case c.Type == "ResolvedRefs" && c.Reason == "RefNotPermitted":
 			refErr = true
@@ -414,7 +434,7 @@ func (p *gatewayRouteHealthCheck) scanGateway(ctx context.Context,
 		}
 	}
 
-	eligible := programmedFalse &&
+	eligible := programmedFalse && !nonWedgeProgrammed &&
 		acceptedTrue && !acceptedFalse &&
 		gcKnown && !classInvalid && !gcAcceptedFalse[className] &&
 		!refErr
