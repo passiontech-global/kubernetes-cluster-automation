@@ -6,9 +6,11 @@
 //   - THP targets: enabled=madvise, defrag=defer+madvise by default
 //     (precedence: Deps.THPEnabled/THPDefrag > VarsDir host_thp_* >
 //     DefaultTHPEnabled/DefaultTHPDefrag).
-//   - rp_filter targets: "2" (loose) on all/default, "0" on overlay/CNI
-//     interfaces (neb*, nebula*, cilium_*, lxc*). Physical NICs are
-//     ignored.
+//   - rp_filter targets: "0" on all, default, and overlay/CNI
+//     interfaces (neb*, nebula*, cilium_*, lxc*). Linux computes
+//     max(conf.all.rp_filter, conf.<dev>.rp_filter), so all must stay
+//     "0" or it overrides per-interface CNI/overlay settings and breaks
+//     Cilium eBPF/netkit traffic. Physical NICs are ignored.
 //
 // When KernelDriftHeal is true, drifted targets are healed via
 // RunHostCmd (PID-1 mount/net namespaces — never direct os.WriteFile
@@ -174,9 +176,7 @@ func (r *Runner) collectKernelDrift() (drifts []kernelDriftItem, readable int) {
 			name := e.Name()
 			var want string
 			switch {
-			case name == "all" || name == "default":
-				want = "2"
-			case isOverlayCNIIface(name):
+			case name == "all" || name == "default" || isOverlayCNIIface(name):
 				want = "0"
 			default:
 				continue

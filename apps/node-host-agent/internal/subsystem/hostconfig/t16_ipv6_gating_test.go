@@ -85,8 +85,8 @@ func TestT16PairsRPFilter(t *testing.T) {
 		"net.ipv4.conf.all.rp_filter",
 		"net.ipv4.conf.default.rp_filter",
 	} {
-		if got := pairs[k]; got != "2" {
-			t.Fatalf("%s = %q, want \"2\"", k, got)
+		if got := pairs[k]; got != "0" {
+			t.Fatalf("%s = %q, want \"0\"", k, got)
 		}
 	}
 }

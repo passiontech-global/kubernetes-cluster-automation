@@ -32,9 +32,13 @@ var (
 	// value class is deliberately wide — IPv6 literals and
 	// hostnames are legal node identifiers, and a narrow [0-9.]+
 	// silently read them as "no node-ip" (inconclusive forever).
-	// \s/& bound the capture: unit-file and cmdline args are
-	// space-separated, and & is the shell background operator.
-	nodeIPRe = regexp.MustCompile(`--node-ip=([^\s&]+)`)
+	// Stop at whitespace, shell &, quotes, and backslash: k0s and
+	// hostconfig group_kubelet pack --kubelet-extra-args="..." with
+	// systemd \x20 escaped spaces (e.g.
+	// --node-ip=172.29.0.14\x20--address=0.0.0.0); swallowing \x20
+	// or a closing quote made every healthy agent look stale in an
+	// infinite KONNECTIVITY-IP-RESTART loop.
+	nodeIPRe = regexp.MustCompile(`--node-ip=([^\s&"'\\]+)`)
 	// --agent-identifiers=host=<ip> inside proxy-agent cmdline —
 	// fallback when environ is unreadable. NEVER grep bare 'host='
 	// (matches --proxy-server-host first — the false positive that

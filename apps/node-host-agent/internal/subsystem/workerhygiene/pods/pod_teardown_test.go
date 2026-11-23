@@ -369,6 +369,68 @@ func TestKonnectivityNonIPv4NodeIP(t *testing.T) {
 	}
 }
 
+// TestKonnectivitySystemdEscapedKubeletExtraArgs: k0sworker.service
+// packs --node-ip inside quoted --kubelet-extra-args with systemd \x20
+// escaped spaces; nodeIPRe must stop at backslash and quotes so healthy
+// konnectivity-agent pods are not recreate-looped.
+func TestKonnectivitySystemdEscapedKubeletExtraArgs(t *testing.T) {
+	cases := []struct {
+		name     string
+		execLine string
+		nodeIP   string
+	}{
+		{
+			name:     "double_quoted_x20_escaped",
+			execLine: `ExecStart=/usr/bin/k0s worker --kubelet-extra-args="--node-ip=172.29.0.14\x20--address=0.0.0.0\x20--node-labels=topology.kubernetes.io/zone=datahub\x20--serialize-image-pulls=false"`,
+			nodeIP:   "172.29.0.14",
+		},
+		{
+			name:     "single_quoted_x20_escaped",
+			execLine: `ExecStart=/usr/bin/k0s worker --kubelet-extra-args='--node-ip=172.29.0.14\x20--registry-qps=2'`,
+			nodeIP:   "172.29.0.14",
+		},
+		{
+			name:     "double_quoted_single_arg",
+			execLine: `ExecStart=/usr/bin/k0s worker --kubelet-extra-args="--node-ip=172.29.0.14"`,
+			nodeIP:   "172.29.0.14",
+		},
+		{
+			name:     "ipv6_quoted_x20_escaped",
+			execLine: `ExecStart=/usr/bin/k0s worker --kubelet-extra-args="--node-ip=fd00:abcd::1\x20--address=0.0.0.0"`,
+			nodeIP:   "fd00:abcd::1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/healthy", func(t *testing.T) {
+			e := fixture(t)
+			wdepstest.WriteFile(t, e.UnitFile, "[Service]\n"+tc.execLine+"\n")
+			e.MkProc(t, 7001, "S",
+				fmt.Sprintf(proxyCmdline, tc.nodeIP), "NODE_IP="+tc.nodeIP+"\x00")
+			e.H.Cycle(context.Background())
+			if _, err := os.Stat(filepath.Join(e.StateDir, "state-konnectivity-ip-mismatch")); !os.IsNotExist(err) {
+				t.Fatalf("false-positive mismatch latch for %s:\n%s", tc.execLine, e.LogLines(t))
+			}
+			if len(e.Kills) != 0 || len(wdepstest.DeleteActions(e.CS)) != 0 {
+				t.Fatal("action taken on healthy agent with systemd-escaped unit")
+			}
+		})
+		t.Run(tc.name+"/stale", func(t *testing.T) {
+			e := fixture(t)
+			wdepstest.WriteFile(t, e.UnitFile, "[Service]\n"+tc.execLine+"\n")
+			e.MkProc(t, 7001, "S",
+				fmt.Sprintf(proxyCmdline, "10.9.9.9"), "NODE_IP=10.9.9.9\x00")
+			e.H.Cycle(context.Background())
+			if _, err := os.Stat(filepath.Join(e.StateDir, "state-konnectivity-ip-mismatch")); err != nil {
+				t.Fatalf("stale agent not detected for %s: %v", tc.execLine, err)
+			}
+			want := "host=10.9.9.9 != node-ip=" + tc.nodeIP + " ("
+			if !strings.Contains(e.LogLines(t), want) {
+				t.Fatalf("parsed node-ip polluted in log, want %q:\n%s", want, e.LogLines(t))
+			}
+		})
+	}
+}
+
 // TestKonnectivityFallbackKillHeldOnAPIFailure: a failed pod LIST
 // leaves e.Pods empty — indistinguishable from "no agent pod". The
 // fallback SIGKILL must NOT fire while the API is unwell.

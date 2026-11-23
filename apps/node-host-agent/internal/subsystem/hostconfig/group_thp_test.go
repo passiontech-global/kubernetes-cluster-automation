@@ -244,8 +244,8 @@ func TestGroupBaseConvergesRPFilterAndTHP(t *testing.T) {
 	}
 	sysctlConf := hostRead(t, r, "/etc/sysctl.d/99-k8s-network-tuning.conf")
 	for _, want := range []string{
-		"net.ipv4.conf.all.rp_filter = 2",
-		"net.ipv4.conf.default.rp_filter = 2",
+		"net.ipv4.conf.all.rp_filter = 0",
+		"net.ipv4.conf.default.rp_filter = 0",
 	} {
 		if !strings.Contains(sysctlConf, want) {
 			t.Fatalf("99-k8s-network-tuning.conf missing %q:\n%s", want, sysctlConf)

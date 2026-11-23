@@ -87,10 +87,14 @@ func (c *cyc) t16Pairs() [][2]string {
 		{"net.ipv4.neigh.default.gc_thresh1", "8192"},
 		{"net.ipv4.neigh.default.gc_thresh2", "32768"},
 		{"net.ipv4.neigh.default.gc_thresh3", "65536"},
-		// Wave-4 #9: loose rp_filter (2) for all/default avoids Linux
-		// strict rp_filter=1 drops on asymmetric CNI/overlay routing.
-		{"net.ipv4.conf.all.rp_filter", "2"},
-		{"net.ipv4.conf.default.rp_filter", "2"},
+		// Wave-4 #9: disable rp_filter (0) for all/default. Linux evaluates
+		// max(conf.all.rp_filter, conf.<dev>.rp_filter), so all=2 (loose)
+		// overrides per-interface cilium_*/lxc*/neb*=0 and breaks Cilium
+		// eBPF/netkit host-to-pod traffic (matching cilium-sysctlfix's
+		// 99-zzz-override_cilium.conf); default=0 prevents newly created
+		// pod netdevs from starting with non-zero rp_filter.
+		{"net.ipv4.conf.all.rp_filter", "0"},
+		{"net.ipv4.conf.default.rp_filter", "0"},
 	}
 	// aio-pressure: AIO table headroom — io_uring/native-aio DB engines
 	// exhaust the stock aio-max-nr and surface EAGAIN as generic

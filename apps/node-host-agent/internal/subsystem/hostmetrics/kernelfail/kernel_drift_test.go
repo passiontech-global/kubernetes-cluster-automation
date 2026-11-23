@@ -90,8 +90,8 @@ func TestKernelDriftHealthyClearsLatch(t *testing.T) {
 
 	seedTHP(t, f.deps.HostRoot, "always [madvise] never\n", "always defer [defer+madvise] madvise never\n")
 	seedRPFilter(t, f.deps.ProcRoot, map[string]string{
-		"all":         "2",
-		"default":     "2",
+		"all":         "0",
+		"default":     "0",
 		"cilium_host": "0",
 		"nebula0":     "0",
 		"neb1":        "0",
@@ -123,7 +123,7 @@ func TestKernelDriftTransientHealClearsWithoutLatch(t *testing.T) {
 
 	seedTHP(t, f.deps.HostRoot, "[always] madvise never\n", "[always] defer defer+madvise madvise never\n")
 	seedRPFilter(t, f.deps.ProcRoot, map[string]string{
-		"all":         "1",
+		"all":         "2",
 		"default":     "1",
 		"cilium_host": "1",
 		"nebula0":     "1",
@@ -167,9 +167,9 @@ func TestKernelDriftTransientHealClearsWithoutLatch(t *testing.T) {
 	wantCalls := [][]string{
 		{"sh", "-c", "printf '%s' \"$1\" > \"$2\"", "sh", "madvise", "/sys/kernel/mm/transparent_hugepage/enabled"},
 		{"sh", "-c", "printf '%s' \"$1\" > \"$2\"", "sh", "defer+madvise", "/sys/kernel/mm/transparent_hugepage/defrag"},
-		{"sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"},
+		{"sysctl", "-w", "net.ipv4.conf.all.rp_filter=0"},
 		{"sysctl", "-w", "net.ipv4.conf.cilium_host.rp_filter=0"},
-		{"sysctl", "-w", "net.ipv4.conf.default.rp_filter=2"},
+		{"sysctl", "-w", "net.ipv4.conf.default.rp_filter=0"},
 		{"sysctl", "-w", "net.ipv4.conf.lxc1.rp_filter=0"},
 		{"sysctl", "-w", "net.ipv4.conf.neb1.rp_filter=0"},
 		{"sysctl", "-w", "net.ipv4.conf.nebula0.rp_filter=0"},
@@ -191,7 +191,7 @@ func TestKernelDriftTransientHealClearsWithoutLatch(t *testing.T) {
 	for _, want := range []string{
 		latchdefs.ActionPrefix + "healed THP enabled always->madvise",
 		latchdefs.ActionPrefix + "healed THP defrag always->defer+madvise",
-		latchdefs.ActionPrefix + "healed net.ipv4.conf.all.rp_filter=2 (was 1)",
+		latchdefs.ActionPrefix + "healed net.ipv4.conf.all.rp_filter=0 (was 2)",
 		latchdefs.ActionPrefix + "healed net.ipv4.conf.cilium_host.rp_filter=0 (was 1)",
 	} {
 		if !strings.Contains(logStr, want) {
