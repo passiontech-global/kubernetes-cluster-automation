@@ -16,6 +16,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -258,8 +259,11 @@ func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	// that family's scan is skipped, matching the report-GC posture.
 	// endpointKeep is the ledger rebuild set — a CR gone (peer left,
 	// object recreated) drops its endpoint entry so a future object
-	// reusing the key re-arms cold.
+	// reusing the key re-arms cold. forbidden marks the families a
+	// 403 kept this sweep from evaluating — their emitted tuples
+	// carry forward below.
 	endpointKeep := map[string]bool{}
+	forbidden := map[string]bool{}
 	for _, g := range liqoTunnelCRs {
 		// The per-sweep unstructured snapshot memoizes one LIST per
 		// GVR; the raw error keeps the NoMatch/NotFound = "family
@@ -267,6 +271,14 @@ func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		items, lerr := p.AllUnstructured(ctx, g.gvr)
 		switch {
 		case kube.IsCRDAbsent(lerr):
+			continue
+		case apierrors.IsForbidden(lerr):
+			// RBAC denies this family — networking.liqo.io carries
+			// no grant on clusters without the peering stack (a
+			// Calico cluster included), where an Infra error would
+			// reconcile-error every sweep. Skip like an absent CRD.
+			log.V(1).Info("liqo "+g.gvr.Resource+" list skipped (403)", "error", lerr)
+			forbidden[g.reason] = true
 			continue
 		case lerr != nil:
 			return probefw.Result{Infra: fmt.Errorf("list %s: %w", g.gvr.Resource, lerr)}
@@ -324,6 +336,14 @@ func (p *liqoTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		rep.Emit(liqoPeerUnhealthyGauge, f.peer+"/"+f.reason,
 			[]string{f.peer, f.reason}, f.peer+"("+f.reason+")")
 	}
+	// Tuples emitted by families this sweep could not list carry
+	// forward — "can't tell" must not read as resolved and flap
+	// the peer alert off.
+	for k, lv := range p.emitted.Last() {
+		if len(lv) == 2 && liqoReasonForbidden(lv[1], forbidden) {
+			rep.Carry(k, lv)
+		}
+	}
 	rep.Close(&p.emitted, liqoPeerUnhealthyGauge.DeleteLabelValues)
 
 	if len(found) > 0 {
@@ -345,6 +365,23 @@ var liqoTunnelCRs = []struct {
 	{"connection_disconnected", kube.GVRLiqoConnection},
 	{"gateway_client_disconnected", kube.GVRLiqoGatewayClient},
 	{"gateway_server_disconnected", kube.GVRLiqoGatewayServer},
+}
+
+// liqoReasonForbidden reports whether an emitted tuple's reason
+// belongs to a networking.liqo.io family the sweep could not list
+// — endpoint_changed can originate from either gateway family, so
+// either one's 403 carries it; virtual_node_not_ready rides the
+// core node list and is never carried.
+func liqoReasonForbidden(reason string, forbidden map[string]bool) bool {
+	switch reason {
+	case "connection_disconnected", "gateway_client_disconnected",
+		"gateway_server_disconnected":
+		return forbidden[reason]
+	case "endpoint_changed":
+		return forbidden["gateway_client_disconnected"] ||
+			forbidden["gateway_server_disconnected"]
+	}
+	return false
 }
 
 // bounceLiqoGateways deletes one Running liqo-gateway pod per dead

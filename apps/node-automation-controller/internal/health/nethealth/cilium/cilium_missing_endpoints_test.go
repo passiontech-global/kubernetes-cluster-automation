@@ -4,6 +4,7 @@
 package cilium
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -12,7 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -132,4 +135,49 @@ func TestCiliumReservedWorldIdentityIsUnprogrammed(t *testing.T) {
 	if res.Pass {
 		t.Fatalf("reserved:world identity must fail: %+v", res)
 	}
+}
+
+// A 403 on the CEP census — the shape a Calico cluster produces,
+// where the opt-in cilium-identity grant does not exist — must
+// skip cleanly: no Infra error, and tuples held from a previous
+// sweep carry forward instead of flapping off. A non-403 failure
+// still reports Infra.
+func TestCiliumMissingCEPForbiddenSkipsAndCarries(t *testing.T) {
+	pod := probetest.PodWithPhase("apps", "app-bare", corev1.PodRunning, true, time.Hour)
+	pod.Spec.NodeName = "w1"
+	// Ownerless: the pod survives the heal delete so the emitted
+	// tuple stays held into the forbidden sweep.
+	cs := fake.NewSimpleClientset(pod)
+	p := testProber(cs)
+	chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
+		t.Fatal("persistent missing CEP must fail to seed the held tuple")
+	}
+	dynBlocked := probetest.OpDyn()
+	dynBlocked.PrependReactor("list", "ciliumendpoints",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(
+				schema.GroupResource{Group: "cilium.io", Resource: "ciliumendpoints"},
+				"", errors.New("forbidden"))
+		})
+	chk.Dyn = dynBlocked
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass || res.Infra != nil {
+		t.Fatalf("403 census must pass with nil Infra, got %+v", res)
+	}
+	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_cilium_missing_cep_pods",
+		map[string]string{"namespace": "apps", "pod": "app-bare", "node": "w1"}); !ok || v != 1 {
+		t.Fatalf("held tuple must carry through the 403 sweep: %v,%v", v, ok)
+	}
+	// A non-403 census failure still reports Infra.
+	dynErr := probetest.OpDyn()
+	dynErr.PrependReactor("list", "ciliumendpoints",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("apiserver timeout")
+		})
+	chk.Dyn = dynErr
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Infra == nil {
+		t.Fatalf("transient census failure must report Infra, got %+v", res)
+	}
+	ciliumMissingCEPPodsGauge.DeleteLabelValues("apps", "app-bare", "w1")
 }

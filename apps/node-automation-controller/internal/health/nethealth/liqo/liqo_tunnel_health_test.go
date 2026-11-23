@@ -6,6 +6,7 @@
 package liqo
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -15,7 +16,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -393,6 +397,92 @@ func TestLiqoEndpointChangeBouncesGateway(t *testing.T) {
 	}
 	if v := ptestutil.ToFloat64(liqoEndpointChangedTotal.WithLabelValues("peer-b")); v != 1 {
 		t.Fatalf("unchanged endpoint re-fired the counter: %v", v)
+	}
+}
+
+// A 403 on every networking.liqo.io family — the shape a cluster
+// without the peering stack produces, where no RBAC grant exists
+// for these GVRs — must skip cleanly: no Infra error, and tuples
+// held from a previous sweep carry forward. A non-403 failure
+// still reports Infra.
+func TestLiqoTunnelForbiddenSkipsAndCarries(t *testing.T) {
+	conn := liqoConnection("liqo-tenant", "conn-peer-b", "False", 20*time.Minute)
+	cs := fake.NewSimpleClientset()
+	dyn := probetest.OpDyn(conn)
+	p := testProberDyn(cs, dyn)
+	chk := probetest.MustCheck[*liqoTunnelHealthCheck](t, p)
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Pass {
+		t.Fatal("dead peer must fail to seed the held tuple")
+	}
+	forbidden := func(resource string) func(k8stesting.Action) (bool, runtime.Object, error) {
+		return func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(
+				schema.GroupResource{Group: "networking.liqo.io", Resource: resource},
+				"", errors.New("forbidden"))
+		}
+	}
+	dynBlocked := probetest.OpDyn()
+	for _, r := range []string{"connections", "gatewayclients", "gatewayservers"} {
+		dynBlocked.PrependReactor("list", r, forbidden(r))
+	}
+	chk.Dyn = dynBlocked
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass || res.Infra != nil {
+		t.Fatalf("403 families must pass with nil Infra, got %+v", res)
+	}
+	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_liqo_peer_unhealthy",
+		map[string]string{"peer": "peer-b", "reason": "connection_disconnected"}); !ok || v != 1 {
+		t.Fatalf("held tuple must carry through the 403 sweep: %v,%v", v, ok)
+	}
+	// A non-403 family failure still reports Infra.
+	dynErr := probetest.OpDyn()
+	dynErr.PrependReactor("list", "connections",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("apiserver timeout")
+		})
+	chk.Dyn = dynErr
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); res.Infra == nil {
+		t.Fatalf("transient family failure must report Infra, got %+v", res)
+	}
+	liqoPeerUnhealthyGauge.DeleteLabelValues("peer-b", "connection_disconnected")
+}
+
+// liqoReasonForbidden maps an emitted tuple's reason back to the
+// family that produced it — a 403 on that family carries the tuple;
+// endpoint_changed can come from either gateway family.
+func TestLiqoReasonForbidden(t *testing.T) {
+	all := map[string]bool{
+		"connection_disconnected":     true,
+		"gateway_client_disconnected": true,
+		"gateway_server_disconnected": true,
+	}
+	gatewaysOnly := map[string]bool{
+		"gateway_client_disconnected": true,
+		"gateway_server_disconnected": true,
+	}
+	cases := []struct {
+		name      string
+		reason    string
+		forbidden map[string]bool
+		want      bool
+	}{
+		{"connection carried when its family is forbidden",
+			"connection_disconnected", all, true},
+		{"connection not carried when only gateways are forbidden",
+			"connection_disconnected", gatewaysOnly, false},
+		{"endpoint change carried by either gateway family",
+			"endpoint_changed", gatewaysOnly, true},
+		{"endpoint change not carried when only connections forbidden",
+			"endpoint_changed", map[string]bool{"connection_disconnected": true}, false},
+		{"virtual-node findings never carry",
+			"virtual_node_not_ready", all, false},
+		{"empty forbidden set carries nothing",
+			"connection_disconnected", map[string]bool{}, false},
+	}
+	for _, tc := range cases {
+		if got := liqoReasonForbidden(tc.reason, tc.forbidden); got != tc.want {
+			t.Errorf("%s: liqoReasonForbidden(%q) = %v, want %v",
+				tc.name, tc.reason, got, tc.want)
+		}
 	}
 }
 

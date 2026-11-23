@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -130,6 +131,19 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		return rep.Result(&p.emitted, ciliumMissingCEPPodsGauge.DeleteLabelValues,
 			fmt.Sprintf("pods missing a programmed CiliumEndpoint across %d sweeps: ",
 				ciliumCEPMinStreak), ", ")
+	case apierrors.IsForbidden(err):
+		// RBAC denies the CEP census — expected wherever the opt-in
+		// cilium-identity grant is absent (Calico clusters never get
+		// it), and an Infra error would reconcile-error every sweep.
+		// "Can't tell" carries the held tuples instead of reading as
+		// resolved; streaks stay frozen until a sweep can evaluate.
+		log.V(1).Info("cilium endpoint census skipped (403)", "error", err)
+		var rep probefw.SweepReport
+		for k, lv := range p.emitted.Last() {
+			rep.Carry(k, lv)
+		}
+		rep.Close(&p.emitted, ciliumMissingCEPPodsGauge.DeleteLabelValues)
+		return probefw.Result{Pass: true}
 	case err != nil:
 		return probefw.Result{Infra: fmt.Errorf("list ciliumendpoints: %w", err)}
 	}
