@@ -846,7 +846,7 @@ func runTier2Tests(t *testing.T, bin string) {
 			backupDir := filepath.Join(sb.hostroot, "var", "backups", "kine")
 			envFile := filepath.Join(sb.hostroot, "opt", "apps", "postgres", ".env")
 			_ = os.WriteFile(envFile, []byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=pw\n"), 0o600)
-			installFakeDockerForKinedb(t, sb, false, false, 0)
+			installFakeRuntimeForKinedb(t, sb, false, false, 0)
 
 			// Pre-seed 5 aged dumps (> 6h old) so backupVerify generates a 6th and prunes down to <= 4.
 			base := time.Now().Add(-10 * time.Hour)
@@ -878,7 +878,7 @@ func runTier2Tests(t *testing.T, bin string) {
 			backupDir := filepath.Join(sb.hostroot, "var", "backups", "kine")
 			envFile := filepath.Join(sb.hostroot, "opt", "apps", "postgres", ".env")
 			_ = os.WriteFile(envFile, []byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=pw\n"), 0o600)
-			installFakeDockerForKinedb(t, sb, false, false, 0)
+			installFakeRuntimeForKinedb(t, sb, false, false, 0)
 
 			bad := filepath.Join(backupDir, "kine-1700000001.dump")
 			_ = os.WriteFile(bad, []byte("BAD_MAGIC"), 0o644)

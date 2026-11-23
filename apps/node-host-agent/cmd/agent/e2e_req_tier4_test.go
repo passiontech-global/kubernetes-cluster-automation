@@ -100,7 +100,7 @@ func runTier4Tests(t *testing.T, bin string) {
 
 		_ = os.WriteFile(filepath.Join(sb.hostroot, "opt", "apps", "postgres", ".env"),
 			[]byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=pw\n"), 0o600)
-		installFakeDockerForKinedb(t, sb, false, false, 0)
+		installFakeRuntimeForKinedb(t, sb, false, false, 0)
 
 		etcdBackupDir := filepath.Join(sb.hostroot, "var", "backups", "etcd")
 		_ = os.Chmod(etcdBackupDir, 0o755)

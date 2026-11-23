@@ -696,7 +696,7 @@ exit 0
 		), "", "")
 		envFile := filepath.Join(sb.hostroot, "opt", "apps", "postgres", ".env")
 		_ = os.WriteFile(envFile, []byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=pw\n"), 0o600)
-		installFakeDockerForKinedb(t, sb, false, false, 0)
+		installFakeRuntimeForKinedb(t, sb, false, false, 0)
 
 		ra := startReqAgent(t, bin, sb.envSlice())
 		defer ra.stopAndWait(t)

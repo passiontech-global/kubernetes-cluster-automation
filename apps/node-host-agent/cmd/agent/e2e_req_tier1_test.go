@@ -1070,7 +1070,7 @@ func runTier1Tests(t *testing.T, bin string) {
 			if err := os.WriteFile(envFile, []byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=pw\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			installFakeDockerForKinedb(t, sb, false, false, 0)
+			installFakeRuntimeForKinedb(t, sb, false, false, 0)
 
 			ra := startReqAgent(t, bin, sb.envSlice())
 			defer ra.stopAndWait(t)
@@ -1115,7 +1115,7 @@ func runTier1Tests(t *testing.T, bin string) {
 			backupDir := filepath.Join(sb.hostroot, "var", "backups", "kine")
 			envFile := filepath.Join(sb.hostroot, "opt", "apps", "postgres", ".env")
 			_ = os.WriteFile(envFile, []byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=pw\n"), 0o600)
-			installFakeDockerForKinedb(t, sb, true, false, 0)
+			installFakeRuntimeForKinedb(t, sb, true, false, 0)
 
 			ra := startReqAgent(t, bin, sb.envSlice())
 			defer ra.stopAndWait(t)
@@ -1144,7 +1144,7 @@ func runTier1Tests(t *testing.T, bin string) {
 			envFile := filepath.Join(sb.hostroot, "opt", "apps", "postgres", ".env")
 			_ = os.WriteFile(envFile, []byte("POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=pw\n"), 0o600)
 			// Delay 300ms inside pg_dump, then exit 1 so backupVerify runs cleanup after SIGTERM.
-			installFakeDockerForKinedb(t, sb, true, false, 300)
+			installFakeRuntimeForKinedb(t, sb, true, false, 300)
 
 			ra := startReqAgent(t, bin, sb.envSlice())
 			eventually(t, 5*time.Second, 50*time.Millisecond, "pg_dump started", func() error {
@@ -3174,10 +3174,20 @@ func sha256Sum(b []byte) [32]byte {
 	return sha256Bytes(b)
 }
 
-func installFakeDockerForKinedb(t *testing.T, sb *reqSandbox, failDump, failRestore bool, sleepMs int) {
+// installFakeRuntimeForKinedb stubs the container runtime under BOTH
+// names. kdeps.ApplyDefaults auto-detects podman first when it is on
+// PATH — GitHub's ubuntu-latest runners ship podman while most dev
+// boxes do not — so a docker-only fake leaves the agent shelling out
+// to the real podman on CI (every inspect/exec fails, the guard
+// cycle marks the postgres container down and the backup verifier
+// never runs). fakebin precedes PATH, so LookPath resolves whichever
+// name the detector picks to this stub either way; the argv shape
+// is identical for podman and docker.
+func installFakeRuntimeForKinedb(t *testing.T, sb *reqSandbox, failDump, failRestore bool, sleepMs int) {
 	t.Helper()
-	script := fmt.Sprintf(`#!/bin/sh
-echo "docker $*" >> %q
+	for _, name := range []string{"docker", "podman"} {
+		script := fmt.Sprintf(`#!/bin/sh
+echo "%s $*" >> %q
 cmd="$1"
 shift
 case "$cmd" in
@@ -3211,8 +3221,9 @@ case "$cmd" in
     exit 0 ;;
 esac
 exit 0
-`, sb.toolLog, sleepMs, sleepMs, failDump, failRestore)
-	installFakeTool(t, sb.fakebin, "docker", script)
+`, name, sb.toolLog, sleepMs, sleepMs, failDump, failRestore)
+		installFakeTool(t, sb.fakebin, name, script)
+	}
 }
 
 func startMockCiliumUnixServer(t *testing.T, sockPath string, handler http.HandlerFunc) string {
