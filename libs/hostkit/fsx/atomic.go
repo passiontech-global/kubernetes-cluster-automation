@@ -45,31 +45,63 @@ func currentRenamePtr() uintptr {
 	return reflect.ValueOf(RenameFile).Pointer()
 }
 
-func isMemoizedBindMount(cleanPath string, rptr uintptr) bool {
+// memoizedDirectWrite services a WriteFileAtomic* call whose target
+// has a memoized bind-mount EBUSY: re-validate the fingerprint, run
+// write (the direct fsync'd fallback), then re-stamp the entry —
+// check, write and re-stamp all under bindMountMu so a concurrent
+// writer can never stat between our write and our re-stamp and
+// mistake our own size/mtime bump for a replaced file (that would
+// drop the memo and burn a doomed rename). handled=false means no
+// usable entry — the caller falls through to the stage+rename path.
+// A write error, a vanished target, or a mid-write inode swap all
+// evict: the next call re-probes rename(2) instead of trusting a
+// fingerprint that no longer describes what sits at path.
+//
+// The critical section is one mutex hold, so memoized-path writes
+// serialize — fine: only bind-mounted files (a handful per node,
+// written once per sweep) ever reach it, and their direct writes
+// were never atomic anyway.
+func memoizedDirectWrite(cleanPath string, rptr uintptr, write func() error) (bool, error) {
+	// Fast path: the overwhelming majority of WriteFileAtomic* calls
+	// hit paths with no memo entry — an RLock map probe is the only
+	// cost they pay.
 	bindMountMu.RLock()
-	entry, ok := bindMountMemo[cleanPath]
+	_, memoized := bindMountMemo[cleanPath]
 	bindMountMu.RUnlock()
+	if !memoized {
+		return false, nil
+	}
+
+	bindMountMu.Lock()
+	defer bindMountMu.Unlock()
+	entry, ok := bindMountMemo[cleanPath]
 	if !ok {
-		return false
+		return false, nil
 	}
-	if entry.renamePtr != rptr {
-		bindMountMu.Lock()
-		if cur, still := bindMountMemo[cleanPath]; still && cur == entry {
-			delete(bindMountMemo, cleanPath)
-		}
-		bindMountMu.Unlock()
-		return false
+	curID, statOK := statFileIdentity(cleanPath)
+	if entry.renamePtr != rptr || !statOK || curID != entry.id {
+		// Stale entry: RenameFile swapped, target replaced or
+		// removed — drop it and let the caller re-probe through the
+		// atomic path.
+		delete(bindMountMemo, cleanPath)
+		return false, nil
 	}
-	curID, ok := statFileIdentity(cleanPath)
-	if !ok || curID != entry.id {
-		bindMountMu.Lock()
-		if cur, still := bindMountMemo[cleanPath]; still && cur == entry {
-			delete(bindMountMemo, cleanPath)
-		}
-		bindMountMu.Unlock()
-		return false
+	if err := write(); err != nil {
+		delete(bindMountMemo, cleanPath)
+		return true, err
 	}
-	return true
+	// Re-stamp the post-write fingerprint — the direct write just
+	// bumped size/mtime, so keeping the old stamp would read as a
+	// replacement on the next call. dev+ino must still match the
+	// validated entry: if they don't, the file was swapped while we
+	// wrote it and the memo must not vouch for the new inode.
+	if id, ok := statFileIdentity(cleanPath); ok &&
+		id.dev == entry.id.dev && id.ino == entry.id.ino {
+		bindMountMemo[cleanPath] = bindMountEntry{renamePtr: rptr, id: id}
+	} else {
+		delete(bindMountMemo, cleanPath)
+	}
+	return true, nil
 }
 
 func memoizeBindMount(cleanPath string, rptr uintptr) {
@@ -83,12 +115,6 @@ func memoizeBindMount(cleanPath string, rptr uintptr) {
 		return
 	}
 	bindMountMemo[cleanPath] = bindMountEntry{renamePtr: rptr, id: id}
-}
-
-func evictBindMount(cleanPath string) {
-	bindMountMu.Lock()
-	delete(bindMountMemo, cleanPath)
-	bindMountMu.Unlock()
 }
 
 // warnRenameFallback emits the once-per-path fallback warning.
@@ -138,12 +164,10 @@ func WriteFileAtomic(path, content string) error {
 func writeFileAtomic(path string, data []byte) error {
 	cleanPath := filepath.Clean(path)
 	rptr := currentRenamePtr()
-	if isMemoizedBindMount(cleanPath, rptr) {
-		if err := writeFileDirectBytes(cleanPath, data); err != nil {
-			evictBindMount(cleanPath)
-			return err
-		}
-		return nil
+	if handled, err := memoizedDirectWrite(cleanPath, rptr, func() error {
+		return writeFileDirectBytes(cleanPath, data)
+	}); handled {
+		return err
 	}
 	err := WriteFile(path, data, Opts{
 		Stage:   StageTempPattern(".tmp-" + filepath.Base(path) + "-*"),
@@ -241,15 +265,13 @@ func WriteFileAtomicBytes(path string, data []byte) error {
 func WriteFileAtomicNoSync(path, content string) error {
 	cleanPath := filepath.Clean(path)
 	rptr := currentRenamePtr()
-	if isMemoizedBindMount(cleanPath, rptr) {
+	if handled, err := memoizedDirectWrite(cleanPath, rptr, func() error {
 		// The fallback must honor NoSync too — WriteFileDirect would
 		// sneak the fsync this family exists to skip back onto every
 		// bind-mounted .prom render.
-		if err := WriteFileDirectNoSync(cleanPath, content); err != nil {
-			evictBindMount(cleanPath)
-			return err
-		}
-		return nil
+		return WriteFileDirectNoSync(cleanPath, content)
+	}); handled {
+		return err
 	}
 	err := WriteFile(path, []byte(content), Opts{
 		Stage:  StageTempPattern(".tmp-" + filepath.Base(path) + "-*"),

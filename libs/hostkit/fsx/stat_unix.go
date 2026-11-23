@@ -28,13 +28,23 @@ func isBindMountEBUSYErr(err error) bool {
 	return errors.Is(err, syscall.EBUSY)
 }
 
+// fileIdentity fingerprints one generation of the file at a path:
+// dev+ino name the inode, size+mtime name the content generation.
+// dev+ino ALONE are not enough — an unlink+recreate in the same
+// directory can hand the new file the just-freed inode (the
+// allocator reuses it), which is exactly the bind-mount replacement
+// the memo must detect; size+mtime almost always differ across a
+// replace, and the memo re-stamps them after every direct write so
+// our own writes never read as a replacement.
 type fileIdentity struct {
-	dev uint64
-	ino uint64
+	dev   uint64
+	ino   uint64
+	size  int64
+	mtime int64 // UnixNano
 }
 
-// statFileIdentity returns the (dev, ino) pair for path so bind-mount
-// memoization can detect when the target is unlinked/remounted.
+// statFileIdentity fingerprints path for the bind-mount memo — see
+// fileIdentity for why the fingerprint is wider than dev+ino.
 func statFileIdentity(path string) (fileIdentity, bool) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -44,7 +54,12 @@ func statFileIdentity(path string) (fileIdentity, bool) {
 	if !ok {
 		return fileIdentity{}, false
 	}
-	return fileIdentity{dev: st.Dev, ino: st.Ino}, true
+	return fileIdentity{
+		dev:   st.Dev,
+		ino:   st.Ino,
+		size:  fi.Size(),
+		mtime: fi.ModTime().UnixNano(),
+	}, true
 }
 
 // FileStatKey fingerprints a file's identity+generation WITHOUT

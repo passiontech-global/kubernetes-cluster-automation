@@ -15,8 +15,10 @@ func isBindMountRenameErr(error) bool { return false }
 func isBindMountEBUSYErr(error) bool { return false }
 
 type fileIdentity struct {
-	dev uint64
-	ino uint64
+	dev   uint64
+	ino   uint64
+	size  int64
+	mtime int64
 }
 
 func statFileIdentity(string) (fileIdentity, bool) { return fileIdentity{}, false }
