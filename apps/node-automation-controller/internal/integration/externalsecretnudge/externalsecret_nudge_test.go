@@ -860,6 +860,43 @@ func TestExternalSecretEmptyKeyOptOutAndTargetName(t *testing.T) {
 	}
 }
 
+// spec.target.template.data owns the output key set: spec.data[]
+// secretKey names are template variables, not Secret keys — the
+// concourse-helm-values shape (postgres_password feeding
+// {{ .postgres_password }} inside values.yaml) must not flag
+// postgres_password as missing, while a genuinely absent template
+// key still alerts.
+func TestExternalSecretEmptyKeyTemplateDataKeys(t *testing.T) {
+	es := esObj("apps", "es-tmpl", "True", time.Hour)
+	esDataKeys(es, "postgres_password")
+	_ = unstructured.SetNestedMap(es.Object, map[string]any{
+		"values.yaml": "postgresql:\n  auth:\n    password: \"{{ .postgres_password }}\"\n",
+		"extra.yaml":  "static: value\n",
+	}, "spec", "target", "template", "data")
+	secret := esSecret("apps", "es-tmpl", map[string][]byte{
+		"values.yaml": []byte("postgresql:\n  auth:\n    password: x\n"),
+	}, nil)
+	dyn := newDynFake(es)
+	n := &externalSecretNudge{queue: "externalsecret-nudge",
+		cs: kfake.NewSimpleClientset(secret), dyn: dyn,
+		storeReady: map[string]bool{}}
+	if err := n.nudge(ctx, true, true); err != nil {
+		t.Fatal(err)
+	}
+	// postgres_password is a template variable — never a Secret key.
+	if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-tmpl", "postgres_password") {
+		t.Fatal("template variable flagged as a missing Secret key")
+	}
+	// values.yaml synced fine; extra.yaml is declared by the template
+	// but absent from the Secret — the audit must still catch it.
+	if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-tmpl", "values.yaml") {
+		t.Fatal("populated template key flagged")
+	}
+	if !metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-tmpl", "extra.yaml") {
+		t.Fatal("absent template.data key not flagged")
+	}
+}
+
 // The empty skeleton an ESO-owned Secret can be left as after a failed
 // sync is deleted (UID precondition) right before the force-sync stamp
 // lands — the forced reconcile recreates it populated.
