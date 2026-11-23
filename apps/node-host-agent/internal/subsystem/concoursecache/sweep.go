@@ -79,8 +79,10 @@ func (p *Pruner) pruneSharedCacheRoot(ctx context.Context, scRoot *os.Root, scDi
 	p.capTopLevelDirsRoot(ctx, scRoot, "build",
 		eff.BuildHighMark, eff.BuildLowMark, false, log)
 
-	// affected + ytt: 48h files, no dir cleanup.
-	for _, b := range []string{"affected", "ytt"} {
+	// affected + ytt + pr: 48h files, no dir cleanup. pr is the
+	// PR-build partition root (<shared>/pr/<tool>) — its nested
+	// tool dirs are recreated by CI, so only stale files age out.
+	for _, b := range []string{"affected", "ytt", "pr"} {
 		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.StaleMaxAge, false, log)
 	}
 	// nx + moon task-graph caches: 7d files + empty dirs.
@@ -89,7 +91,7 @@ func (p *Pruner) pruneSharedCacheRoot(ctx context.Context, scRoot *os.Root, scDi
 	}
 	// Scanner/tool caches: 14d files + empty dirs.
 	for _, b := range []string{"trivy", "sonar", "golangci-lint",
-		"uv", "pip", "bin", "py-tools", "bun"} {
+		"uv", "pip", "bin", "py-tools", "bun", "proto", "uv-tools"} {
 		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.ToolMaxAge, true, log)
 	}
 	p.pruneNodeDepsRoot(ctx, scRoot, eff, log)

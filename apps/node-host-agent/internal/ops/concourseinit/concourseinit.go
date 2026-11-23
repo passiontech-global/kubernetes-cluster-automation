@@ -9,8 +9,8 @@
 //
 //   - WorkerInit — the init container half: btrfs subvolume cleanup,
 //     selective wipe of /concourse-work-dir (shared-cache survives and,
-//     inside it, the 14 PersistentCacheDirs), recreation of the
-//     20-entry ScaffoldCacheDirs layout owned by uid/gid 4294967294
+//     inside it, the 16 PersistentCacheDirs), recreation of the
+//     23-entry ScaffoldCacheDirs layout owned by uid/gid 4294967294
 //     mode 0777, then installation of runc.real + the wrapper binary
 //     into the concourse-runc emptyDir.
 //   - RunRuncWrapper — installed as /concourse-runc/runc and mounted
@@ -48,23 +48,25 @@ const (
 	cachePerm         = concourse.CachePerm
 )
 
-// PersistentCacheDirs is the keep-list under shared-cache — the 14
+// PersistentCacheDirs is the keep-list under shared-cache — the 16
 // caches expensive enough to rebuild (go-mod ~1.4GB, toolchains,
 // scanner DBs, package caches) that the wipe preserves. Every other
 // first-level entry is removed; the script's case-list verbatim.
 var PersistentCacheDirs = []string{
 	"go-mod", "mise", "ci-tool", "node-deps", "bun", "uv", "pip",
 	"trivy", "sonar", "golangci-lint", "nx", "moon", "bin", "py-tools",
+	"proto", "uv-tools",
 }
 
-// ScaffoldCacheDirs is the mkdir -p list — the 20 shared-cache
+// ScaffoldCacheDirs is the mkdir -p list — the 23 shared-cache
 // subdirs recreated every init (a superset of PersistentCacheDirs;
-// the difference — go-build, go, affected, build, coverage, ytt —
+// the difference — go-build, go, affected, build, coverage, ytt, pr —
 // is wiped and rebuilt empty each restart). Script order preserved.
 var ScaffoldCacheDirs = []string{
 	"go-mod", "go-build", "go", "mise", "bun", "uv", "pip", "affected",
 	"golangci-lint", "build", "coverage", "ci-tool", "ytt", "node-deps",
 	"trivy", "sonar", "nx", "moon", "bin", "py-tools",
+	"proto", "uv-tools", "pr",
 }
 
 // persistentSet is PersistentCacheDirs as a lookup map for the wipe.

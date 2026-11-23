@@ -77,7 +77,7 @@ func assertPresent(t *testing.T, path string) {
 }
 
 // seedWorkDir builds a realistic work dir: baggageclaim/containerd
-// state at the top level, all 20 scaffold dirs (each carrying a
+// state at the top level, all 23 scaffold dirs (each carrying a
 // marker file so preserved-vs-recreated is observable), junk entries
 // inside shared-cache, and dotfiles everywhere.
 func seedWorkDir(t *testing.T, workDir string) (sc string) {
@@ -109,9 +109,9 @@ func seedWorkDir(t *testing.T, workDir string) (sc string) {
 	return sc
 }
 
-// Selective cleanup: shared-cache + the 14 persistent dirs (contents
+// Selective cleanup: shared-cache + the 16 persistent dirs (contents
 // intact) survive; everything else — top-level state, junk inside
-// shared-cache, the 6 non-persistent scaffold dirs' contents — is
+// shared-cache, the 7 non-persistent scaffold dirs' contents — is
 // removed. Dotfiles survive both wipes (bash `*` never matches them).
 func TestWorkerInitSelectiveWipe(t *testing.T) {
 	cfg := testConfig(t, nil)
@@ -128,11 +128,11 @@ func TestWorkerInitSelectiveWipe(t *testing.T) {
 	assertPresent(t, filepath.Join(cfg.WorkDir, ".work-dotfile"))
 	assertPresent(t, sc)
 
-	// Inside shared-cache: the 14 keep-list dirs kept their marker.
+	// Inside shared-cache: the 16 keep-list dirs kept their marker.
 	for _, d := range PersistentCacheDirs {
 		assertPresent(t, filepath.Join(sc, d, "marker"))
 	}
-	// The 6 scaffold dirs NOT on the keep-list were wiped and
+	// The 7 scaffold dirs NOT on the keep-list were wiped and
 	// recreated empty.
 	for _, d := range ScaffoldCacheDirs {
 		if slices.Contains(PersistentCacheDirs, d) {
@@ -151,9 +151,9 @@ func TestWorkerInitSelectiveWipe(t *testing.T) {
 	assertPresent(t, filepath.Join(sc, ".hidden"))
 }
 
-// Scaffold invariant: all 20 dirs exist, mode 0777 on shared-cache
+// Scaffold invariant: all 23 dirs exist, mode 0777 on shared-cache
 // and every first-level entry; the recording chown sees exactly
-// shared-cache + the 20 dirs at uid/gid 4294967294 (dotfiles and
+// shared-cache + the 23 dirs at uid/gid 4294967294 (dotfiles and
 // symlinks are skipped — same Lstat guard the sweeper port uses).
 func TestWorkerInitScaffoldPermOwnership(t *testing.T) {
 	var chowned []string
