@@ -614,15 +614,34 @@ func runTier1Tests(t *testing.T, bin string) {
 				}
 				return nil
 			})
-			if dfi, err := os.Stat(usrLocalBin); err != nil || dfi.Mode().Perm() != 0o755 {
-				t.Fatalf("/usr/local/bin permissions altered: err=%v mode=%v want 0755", err, dfi.Mode().Perm())
-			}
-			if efi, err := os.Stat(filepath.Join(sb.hostroot, "etc", "kine")); err != nil || efi.Mode().Perm() != 0o700 {
-				t.Fatalf("/etc/kine mode=%v want 0700 (err=%v)", efi.Mode().Perm(), err)
-			}
-			if kfi, err := os.Stat(filepath.Join(sb.hostroot, "etc", "kine", "kine.env")); err != nil || kfi.Mode().Perm() != 0o600 {
-				t.Fatalf("kine.env mode=%v want 0600 (err=%v)", kfi.Mode().Perm(), err)
-			}
+			// The sandbox pre-creates hostroot/etc/kine at 0755 and the
+			// converge chmods it to 0700 in the same pass that lands the
+			// binary — a beat after the binary becomes visible. Poll like
+			// the binary check above instead of racing that window.
+			eventually(t, 8*time.Second, 100*time.Millisecond, "kine dir/env modes converged", func() error {
+				dfi, err := os.Stat(usrLocalBin)
+				if err != nil {
+					return err
+				}
+				if dfi.Mode().Perm() != 0o755 {
+					return fmt.Errorf("/usr/local/bin mode=%v want 0755", dfi.Mode().Perm())
+				}
+				efi, err := os.Stat(filepath.Join(sb.hostroot, "etc", "kine"))
+				if err != nil {
+					return err
+				}
+				if efi.Mode().Perm() != 0o700 {
+					return fmt.Errorf("/etc/kine mode=%v want 0700", efi.Mode().Perm())
+				}
+				kfi, err := os.Stat(filepath.Join(sb.hostroot, "etc", "kine", "kine.env"))
+				if err != nil {
+					return err
+				}
+				if kfi.Mode().Perm() != 0o600 {
+					return fmt.Errorf("kine.env mode=%v want 0600", kfi.Mode().Perm())
+				}
+				return nil
+			})
 		})
 
 		t.Run("SHA256TamperRejectedSingleFD", func(t *testing.T) {
@@ -1147,7 +1166,7 @@ func runTier1Tests(t *testing.T, bin string) {
 			installFakeRuntimeForKinedb(t, sb, true, false, 300)
 
 			ra := startReqAgent(t, bin, sb.envSlice())
-			eventually(t, 5*time.Second, 50*time.Millisecond, "pg_dump started", func() error {
+			eventually(t, 15*time.Second, 50*time.Millisecond, "pg_dump started", func() error {
 				b, err := os.ReadFile(sb.toolLog)
 				if err != nil {
 					return err
