@@ -606,15 +606,16 @@ func TestDNSQueryTCPShortHeaderRejectedBeforeBodyRead(t *testing.T) {
 }
 
 func TestProbesHonorDeadline(t *testing.T) {
-	// A handler that outlives the probe timeout: the client-side
-	// deadline must fire first.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-r.Context().Done():
-		case <-time.After(5 * time.Second):
-		}
+	// A handler that never responds: the client-side deadline must
+	// fire first. It must NOT watch r.Context().Done() — the cancel
+	// and the server's implicit 200 can land in the same transport
+	// select window and the response occasionally wins under load.
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
 	}))
 	defer srv.Close()
+	defer close(release) // LIFO: handlers drain before Close waits
 
 	start := time.Now()
 	if err := HTTPGet(context.Background(), srv.URL, 100*time.Millisecond); err == nil {

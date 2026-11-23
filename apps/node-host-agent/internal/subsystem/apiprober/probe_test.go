@@ -264,10 +264,17 @@ func TestListRVParseAndTimeout(t *testing.T) {
 	})
 
 	t.Run("query timeout", func(t *testing.T) {
-		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			<-r.Context().Done() // hang until the client gives up
+		// The handler must never respond on its own: watching
+		// r.Context().Done() races the client deadline — the cancel
+		// and the server's implicit 200-empty can land in the same
+		// transport select window, and the response occasionally wins
+		// under load (failParse instead of failTimeout).
+		release := make(chan struct{})
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			<-release
 		}))
 		defer srv.Close()
+		defer close(release) // LIFO: handlers drain before Close waits
 		p, err := New(Config{HTTPClient: srv.Client()}, prometheus.NewRegistry())
 		if err != nil {
 			t.Fatal(err)
