@@ -131,8 +131,12 @@ jobs:
       - name: Run govulncheck
         run: |
           set -euo pipefail
+          # mise exports GOBIN (the toolchain's own bin dir), so a bare
+          # `go install` does NOT land in GOPATH/bin — pin GOBIN to a
+          # temp dir and resolve the binary from the same place.
+          export GOBIN="$RUNNER_TEMP/gobin"
           go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
-          GOVULN="$(go env GOPATH)/bin/govulncheck"
+          GOVULN="$GOBIN/govulncheck"
           for m in libs/hostkit libs/jinja apps/webhook-dispatcher apps/node-automation-controller apps/node-host-agent; do
             echo "::group::govulncheck $m"
             (cd "$m" && "$GOVULN" ./...)
@@ -202,8 +206,12 @@ jobs:
       - name: Run govulncheck
         run: |
           set -euo pipefail
+          # mise exports GOBIN (the toolchain's own bin dir), so a bare
+          # `go install` does NOT land in GOPATH/bin — pin GOBIN to a
+          # temp dir and resolve the binary from the same place.
+          export GOBIN="$RUNNER_TEMP/gobin"
           go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
-          GOVULN="$(go env GOPATH)/bin/govulncheck"
+          GOVULN="$GOBIN/govulncheck"
           for m in libs/hostkit libs/jinja apps/webhook-dispatcher apps/node-automation-controller apps/node-host-agent; do
             echo "::group::govulncheck $m"
             (cd "$m" && "$GOVULN" ./...)
