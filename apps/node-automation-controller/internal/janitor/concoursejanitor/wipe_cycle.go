@@ -8,6 +8,7 @@ package concoursejanitor
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -52,6 +53,37 @@ func (j *concourseWorkdirJanitor) processPod(ctx context.Context, podName string
 	}
 
 	s := j.readStats(ctx, pod)
+
+	// Fresh-init baseline stamp: a worker pod (re)created outside
+	// this janitor's wipe path — node reboot, manual delete, STS
+	// rollout — runs init-rm on start but carries no usable
+	// baseline-nodefs-gib annotation, so readStats falls back to
+	// the imageFs+32GiB estimate. On nodes hosting large
+	// non-Concourse local PVCs that estimate undercounts the
+	// baseline and the workdir reading overshoots — the wipe-oan
+	// the annotation exists to prevent. While the pod is still
+	// inside cjBaselineStampWindow of becoming Ready the work-dir
+	// is near-empty, so the current nodefs reading IS the
+	// baseline: stamp it once (same merge-patch as the post-wipe
+	// path) and re-derive this run's workdir against the stamp —
+	// ~0, the truth for a just-wiped worker.
+	if s.nodefsOK {
+		if _, err := strconv.ParseUint(pod.Annotations[cjBaselineAnno], 10, 64); err != nil {
+			if since, ok := kube.PodReadySince(pod); ok &&
+				j.now.Now().Sub(since) < cjBaselineStampWindow {
+				if err := j.annotateBaseline(ctx, podName, s.usedGiB); err != nil {
+					log.Info("WARN: fresh-worker baseline annotate failed",
+						"pod", podName, "error", err)
+				} else {
+					s.workdirGiB, s.workdirOK = 0, true
+					log.Info("baseline stamped on fresh worker",
+						"pod", podName, "nodefsUsedGiB", s.usedGiB,
+						"readyFor", j.now.Now().Sub(since).Truncate(time.Minute))
+				}
+			}
+		}
+	}
+
 	log.Info("=== stats ===",
 		"pod", podName, "node", strOr(s.node, "?"),
 		"nodefsUsedGiB", intOr(s.usedGiB, s.nodefsOK),

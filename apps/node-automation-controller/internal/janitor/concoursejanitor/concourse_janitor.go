@@ -34,7 +34,11 @@
 // zero-I/O (<50ms) Concourse-only reading the janitor stamps the
 // annotation `passiontech.dev/baseline-nodefs-gib` on the
 // worker pod right after init-rm wiped the work-dir
-// (workdir = nodefs_used - baseline). When the annotation is missing
+// (workdir = nodefs_used - baseline). A worker pod recreated outside
+// the wipe path gets the same stamp on first sighting while it is
+// still inside cjBaselineStampWindow of Ready — its work-dir is
+// near-empty then, so the current nodefs reading is the baseline.
+// When the annotation is missing
 // the baseline is estimated as imageFs_used + 32GiB (OS/k0s/other
 // PVCs outside imageFs — measured 29-35GiB on the worker nodes).
 //
@@ -161,6 +165,13 @@ const (
 	// under-cap cache. Under 15m the pod may still be finishing
 	// init-rm from a previous wipe — replacing it again would thrash.
 	cjSteadyWorkerMinAge = 15 * time.Minute
+	// cjBaselineStampWindow bounds the fresh-init baseline stamp:
+	// a worker pod (re)created outside this janitor's wipe path
+	// (node reboot, manual delete, STS rollout) runs init-rm on
+	// start but carries no baseline-nodefs-gib annotation. While
+	// it is still this fresh out of Ready the work-dir is
+	// near-empty, so the current nodefs reading IS the baseline.
+	cjBaselineStampWindow = 20 * time.Minute
 	// The Garden/baggageclaim fault signatures appear in the
 	// concourse-worker container's stdout; a bounded tail suffices —
 	// the lines repeat on every volume/container creation attempt.

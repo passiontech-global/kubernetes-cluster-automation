@@ -241,6 +241,71 @@ func TestConcourseJanitorReadyTimeout(t *testing.T) {
 	}
 }
 
+// A worker pod recreated outside the wipe path (node reboot, manual
+// delete, STS rollout) runs init-rm on start but carries no baseline
+// annotation — the imageFs+32GiB fallback reads workdir=108GiB here
+// (>100 → oan wipe) because the node's non-Concourse local PVCs push
+// real nodefs to 150GiB. Inside the stamp window of Ready the
+// work-dir is near-empty, so the janitor stamps the current nodefs
+// as baseline and keeps the cache.
+func TestConcourseJanitorStampsBaselineOnFreshWorker(t *testing.T) {
+	var events []string
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1),
+		cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil),
+		cjReadySibling(),
+		cjLocalUsers())
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 150 * gib, 400 * gib, 10 * gib, nil // 37% nodefs
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p := cjPod(t, cs, "concourse-worker-0")
+	if p.UID != "uid-0" {
+		t.Fatalf("fresh worker wiped on the fallback estimate: uid %s", p.UID)
+	}
+	if got := p.Annotations[cjBaselineAnno]; got != "150" {
+		t.Fatalf("baseline annotation %q, want \"150\"", got)
+	}
+	for _, e := range events {
+		if e == "delete:concourse-worker-0" {
+			t.Fatalf("fresh worker deleted: %v", events)
+		}
+	}
+}
+
+// The same pod past the stamp window keeps the fallback estimate —
+// its work-dir may already hold real build output, so stamping now
+// would hide it. workdir=150-10-32=108 > 100 → normal wipe.
+func TestConcourseJanitorNoStampOnSettledWorker(t *testing.T) {
+	var events []string
+	p := cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil)
+	p.Status.Conditions[0].LastTransitionTime = metav1.NewTime(
+		time.Now().Add(-cjBaselineStampWindow - time.Minute))
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1), p, cjReadySibling(), cjLocalUsers())
+	cjReplaceOnDelete(cs, &events, true)
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 150 * gib, 400 * gib, 10 * gib, nil
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range events {
+		if e == "delete:concourse-worker-0" {
+			return // wiped on the fallback estimate, as before
+		}
+	}
+	t.Fatalf("settled worker without annotation was not wiped: %v", events)
+}
+
 // Missing StatefulSet is a hard error — bash `exit 1`.
 func TestConcourseJanitorMissingSTS(t *testing.T) {
 	var events []string
