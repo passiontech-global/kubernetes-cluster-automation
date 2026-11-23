@@ -33,10 +33,18 @@ type shimWedgeIncident struct {
 	pid              int
 	comm             string
 	state            string
+	startTime        string
 	isShim           bool
 	hostRootVerified bool
 	mount            string
 	uid              string
+}
+
+func statStartTime(st procfs.Stat) string {
+	if len(st.Fields) > 19 {
+		return st.Fields[19]
+	}
+	return ""
 }
 
 func extractDeadPodMounts(mountinfoData []byte, hostPodsDir string, podLive map[string]bool) []deadPodMount {
@@ -200,6 +208,7 @@ func (c *MountinfoCheck) reconcileShimMountWedges(
 			pid:              pid,
 			comm:             st.Comm,
 			state:            state,
+			startTime:        statStartTime(st),
 			isShim:           strings.HasPrefix(st.Comm, "containerd-shim"),
 			hostRootVerified: hostRootOK,
 			mount:            matched.mount,
@@ -231,7 +240,7 @@ func (c *MountinfoCheck) reconcileShimMountWedges(
 		fmt.Sprintf("ebusy-mount=%s pid=%d uid=%s", incidents[0].mount, incidents[0].pid, incidents[0].uid))
 
 	held := c.d.HoldLocalAction(ctx)
-	umountDone := map[string]bool{}
+	umountResult := map[string]bool{}
 	for _, inc := range incidents {
 		if held {
 			c.d.State.AppendLog(fmt.Sprintf(
@@ -250,23 +259,31 @@ func (c *MountinfoCheck) reconcileShimMountWedges(
 			c.d.State.AppendLog(fmt.Sprintf(
 				"suspect: mountinfo-hygiene EBUSY dead-pod mount %s (uid=%s) pinned by non-host-root pid=%d — shim kill refused",
 				inc.mount, inc.uid, inc.pid))
-			if c.d.Cfg.Systemd != nil && !umountDone[inc.mount] {
-				umountDone[inc.mount] = true
-				c.ebusyLazyUmount(ctx, inc)
+			if c.d.Cfg.Systemd != nil {
+				if _, attempted := umountResult[inc.mount]; !attempted {
+					umountResult[inc.mount] = c.ebusyLazyUmount(ctx, inc)
+				}
 			}
 			continue
 		}
 
 		unmounted := false
 		if c.d.Cfg.Systemd != nil {
-			if !umountDone[inc.mount] {
-				umountDone[inc.mount] = true
-				unmounted = c.ebusyLazyUmount(ctx, inc)
+			if res, attempted := umountResult[inc.mount]; !attempted {
+				res = c.ebusyLazyUmount(ctx, inc)
+				umountResult[inc.mount] = res
+				unmounted = res
 			} else {
-				unmounted = true
+				unmounted = res
 			}
 		}
 		if !unmounted && runtimeKillComm(inc.comm) && c.d.Cfg.Seams.Host.KillFn != nil {
+			if !c.reverifyShimBeforeKill(inc) {
+				c.d.State.AppendLog(fmt.Sprintf(
+					"suspect: mountinfo-hygiene EBUSY shim pid=%d identity changed before kill — skipped",
+					inc.pid))
+				continue
+			}
 			c.d.State.AppendLog(fmt.Sprintf(
 				"ACTION: mountinfo-hygiene EBUSY kill wedged shim pid=%d mount=%s uid=%s",
 				inc.pid, inc.mount, inc.uid))
@@ -281,6 +298,28 @@ func (c *MountinfoCheck) reconcileShimMountWedges(
 	}
 
 	return !inconclusive
+}
+
+// reverifyShimBeforeKill re-reads /proc/<pid>/stat and host-root proof
+// immediately before SIGKILL so PID reuse or S->D transitions across
+// HoldLocalAction / umount exec cannot signal an unrelated process.
+func (c *MountinfoCheck) reverifyShimBeforeKill(inc shimWedgeIncident) bool {
+	st, ok := c.d.Proc.Stat(inc.pid)
+	if !ok || !st.HasComm || len(st.Fields) == 0 {
+		return false
+	}
+	if !strings.HasPrefix(st.Comm, "containerd-shim") || !runtimeKillComm(st.Comm) {
+		return false
+	}
+	switch st.Fields[0] {
+	case "D", "Z", "X", "x":
+		return false
+	}
+	if inc.startTime != "" && statStartTime(st) != inc.startTime {
+		return false
+	}
+	hostRootOK, _ := verifyHostRootShim(c.d, inc.pid)
+	return hostRootOK
 }
 
 func (c *MountinfoCheck) ebusyLazyUmount(ctx context.Context, inc shimWedgeIncident) bool {

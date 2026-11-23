@@ -6,6 +6,7 @@ package hostconfig
 
 import (
 	"net"
+	"net/netip"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -113,6 +114,40 @@ func (c *cyc) etcdctlInstallBinary() {
 // (defaults.yaml declares [] => fully off until cluster.yaml lists
 // cutover hosts). An unlisted node is never touched.
 
+// kineListenNeedsMTLS reports whether a kine --listen-address requires
+// full mTLS (fail-closed allowlist). Only unix:// / unixs:// sockets
+// and explicit loopback TCP hosts (localhost / 127.0.0.0/8 / ::1) are
+// exempt; bare host:port (e.g. 0.0.0.0:2379, :2379), uppercase schemes
+// (TCP://...), http://..., unknown schemes, and unparseable values all
+// require mTLS because kine treats non-unix listeners as TCP.
+func kineListenNeedsMTLS(listen string) bool {
+	s := strings.ToLower(strings.TrimSpace(listen))
+	if strings.HasPrefix(s, "unix://") || strings.HasPrefix(s, "unixs://") {
+		return false
+	}
+	for _, scheme := range []string{"tcp://", "http://", "https://"} {
+		if trimmed, ok := strings.CutPrefix(s, scheme); ok {
+			s = trimmed
+			break
+		}
+	}
+	if strings.Contains(s, "://") {
+		return true
+	}
+	host, _, err := net.SplitHostPort(s)
+	if err != nil {
+		return true
+	}
+	if host == "localhost" {
+		return false
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return true
+	}
+	return !addr.IsLoopback()
+}
+
 func (c *cyc) groupKineService() {
 	r, ctx := c.r, c.ctx
 	if !slices.Contains(c.vs("kine_service_hosts"), r.cfg.NodeName) {
@@ -133,7 +168,7 @@ func (c *cyc) groupKineService() {
 	}
 
 	listen := defStr(c.v("kine_listen_address"), "unix:///run/k0s/kine.sock")
-	// Fail-closed mTLS guard: a tcp:// listener on a NON-loopback host
+	// Fail-closed mTLS guard: any non-unix, non-loopback listener
 	// exposes the etcd3 API to the network — without full mTLS the
 	// datastore is wide open (read+write+delete) to anyone who can
 	// reach the port. All three cert vars must be configured AND
@@ -142,33 +177,23 @@ func (c *cyc) groupKineService() {
 	// unrestricted — the socket never leaves the host). Gate runs
 	// BEFORE anything is written: a refused converge leaves both the
 	// env file and the unit untouched.
-	if hp := strings.TrimPrefix(listen, "tcp://"); hp != listen {
-		host := hp
-		if i := strings.LastIndex(host, ":"); i >= 0 {
-			host = host[:i]
+	if kineListenNeedsMTLS(listen) {
+		missing := make([]string, 0, 3)
+		for _, name := range []string{
+			"kine_ca_file", "kine_server_cert_file", "kine_server_key_file",
+		} {
+			s := c.t.Vars.StrDef(name, "")
+			switch {
+			case s == "":
+				missing = append(missing, name+" (not configured)")
+			case !r.fileExists(s):
+				missing = append(missing, name+" (missing on disk: "+s+")")
+			}
 		}
-		host = strings.Trim(host, "[]")
-		// Loopback stays unrestricted in every spelling — v4
-		// literal, name and the IPv6 loopback the mTLS cutover
-		// binds ([::1]:2379 parses to "::1" after the bracket trim).
-		if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-			missing := make([]string, 0, 3)
-			for _, name := range []string{
-				"kine_ca_file", "kine_server_cert_file", "kine_server_key_file",
-			} {
-				s := c.t.Vars.StrDef(name, "")
-				switch {
-				case s == "":
-					missing = append(missing, name+" (not configured)")
-				case !r.fileExists(s):
-					missing = append(missing, name+" (missing on disk: "+s+")")
-				}
-			}
-			if len(missing) > 0 {
-				c.err("kine.service: tcp listener on non-loopback host requires full mTLS — refusing to converge (an unencrypted Kine datastore must never listen on the network)",
-					"listen", listen, "missing", strings.Join(missing, ", "))
-				return
-			}
+		if len(missing) > 0 {
+			c.err("kine.service: tcp listener on non-loopback host requires full mTLS — refusing to converge (an unencrypted Kine datastore must never listen on the network)",
+				"listen", listen, "missing", strings.Join(missing, ", "))
+			return
 		}
 	}
 

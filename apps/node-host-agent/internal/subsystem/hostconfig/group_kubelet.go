@@ -7,9 +7,11 @@ package hostconfig
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
@@ -67,6 +69,42 @@ func t7AppendExtraArgs(u, extra string) (string, bool) {
 	return out, ok
 }
 
+// maxKubeletCfgBytes caps live kubelet config reads so a hostile or
+// corrupted file cannot OOM hostconfig.
+const maxKubeletCfgBytes = 1 << 20
+
+// t7KubeletCfgAllowedPrefixes confines live kubelet --config discovery
+// and writes to trusted kubelet/k0s config directories. Any probed
+// path outside these prefixes (or containing traversal/NUL) is refused.
+var t7KubeletCfgAllowedPrefixes = []string{
+	"/run/k0s/",
+	"/var/lib/k0s/",
+	"/etc/k0s/",
+	"/etc/kubernetes/",
+	"/etc/kubelet/",
+}
+
+func kubeletCfgPathAllowed(p string) bool {
+	if p == "" || strings.ContainsRune(p, 0) {
+		return false
+	}
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	cleaned := filepath.Clean(p)
+	for _, prefix := range t7KubeletCfgAllowedPrefixes {
+		if strings.HasPrefix(cleaned, prefix) && len(cleaned) > len(prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // kubeletCfgPath ports the T7 discovery: --config of the RUNNING
 // kubelet first (via /proc cmdline — the only source that follows a
 // non-listed --config), the on-disk candidates only as fallback when
@@ -74,13 +112,25 @@ func t7AppendExtraArgs(u, extra string) (string, bool) {
 // would silently patch a stale unit file (e.g. a /run/k0s leftover
 // beside the live /var/lib/k0s path) that the running kubelet never
 // reads — the write would succeed and the heal silently not happen.
+//
+// Security: only inspect UID-0 kubelet processes inside k0sworker or
+// k0scontroller cgroups (never kubepods), and confine any discovered
+// --config path to t7KubeletCfgAllowedPrefixes so an unprivileged
+// process/container spoofing comm=kubelet cannot redirect root writes
+// to arbitrary host files (e.g. /etc/sudoers) or block on a FIFO.
 func (c *cyc) kubeletCfgPath() string {
 	if out, err := c.r.run(c.ctx, "sh", "-c",
-		`pid=$(pgrep -x kubelet | head -1); `+
-			`if [ -n "$pid" ]; then tr '\0' '\n' < "/proc/$pid/cmdline" `+
-			`| awk '/^--config=/{sub(/^--config=/,"");print;exit} /^--config$/{getline;print;exit}'; fi`); err == nil {
+		`for pid in $(pgrep -u 0 -x kubelet 2>/dev/null); do `+
+			`cg="/proc/$pid/cgroup"; `+
+			`if [ -r "$cg" ] && grep -qE '(k0sworker|k0scontroller)\.service' "$cg" && ! grep -q 'kubepods' "$cg"; then `+
+			`tr '\0' '\n' < "/proc/$pid/cmdline" `+
+			`| awk '/^--config=/{sub(/^--config=/,"");print;exit} /^--config$/{getline;print;exit}'; `+
+			`exit 0; fi; done`); err == nil {
 		if p := strings.TrimSpace(out); p != "" {
-			return p
+			if kubeletCfgPathAllowed(p) {
+				return filepath.Clean(p)
+			}
+			logger().Warn("T7: ignoring kubelet --config outside allowlisted directories", "path", p)
 		}
 	}
 	for _, p := range t7KubeletCfgCandidates {
@@ -259,8 +309,19 @@ func (c *cyc) groupPulls() {
 	// Kubelet config live patch (T7 maxParallelImagePulls + T17
 	// kubeAPIQPS/Burst, podPidsLimit, evictionMinimumReclaim).
 	cfgPath := c.kubeletCfgPath()
-	if cfgPath != "" && r.fileExists(cfgPath) {
-		kf, err := os.ReadFile(r.hp(cfgPath))
+	if cfgPath != "" && kubeletCfgPathAllowed(cfgPath) && r.fileExists(cfgPath) {
+		resolvedCfg, cerr := k0sconfig.ConfinedHostPath(r.cfg.HostRoot, r.hp(cfgPath))
+		var kf []byte
+		var err error
+		if cerr != nil {
+			err = cerr
+		} else if fi, lerr := os.Lstat(resolvedCfg); lerr != nil {
+			err = lerr
+		} else if fi.Mode()&os.ModeSymlink != 0 {
+			err = fmt.Errorf("refusing symlink kubelet config %s", cfgPath)
+		} else {
+			kf, err = k0sconfig.ReadConfigBounded(resolvedCfg, maxKubeletCfgBytes)
+		}
 		if err != nil {
 			c.err("T7: kubelet config unreadable — skipping live patch",
 				"path", cfgPath, "error", err)

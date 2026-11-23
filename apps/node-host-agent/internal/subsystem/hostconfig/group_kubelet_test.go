@@ -4,6 +4,8 @@
 package hostconfig
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -293,8 +295,8 @@ func TestKubeletCfgPathDiscovery(t *testing.T) {
 	}
 	c := loadCyc(t, r, vars, "node-b")
 
-	// Probe answers with the live --config path.
-	sr.On("pgrep -x kubelet", "/etc/kubelet/custom.yaml")
+	// Probe answers with the live --config path (under allowlisted kubelet dir).
+	sr.On("pgrep -u 0 -x kubelet", "/etc/kubelet/custom.yaml")
 	hostWrite(t, r, "/etc/kubelet/custom.yaml", "apiVersion: kubelet.config.k8s.io/v1beta1\n")
 	if got := c.kubeletCfgPath(); got != "/etc/kubelet/custom.yaml" {
 		t.Fatalf("kubeletCfgPath = %q, want the probed path", got)
@@ -304,19 +306,65 @@ func TestKubeletCfgPathDiscovery(t *testing.T) {
 	// running with a non-listed --config beside a stale listed file
 	// must get its live config patched, not the leftover.
 	sr.ClearLog()
-	sr.On("pgrep -x kubelet", "/etc/kubelet/custom.yaml")
+	sr.On("pgrep -u 0 -x kubelet", "/etc/kubelet/custom.yaml")
 	hostWrite(t, r, "/var/lib/k0s/kubelet/config.yaml", "apiVersion: kubelet.config.k8s.io/v1beta1\n")
 	if got := c.kubeletCfgPath(); got != "/etc/kubelet/custom.yaml" {
 		t.Fatalf("kubeletCfgPath = %q, want the probed path over the stale candidate", got)
 	}
 
+	// Probe returns an unallowlisted or traversal path (e.g. spoofed
+	// process trying to overwrite /etc/sudoers) → rejected; falls back
+	// to safe on-disk candidate.
+	for _, bad := range []string{
+		"/etc/sudoers",
+		"/etc/ssh/sshd_config",
+		"/etc/kubelet/../../etc/sudoers",
+		"relative/config.yaml",
+	} {
+		sr.ClearLog()
+		sr.On("pgrep -u 0 -x kubelet", bad)
+		if got := c.kubeletCfgPath(); got != "/var/lib/k0s/kubelet/config.yaml" {
+			t.Fatalf("kubeletCfgPath(%q) = %q, want fallback candidate", bad, got)
+		}
+	}
+
 	// Probe silent → first existing candidate.
 	sr.ClearLog()
-	sr.On("pgrep -x kubelet", "")
+	sr.On("pgrep -u 0 -x kubelet", "")
 	hostWrite(t, r, "/var/lib/k0s/kubelet/config.yaml", "apiVersion: kubelet.config.k8s.io/v1beta1\n")
 	if got := c.kubeletCfgPath(); got != "/var/lib/k0s/kubelet/config.yaml" {
 		t.Fatalf("kubeletCfgPath = %q, want the first existing candidate", got)
 	}
+
+	// Symlink kubelet config is refused in groupPulls (never follows
+	// symlink to overwrite arbitrary host files).
+	t.Run("symlink_kubelet_config_refused", func(t *testing.T) {
+		hostRoot := t.TempDir()
+		sr2 := newScripted(nil, nil)
+		rSym, err := New(Config{NodeName: "node-b", HostRoot: hostRoot,
+			VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr2}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hostWrite(t, rSym, "/etc/systemd/system/k0sworker.service", "[Service]\nExecStart=/usr/bin/k0s worker --data-dir=/var/lib/k0s\n")
+		hostWrite(t, rSym, "/etc/sudoers", "root ALL=(ALL) ALL\n")
+		cfgDir := filepath.Join(hostRoot, "var", "lib", "k0s", "kubelet")
+		if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(hostRoot, "etc", "sudoers"), filepath.Join(cfgDir, "config.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		cSym := loadCyc(t, rSym, vars, "node-b")
+		cSym.groupPulls()
+		if cSym.errs == 0 {
+			t.Fatal("expected counted error on symlinked kubelet config")
+		}
+		gotSudoers := hostRead(t, rSym, "/etc/sudoers")
+		if gotSudoers != "root ALL=(ALL) ALL\n" {
+			t.Fatalf("/etc/sudoers was modified through symlink:\n%s", gotSudoers)
+		}
+	})
 
 	// Nothing anywhere → "".
 	sr.ClearLog()

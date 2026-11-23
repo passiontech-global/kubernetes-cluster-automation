@@ -82,7 +82,7 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 		c.konnBadCycles = 0
 		return
 	}
-	pid := c.konnectivityPID()
+	pid, origStart := c.konnectivityPID()
 	if pid == 0 {
 		d.State.AppendLog("suspect: konnectivity-server process not found — nothing to kill")
 		return
@@ -97,6 +97,13 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 	}
 	switch d.Cfg.Sig13.Mode {
 	case cdeps.ModeEnforce:
+		// Re-verify process identity, cgroup, and starttime right before
+		// SIGKILL to close any PID-reuse TOCTOU window across HoldEmergencyHeal.
+		if !c.verifyKonnectivityPID(pid, origStart) {
+			d.State.AppendLog(fmt.Sprintf(
+				"suspect: konnectivity-server pid=%d identity changed before kill — skipped", pid))
+			return
+		}
 		// Check+spend atomically right before the action — off and
 		// dry-run modes must not burn the 30-minute restart budget.
 		if !d.State.RateTrySpend(cdeps.FileRateKonnRestart, konnRestartBudget) {
@@ -167,10 +174,10 @@ func ParseKonnectivityReadyBackends(body string) (float64, bool) {
 // would truncate at 15 chars ("konnectivity-se") so the cmdline is
 // the reliable name; a pod-side konnectivity-agent argv contains
 // "konnectivity-agent", never the server binary.
-func (c *FreezeCheck) konnectivityPID() int {
+func (c *FreezeCheck) konnectivityPID() (int, string) {
 	pids, err := c.d.Proc.PIDs()
 	if err != nil {
-		return 0
+		return 0, ""
 	}
 	slices.Sort(pids)
 	for _, pid := range pids {
@@ -184,10 +191,35 @@ func (c *FreezeCheck) konnectivityPID() int {
 		}
 		if base == "konnectivity-server" &&
 			c.d.Proc.CgroupContains(pid, cdeps.K0sControllerCgroupSubstr) {
-			return pid
+			var startTime string
+			if st, ok := c.d.Proc.Stat(pid); ok && len(st.Fields) > 19 {
+				startTime = st.Fields[19]
+			}
+			return pid, startTime
 		}
 	}
-	return 0
+	return 0, ""
+}
+
+func (c *FreezeCheck) verifyKonnectivityPID(pid int, origStart string) bool {
+	if !c.d.Proc.CgroupContains(pid, cdeps.K0sControllerCgroupSubstr) {
+		return false
+	}
+	if origStart != "" {
+		st, ok := c.d.Proc.Stat(pid)
+		if !ok || len(st.Fields) <= 19 || st.Fields[19] != origStart {
+			return false
+		}
+	}
+	args := c.d.Proc.Cmdline(pid)
+	if len(args) == 0 {
+		return false
+	}
+	base := args[0]
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	return base == "konnectivity-server"
 }
 
 // isVirtualWorkerNodeLabels filters Liqo / virtual-kubelet /

@@ -86,6 +86,14 @@ func startMockKMSUnix(t *testing.T, sockPath string, hang bool) {
 	})
 }
 
+func plantKubeAPIServerProc(t *testing.T, procRoot, pid, cmdline string) {
+	t.Helper()
+	testutil.WriteFile(t, filepath.Join(procRoot, pid, "stat"), pid+" (kube-apiserver) S 1 0 0")
+	testutil.WriteFile(t, filepath.Join(procRoot, pid, "cgroup"), "0::/system.slice/k0scontroller.service\n")
+	testutil.WriteFile(t, filepath.Join(procRoot, pid, "status"), "Name:\tkube-apiserver\nUid:\t0\t0\t0\t0\n")
+	testutil.WriteFile(t, filepath.Join(procRoot, pid, "cmdline"), cmdline)
+}
+
 func runKMSCheck(e *env) {
 	cdepstest.Check[*apiserver.KMSv2Check](e.H, cdeps.CheckKMSv2).Run(context.Background())
 }
@@ -267,8 +275,7 @@ resources:
 				if source == "proc" {
 					// Also place a D-state non-apiserver process whose cmdline must be skipped.
 					testutil.WriteFile(t, filepath.Join(e.Proc, "200", "stat"), "200 (sleep) D 1 0 0")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "stat"), "201 (kube-apiserver) S 1 0 0")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "cmdline"),
+					plantKubeAPIServerProc(t, e.Proc, "201",
 						"kube-apiserver\x00--encryption-provider-config="+encCfgPath+"\x00")
 				} else {
 					k0sYAML := `apiVersion: k0s.k8sproject.io/v1beta1
@@ -453,8 +460,7 @@ func TestKMSv2GuardAdversarialTier5(t *testing.T) {
 					bigPath = filepath.Join(hostRoot, "etc", "k0s", "k0s.yaml")
 				} else {
 					bigPath = filepath.Join(hostRoot, "etc", "k0s", "enc.yaml")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "stat"), "201 (kube-apiserver) S 1 0 0")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "cmdline"),
+					plantKubeAPIServerProc(t, e.Proc, "201",
 						"kube-apiserver\x00--encryption-provider-config=/etc/k0s/enc.yaml\x00")
 				}
 				if err := os.MkdirAll(filepath.Dir(bigPath), 0o755); err != nil {
@@ -522,8 +528,7 @@ func TestKMSv2GuardAdversarialTier5(t *testing.T) {
 				name: "proc_relative_dotdot",
 				setup: func(t *testing.T, e *env, base, _ string) {
 					testutil.WriteFile(t, filepath.Join(base, "outside-enc.yaml"), "not: [valid: yaml")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "stat"), "201 (kube-apiserver) S 1 0 0")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "cmdline"),
+					plantKubeAPIServerProc(t, e.Proc, "201",
 						"kube-apiserver\x00--encryption-provider-config=../outside-enc.yaml\x00")
 				},
 				wantLogSub: "invalid encryption config path",
@@ -532,8 +537,7 @@ func TestKMSv2GuardAdversarialTier5(t *testing.T) {
 				name: "proc_absolute_dotdot",
 				setup: func(t *testing.T, e *env, base, _ string) {
 					testutil.WriteFile(t, filepath.Join(base, "outside-enc.yaml"), "not: [valid: yaml")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "stat"), "201 (kube-apiserver) S 1 0 0")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "cmdline"),
+					plantKubeAPIServerProc(t, e.Proc, "201",
 						"kube-apiserver\x00--encryption-provider-config=/etc/k0s/../../outside-enc.yaml\x00")
 				},
 				wantLogSub: "invalid encryption config path",
@@ -595,8 +599,7 @@ spec:
 					if err := os.Symlink(outside, filepath.Join(encDir, "enc.yaml")); err != nil {
 						t.Fatal(err)
 					}
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "stat"), "201 (kube-apiserver) S 1 0 0")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "cmdline"),
+					plantKubeAPIServerProc(t, e.Proc, "201",
 						"kube-apiserver\x00--encryption-provider-config=/etc/k0s/enc.yaml\x00")
 				},
 				wantLogSub: "escapes HostRoot",
@@ -666,8 +669,7 @@ spec:
 				target := filepath.Join(hostRoot, "etc", "k0s", "k0s.yaml")
 				if tc.useProc {
 					target = filepath.Join(hostRoot, "etc", "k0s", "enc.yaml")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "stat"), "201 (kube-apiserver) S 1 0 0")
-					testutil.WriteFile(t, filepath.Join(e.Proc, "201", "cmdline"),
+					plantKubeAPIServerProc(t, e.Proc, "201",
 						"kube-apiserver\x00--encryption-provider-config=/etc/k0s/enc.yaml\x00")
 				}
 				if tc.kind == "dir" {
@@ -701,6 +703,58 @@ spec:
 					t.Fatalf("expected non-regular file error in logs, got:\n%s", logs)
 				}
 			})
+		}
+	})
+
+	t.Run("spoofed_kube_apiserver_proc_ignored", func(t *testing.T) {
+		e := fixture(t)
+		hostRoot := t.TempDir()
+		e.H.Cfg.HostRoot = hostRoot
+		e.H.Cfg.K0sRunDir = filepath.Join(hostRoot, "run", "k0s")
+		var dialed []string
+		e.H.Cfg.KMSProbeFn = func(_ context.Context, sock string) error {
+			dialed = append(dialed, sock)
+			return fmt.Errorf("missing socket %s", sock)
+		}
+		setupKMSHTTP(t, e, 2, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		})
+
+		evilYAML := `apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources: ["secrets"]
+    providers:
+      - kms:
+          apiVersion: v2
+          name: evil
+          endpoint: unix:///tmp/attacker.sock
+`
+		testutil.WriteFile(t, filepath.Join(hostRoot, "tmp", "evil.yaml"), evilYAML)
+
+		// Spoofed container process in kubepods.
+		testutil.WriteFile(t, filepath.Join(e.Proc, "150", "stat"), "150 (kube-apiserver) S 1 0 0")
+		testutil.WriteFile(t, filepath.Join(e.Proc, "150", "cgroup"), "0::/kubepods.slice/kubepods-pod1.slice/cri-containerd-evil.scope\n")
+		testutil.WriteFile(t, filepath.Join(e.Proc, "150", "status"), "Name:\tkube-apiserver\nUid:\t0\t0\t0\t0\n")
+		testutil.WriteFile(t, filepath.Join(e.Proc, "150", "cmdline"), "kube-apiserver\x00--encryption-provider-config=/tmp/evil.yaml\x00")
+
+		// Non-root spoofed process even if cgroup substring were forged.
+		testutil.WriteFile(t, filepath.Join(e.Proc, "151", "stat"), "151 (kube-apiserver) S 1 0 0")
+		testutil.WriteFile(t, filepath.Join(e.Proc, "151", "cgroup"), "0::/system.slice/k0scontroller.service\n")
+		testutil.WriteFile(t, filepath.Join(e.Proc, "151", "status"), "Name:\tkube-apiserver\nUid:\t1000\t1000\t1000\t1000\n")
+		testutil.WriteFile(t, filepath.Join(e.Proc, "151", "cmdline"), "kube-apiserver\x00--encryption-provider-config=/tmp/evil.yaml\x00")
+
+		// Real kube-apiserver without --encryption-provider-config.
+		plantKubeAPIServerProc(t, e.Proc, "200", "kube-apiserver\x00--secure-port=6443\x00")
+
+		runKMSCheck(e)
+		runKMSCheck(e)
+		if len(dialed) != 0 {
+			t.Fatalf("spoofed kube-apiserver caused unix socket dials: %v", dialed)
+		}
+		if e.H.State.Exists(cdeps.StateKMSv2Unhealthy) || len(e.Rst) != 0 {
+			t.Fatalf("spoofed kube-apiserver caused latch=%v rst=%v",
+				e.H.State.Exists(cdeps.StateKMSv2Unhealthy), e.Rst)
 		}
 	})
 }

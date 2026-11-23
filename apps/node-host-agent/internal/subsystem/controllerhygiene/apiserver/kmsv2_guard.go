@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -305,11 +306,26 @@ func (c *KMSv2Check) discoverKMSv2() (sockets []string, providerCount int, confi
 	return sockets, providerCount, configured, ""
 }
 
+func procHasRootUID(statusPath string) bool {
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		return false
+	}
+	for ln := range strings.SplitSeq(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(ln, "Uid:"); ok {
+			fields := strings.Fields(rest)
+			return len(fields) >= 2 && fields[0] == "0" && fields[1] == "0"
+		}
+	}
+	return false
+}
+
 func (c *KMSv2Check) findEncryptionConfigFromProc() string {
 	pids, err := c.d.Proc.PIDs()
 	if err != nil {
 		return ""
 	}
+	slices.Sort(pids)
 	for _, pid := range pids {
 		st, ok := c.d.Proc.Stat(pid)
 		if !ok || len(st.Fields) == 0 {
@@ -323,6 +339,14 @@ func (c *KMSv2Check) findEncryptionConfigFromProc() string {
 		if !st.HasComm || st.Comm != "kube-apiserver" {
 			continue
 		}
+		// Anti-spoof: only trust the real root-owned kube-apiserver inside
+		// k0scontroller.service (never a container/unprivileged process
+		// spoofing comm="kube-apiserver").
+		if !c.d.Proc.CgroupContains(pid, cdeps.K0sControllerCgroupSubstr) ||
+			c.d.Proc.CgroupContains(pid, "kubepods") ||
+			!procHasRootUID(c.d.Proc.File(pid, "status")) {
+			continue
+		}
 		argv := c.d.Proc.Cmdline(pid)
 		for i, a := range argv {
 			if v, ok := strings.CutPrefix(a, "--encryption-provider-config="); ok && v != "" {
@@ -332,6 +356,9 @@ func (c *KMSv2Check) findEncryptionConfigFromProc() string {
 				return argv[i+1]
 			}
 		}
+		// The real kube-apiserver was found and has no encryption config flag;
+		// stop here rather than falling through to later PIDs.
+		return ""
 	}
 	return ""
 }

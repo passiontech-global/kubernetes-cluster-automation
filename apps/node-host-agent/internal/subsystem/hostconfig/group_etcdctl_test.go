@@ -784,3 +784,60 @@ kine_endpoint: %q
 		}
 	}
 }
+
+func TestKineListenNeedsMTLSFailClosed(t *testing.T) {
+	cases := []struct {
+		listen   string
+		wantMTLS bool
+	}{
+		{"unix:///run/k0s/kine.sock", false},
+		{"unixs:///run/k0s/kine.sock", false},
+		{"UNIX:///run/k0s/kine.sock", false},
+		{"tcp://127.0.0.1:2379", false},
+		{"tcp://127.0.0.2:2379", false},
+		{"tcp://localhost:2379", false},
+		{"tcp://[::1]:2379", false},
+		{"127.0.0.1:2379", false},
+		{"localhost:2379", false},
+		{"[::1]:2379", false},
+		// Non-loopback TCP forms (including bare host:port, :port, uppercase/http schemes) must require mTLS.
+		{"0.0.0.0:2379", true},
+		{":2379", true},
+		{"[::]:2379", true},
+		{"TCP://0.0.0.0:2379", true},
+		{"http://0.0.0.0:2379", true},
+		{"https://10.0.0.1:2379", true},
+		{"tcp://10.20.30.40:2379", true},
+		{"tcp://:2379", true},
+		{"invalid-no-port", true},
+		{"ftp://127.0.0.1:2379", true},
+	}
+	for _, tc := range cases {
+		if got := kineListenNeedsMTLS(tc.listen); got != tc.wantMTLS {
+			t.Errorf("kineListenNeedsMTLS(%q) = %v, want %v", tc.listen, got, tc.wantMTLS)
+		}
+	}
+
+	// End-to-end refusal when kine_listen_address is bare 0.0.0.0:2379 or :2379 without mTLS certs.
+	for _, listen := range []string{"0.0.0.0:2379", ":2379", "TCP://0.0.0.0:2379", "http://10.0.0.1:2379"} {
+		vars := writeVarsDir(t, fmt.Sprintf(`kine_service_hosts: [node-a]
+kine_bin_url: "http://127.0.0.1:1/never"
+kine_bin_sha256: "deadbeef"
+kine_endpoint: "postgres://u:p@db/kine"
+kine_listen_address: %q
+`, listen))
+		r, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+			VarsDir: vars, Runner: newScripted(nil, nil), DownloadDir: t.TempDir()}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := loadCyc(t, r, vars, "node-a")
+		c.groupKineService()
+		if c.errs == 0 {
+			t.Fatalf("listen %q without mTLS certs must fail closed", listen)
+		}
+		if hostExists(r, "/etc/systemd/system/kine.service") {
+			t.Fatalf("kine.service written for unencrypted listen %q", listen)
+		}
+	}
+}

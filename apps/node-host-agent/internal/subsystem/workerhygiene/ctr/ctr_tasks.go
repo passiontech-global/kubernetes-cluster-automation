@@ -199,12 +199,14 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			continue
 		}
 		var argv []string
+		var origStartTime string
 		if st, ok := c.d.Proc.Stat(pid); !ok || len(st.Fields) == 0 {
 			if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) {
 				shimScanInconclusive = true
 			}
 			continue
 		} else {
+			origStartTime = statStartTime(st)
 			switch st.Fields[0] {
 			case "X", "x":
 				continue
@@ -297,6 +299,24 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if c.d.HoldLocalAction(ctx) {
 			c.d.State.AppendLog(fmt.Sprintf(
 				"cleanup: ctr-tasks orphan shim kill pid=%d held — cluster maintenance in progress",
+				pid))
+			continue
+		}
+		// Re-verify process identity and starttime immediately before
+		// SIGKILL to close the PID-reuse TOCTOU window across HoldLocalAction.
+		if curSt, ok := c.d.Proc.Stat(pid); !ok || len(curSt.Fields) == 0 ||
+			curSt.Fields[0] == "D" || curSt.Fields[0] == "Z" ||
+			curSt.Fields[0] == "X" || curSt.Fields[0] == "x" ||
+			(origStartTime != "" && statStartTime(curSt) != origStartTime) ||
+			!c.commKillable(pid) {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: orphan shim candidate pid=%d identity changed before kill — skipped",
+				pid))
+			continue
+		}
+		if curOK, _ := verifyHostRootShim(c.d, pid); !curOK {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: orphan shim candidate pid=%d failed host-root re-check before kill — skipped",
 				pid))
 			continue
 		}

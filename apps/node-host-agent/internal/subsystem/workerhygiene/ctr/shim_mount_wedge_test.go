@@ -350,3 +350,62 @@ func TestShimMountWedgePID1Skipped(t *testing.T) {
 		t.Fatalf("PID 1 triggered K3 false positive:\n%s", e.LogLines(t))
 	}
 }
+
+func TestShimMountWedgeMultiHolderFailedUmountAndPIDReuse(t *testing.T) {
+	t.Run("failed_umount_on_non_shim_still_kills_subsequent_host_root_shim", func(t *testing.T) {
+		e := fixture(t)
+		e.H.Cfg.ConsecNeeded = 1
+		// Leave e.SDReply["umount"] unset so umount -l fails.
+		deadMount := filepath.Join(e.KubepodsDir, "dead-multi", "volumes", "kubernetes.io~empty-dir", "c")
+		writeMountinfo(t, e, []string{miLine(deadMount)})
+
+		// Lower PID: non-host-root process pinning deadMount (triggers umount -l first, which fails).
+		setupPinningProc(t, e, 40001, "containerd-shim", "S",
+			"0::/kubepods.slice/kubepods-pod123.slice/cri-containerd-spoof.scope\n",
+			"Uid:\t1000\t1000\t1000\t1000\n",
+			deadMount, miLine(deadMount))
+		// Higher PID: real host-root containerd-shim pinning the SAME mount.
+		setupPinningProc(t, e, 40002, "containerd-shim", "S",
+			"0::/system.slice/k0sworker.service\n",
+			"Uid:\t0\t0\t0\t0\n",
+			deadMount, miLine(deadMount))
+
+		runMountinfoCycle(e, true)
+		if len(e.Kills) != 1 || e.Kills[0].PID != 40002 {
+			t.Fatalf("Kills = %v, want SIGKILL on host-root shim PID 40002 after failed umount", e.Kills)
+		}
+	})
+
+	t.Run("pid_reuse_during_hold_check_refuses_sigkill", func(t *testing.T) {
+		e := fixture(t)
+		e.H.Cfg.ConsecNeeded = 1
+		deadMount := filepath.Join(e.KubepodsDir, "dead-reuse", "volumes", "kubernetes.io~empty-dir", "c")
+		writeMountinfo(t, e, []string{miLine(deadMount)})
+
+		// Write 22-field stat with starttime=12345 for PID 40010.
+		fields1 := "40010 (containerd-shim) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 12345 0 0"
+		setupPinningProc(t, e, 40010, "containerd-shim", "S",
+			"0::/system.slice/k0sworker.service\n",
+			"Uid:\t0\t0\t0\t0\n",
+			deadMount, miLine(deadMount))
+		wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "40010", "stat"), fields1)
+
+		// Simulate PID reuse inside HoldLocalAction (same PID now has new starttime=99999).
+		e.H.Cfg.Coord = &nodecoord.Coord{
+			Now: func() time.Time { return e.Now },
+			GetAnnos: func(context.Context) (map[string]string, error) {
+				fields2 := "40010 (containerd-shim) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 99999 0 0"
+				wdepstest.WriteFile(t, filepath.Join(e.ProcDir, "40010", "stat"), fields2)
+				return map[string]string{}, nil
+			},
+		}
+
+		runMountinfoCycle(e, true)
+		if len(e.Kills) != 0 {
+			t.Fatalf("reused PID was SIGKILLed: %v", e.Kills)
+		}
+		if !strings.Contains(e.LogLines(t), "identity changed before kill") {
+			t.Fatalf("expected identity-changed refusal log:\n%s", e.LogLines(t))
+		}
+	})
+}
