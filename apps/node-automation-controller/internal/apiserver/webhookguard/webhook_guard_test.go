@@ -10,6 +10,9 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +29,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/apiserver/webhookguard/guardstate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 // ---------------------------------------------------------------------------
@@ -613,4 +617,90 @@ func wgPod(ns, name string, age time.Duration) *corev1.Pod {
 			}},
 		},
 	}
+}
+
+type wgRTFunc func(*http.Request) (*http.Response, error)
+
+func (f wgRTFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestWebhookGuardConfigAndAutoDetectFailover(t *testing.T) {
+	t.Run("configFromEnv enables AutoDetectProm only when URLs are unset", func(t *testing.T) {
+		t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", "")
+		t.Setenv("HEALTH_HTTP_CONTENT_URL", "")
+		t.Setenv("NODE_AUTOMATION_OBS_BACKEND", "victoriametrics")
+		cfg := configFromEnv()
+		if !cfg.autoDetectProm || cfg.obsBackendMode != promq.ObsBackendVictoriaMetrics ||
+			cfg.promEndpoint != promq.DefaultVMAuthTarget().QueryURL {
+			t.Fatalf("configFromEnv unset = %+v", cfg)
+		}
+
+		t.Setenv("HEALTH_HTTP_CONTENT_URL", "http://custom:8427/health")
+		cfg = configFromEnv()
+		if cfg.autoDetectProm || cfg.promEndpoint != "http://custom:8427/api/v1/query" {
+			t.Fatalf("configFromEnv explicit http = %+v", cfg)
+		}
+
+		t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", "http://prom-override:9090/api/v1/query")
+		cfg = configFromEnv()
+		if cfg.autoDetectProm || cfg.promEndpoint != "http://prom-override:9090/api/v1/query" {
+			t.Fatalf("configFromEnv explicit prom = %+v", cfg)
+		}
+	})
+
+	t.Run("live AutoDetectProm fails over from Prometheus to VMAuth across sweeps", func(t *testing.T) {
+		promq.InvalidateAutoDetectCache()
+		t.Cleanup(promq.InvalidateAutoDetectCache)
+
+		var promUp atomic.Bool
+		promUp.Store(true)
+		var lastQueryHost string
+		client := &http.Client{Transport: wgRTFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/api/v1/query" {
+				lastQueryHost = r.URL.Host
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"status":"success","data":{"resultType":"vector","result":[]}}`)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			switch r.URL.Host {
+			case "kube-prometheus-stack-prometheus.prometheus-operator.svc:9090":
+				if promUp.Load() {
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("Healthy")), Header: make(http.Header)}, nil
+				}
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("down")), Header: make(http.Header)}, nil
+			case "vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427":
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("OK")), Header: make(http.Header)}, nil
+			default:
+				return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+			}
+		})}
+
+		cs := fake.NewSimpleClientset(wgNamespace("kube-system"))
+		g := &webhookGuard{Guard: guardstate.Guard{
+			CS:             cs,
+			Dyn:            wgDyn(),
+			AutoDetectProm: true,
+			ObsBackendMode: promq.ObsBackendAuto,
+			PromClient:     promq.Client{HTTP: client, Timeout: 2 * time.Second},
+		}}
+
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if g.PromEndpoint != promq.DefaultPrometheusTarget().QueryURL ||
+			lastQueryHost != "kube-prometheus-stack-prometheus.prometheus-operator.svc:9090" {
+			t.Fatalf("sweep 1 endpoint = %q (host %q)", g.PromEndpoint, lastQueryHost)
+		}
+
+		promUp.Store(false)
+		promq.InvalidateAutoDetectCache()
+		if err := g.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if g.PromEndpoint != promq.DefaultVMAuthTarget().QueryURL ||
+			lastQueryHost != "vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427" {
+			t.Fatalf("sweep 2 failover endpoint = %q (host %q)", g.PromEndpoint, lastQueryHost)
+		}
+	})
 }

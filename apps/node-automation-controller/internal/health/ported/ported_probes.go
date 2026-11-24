@@ -8,7 +8,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 // Check names — the exact HealthCheck metadata.name values the
@@ -72,18 +75,70 @@ func NewResourceQuotaCheck(d *probefw.Deps) probefw.Check {
 	return &resourceQuotaCheck{Deps: d, cfg: QuotaConfigFromEnv()}
 }
 
+const defaultKubernetesDNSHost = "kubernetes.default.svc.cluster.local"
+
 // probeDNS ports dns-resolution-check: every configured hostname must
 // resolve. Per-check timeout comes from HEALTH_CHECK_TIMEOUT (the
 // checker pod's TIMEOUT_DURATION was 30s).
 func (p *dnsStatusCheck) Run(ctx context.Context) probefw.Result {
 	ctx, cancel := context.WithTimeout(ctx, p.Cfg.Timeouts.Check)
 	defer cancel()
-	for _, host := range p.cfg.Hostnames {
+	hostnames := p.cfg.Hostnames
+	if !p.cfg.Explicit {
+		switch {
+		case p.Cfg.HTTPContent.AutoDetect:
+			target, detected := p.ObsTarget(ctx)
+			if (detected || p.Cfg.ObsBackendMode == promq.ObsBackendVictoriaMetrics) && target.DNSHost != "" {
+				hostnames = dedupDNSHosts(defaultKubernetesDNSHost, target.DNSHost)
+			}
+		case p.Cfg.HTTPContent.URLExplicit:
+			if host := nonIPHostname(p.Cfg.HTTPContent.URL); host != "" {
+				hostnames = dedupDNSHosts(defaultKubernetesDNSHost, host)
+			} else if p.Cfg.ObsBackendMode == promq.ObsBackendVictoriaMetrics {
+				hostnames = dedupDNSHosts(defaultKubernetesDNSHost,
+					promq.DefaultTargetForMode(promq.ObsBackendVictoriaMetrics).DNSHost)
+			}
+		case p.Cfg.ObsBackendMode == promq.ObsBackendVictoriaMetrics:
+			hostnames = dedupDNSHosts(defaultKubernetesDNSHost,
+				promq.DefaultTargetForMode(promq.ObsBackendVictoriaMetrics).DNSHost)
+		}
+	}
+	for _, host := range hostnames {
 		if _, err := p.LookupHost(ctx, host); err != nil {
 			return probefw.Result{Why: fmt.Sprintf("lookup %s: %v", host, err)}
 		}
 	}
 	return probefw.Result{Pass: true}
+}
+
+func dedupDNSHosts(hosts ...string) []string {
+	out := make([]string, 0, len(hosts))
+	seen := make(map[string]struct{}, len(hosts))
+	for _, h := range hosts {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		key := strings.ToLower(h)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, h)
+	}
+	return out
+}
+
+func nonIPHostname(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" || strings.EqualFold(host, "localhost") || net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
 }
 
 // httpBodyReadCap bounds how much of a 200 response body the content
@@ -94,17 +149,28 @@ const httpBodyReadCap = 1 << 20
 // probeHTTPContent ports http-content-check: GET must return 200 and
 // a body containing the expected string (live check: prometheus
 // /-/healthy answers "Prometheus Server is Healthy.", expected
-// substring "Healthy").
+// substring "Healthy", or VictoriaMetrics /health answers "OK").
 func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 	ctx, cancel := context.WithTimeout(ctx, p.Cfg.Timeouts.Check)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.Cfg.HTTPContent.URL, nil)
+	targetURL := p.Cfg.HTTPContent.URL
+	expected := p.Cfg.HTTPContent.Expected
+	if p.Cfg.HTTPContent.AutoDetect && !p.Cfg.HTTPContent.URLExplicit {
+		target, _ := p.ObsTarget(ctx)
+		if target.HealthURL != "" {
+			targetURL = target.HealthURL
+		}
+		if !p.Cfg.HTTPContent.ExpectedExplicit && target.ExpectedBody != "" {
+			expected = target.ExpectedBody
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return probefw.Result{Why: fmt.Sprintf("build request: %v", err)}
 	}
 	resp, err := p.HTTPClient.Do(req)
 	if err != nil {
-		return probefw.Result{Why: fmt.Sprintf("GET %s: %v", p.Cfg.HTTPContent.URL, err)}
+		return probefw.Result{Why: fmt.Sprintf("GET %s: %v", targetURL, err)}
 	}
 	defer func() {
 		// Drain before Close (bounded): an unread body makes the
@@ -116,13 +182,13 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 	}()
 	if resp.StatusCode != http.StatusOK {
 		return probefw.Result{Why: fmt.Sprintf("GET %s: status %d, want 200",
-			p.Cfg.HTTPContent.URL, resp.StatusCode)}
+			targetURL, resp.StatusCode)}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, httpBodyReadCap))
 	if err != nil {
 		return probefw.Result{Why: fmt.Sprintf("read body: %v", err)}
 	}
-	if !strings.Contains(string(body), p.Cfg.HTTPContent.Expected) {
+	if !strings.Contains(string(body), expected) {
 		// The read is capped: a match miss at exactly the cap is
 		// inconclusive, not a clean FAIL — the expected string may
 		// sit past the byte cap, and reading further is not an
@@ -133,8 +199,7 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 				"body truncated at cap (%d bytes), match inconclusive",
 				httpBodyReadCap)}
 		}
-		return probefw.Result{Why: fmt.Sprintf("body missing %q",
-			p.Cfg.HTTPContent.Expected)}
+		return probefw.Result{Why: fmt.Sprintf("body missing %q", expected)}
 	}
 	return probefw.Result{Pass: true}
 }

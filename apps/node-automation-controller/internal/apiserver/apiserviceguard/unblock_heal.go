@@ -66,6 +66,7 @@ var apiServiceProtectedNamespaces = map[string]bool{
 	"keda":                true,
 	"cert-manager":        true,
 	"prometheus-operator": true,
+	"victoria-metrics":    true,
 	"operators":           true,
 }
 

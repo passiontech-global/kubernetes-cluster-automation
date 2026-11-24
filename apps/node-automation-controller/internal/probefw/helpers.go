@@ -68,6 +68,131 @@ func (d *Deps) PromEndpoint() (string, error) {
 		d.promEndpointOverride, d.Cfg.HTTPContent.URL)
 }
 
+var errObsBackendUnknown = errors.New("observability backend undetermined")
+
+// ObsTarget returns the active observability target for this sweep.
+// When Cfg.HTTPContent.AutoDetect is true and HEALTH_HTTP_CONTENT_URL
+// was not explicitly set, it probes candidate endpoints via
+// promq.AutoDetectTarget (memoized per sweep — including negative
+// detections — so concurrent checks in one sweep never amplify probes;
+// promq.TargetDetector never caches negative detections across sweeps).
+// Explicit configs and literal test Deps (probetest.NewDeps) return
+// Cfg.HTTPContent verbatim with zero network probes.
+func (d *Deps) ObsTarget(ctx context.Context) (promq.ObsTarget, bool) {
+	if !d.Cfg.HTTPContent.AutoDetect || d.Cfg.HTTPContent.URLExplicit {
+		endpoint, _ := d.PromEndpoint()
+		return promq.ObsTarget{
+			Backend:      inferBackendFromURL(endpoint),
+			HealthURL:    d.Cfg.HTTPContent.URL,
+			ExpectedBody: d.Cfg.HTTPContent.Expected,
+			QueryURL:     endpoint,
+		}, false
+	}
+
+	s := sweepSnap(ctx)
+	res, _ := s.obsTarget.get(func(bool) (obsTargetMemo, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		target, detected := promq.AutoDetectTarget(lctx, d.HTTPClient, d.Cfg.ObsBackendMode)
+		return obsTargetMemo{target: target, detected: detected}, nil
+	})
+	target := res.target
+	if d.Cfg.HTTPContent.ExpectedExplicit {
+		target.ExpectedBody = d.Cfg.HTTPContent.Expected
+	}
+	if d.promEndpointOverride != "" {
+		target.QueryURL = d.promEndpointOverride
+	}
+	return target, res.detected
+}
+
+func inferBackendFromURL(endpoint string) promq.BackendKind {
+	lower := strings.ToLower(endpoint)
+	for _, hint := range []string{"vmauth", "vmsingle", "vmselect", "victoria-metrics"} {
+		if strings.Contains(lower, hint) {
+			return promq.BackendVictoriaMetrics
+		}
+	}
+	for _, hint := range []string{"prometheus-operator", "kube-prometheus-stack"} {
+		if strings.Contains(lower, hint) {
+			return promq.BackendPrometheus
+		}
+	}
+	return promq.BackendUnknown
+}
+
+// PromEndpointCtx resolves the /api/v1/query URL for ctx: an explicit
+// HEALTH_PROMETHEUS_QUERY_URL override wins verbatim, else when
+// auto-detection is active it uses ObsTarget(ctx), otherwise it falls
+// back to PromEndpoint().
+func (d *Deps) PromEndpointCtx(ctx context.Context) (string, error) {
+	if d.promEndpointOverride != "" {
+		return d.promEndpointOverride, nil
+	}
+	if d.Cfg.HTTPContent.AutoDetect && !d.Cfg.HTTPContent.URLExplicit {
+		if sweepSnap(ctx).promCircuitOpen() {
+			return "", errPromCircuitOpen
+		}
+		target, _ := d.ObsTarget(ctx)
+		if target.QueryURL != "" {
+			return target.QueryURL, nil
+		}
+		return promq.ResolveEndpoint("", target.HealthURL)
+	}
+	return d.PromEndpoint()
+}
+
+// PromBackend returns the detected observability backend for the sweep,
+// memoizing positive determinations in sweepSnapshot and leaving
+// transient errors or undetermined results un-memoized.
+func (d *Deps) PromBackend(ctx context.Context) promq.BackendKind {
+	s := sweepSnap(ctx)
+	backend, err := s.promBackend.getLive(func() (promq.BackendKind, error) {
+		var endpoint string
+		var err error
+		if d.Cfg.HTTPContent.AutoDetect && !d.Cfg.HTTPContent.URLExplicit && d.promEndpointOverride == "" {
+			target, detected := d.ObsTarget(ctx)
+			if detected && target.Backend != promq.BackendUnknown {
+				return target.Backend, nil
+			}
+			if s.promCircuitOpen() {
+				return promq.BackendUnknown, errPromCircuitOpen
+			}
+			endpoint = target.QueryURL
+			if endpoint == "" {
+				endpoint, err = promq.ResolveEndpoint("", target.HealthURL)
+			}
+		} else {
+			if s.promCircuitOpen() {
+				return promq.BackendUnknown, errPromCircuitOpen
+			}
+			endpoint, err = d.PromEndpointCtx(ctx)
+		}
+		if err != nil {
+			return promq.BackendUnknown, err
+		}
+		c := d.Prom
+		c.HTTP = d.HTTPClient
+		lctx, cancel := context.WithTimeout(ctx, snapshotListTimeout)
+		defer cancel()
+		kind, err := promq.DetectBackend(lctx, &c, endpoint)
+		if err != nil {
+			if ctx.Err() == nil {
+				s.promNoteResult(err)
+			}
+			return promq.BackendUnknown, err
+		}
+		if kind == promq.BackendUnknown {
+			return promq.BackendUnknown, errObsBackendUnknown
+		}
+		return kind, nil
+	})
+	if err != nil {
+		return promq.BackendUnknown
+	}
+	return backend
+}
+
 // PromQuery runs an instant PromQL query against the resolved
 // endpoint and returns the vector samples. d.Prom carries the client
 // config; HTTP is re-read per call so the HTTPClient seam (tests
@@ -80,7 +205,7 @@ func (d *Deps) PromEndpoint() (string, error) {
 // sweep the per-call snapshot means no dedup — the pre-cache
 // semantics.
 func (d *Deps) PromQuery(ctx context.Context, query string) ([]promq.Sample, error) {
-	endpoint, err := d.PromEndpoint()
+	endpoint, err := d.PromEndpointCtx(ctx)
 	if err != nil {
 		return nil, err
 	}

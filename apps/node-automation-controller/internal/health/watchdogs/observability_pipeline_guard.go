@@ -71,30 +71,42 @@ const (
 	// obsPipelineEventReason is the Warning Event reason — the
 	// byte-stable reason the alert runbook references.
 	obsPipelineEventReason = "ObservabilityPipelineDegraded"
-	// obsPipelineEventNS/Obj anchor the event where operators look:
-	// the prometheus-operator namespace's kube-prometheus-stack
-	// deployment reporting on its own pipeline.
+	// obsPipelineEventNS / obsVMEventNS anchor the event where operators
+	// look: prometheus-operator for kube-prometheus-stack, or
+	// victoria-metrics for victoria-metrics-k8s-stack.
 	obsPipelineEventNS = "prometheus-operator"
+	obsVMEventNS       = "victoria-metrics"
 )
 
-// obsWatchdogQuery is the Dead-Man's-Switch: the kube-prometheus-stack
-// chart ships an always-firing Watchdog alert precisely so its
-// ABSENCE proves the alert pipeline is broken. count() >= 1 keeps
-// the pipeline alive; an empty vector is the worst signal here.
+// obsWatchdogQuery is the Dead-Man's-Switch: both kube-prometheus-stack
+// and victoria-metrics-k8s-stack ship an always-firing Watchdog alert
+// precisely so its ABSENCE proves the alert pipeline is broken.
+// count() >= 1 keeps the pipeline alive; an empty vector is the worst
+// signal here.
 const obsWatchdogQuery = `count(ALERTS{alertname="Watchdog",alertstate="firing"})`
 
-// obsPipelineCounters is the per-stage error-counter table: each
-// component is the gauge/event label value, the query detects a
-// non-zero increase over the trailing 10m (counters only ever go
-// up — the rate, not the level, is the live signature).
-var obsPipelineCounters = []struct {
+type obsPipelineCounter struct {
 	component string
 	query     string
 	desc      string
-}{
+}
+
+// obsPipelineSharedCounters are pipeline stages common to both
+// Prometheus and VictoriaMetrics stacks.
+var obsPipelineSharedCounters = []obsPipelineCounter{
 	{"alertmanager_notifications",
 		`sum(increase(alertmanager_notifications_failed_total[10m])) > 0`,
 		"alert notifications failing to deliver"},
+	{"fluentbit_drops",
+		`sum(increase(fluentbit_output_dropped_records_total[10m])) > 0`,
+		"fluent-bit dropping log records on a backed-up output"},
+	{"fluentbit_retries",
+		`sum(increase(fluentbit_output_retries_failed_total[10m])) > 0`,
+		"fluent-bit output retries exhausted"},
+}
+
+// obsPipelinePrometheusCounters are Prometheus-specific pipeline stages.
+var obsPipelinePrometheusCounters = []obsPipelineCounter{
 	{"prometheus_notifications_dropped",
 		`sum(increase(prometheus_notifications_dropped_total[10m])) > 0`,
 		"prometheus dropping alert notifications before delivery"},
@@ -107,12 +119,38 @@ var obsPipelineCounters = []struct {
 	{"prometheus_sample_limit",
 		`sum(increase(prometheus_target_scrapes_exceeded_sample_limit_total[10m])) > 0`,
 		"scrapes exceeding the sample limit — metrics silently dropped"},
-	{"fluentbit_drops",
-		`sum(increase(fluentbit_output_dropped_records_total[10m])) > 0`,
-		"fluent-bit dropping log records on a backed-up output"},
-	{"fluentbit_retries",
-		`sum(increase(fluentbit_output_retries_failed_total[10m])) > 0`,
-		"fluent-bit output retries exhausted"},
+}
+
+// obsPipelineVMCounters are VictoriaMetrics-specific pipeline stages.
+var obsPipelineVMCounters = []obsPipelineCounter{
+	{"vmalert_notifications_dropped",
+		`sum(increase(vmalert_alerts_send_errors_total[10m])) > 0`,
+		"vmalert failing to send alerts to alertmanager"},
+	{"vmalert_rule_eval_errors",
+		`sum(increase(vmalert_execution_errors_total[10m])) > 0`,
+		"vmalert failing to evaluate alerting/recording rules"},
+	{"vmstorage_rows_ignored",
+		`sum(increase(vm_rows_ignored_total[10m])) > 0`,
+		"vmstorage ignoring incoming metric rows"},
+	{"vmagent_remotewrite_errors",
+		`sum(increase(vmagent_remotewrite_errors_total[10m])) > 0`,
+		"vmagent failing remote-write delivery to vmstorage/hub"},
+	{"vmagent_scrapes_failed",
+		`sum(increase(vm_promscrape_scrapes_failed_total[10m])) > 0`,
+		"vmagent target scrapes failing"},
+}
+
+func obsCountersForBackend(backend promq.BackendKind) []obsPipelineCounter {
+	if backend == promq.BackendVictoriaMetrics {
+		out := make([]obsPipelineCounter, 0, len(obsPipelineSharedCounters)+len(obsPipelineVMCounters))
+		out = append(out, obsPipelineSharedCounters...)
+		out = append(out, obsPipelineVMCounters...)
+		return out
+	}
+	out := make([]obsPipelineCounter, 0, len(obsPipelineSharedCounters)+len(obsPipelinePrometheusCounters))
+	out = append(out, obsPipelineSharedCounters...)
+	out = append(out, obsPipelinePrometheusCounters...)
+	return out
 }
 
 var (
@@ -146,6 +184,16 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 	degraded := map[string]bool{}
 	inconclusive := false
 
+	backend := p.PromBackend(ctx)
+	if backend == promq.BackendUnknown {
+		// Fall back to Prometheus queries when the backend could not be
+		// determined (e.g. generic mock or transport failure), so
+		// inconclusive checks behave identically.
+		backend = promq.BackendPrometheus
+	}
+	counters := obsCountersForBackend(backend)
+	headQuery, growthQuery := obsCardinalityQueries(backend)
+
 	// Phase 1 — issue all baseline queries concurrently (bounded 8):
 	// they are independent instant queries and the serial loop used to
 	// pay Prometheus round-trip latency inside one PerCheck budget.
@@ -156,9 +204,9 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 		series []promq.Sample
 		err    error
 	}
-	headIdx := 1 + len(obsPipelineCounters)
-	growthIdx := 2 + len(obsPipelineCounters)
-	results := make([]qres, 3+len(obsPipelineCounters))
+	headIdx := 1 + len(counters)
+	growthIdx := 2 + len(counters)
+	results := make([]qres, 3+len(counters))
 	var g errgroup.Group
 	g.SetLimit(8)
 	fire := func(i int, query string) {
@@ -169,11 +217,11 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 		})
 	}
 	fire(0, obsWatchdogQuery)
-	for i, q := range obsPipelineCounters {
+	for i, q := range counters {
 		fire(1+i, q.query)
 	}
-	fire(headIdx, obsHeadSeriesQuery)
-	fire(growthIdx, obsHeadSeriesGrowthQuery)
+	fire(headIdx, headQuery)
+	fire(growthIdx, growthQuery)
 	_ = g.Wait()
 
 	// Phase 2 — evaluate in declared order.
@@ -192,11 +240,11 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 		}
 	case len(series) == 0 || series[0].Value < 1:
 		degraded["watchdog_heartbeat"] = true
-		p.degrade(ctx, log, &rep, "watchdog_heartbeat",
+		p.degrade(ctx, log, &rep, backend, "watchdog_heartbeat",
 			"always-firing Watchdog alert absent — alert evaluation or routing is wedged")
 	}
 
-	for i, q := range obsPipelineCounters {
+	for i, q := range counters {
 		series, err := results[1+i].series, results[1+i].err
 		if err != nil {
 			inconclusive = true
@@ -212,9 +260,9 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		degraded[q.component] = true
-		p.degrade(ctx, log, &rep, q.component, q.desc)
+		p.degrade(ctx, log, &rep, backend, q.component, q.desc)
 	}
-	p.evalCardinality(ctx, log, &rep, last, degraded, &inconclusive,
+	p.evalCardinality(ctx, log, &rep, backend, last, degraded, &inconclusive,
 		results[headIdx].series, results[headIdx].err,
 		results[growthIdx].series, results[growthIdx].err)
 	// Recovery prune — a conclusive cycle in which a component is no
@@ -231,7 +279,7 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 // degrade flags one pipeline component — the gauge emission plus the
 // finding plus the deduped Warning Event.
 func (p *observabilityPipelineCheck) degrade(ctx context.Context,
-	log logr.Logger, rep *probefw.SweepReport, component, desc string) {
+	log logr.Logger, rep *probefw.SweepReport, backend promq.BackendKind, component, desc string) {
 
 	rep.Emit(obsPipelineDegradedGauge, component,
 		[]string{component},
@@ -240,8 +288,50 @@ func (p *observabilityPipelineCheck) degrade(ctx context.Context,
 	// retry next sweep, not dedupe against an episode marker that
 	// never produced an event.
 	if !p.evented.Has(component) &&
-		p.emitDegradedEvent(ctx, log, component, desc) == nil {
+		p.emitDegradedEvent(ctx, log, backend, component, desc) == nil {
 		p.evented.Add(component)
+	}
+}
+
+func (p *observabilityPipelineCheck) obsTargetRef(
+	ctx context.Context, backend promq.BackendKind,
+) (string, corev1.ObjectReference) {
+	if backend == promq.BackendVictoriaMetrics {
+		kind := "VMCluster"
+		if pods, err := p.AllPods(ctx); err == nil {
+			hasStorage := false
+			hasSingle := false
+			for i := range pods {
+				pod := &pods[i]
+				if pod.Namespace != obsVMEventNS {
+					continue
+				}
+				if strings.HasPrefix(pod.Name, "vmstorage-") ||
+					pod.Labels["app.kubernetes.io/name"] == "vmstorage" {
+					hasStorage = true
+					break
+				}
+				if strings.HasPrefix(pod.Name, "vmsingle-") ||
+					pod.Labels["app.kubernetes.io/name"] == "vmsingle" {
+					hasSingle = true
+				}
+			}
+			if !hasStorage && hasSingle {
+				kind = "VMSingle"
+			}
+		}
+		return obsVMEventNS, corev1.ObjectReference{
+			APIVersion: "operator.victoriametrics.com/v1beta1",
+			Kind:       kind,
+			Namespace:  obsVMEventNS,
+			Name:       "victoria-metrics-k8s-stack",
+		}
+	}
+	return obsPipelineEventNS, corev1.ObjectReference{
+		APIVersion: "monitoring.coreos.com/v1",
+		Kind:       "Prometheus",
+		Namespace:  obsPipelineEventNS,
+		Name:       "kube-prometheus-stack-prometheus",
 	}
 }
 
@@ -251,9 +341,10 @@ func (p *observabilityPipelineCheck) degrade(ctx context.Context,
 // anchors on the monitoring namespace so it surfaces where the
 // on-call actually watches.
 func (p *observabilityPipelineCheck) emitDegradedEvent(
-	ctx context.Context, log logr.Logger, component, desc string) error {
+	ctx context.Context, log logr.Logger, backend promq.BackendKind, component, desc string) error {
 
 	now := p.Now()
+	ns, regarding := p.obsTargetRef(ctx, backend)
 	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
 		// The component rides the name (underscores are not
 		// DNS-1123 — map them to dashes): one sweep can degrade
@@ -262,16 +353,10 @@ func (p *observabilityPipelineCheck) emitDegradedEvent(
 		// second Create hits 409 AlreadyExists.
 		Name: fmt.Sprintf("observability-pipeline.%s.%x",
 			strings.ReplaceAll(component, "_", "-"), now.UnixNano()),
-		Namespace: obsPipelineEventNS,
-		Regarding: corev1.ObjectReference{
-			APIVersion: "monitoring.coreos.com/v1",
-			Kind:       "Prometheus",
-			Namespace:  obsPipelineEventNS,
-			Name:       "kube-prometheus-stack-prometheus",
-		},
-		Reason: obsPipelineEventReason,
-		Note: fmt.Sprintf("observability pipeline component %s degraded: %s — alerts and logs may be silently lost",
-			component, desc),
+		Namespace:         ns,
+		Regarding:         regarding,
+		Reason:            obsPipelineEventReason,
+		Note:              fmt.Sprintf("observability pipeline component %s degraded: %s — alerts and logs may be silently lost", component, desc),
 		ReportingInstance: p.Name,
 		Now:               now,
 	}); err != nil {

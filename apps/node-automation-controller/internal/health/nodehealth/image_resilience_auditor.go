@@ -30,7 +30,7 @@ import (
 const (
 	CheckNameImageResilienceAuditor = "image-resilience-auditor"
 
-	defaultImageAuditNamespaces = "kube-system,node-ops,linkerd,cilium,prometheus-operator,cert-manager,flux-system,argocd,medik8s"
+	defaultImageAuditNamespaces = "kube-system,node-ops,linkerd,cilium,prometheus-operator,victoria-metrics,cert-manager,flux-system,argocd,medik8s"
 
 	imageRiskPullPolicyAlways = "pull_policy_always"
 	imageRiskMutableTag       = "mutable_tag"

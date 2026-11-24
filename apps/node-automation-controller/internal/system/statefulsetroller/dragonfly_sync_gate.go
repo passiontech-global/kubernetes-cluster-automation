@@ -50,21 +50,35 @@ const (
 	dragonflyPromFallbackURL = "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"
 )
 
-// dragonflyPromSeam is the Setup-time Prometheus wiring the
-// dragonfly gate reads: endpoint + client resolved ONCE (env inside
-// a run is a bug — the probefw contract). ok=false leaves the gate
-// inert (logged at Setup): no endpoint, no evidence source.
+// dragonflyPromSeam is the Setup-time Prometheus/VictoriaMetrics wiring
+// the dragonfly gate reads: endpoint + client resolved from env when
+// explicitly overridden, or auto-detected live per sweep when
+// HEALTH_PROMETHEUS_QUERY_URL and HEALTH_HTTP_CONTENT_URL are unset.
+// ok=false leaves the gate inert: no endpoint, no evidence source.
 type dragonflyPromSeam struct {
-	endpoint string
-	client   promq.Client
-	ok       bool
+	endpoint       string
+	client         promq.Client
+	ok             bool
+	autoDetect     bool
+	obsBackendMode promq.ObsBackendMode
 }
 
-// newDragonflyPromSeam resolves the endpoint exactly like probefw's
-// PromEndpoint derivation: HEALTH_PROMETHEUS_QUERY_URL (a full
-// /api/v1/query URL) wins, else scheme://host of the
-// http-content-check target.
+// newDragonflyPromSeam resolves the endpoint from HEALTH_PROMETHEUS_QUERY_URL
+// or HEALTH_HTTP_CONTENT_URL when explicitly set, else arms live
+// promq.AutoDetectTarget resolution honoring NODE_AUTOMATION_OBS_BACKEND.
 func newDragonflyPromSeam() dragonflyPromSeam {
+	mode := promq.EnvObsBackendMode()
+	promExplicit := envx.IsSet("HEALTH_PROMETHEUS_QUERY_URL")
+	httpExplicit := envx.IsSet("HEALTH_HTTP_CONTENT_URL")
+	if !promExplicit && !httpExplicit {
+		return dragonflyPromSeam{
+			endpoint:       promq.DefaultTargetForMode(mode).QueryURL,
+			client:         promq.Client{Timeout: dragonflySyncQueryTimeout},
+			ok:             true,
+			autoDetect:     true,
+			obsBackendMode: mode,
+		}
+	}
 	endpoint, err := promq.ResolveEndpoint(
 		envx.Getenv("HEALTH_PROMETHEUS_QUERY_URL", ""),
 		envx.Getenv("HEALTH_HTTP_CONTENT_URL", dragonflyPromFallbackURL))
@@ -76,7 +90,8 @@ func newDragonflyPromSeam() dragonflyPromSeam {
 		client: promq.Client{
 			Timeout: dragonflySyncQueryTimeout,
 		},
-		ok: true,
+		ok:             true,
+		obsBackendMode: mode,
 	}
 }
 
@@ -118,7 +133,13 @@ func (r *statefulSetOnDeleteRoller) dragonflyReplicasSynced(ctx context.Context,
 	// labels, but a hostile label must not break out of the string.
 	ns := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(sts.Namespace)
 	query := fmt.Sprintf(dragonflyLinkDownQuery, ns, ns)
-	series, err := r.prom.client.InstantQuery(ctx, r.prom.endpoint, query)
+	endpoint := r.prom.endpoint
+	if r.prom.autoDetect {
+		if target, detected := promq.AutoDetectTarget(ctx, r.prom.client.HTTP, r.prom.obsBackendMode); detected || target.QueryURL != "" {
+			endpoint = target.QueryURL
+		}
+	}
+	series, err := r.prom.client.InstantQuery(ctx, endpoint, query)
 	if err != nil {
 		log.Info("WARN: dragonfly master-link query failed — sync gate skipped",
 			"statefulset", sts.Namespace+"/"+sts.Name, "error", err)

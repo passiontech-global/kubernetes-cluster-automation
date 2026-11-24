@@ -15,7 +15,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	corev1 "k8s.io/api/core/v1"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -35,9 +34,18 @@ const (
 
 	obsHeadSeriesQuery                = `max(prometheus_tsdb_head_series)`
 	obsHeadSeriesGrowthQuery          = `max(deriv(prometheus_tsdb_head_series[15m])) * 3600`
+	vmHeadSeriesQuery                 = `max(vm_cache_entries{type="storage/tsid"})`
+	vmHeadSeriesGrowthQuery           = `max(deriv(vm_cache_entries{type="storage/tsid"}[15m])) * 3600`
 	obsCardinalitySeriesAddedQuery    = `topk(5, sum by (job, namespace) (scrape_series_added))`
 	obsCardinalitySamplesScrapedQuery = `topk(5, sum by (job, namespace) (scrape_samples_scraped))`
 )
+
+func obsCardinalityQueries(backend promq.BackendKind) (headQuery, growthQuery string) {
+	if backend == promq.BackendVictoriaMetrics {
+		return vmHeadSeriesQuery, vmHeadSeriesGrowthQuery
+	}
+	return obsHeadSeriesQuery, obsHeadSeriesGrowthQuery
+}
 
 type obsCardinalityConfig struct {
 	headSeriesWarn    float64
@@ -70,6 +78,7 @@ func (p *observabilityPipelineCheck) evalCardinality(
 	ctx context.Context,
 	log logr.Logger,
 	rep *probefw.SweepReport,
+	backend promq.BackendKind,
 	last map[string][]string,
 	degraded map[string]bool,
 	inconclusive *bool,
@@ -135,44 +144,69 @@ func (p *observabilityPipelineCheck) evalCardinality(
 	rep.Emit(obsPipelineDegradedGauge, obsCardinalityComponent, []string{obsCardinalityComponent}, detail)
 
 	// Run attribution queries ONLY when threshold breached.
-	addedSamples, addedErr := p.PromQuery(ctx, obsCardinalitySeriesAddedQuery)
-	scrapedSamples, scrapedErr := p.PromQuery(ctx, obsCardinalitySamplesScrapedQuery)
-	if addedErr != nil {
-		*inconclusive = true
-		log.Info("WARN: scrape_series_added attribution query failed", "error", addedErr)
-		rep.InfraErr(addedErr)
-		for k, lv := range p.culpritEmitted.Last() {
-			p.culpritEmitted.Emit(k, lv...)
+	var addedSamples, scrapedSamples []promq.Sample
+	var addedErr, scrapedErr error
+	if backend == promq.BackendVictoriaMetrics {
+		// vmagent exports scrape_samples_scraped (not scrape_series_added).
+		scrapedSamples, scrapedErr = p.PromQuery(ctx, obsCardinalitySamplesScrapedQuery)
+		if scrapedErr != nil {
+			*inconclusive = true
+			log.Info("WARN: scrape_samples_scraped attribution query failed", "error", scrapedErr)
+			rep.InfraErr(scrapedErr)
+			for k, lv := range p.culpritEmitted.Last() {
+				p.culpritEmitted.Emit(k, lv...)
+			}
+		} else {
+			p.emitCulpritSamples(scrapedSamples)
 		}
 	} else {
-		for _, s := range addedSamples {
-			job := s.Label("job")
-			if job == "" {
-				job = "-"
+		addedSamples, addedErr = p.PromQuery(ctx, obsCardinalitySeriesAddedQuery)
+		scrapedSamples, scrapedErr = p.PromQuery(ctx, obsCardinalitySamplesScrapedQuery)
+		if addedErr != nil {
+			*inconclusive = true
+			log.Info("WARN: scrape_series_added attribution query failed", "error", addedErr)
+			rep.InfraErr(addedErr)
+			for k, lv := range p.culpritEmitted.Last() {
+				p.culpritEmitted.Emit(k, lv...)
 			}
-			ns := s.Label("namespace")
-			if ns == "" {
-				ns = "-"
-			}
-			p.culpritEmitted.Set(prometheusCardinalityCulpritGauge, s.Value, culpritKey{job: job, ns: ns}, job, ns)
+		} else {
+			p.emitCulpritSamples(addedSamples)
 		}
-	}
-	if scrapedErr != nil {
-		*inconclusive = true
-		log.Info("WARN: scrape_samples_scraped attribution query failed", "error", scrapedErr)
-		rep.InfraErr(scrapedErr)
+		if scrapedErr != nil {
+			*inconclusive = true
+			log.Info("WARN: scrape_samples_scraped attribution query failed", "error", scrapedErr)
+			rep.InfraErr(scrapedErr)
+		}
 	}
 
 	if !p.cardEvented.Has(obsCardinalityEventKey) {
 		summary := formatCardinalityCulprits(addedSamples, scrapedSamples)
-		note := fmt.Sprintf("Prometheus TSDB cardinality surge (%s); top culprits: %s",
-			strings.Join(reasons, ", "), summary)
-		if p.emitCardinalityEvent(ctx, log, note) == nil {
+		backendName := "Prometheus"
+		if backend == promq.BackendVictoriaMetrics {
+			backendName = "VictoriaMetrics"
+		}
+		note := fmt.Sprintf("%s TSDB cardinality surge (%s); top culprits: %s",
+			backendName, strings.Join(reasons, ", "), summary)
+		if p.emitCardinalityEvent(ctx, log, backend, note) == nil {
 			p.cardEvented.Add(obsCardinalityEventKey)
 		}
 	}
 
 	p.culpritEmitted.Prune(prometheusCardinalityCulpritGauge.DeleteLabelValues)
+}
+
+func (p *observabilityPipelineCheck) emitCulpritSamples(samples []promq.Sample) {
+	for _, s := range samples {
+		job := s.Label("job")
+		if job == "" {
+			job = "-"
+		}
+		ns := s.Label("namespace")
+		if ns == "" {
+			ns = "-"
+		}
+		p.culpritEmitted.Set(prometheusCardinalityCulpritGauge, s.Value, culpritKey{job: job, ns: ns}, job, ns)
+	}
 }
 
 func formatCardinalityCulprits(added, scraped []promq.Sample) string {
@@ -208,18 +242,14 @@ func formatCardinalityCulprits(added, scraped []promq.Sample) string {
 }
 
 func (p *observabilityPipelineCheck) emitCardinalityEvent(
-	ctx context.Context, log logr.Logger, note string,
+	ctx context.Context, log logr.Logger, backend promq.BackendKind, note string,
 ) error {
 	now := p.Now()
+	ns, regarding := p.obsTargetRef(ctx, backend)
 	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
-		Name:      fmt.Sprintf("observability-cardinality.%x", now.UnixNano()),
-		Namespace: obsPipelineEventNS,
-		Regarding: corev1.ObjectReference{
-			APIVersion: "monitoring.coreos.com/v1",
-			Kind:       "Prometheus",
-			Namespace:  obsPipelineEventNS,
-			Name:       "kube-prometheus-stack-prometheus",
-		},
+		Name:              fmt.Sprintf("observability-cardinality.%x", now.UnixNano()),
+		Namespace:         ns,
+		Regarding:         regarding,
 		Reason:            obsCardinalityEventReason,
 		Note:              note,
 		ReportingInstance: p.Name,

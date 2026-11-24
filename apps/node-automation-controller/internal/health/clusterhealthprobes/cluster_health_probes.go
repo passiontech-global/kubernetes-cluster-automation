@@ -70,9 +70,11 @@ import (
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/ported"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -85,10 +87,8 @@ func healthProbeConfigFromEnv() probefw.Config {
 			Check:    envx.GetenvDuration("HEALTH_CHECK_TIMEOUT", 30*time.Second),
 			PerCheck: envx.GetenvDuration("HEALTH_PER_CHECK_TIMEOUT", 2*time.Minute),
 		},
-		HTTPContent: probefw.HTTPContentConfig{
-			URL:      envx.Getenv("HEALTH_HTTP_CONTENT_URL", "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"),
-			Expected: envx.Getenv("HEALTH_HTTP_EXPECTED_CONTENT", "Healthy"),
-		},
+		HTTPContent:    ported.HTTPContentConfigFromEnv(),
+		ObsBackendMode: promq.EnvObsBackendMode(),
 	}
 }
 
@@ -194,7 +194,9 @@ func Setup(d shared.Deps) error {
 			"interval", cfg.interval, "runTimeout", runTimeout,
 			"perCheckTimeout", p.Cfg.Timeouts.PerCheck,
 			"checkTimeout", p.Cfg.Timeouts.Check, "httpURL", p.Cfg.HTTPContent.URL,
-			"httpExpectedContent", p.Cfg.HTTPContent.Expected)
+			"httpExpectedContent", p.Cfg.HTTPContent.Expected,
+			"obsBackendMode", p.Cfg.ObsBackendMode,
+			"httpAutoDetect", p.Cfg.HTTPContent.AutoDetect)
 		return shared.AddPeriodicWithTimeout(d.Mgr, d.Name, cfg.interval, runTimeout, p.run)
 	})
 }

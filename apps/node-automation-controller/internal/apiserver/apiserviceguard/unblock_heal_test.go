@@ -350,3 +350,25 @@ func TestDeleteBackingPodsProceedFalseStopsLoop(t *testing.T) {
 		}
 	})
 }
+
+func TestAPIServiceGuardVictoriaMetricsProtectedNamespace(t *testing.T) {
+	if !apiServiceProtectedNamespaces["victoria-metrics"] {
+		t.Fatal("victoria-metrics missing from apiServiceProtectedNamespaces")
+	}
+	apiSvc := asgObj("v1beta1.custom.metrics.k8s.io", "victoria-metrics", "victoria-metrics-adapter")
+	asgUnavailable(apiSvc, 45*time.Minute)
+	cs := fake.NewSimpleClientset(
+		testutil.Namespace("victoria-metrics"),
+		asgBackendSvc("victoria-metrics", "victoria-metrics-adapter", "vm-adapter"),
+		asgBackendPod("victoria-metrics", "vm-adapter-0", "vm-adapter"))
+	testutil.EmulateEviction(cs)
+	dyn := asgDynFake(apiSvc)
+	g := asgGuard(cs, dyn)
+
+	if err := g.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if testutil.PodExists(t, cs, "victoria-metrics", "vm-adapter-0") {
+		t.Fatal("victoria-metrics protected namespace backing pod was not restarted")
+	}
+}

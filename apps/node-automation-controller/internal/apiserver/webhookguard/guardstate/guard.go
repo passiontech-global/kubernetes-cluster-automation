@@ -63,8 +63,13 @@ type Guard struct {
 	NodeReader kube.CachedNodeReader
 	// PromEndpoint and PromClient feed Prometheus-backed admission
 	// latency/5xx queries; empty PromEndpoint disables the queries.
-	PromEndpoint string
-	PromClient   promq.Client
+	// AutoDetectProm enables live per-sweep promq.AutoDetectTarget
+	// resolution under ObsBackendMode when no explicit URL override
+	// was configured at Setup.
+	PromEndpoint   string
+	PromClient     promq.Client
+	AutoDetectProm bool
+	ObsBackendMode promq.ObsBackendMode
 	// WebhookErrorRateThreshold, WebhookLatencyP99Seconds, and
 	// LatencyBreakerTripEnabled tune slow/5xx admission degradation and
 	// circuit tripping.

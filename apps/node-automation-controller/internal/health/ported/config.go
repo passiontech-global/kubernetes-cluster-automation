@@ -15,12 +15,14 @@ import (
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 // DNSConfig — dns-status-internal: every hostname must resolve.
 type DNSConfig struct {
 	Hostnames []string // HEALTH_DNS_HOSTNAMES
+	Explicit  bool     // true when HEALTH_DNS_HOSTNAMES was explicitly set
 }
 
 // PodsConfig — pod-restarts and pod-status checks.
@@ -37,23 +39,30 @@ type QuotaConfig struct {
 
 // DNSConfigFromEnv resolves HEALTH_DNS_HOSTNAMES.
 func DNSConfigFromEnv() DNSConfig {
+	explicit := envx.IsSet("HEALTH_DNS_HOSTNAMES")
 	var trimmed []string
 	for h := range strings.SplitSeq(envx.Getenv("HEALTH_DNS_HOSTNAMES",
 		"kubernetes.default.svc.cluster.local,"+
-			"kube-prometheus-stack-prometheus.prometheus-operator.svc.cluster.local"), ",") {
+			promq.DefaultPrometheusTarget().DNSHost), ",") {
 		if h = strings.TrimSpace(h); h != "" {
 			trimmed = append(trimmed, h)
 		}
 	}
-	return DNSConfig{Hostnames: trimmed}
+	return DNSConfig{Hostnames: trimmed, Explicit: explicit}
 }
 
 // HTTPContentConfigFromEnv resolves HEALTH_HTTP_CONTENT_URL and
 // HEALTH_HTTP_EXPECTED_CONTENT.
 func HTTPContentConfigFromEnv() probefw.HTTPContentConfig {
+	urlExplicit := envx.IsSet("HEALTH_HTTP_CONTENT_URL")
+	expectedExplicit := envx.IsSet("HEALTH_HTTP_EXPECTED_CONTENT")
+	def := promq.DefaultPrometheusTarget()
 	return probefw.HTTPContentConfig{
-		URL:      envx.Getenv("HEALTH_HTTP_CONTENT_URL", "http://kube-prometheus-stack-prometheus.prometheus-operator.svc:9090/-/healthy"),
-		Expected: envx.Getenv("HEALTH_HTTP_EXPECTED_CONTENT", "Healthy"),
+		URL:              envx.Getenv("HEALTH_HTTP_CONTENT_URL", def.HealthURL),
+		Expected:         envx.Getenv("HEALTH_HTTP_EXPECTED_CONTENT", def.ExpectedBody),
+		URLExplicit:      urlExplicit,
+		ExpectedExplicit: expectedExplicit,
+		AutoDetect:       !urlExplicit,
 	}
 }
 

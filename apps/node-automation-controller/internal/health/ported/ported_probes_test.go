@@ -8,9 +8,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +26,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 func chPod(ns, name string, phase corev1.PodPhase, age time.Duration) *corev1.Pod {
@@ -297,4 +302,258 @@ func TestProbeResourceQuota(t *testing.T) {
 	if rqRV != "0" {
 		t.Fatalf("resourcequotas resourceVersion = %q, want \"0\"", rqRV)
 	}
+}
+
+type portedRTFunc func(*http.Request) (*http.Response, error)
+
+func (f portedRTFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestPortedAutoDetectAndFailover(t *testing.T) {
+	promq.InvalidateAutoDetectCache()
+	t.Cleanup(promq.InvalidateAutoDetectCache)
+	blankPortedEnv(t)
+
+	var promUp atomic.Bool
+	promUp.Store(true)
+
+	client := &http.Client{Transport: portedRTFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Host {
+		case "kube-prometheus-stack-prometheus.prometheus-operator.svc:9090":
+			if promUp.Load() {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("Prometheus Server is Healthy.")),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader("down")),
+				Header:     make(http.Header),
+			}, nil
+		case "vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("OK")),
+				Header:     make(http.Header),
+			}, nil
+		default:
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     make(http.Header),
+			}, nil
+		}
+	})}
+
+	var mu sync.Mutex
+	var lookedUp []string
+	p := testProber(fake.NewSimpleClientset())
+	p.Cfg.HTTPContent = HTTPContentConfigFromEnv()
+	p.Cfg.ObsBackendMode = promq.ObsBackendAuto
+	p.HTTPClient = client
+	p.LookupHost = func(_ context.Context, host string) ([]string, error) {
+		mu.Lock()
+		lookedUp = append(lookedUp, host)
+		mu.Unlock()
+		return []string{"10.0.0.1"}, nil
+	}
+
+	dnsChk := NewDNSStatusCheck(p.Deps)
+	httpChk := NewHTTPContentCheck(p.Deps)
+
+	// Sweep 1: Prometheus healthy -> resolves Prom DNS & checks Healthy.
+	if res := httpChk.Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("http-content-check sweep 1 = %+v, want pass", res)
+	}
+	if res := dnsChk.Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("dns-status-internal sweep 1 = %+v, want pass", res)
+	}
+	mu.Lock()
+	if len(lookedUp) != 2 || lookedUp[1] != promq.DefaultPrometheusTarget().DNSHost {
+		t.Fatalf("sweep 1 DNS hostnames = %v", lookedUp)
+	}
+	lookedUp = nil
+	mu.Unlock()
+
+	// Sweep 2 (cutover): Prometheus down -> cache invalidated -> failover to VMAuth ("OK" + vmauth DNS).
+	promUp.Store(false)
+	promq.InvalidateAutoDetectCache()
+	sctx := probetest.SweepCtx(ctx, p.Deps)
+	if res := httpChk.Run(sctx); !res.Pass {
+		t.Fatalf("http-content-check failover = %+v, want pass on VMAuth", res)
+	}
+	if res := dnsChk.Run(sctx); !res.Pass {
+		t.Fatalf("dns-status-internal failover = %+v, want pass on VMAuth", res)
+	}
+	mu.Lock()
+	if len(lookedUp) != 2 || lookedUp[1] != promq.DefaultVMAuthTarget().DNSHost {
+		t.Fatalf("sweep 2 DNS hostnames = %v, want VMAuth DNS", lookedUp)
+	}
+	mu.Unlock()
+
+	// Explicit HEALTH_DNS_HOSTNAMES overrides auto-detected DNS hostnames.
+	t.Setenv("HEALTH_DNS_HOSTNAMES", "custom.svc.cluster.local")
+	explicitDNS := NewDNSStatusCheck(p.Deps)
+	mu.Lock()
+	lookedUp = nil
+	mu.Unlock()
+	if res := explicitDNS.Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("explicit DNS check = %+v", res)
+	}
+	mu.Lock()
+	if len(lookedUp) != 1 || lookedUp[0] != "custom.svc.cluster.local" {
+		t.Fatalf("explicit DNS looked up %v, want [custom.svc.cluster.local]", lookedUp)
+	}
+	mu.Unlock()
+}
+
+func TestDNSStatusExplicitURLAndBackendMode(t *testing.T) {
+	t.Run("explicit HEALTH_HTTP_CONTENT_URL to VMAuth with HEALTH_DNS_HOSTNAMES unset", func(t *testing.T) {
+		blankPortedEnv(t)
+		t.Setenv("HEALTH_HTTP_CONTENT_URL", "http://vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427/health")
+
+		var mu sync.Mutex
+		var lookedUp []string
+		p := testProber(fake.NewSimpleClientset())
+		p.Cfg.HTTPContent = HTTPContentConfigFromEnv()
+		p.Cfg.ObsBackendMode = promq.ObsBackendVictoriaMetrics
+		p.HTTPClient = &http.Client{Transport: portedRTFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("unexpected HTTP probe when HEALTH_HTTP_CONTENT_URL is explicit")
+			return nil, nil
+		})}
+		p.LookupHost = func(_ context.Context, host string) ([]string, error) {
+			mu.Lock()
+			lookedUp = append(lookedUp, host)
+			mu.Unlock()
+			return []string{"10.0.0.1"}, nil
+		}
+
+		chk := NewDNSStatusCheck(p.Deps)
+		if res := chk.Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+			t.Fatalf("dns-status-internal = %+v, want pass", res)
+		}
+		want := []string{
+			"kubernetes.default.svc.cluster.local",
+			"vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc",
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if !reflect.DeepEqual(lookedUp, want) {
+			t.Fatalf("lookedUp = %v, want %v", lookedUp, want)
+		}
+	})
+
+	t.Run("explicit HEALTH_HTTP_CONTENT_URL deduplicates identical k8s host and ignores IP or localhost", func(t *testing.T) {
+		cases := []struct {
+			name string
+			url  string
+			mode promq.ObsBackendMode
+			want []string
+		}{
+			{
+				name: "identical kubernetes host deduplicated",
+				url:  "https://kubernetes.default.svc.cluster.local:443/healthz",
+				mode: promq.ObsBackendAuto,
+				want: []string{"kubernetes.default.svc.cluster.local"},
+			},
+			{
+				name: "IP literal falls back to default",
+				url:  "http://127.0.0.1:8427/health",
+				mode: promq.ObsBackendAuto,
+				want: []string{
+					"kubernetes.default.svc.cluster.local",
+					promq.DefaultPrometheusTarget().DNSHost,
+				},
+			},
+			{
+				name: "localhost falls back to VM target when mode is victoriametrics",
+				url:  "http://localhost:8427/health",
+				mode: promq.ObsBackendVictoriaMetrics,
+				want: []string{
+					"kubernetes.default.svc.cluster.local",
+					promq.DefaultVMAuthTarget().DNSHost,
+				},
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				blankPortedEnv(t)
+				t.Setenv("HEALTH_HTTP_CONTENT_URL", tc.url)
+
+				var lookedUp []string
+				p := testProber(fake.NewSimpleClientset())
+				p.Cfg.HTTPContent = HTTPContentConfigFromEnv()
+				p.Cfg.ObsBackendMode = tc.mode
+				p.LookupHost = func(_ context.Context, host string) ([]string, error) {
+					lookedUp = append(lookedUp, host)
+					return []string{"10.0.0.1"}, nil
+				}
+
+				chk := NewDNSStatusCheck(p.Deps)
+				if res := chk.Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+					t.Fatalf("dns-status-internal = %+v, want pass", res)
+				}
+				if !reflect.DeepEqual(lookedUp, tc.want) {
+					t.Fatalf("lookedUp = %v, want %v", lookedUp, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("NODE_AUTOMATION_OBS_BACKEND=victoriametrics with HEALTH_DNS_HOSTNAMES unset", func(t *testing.T) {
+		blankPortedEnv(t)
+
+		var lookedUp []string
+		p := testProber(fake.NewSimpleClientset())
+		p.Cfg.ObsBackendMode = promq.ObsBackendVictoriaMetrics
+		p.HTTPClient = &http.Client{Transport: portedRTFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("unexpected HTTP probe when AutoDetect is false")
+			return nil, nil
+		})}
+		p.LookupHost = func(_ context.Context, host string) ([]string, error) {
+			lookedUp = append(lookedUp, host)
+			return []string{"10.0.0.1"}, nil
+		}
+
+		chk := NewDNSStatusCheck(p.Deps)
+		if res := chk.Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+			t.Fatalf("dns-status-internal = %+v, want pass", res)
+		}
+		want := []string{
+			"kubernetes.default.svc.cluster.local",
+			promq.DefaultTargetForMode(promq.ObsBackendVictoriaMetrics).DNSHost,
+		}
+		if !reflect.DeepEqual(lookedUp, want) {
+			t.Fatalf("lookedUp = %v, want %v", lookedUp, want)
+		}
+	})
+
+	t.Run("probetest.NewDeps stays inert and uses default hostnames without HTTP probes", func(t *testing.T) {
+		blankPortedEnv(t)
+
+		var lookedUp []string
+		d := probetest.NewDeps(fake.NewSimpleClientset(), nil)
+		d.HTTPClient = &http.Client{Transport: portedRTFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("unexpected HTTP probe from probetest.NewDeps")
+			return nil, nil
+		})}
+		d.LookupHost = func(_ context.Context, host string) ([]string, error) {
+			lookedUp = append(lookedUp, host)
+			return []string{"10.0.0.1"}, nil
+		}
+
+		chk := NewDNSStatusCheck(d)
+		if res := chk.Run(probetest.SweepCtx(ctx, d)); !res.Pass {
+			t.Fatalf("dns-status-internal = %+v, want pass", res)
+		}
+		want := []string{
+			"kubernetes.default.svc.cluster.local",
+			promq.DefaultPrometheusTarget().DNSHost,
+		}
+		if !reflect.DeepEqual(lookedUp, want) {
+			t.Fatalf("lookedUp = %v, want %v", lookedUp, want)
+		}
+	})
 }

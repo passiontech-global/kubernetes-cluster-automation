@@ -2,8 +2,11 @@ package watchdogs
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +16,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 // A missing Watchdog heartbeat or a rising error counter degrades
@@ -228,6 +233,125 @@ func TestObservabilityPipelineEventPrunedOnRecovery(t *testing.T) {
 	}
 }
 
+func TestObservabilityPipelineGuardVictoriaMetrics(t *testing.T) {
+	t.Run("VMCluster detects VM-specific pipeline degradations and targets VMCluster", func(t *testing.T) {
+		var mu sync.Mutex
+		var seenQueries []string
+		srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+			mu.Lock()
+			seenQueries = append(seenQueries, query)
+			mu.Unlock()
+			switch {
+			case query == "count(vm_app_version)":
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "Watchdog"):
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "vmalert_alerts_send_errors_total") ||
+				strings.Contains(query, "vm_rows_ignored_total") ||
+				strings.Contains(query, "vmagent_remotewrite_errors_total"):
+				return []probetest.PromTestSample{{Value: 2}}
+			}
+			return nil
+		})
+		vmStoragePod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: obsVMEventNS, Name: "vmstorage-victoria-metrics-k8s-stack-0",
+		}}
+		cs := fake.NewSimpleClientset(vmStoragePod)
+		p := testProber(cs)
+		p.Cfg.HTTPContent.URL = srv.URL + "/health"
+		p.HTTPClient = srv.Client()
+		chk := probetest.MustCheck[*observabilityPipelineCheck](t, p)
+
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res.Pass {
+			t.Fatal("degraded VM pipeline must fail the check")
+		}
+		for _, c := range []string{"vmalert_notifications_dropped", "vmstorage_rows_ignored", "vmagent_remotewrite_errors"} {
+			if !obsPipelineDegradedGauge.DeleteLabelValues(c) {
+				t.Fatalf("missing degraded series for %s", c)
+			}
+		}
+		mu.Lock()
+		for _, q := range seenQueries {
+			if strings.Contains(q, "prometheus_tsdb_wal_corruptions_total") ||
+				strings.Contains(q, "prometheus_notifications_dropped_total") {
+				t.Fatalf("Prometheus-only query %q issued on VictoriaMetrics backend", q)
+			}
+		}
+		mu.Unlock()
+
+		evs, err := cs.EventsV1().Events(obsVMEventNS).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evs.Items) != 3 {
+			t.Fatalf("warning events in %s = %d, want 3", obsVMEventNS, len(evs.Items))
+		}
+		for _, ev := range evs.Items {
+			if ev.Regarding.APIVersion != "operator.victoriametrics.com/v1beta1" ||
+				ev.Regarding.Kind != "VMCluster" ||
+				ev.Regarding.Name != "victoria-metrics-k8s-stack" ||
+				ev.Regarding.Namespace != obsVMEventNS {
+				t.Fatalf("unexpected Regarding: %+v", ev.Regarding)
+			}
+		}
+	})
+
+	t.Run("VMSingle resolves Regarding Kind=VMSingle when vmsingle pod exists", func(t *testing.T) {
+		srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+			switch {
+			case query == "count(vm_app_version)":
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "Watchdog"):
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "vm_promscrape_scrapes_failed_total"):
+				return []probetest.PromTestSample{{Value: 5}}
+			}
+			return nil
+		})
+		vmSinglePod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: obsVMEventNS, Name: "vmsingle-victoria-metrics-k8s-stack-0",
+		}}
+		cs := fake.NewSimpleClientset(vmSinglePod)
+		p := testProber(cs)
+		p.Cfg.HTTPContent.URL = srv.URL + "/health"
+		p.HTTPClient = srv.Client()
+		chk := probetest.MustCheck[*observabilityPipelineCheck](t, p)
+
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res.Pass {
+			t.Fatal("degraded VMSingle pipeline must fail the check")
+		}
+		obsPipelineDegradedGauge.DeleteLabelValues("vmagent_scrapes_failed")
+		evs, err := cs.EventsV1().Events(obsVMEventNS).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evs.Items) != 1 || evs.Items[0].Regarding.Kind != "VMSingle" {
+			t.Fatalf("events = %+v, want 1 event Regarding Kind=VMSingle", evs.Items)
+		}
+	})
+
+	t.Run("healthy VictoriaMetrics pipeline passes", func(t *testing.T) {
+		srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+			switch {
+			case query == "count(vm_app_version)":
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "Watchdog"):
+				return []probetest.PromTestSample{{Value: 1}}
+			}
+			return nil
+		})
+		p := testProber(fake.NewSimpleClientset())
+		p.Cfg.HTTPContent.URL = srv.URL + "/health"
+		p.HTTPClient = srv.Client()
+		res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+		if !res.Pass {
+			t.Fatalf("healthy VM pipeline must pass: %+v", res)
+		}
+	})
+}
+
 // failingHTTPClient returns an HTTP client whose transport always
 // errors — the Prometheus-unreachable posture for the inconclusive
 // cycle in the recovery-prune test.
@@ -240,4 +364,102 @@ type failingRoundTripper struct{}
 
 func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, errors.New("prometheus unreachable")
+}
+
+type obsPipelineRTFunc func(*http.Request) (*http.Response, error)
+
+func (f obsPipelineRTFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestObservabilityPipelineAllDownNoProbeStorm(t *testing.T) {
+	t.Run("all 3 candidate health endpoints and query return 503", func(t *testing.T) {
+		promq.InvalidateAutoDetectCache()
+		t.Cleanup(promq.InvalidateAutoDetectCache)
+
+		var healthProbes atomic.Int32
+		client := &http.Client{Transport: obsPipelineRTFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/-/healthy" || r.URL.Path == "/health" {
+				healthProbes.Add(1)
+			}
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader("down")),
+				Header:     make(http.Header),
+			}, nil
+		})}
+
+		p := testProber(fake.NewSimpleClientset())
+		p.Cfg.HTTPContent = probefw.HTTPContentConfig{AutoDetect: true}
+		p.Cfg.ObsBackendMode = promq.ObsBackendAuto
+		p.HTTPClient = client
+		chk := probetest.MustCheck[*observabilityPipelineCheck](t, p)
+
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res.Pass {
+			t.Fatalf("expected FAIL when all endpoints return 503, got %+v", res)
+		}
+		if got := healthProbes.Load(); got > 3 {
+			t.Fatalf("single sweep fired %d health probes, want <= 3", got)
+		}
+	})
+
+	t.Run("all 3 candidate health endpoints timeout then recover next sweep", func(t *testing.T) {
+		promq.InvalidateAutoDetectCache()
+		t.Cleanup(promq.InvalidateAutoDetectCache)
+
+		var healthProbes atomic.Int32
+		var vmHealthy atomic.Bool
+		client := &http.Client{Transport: obsPipelineRTFunc(func(r *http.Request) (*http.Response, error) {
+			isHealth := r.URL.Path == "/-/healthy" || r.URL.Path == "/health"
+			if isHealth {
+				healthProbes.Add(1)
+			}
+			if vmHealthy.Load() && r.URL.Host == "vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427" {
+				if r.URL.Path == "/health" {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader("OK")),
+						Header:     make(http.Header),
+					}, nil
+				}
+				if r.URL.Path == "/api/v1/query" {
+					_ = r.ParseForm()
+					q := r.FormValue("query")
+					body := `{"status":"success","data":{"resultType":"vector","result":[]}}`
+					if strings.Contains(q, "Watchdog") {
+						body = `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"1"]}]}}`
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Header:     make(http.Header),
+					}, nil
+				}
+			}
+			if isHealth {
+				time.Sleep(15 * time.Millisecond)
+			}
+			return nil, fmt.Errorf("connect timeout: %s", r.URL.Host)
+		})}
+
+		p := testProber(fake.NewSimpleClientset())
+		p.Cfg.HTTPContent = probefw.HTTPContentConfig{AutoDetect: true}
+		p.Cfg.ObsBackendMode = promq.ObsBackendAuto
+		p.HTTPClient = client
+		chk := probetest.MustCheck[*observabilityPipelineCheck](t, p)
+
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res.Pass {
+			t.Fatalf("expected FAIL when all endpoints timeout, got %+v", res)
+		}
+		if got := healthProbes.Load(); got > 3 {
+			t.Fatalf("single timeout sweep fired %d health probes, want <= 3", got)
+		}
+
+		// Recovery on next sweep without needing InvalidateAutoDetectCache.
+		vmHealthy.Store(true)
+		res2 := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if !res2.Pass {
+			t.Fatalf("expected recovery on sweep 2 once VMAuth is healthy, got %+v", res2)
+		}
+	})
 }

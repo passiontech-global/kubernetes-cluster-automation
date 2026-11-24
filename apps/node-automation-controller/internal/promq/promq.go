@@ -70,16 +70,19 @@ type Client struct {
 // wins when non-empty, else the endpoint is derived from fallbackURL.
 // An error means neither source produced a usable endpoint.
 //
-// The fallback URL is a HEALTH endpoint (…/-/healthy, …/metrics),
-// not the API root — but when Prometheus/VictoriaMetrics/Thanos sits
-// behind a reverse-proxy SUBPATH mount (https://host/prometheus/-/healthy)
+// The fallback URL is a HEALTH endpoint (…/-/healthy, …/-/ready,
+// …/health, …/healthz, …/metrics), not the API root — but when
+// Prometheus/VictoriaMetrics/Thanos sits behind a reverse-proxy SUBPATH
+// mount (https://host/prometheus/-/healthy or https://host/vm/health)
 // the mount prefix must survive into the derived endpoint or every
-// query 404s at the proxy's bare root. path.Dir drops exactly the
-// last segment — the probe endpoint itself — and url.JoinPath (not
-// string concatenation) rebuilds the API path under whatever mount
-// prefix remains, so "/prometheus/-/healthy" derives
-// "/prometheus/api/v1/query" while "/-/healthy" still derives the
-// root "/api/v1/query".
+// query 404s at the proxy's bare root. Trailing slashes on the health
+// path (e.g. …/vm/health/) are stripped first so path.Dir drops
+// exactly the probe segment, and url.JoinPath (not string
+// concatenation) rebuilds the API path under whatever mount prefix
+// remains, so "/prometheus/-/healthy" derives
+// "/prometheus/api/v1/query", "/vm/health" derives
+// "/vm/api/v1/query", while "/-/healthy" or "/health" still derives
+// the root "/api/v1/query".
 func ResolveEndpoint(override, fallbackURL string) (string, error) {
 	if override != "" {
 		return override, nil
@@ -88,7 +91,8 @@ func ResolveEndpoint(override, fallbackURL string) (string, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("cannot derive prometheus base from %q", fallbackURL)
 	}
-	mount := path.Dir(u.EscapedPath())
+	trimmedPath := strings.TrimRight(u.EscapedPath(), "/")
+	mount := path.Dir(trimmedPath)
 	// Prometheus-family health endpoints live under the reserved
 	// "/-/" namespace (…/-/healthy, …/-/ready) — the "-" segment is
 	// part of the endpoint, not the proxy mount, so drop it too.

@@ -450,6 +450,8 @@ type sweepSnapshot struct {
 	// second round-trip.
 	promMu      sync.Mutex
 	promQueries map[string]*memo[[]promq.Sample]
+	obsTarget   memo[obsTargetMemo]
+	promBackend memo[promq.BackendKind]
 	// promFails/promOpen are the per-sweep Prometheus circuit
 	// breaker: promCircuitThreshold consecutive transport-level
 	// failures (dial/TLS/timeout — promq.TransportError, never a
@@ -504,6 +506,7 @@ func newSweepSnapshot(ctx context.Context, nowFn func() time.Time) *sweepSnapsho
 		&s.validatingWebhooks, &s.mutatingWebhooks,
 		&s.nodeZones, &s.podNodes, &s.nodeByName,
 		&s.leaseIndex, &s.serviceIndex,
+		&s.obsTarget, &s.promBackend,
 	}
 	for _, mm := range s.memos {
 		mm.setNow(nowFn)
@@ -515,6 +518,11 @@ func newSweepSnapshot(ctx context.Context, nowFn func() time.Time) *sweepSnapsho
 		s.resetUnstructs,
 	}
 	return s
+}
+
+type obsTargetMemo struct {
+	target   promq.ObsTarget
+	detected bool
 }
 
 // promMemo returns the per-key memo for this sweep — created

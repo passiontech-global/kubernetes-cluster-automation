@@ -9,9 +9,12 @@ package probefw
 import (
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +29,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/maintenance"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/testhelp"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 func TestSelfHealKey(t *testing.T) {
@@ -278,6 +282,208 @@ func TestPromEndpointResolvedOnceAtConstruction(t *testing.T) {
 		got != "http://prom.internal:9090/api/v1/query" {
 		t.Fatalf("endpoint re-resolved after construction = (%q,%v)", got, err)
 	}
+}
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestObsTargetAndPromBackendMemoization(t *testing.T) {
+	t.Run("literal Deps without AutoDetect never issues network probes", func(t *testing.T) {
+		d := &Deps{
+			Cfg: Config{HTTPContent: HTTPContentConfig{
+				URL:      "http://127.0.0.1:1/",
+				Expected: "Healthy",
+			}},
+			HTTPClient: &http.Client{Transport: rtFunc(func(*http.Request) (*http.Response, error) {
+				t.Fatal("unexpected HTTP probe when AutoDetect is false")
+				return nil, nil
+			})},
+		}
+		target, detected := d.ObsTarget(t.Context())
+		if detected || target.HealthURL != "http://127.0.0.1:1/" || target.ExpectedBody != "Healthy" {
+			t.Fatalf("ObsTarget = (%+v, %v)", target, detected)
+		}
+	})
+
+	t.Run("AutoDetect memoizes positive target per sweep and honors overrides", func(t *testing.T) {
+		promq.InvalidateAutoDetectCache()
+		t.Cleanup(promq.InvalidateAutoDetectCache)
+
+		var probeCalls atomic.Int32
+		client := &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			probeCalls.Add(1)
+			switch r.URL.Host {
+			case "kube-prometheus-stack-prometheus.prometheus-operator.svc:9090":
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Body:       io.NopCloser(strings.NewReader("down")),
+					Header:     make(http.Header),
+				}, nil
+			case "vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427":
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("OK")),
+					Header:     make(http.Header),
+				}, nil
+			default:
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       io.NopCloser(strings.NewReader("")),
+					Header:     make(http.Header),
+				}, nil
+			}
+		})}
+
+		t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", "")
+		d := NewDeps("test", nil, nil, nil, Config{
+			HTTPContent: HTTPContentConfig{
+				AutoDetect:       true,
+				ExpectedExplicit: true,
+				Expected:         "CustomExpected",
+			},
+			ObsBackendMode: promq.ObsBackendAuto,
+		})
+		d.HTTPClient = client
+
+		sctx := WithSweepSnapshot(t.Context(), d)
+		t1, ok1 := d.ObsTarget(sctx)
+		t2, ok2 := d.ObsTarget(sctx)
+		if !ok1 || !ok2 || t1.Backend != promq.BackendVictoriaMetrics || t1.ExpectedBody != "CustomExpected" {
+			t.Fatalf("ObsTarget = (%+v,%v) / (%+v,%v)", t1, ok1, t2, ok2)
+		}
+		if probeCalls.Load() != 2 {
+			t.Fatalf("probeCalls = %d, want 2 (1 failed Prom + 1 OK VMAuth, memoized on second ObsTarget)", probeCalls.Load())
+		}
+		if ep, err := d.PromEndpointCtx(sctx); err != nil || ep != promq.DefaultVMAuthTarget().QueryURL {
+			t.Fatalf("PromEndpointCtx = (%q, %v)", ep, err)
+		}
+		if b := d.PromBackend(sctx); b != promq.BackendVictoriaMetrics {
+			t.Fatalf("PromBackend = %v, want BackendVictoriaMetrics", b)
+		}
+		if probeCalls.Load() != 2 {
+			t.Fatalf("PromBackend/PromEndpointCtx triggered extra probes: %d", probeCalls.Load())
+		}
+	})
+
+	t.Run("all-down detection is memoized per sweep and recovers on next sweep", func(t *testing.T) {
+		promq.InvalidateAutoDetectCache()
+		t.Cleanup(promq.InvalidateAutoDetectCache)
+
+		var healthy atomic.Bool
+		var probeCalls atomic.Int32
+		client := &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			probeCalls.Add(1)
+			if healthy.Load() && r.URL.Host == "vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427" {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("OK")),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Body:       io.NopCloser(strings.NewReader("down")),
+				Header:     make(http.Header),
+			}, nil
+		})}
+
+		d := &Deps{
+			Cfg: Config{
+				HTTPContent:    HTTPContentConfig{AutoDetect: true},
+				ObsBackendMode: promq.ObsBackendAuto,
+			},
+			HTTPClient: client,
+		}
+		sctx1 := WithSweepSnapshot(t.Context(), d)
+		if _, ok := d.ObsTarget(sctx1); ok {
+			t.Fatal("expected detected=false while all targets are down")
+		}
+		if got := probeCalls.Load(); got != 3 {
+			t.Fatalf("first ObsTarget probeCalls = %d, want 3 (Prom, VMAuth, VMSingle)", got)
+		}
+		// Repeated ObsTarget, PromEndpointCtx, and PromBackend inside the same sweep
+		// must reuse the per-sweep memo instead of re-probing all 3 candidates.
+		if _, ok := d.ObsTarget(sctx1); ok {
+			t.Fatal("expected memoized detected=false within same sweep")
+		}
+		if ep, err := d.PromEndpointCtx(sctx1); err != nil || ep != promq.DefaultPrometheusTarget().QueryURL {
+			t.Fatalf("PromEndpointCtx = (%q, %v)", ep, err)
+		}
+		if b := d.PromBackend(sctx1); b != promq.BackendPrometheus {
+			t.Fatalf("PromBackend = %v, want BackendPrometheus fallback", b)
+		}
+		if got := probeCalls.Load(); got != 3 {
+			t.Fatalf("same-sweep calls amplified probes: probeCalls = %d, want 3", got)
+		}
+
+		// Recovery on a subsequent sweep succeeds immediately because
+		// promq.TargetDetector never caches negative detections across sweeps.
+		healthy.Store(true)
+		sctx2 := WithSweepSnapshot(t.Context(), d)
+		target, ok := d.ObsTarget(sctx2)
+		if !ok || target.Backend != promq.BackendVictoriaMetrics {
+			t.Fatalf("expected recovery on next sweep: (%+v, %v)", target, ok)
+		}
+	})
+
+	t.Run("PromBackend respects explicit URL and promEndpointOverride", func(t *testing.T) {
+		var queryCalls atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			queryCalls.Add(1)
+			_ = r.ParseForm()
+			if r.FormValue("query") == "count(vm_app_version)" {
+				_, _ = fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"1"]}]}}`)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[]}}`)
+		}))
+		defer srv.Close()
+
+		t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", srv.URL+"/api/v1/query")
+		d := NewDeps("test", nil, nil, nil, Config{
+			HTTPContent: HTTPContentConfig{AutoDetect: true},
+		})
+		d.HTTPClient = srv.Client()
+		sctx := WithSweepSnapshot(t.Context(), d)
+		if got := d.PromBackend(sctx); got != promq.BackendVictoriaMetrics {
+			t.Fatalf("PromBackend with promEndpointOverride = %v, want BackendVictoriaMetrics", got)
+		}
+		if queryCalls.Load() == 0 {
+			t.Fatal("expected DetectBackend queries against promEndpointOverride")
+		}
+	})
+
+	t.Run("PromBackend does not memoize query transport error", func(t *testing.T) {
+		var fail atomic.Bool
+		fail.Store(true)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if fail.Load() {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			_ = r.ParseForm()
+			if r.FormValue("query") == "count(vm_app_version)" {
+				_, _ = fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"1"]}]}}`)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[]}}`)
+		}))
+		defer srv.Close()
+
+		d := &Deps{
+			Cfg:        Config{HTTPContent: HTTPContentConfig{URL: srv.URL + "/health"}},
+			HTTPClient: srv.Client(),
+		}
+		sctx := WithSweepSnapshot(t.Context(), d)
+		if got := d.PromBackend(sctx); got != promq.BackendUnknown {
+			t.Fatalf("first PromBackend = %v, want BackendUnknown on 502", got)
+		}
+		fail.Store(false)
+		if got := d.PromBackend(sctx); got != promq.BackendVictoriaMetrics {
+			t.Fatalf("recovered PromBackend = %v, want BackendVictoriaMetrics", got)
+		}
+	})
 }
 
 // healPod is the pod DeletePodHeal bounces in these tests — seeded in

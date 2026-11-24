@@ -89,6 +89,51 @@ func TestResolveEndpoint(t *testing.T) {
 			fallback: "https://mon.example.com/obs/vm/-/healthy?x=1",
 			want:     "https://mon.example.com/obs/vm/api/v1/query",
 		},
+		{
+			name:     "prometheus ready endpoint",
+			fallback: "http://prom:9090/-/ready",
+			want:     "http://prom:9090/api/v1/query",
+		},
+		{
+			name:     "prometheus healthy endpoint with trailing slash",
+			fallback: "http://prom:9090/-/healthy/",
+			want:     "http://prom:9090/api/v1/query",
+		},
+		{
+			name:     "victoriametrics root health endpoint",
+			fallback: "http://vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427/health",
+			want:     "http://vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427/api/v1/query",
+		},
+		{
+			name:     "victoriametrics root healthz endpoint",
+			fallback: "http://vmsingle-victoria-metrics-k8s-stack.victoria-metrics.svc:8428/healthz",
+			want:     "http://vmsingle-victoria-metrics-k8s-stack.victoria-metrics.svc:8428/api/v1/query",
+		},
+		{
+			name:     "victoriametrics health endpoint with trailing slash",
+			fallback: "http://vmauth:8427/health/",
+			want:     "http://vmauth:8427/api/v1/query",
+		},
+		{
+			name:     "victoriametrics subpath health endpoint preserved",
+			fallback: "https://mon.example.com/vm/health",
+			want:     "https://mon.example.com/vm/api/v1/query",
+		},
+		{
+			name:     "victoriametrics subpath health with trailing slash preserved",
+			fallback: "https://mon.example.com/vm/health/",
+			want:     "https://mon.example.com/vm/api/v1/query",
+		},
+		{
+			name:     "victoriametrics subpath healthz preserved",
+			fallback: "https://mon.example.com/obs/vm/healthz/",
+			want:     "https://mon.example.com/obs/vm/api/v1/query",
+		},
+		{
+			name:     "vmselect prometheus subpath preserved",
+			fallback: "http://vmselect:8481/select/0/prometheus/health",
+			want:     "http://vmselect:8481/select/0/prometheus/api/v1/query",
+		},
 		{name: "both empty", wantErr: true},
 		{name: "relative fallback", fallback: "/metrics", wantErr: true},
 		{name: "hostless scheme", fallback: "prom:9090", wantErr: true},

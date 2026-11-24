@@ -264,4 +264,89 @@ func TestObservabilityCardinalityGuard(t *testing.T) {
 			t.Fatalf("stale series job=a ns=b/c not pruned: %v", m)
 		}
 	})
+
+	t.Run("VictoriaMetrics backend queries vm_cache_entries and scrape_samples_scraped with dynamic Regarding", func(t *testing.T) {
+		t.Setenv("NODE_AUTOMATION_OBS_HEAD_SERIES_WARN", "1000")
+		t.Setenv("NODE_AUTOMATION_OBS_HEAD_SERIES_GROWTH_PER_HOUR", "500")
+
+		var breached atomic.Bool
+		breached.Store(true)
+		var mu sync.Mutex
+		var seenQueries []string
+
+		srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+			mu.Lock()
+			seenQueries = append(seenQueries, query)
+			mu.Unlock()
+			switch {
+			case query == "count(vm_app_version)":
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "Watchdog"):
+				return []probetest.PromTestSample{{Value: 1}}
+			case query == vmHeadSeriesQuery:
+				if breached.Load() {
+					return []probetest.PromTestSample{{Value: 2500}}
+				}
+				return []probetest.PromTestSample{{Value: 400}}
+			case query == vmHeadSeriesGrowthQuery:
+				return []probetest.PromTestSample{{Value: 100}}
+			case query == obsCardinalitySamplesScrapedQuery:
+				return []probetest.PromTestSample{
+					{Labels: map[string]string{"job": "vm-noisy", "namespace": "apps"}, Value: 88000},
+				}
+			}
+			return nil
+		})
+
+		vmStoragePod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: obsVMEventNS, Name: "vmstorage-victoria-metrics-k8s-stack-0",
+		}}
+		cs := fake.NewSimpleClientset(vmStoragePod)
+		p := testProber(cs)
+		p.Cfg.HTTPContent.URL = srv.URL + "/health"
+		p.HTTPClient = srv.Client()
+		chk := probetest.MustCheck[*observabilityPipelineCheck](t, p)
+
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res.Pass {
+			t.Fatal("expected check FAIL when vm_cache_entries exceeds warn threshold")
+		}
+		if m := probetest.FindMetric(t, "node_automation_prometheus_head_series", nil); m == nil || m.GetGauge().GetValue() != 2500 {
+			t.Fatalf("head_series gauge = %v, want 2500", m)
+		}
+		if m := probetest.FindMetric(t, "node_automation_prometheus_cardinality_culprit", map[string]string{"job": "vm-noisy", "namespace": "apps"}); m == nil || m.GetGauge().GetValue() != 88000 {
+			t.Fatalf("culprit gauge missing or wrong value: %v", m)
+		}
+		mu.Lock()
+		for _, q := range seenQueries {
+			if q == obsCardinalitySeriesAddedQuery || q == obsHeadSeriesQuery {
+				t.Fatalf("Prometheus-only query %q issued on VictoriaMetrics backend", q)
+			}
+		}
+		mu.Unlock()
+
+		evs, err := cs.EventsV1().Events(obsVMEventNS).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evs.Items) != 1 || evs.Items[0].Reason != obsCardinalityEventReason {
+			t.Fatalf("unexpected events in %s: %+v", obsVMEventNS, evs.Items)
+		}
+		if evs.Items[0].Regarding.Kind != "VMCluster" || evs.Items[0].Regarding.Name != "victoria-metrics-k8s-stack" {
+			t.Fatalf("unexpected Regarding: %+v", evs.Items[0].Regarding)
+		}
+		if !strings.Contains(evs.Items[0].Note, "apps/vm-noisy") {
+			t.Fatalf("event note missing culprit: %q", evs.Items[0].Note)
+		}
+
+		// Recovery prunes gauges.
+		breached.Store(false)
+		res = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if !res.Pass {
+			t.Fatalf("expected PASS on VM cardinality recovery, got %+v", res)
+		}
+		if m := probetest.FindMetric(t, "node_automation_prometheus_cardinality_culprit", map[string]string{"job": "vm-noisy", "namespace": "apps"}); m != nil {
+			t.Fatalf("stale VM culprit series not deleted on recovery: %v", m)
+		}
+	})
 }

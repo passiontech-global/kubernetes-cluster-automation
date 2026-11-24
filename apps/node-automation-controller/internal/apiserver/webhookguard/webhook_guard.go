@@ -114,6 +114,8 @@ const (
 
 type guardConfig struct {
 	promEndpoint       string
+	autoDetectProm     bool
+	obsBackendMode     promq.ObsBackendMode
 	errRateThreshold   float64
 	latP99Threshold    float64
 	latencyTripEnabled bool
@@ -122,15 +124,27 @@ type guardConfig struct {
 }
 
 func configFromEnv() guardConfig {
-	endpoint, err := promq.ResolveEndpoint(
-		envx.Getenv("HEALTH_PROMETHEUS_QUERY_URL", ""),
-		envx.Getenv("HEALTH_HTTP_CONTENT_URL", defaultPromFallbackURL),
-	)
-	if err != nil {
-		endpoint = ""
+	mode := promq.EnvObsBackendMode()
+	promExplicit := envx.IsSet("HEALTH_PROMETHEUS_QUERY_URL")
+	httpExplicit := envx.IsSet("HEALTH_HTTP_CONTENT_URL")
+	autoDetect := !promExplicit && !httpExplicit
+	var endpoint string
+	if autoDetect {
+		endpoint = promq.DefaultTargetForMode(mode).QueryURL
+	} else {
+		var err error
+		endpoint, err = promq.ResolveEndpoint(
+			envx.Getenv("HEALTH_PROMETHEUS_QUERY_URL", ""),
+			envx.Getenv("HEALTH_HTTP_CONTENT_URL", defaultPromFallbackURL),
+		)
+		if err != nil {
+			endpoint = ""
+		}
 	}
 	return guardConfig{
 		promEndpoint:       endpoint,
+		autoDetectProm:     autoDetect,
+		obsBackendMode:     mode,
 		errRateThreshold:   envx.GetenvFloatPositive("WEBHOOK_ERROR_RATE_THRESHOLD", defaultErrorRateThreshold),
 		latP99Threshold:    envx.GetenvFloatPositive("WEBHOOK_LATENCY_P99_SECONDS", defaultLatencyP99Seconds),
 		latencyTripEnabled: envx.Gate("WEBHOOK_LATENCY_BREAKER_TRIP_ENABLED", true),
@@ -174,12 +188,16 @@ func Setup(d shared.Deps) error {
 			"latencyTrip", cfg.latencyTripEnabled,
 			"timeoutClamp", cfg.timeoutClampOn,
 			"maxTimeoutSeconds", cfg.maxTimeoutSeconds,
-			"promEndpoint", cfg.promEndpoint)
+			"promEndpoint", cfg.promEndpoint,
+			"autoDetectProm", cfg.autoDetectProm,
+			"obsBackendMode", cfg.obsBackendMode)
 		g := &webhookGuard{Guard: guardstate.Guard{
 			CS: d.CS, Dyn: d.Dyn, Queue: d.Name, Now: shared.SystemClock,
 			NodeReader: d.CachedClient(), Verdict: d.Maintenance,
 			PromEndpoint:              cfg.promEndpoint,
 			PromClient:                promq.Client{Timeout: defaultPromQueryTimeout},
+			AutoDetectProm:            cfg.autoDetectProm,
+			ObsBackendMode:            cfg.obsBackendMode,
 			WebhookErrorRateThreshold: cfg.errRateThreshold,
 			WebhookLatencyP99Seconds:  cfg.latP99Threshold,
 			LatencyBreakerTripEnabled: cfg.latencyTripEnabled,
@@ -191,6 +209,11 @@ func Setup(d shared.Deps) error {
 }
 
 func (g *webhookGuard) run(ctx context.Context) error {
+	if g.AutoDetectProm {
+		if target, detected := promq.AutoDetectTarget(ctx, g.PromClient.HTTP, g.ObsBackendMode); detected || target.QueryURL != "" {
+			g.PromEndpoint = target.QueryURL
+		}
+	}
 	// The orphan sweep, the circuit breaker, the CRD conversion-
 	// backend check, the critical-NS audits and the unmeshed-pod
 	// auditor are independent duties — a failure in one must never

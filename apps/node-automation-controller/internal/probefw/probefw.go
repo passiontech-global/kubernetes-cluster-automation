@@ -180,14 +180,14 @@ func NewDeps(name string, cs kubernetes.Interface, dyn dynamic.Interface,
 	return deps
 }
 
-// Config carries the HEALTH_* env knobs the checker Pods read
 // Config holds the framework-wide sweep configuration: remote-call
-// timeouts and the HTTP/Prometheus target URL used by http-content-check
-// and Probefw.PromEndpoint. Check-specific knobs live in the check
-// packages themselves.
+// timeouts, the HTTP/Prometheus target URL used by http-content-check
+// and Probefw.PromEndpoint, and the observability backend mode.
+// Check-specific knobs live in the check packages themselves.
 type Config struct {
-	Timeouts    TimeoutsConfig
-	HTTPContent HTTPContentConfig
+	Timeouts       TimeoutsConfig
+	HTTPContent    HTTPContentConfig
+	ObsBackendMode promq.ObsBackendMode
 }
 
 // TimeoutsConfig bounds remote calls at two levels: Check is the
@@ -201,6 +201,9 @@ type TimeoutsConfig struct {
 
 // HTTPContentConfig — http-content-check & shared Prometheus base URL.
 type HTTPContentConfig struct {
-	URL      string // HEALTH_HTTP_CONTENT_URL
-	Expected string // HEALTH_HTTP_EXPECTED_CONTENT
+	URL              string // HEALTH_HTTP_CONTENT_URL
+	Expected         string // HEALTH_HTTP_EXPECTED_CONTENT
+	URLExplicit      bool   // true when HEALTH_HTTP_CONTENT_URL was explicitly set
+	ExpectedExplicit bool   // true when HEALTH_HTTP_EXPECTED_CONTENT was explicitly set
+	AutoDetect       bool   // true when built without explicit URL override
 }

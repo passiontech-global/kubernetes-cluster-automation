@@ -5,10 +5,12 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1188,3 +1190,85 @@ func TestStatefulSetRollerDragonflySyncedRollsAndOutageTolerated(t *testing.T) {
 
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()
+
+type srRTFunc func(*http.Request) (*http.Response, error)
+
+func (f srRTFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestDragonflyPromSeamConfigAndAutoDetectFailover(t *testing.T) {
+	t.Run("newDragonflyPromSeam arms autoDetect only when URLs are unset", func(t *testing.T) {
+		t.Setenv("HEALTH_PROMETHEUS_QUERY_URL", "")
+		t.Setenv("HEALTH_HTTP_CONTENT_URL", "")
+		t.Setenv("NODE_AUTOMATION_OBS_BACKEND", "victoriametrics")
+		seam := newDragonflyPromSeam()
+		if !seam.ok || !seam.autoDetect || seam.obsBackendMode != promq.ObsBackendVictoriaMetrics ||
+			seam.endpoint != promq.DefaultVMAuthTarget().QueryURL {
+			t.Fatalf("unset env seam = %+v", seam)
+		}
+
+		t.Setenv("HEALTH_HTTP_CONTENT_URL", "http://vmauth-custom:8427/health")
+		seam = newDragonflyPromSeam()
+		if !seam.ok || seam.autoDetect || seam.endpoint != "http://vmauth-custom:8427/api/v1/query" {
+			t.Fatalf("explicit http seam = %+v", seam)
+		}
+	})
+
+	t.Run("live autoDetect fails over from Prometheus to VMAuth and blocks unsynced Dragonfly roll", func(t *testing.T) {
+		promq.InvalidateAutoDetectCache()
+		t.Cleanup(promq.InvalidateAutoDetectCache)
+		natestutil.CleanupMetric(t, metrics.StatefulSetOnDeleteDragonflyUnsyncedSkipped, "apps", "cache")
+
+		var promUp atomic.Bool
+		promUp.Store(false)
+		var lastQueryHost string
+		client := &http.Client{Transport: srRTFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/api/v1/query" {
+				lastQueryHost = r.URL.Host
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"pod":"cache-1"},"value":[1,"0"]}]}}`)),
+					Header:     make(http.Header),
+				}, nil
+			}
+			switch r.URL.Host {
+			case "kube-prometheus-stack-prometheus.prometheus-operator.svc:9090":
+				if promUp.Load() {
+					return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("Healthy")), Header: make(http.Header)}, nil
+				}
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("down")), Header: make(http.Header)}, nil
+			case "vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427":
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("OK")), Header: make(http.Header)}, nil
+			default:
+				return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+			}
+		})}
+
+		t0 := time.Now()
+		sts := srDragonflySTS(t)
+		objs := srNodes(1)
+		objs = append(objs, sts,
+			srPod("cache", 0, "rev-old", 30*time.Minute),
+			srPod("cache", 1, "rev-old", 30*time.Minute))
+		cs := fake.NewSimpleClientset(objs...)
+		natestutil.EmulateEviction(cs)
+		r := srRoller(cs, t0)
+		r.driftSince.Observe("apps/cache@rev-new", t0.Add(-time.Hour))
+		r.prom = dragonflyPromSeam{
+			endpoint:       promq.DefaultPrometheusTarget().QueryURL,
+			client:         promq.Client{HTTP: client, Timeout: 2 * time.Second},
+			ok:             true,
+			autoDetect:     true,
+			obsBackendMode: promq.ObsBackendAuto,
+		}
+
+		if err := r.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if lastQueryHost != "vmauth-victoria-metrics-k8s-stack.victoria-metrics.svc:8427" {
+			t.Fatalf("query host = %q, want VMAuth after Prometheus down", lastQueryHost)
+		}
+		if !natestutil.PodExists(t, cs, "apps", "cache-1") {
+			t.Fatal("dragonfly pod rolled while VMAuth reported master link down")
+		}
+	})
+}

@@ -39,6 +39,9 @@ func TestDNSConfigFromEnv(t *testing.T) {
 		if !reflect.DeepEqual(c.Hostnames, want) {
 			t.Fatalf("Hostnames = %v, want %v", c.Hostnames, want)
 		}
+		if c.Explicit {
+			t.Fatal("Explicit = true when HEALTH_DNS_HOSTNAMES is unset")
+		}
 	})
 
 	t.Run("csv is trimmed and empties dropped", func(t *testing.T) {
@@ -49,6 +52,9 @@ func TestDNSConfigFromEnv(t *testing.T) {
 		want := []string{"a.example.com", "b.example.com"}
 		if !reflect.DeepEqual(c.Hostnames, want) {
 			t.Fatalf("Hostnames = %v, want %v", c.Hostnames, want)
+		}
+		if !c.Explicit {
+			t.Fatal("Explicit = false when HEALTH_DNS_HOSTNAMES is set")
 		}
 	})
 }
@@ -63,6 +69,10 @@ func TestHTTPContentConfigFromEnv(t *testing.T) {
 		if c.Expected != "Healthy" {
 			t.Fatalf("Expected = %q", c.Expected)
 		}
+		if c.URLExplicit || c.ExpectedExplicit || !c.AutoDetect {
+			t.Fatalf("flags = (%v,%v,%v), want (false,false,true)",
+				c.URLExplicit, c.ExpectedExplicit, c.AutoDetect)
+		}
 	})
 
 	t.Run("overrides land verbatim", func(t *testing.T) {
@@ -72,6 +82,10 @@ func TestHTTPContentConfigFromEnv(t *testing.T) {
 		c := HTTPContentConfigFromEnv()
 		if c.URL != "http://x/-/healthy" || c.Expected != "OK" {
 			t.Fatalf("HTTPContent = %+v", c)
+		}
+		if !c.URLExplicit || !c.ExpectedExplicit || c.AutoDetect {
+			t.Fatalf("flags = (%v,%v,%v), want (true,true,false)",
+				c.URLExplicit, c.ExpectedExplicit, c.AutoDetect)
 		}
 	})
 }

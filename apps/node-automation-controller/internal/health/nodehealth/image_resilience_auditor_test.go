@@ -322,4 +322,33 @@ func TestImageResilienceAuditor_PassiveDefaultAndFailOnRisk(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("victoria-metrics is audited in default namespaces", func(t *testing.T) {
+		vmDep := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "victoria-metrics", Name: "vm-agent"},
+			Spec: appsv1.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:            "vmagent",
+							Image:           "victoriametrics/vmagent:latest",
+							ImagePullPolicy: corev1.PullAlways,
+						}},
+					},
+				},
+			},
+		}
+		cs := fake.NewSimpleClientset(vmDep)
+		p := testProber(cs)
+		ch := probetest.MustCheck[*imageResilienceAuditorCheck](t, p)
+		res := ch.Run(probetest.SweepCtx(ctx, p.Deps))
+		if !res.Pass {
+			t.Fatalf("default mode must return PASS, got %+v", res)
+		}
+		v, ok := testutil.GaugeSeriesValue(t, "node_automation_workload_image_resilience_risk",
+			map[string]string{"namespace": "victoria-metrics", "workload": "Deployment/vm-agent", "reason": imageRiskMutableTag})
+		if !ok || v != 1 {
+			t.Fatalf("expected victoria-metrics mutable_tag risk gauge=1, got (%v, %v)", v, ok)
+		}
+	})
 }
