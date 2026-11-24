@@ -3,6 +3,7 @@ package concoursejanitor
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,6 +68,7 @@ func TestConcourseJanitorATCCredentials(t *testing.T) {
 // request plus the token POST form, and serving programmable replies.
 type atcRecorder struct {
 	requests  []string
+	putBodies []string
 	tokenForm map[string]string
 	tokenCode int
 	tokenBody string
@@ -90,6 +92,8 @@ func (r *atcRecorder) handler() http.Handler {
 		case "/api/v1/workers":
 			_, _ = w.Write([]byte(r.workers))
 		default:
+			body, _ := io.ReadAll(req.Body)
+			r.putBodies = append(r.putBodies, string(body))
 			code := r.putCode
 			if code == 0 {
 				code = http.StatusOK
@@ -102,12 +106,14 @@ func (r *atcRecorder) handler() http.Handler {
 // OAuth2 password grant (Concourse ≥3.15, deployed 8.3.2): POST
 // /sky/issuer/token with Basic client creds fly:Zmx5, then Bearer on
 // every subsequent call. Asserts method+path+Authorization for
-// token/workers/land/prune — worker routes are NOT team-scoped.
+// token/workers/land/prune — worker routes are NOT team-scoped in
+// the URL, but Concourse ≥8 land requires the worker's team in the
+// JSON body, which landWorker reads from the workers list first.
 func TestATCClientOAuthShape(t *testing.T) {
 	rec := &atcRecorder{
 		tokenCode: http.StatusOK,
 		tokenBody: `{"access_token":"tok-oauth","token_type":"Bearer"}`,
-		workers:   `[{"name":"w1","state":"running"},{"name":"w2","state":"landed"}]`,
+		workers:   `[{"name":"w1","state":"running","team":"main"},{"name":"w2","state":"landed","team":"ops"}]`,
 	}
 	srv := httptest.NewServer(rec.handler())
 	defer srv.Close()
@@ -141,11 +147,18 @@ func TestATCClientOAuthShape(t *testing.T) {
 		`POST /sky/issuer/token auth="Basic Zmx5OlpteDU="`,
 		`GET /api/v1/workers auth="Bearer tok-oauth"`,
 		`GET /api/v1/workers auth="Bearer tok-oauth"`,
+		`GET /api/v1/workers auth="Bearer tok-oauth"`,
 		`PUT /api/v1/workers/w2/land auth="Bearer tok-oauth"`,
 		`PUT /api/v1/workers/w2/prune auth="Bearer tok-oauth"`,
 	}
 	if fmt.Sprint(rec.requests) != fmt.Sprint(want) {
 		t.Fatalf("requests:\n%v\nwant:\n%v", rec.requests, want)
+	}
+	// land carries the worker's team (w2 → "ops") as JSON; prune
+	// stays bodyless — its handler never required one.
+	if len(rec.putBodies) != 2 ||
+		rec.putBodies[0] != `{"team":"ops"}` || rec.putBodies[1] != "" {
+		t.Fatalf("put bodies = %q, want [land-team, empty]", rec.putBodies)
 	}
 }
 
@@ -170,6 +183,7 @@ func TestATCClientNon2xx(t *testing.T) {
 	rec := &atcRecorder{
 		tokenCode: http.StatusOK,
 		tokenBody: `{"access_token":"t","token_type":"Bearer"}`,
+		workers:   `[{"name":"w","state":"running","team":"main"}]`,
 		putCode:   http.StatusInternalServerError,
 	}
 	srv := httptest.NewServer(rec.handler())

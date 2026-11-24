@@ -5,6 +5,7 @@
 package concoursejanitor
 
 import (
+	"bytes"
 	"context"
 	json "encoding/json/v2"
 	"errors"
@@ -107,14 +108,18 @@ func (c *atcClient) login(ctx context.Context, user, pass string) error {
 	return nil
 }
 
+// workerRef is the slice of GET /api/v1/workers the janitor consumes.
+type workerRef struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+	Team  string `json:"team"`
+}
+
 // workerState returns the ATC-recorded state of worker `name`
 // ("running", "landing", "landed", "stalled", "retiring", "retired"),
 // or "" when the worker is not registered at all.
 func (c *atcClient) workerState(ctx context.Context, name string) (string, error) {
-	var workers []struct {
-		Name  string `json:"name"`
-		State string `json:"state"`
-	}
+	var workers []workerRef
 	if err := c.doJSON(ctx, http.MethodGet, c.base+"/api/v1/workers", &workers); err != nil {
 		return "", err
 	}
@@ -127,11 +132,32 @@ func (c *atcClient) workerState(ctx context.Context, name string) (string, error
 }
 
 // landWorker PUTs /api/v1/workers/<name>/land — ATC stops scheduling
-// new builds onto the worker. Worker routes are NOT team-scoped on
-// Concourse 8.x (atc/routes.go).
+// new builds onto the worker. Concourse ≥8 requires a JSON body
+// carrying the worker's team: workerserver/land.go decodes an
+// atc.Worker and 400s on a decode failure or team mismatch, so the
+// pre-8.x empty-body shape always fails — fly reads the team from
+// ListWorkers, and so does this. Worker routes are still NOT
+// team-scoped in the URL itself (atc/routes.go).
 func (c *atcClient) landWorker(ctx context.Context, name string) error {
-	return c.doJSON(ctx, http.MethodPut,
-		fmt.Sprintf("%s/api/v1/workers/%s/land", c.base, url.PathEscape(name)), nil)
+	var workers []workerRef
+	if err := c.doJSON(ctx, http.MethodGet, c.base+"/api/v1/workers", &workers); err != nil {
+		return fmt.Errorf("atc workers list for land team: %w", err)
+	}
+	team := ""
+	for _, w := range workers {
+		if w.Name == name {
+			team = w.Team
+			break
+		}
+	}
+	payload, err := json.Marshal(struct {
+		Team string `json:"team"`
+	}{Team: team})
+	if err != nil {
+		return err
+	}
+	return c.doJSONBody(ctx, http.MethodPut,
+		fmt.Sprintf("%s/api/v1/workers/%s/land", c.base, url.PathEscape(name)), payload, nil)
 }
 
 // pruneWorker PUTs /api/v1/workers/<name>/prune — drops the worker
@@ -150,14 +176,20 @@ func (c *atcClient) pruneWorker(ctx context.Context, name string) error {
 // credentials and retries the request EXACTLY once — no loop; a
 // second 401 (or a failed re-login) surfaces as the error it is.
 func (c *atcClient) doJSON(ctx context.Context, method, endpoint string, out any) error {
-	status, err := c.atcDo(ctx, method, endpoint, out)
+	return c.doJSONBody(ctx, method, endpoint, nil, out)
+}
+
+// doJSONBody is doJSON with a request body (land's team payload);
+// a non-nil body is sent as application/json.
+func (c *atcClient) doJSONBody(ctx context.Context, method, endpoint string, body []byte, out any) error {
+	status, err := c.atcDo(ctx, method, endpoint, body, out)
 	if err == nil || status != http.StatusUnauthorized {
 		return err
 	}
 	if err := c.relogin(ctx); err != nil {
 		return fmt.Errorf("atc re-login after 401 on %s %s: %w", method, endpoint, err)
 	}
-	_, err = c.atcDo(ctx, method, endpoint, out)
+	_, err = c.atcDo(ctx, method, endpoint, body, out)
 	return err
 }
 
@@ -172,13 +204,20 @@ func (c *atcClient) relogin(ctx context.Context) error {
 // atcDo issues ONE authenticated request; status is the HTTP status
 // code (0 on transport error) and err the transport/status/decode
 // error — a non-2xx status is an error carrying the status line.
-func (c *atcClient) atcDo(ctx context.Context, method, endpoint string, out any) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
+func (c *atcClient) atcDo(ctx context.Context, method, endpoint string, body []byte, out any) (int, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, rdr)
 	if err != nil {
 		return 0, err
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", c.token)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
