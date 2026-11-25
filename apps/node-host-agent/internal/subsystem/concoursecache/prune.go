@@ -409,7 +409,7 @@ func (p *Pruner) deleteEmptyDirsRoot(ctx context.Context, dirRoot *os.Root, dirL
 		}
 	}
 	if n > 0 {
-		log.Info("empty dirs pruned", "dir", dirLabel, "dirs", n)
+		log.Info("empty dirs pruned", "bucket", dirLabel, "dirs", n)
 	}
 }
 
@@ -454,7 +454,7 @@ func (p *Pruner) capTopLevelDirsRoot(ctx context.Context, scRoot *os.Root, bucke
 			p.bytesFreed.Add(float64(dsz))
 		} else {
 			log.Warn(bucket+": rm -rf failed — cap accounting may overshoot",
-				"dir", d.path, "error", err)
+				"entry", d.path, "error", err)
 		}
 		// freed is accumulated unconditionally — the shell did
 		// `rm -rf; freed+=dsz` without checking rm's exit.
@@ -486,7 +486,7 @@ func (p *Pruner) pruneNodeDepsRoot(ctx context.Context, scRoot *os.Root, cfg Con
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Warn("node-deps: cannot list dir — skipped",
-				"dir", filepath.Join(scRoot.Name(), "node-deps"), "error", err)
+				"bucket", filepath.Join(scRoot.Name(), "node-deps"), "error", err)
 		}
 		return
 	}
@@ -508,15 +508,15 @@ func (p *Pruner) pruneNodeDepsRoot(ctx context.Context, scRoot *os.Root, cfg Con
 				continue
 			}
 			if err := removeTreeRoot(dirRoot, e.Name()); err == nil {
-				log.Info("node-deps: aged cksum dir removed", "dir", e.Name())
+				log.Info("node-deps: aged cksum dir removed", "entry", e.Name())
 			} else {
 				log.Warn("node-deps: cksum dir removal failed",
-					"dir", e.Name(), "error", err)
+					"entry", e.Name(), "error", err)
 			}
 		}
 	} else {
 		log.Warn("node-deps: cannot list dir — aged cksum dirs not pruned",
-			"dir", "node-deps", "error", err)
+			"bucket", "node-deps", "error", err)
 	}
 
 	// Stale .lock-*/.tmp-* FILES at any depth (-mmin +60).
@@ -585,15 +585,15 @@ func (p *Pruner) pruneNodeDepsRoot(ctx context.Context, scRoot *os.Root, cfg Con
 				continue
 			}
 			if err := removeTreeRoot(dirRoot, e.Name()); err == nil {
-				log.Info("node-deps: stale staging dir removed", "dir", e.Name())
+				log.Info("node-deps: stale staging dir removed", "entry", e.Name())
 			} else {
 				log.Warn("node-deps: staging dir removal failed",
-					"dir", e.Name(), "error", err)
+					"entry", e.Name(), "error", err)
 			}
 		}
 	} else {
 		log.Warn("node-deps: cannot list dir — stale staging dirs not pruned",
-			"dir", "node-deps", "error", err)
+			"bucket", "node-deps", "error", err)
 	}
 
 	p.capTopLevelDirsRoot(ctx, scRoot, "node-deps",

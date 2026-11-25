@@ -741,6 +741,108 @@ func TestClockSkewAdjtimexFallback(t *testing.T) {
 	}
 }
 
+func TestClockSkewTimesyncdFallback(t *testing.T) {
+	runCase := func(t *testing.T, isActiveErr, isEnabledErr, restartErr error) (cmds []string, markerExists bool) {
+		t.Helper()
+		f := kfixture(t)
+		now := time.Unix(1_700_000_000, 0)
+		f.deps.Clock.Set(func() time.Time { return now })
+		f.deps.Adjtimex = func(tx *unix.Timex) (int, error) {
+			tx.Offset = 3_000_000 // 3s (> 0.5s step threshold)
+			tx.Status = 0
+			return 0, nil
+		}
+		f.r.deps.Adjtimex = f.deps.Adjtimex
+		f.r.deps.RunHostCmd = func(_ context.Context, argv ...string) (string, error) {
+			cmd := strings.Join(argv, " ")
+			cmds = append(cmds, cmd)
+			switch cmd {
+			case "chronyc tracking":
+				return "", errors.New("chronyc not found")
+			case "chronyc makestep":
+				return "", errors.New("chronyc not found")
+			case "systemctl is-active --quiet systemd-timesyncd":
+				return "", isActiveErr
+			case "systemctl is-enabled --quiet systemd-timesyncd":
+				return "", isEnabledErr
+			case "systemctl restart systemd-timesyncd":
+				return "", restartErr
+			default:
+				t.Fatalf("unexpected RunHostCmd: %v", argv)
+				return "", nil
+			}
+		}
+		f.r.checkClockSkew(context.Background())
+		_, err := os.Stat(f.r.statePath(clockSteppedMarkerFile))
+		return cmds, err == nil
+	}
+
+	t.Run("chronyc fails + timesyncd active -> restarts and writes marker", func(t *testing.T) {
+		cmds, marker := runCase(t, nil, errors.New("unused"), nil)
+		if !marker {
+			t.Fatal("clock-stepped marker not written after successful systemd-timesyncd restart")
+		}
+		want := []string{
+			"chronyc tracking",
+			"chronyc makestep",
+			"systemctl is-active --quiet systemd-timesyncd",
+			"systemctl restart systemd-timesyncd",
+		}
+		if strings.Join(cmds, "|") != strings.Join(want, "|") {
+			t.Fatalf("cmds = %v, want %v", cmds, want)
+		}
+	})
+
+	t.Run("chronyc fails + timesyncd inactive but enabled -> restarts and writes marker", func(t *testing.T) {
+		cmds, marker := runCase(t, errors.New("inactive"), nil, nil)
+		if !marker {
+			t.Fatal("clock-stepped marker not written after successful systemd-timesyncd restart")
+		}
+		want := []string{
+			"chronyc tracking",
+			"chronyc makestep",
+			"systemctl is-active --quiet systemd-timesyncd",
+			"systemctl is-enabled --quiet systemd-timesyncd",
+			"systemctl restart systemd-timesyncd",
+		}
+		if strings.Join(cmds, "|") != strings.Join(want, "|") {
+			t.Fatalf("cmds = %v, want %v", cmds, want)
+		}
+	})
+
+	t.Run("chronyc fails + timesyncd inactive and disabled -> no restart and no marker", func(t *testing.T) {
+		cmds, marker := runCase(t, errors.New("inactive"), errors.New("disabled"), nil)
+		if marker {
+			t.Fatal("clock-stepped marker written when systemd-timesyncd was neither active nor enabled")
+		}
+		want := []string{
+			"chronyc tracking",
+			"chronyc makestep",
+			"systemctl is-active --quiet systemd-timesyncd",
+			"systemctl is-enabled --quiet systemd-timesyncd",
+		}
+		if strings.Join(cmds, "|") != strings.Join(want, "|") {
+			t.Fatalf("cmds = %v, want %v", cmds, want)
+		}
+	})
+
+	t.Run("chronyc fails + timesyncd active + restart fails -> no marker", func(t *testing.T) {
+		cmds, marker := runCase(t, nil, errors.New("unused"), errors.New("restart failed"))
+		if marker {
+			t.Fatal("clock-stepped marker written when systemctl restart systemd-timesyncd failed")
+		}
+		want := []string{
+			"chronyc tracking",
+			"chronyc makestep",
+			"systemctl is-active --quiet systemd-timesyncd",
+			"systemctl restart systemd-timesyncd",
+		}
+		if strings.Join(cmds, "|") != strings.Join(want, "|") {
+			t.Fatalf("cmds = %v, want %v", cmds, want)
+		}
+	})
+}
+
 // TestClockWarpPromInstallFailure: a failed textfile install is a
 // Warn — the detector keeps running and the event count stays put.
 func TestClockWarpPromInstallFailure(t *testing.T) {

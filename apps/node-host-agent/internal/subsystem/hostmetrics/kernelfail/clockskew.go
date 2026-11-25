@@ -119,8 +119,33 @@ func (r *Runner) checkClockSkew(ctx context.Context) {
 		r.deps.Store.RateTrySpend(clockStepBudgetFile, clockSkewMakestepGap) {
 		out, err := r.deps.RunHostCmd(ctx, "chronyc", "makestep")
 		if err != nil {
-			logger().Warn("hostmetrics: chronyc makestep failed",
-				"error", err, "out", strings.TrimSpace(out))
+			// On hosts running systemd-timesyncd instead of chrony,
+			// chronyc is absent or fails — fall back to restarting
+			// systemd-timesyncd ONLY when it is active or enabled so we
+			// never start a dormant timesyncd alongside chrony.
+			_, actErr := r.deps.RunHostCmd(ctx, "systemctl", "is-active", "--quiet", "systemd-timesyncd")
+			timesyncdManaged := actErr == nil
+			if !timesyncdManaged {
+				_, enErr := r.deps.RunHostCmd(ctx, "systemctl", "is-enabled", "--quiet", "systemd-timesyncd")
+				timesyncdManaged = enErr == nil
+			}
+			if timesyncdManaged {
+				rout, rerr := r.deps.RunHostCmd(ctx, "systemctl", "restart", "systemd-timesyncd")
+				if rerr != nil {
+					logger().Warn("hostmetrics: chronyc makestep and systemd-timesyncd restart failed",
+						"chronycError", err, "chronycOut", strings.TrimSpace(out),
+						"restartError", rerr, "restartOut", strings.TrimSpace(rout))
+				} else {
+					logger().Warn("hostmetrics: ACTION systemctl restart systemd-timesyncd — "+
+						"clock offset beyond step threshold",
+						"offset", off, "synced", synced, "chronycError", err)
+					r.deps.Store.WriteEpochFile(
+						r.statePath(clockSteppedMarkerFile), r.deps.Clock.Now().Unix())
+				}
+			} else {
+				logger().Warn("hostmetrics: chronyc makestep failed",
+					"error", err, "out", strings.TrimSpace(out))
+			}
 		} else {
 			logger().Warn("hostmetrics: ACTION chronyc makestep — "+
 				"clock offset beyond step threshold",

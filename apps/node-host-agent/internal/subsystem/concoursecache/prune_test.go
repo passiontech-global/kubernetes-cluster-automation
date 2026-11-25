@@ -5,8 +5,12 @@
 package concoursecache
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -562,4 +566,120 @@ func TestGoBuildGraceSurvivesSizeCap(t *testing.T) {
 
 	ccPresent(t, young) // <2h — never a cap candidate
 	ccMissing(t, old)   // >2h — trimmed
+}
+
+func assertNoDuplicateJSONKeys(t *testing.T, line string) map[string]any {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(line))
+	tok, err := dec.Token()
+	if err != nil {
+		t.Fatalf("decode start token for %q: %v", line, err)
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		t.Fatalf("expected JSON object for %q, got %v", line, tok)
+	}
+	seen := make(map[string]any)
+	for dec.More() {
+		ktok, err := dec.Token()
+		if err != nil {
+			t.Fatalf("decode key token in %q: %v", line, err)
+		}
+		k, ok := ktok.(string)
+		if !ok {
+			t.Fatalf("expected string key in %q, got %T", line, ktok)
+		}
+		if _, dup := seen[k]; dup {
+			t.Fatalf("duplicate JSON log key %q in line: %s", k, line)
+		}
+		var val any
+		if err := dec.Decode(&val); err != nil {
+			t.Fatalf("decode value for %q in %q: %v", k, line, err)
+		}
+		seen[k] = val
+	}
+	if _, err := dec.Token(); err != nil && err != io.EOF {
+		t.Fatalf("decode closing brace in %q: %v", line, err)
+	}
+	return seen
+}
+
+func TestSweepJSONLogsNoDuplicateKeys(t *testing.T) {
+	oldDefault := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(oldDefault) })
+
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("jsonlog"))
+	// Trigger empty dirs pruned + age prune in build bucket.
+	ccFile(t, filepath.Join(sc, "build", "old-file"), 4, 48*time.Hour)
+	ccDir(t, filepath.Join(sc, "build", "empty-sub"), 48*time.Hour)
+	// Trigger node-deps aged cksum dir + stale staging dir removed.
+	ccDir(t, filepath.Join(sc, "node-deps", "deadbeef"), 10*24*time.Hour)
+	ccDir(t, filepath.Join(sc, "node-deps", "pkg.tmp-1234"), 2*time.Hour)
+
+	p := ccPruner(t, func(c *Config) {
+		c.statfsFn = ccStatfs(80, 0) // >= DiskHighPct (75), < DiskCritPct (85) → "high"
+	})
+	if err := p.Sweep(context.Background(), root); err != nil {
+		t.Fatalf("Sweep (high): %v", err)
+	}
+	// Also exercise crit escalation (>= DiskCritPct) and enforcePerms failure path.
+	pCrit := ccPruner(t, func(c *Config) {
+		c.statfsFn = ccStatfs(90, 0)
+	})
+	if err := pCrit.Sweep(context.Background(), root); err != nil {
+		t.Fatalf("Sweep (crit): %v", err)
+	}
+	p.enforcePerms(filepath.Join(root, "does-not-exist"), logger())
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) < 6 {
+		t.Fatalf("expected multiple JSON log lines, got %d:\n%s", len(lines), buf.String())
+	}
+	var sawEmptyDirs, sawAgedCksum, sawStaging, sawEnforceFail, sawEscHigh, sawEscCrit bool
+	for _, ln := range lines {
+		obj := assertNoDuplicateJSONKeys(t, ln)
+		if _, hasDir := obj["dir"]; hasDir {
+			t.Fatalf("unexpected \"dir\" key in JSON log line: %s", ln)
+		}
+		if _, hasRoot := obj["cacheRoot"]; !hasRoot {
+			t.Fatalf("missing \"cacheRoot\" key in JSON log line: %s", ln)
+		}
+		switch obj["msg"] {
+		case "fs pressure — escalating shared-cache prune":
+			if obj["level"] != "WARN" {
+				t.Fatalf("escalated log level = %v, want WARN", obj["level"])
+			}
+			switch obj["pressureLevel"] {
+			case "high":
+				sawEscHigh = true
+			case "crit":
+				sawEscCrit = true
+			default:
+				t.Fatalf("unexpected pressureLevel = %v in line: %s", obj["pressureLevel"], ln)
+			}
+		case "empty dirs pruned":
+			sawEmptyDirs = true
+			if obj["bucket"] != "build" {
+				t.Fatalf("empty dirs pruned bucket = %v, want build", obj["bucket"])
+			}
+		case "node-deps: aged cksum dir removed":
+			sawAgedCksum = true
+			if obj["entry"] != "deadbeef" {
+				t.Fatalf("aged cksum dir entry = %v, want deadbeef", obj["entry"])
+			}
+		case "node-deps: stale staging dir removed":
+			sawStaging = true
+			if obj["entry"] != "pkg.tmp-1234" {
+				t.Fatalf("stale staging dir entry = %v, want pkg.tmp-1234", obj["entry"])
+			}
+		case "cannot open shared-cache root — perms not enforced":
+			sawEnforceFail = true
+		}
+	}
+	if !sawEmptyDirs || !sawAgedCksum || !sawStaging || !sawEnforceFail || !sawEscHigh || !sawEscCrit {
+		t.Fatalf("missing expected log lines (empty=%v aged=%v staging=%v enforceFail=%v escHigh=%v escCrit=%v):\n%s",
+			sawEmptyDirs, sawAgedCksum, sawStaging, sawEnforceFail, sawEscHigh, sawEscCrit, buf.String())
+	}
 }

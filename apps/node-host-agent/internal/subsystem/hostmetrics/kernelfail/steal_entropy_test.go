@@ -145,14 +145,17 @@ func TestClockSteppedMarker(t *testing.T) {
 	defer func() { f.r.deps.RunHostCmd = orig }()
 	markStep := func(fail bool) {
 		f.r.deps.RunHostCmd = func(ctx context.Context, argv ...string) (string, error) {
-			if len(argv) > 1 && argv[1] == "makestep" {
+			if len(argv) > 1 && argv[0] == "chronyc" && argv[1] == "makestep" {
 				if fail {
 					return "", fmt.Errorf("makestep rejected")
 				}
 				return "", nil
 			}
-			return "System time     : 3.0 seconds fast of NTP time\n" +
-				"Leap status     : Not synchronised\n", nil
+			if len(argv) > 1 && argv[0] == "chronyc" && argv[1] == "tracking" {
+				return "System time     : 3.0 seconds fast of NTP time\n" +
+					"Leap status     : Not synchronised\n", nil
+			}
+			return "", fmt.Errorf("unit not active/enabled")
 		}
 	}
 	marker := filepath.Join(f.deps.StateDir, clockSteppedMarkerFile)

@@ -65,8 +65,8 @@ func (p *Pruner) Sweep(ctx context.Context, openebsRoot string) error {
 }
 
 func (p *Pruner) pruneSharedCacheRoot(ctx context.Context, scRoot *os.Root, scDisplay string) {
-	log := logger().With("subsystem", "concourse-cache", "dir", scDisplay)
-	p.enforcePermsRoot(scRoot, scDisplay, log)
+	log := logger().With("subsystem", "concourse-cache", "cacheRoot", scDisplay)
+	p.enforcePermsRoot(scRoot, log)
 	eff := p.escalatedLimits(scDisplay, log)
 
 	// go-build: stale entries + its own size cap.
@@ -164,7 +164,7 @@ func (p *Pruner) escalatedLimits(sc string, log *slog.Logger) Config {
 		level = "crit"
 	}
 	log.Warn("fs pressure — escalating shared-cache prune",
-		"usedPct", pct, "level", level)
+		"usedPct", pct, "pressureLevel", level)
 	return eff
 }
 
@@ -177,14 +177,14 @@ func (p *Pruner) enforcePerms(sc string, log *slog.Logger) {
 	scRoot, err := openDirRootNoSymlink(sc)
 	if err != nil {
 		log.Debug("cannot open shared-cache root — perms not enforced",
-			"dir", sc, "error", err)
+			"cacheRoot", sc, "error", err)
 		return
 	}
 	defer func() { _ = scRoot.Close() }()
-	p.enforcePermsRoot(scRoot, sc, log)
+	p.enforcePermsRoot(scRoot, log.With("cacheRoot", sc))
 }
 
-func (p *Pruner) enforcePermsRoot(scRoot *os.Root, scDisplay string, log *slog.Logger) {
+func (p *Pruner) enforcePermsRoot(scRoot *os.Root, log *slog.Logger) {
 	targets := []string{"."}
 	if entries, err := fs.ReadDir(scRoot.FS(), "."); err == nil {
 		for _, e := range entries {
@@ -202,7 +202,7 @@ func (p *Pruner) enforcePermsRoot(scRoot *os.Root, scDisplay string, log *slog.L
 		}
 	} else {
 		log.Debug("cannot list shared-cache — perms enforced on root only",
-			"dir", scDisplay, "error", err)
+			"error", err)
 	}
 	for _, t := range targets {
 		// fd-based: open O_NOFOLLOW relative to scRoot + Fchown/Fchmod
