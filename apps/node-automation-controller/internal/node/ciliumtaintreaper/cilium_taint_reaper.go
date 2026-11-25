@@ -85,17 +85,25 @@ var ciliumTaintChanges = shared.NodeUpdatePredicate(true, func(oldN, newN *corev
 	return !equality.Semantic.DeepEqual(ciliumStaleTaints(oldN), ciliumStaleTaints(newN))
 })
 
+func newReaper(d shared.Deps) *ciliumTaintReaper {
+	cached := d.CachedClient()
+	var podReader kube.CachedNodeReader
+	if kube.KubeSystemPodInformerEnabled() {
+		podReader = cached
+	}
+	return &ciliumTaintReaper{cs: d.CS, nodeReader: cached, podReader: podReader}
+}
+
 func Setup(d shared.Deps) error {
-	mgr, cs := d.Mgr, d.CS
+	mgr := d.Mgr
 	// Clusters without the cilium component (and thus without pods
 	// watch RBAC) skip registration entirely — CILIUM_TAINT_REAPER_ENABLED
 	// is opt-in, resolved by setupModules into Deps.Disabled: no
 	// controller, no informer, no RequeueAfter loop. The manager
 	// cache's cilium-pod ByObject entry exists only for this module.
 	return shared.SetupNoConfig(d, func() error {
-		cached := d.CachedClient()
-		r := &ciliumTaintReaper{cs: cs, nodeReader: cached, podReader: cached}
-		return ctrl.NewControllerManagedBy(mgr).
+		r := newReaper(d)
+		b := ctrl.NewControllerManagedBy(mgr).
 			Named(d.Name).
 			// Watches with a single fixed workqueue key, not For(): the
 			// reconcile ignores req.Name and always sweeps the whole
@@ -105,15 +113,15 @@ func Setup(d shared.Deps) error {
 			// shared.SweepRequests). Predicate semantics are unchanged.
 			Watches(&corev1.Node{},
 				handler.EnqueueRequestsFromMapFunc(nodeSweepRequests),
-				builder.WithPredicates(ciliumTaintChanges)).
+				builder.WithPredicates(ciliumTaintChanges))
+		if kube.KubeSystemPodInformerEnabled() {
 			// Also react when a node's cilium pod flips Ready/not-Ready.
 			// The pod informer is already scoped to kube-system +
 			// k8s-app=cilium (manager cache options) and only exists
-			// because this module registered, so no extra predicate is
-			// needed. Same fixed sweep key — the reconcile never read
-			// the pod's node name anyway.
-			Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(ciliumPodSweepRequests)).
-			Complete(shared.CountReconcile(d.Name, r.Reconcile))
+			// when startup SSAR proved kube-system pods list+watch RBAC.
+			b = b.Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(ciliumPodSweepRequests))
+		}
+		return b.Complete(shared.CountReconcile(d.Name, r.Reconcile))
 	})
 }
 
@@ -152,7 +160,7 @@ func (r *ciliumTaintReaper) Reconcile(ctx context.Context, _ reconcile.Request) 
 	// confirms and patches on the direct clientset, the only safe
 	// path for a destructive write.
 	var pods []corev1.Pod
-	if r.podReader != nil {
+	if r.podReader != nil && kube.KubeSystemPodInformerEnabled() {
 		var cached corev1.PodList
 		if err := r.podReader.List(ctx, &cached, client.InNamespace("kube-system"),
 			client.MatchingLabels{"k8s-app": "cilium"}); err != nil {

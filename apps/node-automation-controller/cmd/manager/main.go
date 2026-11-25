@@ -261,11 +261,13 @@ func run(sigCtx context.Context, args []string) error {
 	}
 	watchCRDs := canWatchCRDs(sigCtx, clients.cs, log)
 	kube.SetCRDInformerEnabled(watchCRDs)
+	watchPods := canWatchKubeSystemPods(sigCtx, clients.cs, log)
+	kube.SetKubeSystemPodInformerEnabled(watchPods)
 
 	crdSize := kube.NewCRDSizeTable(1024)
 	mgr, err := ctrl.NewManager(managerConfig(cfg),
 		buildMgrOptions(scheme, metricsAddr, probeAddr, leaderElect,
-			leaseDuration, renewDeadline, retryPeriod, leaderNS, leaderLock, crdSize, watchCRDs))
+			leaseDuration, renewDeadline, retryPeriod, leaderNS, leaderLock, crdSize, watchCRDs, watchPods))
 	if err != nil {
 		log.Error(err, "unable to create manager")
 		return err
@@ -497,22 +499,36 @@ func validateLoopbackBindAddr(addr string) error {
 }
 
 func canWatchCRDs(ctx context.Context, cs kubernetes.Interface, log logr.Logger) bool {
+	return canListWatchResource(ctx, cs, log,
+		"apiextensions.k8s.io", "customresourcedefinitions", "",
+		"SSAR denied or failed for CRD informer — falling back to targeted dynamic reads")
+}
+
+func canWatchKubeSystemPods(ctx context.Context, cs kubernetes.Interface, log logr.Logger) bool {
+	return canListWatchResource(ctx, cs, log,
+		"", "pods", "kube-system",
+		"SSAR denied or failed for kube-system Pod informer — falling back to direct Pod reads")
+}
+
+func canListWatchResource(ctx context.Context, cs kubernetes.Interface, log logr.Logger,
+	group, resource, namespace, deniedMsg string) bool {
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	for _, verb := range []string{"list", "watch"} {
 		sar := &authv1.SelfSubjectAccessReview{
 			Spec: authv1.SelfSubjectAccessReviewSpec{
 				ResourceAttributes: &authv1.ResourceAttributes{
-					Group:    "apiextensions.k8s.io",
-					Resource: "customresourcedefinitions",
-					Verb:     verb,
+					Group:     group,
+					Resource:  resource,
+					Namespace: namespace,
+					Verb:      verb,
 				},
 			},
 		}
 		res, err := cs.AuthorizationV1().SelfSubjectAccessReviews().Create(
 			sctx, sar, metav1.CreateOptions{})
-		if err != nil || !res.Status.Allowed {
-			log.Info("SSAR denied or failed for CRD informer — falling back to targeted dynamic reads",
+		if err != nil || res == nil || !res.Status.Allowed {
+			log.Info(deniedMsg,
 				"verb", verb, "allowed", res != nil && res.Status.Allowed, "error", err)
 			return false
 		}

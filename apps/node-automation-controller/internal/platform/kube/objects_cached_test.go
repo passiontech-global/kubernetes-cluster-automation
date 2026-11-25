@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -105,4 +106,77 @@ func TestGetSecretCached(t *testing.T) {
 	if r.key != (client.ObjectKey{Namespace: "passiontech-pipeline", Name: "creds"}) {
 		t.Fatalf("cache read key = %v", r.key)
 	}
+}
+
+type cachePodListReader struct {
+	pods  []corev1.Pod
+	lists int
+	err   error
+}
+
+func (r *cachePodListReader) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	r.lists++
+	if r.err != nil {
+		return r.err
+	}
+	pl := list.(*corev1.PodList)
+	pl.Items = append(pl.Items, r.pods...)
+	return nil
+}
+
+func TestListPodsCachedKubeSystemInformerGate(t *testing.T) {
+	ctx := t.Context()
+	defer SetKubeSystemPodInformerEnabled(true)
+	SetKubeSystemPodInformerEnabled(true)
+
+	directPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-system",
+			Name:      "coredns-direct",
+			Labels:    map[string]string{"k8s-app": "kube-dns"},
+		},
+	}
+	otherNSPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "apps",
+			Name:      "app-direct",
+			Labels:    map[string]string{"k8s-app": "kube-dns"},
+		},
+	}
+	cs := fake.NewSimpleClientset(directPod, otherNSPod)
+	sel := labels.SelectorFromSet(labels.Set{"k8s-app": "kube-dns"})
+
+	t.Run("nil reader uses direct cs", func(t *testing.T) {
+		got, err := ListPodsCached(ctx, nil, cs, "kube-system", sel)
+		if err != nil || len(got) != 1 || got[0].Name != "coredns-direct" {
+			t.Fatalf("got = (%v, %v), want [coredns-direct]", got, err)
+		}
+	})
+
+	t.Run("enabled uses cached reader", func(t *testing.T) {
+		SetKubeSystemPodInformerEnabled(true)
+		r := &cachePodListReader{pods: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "coredns-cached"}}}}
+		got, err := ListPodsCached(ctx, r, cs, "kube-system", sel)
+		if err != nil || len(got) != 1 || got[0].Name != "coredns-cached" || r.lists != 1 {
+			t.Fatalf("got = (%v, %v, lists=%d), want [coredns-cached] via cache", got, err, r.lists)
+		}
+	})
+
+	t.Run("disabled kube-system bypasses reader and uses direct cs", func(t *testing.T) {
+		SetKubeSystemPodInformerEnabled(false)
+		r := &cachePodListReader{err: errors.New("must not invoke cache when disabled")}
+		got, err := ListPodsCached(ctx, r, cs, "kube-system", sel)
+		if err != nil || len(got) != 1 || got[0].Name != "coredns-direct" || r.lists != 0 {
+			t.Fatalf("got = (%v, %v, lists=%d), want [coredns-direct] via direct cs", got, err, r.lists)
+		}
+	})
+
+	t.Run("disabled kube-system still uses reader for other namespaces", func(t *testing.T) {
+		SetKubeSystemPodInformerEnabled(false)
+		r := &cachePodListReader{pods: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "app-cached"}}}}
+		got, err := ListPodsCached(ctx, r, cs, "apps", sel)
+		if err != nil || len(got) != 1 || got[0].Name != "app-cached" || r.lists != 1 {
+			t.Fatalf("got = (%v, %v, lists=%d), want [app-cached] via cache", got, err, r.lists)
+		}
+	})
 }

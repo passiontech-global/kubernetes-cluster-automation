@@ -17,11 +17,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	toolscache "k8s.io/client-go/tools/cache"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -592,7 +598,7 @@ func TestPprofMuxAndMetricsServerSeparation(t *testing.T) {
 		t.Fatalf("/metrics on pprofMux: got %d, want 404", rec.Code)
 	}
 
-	opts := buildMgrOptions(runtime.NewScheme(), ":9115", ":8081", false, 0, 0, 0, "node-ops", nil, nil, false)
+	opts := buildMgrOptions(runtime.NewScheme(), ":9115", ":8081", false, 0, 0, 0, "node-ops", nil, nil, false, false)
 	if opts.Metrics.ExtraHandlers != nil {
 		t.Fatalf("Metrics.ExtraHandlers = %v, want nil (pprof must not mount on :9115)", opts.Metrics.ExtraHandlers)
 	}
@@ -684,4 +690,107 @@ func TestLeasePreemptRunnable(t *testing.T) {
 	if err := r.Start(ctx); err != nil {
 		t.Fatalf("Start with cancelled ctx: %v", err)
 	}
+}
+
+func TestCanWatchKubeSystemPods(t *testing.T) {
+	type verbCase struct {
+		name        string
+		allowed     map[string]bool
+		errVerb     string
+		nilRespVerb string
+		want        bool
+	}
+	cases := []verbCase{
+		{
+			name:    "allowed for list and watch",
+			allowed: map[string]bool{"list": true, "watch": true},
+			want:    true,
+		},
+		{
+			name:    "denied on list",
+			allowed: map[string]bool{"list": false, "watch": true},
+			want:    false,
+		},
+		{
+			name:    "denied on watch",
+			allowed: map[string]bool{"list": true, "watch": false},
+			want:    false,
+		},
+		{
+			name:    "error on SSAR",
+			allowed: map[string]bool{"list": true, "watch": true},
+			errVerb: "watch",
+			want:    false,
+		},
+		{
+			name:        "nil response without error",
+			allowed:     map[string]bool{"list": true, "watch": true},
+			nilRespVerb: "list",
+			want:        false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+			var seen []authv1.ResourceAttributes
+			cs.PrependReactor("create", "selfsubjectaccessreviews", func(a ktesting.Action) (bool, runtime.Object, error) {
+				obj := a.(ktesting.CreateAction).GetObject().(*authv1.SelfSubjectAccessReview)
+				ra := *obj.Spec.ResourceAttributes
+				seen = append(seen, ra)
+				if tc.errVerb == ra.Verb {
+					return true, nil, errors.New("apiserver unavailable")
+				}
+				if tc.nilRespVerb == ra.Verb {
+					return true, nil, nil
+				}
+				out := obj.DeepCopy()
+				out.Status.Allowed = tc.allowed[ra.Verb]
+				return true, out, nil
+			})
+			got := canWatchKubeSystemPods(t.Context(), cs, logr.Discard())
+			if got != tc.want {
+				t.Fatalf("canWatchKubeSystemPods() = %v, want %v", got, tc.want)
+			}
+			if len(seen) == 0 {
+				t.Fatal("expected at least one SSAR call")
+			}
+			for _, ra := range seen {
+				if ra.Group != "" || ra.Resource != "pods" || ra.Namespace != "kube-system" {
+					t.Fatalf("unexpected SSAR ResourceAttributes: %+v", ra)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildCacheOptionsPodInformer(t *testing.T) {
+	findPodCfg := func(opts map[client.Object]cache.ByObject) (cache.ByObject, bool) {
+		for obj, cfg := range opts {
+			if _, ok := obj.(*corev1.Pod); ok {
+				return cfg, true
+			}
+		}
+		return cache.ByObject{}, false
+	}
+
+	t.Run("watchPods=true includes scoped kube-system Pod informer", func(t *testing.T) {
+		opts := buildCacheOptions(nil, false, true)
+		podCfg, ok := findPodCfg(opts.ByObject)
+		if !ok {
+			t.Fatal("ByObject missing *corev1.Pod when watchPods=true")
+		}
+		if _, hasNS := podCfg.Namespaces["kube-system"]; !hasNS || len(podCfg.Namespaces) != 1 {
+			t.Fatalf("Pod Namespaces = %+v, want only kube-system", podCfg.Namespaces)
+		}
+		if podCfg.Label == nil || podCfg.Label.String() != podCacheLabelSelector.String() {
+			t.Fatalf("Pod Label selector = %v, want %v", podCfg.Label, podCacheLabelSelector)
+		}
+	})
+
+	t.Run("watchPods=false omits Pod informer", func(t *testing.T) {
+		opts := buildCacheOptions(nil, false, false)
+		if _, ok := findPodCfg(opts.ByObject); ok {
+			t.Fatal("ByObject unexpectedly includes *corev1.Pod when watchPods=false")
+		}
+	})
 }

@@ -65,7 +65,7 @@ Parsing rules (`libs/hostkit/envx` — the strict `Getenv*`/`Gate` family):
 
 | Env var | Module | Default | Notes |
 |---|---|---|---|
-| `CILIUM_TAINT_REAPER_ENABLED` | cilium-taint-reaper | opt-in (`"true"`) | Registration gate — removes cilium agent-not-ready taints (`kube-system` pods informer for `k8s-app in (cilium,kube-dns)` stays configured in the manager cache for `coredns-stale-watchdog` regardless). |
+| `CILIUM_TAINT_REAPER_ENABLED` | cilium-taint-reaper | opt-in (`"true"`) | Registration gate — removes cilium agent-not-ready taints (`kube-system` pods informer for `k8s-app in (cilium,kube-dns)` is registered in the manager cache for `cilium-taint-reaper` and `coredns-stale-watchdog` when startup SSAR proves `pods` list/watch RBAC in `kube-system`; otherwise both fall back to direct API reads). |
 | `PDB_WATCHDOG_ENABLED` | pdb-deadlock-watchdog | on unless `"false"` | Registration gate — detects PDBs deadlocking drains/evictions. |
 | `PDB_UNHEALTHY_EVICTION_PATCH_ENABLED` | pdb-deadlock-watchdog | on unless `"false"` | Sub-feature gate — cordoned-block relief: `"false"` disables patching `unhealthyPodEvictionPolicy=AlwaysAllow` on drain-blocked PDBs (report-only). Resolved at Setup. |
 | `PDB_CORDONED_UNHEALTHY_RELIEF_ENABLED` | pdb-deadlock-watchdog | on unless `"false"` | Sub-feature gate — cordoned-block relief: `"false"` disables the wedged-pod delete fallback that reschedules an unhealthy pod off a cordoned node. Resolved at Setup. |

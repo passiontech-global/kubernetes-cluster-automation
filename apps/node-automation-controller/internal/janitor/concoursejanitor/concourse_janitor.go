@@ -171,7 +171,10 @@ const (
 	// start but carries no baseline-nodefs-gib annotation. While
 	// it is still this fresh out of Ready the work-dir is
 	// near-empty, so the current nodefs reading IS the baseline.
-	cjBaselineStampWindow = 20 * time.Minute
+	// Exceeds the 30m sweep interval plus delay margin so a pod
+	// recreated just after a sweep is still caught on the next run
+	// rather than falling back to the imageFs+32GiB estimate.
+	cjBaselineStampWindow = 40 * time.Minute
 	// The Garden/baggageclaim fault signatures appear in the
 	// concourse-worker container's stdout; a bounded tail suffices —
 	// the lines repeat on every volume/container creation attempt.

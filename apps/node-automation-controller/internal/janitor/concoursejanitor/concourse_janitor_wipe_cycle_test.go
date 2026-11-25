@@ -278,6 +278,41 @@ func TestConcourseJanitorStampsBaselineOnFreshWorker(t *testing.T) {
 	}
 }
 
+// A worker Ready for 25m (between the old 20m window and the 40m
+// window covering the 30m sweep interval + margin) is still inside
+// cjBaselineStampWindow: it must be stamped with cjBaselineAnno and
+// NOT wiped on the fallback estimate.
+func TestConcourseJanitorStampsBaselineMidWindow(t *testing.T) {
+	var events []string
+	base := time.Now()
+	p := cjWorkerPod("concourse-worker-0", "uid-0", "node-a", true, nil)
+	p.Status.Conditions[0].LastTransitionTime = metav1.NewTime(base.Add(-25 * time.Minute))
+	cs := fake.NewSimpleClientset(
+		cjWorkerSTS(1), p, cjReadySibling(), cjLocalUsers())
+	st := &cjFakeStats{events: &events, calls: map[string]int{},
+		fn: func(string, int) (int64, int64, int64, error) {
+			return 150 * gib, 400 * gib, 10 * gib, nil // 37% nodefs, 108GiB fallback
+		}}
+	j := cjTestJanitor(cs, st,
+		&cjFakeATC{events: &events, states: map[string]string{}})
+	j.now = func() time.Time { return base }
+	if err := j.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gotPod := cjPod(t, cs, "concourse-worker-0")
+	if gotPod.UID != "uid-0" {
+		t.Fatalf("mid-window worker wiped on fallback estimate: uid %s", gotPod.UID)
+	}
+	if got := gotPod.Annotations[cjBaselineAnno]; got != "150" {
+		t.Fatalf("baseline annotation %q, want \"150\"", got)
+	}
+	for _, e := range events {
+		if e == "delete:concourse-worker-0" {
+			t.Fatalf("mid-window worker deleted: %v", events)
+		}
+	}
+}
+
 // The same pod past the stamp window keeps the fallback estimate —
 // its work-dir may already hold real build output, so stamping now
 // would hide it. workdir=150-10-32=108 > 100 → normal wipe.

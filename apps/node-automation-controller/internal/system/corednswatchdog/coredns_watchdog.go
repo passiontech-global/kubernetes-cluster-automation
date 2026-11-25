@@ -296,6 +296,26 @@ func (w *coreDNSWatchdog) dnsLayerProbe(ctx context.Context, podIP map[string]st
 	return res
 }
 
+func newCoreDNSWatchdog(d shared.Deps) *coreDNSWatchdog {
+	w := &coreDNSWatchdog{
+		verdict: d.Maintenance,
+		cs:      d.CS,
+		dyn:     d.Dyn,
+		http:    &http.Client{Timeout: 5 * time.Second, Transport: hosthttpx.PooledTransport(16, nil)},
+		queue:   d.Name,
+		now:     shared.SystemClock,
+	}
+	w.nodeReader = d.CachedClient()
+	if kube.KubeSystemPodInformerEnabled() {
+		w.podReader = d.CachedClient()
+	}
+	w.logHitFn = w.logHit
+	w.prevLogFn = w.previousLogLoopHit
+	w.dnsFn = w.dnsProbe
+	w.panicsFn = w.panics
+	return w
+}
+
 func Setup(d shared.Deps) error {
 	// No env knobs to parse — SetupNoConfig IS the Deps.Disabled gate,
 	// structural rather than comment-enforced: the module has no
@@ -303,19 +323,7 @@ func Setup(d shared.Deps) error {
 	// through setupModules into Disabled and this Setup needs no
 	// change.
 	return shared.SetupNoConfig(d, func() error {
-		w := &coreDNSWatchdog{
-			verdict: d.Maintenance,
-			cs:      d.CS,
-			dyn:     d.Dyn,
-			http:    &http.Client{Timeout: 5 * time.Second, Transport: hosthttpx.PooledTransport(16, nil)},
-			queue:   d.Name,
-			now:     shared.SystemClock,
-		}
-		w.nodeReader, w.podReader = d.CachedClient(), d.CachedClient()
-		w.logHitFn = w.logHit
-		w.prevLogFn = w.previousLogLoopHit
-		w.dnsFn = w.dnsProbe
-		w.panicsFn = w.panics
+		w := newCoreDNSWatchdog(d)
 		return shared.AddPeriodic(d.Mgr, w.queue, time.Minute, w.run)
 	})
 }

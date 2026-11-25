@@ -897,6 +897,116 @@ func TestExternalSecretEmptyKeyTemplateDataKeys(t *testing.T) {
 	}
 }
 
+func TestExternalSecretEmptyKeyTemplateMergePolicyAndTemplateFrom(t *testing.T) {
+	t.Run("mergePolicy=Merge audits union of template.data and spec.data", func(t *testing.T) {
+		es := esObj("apps", "es-merge", "True", time.Hour)
+		esDataKeys(es, "merged_key", "missing_data_key")
+		_ = unstructured.SetNestedField(es.Object, "Merge", "spec", "target", "template", "mergePolicy")
+		_ = unstructured.SetNestedMap(es.Object, map[string]any{
+			"tmpl_present": "val",
+			"tmpl_missing": "val2",
+		}, "spec", "target", "template", "data")
+		secret := esSecret("apps", "es-merge", map[string][]byte{
+			"merged_key":   []byte("ok"),
+			"tmpl_present": []byte("ok"),
+		}, nil)
+		n := &externalSecretNudge{queue: "externalsecret-nudge",
+			cs: kfake.NewSimpleClientset(secret), dyn: newDynFake(es),
+			storeReady: map[string]bool{}}
+		if err := n.nudge(ctx, true, true); err != nil {
+			t.Fatal(err)
+		}
+		if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-merge", "merged_key") {
+			t.Fatal("populated spec.data key flagged")
+		}
+		if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-merge", "tmpl_present") {
+			t.Fatal("populated template.data key flagged")
+		}
+		if !metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-merge", "missing_data_key") {
+			t.Fatal("missing spec.data key under mergePolicy=Merge not flagged")
+		}
+		if !metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-merge", "tmpl_missing") {
+			t.Fatal("missing template.data key under mergePolicy=Merge not flagged")
+		}
+	})
+
+	t.Run("mergePolicy=Replace with template.data ignores spec.data keys", func(t *testing.T) {
+		es := esObj("apps", "es-replace", "True", time.Hour)
+		esDataKeys(es, "tmpl_var")
+		_ = unstructured.SetNestedField(es.Object, "Replace", "spec", "target", "template", "mergePolicy")
+		_ = unstructured.SetNestedMap(es.Object, map[string]any{
+			"out_key": "{{ .tmpl_var }}",
+		}, "spec", "target", "template", "data")
+		secret := esSecret("apps", "es-replace", map[string][]byte{
+			"out_key": []byte("ok"),
+		}, nil)
+		n := &externalSecretNudge{queue: "externalsecret-nudge",
+			cs: kfake.NewSimpleClientset(secret), dyn: newDynFake(es),
+			storeReady: map[string]bool{}}
+		if err := n.nudge(ctx, true, true); err != nil {
+			t.Fatal(err)
+		}
+		if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-replace", "tmpl_var") {
+			t.Fatal("spec.data template variable flagged under mergePolicy=Replace")
+		}
+		if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-replace", "out_key") {
+			t.Fatal("populated template.data key flagged")
+		}
+	})
+
+	t.Run("templateFrom without template.data skips spec.data missing check but flags empty Secret keys", func(t *testing.T) {
+		es := esObj("apps", "es-tmplfrom", "True", time.Hour)
+		esDataKeys(es, "input_var")
+		_ = unstructured.SetNestedSlice(es.Object, []any{
+			map[string]any{"configMap": map[string]any{"name": "tpl-cm", "items": []any{map[string]any{"key": "tpl.yaml"}}}},
+		}, "spec", "target", "template", "templateFrom")
+		secret := esSecret("apps", "es-tmplfrom", map[string][]byte{
+			"rendered.yaml": []byte("content"),
+			"blank.yaml":    []byte("   "),
+		}, nil)
+		n := &externalSecretNudge{queue: "externalsecret-nudge",
+			cs: kfake.NewSimpleClientset(secret), dyn: newDynFake(es),
+			storeReady: map[string]bool{}}
+		if err := n.nudge(ctx, true, true); err != nil {
+			t.Fatal(err)
+		}
+		if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-tmplfrom", "input_var") {
+			t.Fatal("spec.data template variable flagged under templateFrom")
+		}
+		if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-tmplfrom", "rendered.yaml") {
+			t.Fatal("populated rendered key flagged")
+		}
+		if !metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-tmplfrom", "blank.yaml") {
+			t.Fatal("present-but-whitespace key in Secret not flagged under templateFrom")
+		}
+	})
+
+	t.Run("templateFrom with mergePolicy=Merge audits spec.data keys", func(t *testing.T) {
+		es := esObj("apps", "es-tmplfrom-merge", "True", time.Hour)
+		esDataKeys(es, "present_key", "missing_key")
+		_ = unstructured.SetNestedField(es.Object, "Merge", "spec", "target", "template", "mergePolicy")
+		_ = unstructured.SetNestedSlice(es.Object, []any{
+			map[string]any{"configMap": map[string]any{"name": "tpl-cm", "items": []any{map[string]any{"key": "tpl.yaml"}}}},
+		}, "spec", "target", "template", "templateFrom")
+		secret := esSecret("apps", "es-tmplfrom-merge", map[string][]byte{
+			"rendered.yaml": []byte("content"),
+			"present_key":   []byte("ok"),
+		}, nil)
+		n := &externalSecretNudge{queue: "externalsecret-nudge",
+			cs: kfake.NewSimpleClientset(secret), dyn: newDynFake(es),
+			storeReady: map[string]bool{}}
+		if err := n.nudge(ctx, true, true); err != nil {
+			t.Fatal(err)
+		}
+		if metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-tmplfrom-merge", "present_key") {
+			t.Fatal("populated merged spec.data key flagged")
+		}
+		if !metrics.ExternalSecretEmptyKey.DeleteLabelValues("apps", "es-tmplfrom-merge", "missing_key") {
+			t.Fatal("missing spec.data key under templateFrom+Merge not flagged")
+		}
+	})
+}
+
 // The empty skeleton an ESO-owned Secret can be left as after a failed
 // sync is deleted (UID precondition) right before the force-sync stamp
 // lands — the forced reconcile recreates it populated.

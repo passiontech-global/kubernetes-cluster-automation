@@ -4,15 +4,25 @@
 package ciliumtaintreaper
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -141,6 +151,131 @@ func TestSetupCiliumTaintReaperWatches(t *testing.T) {
 	h.Create(t.Context(), event.CreateEvent{Object: &corev1.Pod{}}, q)
 	if q.Len() != 0 {
 		t.Fatalf("nodeless pod enqueued %d requests, want 0", q.Len())
+	}
+}
+
+type stubMgrWithClientAndCache struct {
+	manager.Manager
+	c     client.Client
+	cache cache.Cache
+}
+
+func (s stubMgrWithClientAndCache) GetClient() client.Client { return s.c }
+func (s stubMgrWithClientAndCache) GetCache() cache.Cache    { return s.cache }
+
+type stubClient struct{ client.Client }
+
+type spyHandlerReg struct{}
+
+func (spyHandlerReg) HasSynced() bool                          { return true }
+func (spyHandlerReg) HasSyncedChecker() toolscache.DoneChecker { return nil }
+
+type spyInformer struct{ cache.Informer }
+
+func (spyInformer) AddEventHandler(toolscache.ResourceEventHandler) (toolscache.ResourceEventHandlerRegistration, error) {
+	return spyHandlerReg{}, nil
+}
+
+func (spyInformer) AddEventHandlerWithOptions(toolscache.ResourceEventHandler, toolscache.HandlerOptions) (toolscache.ResourceEventHandlerRegistration, error) {
+	return spyHandlerReg{}, nil
+}
+
+func (spyInformer) HasSynced() bool { return true }
+
+type spyCache struct {
+	cache.Cache
+	mu    sync.Mutex
+	types []string
+}
+
+func (s *spyCache) GetInformer(_ context.Context, obj client.Object, _ ...cache.InformerGetOption) (cache.Informer, error) {
+	s.mu.Lock()
+	s.types = append(s.types, fmt.Sprintf("%T", obj))
+	s.mu.Unlock()
+	return spyInformer{}, nil
+}
+
+func (s *spyCache) WaitForCacheSync(context.Context) bool { return false }
+
+func (s *spyCache) watchedTypes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := slices.Clone(s.types)
+	slices.Sort(out)
+	return out
+}
+
+func TestSetupKubeSystemPodInformerGate(t *testing.T) {
+	defer kube.SetKubeSystemPodInformerEnabled(true)
+
+	t.Run("disabled sets podReader nil and skips Pod watch", func(t *testing.T) {
+		kube.SetKubeSystemPodInformerEnabled(false)
+		sc := &spyCache{}
+		sm := testutil.NewStubManager()
+		m := stubMgrWithClientAndCache{Manager: sm, c: stubClient{}, cache: sc}
+		d := shared.Deps{Name: "cilium-taint-reaper", Mgr: m, CS: fake.NewSimpleClientset()}
+
+		r := newReaper(d)
+		if r.nodeReader == nil {
+			t.Fatal("expected nodeReader to remain wired")
+		}
+		if r.podReader != nil {
+			t.Fatalf("expected podReader == nil when disabled, got %v", r.podReader)
+		}
+
+		if err := Setup(d); err != nil {
+			t.Fatalf("Setup: %v", err)
+		}
+		if len(sm.Added) != 1 {
+			t.Fatalf("registered %d runnables, want 1", len(sm.Added))
+		}
+		_ = sm.Added[0].Start(t.Context())
+		got := sc.watchedTypes()
+		if !slices.Equal(got, []string{"*v1.Node"}) {
+			t.Fatalf("watched types = %v, want [*v1.Node]", got)
+		}
+	})
+
+	t.Run("enabled wires podReader and attaches Pod watch", func(t *testing.T) {
+		kube.SetKubeSystemPodInformerEnabled(true)
+		sc := &spyCache{}
+		sm := testutil.NewStubManager()
+		m := stubMgrWithClientAndCache{Manager: sm, c: stubClient{}, cache: sc}
+		d := shared.Deps{Name: "cilium-taint-reaper", Mgr: m, CS: fake.NewSimpleClientset()}
+
+		r := newReaper(d)
+		if r.nodeReader == nil || r.podReader == nil {
+			t.Fatalf("expected both readers wired, got node=%v pod=%v", r.nodeReader, r.podReader)
+		}
+		if err := Setup(d); err != nil {
+			t.Fatalf("Setup: %v", err)
+		}
+		_ = sm.Added[0].Start(t.Context())
+		got := sc.watchedTypes()
+		if !slices.Equal(got, []string{"*v1.Node", "*v1.Pod"}) {
+			t.Fatalf("watched types = %v, want [*v1.Node *v1.Pod]", got)
+		}
+	})
+}
+
+func TestCiliumTaintReaperPodInformerDisabledUsesDirectCS(t *testing.T) {
+	defer kube.SetKubeSystemPodInformerEnabled(true)
+	kube.SetKubeSystemPodInformerEnabled(false)
+
+	healthy := ciliumPod("n1", corev1.PodRunning, true)
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil, ciliumStaleTaint),
+		healthy)
+	pr := &stubPodReader{err: errors.New("cache must not be read when disabled")}
+	r := &ciliumTaintReaper{cs: cs, podReader: pr}
+	if _, err := r.Reconcile(t.Context(), reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if pr.lists != 0 {
+		t.Fatalf("cache podReader called %d times, want 0", pr.lists)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "n1").Spec.Taints, kube.TaintCiliumAgentNotReady) {
+		t.Fatal("stale taint not reaped via direct clientset fallback")
 	}
 }
 

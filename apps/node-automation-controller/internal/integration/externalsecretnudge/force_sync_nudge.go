@@ -351,31 +351,35 @@ func esTargetSecretName(es *unstructured.Unstructured) string {
 // — the keys ESO is expected to have written; a declared key absent
 // from the Secret is as poisonous as an empty one.
 //
-// spec.target.template.data owns the output key set when present:
-// each entry's key becomes a Secret key rendered from the spec.data
-// values exposed as template variables (secretKey postgres_password
-// feeds {{ .postgres_password }} inside values.yaml). With a template
-// map the spec.data[] secretKey names are template variables, NOT
+// When spec.target.template.data or spec.target.template.templateFrom
+// is present, the template owns the output key set under the default
+// mergePolicy ("Replace"): spec.data[].secretKey names are template
+// variables (and templateFrom renders output keys dynamically), NOT
 // Secret keys — auditing them flags every templated ES with false
-// "declared key missing" warnings.
+// "declared key missing" warnings. When mergePolicy == "Merge", ESO
+// merges spec.data[].secretKey directly into the target Secret along
+// with any template.data keys, so the union of both is expected.
 func esDeclaredKeys(es *unstructured.Unstructured) map[string]bool {
-	if tmpl, ok := kube.NestedMap(es.Object,
-		"spec", "target", "template", "data"); ok {
-		keys := make(map[string]bool, len(tmpl))
-		for k := range tmpl {
-			keys[k] = true
-		}
-		return keys
-	}
 	keys := map[string]bool{}
-	entries, _ := kube.NestedSlice(es.Object, "spec", "data")
-	for _, e := range entries {
-		m, ok := e.(map[string]any)
-		if !ok {
-			continue
-		}
-		if k, ok := kube.NestedString(m, "secretKey"); ok && k != "" {
-			keys[k] = true
+	tmpl, hasTmplData := kube.NestedMap(es.Object,
+		"spec", "target", "template", "data")
+	for k := range tmpl {
+		keys[k] = true
+	}
+	tmplFrom, _ := kube.NestedSlice(es.Object,
+		"spec", "target", "template", "templateFrom")
+	mergePolicy, _ := kube.NestedString(es.Object,
+		"spec", "target", "template", "mergePolicy")
+	if (!hasTmplData && len(tmplFrom) == 0) || mergePolicy == "Merge" {
+		entries, _ := kube.NestedSlice(es.Object, "spec", "data")
+		for _, e := range entries {
+			m, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if k, ok := kube.NestedString(m, "secretKey"); ok && k != "" {
+				keys[k] = true
+			}
 		}
 	}
 	return keys

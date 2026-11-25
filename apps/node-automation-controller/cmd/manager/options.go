@@ -67,7 +67,7 @@ var podCacheLabelSelector = func() labels.Selector {
 	return sel
 }()
 
-func buildCacheOptions(crdSize *kube.CRDSizeTable, watchCRDs bool) cache.Options {
+func buildCacheOptions(crdSize *kube.CRDSizeTable, watchCRDs, watchPods bool) cache.Options {
 	byObj := map[client.Object]cache.ByObject{
 		&appsv1.DaemonSet{}: {
 			Namespaces: map[string]cache.Config{"kube-system": {}},
@@ -86,10 +86,15 @@ func buildCacheOptions(crdSize *kube.CRDSizeTable, watchCRDs bool) cache.Options
 			Field: fields.SelectorFromSet(
 				fields.Set{"metadata.name": "passiontech-pipeline"}),
 		},
-		&corev1.Pod{}: {
+	}
+	// Register the kube-system Pod informer only when startup SSAR proved
+	// list+watch permissions on pods in kube-system; otherwise
+	// controller-runtime's reflector would log Forbidden watch errors.
+	if watchPods {
+		byObj[&corev1.Pod{}] = cache.ByObject{
 			Namespaces: map[string]cache.Config{"kube-system": {}},
 			Label:      podCacheLabelSelector,
-		},
+		}
 	}
 	// Register the CRD informer only when startup SSAR proved list+watch
 	// permissions on apiextensions.k8s.io/customresourcedefinitions;
@@ -177,7 +182,7 @@ func resolveLeaderNamespace() string {
 
 func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 	leaderElect bool, leaseDuration, renewDeadline, retryPeriod time.Duration,
-	leaderNS string, leaderLock resourcelock.Interface, crdSize *kube.CRDSizeTable, watchCRDs bool) ctrl.Options {
+	leaderNS string, leaderLock resourcelock.Interface, crdSize *kube.CRDSizeTable, watchCRDs, watchPods bool) ctrl.Options {
 	mgrOptions := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -189,7 +194,7 @@ func buildMgrOptions(scheme *runtime.Scheme, metricsAddr, probeAddr string,
 		LeaderElectionID:                    leaderElectionID,
 		LeaderElectionReleaseOnCancel:       true,
 		LeaderElectionResourceLockInterface: leaderLock,
-		Cache:                               buildCacheOptions(crdSize, watchCRDs),
+		Cache:                               buildCacheOptions(crdSize, watchCRDs, watchPods),
 		// RecoverPanic: a panicking reconcile must not take the
 		// whole manager down — controller-runtime recovers per
 		// invocation and surfaces the panic as a reconcile error.
