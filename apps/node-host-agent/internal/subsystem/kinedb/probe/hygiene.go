@@ -29,7 +29,7 @@
 //     classic way a postgres data disk fills to PANIC; past the
 //     10GiB critical threshold the orphan slot is dropped (5GiB only
 //     notes a warning).
-//  5. MultiXact age — MAX(age(datminmxid)) feeds
+//  5. MultiXact age — MAX(mxid_age(datminmxid)) feeds
 //     kine_db_multixact_age_transactions: the row-lock-share
 //     wraparound horizon, the lesser-known twin of the datfrozenxid
 //     wraparound item 3 watches.

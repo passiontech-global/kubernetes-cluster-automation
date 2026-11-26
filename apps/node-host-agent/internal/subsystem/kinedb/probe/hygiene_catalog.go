@@ -74,7 +74,9 @@ func (p *Probe) hygieneCatalogWithBatch(ctx context.Context, pg, user, pass stri
 	// MAX(max_value) is 0 and parseSeqCliffLines drops the whole reading.
 	seqFallbackQ := kdeps.SQLQuote(p.d.Cfg.Table + "_id_seq")
 	seqNameExpr := "COALESCE(" + seqByOID + ", " + seqFallbackQ + ")"
-	sql := "SELECT COALESCE(MAX(age(datminmxid)),0) FROM pg_database; " +
+	// mxid_age(datminmxid), NOT age(datminmxid): age() takes an XID and
+	// returns INT32_MAX (2147483647) when datminmxid < FirstNormalTransactionId (3).
+	sql := "SELECT COALESCE(MAX(mxid_age(datminmxid)),0) FROM pg_database; " +
 		"SELECT COUNT(indexrelid) FROM pg_index WHERE NOT indisvalid; " +
 		// MAX() folds the empty stats view into one 0|0 row. A plain
 		// SELECT returned ZERO rows under psql -tAc, shifting line(3)

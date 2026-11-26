@@ -77,7 +77,7 @@ func (p *Probe) emitXactTextfile(h *hygieneResult) {
 		return
 	}
 	var b promfile.Builder
-	mxidHelp := "MAX(age(datminmxid)) across databases — distance " +
+	mxidHelp := "MAX(mxid_age(datminmxid)) across databases — distance " +
 		"to MultiXact wraparound pressure."
 	if h.mxidSeen {
 		b.Gauge("kine_db_multixact_age_transactions", mxidHelp,

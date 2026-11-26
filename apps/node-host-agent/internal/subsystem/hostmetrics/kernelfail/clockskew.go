@@ -59,10 +59,14 @@ const (
 // nodes) do not install chrony, so probing/stepping with chronyc would
 // unconditionally fail with exit 127 ("No such file or directory").
 func (r *Runner) hostHasChronyc() bool {
-	root := strings.TrimRight(r.deps.HostRoot, "/")
-	if root == "" {
+	if r.deps.HostRoot == "/" {
 		_, err := exec.LookPath("chronyc")
 		return err == nil
+	}
+	root := strings.TrimRight(r.deps.HostRoot, "/")
+	if root == "" {
+		// Matches hostexec.DefaultHostRoot when HostRoot is left empty.
+		root = "/host"
 	}
 	for _, rel := range []string{
 		"usr/bin/chronyc",
@@ -169,15 +173,24 @@ func (r *Runner) checkClockSkew(ctx context.Context) {
 			if timesyncdManaged {
 				rout, rerr := r.deps.RunHostCmd(ctx, "systemctl", "restart", "systemd-timesyncd")
 				if rerr != nil {
-					logger().Warn("hostmetrics: systemd-timesyncd restart failed",
+					attrs := []any{
 						"triedChronyc", triedChrony,
-						"chronycError", err, "chronycOut", strings.TrimSpace(out),
-						"restartError", rerr, "restartOut", strings.TrimSpace(rout))
+						"restartError", rerr, "restartOut", strings.TrimSpace(rout),
+					}
+					if triedChrony {
+						attrs = append(attrs, "chronycError", err, "chronycOut", strings.TrimSpace(out))
+					}
+					logger().Warn("hostmetrics: systemd-timesyncd restart failed", attrs...)
 				} else {
-					logger().Warn("hostmetrics: ACTION systemctl restart systemd-timesyncd — "+
-						"clock offset beyond step threshold",
+					attrs := []any{
 						"offset", off, "synced", synced,
-						"triedChronyc", triedChrony, "chronycError", err)
+						"triedChronyc", triedChrony,
+					}
+					if triedChrony {
+						attrs = append(attrs, "chronycError", err)
+					}
+					logger().Warn("hostmetrics: ACTION systemctl restart systemd-timesyncd — "+
+						"clock offset beyond step threshold", attrs...)
 					r.deps.Store.WriteEpochFile(
 						r.statePath(clockSteppedMarkerFile), r.deps.Clock.Now().Unix())
 				}

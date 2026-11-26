@@ -291,11 +291,16 @@ func TestProbeArchiveStaleEmitsOne(t *testing.T) {
 // --- item 5: multiXact age ---
 
 func TestProbeHygieneMultiXactEmits(t *testing.T) {
-	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
+	gotBatch := probeBatchSQL("kine")
+	if !strings.Contains(gotBatch, "mxid_age(datminmxid)") ||
+		strings.Contains(strings.ReplaceAll(gotBatch, "mxid_age(datminmxid)", ""), "age(datminmxid)") {
+		t.Fatalf("probeBatchSQL must use mxid_age(datminmxid), not age(datminmxid): %s", gotBatch)
+	}
+	k, fr, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
 		// The catalog exec answers all three censuses in one
 		// multi-statement output: mxid line, invalid-index line,
 		// seq_scan|seq_tup_read line.
-		testutil.ExecRule{Substr: "datminmxid", Out: "250000\n1\n7|40000\n"},
+		testutil.ExecRule{Substr: "mxid_age(datminmxid)", Out: "250000\n1\n7|40000\n"},
 	))
 	res := k.Cycle(context.Background())
 	if !res.succeeded {
@@ -303,6 +308,12 @@ func TestProbeHygieneMultiXactEmits(t *testing.T) {
 	}
 	if res.hyg.mxidAge != 250000 || !res.hyg.mxidSeen {
 		t.Fatalf("mxid=%+v", res.hyg)
+	}
+	for _, argv := range fr.Cmds() {
+		cmd := strings.Join(argv, " ")
+		if strings.Contains(cmd, "datminmxid") && !strings.Contains(cmd, "mxid_age(datminmxid)") {
+			t.Fatalf("catalog query used age(datminmxid) instead of mxid_age(datminmxid): %s", cmd)
+		}
 	}
 	content := kdepstest.ReadText(t, dir, xactPromFile)
 	if !strings.Contains(content, "kine_db_multixact_age_transactions 250000") {
@@ -315,7 +326,7 @@ func TestProbeHygieneMultiXactEmits(t *testing.T) {
 // succeeds.
 func TestProbeHygieneMultiXactQueryFailure(t *testing.T) {
 	k, _, dir := fixture(t, append(append([]testutil.ExecRule{}, hygieneRules...),
-		testutil.ExecRule{Substr: "datminmxid", Err: errors.New("connection reset")},
+		testutil.ExecRule{Substr: "mxid_age(datminmxid)", Err: errors.New("connection reset")},
 	))
 	res := k.Cycle(context.Background())
 	if !res.succeeded {

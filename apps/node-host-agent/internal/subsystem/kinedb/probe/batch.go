@@ -81,7 +81,10 @@ func probeBatchSQL(table string) string {
 		"SELECT 'slot', slot_name, " +
 		"COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn),0)::bigint " +
 		"FROM pg_replication_slots WHERE NOT active; " +
-		"SELECT 'mxid', COALESCE(MAX(age(datminmxid)),0) FROM pg_database; " +
+		// mxid_age(datminmxid), NOT age(datminmxid): age() compares against
+		// current XID and returns INT32_MAX (2147483647) when datminmxid <
+		// FirstNormalTransactionId (3), e.g. fresh clusters with datminmxid=1.
+		"SELECT 'mxid', COALESCE(MAX(mxid_age(datminmxid)),0) FROM pg_database; " +
 		"SELECT 'invidx', COUNT(indexrelid) FROM pg_index WHERE NOT indisvalid; " +
 		"SELECT 'seq', COALESCE(MAX(seq_scan),0), COALESCE(MAX(seq_tup_read),0) " +
 		"FROM pg_stat_user_tables WHERE relname=" + tblQ + "; " +
