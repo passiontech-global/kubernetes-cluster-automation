@@ -55,6 +55,26 @@ func TestGroupBaseHostProtectionFilesConverge(t *testing.T) {
 		"/etc/apt/apt.conf.d/99-k8s-unattended-safety")); err != nil || fi.Mode().Perm() != 0o644 {
 		t.Fatalf("apt safety mode = %v want 0644", fi)
 	}
+	// Without /etc/needrestart on the host, the needrestart drop-in must not be created.
+	if _, err := os.Stat(filepath.Join(r.cfg.HostRoot,
+		"/etc/needrestart/conf.d/90-k0s-no-restart.conf")); !os.IsNotExist(err) {
+		t.Fatalf("needrestart drop-in created despite missing /etc/needrestart: err=%v", err)
+	}
+	// Once /etc/needrestart exists, groupBase converges 90-k0s-no-restart.conf.
+	if err := os.MkdirAll(filepath.Join(r.cfg.HostRoot, "/etc/needrestart"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c.groupBase()
+	nr := hostRead(t, r, "/etc/needrestart/conf.d/90-k0s-no-restart.conf")
+	for _, want := range []string{
+		`$nrconf{override_rc}{qr(^k0s)} = 0;`,
+		`$nrconf{override_rc}{qr(^containerd)} = 0;`,
+		`$nrconf{override_rc}{qr(^nebula)} = 0;`,
+	} {
+		if !strings.Contains(nr, want) {
+			t.Fatalf("needrestart safety drop-in missing %q:\n%s", want, nr)
+		}
+	}
 }
 
 // TestGroupBaseLogindInhibitTracksGraceVar — InhibitDelayMaxSec must

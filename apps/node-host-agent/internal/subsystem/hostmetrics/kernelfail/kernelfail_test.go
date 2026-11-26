@@ -742,6 +742,60 @@ func TestClockSkewAdjtimexFallback(t *testing.T) {
 	}
 }
 
+// TestClockSkewAdjtimexSTANano: per Linux adjtimex(2), when STA_NANO is set
+// in Timex.Status (systemd-timesyncd default), Timex.Offset is in nanoseconds,
+// not microseconds. A normal -47.7ms jitter (-47_700_000 ns) must NOT be
+// misread as -47.7s or trigger a systemd-timesyncd restart, whereas a genuine
+// 3s skew (3_000_000_000 ns) must still step and advance the latch streak.
+func TestClockSkewAdjtimexSTANano(t *testing.T) {
+	t.Run("STA_NANO sub-50ms jitter stays clean and skips timesyncd restart", func(t *testing.T) {
+		f := kfixture(t)
+		var cmds []string
+		f.r.deps.RunHostCmd = func(_ context.Context, argv ...string) (string, error) {
+			cmds = append(cmds, strings.Join(argv, " "))
+			return "", nil
+		}
+		f.r.deps.Adjtimex = func(tx *unix.Timex) (int, error) {
+			tx.Offset = -47_700_000 // -47.7ms in ns (would be -47.7s if wrongly divided by 1e6)
+			tx.Status = unix.STA_NANO
+			return 0, nil
+		}
+
+		f.r.checkClockSkew(context.Background())
+		if len(cmds) != 0 {
+			t.Fatalf("STA_NANO -47.7ms jitter triggered host cmds: %v", cmds)
+		}
+		if _, err := os.Stat(f.r.statePath(clockSkewCountFile)); !os.IsNotExist(err) {
+			t.Fatal("STA_NANO -47.7ms jitter armed clock-skew counter")
+		}
+	})
+
+	t.Run("STA_NANO genuine 3s skew triggers step and increments streak", func(t *testing.T) {
+		f := kfixture(t)
+		restarted := false
+		f.r.deps.RunHostCmd = func(_ context.Context, argv ...string) (string, error) {
+			if strings.Join(argv, " ") == "systemctl restart systemd-timesyncd" {
+				restarted = true
+			}
+			return "", nil
+		}
+		f.r.deps.Adjtimex = func(tx *unix.Timex) (int, error) {
+			tx.Offset = 3_000_000_000 // +3.0s in ns
+			tx.Status = unix.STA_NANO
+			return 0, nil
+		}
+
+		f.r.checkClockSkew(context.Background())
+		if !restarted {
+			t.Fatal("STA_NANO 3s skew did not trigger systemd-timesyncd restart")
+		}
+		b, err := os.ReadFile(f.r.statePath(clockSkewCountFile))
+		if err != nil || strings.TrimSpace(string(b)) != "1" {
+			t.Fatalf("STA_NANO 3s skew count = %q (err=%v), want 1", b, err)
+		}
+	})
+}
+
 func TestClockSkewTimesyncdFallback(t *testing.T) {
 	runCase := func(t *testing.T, hasChronyc bool, isActiveErr, isEnabledErr, restartErr error) (cmds []string, markerExists bool) {
 		t.Helper()

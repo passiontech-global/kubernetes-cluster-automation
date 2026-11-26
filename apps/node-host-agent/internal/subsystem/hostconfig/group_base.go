@@ -222,6 +222,23 @@ Unattended-Upgrade::Package-Blacklist {
 Unattended-Upgrade::Automatic-Reboot "false";
 `), 0o644)
 
+	// needrestart safety: even with k0s*/containerd* blacklisted in
+	// unattended-upgrades, upgrading shared libraries (libc/libssl/dbus)
+	// invokes needrestart, which otherwise silently restarts
+	// k0sworker.service / k0scontroller.service / nebula (cicd 05:24Z
+	// full-cluster pod restart storm 2026-11-26). Only converged when
+	// /etc/needrestart is present on the host.
+	if r.fileExists("/etc/needrestart") {
+		_ = r.ensureDir("/etc/needrestart/conf.d", 0o755)
+		_, _ = r.writeManaged("/etc/needrestart/conf.d/90-k0s-no-restart.conf",
+			[]byte(`# Managed by node-config-agent - host-protection-drop-ins needrestart safety.
+# Prevent unattended-upgrades / needrestart from silently restarting k0s, containerd, or nebula.
+$nrconf{override_rc}{qr(^k0s)} = 0;
+$nrconf{override_rc}{qr(^containerd)} = 0;
+$nrconf{override_rc}{qr(^nebula)} = 0;
+`), 0o644)
+	}
+
 	// multipathd-mount-isolation multipathd isolation: on hosts where multipath-tools is
 	// installed, multipathd claims every new block device it can see —
 	// including /dev/longhorn/*, RBD images and plain sd*/vd*/nvme*

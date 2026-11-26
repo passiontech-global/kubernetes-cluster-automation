@@ -119,6 +119,26 @@ func TestPGBStarveReconnectAfterTwoProbes(t *testing.T) {
 	}
 }
 
+// When direct Postgres login fails (CheckBackendEnv==0, e.g. non-kine client
+// exhausted max_connections on :5432), cl_waiting > WaitMax must NOT restart
+// PgBouncer — bouncing the pooler drops live kine sessions without freeing
+// Postgres slots.
+func TestPGBSaturationSkipsRestartWhenBackendEnvFails(t *testing.T) {
+	const satPoolsOut = "database|user|cl_active|cl_waiting|sv_active|sv_idle|sv_used|sv_tested|sv_login|maxwait|maxwait_us|pool_mode\n" +
+		"postgres|postgres|10|50|5|0|0|0|0|15|0|transaction\n"
+	k, fr, _ := starveFixture(t, satPoolsOut)
+	// Direct backend_env login fails (max_connections exhausted on :5432).
+	fr.FailOn("-h 127.0.0.1 -U postgres -d postgres -tAc select 1",
+		errors.New("FATAL: sorry, too many clients already"))
+	res := k.Cycle(context.Background())
+	if res.Checks[CheckBackendEnv] != 0 {
+		t.Fatalf("expected backend_env=0, got %d", res.Checks[CheckBackendEnv])
+	}
+	if fr.Ran("restart kine-pgbouncer") {
+		t.Fatalf("PgBouncer restarted despite backend_env=0:\n%s", fr.Joined())
+	}
+}
+
 // cl_waiting>0 with sv_active==0 is the other starvation shape —
 // the queue exists but no server conn actually runs.
 func TestPGBStarveOnQueueWithNoActiveConns(t *testing.T) {

@@ -82,12 +82,25 @@ func (r *Runner) hostHasChronyc() bool {
 	return false
 }
 
+// timexOffsetSeconds converts unix.Timex.Offset to seconds. Per Linux
+// adjtimex(2), Offset is in nanoseconds when STA_NANO is set in Status
+// (systemd-timesyncd sets ADJ_NANO on modern kernels) and microseconds
+// otherwise. Dividing a STA_NANO offset by 1e6 inflates normal sub-50ms
+// jitter by 1,000x into fake multi-second clock skew and causes periodic
+// systemd-timesyncd restarts every 10 minutes.
+func timexOffsetSeconds(tx *unix.Timex) float64 {
+	if tx.Status&unix.STA_NANO != 0 {
+		return float64(tx.Offset) / 1e9
+	}
+	return float64(tx.Offset) / 1e6
+}
+
 func (r *Runner) clockSkewProbe(ctx context.Context) (float64, bool, bool) {
 	var tx unix.Timex
 	txOK := false
 	if _, err := r.deps.Adjtimex(&tx); err == nil {
 		txOK = true
-		off := float64(tx.Offset) / 1e6
+		off := timexOffsetSeconds(&tx)
 		if tx.Status&unix.STA_UNSYNC == 0 &&
 			math.Abs(off) <= clockSkewStepOffset {
 			return off, true, true
@@ -104,7 +117,7 @@ func (r *Runner) clockSkewProbe(ctx context.Context) (float64, bool, bool) {
 	if !txOK {
 		return 0, false, false
 	}
-	return float64(tx.Offset) / 1e6,
+	return timexOffsetSeconds(&tx),
 		tx.Status&unix.STA_UNSYNC == 0, true
 }
 

@@ -211,7 +211,13 @@ func (p *Probe) checkPGBWedge(ctx context.Context, pg, pgb, user, pass string,
 	dir := p.d.Cfg.GuardStateDir
 	failPath := filepath.Join(dir, pgbE2EFailFile)
 
-	saturated := res.poolSeen && res.pool.clWaiting > p.d.Cfg.WaitMax
+	// Gate saturation on backend_env==1 just like authWedge and starved:
+	// when direct Postgres login fails (e.g. a non-kine client exhausted
+	// max_connections on :5432), restarting PgBouncer drops live kine
+	// sessions without freeing Postgres slots (nonprod .15 incident
+	// 2026-11-26).
+	saturated := res.poolSeen && res.pool.clWaiting > p.d.Cfg.WaitMax &&
+		res.Checks[CheckBackendEnv] == 1
 	// e2e failed AND the raw backend env login still succeeded —
 	// backend_env==0 means postgres itself is broken and a pooler
 	// restart can't help.
