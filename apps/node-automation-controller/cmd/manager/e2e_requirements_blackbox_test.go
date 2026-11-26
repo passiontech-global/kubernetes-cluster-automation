@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -63,7 +64,7 @@ func TestE2ERequirements(t *testing.T) {
 		t.Fatalf("compile manager binary: %v\n%s", err, out)
 	}
 
-	sem := make(chan struct{}, 12)
+	sem := make(chan struct{}, min(max(goruntime.GOMAXPROCS(0), 2), 8))
 
 	t.Run("Tier1", func(t *testing.T) {
 		t.Parallel()
@@ -132,8 +133,9 @@ func reserveLoopbackPort(t *testing.T) string {
 	return ""
 }
 
-func waitReqManagerReady(rawURL string, timeout time.Duration, proc *managerProcess) (ready, bindCollision bool, lastCode int, lastErr error) {
+func waitReqManagerReady(probeURL, metricsURL string, timeout time.Duration, proc *managerProcess) (ready, bindCollision bool, lastCode int, lastErr error) {
 	deadline := time.Now().Add(timeout)
+	probeOK := false
 	for time.Now().Before(deadline) {
 		select {
 		case <-proc.done:
@@ -144,7 +146,17 @@ func waitReqManagerReady(rawURL string, timeout time.Duration, proc *managerProc
 			return false, false, lastCode, proc.waitErr
 		default:
 		}
-		code, _, err := httpGetBody(rawURL)
+		if !probeOK {
+			code, _, err := httpGetBody(probeURL)
+			if err != nil || code != http.StatusOK {
+				lastErr = err
+				lastCode = code
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			probeOK = true
+		}
+		code, _, err := httpGetBody(metricsURL)
 		if err == nil && code == http.StatusOK {
 			return true, false, code, nil
 		}
@@ -169,6 +181,7 @@ func startReqManager(t *testing.T, binPath string, srv *reqE2EAPIServer, extraEn
 		env := scrubbedKubeEnv(
 			"KUBECONFIG="+kubeconfig,
 			"NODE_AUTOMATION_PPROF_BIND_ADDRESS=",
+			"NODE_AUTOMATION_TEST_NO_INITIAL_JITTER=true",
 		)
 		env = append(env, extraEnv...)
 
@@ -183,7 +196,7 @@ func startReqManager(t *testing.T, binPath string, srv *reqE2EAPIServer, extraEn
 		args = append(args, extraArgs...)
 
 		proc = startManagerProcess(t, binPath, env, args...)
-		ready, bindCollision, lastCode, lastErr := waitReqManagerReady("http://"+probeAddr+"/readyz", 25*time.Second, proc)
+		ready, bindCollision, lastCode, lastErr := waitReqManagerReady("http://"+probeAddr+"/readyz", "http://"+metricsAddr+"/metrics", 45*time.Second, proc)
 		if ready {
 			t.Cleanup(func() {
 				select {
@@ -224,16 +237,24 @@ type metricSample struct {
 	Value  float64
 }
 
+func tryScrapeMetrics(metricsURL string) ([]metricSample, error) {
+	code, body, err := httpGetBody(metricsURL)
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("GET %s status = %d, want 200", metricsURL, code)
+	}
+	return parseMetricsText(body), nil
+}
+
 func scrapeMetrics(t *testing.T, metricsURL string) []metricSample {
 	t.Helper()
-	code, body, err := httpGetBody(metricsURL)
+	samples, err := tryScrapeMetrics(metricsURL)
 	if err != nil {
 		t.Fatalf("GET %s: %v", metricsURL, err)
 	}
-	if code != http.StatusOK {
-		t.Fatalf("GET %s status = %d, want 200", metricsURL, code)
-	}
-	return parseMetricsText(body)
+	return samples
 }
 
 func parseMetricsText(body string) []metricSample {
@@ -362,6 +383,7 @@ func waitForMetric(t *testing.T, metricsURL string, proc *managerProcess, timeou
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last []metricSample
+	var lastErr error
 	for time.Now().Before(deadline) {
 		select {
 		case <-proc.done:
@@ -369,14 +391,20 @@ func waitForMetric(t *testing.T, metricsURL string, proc *managerProcess, timeou
 				proc.waitErr, desc, proc.stdout.String(), proc.stderr.String())
 		default:
 		}
-		last = scrapeMetrics(t, metricsURL)
-		if pred(last) {
-			return last
+		samples, err := tryScrapeMetrics(metricsURL)
+		if err == nil {
+			last = samples
+			lastErr = nil
+			if pred(last) {
+				return last
+			}
+		} else {
+			lastErr = err
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
-	t.Fatalf("timed out after %s waiting for metric %s\nstdout:\n%s\nstderr:\n%s",
-		timeout, desc, proc.stdout.String(), proc.stderr.String())
+	t.Fatalf("timed out after %s waiting for metric %s (lastErr=%v)\nstdout:\n%s\nstderr:\n%s",
+		timeout, desc, lastErr, proc.stdout.String(), proc.stderr.String())
 	return last
 }
 

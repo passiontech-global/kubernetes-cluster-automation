@@ -951,7 +951,7 @@ func runTier2Tests(t *testing.T, binPath string, sem chan struct{}) {
 			srv := newReqE2EAPIServer(t)
 			srv.addErrorRule(http.MethodGet, "/api/v1/serviceaccounts", http.StatusInternalServerError, 1)
 			proc, _, _ := startReqManager(t, binPath, srv, []string{"CLUSTER_HEALTH_PROBES_INTERVAL=1s"}, "imagepull-secret-auditor,cluster-health-probes")
-			srv.waitForRequest(t, proc, 5*time.Second, "immediate retry of ServiceAccounts on cycle 2", func(r reqRecord) bool {
+			srv.waitForRequest(t, proc, 15*time.Second, "immediate retry of ServiceAccounts on cycle 2", func(r reqRecord) bool {
 				return srv.requestCount(func(x reqRecord) bool {
 					return x.Method == http.MethodGet && x.Path == "/api/v1/serviceaccounts"
 				}) >= 2

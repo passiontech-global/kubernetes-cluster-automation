@@ -104,13 +104,41 @@ func TestOperatorStuckPredicates(t *testing.T) {
 	if !staleObservedGeneration(never) {
 		t.Fatal("missing observedGeneration must read as stuck")
 	}
-	// Populated status WITHOUT status.observedGeneration means the CRD
-	// does not implement status.observedGeneration (e.g. Dragonfly,
-	// ExternalSecret, ScaledObject) — must NOT false-positive.
+	// Populated status WITHOUT status.observedGeneration (omitted/null) or
+	// with explicit observedGeneration=0 alongside populated conditions/phase
+	// means the CRD does not implement/populate status.observedGeneration —
+	// must NOT false-positive.
 	noOGWithPhase := probetest.UnstructuredObj("dragonflydb.io/v1alpha1", "Dragonfly", "db", "cache", 3, 0)
 	_ = unstructured.SetNestedField(noOGWithPhase.Object, "Ready", "status", "phase")
 	if staleObservedGeneration(noOGWithPhase) {
 		t.Fatal("populated status without observedGeneration must not read as stale_observed_generation")
+	}
+	nullOGWithConds := probetest.UnstructuredObj("external-secrets.io/v1", "ExternalSecret", "apps", "es", 3, 0)
+	_ = unstructured.SetNestedField(nullOGWithConds.Object, nil, "status", "observedGeneration")
+	_ = unstructured.SetNestedSlice(nullOGWithConds.Object, []any{
+		map[string]any{"type": "Ready", "status": "True"},
+	}, "status", "conditions")
+	if staleObservedGeneration(nullOGWithConds) {
+		t.Fatal("null observedGeneration with populated status must not read as stale_observed_generation")
+	}
+	zeroOGWithConds := probetest.UnstructuredObj("example.io/v1", "Widget", "apps", "w1", 3, 0)
+	_ = unstructured.SetNestedField(zeroOGWithConds.Object, int64(0), "status", "observedGeneration")
+	_ = unstructured.SetNestedSlice(zeroOGWithConds.Object, []any{
+		map[string]any{"type": "Ready", "status": "True"},
+	}, "status", "conditions")
+	if staleObservedGeneration(zeroOGWithConds) {
+		t.Fatal("observedGeneration=0 with populated conditions must not read as stale_observed_generation")
+	}
+	zeroOGWithPhase := probetest.UnstructuredObj("example.io/v1", "Widget", "apps", "w2", 3, 0)
+	_ = unstructured.SetNestedField(zeroOGWithPhase.Object, int64(0), "status", "observedGeneration")
+	_ = unstructured.SetNestedField(zeroOGWithPhase.Object, "Ready", "status", "phase")
+	if staleObservedGeneration(zeroOGWithPhase) {
+		t.Fatal("observedGeneration=0 with populated phase must not read as stale_observed_generation")
+	}
+	zeroOGNoSignals := probetest.UnstructuredObj("scylla.scylladb.com/v1", "ScyllaCluster", "scylla", "db", 2, 0)
+	_ = unstructured.SetNestedField(zeroOGNoSignals.Object, int64(0), "status", "observedGeneration")
+	if !staleObservedGeneration(zeroOGNoSignals) {
+		t.Fatal("observedGeneration=0 without conditions or phase must still read as stuck")
 	}
 
 	// Certificate condition-level observedGeneration predicate.
@@ -138,6 +166,13 @@ func TestOperatorStuckPredicates(t *testing.T) {
 	}, "status", "conditions")
 	if condObservedGenStale(certNoCondOG) {
 		t.Fatal("conditions without observedGeneration field must not read as stale")
+	}
+	certZeroCondOG := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate", "apps", "tls", 3, 0)
+	_ = unstructured.SetNestedSlice(certZeroCondOG.Object, []any{
+		map[string]any{"type": "Ready", "status": "True", "observedGeneration": int64(0)},
+	}, "status", "conditions")
+	if condObservedGenStale(certZeroCondOG) {
+		t.Fatal("conditions with observedGeneration=0 must not read as stale")
 	}
 
 	// Suspended flux objects are parked, not stuck.

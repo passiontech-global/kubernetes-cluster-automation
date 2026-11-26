@@ -629,3 +629,38 @@ func TestPeriodicLiveness(t *testing.T) {
 		<-done
 	})
 }
+
+func TestPeriodicSkipInitialJitter(t *testing.T) {
+	ran := make(chan struct{})
+	p := &Periodic{
+		Name:              "skip-jitter",
+		Interval:          time.Hour,
+		SkipInitialJitter: true,
+		Fn: func(context.Context) error {
+			close(ran)
+			return nil
+		},
+		Log: logr.Discard(),
+	}
+	pctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- p.Start(pctx) }()
+	select {
+	case <-ran:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("SkipInitialJitter did not invoke Fn immediately")
+	}
+	cancel()
+	<-done
+
+	t.Setenv(skipInitialJitterEnv, "true")
+	mgr := &fakePeriodicMgr{}
+	if err := AddPeriodic(mgr, "env-skip", time.Hour, func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddPeriodic err: %v", err)
+	}
+	got := mgr.added[0].(*Periodic)
+	if !got.SkipInitialJitter {
+		t.Fatal("AddPeriodic did not honor NODE_AUTOMATION_TEST_NO_INITIAL_JITTER=true")
+	}
+}

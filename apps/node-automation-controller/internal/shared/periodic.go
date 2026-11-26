@@ -29,7 +29,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
+
+const skipInitialJitterEnv = "NODE_AUTOMATION_TEST_NO_INITIAL_JITTER"
 
 // ---------------------------------------------------------------------------
 // periodic — replaces a shell-operator `schedule:` binding.
@@ -187,6 +190,10 @@ type Periodic struct {
 	// Liveness overrides the context-injected Liveness tracker when
 	// non-nil (useful for isolated unit tests).
 	Liveness *Liveness
+	// SkipInitialJitter disables the startup phase-offset wait before
+	// the first run; set by AddPeriodicWithTimeout when
+	// NODE_AUTOMATION_TEST_NO_INITIAL_JITTER=true for E2E subprocesses.
+	SkipInitialJitter bool
 }
 
 func (p *Periodic) effectiveTimeout() time.Duration {
@@ -254,16 +261,18 @@ func (p *Periodic) Start(ctx context.Context) error {
 	// 45s: a 60m interval would otherwise park the first run up
 	// to an hour out, and the ±5% per-tick jitter below keeps the
 	// modules de-phased after that first run anyway.
-	initialJitter := p.Interval
-	if cap := 45 * time.Second; initialJitter > cap {
-		initialJitter = cap
-	}
-	timer := time.NewTimer(rand.N(initialJitter))
-	select {
-	case <-ctx.Done():
-		timer.Stop()
-		return nil
-	case <-timer.C:
+	if !p.SkipInitialJitter {
+		initialJitter := p.Interval
+		if cap := 45 * time.Second; initialJitter > cap {
+			initialJitter = cap
+		}
+		timer := time.NewTimer(rand.N(initialJitter))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
 	}
 	p.invokeOnce(runCtx, log)
 	stamp()
@@ -391,11 +400,12 @@ func AddPeriodicWithTimeout(mgr manager.Manager, name string, interval, runTimeo
 			name, interval)
 	}
 	return mgr.Add(&Periodic{
-		Name:       name,
-		Interval:   interval,
-		RunTimeout: runTimeout,
-		Fn:         fn,
-		Log:        mgr.GetLogger().WithName(name),
+		Name:              name,
+		Interval:          interval,
+		RunTimeout:        runTimeout,
+		Fn:                fn,
+		Log:               mgr.GetLogger().WithName(name),
+		SkipInitialJitter: envx.Gate(skipInitialJitterEnv, false),
 	})
 }
 

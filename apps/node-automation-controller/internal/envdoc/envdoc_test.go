@@ -52,7 +52,9 @@ var registryDir = filepath.Join("internal", "registry")
 // catalog. Add an entry ONLY for an internal-only seam (e.g. a test
 // hook living in non-test source); an undocumented user-facing knob
 // is a bug this test exists to catch, so fix the doc instead.
-var knownGaps = map[string]string{}
+var knownGaps = map[string]string{
+	"NODE_AUTOMATION_TEST_NO_INITIAL_JITTER": "internal test-only seam read at Periodic registration to skip the 0-45s startup phase offset in cmd/manager E2E subprocesses",
+}
 
 // TestEnvDocCoversSource fails when source introduces an env knob not
 // documented in docs/env.md. The scanner collects:

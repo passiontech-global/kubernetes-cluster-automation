@@ -16,12 +16,26 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
+// hasStatusSignals reports whether the CR already carries reconciled
+// status signals (non-empty status.conditions or non-empty
+// status.phase). Used to distinguish "observedGeneration: 0 because
+// the CRD/controller does not populate it" from "never reconciled".
+func hasStatusSignals(o *unstructured.Unstructured) bool {
+	if phase, found := kube.NestedString(o.Object, "status", "phase"); found && phase != "" {
+		return true
+	}
+	conds, found := kube.NestedSlice(o.Object, "status", "conditions")
+	return found && len(conds) > 0
+}
+
 // staleObservedGeneration is the canonical "controller never saw the
 // last spec write" signature: status.observedGeneration lags
 // metadata.generation. A missing observedGeneration with an empty/absent
 // status reads as 0 (never touched by its controller). If status IS
-// already populated (len > 0) without status.observedGeneration, the CRD
-// does not implement status.observedGeneration — do not fabricate 0 < gen.
+// already populated (len > 0) without status.observedGeneration, or
+// carries observedGeneration: 0 alongside populated status.conditions /
+// status.phase, the CRD does not implement/populate
+// status.observedGeneration — do not fabricate 0 < gen.
 func staleObservedGeneration(o *unstructured.Unstructured) bool {
 	og, found := kube.NestedNumber(o.Object, "status", "observedGeneration")
 	if !found {
@@ -29,6 +43,9 @@ func staleObservedGeneration(o *unstructured.Unstructured) bool {
 			return false
 		}
 		return 0 < o.GetGeneration()
+	}
+	if og == 0 && hasStatusSignals(o) {
+		return false
 	}
 	return og < o.GetGeneration()
 }
@@ -38,7 +55,8 @@ func staleObservedGeneration(o *unstructured.Unstructured) bool {
 // top-level status.observedGeneration (e.g. cert-manager Certificate).
 // Absent/empty conditions are handled by noStatusConditions (returns false
 // here so never-reconciled objects do not double-fire stale_observed_generation);
-// if conditions exist but none carry an observedGeneration field, returns false.
+// if conditions exist but none carry a populated (>0) observedGeneration
+// field, returns false.
 func condObservedGenStale(o *unstructured.Unstructured) bool {
 	raw, found := kube.NestedSlice(o.Object, "status", "conditions")
 	if !found || len(raw) == 0 {
@@ -51,7 +69,7 @@ func condObservedGenStale(o *unstructured.Unstructured) bool {
 		if !ok {
 			continue
 		}
-		if og, ok := kube.NestedNumber(m, "observedGeneration"); ok {
+		if og, ok := kube.NestedNumber(m, "observedGeneration"); ok && og > 0 {
 			if !hasOG || og > maxOG {
 				maxOG = og
 			}
@@ -114,11 +132,7 @@ func emptyStatusPhase(o *unstructured.Unstructured) bool {
 // NHC still carries phase=Paused, a finished SNR keeps its last
 // phase — so only the both-absent shape proves "never reconciled".
 func noStatusAtAll(o *unstructured.Unstructured) bool {
-	if phase, found := kube.NestedString(o.Object, "status", "phase"); found && phase != "" {
-		return false
-	}
-	conds, found := kube.NestedSlice(o.Object, "status", "conditions")
-	return !found || len(conds) == 0
+	return !hasStatusSignals(o)
 }
 
 // perconaUnpausedStaleGen is staleObservedGeneration with the Percona

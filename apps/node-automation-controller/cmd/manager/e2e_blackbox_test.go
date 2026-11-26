@@ -201,6 +201,7 @@ func TestE2EManager(t *testing.T) {
 
 		waitHTTP200(t, "http://"+probeAddr+"/healthz", 20*time.Second, proc)
 		waitHTTP200(t, "http://"+probeAddr+"/readyz", 20*time.Second, proc)
+		waitHTTP200(t, "http://"+metricsAddr+"/metrics", 20*time.Second, proc)
 
 		metricsCode, metricsBody, err := httpGetBody("http://" + metricsAddr + "/metrics")
 		if err != nil {
@@ -314,6 +315,7 @@ func TestE2EManager(t *testing.T) {
 				"-modules=evicted-pod-janitor",
 			)
 			waitHTTP200(t, "http://"+probeAddr+"/readyz", 20*time.Second, proc)
+			waitHTTP200(t, "http://"+metricsAddr+"/metrics", 20*time.Second, proc)
 
 			if c, _, err := httpGetBody("http://" + metricsAddr + "/debug/pprof/"); err != nil {
 				t.Fatalf("GET metrics /debug/pprof/: %v", err)
@@ -352,6 +354,7 @@ func TestE2EManager(t *testing.T) {
 				"-modules=evicted-pod-janitor",
 			)
 			waitHTTP200(t, "http://"+probeAddr+"/readyz", 20*time.Second, proc)
+			waitHTTP200(t, "http://"+metricsAddr+"/metrics", 20*time.Second, proc)
 
 			if c, _, err := httpGetBody("http://" + metricsAddr + "/debug/pprof/"); err != nil {
 				t.Fatalf("GET metrics /debug/pprof/: %v", err)
