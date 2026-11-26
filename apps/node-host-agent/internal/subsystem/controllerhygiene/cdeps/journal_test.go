@@ -149,6 +149,25 @@ func TestJournalText(t *testing.T) {
 	}
 }
 
+func TestJournalTextGrepNoEntriesExit1(t *testing.T) {
+	d, script, _ := newJournalDeps(t)
+	since := time.Now()
+
+	// systemd 255 exits 1 with "-- No entries --" when --grep matches nothing.
+	script("-- No entries --\n", errors.New("exit status 1"), "", nil)
+	got, err := d.JournalTextGrep(context.Background(), since, "Cache consistency check error")
+	if err != nil {
+		t.Fatalf("JournalTextGrep exit 1 with -- No entries -- failed: %v", err)
+	}
+	if !strings.Contains(got, "-- No entries --") {
+		t.Fatalf("JournalTextGrep=%q want -- No entries --", got)
+	}
+	if d.JournalReads.Latched() || d.JournalReads.Fails() != 0 {
+		t.Fatalf("no-entries exit 1 tripped journal-unreadable: latched=%v fails=%d",
+			d.JournalReads.Latched(), d.JournalReads.Fails())
+	}
+}
+
 func TestClassifyJournalRead(t *testing.T) {
 	cases := []struct {
 		name     string

@@ -231,11 +231,7 @@ func (c *Config) ApplyDefaults() error {
 		c.GuardStateDir = defaultGuardStateDir
 	}
 	if c.Runtime == "" {
-		if _, err := exec.LookPath("podman"); err == nil {
-			c.Runtime = "podman"
-		} else {
-			c.Runtime = "docker"
-		}
+		c.Runtime = detectRuntime()
 	}
 	if c.PGContainer == "" {
 		c.PGContainer = defaultPGContainer
@@ -345,4 +341,32 @@ func statfsFree(path string) (float64, error) {
 		return 0, fmt.Errorf("statfs %s", path)
 	}
 	return float64(st.Bavail) / float64(st.Blocks), nil
+}
+
+// detectRuntime chooses between podman and docker. When both are installed, an
+// unused podman (0 containers) must not shadow a running docker stack (e.g.
+// production DB VM 2026-11-26).
+func detectRuntime() string {
+	_, podErr := exec.LookPath("podman")
+	_, docErr := exec.LookPath("docker")
+	switch {
+	case podErr == nil && docErr != nil:
+		return "podman"
+	case podErr != nil && docErr == nil:
+		return "docker"
+	case podErr == nil && docErr == nil:
+		if !runtimeHasContainers("podman") && runtimeHasContainers("docker") {
+			return "docker"
+		}
+		return "podman"
+	default:
+		return "docker"
+	}
+}
+
+func runtimeHasContainers(rt string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, rt, "ps", "-a", "-q").Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
 }

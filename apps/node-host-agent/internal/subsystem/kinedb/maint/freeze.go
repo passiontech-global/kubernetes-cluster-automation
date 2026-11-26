@@ -114,10 +114,6 @@ func (m *Maint) readXidAge(ctx context.Context, pg, user, pass string,
 // can't run — inconclusive means DON'T repack, same as assess-fail.
 func (m *Maint) repackHeadroom(ctx context.Context, pg, user, pass string,
 	heapBytes int64, note func(string)) (free, wal int64, ok bool) {
-	dataDir := m.d.Cfg.PGDataDir
-	if dataDir == "" {
-		dataDir = kdeps.DefaultPGDataDir
-	}
 	out, err := m.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameMaint,
 		"SELECT COALESCE((SELECT SUM(size) FROM pg_ls_waldir()),0)")
 	if err != nil {
@@ -129,8 +125,7 @@ func (m *Maint) repackHeadroom(ctx context.Context, pg, user, pass string,
 		note(fmt.Sprintf("wal-size-unparsed: %v", err))
 		return 0, 0, false
 	}
-	df, err := m.d.Exec(ctx, []string{m.d.Cfg.Runtime, "exec", pg,
-		"df", "-B1", "--output=avail", dataDir}, "")
+	df, err := m.d.PGDataDF(ctx, pg, "avail")
 	if err != nil {
 		note(fmt.Sprintf("df-fail: %v", err))
 		return 0, 0, false

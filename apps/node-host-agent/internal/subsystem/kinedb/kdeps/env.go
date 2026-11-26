@@ -40,6 +40,8 @@ func ConfigFromEnv(d EnvDeps) Config {
 		// kinedb-maintenance: in-container postgres data dir for the repack
 		// headroom gate; empty → package default.
 		envx.StringKnob(envnames.EnvKinedbPgDataDir, &cfg.PGDataDir, ""),
+		// Explicit container runtime override ("podman"|"docker"); empty → auto-detect.
+		envx.StringKnob(envnames.EnvKinedbRuntime, &cfg.Runtime, ""),
 		// backup-health: the physical-backup verifier dir + cadence.
 		envx.StringKnob(envnames.EnvKinedbBackupDir, &cfg.BackupDir,
 			d.PathJoin(defaultBackupDir)),

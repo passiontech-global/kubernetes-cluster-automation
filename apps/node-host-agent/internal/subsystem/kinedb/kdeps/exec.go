@@ -69,6 +69,30 @@ func (d *Deps) ExecLongEnv(ctx context.Context, env, argv []string, stdin string
 	return out, err
 }
 
+// PGDataDF runs `df -B1 --output=<col>` inside the postgres container against
+// Cfg.PGDataDir (or DefaultPGDataDir). When Cfg.PGDataDir is unset and the
+// default path fails (e.g. Percona/Bitnami PGDATA=/data/db), it probes
+// `printenv PGDATA` inside the container and retries once.
+func (d *Deps) PGDataDF(ctx context.Context, pg, outputCol string) (string, error) {
+	dataDir := d.Cfg.PGDataDir
+	if dataDir == "" {
+		dataDir = DefaultPGDataDir
+	}
+	df, err := d.Exec(ctx, []string{d.Cfg.Runtime, "exec", pg,
+		"df", "-B1", "--output=" + outputCol, dataDir}, "")
+	if err == nil || d.Cfg.PGDataDir != "" {
+		return df, err
+	}
+	pgdata, perr := d.Exec(ctx, []string{d.Cfg.Runtime, "exec", pg,
+		"printenv", "PGDATA"}, "")
+	pgdata = strings.TrimSpace(pgdata)
+	if perr != nil || pgdata == "" || pgdata == dataDir {
+		return df, err
+	}
+	return d.Exec(ctx, []string{d.Cfg.Runtime, "exec", pg,
+		"df", "-B1", "--output=" + outputCol, pgdata}, "")
+}
+
 // DiscoverContainer returns preferred when it exists, else the first
 // running container matching match (and not exclude) — the bash
 // rename-resilience for stack redeploys.

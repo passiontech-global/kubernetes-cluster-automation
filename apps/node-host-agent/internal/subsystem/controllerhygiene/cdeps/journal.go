@@ -12,7 +12,9 @@ package cdeps
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -43,7 +45,26 @@ func (d *Deps) journalGrepRead(ctx context.Context, unit string,
 	defer cancel()
 	argv := journalwatch.UnitWindowGrepArgv(unit,
 		since.Format(journalwatch.SinceLayout), pattern)
-	return d.Cfg.HostExecFn(cctx, true, 0, argv[0], argv[1:]...)
+	out, err := d.Cfg.HostExecFn(cctx, true, 0, argv[0], argv[1:]...)
+	// systemd >=255 `journalctl --grep=...` exits 1 with "-- No entries --"
+	// when zero log lines match the filter (healthy state), unlike real read
+	// errors or missing journal files. Treat it as a successful empty match
+	// so healthy controllers do not trip state-journal-unreadable.
+	if err != nil && isGrepNoEntries(out, err) {
+		return out, nil
+	}
+	return out, err
+}
+
+func isGrepNoEntries(out string, err error) bool {
+	if journalwatch.FilesGone(out) || !strings.Contains(strings.ToLower(out), "-- no entries --") {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode() == 1
+	}
+	return err.Error() == "exit status 1"
 }
 
 // JournalTextGrep is JournalText's filtered sibling — the read error

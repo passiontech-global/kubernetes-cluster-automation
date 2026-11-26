@@ -779,3 +779,50 @@ func TestMemoizedContainerNameCancelledCtxNotCached(t *testing.T) {
 		t.Fatalf("cancelled ctx result was cached: got2=%q calls=%d", got2, calls)
 	}
 }
+
+func TestDetectRuntimePrefersActiveDockerOverEmptyPodman(t *testing.T) {
+	bin := t.TempDir()
+	// Stub empty podman + active docker.
+	podman := filepath.Join(bin, "podman")
+	docker := filepath.Join(bin, "docker")
+	if err := os.WriteFile(podman, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(docker, []byte("#!/bin/sh\necho abc123\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	if got := detectRuntime(); got != "docker" {
+		t.Fatalf("detectRuntime()=%q want docker when podman has 0 containers", got)
+	}
+	// If podman has containers too, podman remains preferred.
+	if err := os.WriteFile(podman, []byte("#!/bin/sh\necho def456\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectRuntime(); got != "podman" {
+		t.Fatalf("detectRuntime()=%q want podman when podman has containers", got)
+	}
+}
+
+func TestConfigFromEnvRuntimeOverride(t *testing.T) {
+	t.Setenv(envnames.EnvKinedbRuntime, "docker")
+	cfg := ConfigFromEnv(EnvDeps{})
+	if cfg.Runtime != "docker" {
+		t.Fatalf("Runtime=%q want docker", cfg.Runtime)
+	}
+}
+
+func TestPGDataDFFallsBackToPrintenvPGDATA(t *testing.T) {
+	d, _, _ := fixture(t, []testutil.ExecRule{
+		{Substr: "df -B1 --output=size " + DefaultPGDataDir, Err: errors.New("No such file or directory")},
+		{Substr: "printenv PGDATA", Out: "/data/db\n"},
+		{Substr: "df -B1 --output=size /data/db", Out: "Size\n1073741824\n"},
+	})
+	out, err := d.PGDataDF(context.Background(), "postgres-percona", "size")
+	if err != nil {
+		t.Fatalf("PGDataDF failed: %v", err)
+	}
+	if !strings.Contains(out, "1073741824") {
+		t.Fatalf("PGDataDF out=%q", out)
+	}
+}

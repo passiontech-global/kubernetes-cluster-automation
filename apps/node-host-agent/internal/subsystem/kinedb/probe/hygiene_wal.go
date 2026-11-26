@@ -31,12 +31,7 @@ func (p *Probe) hygieneWALWithBatch(ctx context.Context, pg, user, pass string,
 	// pressure, not remaining headroom). Only meaningful when the
 	// WAL read succeeded.
 	if h.walSeen {
-		dataDir := p.d.Cfg.PGDataDir
-		if dataDir == "" {
-			dataDir = kdeps.DefaultPGDataDir
-		}
-		df, derr := p.d.Exec(ctx, []string{p.d.Cfg.Runtime, "exec", pg,
-			"df", "-B1", "--output=size", dataDir}, "")
+		df, derr := p.d.PGDataDF(ctx, pg, "size")
 		if derr != nil {
 			note(fmt.Sprintf("wal-df-fail: %v", derr))
 		} else {
