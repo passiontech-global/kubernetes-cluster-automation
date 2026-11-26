@@ -268,9 +268,14 @@ func (r *limitRecordingNS) List(ctx context.Context, opts metav1.ListOptions) (*
 // signatures evaluate the objects.
 func TestOperatorCRScanPagesListRequests(t *testing.T) {
 	base := time.Now()
-	stuck := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate",
-		"apps", "tls", 1, 0)
-	dyn := &limitRecordingDyn{Interface: probetest.OpDyn(stuck)}
+	never := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate",
+		"apps", "tls-never", 1, 0)
+	staleCond := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate",
+		"apps", "tls-stale", 5, 0)
+	_ = unstructured.SetNestedSlice(staleCond.Object, []any{
+		map[string]any{"type": "Ready", "status": "True", "observedGeneration": int64(3)},
+	}, "status", "conditions")
+	dyn := &limitRecordingDyn{Interface: probetest.OpDyn(never, staleCond)}
 	p := testProberDyn(fake.NewSimpleClientset(), dyn)
 	var certTarget operatorTarget
 	for _, op := range operatorTargets {
@@ -299,10 +304,11 @@ func TestOperatorCRScanPagesListRequests(t *testing.T) {
 		t.Fatalf("List ResourceVersion = %q, want \"0\" (watch-cache census)",
 			dyn.listOpts[0].ResourceVersion)
 	}
-	for _, reason := range []string{opReasonNoConditions, kcmReasonStaleGen} {
-		if !scan.live["cert-manager/certificates/apps/tls/"+reason] {
-			t.Fatalf("stuck Certificate not judged live under %q: %v", reason, scan.live)
-		}
+	if !scan.live["cert-manager/certificates/apps/tls-never/"+opReasonNoConditions] {
+		t.Fatalf("never-reconciled Certificate not judged live under %q: %v", opReasonNoConditions, scan.live)
+	}
+	if !scan.live["cert-manager/certificates/apps/tls-stale/"+kcmReasonStaleGen] {
+		t.Fatalf("lagging-condition Certificate not judged live under %q: %v", kcmReasonStaleGen, scan.live)
 	}
 }
 

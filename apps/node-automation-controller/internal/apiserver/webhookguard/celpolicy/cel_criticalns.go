@@ -6,6 +6,7 @@ import (
 	"context"
 	json "encoding/json/v2"
 	"slices"
+	"strings"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -70,7 +71,7 @@ func (s *Sweeper) sweepCriticalNS(ctx context.Context, snap *guardstate.Snapshot
 				}
 			}
 
-			if !enforce || criticalPolicyAllowlist[p.key()] {
+			if !enforce || criticalPolicyAllowlist[p.key()] || isFluxManagedPolicy(p.Object) {
 				emitExposed()
 				continue
 			}
@@ -205,4 +206,26 @@ func exposedCriticalNamespaces(p *policyView, bindings []bindingView,
 		}
 	}
 	return out
+}
+
+// isFluxManagedPolicy reports whether obj is owned by Flux/Helm
+// (kustomize-controller / helm-controller in managedFields, or
+// helm.toolkit.fluxcd.io/* / kustomize.toolkit.fluxcd.io/* labels).
+// Flux-managed policies are audited via CELPolicyCriticalNSExposed rather
+// than mutated in-cluster, preventing HelmRelease drift ping-pong and
+// GitOpsAutoHealConflict loops.
+func isFluxManagedPolicy(obj metav1.Object) bool {
+	if obj == nil {
+		return false
+	}
+	if heal.FluxManagerOf(obj) != "" {
+		return true
+	}
+	for k := range obj.GetLabels() {
+		if strings.HasPrefix(k, "helm.toolkit.fluxcd.io/") ||
+			strings.HasPrefix(k, "kustomize.toolkit.fluxcd.io/") {
+			return true
+		}
+	}
+	return false
 }

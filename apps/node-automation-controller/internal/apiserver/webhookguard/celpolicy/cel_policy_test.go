@@ -482,13 +482,28 @@ func TestCELPolicyMaintenanceHoldAndFluxPatchGate(t *testing.T) {
 		t.Fatalf("maintenance hold failed to block critical-NS patch: %+v", got.Spec.MatchConstraints.NamespaceSelector)
 	}
 
-	// 2. FluxPatchGate blocks repeated critical-NS desired-state patches after
-	// loop threshold, while emergency breaker trip bypasses FluxPatchGate.
+	// 2. Flux-managed policies (managedFields OR helm/kustomize toolkit labels)
+	// are NEVER mutated by cel_criticalns — instead CELPolicyCriticalNSExposed
+	// emits 1 without hitting FluxPatchGate (avoiding drift ping-pong and
+	// GitOpsAutoHealConflict), while emergency breaker trip still trips broken
+	// Flux-managed policies.
 	heal.ConfigureFluxConflictLoop(2, 30*time.Minute)
 	t.Cleanup(func() { heal.ConfigureFluxConflictLoop(0, 0) })
 
 	fluxCritVAP := testVAP("vap-flux-crit", ptr.To(admissionv1.Fail), nil)
 	fluxCritVAP.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kustomize-controller"}}
+
+	fluxHelmLabelVAP := testVAP("gateway.cilium.io", ptr.To(admissionv1.Fail), nil)
+	fluxHelmLabelVAP.Labels = map[string]string{
+		"helm.toolkit.fluxcd.io/name":      "cilium",
+		"helm.toolkit.fluxcd.io/namespace": "kube-system",
+	}
+
+	fluxKustLabelVAP := testVAP("vap-kust-label", ptr.To(admissionv1.Fail), nil)
+	fluxKustLabelVAP.Labels = map[string]string{
+		"kustomize.toolkit.fluxcd.io/name":      "policies",
+		"kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+	}
 
 	fluxBreakVAP := testVAP("vap-flux-break", ptr.To(admissionv1.Fail), critNSExcludedSelector())
 	fluxBreakVAP.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kustomize-controller"}}
@@ -500,42 +515,47 @@ func TestCELPolicyMaintenanceHoldAndFluxPatchGate(t *testing.T) {
 			ParamRef:   &admissionv1.ParamRef{Name: "missing", Namespace: "default"},
 		},
 	}
-	cs2 := fake.NewSimpleClientset(fluxCritVAP, fluxBreakVAP, fluxBreakVAPB)
+	cs2 := fake.NewSimpleClientset(fluxCritVAP, fluxHelmLabelVAP, fluxKustLabelVAP, fluxBreakVAP, fluxBreakVAPB)
+	var critPatchCount int
+	cs2.PrependReactor("patch", "validatingadmissionpolicies", func(a ktesting.Action) (bool, runtime.Object, error) {
+		pa := a.(ktesting.PatchAction)
+		if pa.GetName() != "vap-flux-break" {
+			critPatchCount++
+		}
+		return false, nil, nil
+	})
 	s2, g2, now2 := newTestSweeperAndGuard(t, cs2)
 	s2.tripWindow = 10 * time.Minute
 
-	// First sweep consumes sighting 1 on vap-flux-crit (allowed).
 	if err := s2.Sweep(ctx, makeSnap(ctx, g2)); err != nil {
 		t.Fatalf("flux sweep 1: %v", err)
 	}
-	// Simulate Flux reverting NamespaceSelector back to nil.
-	curCrit, _ := cs2.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-flux-crit", metav1.GetOptions{})
-	curCrit.Spec.MatchConstraints.NamespaceSelector = nil
-	_, _ = cs2.AdmissionregistrationV1().ValidatingAdmissionPolicies().Update(ctx, curCrit, metav1.UpdateOptions{})
-
-	// Second sweep hits loop max (2) -> FluxPatchGate blocks critical-NS patch
-	// on vap-flux-crit and emits CELPolicyCriticalNSExposed, while emergency
-	// breaker still trips vap-flux-break despite Flux management!
 	*now2 = now2.Add(11 * time.Minute)
 	if err := s2.Sweep(ctx, makeSnap(ctx, g2)); err != nil {
 		t.Fatalf("flux sweep 2: %v", err)
 	}
-	curCrit, _ = cs2.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-flux-crit", metav1.GetOptions{})
-	if curCrit.Spec.MatchConstraints.NamespaceSelector != nil {
-		t.Fatalf("FluxPatchGate failed to defer critical-NS patch: %+v", curCrit.Spec.MatchConstraints.NamespaceSelector)
+	if critPatchCount != 0 {
+		t.Fatalf("expected 0 critical-NS patches on Flux-managed VAPs, got %d", critPatchCount)
 	}
-	if v := ptestutil.ToFloat64(metrics.CELPolicyCriticalNSExposed.WithLabelValues(KindValidatingPolicy, "vap-flux-crit", "kube-system")); v != 1 {
-		t.Fatalf("expected critical_ns_exposed=1 when FluxPatchGate deferred, got %v", v)
+	for _, name := range []string{"vap-flux-crit", "gateway.cilium.io", "vap-kust-label"} {
+		cur, _ := cs2.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, name, metav1.GetOptions{})
+		if cur.Spec.MatchConstraints.NamespaceSelector != nil {
+			t.Fatalf("Flux-managed %s was mutated: %+v", name, cur.Spec.MatchConstraints.NamespaceSelector)
+		}
+		if v := ptestutil.ToFloat64(metrics.CELPolicyCriticalNSExposed.WithLabelValues(KindValidatingPolicy, name, "kube-system")); v != 1 {
+			t.Fatalf("expected critical_ns_exposed=1 for Flux-managed %s, got %v", name, v)
+		}
 	}
 	curBreak, _ := cs2.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-flux-break", metav1.GetOptions{})
 	if curBreak.Spec.FailurePolicy == nil || *curBreak.Spec.FailurePolicy != admissionv1.Ignore {
-		t.Fatalf("emergency circuit-breaker should bypass FluxPatchGate and trip to Ignore, got %v", curBreak.Spec.FailurePolicy)
+		t.Fatalf("emergency circuit-breaker should bypass Flux ownership and trip to Ignore, got %v", curBreak.Spec.FailurePolicy)
 	}
 
-	// 3. Maintenance hold must NOT record phantom FluxPatchGate sightings
-	// (AllowedV runs before FluxPatchGate), and FluxPatchGate denial must
-	// refund the heal budget grant.
-	t.Run("AllowedV precedes FluxPatchGate and RefundGrant on denial", func(t *testing.T) {
+	// 3. Maintenance hold must NOT record phantom FluxPatchGate sightings on
+	// non-Flux policies (AllowedV runs before FluxPatchGate), and FluxPatchGate
+	// denial (if an object somehow gained a Flux manager mid-flight) refunds
+	// the heal budget grant.
+	t.Run("AllowedV precedes FluxPatchGate on non-Flux policy", func(t *testing.T) {
 		heal.ConfigureFluxConflictLoop(2, 30*time.Minute)
 		heal.ConfigureBudget(1, time.Hour)
 		t.Cleanup(func() {
@@ -547,26 +567,23 @@ func TestCELPolicyMaintenanceHoldAndFluxPatchGate(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "worker-held"},
 			Spec:       corev1.NodeSpec{Unschedulable: true},
 		}
-		fluxVAP := testVAP("vap-flux-maint", ptr.To(admissionv1.Fail), nil)
-		fluxVAP.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kustomize-controller"}}
-		cs3 := fake.NewSimpleClientset(heldNode, fluxVAP)
+		unmanagedVAP := testVAP("vap-unmanaged-maint", ptr.To(admissionv1.Fail), nil)
+		cs3 := fake.NewSimpleClientset(heldNode, unmanagedVAP)
 		s3, g3, now3 := newTestSweeperAndGuard(t, cs3)
 
-		// Run 3 sweeps under maintenance hold: AllowedV defers so FluxPatchGate
-		// must accumulate zero sightings.
+		// Run 3 sweeps under maintenance hold: AllowedV defers.
 		for i := 0; i < 3; i++ {
 			if err := s3.Sweep(ctx, makeSnap(ctx, g3)); err != nil {
 				t.Fatalf("maint sweep %d: %v", i+1, err)
 			}
 			*now3 = now3.Add(time.Minute)
 		}
-		gotHeld, _ := cs3.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-flux-maint", metav1.GetOptions{})
+		gotHeld, _ := cs3.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-unmanaged-maint", metav1.GetOptions{})
 		if gotHeld.Spec.MatchConstraints.NamespaceSelector != nil {
 			t.Fatalf("expected no patch under maintenance hold, got %+v", gotHeld.Spec.MatchConstraints.NamespaceSelector)
 		}
 
-		// Lift maintenance hold: first post-maintenance sweep MUST succeed
-		// (0 phantom sightings recorded during hold).
+		// Lift maintenance hold: first post-maintenance sweep MUST succeed.
 		heldNode.Spec.Unschedulable = false
 		if _, err := cs3.CoreV1().Nodes().Update(ctx, heldNode, metav1.UpdateOptions{}); err != nil {
 			t.Fatal(err)
@@ -574,33 +591,9 @@ func TestCELPolicyMaintenanceHoldAndFluxPatchGate(t *testing.T) {
 		if err := s3.Sweep(ctx, makeSnap(ctx, g3)); err != nil {
 			t.Fatalf("post-maint sweep 1: %v", err)
 		}
-		gotHeld, _ = cs3.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-flux-maint", metav1.GetOptions{})
+		gotHeld, _ = cs3.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-unmanaged-maint", metav1.GetOptions{})
 		if gotHeld.Spec.MatchConstraints.NamespaceSelector == nil {
-			t.Fatal("expected critical-NS patch after maintenance lifted (FluxPatchGate must not have accumulated phantom sightings during hold)")
-		}
-
-		// Advance past budget window, revert selector twice so FluxPatchGate denies
-		// on the 2nd sighting, and verify RefundGrant returns the budget token.
-		*now3 = now3.Add(2 * time.Hour)
-		gotHeld.Spec.MatchConstraints.NamespaceSelector = nil
-		_, _ = cs3.AdmissionregistrationV1().ValidatingAdmissionPolicies().Update(ctx, gotHeld, metav1.UpdateOptions{})
-		// Re-use a fresh budget of 1 for this exact instant.
-		heal.ConfigureBudget(1, time.Hour)
-		if err := s3.Sweep(ctx, makeSnap(ctx, g3)); err != nil {
-			t.Fatalf("post-maint sweep 2: %v", err)
-		}
-		// Budget of 1 was spent by sweep 2 (patch succeeded). Reset budget=1 for denial check.
-		heal.ConfigureBudget(1, time.Hour)
-		gotHeld, _ = cs3.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(ctx, "vap-flux-maint", metav1.GetOptions{})
-		gotHeld.Spec.MatchConstraints.NamespaceSelector = nil
-		_, _ = cs3.AdmissionregistrationV1().ValidatingAdmissionPolicies().Update(ctx, gotHeld, metav1.UpdateOptions{})
-		if err := s3.Sweep(ctx, makeSnap(ctx, g3)); err != nil {
-			t.Fatalf("post-maint sweep 3 (FluxPatchGate deny): %v", err)
-		}
-		// Because FluxPatchGate denied and RefundGrant(now) was called, the 1-grant
-		// budget at *now3 must still be available!
-		if proceed, _ := heal.AllowedV(ctx, logf.FromContext(ctx), nil, cs3, g3.Dyn, nil, "check-refund", 0, *now3); !proceed {
-			t.Fatal("expected budget grant to be available after RefundGrant on FluxPatchGate denial")
+			t.Fatal("expected critical-NS patch after maintenance lifted")
 		}
 	})
 }

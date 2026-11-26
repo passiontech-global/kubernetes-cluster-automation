@@ -154,7 +154,7 @@ const conntrackFlushCooldown = 15 * time.Minute
 // tuples aren't limited to DNS (:53). Deleting the set forces the
 // kernel to re-track live UDP flows on their next packet and drops
 // the stale NAT tuples the inserts were colliding with. Same
-// best-effort contract as flushStaleUDPConntrack: runMountCmd seam,
+// best-effort contract as flushStaleUDPConntrack: runHostCmd seam,
 // a missing conntrack binary logs and moves on.
 func (n *NetHealth) flushStaleUDPConntrackAll(ctx context.Context, check string) {
 	if !n.state.RateTrySpend("last-conntrack-flush", conntrackFlushCooldown) {
@@ -162,12 +162,10 @@ func (n *NetHealth) flushStaleUDPConntrackAll(ctx context.Context, check string)
 			conntrackFlushCooldown.String() + ")")
 		return
 	}
-	// runMountCmd (nsenter -t 1 -m -n) is required — runHostCmd only
-	// joins the host NET namespace, so `conntrack` would resolve
-	// against the container image (which does not ship
-	// conntrack-tools). The host mount ns reaches the host binary;
-	// the host net ns operates on the real conntrack table.
-	out, err := n.cfg.runMountCmd(ctx,
+	// runHostCmd (nsenter -t 1 -n) runs the container-shipped
+	// conntrack-tools binary directly against the host network
+	// namespace's netfilter conntrack table over NETLINK_NETFILTER.
+	out, err := n.cfg.runHostCmd(ctx,
 		[]string{"conntrack", "-D", "-p", "udp"})
 	if err != nil {
 		n.state.AppendLog(fmt.Sprintf("conntrack udp flush skipped: %v (%s)",
@@ -206,14 +204,14 @@ func (n *NetHealth) flushPeerNebulaConntrack(ctx context.Context, check string, 
 		// initiated toward the peer; `-s <peer>` evicts peer-initiated
 		// flows (orig src=peer -> our IP:<port>) whose surviving reply
 		// direction would otherwise keep our outbound packets pinned
-		// on the dead path. Same runMountCmd seam as
-		// flushStaleUDPConntrack — the host's conntrack binary on the
-		// real conntrack table; each delete is independently
-		// best-effort (no-match is a fine "failure").
+		// on the dead path. Same runHostCmd seam as
+		// flushStaleUDPConntrack — container-shipped conntrack binary
+		// operating on the host netns conntrack table; each delete is
+		// independently best-effort (no-match is a fine "failure").
 		for _, sel := range [][]string{{"-d", p}, {"-s", p}} {
 			args := append([]string{"conntrack", "-D", "-p", "udp",
 				"--dport", dport}, sel...)
-			out, err := n.cfg.runMountCmd(ctx, args)
+			out, err := n.cfg.runHostCmd(ctx, args)
 			if err != nil {
 				n.state.AppendLog(fmt.Sprintf("conntrack nebula-peer flush %s skipped: %v (%s) [%s]",
 					p, err, trimRunErr(out), sel[0]))
@@ -244,12 +242,10 @@ func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context, check string) {
 			conntrackFlushCooldown.String() + ")")
 		return
 	}
-	// runMountCmd (nsenter -t 1 -m -n) is required — runHostCmd only
-	// joins the host NET namespace, so `conntrack` would resolve
-	// against the container image (which does not ship
-	// conntrack-tools). The host mount ns reaches the host binary;
-	// the host net ns operates on the real conntrack table.
-	out, err := n.cfg.runMountCmd(ctx,
+	// runHostCmd (nsenter -t 1 -n) runs the container-shipped
+	// conntrack-tools binary directly against the host network
+	// namespace's netfilter conntrack table.
+	out, err := n.cfg.runHostCmd(ctx,
 		[]string{"conntrack", "-D", "-p", "udp", "--dport", "53"})
 	if err != nil {
 		n.state.AppendLog(fmt.Sprintf("conntrack udp/53 flush skipped: %v (%s)",
@@ -266,7 +262,7 @@ func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context, check string) {
 // DNS/UDP tuples a filling or churning table accumulates, while
 // ASSURED entries (established Nebula/WireGuard tunnels, live DNS
 // exchanges) are a different conntrack state and survive untouched.
-// Same best-effort runMountCmd seam and budget shape as the blunt
+// Same best-effort runHostCmd seam and budget shape as the blunt
 // flushes — a missing binary or denied delete logs and moves on,
 // never fails the cycle. The budget is its own
 // (last-conntrack-unreplied-flush): the surgical flush must not be
@@ -277,17 +273,15 @@ func (n *NetHealth) flushUnrepliedUDPConntrack(ctx context.Context, check string
 			conntrackFlushCooldown.String() + ")")
 		return
 	}
-	// runMountCmd (nsenter -t 1 -m -n) is required — runHostCmd only
-	// joins the host NET namespace, so `conntrack` would resolve
-	// against the container image (which does not ship
-	// conntrack-tools). The host mount ns reaches the host binary;
-	// the host net ns operates on the real conntrack table.
+	// runHostCmd (nsenter -t 1 -n) runs the container-shipped
+	// conntrack-tools binary directly against the host network
+	// namespace's netfilter conntrack table.
 	flushed := false
 	for _, args := range [][]string{
 		{"conntrack", "-D", "-p", "udp", "--dport", "53", "-u", "UNREPLIED"},
 		{"conntrack", "-D", "-p", "udp", "-u", "UNREPLIED"},
 	} {
-		out, err := n.cfg.runMountCmd(ctx, args)
+		out, err := n.cfg.runHostCmd(ctx, args)
 		if err != nil {
 			n.state.AppendLog(fmt.Sprintf("conntrack unreplied udp flush skipped: %v (%s)",
 				err, trimRunErr(out)))

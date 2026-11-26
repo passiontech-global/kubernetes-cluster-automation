@@ -291,15 +291,28 @@ func TestSATokenTTLHealthy(t *testing.T) {
 		"volumes", "kubernetes.io~projected", "kube-api-access-ok")
 	exp := e.Now.Add(40 * time.Minute).Unix()
 	wdepstest.WriteFile(t, filepath.Join(tokDir, "token"), fakeJWT(exp)+"\n")
+	// Atomic kubelet ..data/token layout (bypasses non-root `token` symlink under fs.protected_symlinks=1).
+	atomicDir := filepath.Join(e.KubepodsDir, wdepstest.UIDB,
+		"volumes", "kubernetes.io~projected", "kube-api-access-atomic")
+	wdepstest.WriteFile(t, filepath.Join(atomicDir, "..2026_11_26", "token"), fakeJWT(exp-600)+"\n")
+	if err := os.Symlink("..2026_11_26", filepath.Join(atomicDir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	atomicPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "atomic-ok", Namespace: "default",
+			UID: types.UID(wdepstest.UIDB)},
+		Spec:   corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
 	// Garbage token on another pod dir → skipped, never logged.
 	badDir := filepath.Join(e.KubepodsDir, wdepstest.UIDE,
 		"volumes", "kubernetes.io~projected", "v")
 	wdepstest.WriteFile(t, filepath.Join(badDir, "token"), "not-a-jwt\n")
 
-	ce := &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod}}
+	ce := &wdeps.CycleEnv{WorkerActive: true, APIOK: true, Pods: []corev1.Pod{*pod, *atomicPod}}
 	wdepstest.Check[*runtime.SATokenTTLCheck](h, wdeps.CheckSATokenTTL).Run(ctx, ce)
-	if h.SATokenMinTTLSec < 2300 || h.SATokenMinTTLSec > 2400 {
-		t.Fatalf("SATokenMinTTLSec=%v want ~2400", h.SATokenMinTTLSec)
+	if h.SATokenMinTTLSec < 1700 || h.SATokenMinTTLSec > 1800 {
+		t.Fatalf("SATokenMinTTLSec=%v want ~1800 (from ..data/token)", h.SATokenMinTTLSec)
 	}
 	evs, _ := e.CS.EventsV1().Events("default").List(ctx, metav1.ListOptions{})
 	if len(evs.Items) != 0 {
@@ -359,8 +372,11 @@ func TestSATokenTTLExpiredNegativeAndTerminalPods(t *testing.T) {
 	if e.H.SATokenMinTTLSec != -30 {
 		t.Fatalf("SATokenMinTTLSec=%v want -30 (expired token overwritten or terminal pod leaked)", e.H.SATokenMinTTLSec)
 	}
+	if !e.H.SATokenTTLMeasured {
+		t.Fatal("SATokenTTLMeasured must be true when a Running pod token was measured")
+	}
 
-	// Only terminal/deleting/orphan pods -> none measured -> -1 sentinel.
+	// Only terminal/deleting/orphan pods -> none measured -> -1 sentinel and SATokenTTLMeasured=false.
 	chk.Run(ctx, &wdeps.CycleEnv{
 		WorkerActive: true,
 		APIOK:        true,
@@ -368,6 +384,9 @@ func TestSATokenTTLExpiredNegativeAndTerminalPods(t *testing.T) {
 	})
 	if e.H.SATokenMinTTLSec != -1 {
 		t.Fatalf("SATokenMinTTLSec=%v want -1 when no Running non-deleting pod measured", e.H.SATokenMinTTLSec)
+	}
+	if e.H.SATokenTTLMeasured {
+		t.Fatal("SATokenTTLMeasured must be false when no Running non-deleting pod was measured")
 	}
 }
 

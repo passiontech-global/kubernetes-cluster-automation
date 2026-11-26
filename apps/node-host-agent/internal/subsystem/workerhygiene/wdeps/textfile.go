@@ -288,9 +288,14 @@ func (d *Deps) WriteNodeAgentPromTextfile() {
 	counter("node_agent_container_subprocess_oom_total",
 		"Container subprocess OOM kills where container PID 1 survived (living-dead) — subproc-oom.",
 		d.Series.ContainerSubprocessOOM)
-	b.Gauge("node_agent_sa_token_min_ttl_seconds",
-		"Lowest projected service-account token TTL observed across Running pods (-1 = none measured) — sa-token-ttl.",
-		d.Series.SATokenMinTTLSec)
+	const saTokenTTLHelp = "Lowest projected service-account token TTL observed across Running pods (omitted when none measured) — sa-token-ttl."
+	if d.Series.SATokenTTLMeasured {
+		b.Gauge("node_agent_sa_token_min_ttl_seconds",
+			saTokenTTLHelp,
+			d.Series.SATokenMinTTLSec)
+	} else {
+		b.Header("node_agent_sa_token_min_ttl_seconds", saTokenTTLHelp)
+	}
 	counter("node_agent_localpv_quota_throttled_total",
 		"Pods deprioritized (renice+ionice+io.weight) for LocalPV usage >1.5x PV capacity under disk pressure — localpv-quota.",
 		d.Series.LocalPVQuotaThrottled)

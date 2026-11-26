@@ -204,6 +204,7 @@ func TestParseChronycTracking(t *testing.T) {
 
 func TestClockSkew(t *testing.T) {
 	f := kfixture(t)
+	testutil.WriteFile(t, filepath.Join(f.deps.HostRoot, "usr", "bin", "chronyc"), "#!/bin/sh\n")
 	// chronyc stub: 3s fast + unsynchronised → step + latch path.
 	orig := f.r.deps.RunHostCmd
 	defer func() { f.r.deps.RunHostCmd = orig }()
@@ -742,9 +743,12 @@ func TestClockSkewAdjtimexFallback(t *testing.T) {
 }
 
 func TestClockSkewTimesyncdFallback(t *testing.T) {
-	runCase := func(t *testing.T, isActiveErr, isEnabledErr, restartErr error) (cmds []string, markerExists bool) {
+	runCase := func(t *testing.T, hasChronyc bool, isActiveErr, isEnabledErr, restartErr error) (cmds []string, markerExists bool) {
 		t.Helper()
 		f := kfixture(t)
+		if hasChronyc {
+			testutil.WriteFile(t, filepath.Join(f.deps.HostRoot, "usr", "bin", "chronyc"), "#!/bin/sh\n")
+		}
 		now := time.Unix(1_700_000_000, 0)
 		f.deps.Clock.Set(func() time.Time { return now })
 		f.deps.Adjtimex = func(tx *unix.Timex) (int, error) {
@@ -777,8 +781,22 @@ func TestClockSkewTimesyncdFallback(t *testing.T) {
 		return cmds, err == nil
 	}
 
+	t.Run("no chronyc binary on host -> skips chronyc and restarts timesyncd directly", func(t *testing.T) {
+		cmds, marker := runCase(t, false, nil, errors.New("unused"), nil)
+		if !marker {
+			t.Fatal("clock-stepped marker not written after systemd-timesyncd restart")
+		}
+		want := []string{
+			"systemctl is-active --quiet systemd-timesyncd",
+			"systemctl restart systemd-timesyncd",
+		}
+		if strings.Join(cmds, "|") != strings.Join(want, "|") {
+			t.Fatalf("cmds = %v, want %v", cmds, want)
+		}
+	})
+
 	t.Run("chronyc fails + timesyncd active -> restarts and writes marker", func(t *testing.T) {
-		cmds, marker := runCase(t, nil, errors.New("unused"), nil)
+		cmds, marker := runCase(t, true, nil, errors.New("unused"), nil)
 		if !marker {
 			t.Fatal("clock-stepped marker not written after successful systemd-timesyncd restart")
 		}
@@ -794,7 +812,7 @@ func TestClockSkewTimesyncdFallback(t *testing.T) {
 	})
 
 	t.Run("chronyc fails + timesyncd inactive but enabled -> restarts and writes marker", func(t *testing.T) {
-		cmds, marker := runCase(t, errors.New("inactive"), nil, nil)
+		cmds, marker := runCase(t, true, errors.New("inactive"), nil, nil)
 		if !marker {
 			t.Fatal("clock-stepped marker not written after successful systemd-timesyncd restart")
 		}
@@ -811,7 +829,7 @@ func TestClockSkewTimesyncdFallback(t *testing.T) {
 	})
 
 	t.Run("chronyc fails + timesyncd inactive and disabled -> no restart and no marker", func(t *testing.T) {
-		cmds, marker := runCase(t, errors.New("inactive"), errors.New("disabled"), nil)
+		cmds, marker := runCase(t, true, errors.New("inactive"), errors.New("disabled"), nil)
 		if marker {
 			t.Fatal("clock-stepped marker written when systemd-timesyncd was neither active nor enabled")
 		}
@@ -827,7 +845,7 @@ func TestClockSkewTimesyncdFallback(t *testing.T) {
 	})
 
 	t.Run("chronyc fails + timesyncd active + restart fails -> no marker", func(t *testing.T) {
-		cmds, marker := runCase(t, nil, errors.New("unused"), errors.New("restart failed"))
+		cmds, marker := runCase(t, true, nil, errors.New("unused"), errors.New("restart failed"))
 		if marker {
 			t.Fatal("clock-stepped marker written when systemctl restart systemd-timesyncd failed")
 		}

@@ -10,6 +10,9 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -51,6 +54,30 @@ const (
 // remain the last resort when chronyc is absent or unparseable
 // (Timex.Offset µs is the kernel's offset estimate, STA_UNSYNC the
 // sync verdict — enough to makestep and, past 2s, to latch).
+// hostHasChronyc reports whether the host mount namespace actually ships a
+// chronyc binary. Hosts running systemd-timesyncd (the default on cluster
+// nodes) do not install chrony, so probing/stepping with chronyc would
+// unconditionally fail with exit 127 ("No such file or directory").
+func (r *Runner) hostHasChronyc() bool {
+	root := strings.TrimRight(r.deps.HostRoot, "/")
+	if root == "" {
+		_, err := exec.LookPath("chronyc")
+		return err == nil
+	}
+	for _, rel := range []string{
+		"usr/bin/chronyc",
+		"usr/sbin/chronyc",
+		"bin/chronyc",
+		"sbin/chronyc",
+		"usr/local/bin/chronyc",
+	} {
+		if fi, err := os.Stat(filepath.Join(root, rel)); err == nil && !fi.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Runner) clockSkewProbe(ctx context.Context) (float64, bool, bool) {
 	var tx unix.Timex
 	txOK := false
@@ -62,10 +89,12 @@ func (r *Runner) clockSkewProbe(ctx context.Context) (float64, bool, bool) {
 			return off, true, true
 		}
 	}
-	out, err := r.deps.RunHostCmd(ctx, "chronyc", "tracking")
-	if err == nil {
-		if off, synced, ok := parseChronycTracking(out); ok {
-			return off, synced, true
+	if r.hostHasChronyc() {
+		out, err := r.deps.RunHostCmd(ctx, "chronyc", "tracking")
+		if err == nil {
+			if off, synced, ok := parseChronycTracking(out); ok {
+				return off, synced, true
+			}
 		}
 	}
 	if !txOK {
@@ -117,8 +146,16 @@ func (r *Runner) checkClockSkew(ctx context.Context) {
 	}
 	if (!synced || math.Abs(off) > clockSkewStepOffset) &&
 		r.deps.Store.RateTrySpend(clockStepBudgetFile, clockSkewMakestepGap) {
-		out, err := r.deps.RunHostCmd(ctx, "chronyc", "makestep")
-		if err != nil {
+		var (
+			out         string
+			err         error
+			triedChrony bool
+		)
+		if r.hostHasChronyc() {
+			triedChrony = true
+			out, err = r.deps.RunHostCmd(ctx, "chronyc", "makestep")
+		}
+		if !triedChrony || err != nil {
 			// On hosts running systemd-timesyncd instead of chrony,
 			// chronyc is absent or fails — fall back to restarting
 			// systemd-timesyncd ONLY when it is active or enabled so we
@@ -132,19 +169,24 @@ func (r *Runner) checkClockSkew(ctx context.Context) {
 			if timesyncdManaged {
 				rout, rerr := r.deps.RunHostCmd(ctx, "systemctl", "restart", "systemd-timesyncd")
 				if rerr != nil {
-					logger().Warn("hostmetrics: chronyc makestep and systemd-timesyncd restart failed",
+					logger().Warn("hostmetrics: systemd-timesyncd restart failed",
+						"triedChronyc", triedChrony,
 						"chronycError", err, "chronycOut", strings.TrimSpace(out),
 						"restartError", rerr, "restartOut", strings.TrimSpace(rout))
 				} else {
 					logger().Warn("hostmetrics: ACTION systemctl restart systemd-timesyncd — "+
 						"clock offset beyond step threshold",
-						"offset", off, "synced", synced, "chronycError", err)
+						"offset", off, "synced", synced,
+						"triedChronyc", triedChrony, "chronycError", err)
 					r.deps.Store.WriteEpochFile(
 						r.statePath(clockSteppedMarkerFile), r.deps.Clock.Now().Unix())
 				}
-			} else {
+			} else if triedChrony {
 				logger().Warn("hostmetrics: chronyc makestep failed",
 					"error", err, "out", strings.TrimSpace(out))
+			} else {
+				logger().Warn("hostmetrics: clock offset beyond step threshold — neither chronyc nor systemd-timesyncd available",
+					"offset", off, "synced", synced)
 			}
 		} else {
 			logger().Warn("hostmetrics: ACTION chronyc makestep — "+

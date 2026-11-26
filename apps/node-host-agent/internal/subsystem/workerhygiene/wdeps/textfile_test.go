@@ -245,6 +245,25 @@ func TestWriteNodeAgentPromTextfile(t *testing.T) {
 	if strings.Contains(out, "node_agent_network_mount_hung{") {
 		t.Fatalf("stale network_mount_hung sample remained after clear:\n%s", out)
 	}
+	// Unmeasured SA token TTL must emit header-only (never a fake 0 or -1 sample).
+	if !strings.Contains(out, "# TYPE node_agent_sa_token_min_ttl_seconds gauge") {
+		t.Fatalf("missing header-only sa_token_min_ttl_seconds:\n%s", out)
+	}
+	if strings.Contains(out, "\nnode_agent_sa_token_min_ttl_seconds ") {
+		t.Fatalf("unmeasured sa_token_min_ttl_seconds emitted sample:\n%s", out)
+	}
+	e.D.SATokenTTLMeasured = true
+	e.D.SATokenMinTTLSec = 1234
+	e.D.WriteNodeAgentPromTextfile()
+	b, err = os.ReadFile(filepath.Join(dir, "node-agent-hygiene.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "node_agent_sa_token_min_ttl_seconds 1234") {
+		t.Fatalf("measured sa_token_min_ttl_seconds missing:\n%s", string(b))
+	}
+	e.D.SATokenTTLMeasured = false
+	e.D.SATokenMinTTLSec = -1
 
 	// Garbage + missing marker files degrade to 0, never fail.
 	wdepstest.WriteFile(t, e.D.Cfg.Host.OOMCountFile, "not-a-number\n")

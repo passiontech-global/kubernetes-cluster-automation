@@ -43,6 +43,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #     (`nsenter -t 1 -m -u -i -n -p --` and nethealth's `-n`-only form)
 #   ip (iproute2-minimal) + ss (iproute2-ss) — nethealth runHostCmd
 #     `nsenter -t 1 -n --` (net ns only → argv resolves in container fs)
+#   conntrack (conntrack-tools) — nethealth runHostCmd `nsenter -t 1 -n --`
+#     (netlink over host netns → argv resolves in container fs)
 #   ping (iputils-ping)  — reachability probes incl. -m fwmark pinning
 #   sh (busybox)         — `sh -c` probe pipelines / fallbacks
 #   tzdata               — zoneinfo for systemd timestamps: feeder's
@@ -51,7 +53,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #     zoneinfo that lookup always fails and the fallback reports the
 #     wall clock as UTC, skewing k0scontroller.service's age by the
 #     host's UTC offset.
-# Host tools (systemctl, journalctl, nft, sshd, apt-get, haproxy, ...)
+# Host tools (systemctl, journalctl, nft, sshd, apt-get, haproxy, chronyc, ...)
 # are exec'd via `nsenter -m` → they resolve in the HOST mount ns and
 # intentionally do NOT ship here.
 FROM alpine:3.24
@@ -59,7 +61,7 @@ FROM alpine:3.24
 # the floating alpine:3.24 tag would break the build whenever upstream
 # bumps a package.
 # hadolint ignore=DL3018
-RUN apk add --no-cache util-linux iproute2-minimal iproute2-ss iputils-ping tini tzdata
+RUN apk add --no-cache util-linux iproute2-minimal iproute2-ss iputils-ping conntrack-tools tini tzdata
 COPY --from=build /out/node-host-agent /node-host-agent
 USER 65532:65532
 # tini -s: the DaemonSet runs hostPID:true, so tini shares the HOST pid

@@ -135,6 +135,7 @@ func TestStealEntropyPromGauges(t *testing.T) {
 
 func TestClockSteppedMarker(t *testing.T) {
 	f := kfixture(t)
+	testutil.WriteFile(t, filepath.Join(f.deps.HostRoot, "usr", "bin", "chronyc"), "#!/bin/sh\n")
 	// Clock is re-stubbed post-construction on purpose — the Store
 	// observes it through the shared timex.Cell, and the makestep
 	// rate budget must age past clockSkewMakestepGap between

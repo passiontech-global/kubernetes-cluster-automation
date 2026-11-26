@@ -122,7 +122,11 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		return nil, errors.New("workerhygiene: Config.Client is required")
 	}
 	cfg.ApplyDefaults()
-	d := &wdeps.Deps{Cfg: cfg, Proc: procfs.New(cfg.ProcRoot)}
+	d := &wdeps.Deps{
+		Cfg:    cfg,
+		Proc:   procfs.New(cfg.ProcRoot),
+		Series: wdeps.Series{SATokenMinTTLSec: -1},
+	}
 	// The store binds the shared timex.Cell over Seams.Host (NOT the
 	// promoted Base.Clock — the live seam stays there): tests re-stub
 	// via h.Cfg.Seams.Host.Clock.Set after New returns and the store

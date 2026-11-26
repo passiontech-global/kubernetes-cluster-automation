@@ -104,6 +104,41 @@ func TestOperatorStuckPredicates(t *testing.T) {
 	if !staleObservedGeneration(never) {
 		t.Fatal("missing observedGeneration must read as stuck")
 	}
+	// Populated status WITHOUT status.observedGeneration means the CRD
+	// does not implement status.observedGeneration (e.g. Dragonfly,
+	// ExternalSecret, ScaledObject) — must NOT false-positive.
+	noOGWithPhase := probetest.UnstructuredObj("dragonflydb.io/v1alpha1", "Dragonfly", "db", "cache", 3, 0)
+	_ = unstructured.SetNestedField(noOGWithPhase.Object, "Ready", "status", "phase")
+	if staleObservedGeneration(noOGWithPhase) {
+		t.Fatal("populated status without observedGeneration must not read as stale_observed_generation")
+	}
+
+	// Certificate condition-level observedGeneration predicate.
+	certNoConds := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate", "apps", "tls", 2, 0)
+	if condObservedGenStale(certNoConds) {
+		t.Fatal("Certificate without conditions must not double-fire stale_observed_generation")
+	}
+	certHealthy := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate", "apps", "tls", 2, 0)
+	_ = unstructured.SetNestedSlice(certHealthy.Object, []any{
+		map[string]any{"type": "Ready", "status": "True", "observedGeneration": int64(2)},
+	}, "status", "conditions")
+	if condObservedGenStale(certHealthy) {
+		t.Fatal("Certificate with matching condition observedGeneration must not read as stuck")
+	}
+	certStale := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate", "apps", "tls", 3, 0)
+	_ = unstructured.SetNestedSlice(certStale.Object, []any{
+		map[string]any{"type": "Ready", "status": "True", "observedGeneration": int64(1)},
+	}, "status", "conditions")
+	if !condObservedGenStale(certStale) {
+		t.Fatal("Certificate with lagging condition observedGeneration must read as stuck")
+	}
+	certNoCondOG := probetest.UnstructuredObj("cert-manager.io/v1", "Certificate", "apps", "tls", 3, 0)
+	_ = unstructured.SetNestedSlice(certNoCondOG.Object, []any{
+		map[string]any{"type": "Ready", "status": "True"},
+	}, "status", "conditions")
+	if condObservedGenStale(certNoCondOG) {
+		t.Fatal("conditions without observedGeneration field must not read as stale")
+	}
 
 	// Suspended flux objects are parked, not stuck.
 	suspended := probetest.UnstructuredObj("helm.toolkit.fluxcd.io/v2", "HelmRelease", "apps", "hr", 5, 3)
@@ -416,7 +451,7 @@ func TestCheckOperatorWorkqueuesSuspendedFluxIgnored(t *testing.T) {
 // When the leader can't be resolved by holderIdentity, the operator's
 // pod label selector inside the Lease's namespace picks the pod.
 func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
-	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "dragonfly-operator", kcmReasonStaleGen)
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "dragonfly-operator", opReasonNoPhase)
 	base := time.Now()
 	opPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Namespace:       "dragonfly-operator-system",
@@ -433,11 +468,11 @@ func TestCheckOperatorWorkqueuesSelectorFallback(t *testing.T) {
 			"does-not-exist_uuid", 2*time.Second, base),
 		opPod)
 	stuck := probetest.UnstructuredObj("dragonflydb.io/v1alpha1", "Dragonfly",
-		"db", "cache", 9, 4)
+		"db", "cache", 9, 0)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("dragonfly-operator/dragonflies/db/cache/"+kcmReasonStaleGen, base.Add(-time.Hour))
+		Observe("dragonfly-operator/dragonflies/db/cache/"+opReasonNoPhase, base.Add(-time.Hour))
 
 	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); res.Pass {
 		t.Fatal("stuck dragonfly must FAIL")
@@ -497,8 +532,10 @@ func TestCheckOperatorWorkqueuesCertManagerPodNS(t *testing.T) {
 
 // dragonfly-operator runs --leader-elect disabled (replicas:1): no
 // Lease exists at all, so the Running-pod fallback must carry both
-// the liveness proof and the heal path.
+// the liveness proof and the heal path. A healthy Dragonfly with
+// status.phase="Ready" and no status.observedGeneration must NOT trigger.
 func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
+	testutil.CleanupMetric(t, operatorWorkqueueFrozenGauge, "dragonfly-operator", opReasonNoPhase)
 	base := time.Now()
 	opPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -510,14 +547,29 @@ func TestCheckOperatorWorkqueuesDragonflyLeaseOptional(t *testing.T) {
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
-	// NO lease — leaseOptional must carry the check.
+	// Healthy Dragonfly: status.phase="Ready", no status.observedGeneration.
+	healthy := probetest.UnstructuredObj("dragonflydb.io/v1alpha1", "Dragonfly",
+		"db", "cache-ok", 9, 0)
+	_ = unstructured.SetNestedField(healthy.Object, "Ready", "status", "phase")
+	csHealthy := fake.NewSimpleClientset(opPod)
+	pHealthy := testProberDyn(csHealthy, probetest.OpDyn(healthy))
+	pHealthy.Now = func() time.Time { return base }
+	if res := probetest.MustCheck[*operatorWorkqueueCheck](t, pHealthy).Run(probetest.SweepCtx(ctx, pHealthy.Deps)); !res.Pass {
+		t.Fatalf("healthy Dragonfly with phase=Ready and no observedGeneration must pass: %+v", res)
+	}
+	if _, err := csHealthy.CoreV1().Pods(kube.DragonflyOperatorNS).
+		Get(ctx, opPod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("healthy Dragonfly deleted leader pod: %v", err)
+	}
+
+	// NO lease — leaseOptional must carry the check when status.phase is absent.
 	cs := fake.NewSimpleClientset(opPod)
 	stuck := probetest.UnstructuredObj("dragonflydb.io/v1alpha1", "Dragonfly",
-		"db", "cache", 9, 4)
+		"db", "cache", 9, 0)
 	p := testProberDyn(cs, probetest.OpDyn(stuck))
 	p.Now = func() time.Time { return base }
 	probetest.MustCheck[*operatorWorkqueueCheck](t, p).opFirstSeen.
-		Observe("dragonfly-operator/dragonflies/db/cache/"+kcmReasonStaleGen, base.Add(-time.Hour))
+		Observe("dragonfly-operator/dragonflies/db/cache/"+opReasonNoPhase, base.Add(-time.Hour))
 
 	res := probetest.MustCheck[*operatorWorkqueueCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
 	if res.Pass {

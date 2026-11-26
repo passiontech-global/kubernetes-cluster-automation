@@ -93,7 +93,18 @@ func projectedTokenFilesChecked(podDir string) ([]string, bool) {
 		if !en.IsDir() {
 			continue
 		}
-		out = append(out, filepath.Join(projDir, en.Name(), "token"))
+		volDir := filepath.Join(projDir, en.Name())
+		// Kubelet atomic writer creates ..data (root-owned) -> ..YYYY_MM_DD/
+		// and token -> ..data/token (owned by pod fsGroup/runAsUser). Under
+		// Linux fs.protected_symlinks=1 in a 1777 dir, opening `token` fails
+		// with EACCES even as root; reading `..data/token` avoids the
+		// non-root symlink while reading the exact same atomic target.
+		dotDataTok := filepath.Join(volDir, "..data", "token")
+		if _, err := os.Stat(dotDataTok); err == nil {
+			out = append(out, dotDataTok)
+			continue
+		}
+		out = append(out, filepath.Join(volDir, "token"))
 	}
 	return out, false
 }
@@ -135,6 +146,9 @@ func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			tokenReadErr = true
 		}
 		for _, tf := range files {
+			if fi, serr := os.Stat(tf); serr == nil && !fi.Mode().IsRegular() {
+				continue
+			}
 			data, err := os.ReadFile(tf)
 			if err != nil {
 				if !os.IsNotExist(err) {
@@ -163,8 +177,10 @@ func (c *SATokenTTLCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	if !hasMin {
 		c.d.SATokenMinTTLSec = -1
+		c.d.SATokenTTLMeasured = false
 	} else {
 		c.d.SATokenMinTTLSec = minTTL
+		c.d.SATokenTTLMeasured = true
 	}
 	c.d.CycleResult(wdeps.CheckSATokenTTL, "ok")
 }

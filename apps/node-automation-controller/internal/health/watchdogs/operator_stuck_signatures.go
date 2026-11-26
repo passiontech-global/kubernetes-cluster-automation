@@ -18,12 +18,50 @@ import (
 
 // staleObservedGeneration is the canonical "controller never saw the
 // last spec write" signature: status.observedGeneration lags
-// metadata.generation. A missing observedGeneration reads as 0 — an
-// object never touched by its controller is the strongest stuck
-// signal there is (generation >= 1 for any real object).
+// metadata.generation. A missing observedGeneration with an empty/absent
+// status reads as 0 (never touched by its controller). If status IS
+// already populated (len > 0) without status.observedGeneration, the CRD
+// does not implement status.observedGeneration — do not fabricate 0 < gen.
 func staleObservedGeneration(o *unstructured.Unstructured) bool {
-	og, _ := kube.NestedInt64(o.Object, "status", "observedGeneration")
+	og, found := kube.NestedNumber(o.Object, "status", "observedGeneration")
+	if !found {
+		if st, ok := kube.NestedMap(o.Object, "status"); ok && len(st) > 0 {
+			return false
+		}
+		return 0 < o.GetGeneration()
+	}
 	return og < o.GetGeneration()
+}
+
+// condObservedGenStale checks status.conditions[].observedGeneration for CR
+// types that report observedGeneration inside conditions rather than at
+// top-level status.observedGeneration (e.g. cert-manager Certificate).
+// Absent/empty conditions are handled by noStatusConditions (returns false
+// here so never-reconciled objects do not double-fire stale_observed_generation);
+// if conditions exist but none carry an observedGeneration field, returns false.
+func condObservedGenStale(o *unstructured.Unstructured) bool {
+	raw, found := kube.NestedSlice(o.Object, "status", "conditions")
+	if !found || len(raw) == 0 {
+		return false
+	}
+	hasOG := false
+	var maxOG int64
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if og, ok := kube.NestedNumber(m, "observedGeneration"); ok {
+			if !hasOG || og > maxOG {
+				maxOG = og
+			}
+			hasOG = true
+		}
+	}
+	if !hasOG {
+		return false
+	}
+	return maxOG < o.GetGeneration()
 }
 
 // fluxUnsuspendedStaleGen is staleObservedGeneration with the flux

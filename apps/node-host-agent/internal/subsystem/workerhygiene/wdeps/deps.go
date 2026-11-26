@@ -78,6 +78,7 @@ type Series struct {
 	// and the guard's cleanup runs (run-tmpfs).
 	ContainerSubprocessOOM int64
 	SATokenMinTTLSec       float64
+	SATokenTTLMeasured     bool
 	LocalPVQuotaThrottled  int64
 	MemoryCompactionRuns   int64
 	RunTmpfsUsedRatio      float64

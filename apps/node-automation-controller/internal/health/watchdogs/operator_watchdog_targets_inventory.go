@@ -49,8 +49,10 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{{
+			// Dragonfly CRD status carries only {isRollingUpdate, phase} —
+			// no status.observedGeneration or status.conditions.
 			gvr:    kube.GVRDragonfly,
-			reason: kcmReasonStaleGen, stuck: staleObservedGeneration,
+			reason: opReasonNoPhase, stuck: emptyStatusPhase,
 		}},
 	},
 	{
@@ -121,12 +123,11 @@ var operatorTargets = []operatorTarget{
 		resources: []opStuckResource{
 			{gvr: kube.GVRCertificate,
 				reason: opReasonNoConditions, stuck: noStatusConditions},
-			// BUG-C5 — the same GVR additionally watched for
-			// observedGeneration lag: a Certificate the controller
-			// DID once reconcile can still be skipped by every
-			// later spec write.
+			// Certificate reports observedGeneration inside
+			// status.conditions[].observedGeneration (no top-level
+			// status.observedGeneration in the cert-manager CRD schema).
 			{gvr: kube.GVRCertificate,
-				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
+				reason: kcmReasonStaleGen, stuck: condObservedGenStale},
 		},
 	},
 	{
@@ -142,14 +143,12 @@ var operatorTargets = []operatorTarget{
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
 		resources: []opStuckResource{
+			// ExternalSecret CRD has no observedGeneration (top-level or
+			// in conditions) — watch status.conditions presence only.
 			{gvr: kube.GVRExternalSecretV1,
 				reason: opReasonNoConditions, stuck: noStatusConditions},
-			{gvr: kube.GVRExternalSecretV1,
-				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 			{gvr: kube.GVRExternalSecretV1Beta1,
 				reason: opReasonNoConditions, stuck: noStatusConditions},
-			{gvr: kube.GVRExternalSecretV1Beta1,
-				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
 	{
@@ -170,10 +169,10 @@ var operatorTargets = []operatorTarget{
 		podSelector: "app=keda-operator",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
+			// ScaledObject CRD has no observedGeneration (top-level or
+			// in conditions) — watch status.conditions presence only.
 			{gvr: kube.GVRKedaScaledObject,
 				reason: opReasonNoConditions, stuck: noStatusConditions},
-			{gvr: kube.GVRKedaScaledObject,
-				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
 	{
@@ -188,10 +187,10 @@ var operatorTargets = []operatorTarget{
 		podSelector: "control-plane=controller-manager",
 		stuckMinAge: operatorStuckMinAge,
 		resources: []opStuckResource{
+			// ArgoCD CRD has no status.observedGeneration — watch
+			// status.phase presence only.
 			{gvr: kube.GVRArgoCD,
 				reason: opReasonNoPhase, stuck: emptyStatusPhase},
-			{gvr: kube.GVRArgoCD,
-				reason: kcmReasonStaleGen, stuck: staleObservedGeneration},
 		},
 	},
 	{
