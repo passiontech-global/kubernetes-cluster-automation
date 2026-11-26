@@ -24,8 +24,14 @@ import (
 )
 
 const (
-	celVAPErrorRateQuery = `sum by (policy) (rate(apiserver_validating_admission_policy_check_total{error_type!="no_error"}[5m])) > 0`
-	celMAPErrorRateQuery = `sum by (policy) (rate(apiserver_mutating_admission_policy_check_total{error_type!="no_error"}[5m])) > 0`
+	// Exclude both no_error (allowed) and invalid_error (normal policy
+	// denial/warn violation when a CEL expression cleanly evaluates to
+	// false). Only genuine CEL runtime/internal evaluation errors should
+	// trip the circuit breaker — otherwise a misconfigured workload hitting
+	// a working Deny policy disables security enforcement and ping-pongs
+	// with Flux (cicd shipwright-build-controller incident 2026-11-26).
+	celVAPErrorRateQuery = `sum by (policy) (rate(apiserver_validating_admission_policy_check_total{error_type!~"no_error|invalid_error"}[5m])) > 0`
+	celMAPErrorRateQuery = `sum by (policy) (rate(apiserver_mutating_admission_policy_check_total{error_type!~"no_error|invalid_error"}[5m])) > 0`
 )
 
 func (s *Sweeper) sweepCircuitBreaker(ctx context.Context, snap *guardstate.Snapshot, censuses []*kindCensus) error {

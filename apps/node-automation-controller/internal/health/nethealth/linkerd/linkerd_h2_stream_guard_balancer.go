@@ -20,6 +20,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // linkerd-h2-stream-guard — pods whose linkerd-proxy keeps endpoints for a
@@ -142,6 +143,38 @@ func (p *linkerdH2StreamGuardCheck) readyEndpointsByService(
 	return ready, nil
 }
 
+// nebulaPartitionActive reports whether any node currently carries a live
+// NebulaIsolated=True condition (inter-DC overlay partition). Deleting meshed
+// pods whose outbound balancer lost cross-DC endpoints during a live partition
+// cannot restore reachability and triggers a destructive pod-recreation +
+// cardinality storm (nonprod 2026-11-26: 39 pods deleted while 3/3 DataHub
+// workers were NebulaIsolated=True).
+const linkerdPartitionHeartbeatMaxAge = 15 * time.Minute
+
+func (p *linkerdH2StreamGuardCheck) nebulaPartitionActive(
+	ctx context.Context, log logr.Logger, now time.Time) (string, bool) {
+
+	nodes, err := p.AllNodes(ctx)
+	if err != nil {
+		log.V(1).Info("WARN: list nodes for NebulaIsolated partition gate failed", "error", err)
+		return "", false
+	}
+	for i := range nodes {
+		n := &nodes[i]
+		for _, c := range n.Status.Conditions {
+			if c.Type != corev1.NodeConditionType(nodecond.NebulaIsolated) ||
+				c.Status != corev1.ConditionTrue {
+				continue
+			}
+			if !kube.CondHeartbeatLive(&c, linkerdPartitionHeartbeatMaxAge, now) {
+				continue
+			}
+			return n.Name, true
+		}
+	}
+	return "", false
+}
+
 // scanOutboundBalancers implements the linkerd-h2-stream-guard outbound
 // failure-accrual lockout detection: a meshed client pod whose
 // linkerd-proxy holds balancer endpoints for a target but reports
@@ -232,6 +265,18 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 		return svcReady[ns+"/"+svc], svcReadyOK
 	}
 
+	// Lazy inter-DC partition check: evaluated at most once per sweep only
+	// when a persisted wedged pod is actually eligible for deletion.
+	partitionChecked, partitionActive := false, false
+	partitionNode := ""
+	checkPartition := func() (string, bool) {
+		if !partitionChecked {
+			partitionChecked = true
+			partitionNode, partitionActive = p.nebulaPartitionActive(ctx, log, now)
+		}
+		return partitionNode, partitionActive
+	}
+
 	keep := map[string]bool{}
 	for _, s := range totals {
 		ns, podName, target := s.Label("namespace"), s.Label("pod"),
@@ -273,6 +318,11 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 		rep.Find(podKey + "(outbound balancer wedged: " + target + ")")
 		pod := podByKey[podKey]
 		if pod != nil {
+			if partNode, active := checkPartition(); active {
+				log.Info("DEFER: outbound balancer pod heal suppressed during active inter-DC Nebula partition",
+					"pod", podKey, "target", target, "isolatedNode", partNode)
+				continue
+			}
 			// Gone or going is nothing to bounce — SafePodDelete
 			// skips a terminating pod (the replacement proxy
 			// rebuilds its balancer view anyway) and fails closed

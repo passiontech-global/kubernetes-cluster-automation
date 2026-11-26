@@ -82,14 +82,21 @@ func (p *gatewayRouteHealthCheck) loadGrants(ctx context.Context,
 		return
 	}
 	c.grantsTried = true
+	loadedAny := false
+	forbiddenAny := false
 	for _, gvr := range kube.ReferenceGrantGVRs {
 		// The per-sweep unstructured snapshot memoizes one LIST per
-		// GVR; the raw error keeps the NoMatch/NotFound/Forbidden =
-		// "this version is not served / readable" interpretation.
+		// GVR; absent versions (NoMatch/NotFound) are tolerated, while
+		// 403 Forbidden is tracked separately so an RBAC-restricted
+		// cluster cannot silently read as "zero grants exist" and
+		// false-flag every cross-namespace route as ref_not_permitted.
 		l, err := p.AllUnstructured(ctx, gvr)
 		switch {
-		case kube.IsCRDAbsent(err) || apierrors.IsForbidden(err):
-			continue // this version is not served or not readable on the cluster
+		case kube.IsCRDAbsent(err):
+			continue // this version is not served on the cluster
+		case apierrors.IsForbidden(err):
+			forbiddenAny = true
+			continue
 		case err != nil:
 			c.grantsErr = true
 			metrics.IncError(p.Name)
@@ -97,9 +104,18 @@ func (p *gatewayRouteHealthCheck) loadGrants(ctx context.Context,
 				"resource", gvr.Resource, "error", err)
 			return
 		}
+		loadedAny = true
 		for i := range l {
 			c.grants = append(c.grants, decodeRouteGrant(&l[i]))
 		}
+	}
+	if forbiddenAny && !loadedAny {
+		// RBAC denied every served ReferenceGrant version — treat the
+		// grant census as inconclusive (without bumping run_errors on
+		// intentionally restricted clusters) rather than false-flagging
+		// valid cross-namespace routes as ref_not_permitted.
+		c.grantsErr = true
+		log.V(1).Info("gateway route health — referencegrant list forbidden (403), grant verdicts inconclusive")
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 // Two targets wedged on the same pod emit ONE (namespace, pod)
@@ -96,5 +97,63 @@ func TestLinkerdBalancerPartialRecoveryKeepsGauge(t *testing.T) {
 	if m == nil || m.GetGauge().GetValue() != 1 {
 		t.Fatalf("balancer-wedged gauge = %v after partial recovery, want 1 "+
 			"(ledger pruned the still-wedged target's series)", m)
+	}
+}
+
+// During an active inter-DC NebulaIsolated partition, outbound balancer
+// wedges still emit the gauge/finding for visibility, but SafePodDelete must
+// be suppressed even when a Ready sibling exists — deleting pods cannot fix a
+// cross-DC network partition and causes a destructive pod-recreation storm.
+func TestLinkerdBalancerHealSuppressedDuringNebulaPartition(t *testing.T) {
+	base := time.Now()
+	bad := meshedPod("apps", "web-1", true, types.UID("rs-pair"))
+	sib := meshedPod("apps", "web-2", true, types.UID("rs-pair"))
+	isolatedNode := probetest.ReadyWorkerNode("datahub-01", nodecond.NebulaIsolated, 2*time.Minute, false)
+	cs := fake.NewSimpleClientset(
+		isolatedNode, bad, sib,
+		probetest.EndpointSliceForService("backend", "api-svc", "10.244.0.10"))
+	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
+		"linkerd-proxy INFO connection established\n", nil))
+
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if !strings.Contains(query, "outbound_http_balancer_endpoints") ||
+			strings.Contains(query, `state="ready"`) {
+			return nil
+		}
+		return []probetest.PromTestSample{{
+			Labels: map[string]string{
+				"namespace":   "apps",
+				"pod":         "web-1",
+				"target_addr": "api-svc.backend.svc.cluster.local:443",
+			},
+			Value: 2,
+		}}
+	})
+	p := testProber(cs)
+	p.Cfg.HTTPContent.URL = srv.URL
+	p.HTTPClient = srv.Client()
+	chk := probetest.MustCheck[*linkerdH2StreamGuardCheck](t, p)
+	t.Cleanup(func() {
+		linkerdOutboundBalancerWedgedGauge.DeleteLabelValues("apps", "web-1")
+	})
+
+	// Stamp heartbeat inside the frozen clock window.
+	isolatedNode.Status.Conditions[1].LastHeartbeatTime = metav1.NewTime(base)
+	_, _ = cs.CoreV1().Nodes().UpdateStatus(ctx, isolatedNode, metav1.UpdateOptions{})
+
+	probetest.FreezeNow(p.Deps, base)
+	_ = chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+
+	later := base.Add(linkerdBalancerWedgeMinAge + time.Minute)
+	isolatedNode.Status.Conditions[1].LastHeartbeatTime = metav1.NewTime(later)
+	_, _ = cs.CoreV1().Nodes().UpdateStatus(ctx, isolatedNode, metav1.UpdateOptions{})
+	probetest.FreezeNow(p.Deps, later)
+
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if res.Pass {
+		t.Fatal("persisted wedge must still report FAIL for visibility during partition")
+	}
+	if _, err := cs.CoreV1().Pods("apps").Get(ctx, "web-1", metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod was deleted despite active NebulaIsolated partition: %v", err)
 	}
 }

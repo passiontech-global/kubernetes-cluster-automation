@@ -102,6 +102,34 @@ func TestGatewayLoadGrantsToleratesUnservedVersion(t *testing.T) {
 	}
 }
 
+// When RBAC forbids listing every served ReferenceGrant version (403), the
+// census must be marked inconclusive (grantsErr=true) without bumping
+// run_errors so valid cross-namespace routes are never false-flagged as
+// ref_not_permitted.
+func TestGatewayLoadGrantsForbiddenInconclusive(t *testing.T) {
+	cs := fake.NewSimpleClientset(probetest.ReadyWorkerNode("w1", "", 0, false))
+	dyn := probetest.OpDyn()
+	dyn.PrependReactor("list", "referencegrants",
+		func(a ktesting.Action) (bool, runtime.Object, error) {
+			gvr := a.(ktesting.ListAction).GetResource()
+			return true, nil, apierrors.NewForbidden(gvr.GroupResource(), "", errors.New("forbidden"))
+		})
+	p := probetest.NewCheckProber(cs, dyn, NewGatewayRouteHealthCheck)
+	chk := p.Checks[0].(*gatewayRouteHealthCheck)
+
+	before := testutil.QueueErrorCount(t, p.Name)
+	c := newGatewayRouteCensus()
+	granted, conclusive := chk.backendRefGranted(ctx, logr.Discard(), c, "HTTPRoute", "front-ns",
+		routeBackendRef{ns: "backend-ns", name: "svc", crossNS: true})
+	if !c.grantsErr || conclusive || granted {
+		t.Fatalf("403 referencegrants = (grantsErr=%v, granted=%v, conclusive=%v), want (true, false, false)",
+			c.grantsErr, granted, conclusive)
+	}
+	if got := testutil.QueueErrorCount(t, p.Name) - before; got != 0 {
+		t.Fatalf("run_errors delta = %v, want 0 on 403 Forbidden", got)
+	}
+}
+
 // With no errors the load lists each served version exactly once —
 // the census memoizes, so a second loadGrants pays nothing.
 func TestGatewayLoadGrantsMemoizesPerCensus(t *testing.T) {

@@ -132,6 +132,17 @@ func critNSExcludedSelector() *metav1.LabelSelector {
 	}
 }
 
+func TestCELErrorRateQueriesExcludeInvalidError(t *testing.T) {
+	for name, q := range map[string]string{
+		"VAP": celVAPErrorRateQuery,
+		"MAP": celMAPErrorRateQuery,
+	} {
+		if !strings.Contains(q, `error_type!~"no_error|invalid_error"`) {
+			t.Fatalf("%s query %q must exclude both no_error and invalid_error (normal policy denials)", name, q)
+		}
+	}
+}
+
 func TestCELPolicyGracefulSkipOn403And404(t *testing.T) {
 	for _, tc := range []struct {
 		name string
