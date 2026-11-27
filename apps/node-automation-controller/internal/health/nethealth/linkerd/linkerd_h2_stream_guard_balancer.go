@@ -1,14 +1,16 @@
 // linkerd_h2_stream_guard_balancer.go — the linkerd-h2-stream-guard half of the
 // linkerd-h2-stream-guard check: the outbound failure-accrual lockout
-// (a client proxy holding balancer endpoints with NONE state="ready"
-// long after the destination recovered) and the proxy-OOMKilled wedge
-// seed — Prometheus signals cross-checked against live EndpointSlices,
-// healed by the shared Ready-sibling-gated pod delete.
+// (a client proxy holding pending endpoints or active fail-fast shutups
+// with NONE in endpoint_state="ready" / legacy state="ready" long after
+// the destination recovered) and the proxy-OOMKilled wedge seed —
+// Prometheus signals cross-checked against live EndpointSlices, healed
+// by the shared Ready-sibling-gated pod delete.
 package linkerd
 
 import (
 	"context"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,16 +22,18 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
-// linkerd-h2-stream-guard — pods whose linkerd-proxy keeps endpoints for a
-// target but ZERO in state="ready" past the persistence window,
-// while the destination Service still has Ready endpoints: the
-// client-side failure-accrual / dead-channel lockout.
+// linkerd-h2-stream-guard — pods whose linkerd-proxy holds pending
+// endpoints (or active fail-fast queue-gate shutups) for a target with
+// ZERO in endpoint_state="ready" (or legacy state="ready") past the
+// persistence window, while the destination Service still has Ready
+// endpoints: the client-side failure-accrual / dead-channel lockout.
 var linkerdOutboundBalancerWedgedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "node_automation_linkerd_outbound_balancer_wedged",
-	Help: "1 while the meshed pod's outbound balancer holds endpoints for a target but none in state=ready for >=10m with the destination healthy.",
+	Help: "1 while the meshed pod's outbound balancer holds pending endpoints or active fail-fast for a target with none in endpoint_state=ready for >=10m and the destination healthy.",
 }, []string{"namespace", "pod"})
 
 func init() {
@@ -97,8 +101,8 @@ func linkerdProxyOOMKilled(pod *corev1.Pod, now time.Time) bool {
 // Service it fronts — svc.ns.svc.cluster.local[:port] or the short
 // svc.ns.svc[:port] shape — so the wedge candidate can be
 // cross-checked against the live EndpointSlices. Unresolvable
-// targets (IP literals, external authorities) report ok=false — the
-// wedge cannot be disproven and stands.
+// targets (IP literals, external authorities) report ok=false so
+// callers fail closed.
 func linkerdTargetService(targetAddr string) (ns, name string, ok bool) {
 	host, _, err := net.SplitHostPort(targetAddr)
 	if err != nil {
@@ -107,14 +111,50 @@ func linkerdTargetService(targetAddr string) (ns, name string, ok bool) {
 	// DNS-1123 names carry no dots, so the first two labels are
 	// always <name>.<ns> on the standard cluster suffixes.
 	parts := strings.Split(host, ".")
-	if len(parts) == 5 && parts[2] == "svc" &&
-		parts[3] == "cluster" && parts[4] == "local" {
+	if len(parts) == 5 && parts[0] != "" && parts[1] != "" &&
+		parts[2] == "svc" && parts[3] == "cluster" && parts[4] == "local" {
 		return parts[1], parts[0], true
 	}
-	if len(parts) == 3 && parts[2] == "svc" {
+	if len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] == "svc" {
 		return parts[1], parts[0], true
 	}
 	return "", "", false
+}
+
+// linkerdBalancerTarget resolves the destination Kubernetes Service and
+// canonical target identifier from a Prometheus balancer sample.
+// Linkerd edge-26.x exports backend_* and parent_* labels (and drops
+// target_addr); legacy Linkerd exports target_addr. Non-Service kinds
+// and unresolvable targets return ok=false so callers fail closed.
+func linkerdBalancerTarget(s promq.Sample) (targetID, svcNS, svcName string, ok bool) {
+	if bk := s.Label("backend_kind"); bk != "" && bk != "Service" {
+		return "", "", "", false
+	}
+	if bns, bn := s.Label("backend_namespace"), s.Label("backend_name"); bns != "" && bn != "" {
+		id := bns + "/" + bn
+		if bp := s.Label("backend_port"); bp != "" {
+			id += ":" + bp
+		}
+		return id, bns, bn, true
+	}
+	if pk := s.Label("parent_kind"); pk != "" && pk != "Service" {
+		return "", "", "", false
+	}
+	if pns, pn := s.Label("parent_namespace"), s.Label("parent_name"); pns != "" && pn != "" {
+		id := pns + "/" + pn
+		if pp := s.Label("parent_port"); pp != "" {
+			id += ":" + pp
+		}
+		return id, pns, pn, true
+	}
+	if ta := s.Label("target_addr"); ta != "" {
+		ns, name, ok := linkerdTargetService(ta)
+		if !ok {
+			return "", "", "", false
+		}
+		return ta, ns, name, true
+	}
+	return "", "", "", false
 }
 
 // readyEndpointsByService counts Ready endpoints per "ns/svc" across
@@ -175,19 +215,118 @@ func (p *linkerdH2StreamGuardCheck) nebulaPartitionActive(
 	return "", false
 }
 
+const (
+	linkerdBalancerPendingQuery = `sum by (namespace, pod, backend_kind, backend_namespace, backend_name, backend_port, parent_kind, parent_namespace, parent_name, parent_port, target_addr) (outbound_http_balancer_endpoints{endpoint_state="pending"} or outbound_http_balancer_endpoints{state="pending"})`
+	linkerdBalancerReadyQuery   = `sum by (namespace, pod, backend_kind, backend_namespace, backend_name, backend_port, parent_kind, parent_namespace, parent_name, parent_port, target_addr) (outbound_http_balancer_endpoints{endpoint_state="ready"} or outbound_http_balancer_endpoints{state="ready"})`
+	linkerdBalancerFailfastQ    = `sum by (namespace, pod, backend_kind, backend_namespace, backend_name, backend_port, parent_kind, parent_namespace, parent_name, parent_port) (increase(outbound_http_balancer_queue_gate_shut_total[5m])) > 0`
+)
+
+type balancerCandidate struct {
+	ns       string
+	podName  string
+	targetID string
+	svcNS    string
+	svcName  string
+}
+
+func (p *linkerdH2StreamGuardCheck) carryBalancerEmitted(
+	rep, balancerRep *probefw.SweepReport) {
+
+	// Inconclusive, not clean — carry the held wedge series so the Close
+	// below cannot read a Prometheus/API flap as recovery and prune live
+	// alerts. Find lands on rep (the report Verdict reads), not
+	// balancerRep: a carried series is still a live finding.
+	for k, lv := range p.balancerEmitted.Last() {
+		balancerRep.Carry(k, lv)
+		rep.Find(k)
+	}
+}
+
+func (p *linkerdH2StreamGuardCheck) queryBalancerSeries(
+	ctx context.Context, log logr.Logger) (pending, ready, failfast []promq.Sample, ok bool) {
+
+	var err error
+	pending, err = p.PromQuery(ctx, linkerdBalancerPendingQuery)
+	if err != nil {
+		log.Info("WARN: linkerd balancer pending-endpoints query failed — wedge signal skipped",
+			"error", err)
+		return nil, nil, nil, false
+	}
+	ready, err = p.PromQuery(ctx, linkerdBalancerReadyQuery)
+	if err != nil {
+		log.Info("WARN: linkerd balancer ready-endpoints query failed — wedge signal skipped",
+			"error", err)
+		return nil, nil, nil, false
+	}
+	failfast, err = p.PromQuery(ctx, linkerdBalancerFailfastQ)
+	if err != nil {
+		log.Info("WARN: linkerd balancer queue-gate-shut query failed — fail-fast fallback skipped",
+			"error", err)
+		failfast = nil
+	}
+	return pending, ready, failfast, true
+}
+
+func buildReadyByTarget(readySeries []promq.Sample) map[string]float64 {
+	readyByTarget := map[string]float64{}
+	for _, s := range readySeries {
+		ns, podName := s.Label("namespace"), s.Label("pod")
+		if ns == "" || podName == "" {
+			continue
+		}
+		targetID, _, _, ok := linkerdBalancerTarget(s)
+		if !ok {
+			continue
+		}
+		readyByTarget[ns+"/"+podName+"/"+targetID] += s.Value
+	}
+	return readyByTarget
+}
+
+func collectBalancerCandidates(pending, failfast []promq.Sample) map[string]balancerCandidate {
+	candidates := map[string]balancerCandidate{}
+	add := func(samples []promq.Sample) {
+		for _, s := range samples {
+			if s.Value <= 0 {
+				continue
+			}
+			ns, podName := s.Label("namespace"), s.Label("pod")
+			if ns == "" || podName == "" {
+				continue
+			}
+			targetID, svcNS, svcName, ok := linkerdBalancerTarget(s)
+			if !ok || svcNS == "" || svcName == "" {
+				continue
+			}
+			key := ns + "/" + podName + "/" + targetID
+			candidates[key] = balancerCandidate{
+				ns:       ns,
+				podName:  podName,
+				targetID: targetID,
+				svcNS:    svcNS,
+				svcName:  svcName,
+			}
+		}
+	}
+	add(pending)
+	add(failfast)
+	return candidates
+}
+
 // scanOutboundBalancers implements the linkerd-h2-stream-guard outbound
 // failure-accrual lockout detection: a meshed client pod whose
-// linkerd-proxy holds balancer endpoints for a target but reports
-// ZERO in state="ready" is circuit-broken — the destination
-// recovered, the client never did. The signal must persist
-// linkerdBalancerWedgeMinAge (probefw.Persisted on the in-RAM
-// balancerSeen ledger) and is cross-checked against live
-// EndpointSlices: a target Service that genuinely has 0 ready
-// endpoints cluster-wide is a real outage the proxy is reporting
-// honestly — bouncing it heals nothing. Confirmed wedges emit
+// linkerd-proxy holds pending endpoints (or active fail-fast queue-gate
+// shutups) for a target with ZERO in endpoint_state="ready" (or legacy
+// state="ready") is circuit-broken — idle/boot-only targets with
+// ready==0 && pending==0 and no active fail-fast are excluded. The signal
+// must persist linkerdBalancerWedgeMinAge (probefw.Persisted on the in-RAM
+// balancerSeen ledger) and is cross-checked against live EndpointSlices:
+// unresolvable targets or EndpointSlice list failures fail closed, and a
+// target Service that genuinely has 0 ready endpoints cluster-wide is a
+// real outage rather than a wedge. Confirmed wedges emit
 // node_automation_linkerd_outbound_balancer_wedged and get the same
-// Ready-sibling-gated DeletePodHeal as the storm path (shared 30m
-// cooldown key).
+// Ready-sibling-gated SafePodDelete as the storm path (shared 30m
+// cooldown key) when LINKERD_H2_STREAM_GUARD_EVICT_ENABLED is enabled.
 func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 	ctx context.Context, log logr.Logger, now time.Time,
 	pods []corev1.Pod, readyByOwner map[types.UID]int,
@@ -201,43 +340,14 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 		return
 	}
 
-	// "total > 0 AND ready == 0" per (namespace, pod, target_addr)
-	// is diffed client-side across two instant queries: the literal
-	// `> 0 and == 0` single query never matches — the
-	// sum(...{state="ready"}) side produces an EMPTY vector for the
-	// wedged tuple, and PromQL's `and` intersects it away.
-	totals, err := p.PromQuery(ctx,
-		`sum by (namespace, pod, target_addr) (outbound_http_balancer_endpoints)`)
-	if err != nil {
-		log.Info("WARN: linkerd balancer endpoints query failed — wedge signal skipped",
-			"error", err)
-		// Inconclusive, not clean — carry the held wedge series so
-		// the Close below cannot read a Prometheus flap as
-		// recovery and prune live alerts. Find lands on rep (the
-		// report Verdict reads), not balancerRep: a carried series
-		// is still a live finding.
-		for k, lv := range p.balancerEmitted.Last() {
-			balancerRep.Carry(k, lv)
-			rep.Find(k)
-		}
+	pendingSeries, readySeries, failfastSeries, ok := p.queryBalancerSeries(ctx, log)
+	if !ok {
+		p.carryBalancerEmitted(rep, balancerRep)
 		return
 	}
-	readySeries, err := p.PromQuery(ctx,
-		`sum by (namespace, pod, target_addr) (outbound_http_balancer_endpoints{state="ready"})`)
-	if err != nil {
-		log.Info("WARN: linkerd balancer ready-endpoints query failed — wedge signal skipped",
-			"error", err)
-		for k, lv := range p.balancerEmitted.Last() {
-			balancerRep.Carry(k, lv)
-			rep.Find(k)
-		}
-		return
-	}
-	readyByTarget := map[string]float64{}
-	for _, s := range readySeries {
-		readyByTarget[s.Label("namespace")+"/"+s.Label("pod")+
-			"/"+s.Label("target_addr")] = s.Value
-	}
+	readyByTarget := buildReadyByTarget(readySeries)
+	candidates := collectBalancerCandidates(pendingSeries, failfastSeries)
+
 	podByKey := map[string]*corev1.Pod{}
 	for i := range pods {
 		podByKey[pods[i].Namespace+"/"+pods[i].Name] = &pods[i]
@@ -251,12 +361,10 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 	serviceReadyEndpoints := func(ns, svc string) (int, bool) {
 		if !svcReadyLoaded {
 			svcReadyLoaded = true
+			var err error
 			svcReady, err = p.readyEndpointsByService(ctx)
 			if err != nil {
-				// Can't tell — a failed census must not skip every
-				// candidate (can't disprove the wedge), but must not
-				// fail the sweep either.
-				log.Info("WARN: endpointslices list failed — balancer-wedge cross-check disabled",
+				log.Info("WARN: endpointslices list failed — balancer-wedge cross-check failed closed",
 					"error", err)
 			} else {
 				svcReadyOK = true
@@ -277,26 +385,37 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 		return partitionNode, partitionActive
 	}
 
+	keys := make([]string, 0, len(candidates))
+	for k := range candidates {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
 	keep := map[string]bool{}
-	for _, s := range totals {
-		ns, podName, target := s.Label("namespace"), s.Label("pod"),
-			s.Label("target_addr")
-		if ns == "" || podName == "" || s.Value <= 0 {
+	for _, key := range keys {
+		cand := candidates[key]
+		podKey := cand.ns + "/" + cand.podName
+		pod := podByKey[podKey]
+		if pod == nil || pod.DeletionTimestamp != nil {
 			continue
 		}
-		if readyByTarget[ns+"/"+podName+"/"+target] > 0 {
-			continue // balancer still has a live endpoint — healthy
+		if readyByTarget[key] > 0 {
+			continue // balancer still has a live ready endpoint — healthy
 		}
-		key := ns + "/" + podName + "/" + target
-		if svcNS, svcName, ok := linkerdTargetService(target); ok {
-			if n, censusOK := serviceReadyEndpoints(svcNS, svcName); censusOK && n == 0 {
-				// The target Service genuinely has zero ready
-				// endpoints cluster-wide — a real outage, not a
-				// wedge. The proxy is reporting honestly. The
-				// first-seen entry is NOT kept: a scaled-to-zero
-				// backend must not bank wedge age it never proved.
-				continue
-			}
+		n, censusOK := serviceReadyEndpoints(cand.svcNS, cand.svcName)
+		if !censusOK {
+			// Fail closed on EndpointSlice census failure: preserve
+			// held gauges and balancerSeen without deleting pods.
+			p.carryBalancerEmitted(rep, balancerRep)
+			return
+		}
+		if n == 0 {
+			// The target Service genuinely has zero ready
+			// endpoints cluster-wide — a real outage, not a
+			// wedge. The proxy is reporting honestly. The
+			// first-seen entry is NOT kept: a scaled-to-zero
+			// backend must not bank wedge age it never proved.
+			continue
 		}
 		// Only now does the tuple count as wedge evidence — keep
 		// marks it for the balancerSeen prune below.
@@ -305,8 +424,7 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 			linkerdBalancerWedgeMinAge, log) {
 			continue
 		}
-		podKey := ns + "/" + podName
-		lv := []string{ns, podName}
+		lv := []string{cand.ns, cand.podName}
 		// The emitted ledger keys one entry per LABEL TUPLE
 		// (ns/pod), not per wedged target: the gauge declares only
 		// (namespace, pod), so a target-qualified key would make
@@ -315,21 +433,16 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 		// DeleteLabelValues(ns, pod)). balancerSeen keeps the
 		// per-target granularity — only the emitted key collapses.
 		balancerRep.Flag(linkerdOutboundBalancerWedgedGauge, podKey, lv)
-		rep.Find(podKey + "(outbound balancer wedged: " + target + ")")
-		pod := podByKey[podKey]
-		if pod != nil {
-			if partNode, active := checkPartition(); active {
-				log.Info("DEFER: outbound balancer pod heal suppressed during active inter-DC Nebula partition",
-					"pod", podKey, "target", target, "isolatedNode", partNode)
-				continue
-			}
-			// Gone or going is nothing to bounce — SafePodDelete
-			// skips a terminating pod (the replacement proxy
-			// rebuilds its balancer view anyway) and fails closed
-			// on the sibling gate before the delete.
-			p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
-				pod, readyByOwner, 1, linkerdH2HealCool, now)
+		rep.Find(podKey + "(outbound balancer wedged: " + cand.targetID + ")")
+		if !p.evictEnabled {
+			continue
 		}
+		if partNode, active := checkPartition(); active {
+			log.Info("DEFER: outbound balancer pod heal suppressed during active inter-DC Nebula partition",
+				"pod", podKey, "target", cand.targetID, "isolatedNode", partNode)
+			continue
+		}
+		p.maybeSafePodDelete(ctx, log, pod, readyByOwner, now)
 	}
 	p.balancerSeen.Prune(func(k string) bool { return keep[k] })
 }

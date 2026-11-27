@@ -8,14 +8,13 @@
 // every new connection fails TLS validation.
 //
 // linkerd-h2-stream-guard adds the outbound failure-accrual lockout: a client proxy
-// whose balancer holds endpoints for a Service but NONE in
-// state="ready" (outbound_http_balancer_endpoints) is circuit-broken
-// long after the destination recovered — detected via Prometheus,
-// cross-checked against live EndpointSlices so a genuine
-// zero-endpoint outage is not misread as a wedge, and healed by the
-// same Ready-sibling-gated pod delete. The sweep also reports
-// linkerd-proxy OOM kills on
-// node_automation_linkerd_proxy_oomkilled.
+// whose balancer holds pending endpoints (or active fail-fast shutups) for a
+// Service with NONE in endpoint_state="ready" (or legacy state="ready") is
+// circuit-broken long after the destination recovered — detected via Prometheus,
+// cross-checked against live EndpointSlices so a genuine zero-endpoint outage is
+// not misread as a wedge, and healed by the same Ready-sibling-gated pod delete
+// (when LINKERD_H2_STREAM_GUARD_EVICT_ENABLED is enabled). The sweep also
+// reports linkerd-proxy OOM kills on node_automation_linkerd_proxy_oomkilled.
 package linkerd
 
 import (
@@ -23,8 +22,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -38,6 +39,8 @@ import (
 // signature families.
 type linkerdH2StreamGuardCheck struct {
 	*probefw.Deps
+
+	evictEnabled bool
 
 	// emitted is the storm-gauge ledger and identityEmitted the
 	// identity-gauge ledger — a tuple that stops being reported gets
@@ -286,8 +289,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 			// break the HTTP/1.1 probe. SafePodDelete's gate uses
 			// ReadySiblings, which subtracts self so the guard
 			// requires a GENUINELY separate sibling.
-			p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
-				pod, readyByOwner, 1, linkerdH2HealCool, now)
+			p.maybeSafePodDelete(ctx, log, pod, readyByOwner, now)
 		}
 		if identityPast {
 			identityRep.Flag(linkerdProxyIdentityStalledGauge, key, lv)
@@ -301,8 +303,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 			// traffic while the replacement is issued a fresh leaf
 			// cert. Same 30m cooldown key as the storm path — one
 			// delete heals both signatures.
-			p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
-				pod, readyByOwner, 1, linkerdH2HealCool, now)
+			p.maybeSafePodDelete(ctx, log, pod, readyByOwner, now)
 		}
 	}
 	// Drop first-seen entries whose signature cleared — "persisted"
@@ -333,4 +334,19 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 
 	return rep.Verdict(
 		"meshed pods with a linkerd-proxy failure signature (h2 stream storm / identity cert stall / OOM kill / outbound balancer wedge): ", ", ")
+}
+
+// maybeSafePodDelete runs SafePodDelete only when
+// LINKERD_H2_STREAM_GUARD_EVICT_ENABLED is enabled — when false,
+// detection, persistence ledgers, gauges, and findings stay live
+// (audit-only mode).
+func (p *linkerdH2StreamGuardCheck) maybeSafePodDelete(
+	ctx context.Context, log logr.Logger, pod *corev1.Pod,
+	readyByOwner map[types.UID]int, now time.Time) {
+
+	if !p.evictEnabled {
+		return
+	}
+	p.SafePodDelete(ctx, log, CheckNameLinkerdH2StreamGuard,
+		pod, readyByOwner, 1, linkerdH2HealCool, now)
 }

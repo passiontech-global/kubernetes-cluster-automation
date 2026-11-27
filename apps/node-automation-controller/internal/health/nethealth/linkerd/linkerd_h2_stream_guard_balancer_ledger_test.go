@@ -38,22 +38,27 @@ func TestLinkerdBalancerPartialRecoveryKeepsGauge(t *testing.T) {
 	cs.PrependReactor("get", "pods", testutil.ProbeLogReactor(
 		"linkerd-proxy INFO connection established\n", nil))
 
-	targets := []string{
-		"db-svc.backend.svc.cluster.local:5432",
-		"api-svc.backend.svc.cluster.local:443",
+	targets := []struct {
+		name string
+		port string
+	}{
+		{"db-svc", "5432"},
+		{"api-svc", "443"},
 	}
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
-		if !strings.Contains(query, "outbound_http_balancer_endpoints") ||
-			strings.Contains(query, `state="ready"`) {
+		if !strings.Contains(query, `endpoint_state="pending"`) {
 			return nil
 		}
 		var out []probetest.PromTestSample
 		for _, target := range targets {
 			out = append(out, probetest.PromTestSample{
 				Labels: map[string]string{
-					"namespace":   "apps",
-					"pod":         "web-1",
-					"target_addr": target,
+					"namespace":         "apps",
+					"pod":               "web-1",
+					"backend_kind":      "Service",
+					"backend_namespace": "backend",
+					"backend_name":      target.name,
+					"backend_port":      target.port,
 				},
 				Value: 3,
 			})
@@ -116,15 +121,17 @@ func TestLinkerdBalancerHealSuppressedDuringNebulaPartition(t *testing.T) {
 		"linkerd-proxy INFO connection established\n", nil))
 
 	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
-		if !strings.Contains(query, "outbound_http_balancer_endpoints") ||
-			strings.Contains(query, `state="ready"`) {
+		if !strings.Contains(query, `endpoint_state="pending"`) {
 			return nil
 		}
 		return []probetest.PromTestSample{{
 			Labels: map[string]string{
-				"namespace":   "apps",
-				"pod":         "web-1",
-				"target_addr": "api-svc.backend.svc.cluster.local:443",
+				"namespace":         "apps",
+				"pod":               "web-1",
+				"backend_kind":      "Service",
+				"backend_namespace": "backend",
+				"backend_name":      "api-svc",
+				"backend_port":      "443",
 			},
 			Value: 2,
 		}}
