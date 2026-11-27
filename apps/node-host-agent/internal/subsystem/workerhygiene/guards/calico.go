@@ -14,6 +14,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -72,13 +73,13 @@ func calicoIfaceCount(d *wdeps.Deps) int {
 }
 
 // CalicoCheck is the calico-hygiene calico guard as a Check; it owns the
-// veth-leak, felix readiness and wireguard.cali streaks (ex-Hygiene
-// .calicoVethFails/.calicoFelixFails + the calico-wireguard-datapath-guard wg streak).
+// veth-leak, felix readiness, wireguard.cali, and node-IP drift streaks.
 type CalicoCheck struct {
-	d          *wdeps.Deps
-	VethFails  int
-	felixFails int
-	wgFails    int
+	d            *wdeps.Deps
+	VethFails    int
+	felixFails   int
+	wgFails      int
+	ipDriftFails int
 }
 
 // Name returns the check label / WD_SIG key.
@@ -95,6 +96,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.VethFails = 0
 		c.felixFails = 0
 		c.wgFails = 0
+		c.ipDriftFails = 0
 		c.d.State.Exit(latchdefs.LatchCalicoVethLeak, nil)
 		c.d.State.Exit(latchdefs.LatchCalicoFelixDown, nil)
 		c.d.CycleResult(wdeps.CheckCalico, "ok")
@@ -113,6 +115,7 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.VethFails = 0
 		c.felixFails = 0
 		c.wgFails = 0
+		c.ipDriftFails = 0
 		c.d.State.Exit(latchdefs.LatchCalicoVethLeak, nil)
 		c.d.State.Exit(latchdefs.LatchCalicoFelixDown, nil)
 		c.d.CycleResult(wdeps.CheckCalico, "ok")
@@ -229,7 +232,66 @@ func (c *CalicoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// then rebuild calico-node under the same cooldown/overload
 	// gates as the felix remedy.
 	c.checkWireguardCali(ctx, felix)
+	c.checkCalicoNodeIPDrift(ctx, felix)
 	c.d.CycleResult(wdeps.CheckCalico, "ok")
+}
+
+// checkCalicoNodeIPDrift detects when calico-node auto-detected the wrong
+// interface (e.g. neb1 overlay 172.29.0.x with MTU 1300 instead of the
+// node's declared Kubernetes InternalIP — 2026-11-27 cicd incident):
+// node.Annotations["projectcalico.org/IPv4Address"] host IP != Node InternalIP
+// across ConsecNeeded cycles bounces the calico-node pod under the shared
+// last-calico-restart budget.
+func (c *CalicoCheck) checkCalicoNodeIPDrift(ctx context.Context, felix *corev1.Pod) {
+	if felix == nil || c.d.Cfg.Client == nil || c.d.Cfg.NodeName == "" {
+		c.ipDriftFails = 0
+		return
+	}
+	node, err := c.d.Cfg.Client.CoreV1().Nodes().Get(ctx, c.d.Cfg.NodeName, metav1.GetOptions{})
+	if err != nil {
+		// Transient API failure — inconclusive, keep streak.
+		return
+	}
+	var internalIP string
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+			internalIP = addr.Address
+			break
+		}
+	}
+	calicoIP, _, _ := strings.Cut(strings.TrimSpace(node.Annotations["projectcalico.org/IPv4Address"]), "/")
+	if internalIP == "" || calicoIP == "" || calicoIP == internalIP {
+		c.ipDriftFails = 0
+		return
+	}
+	if c.d.StreakPending(&c.ipDriftFails, fmt.Sprintf(
+		"suspect: calico-hygiene IPv4Address=%s != node InternalIP=%s",
+		calicoIP, internalIP)) {
+		return
+	}
+	switch {
+	case c.d.HoldEmergencyHeal(ctx):
+		c.d.State.AppendLog(
+			"suspect: calico-hygiene ip-drift pod delete held — cluster maintenance in progress")
+	case c.d.State.Exists(latchdefs.LatchNodeOverloaded):
+		c.d.State.AppendLog(
+			"suspect: calico-hygiene ip-drift but node overloaded — skip pod restart")
+	case !c.d.State.RateTrySpend("last-calico-restart", c.d.Cfg.MinRestartInterval):
+		c.d.State.AppendLog(
+			"suspect: calico-hygiene ip-drift but pod restart in cooldown (<30m), skip")
+	default:
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: calico-hygiene deleted pod %s/%s - projectcalico.org/IPv4Address=%s != InternalIP=%s",
+			felix.Namespace, felix.Name, calicoIP, internalIP))
+		if derr := c.d.DeletePodGraceful(ctx, felix); derr != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: calico-hygiene delete %s/%s failed: %v",
+				felix.Namespace, felix.Name, derr))
+		} else {
+			c.d.Actions.WithLabelValues(wdeps.CheckCalico, "ip_drift_pod_delete").Inc()
+			c.ipDriftFails = 0
+		}
+	}
 }
 
 // checkWireguardCali is the calico-wireguard-datapath-guard WireGuard-backend wedge
