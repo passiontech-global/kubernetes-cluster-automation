@@ -752,3 +752,53 @@ func TestRemoveTree(t *testing.T) {
 		t.Fatalf("symlink target mode changed: %v", fi)
 	}
 }
+
+// PR partition (<shared>/pr/<bucket>) mirrors the mainline bucket layout:
+// pr/mise, pr/go-mod, and pr/ci-tool must never be pruned by mtime
+// (tarball-extracted mise binaries retain upstream release mtimes > 72h),
+// while pr/affected, pr/go-build, pr/build, and pr/node-deps follow the
+// same bucket-specific rules as mainline.
+func TestPRPartitionPreservesMiseAndAppliesBucketRules(t *testing.T) {
+	root := t.TempDir()
+	sc := mkSharedCache(t, root, ccPVCName("pr"))
+	pr := filepath.Join(sc, "pr")
+
+	// Protected toolchains/module/binary caches with old archive mtimes.
+	miseBin := ccFile(t, filepath.Join(pr, "mise", "installs", "golangci-lint", "2.15.0",
+		"golangci-lint-2.15.0-linux-amd64", "golangci-lint"), 16, 30*24*time.Hour)
+	moonBin := ccFile(t, filepath.Join(pr, "mise", "installs", "github-moonrepo-moon", "2.6.5", "moon"),
+		16, 30*24*time.Hour)
+	goMod := ccFile(t, filepath.Join(pr, "go-mod", "cache", "pkg"), 16, 30*24*time.Hour)
+	ciTool := ccFile(t, filepath.Join(pr, "ci-tool", "ci-tool-deadbeef"), 16, 30*24*time.Hour)
+
+	// Prunable buckets under pr/.
+	affOld := ccFile(t, filepath.Join(pr, "affected", "stale"), 4, 73*time.Hour)
+	affFresh := ccFile(t, filepath.Join(pr, "affected", "live"), 4, 24*time.Hour)
+	gbOld := ccFile(t, filepath.Join(pr, "go-build-lint-pr-verify", "ab", "old"), 4, 73*time.Hour)
+	gbFresh := ccFile(t, filepath.Join(pr, "go-build-lint-pr-verify", "ab", "fresh"), 4, time.Hour)
+	buildOld := ccFile(t, filepath.Join(pr, "build", "k", "art"), 4, 49*time.Hour)
+	// node-deps: fresh cksum dir keeps old inner file; aged cksum dir is removed.
+	ndFreshFile := ccFile(t, filepath.Join(pr, "node-deps", "cksum-fresh", "index.js"), 4, 30*24*time.Hour)
+	ccDir(t, filepath.Join(pr, "node-deps", "cksum-fresh"), 24*time.Hour)
+	ndOldDir := filepath.Join(pr, "node-deps", "cksum-old")
+	ccFile(t, filepath.Join(ndOldDir, "index.js"), 4, 0)
+	ccDir(t, ndOldDir, 9*24*time.Hour)
+
+	p := ccPruner(t, nil)
+	if err := p.Sweep(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+
+	ccPresent(t, miseBin)
+	ccPresent(t, moonBin)
+	ccPresent(t, goMod)
+	ccPresent(t, ciTool)
+	ccPresent(t, affFresh)
+	ccPresent(t, gbFresh)
+	ccPresent(t, ndFreshFile)
+
+	ccMissing(t, affOld)
+	ccMissing(t, gbOld)
+	ccMissing(t, buildOld)
+	ccMissing(t, ndOldDir)
+}

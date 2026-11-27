@@ -69,32 +69,43 @@ func (p *Pruner) pruneSharedCacheRoot(ctx context.Context, scRoot *os.Root, scDi
 	p.enforcePermsRoot(scRoot, log)
 	eff := p.escalatedLimits(scDisplay, log)
 
+	p.prunePartitionBucketsRoot(ctx, scRoot, eff, log)
+
+	// pr is a full partitioned shared-cache root (<shared>/pr/<bucket>)
+	// mirroring the mainline layout: run the same bucket-aware rules so
+	// pr/mise, pr/go-mod, and pr/ci-tool are never gutted by mtime pruning,
+	// pr/go-build* keeps -a/-d protection, and pr/node-deps prunes whole dirs.
+	if prRoot, err := openSubRootNoSymlink(scRoot, "pr"); err == nil {
+		defer func() { _ = prRoot.Close() }()
+		p.prunePartitionBucketsRoot(ctx, prRoot, eff, log.With("partition", "pr"))
+	}
+}
+
+func (p *Pruner) prunePartitionBucketsRoot(ctx context.Context, root *os.Root, eff Config, log *slog.Logger) {
 	// go-build: stale entries + its own size cap.
-	p.pruneGoBuildRoot(ctx, scRoot, eff, log)
+	p.pruneGoBuildRoot(ctx, root, eff, log)
 
 	// Artifact bus: 24h files + empty dirs, then the build <key> cap.
 	for _, b := range []string{"build", "coverage"} {
-		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.ArtifactMaxAge, true, log)
+		p.pruneAgeBucketRoot(ctx, root, b, eff.ArtifactMaxAge, true, log)
 	}
-	p.capTopLevelDirsRoot(ctx, scRoot, "build",
+	p.capTopLevelDirsRoot(ctx, root, "build",
 		eff.BuildHighMark, eff.BuildLowMark, false, log)
 
-	// affected + ytt + pr: 48h files, no dir cleanup. pr is the
-	// PR-build partition root (<shared>/pr/<tool>) — its nested
-	// tool dirs are recreated by CI, so only stale files age out.
-	for _, b := range []string{"affected", "ytt", "pr"} {
-		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.StaleMaxAge, false, log)
+	// affected + ytt: 48h files, no dir cleanup.
+	for _, b := range []string{"affected", "ytt"} {
+		p.pruneAgeBucketRoot(ctx, root, b, eff.StaleMaxAge, false, log)
 	}
 	// nx + moon task-graph caches: 7d files + empty dirs.
 	for _, b := range []string{"nx", "moon"} {
-		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.GraphMaxAge, true, log)
+		p.pruneAgeBucketRoot(ctx, root, b, eff.GraphMaxAge, true, log)
 	}
 	// Scanner/tool caches: 14d files + empty dirs.
 	for _, b := range []string{"trivy", "sonar", "golangci-lint",
 		"uv", "pip", "bin", "py-tools", "bun", "proto", "uv-tools"} {
-		p.pruneAgeBucketRoot(ctx, scRoot, b, eff.ToolMaxAge, true, log)
+		p.pruneAgeBucketRoot(ctx, root, b, eff.ToolMaxAge, true, log)
 	}
-	p.pruneNodeDepsRoot(ctx, scRoot, eff, log)
+	p.pruneNodeDepsRoot(ctx, root, eff, log)
 }
 
 // fsPressure returns the used percent of the filesystem holding
