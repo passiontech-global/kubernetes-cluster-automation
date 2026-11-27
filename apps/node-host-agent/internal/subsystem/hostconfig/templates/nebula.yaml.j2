@@ -105,7 +105,10 @@ tun:
   dev: {{ interdc_nebula_dev }}
   drop_local_broadcast: true
   drop_multicast: true
-  tx_queue: 500
+  # Default 4096 (override via interdc_nebula_tx_queue): default 500 overflows
+  # under Cilium Geneve GSO/TSO bursts (25+ 1264B frames in <30us), causing
+  # sustained tun_net_xmit TX drops on neb1 (40-240 pkt/s on production).
+  tx_queue: {{ interdc_nebula_tx_queue }}
   mtu: {{ interdc_nebula_mtu }}
 {% if interdc_nebula_unsafe_routes | length > 0 %}
   # install:false BAT BUOC — kernel routes/policy rules do agent +

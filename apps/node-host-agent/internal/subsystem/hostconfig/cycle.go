@@ -352,6 +352,10 @@ func (c *cyc) tplCtx() map[string]any {
 	strv := func(name, def string) any {
 		return c.t.Vars.StrDef(name, def)
 	}
+	txQueue := c.t.Vars.Int("interdc_nebula_tx_queue")
+	if txQueue <= 0 {
+		txQueue = 4096
+	}
 	c.tplCtxMemo = map[string]any{
 		"interdc_node":                 t.Node,
 		"interdc_nebula_node":          t.Node,
@@ -361,6 +365,7 @@ func (c *cyc) tplCtx() map[string]any {
 		"interdc_nebula_dev":           strv("interdc_nebula_dev", "neb1"),
 		"interdc_nebula_port":          get("interdc_nebula_port"),
 		"interdc_nebula_mtu":           get("interdc_nebula_mtu"),
+		"interdc_nebula_tx_queue":      txQueue,
 		"interdc_nebula_stats_listen":  strv("interdc_nebula_stats_listen", "127.0.0.1:9800"),
 		"interdc_nebula_table_pub":     get("interdc_nebula_table_pub"),
 		"interdc_nebula_table_marker":  get("interdc_nebula_table_marker"),

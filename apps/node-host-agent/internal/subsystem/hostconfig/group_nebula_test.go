@@ -414,11 +414,29 @@ func TestNebulaConfigRendersSharedCtx(t *testing.T) {
 		`"172.29.0.10": ["10.0.1.10:45670"]`,
 		"port: 45670",
 		"dev: neb1",
+		"tx_queue: 4096",
 		"listen: 127.0.0.1:9800",
 	} {
 		if !strings.Contains(cfg, want) {
 			t.Fatalf("hub config missing %q:\n%s", want, cfg)
 		}
+	}
+
+	// override interdc_nebula_tx_queue via defaults/cluster vars.
+	varsCustom := writeVarsDir(t, "")
+	patchVarsFile(t, varsCustom, "cluster.yaml", "interdc_nebula_tx_queue: 8192\n")
+	rCustom, err := New(Config{NodeName: "node-a", HostRoot: t.TempDir(),
+		VarsDir: varsCustom, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cCustom := loadCyc(t, rCustom, varsCustom, "node-a")
+	bCustom, err := cCustom.nebulaConfig()
+	if err != nil {
+		t.Fatalf("render custom tx_queue: %v", err)
+	}
+	if !strings.Contains(string(bCustom), "tx_queue: 8192") {
+		t.Fatalf("custom tx_queue override not rendered:\n%s", string(bCustom))
 	}
 
 	// spoke: am_lighthouse flips and the hub marker lands in hosts.
