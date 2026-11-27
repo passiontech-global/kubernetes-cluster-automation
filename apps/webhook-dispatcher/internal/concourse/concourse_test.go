@@ -99,20 +99,20 @@ func (a *atcStub) setRoute(path, body string) {
 
 const (
 	pipelinesBody = `[{"name":"p1"},{"name":"p2"}]`
-	p1Body        = `[
+	p1Body        = `{"config":{"resources":[
 		{"name":"repo-git","type":"git","source":{"uri":"git@github.com:org/repo.git"}},
 		{"name":"repo-pr","type":"github-pr","source":{"repository":"org/repo"}},
 		{"name":"other","type":"git","source":{"uri":"https://github.com/org/other"}},
 		{"name":"norepo","type":"time","source":{"interval":"1h"}}
-	]`
-	p2Body = `[{"name":"repo-https","type":"git","source":{"uri":"https://github.com/org/repo"}}]`
+	]}}`
+	p2Body = `{"config":{"resources":[{"name":"repo-https","type":"git","source":{"uri":"https://github.com/org/repo"}}]}}`
 )
 
 func stubRoutes() map[string]string {
 	return map[string]string{
-		"/api/v1/teams/main/pipelines":              pipelinesBody,
-		"/api/v1/teams/main/pipelines/p1/resources": p1Body,
-		"/api/v1/teams/main/pipelines/p2/resources": p2Body,
+		"/api/v1/teams/main/pipelines":           pipelinesBody,
+		"/api/v1/teams/main/pipelines/p1/config": p1Body,
+		"/api/v1/teams/main/pipelines/p2/config": p2Body,
 	}
 }
 

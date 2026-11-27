@@ -208,7 +208,7 @@ type reqTeamATC struct {
 
 	tokenHandler     func(w http.ResponseWriter, r *http.Request, path string)
 	pipelinesHandler func(w http.ResponseWriter, r *http.Request)
-	resourcesHandler func(w http.ResponseWriter, r *http.Request, pipeline string)
+	configHandler    func(w http.ResponseWriter, r *http.Request, pipeline string)
 	checkHandler     func(w http.ResponseWriter, r *http.Request)
 }
 
@@ -239,18 +239,18 @@ func reqNewTeamMockATC(t *testing.T, escapedTeam string) *reqTeamATC {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`[]`))
-		case r.Method == http.MethodGet && strings.HasPrefix(escPath, teamPrefix+"/pipelines/") && strings.HasSuffix(escPath, "/resources"):
+		case r.Method == http.MethodGet && strings.HasPrefix(escPath, teamPrefix+"/pipelines/") && strings.HasSuffix(escPath, "/config"):
 			trimmed := strings.TrimPrefix(escPath, teamPrefix+"/pipelines/")
-			pipeline := strings.TrimSuffix(trimmed, "/resources")
+			pipeline := strings.TrimSuffix(trimmed, "/config")
 			m.mu.Lock()
-			h := m.resourcesHandler
+			h := m.configHandler
 			m.mu.Unlock()
 			if h != nil {
 				h(w, r, pipeline)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[]`))
+			_, _ = w.Write([]byte(`{"config":{"resources":[]}}`))
 		case r.Method == http.MethodPost && strings.HasPrefix(escPath, teamPrefix+"/pipelines/") && strings.HasSuffix(escPath, "/check/webhook"):
 			m.mu.Lock()
 			m.calls = append(m.calls, webhookCall{
@@ -1006,8 +1006,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/m.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/m.git"}}]}}`))
 		}
 		rd := reqStartDispatcher(t, bin, atc.server.URL)
 
@@ -1140,8 +1140,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/redir.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/redir.git"}}]}}`))
 		}
 		atc.checkHandler = func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, foreignATC.URL+"/steal", http.StatusFound)
@@ -1209,8 +1209,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/rec.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/rec.git"}}]}}`))
 		}
 		rd := reqStartDispatcher(t, bin, atc.server.URL)
 
@@ -1248,11 +1248,11 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[
 				{"name":"g1","type":"git","source":{"uri":"https://github.com/org/normal.git"}},
 				{"name":"pr1","type":"github-pr","source":{"repository":"org/normal"}}
-			]`))
+			]}}`))
 		}
 		rd := reqStartDispatcher(t, bin, atc.server.URL)
 
@@ -1440,8 +1440,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"ops-pipe","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"ops-git","type":"git","source":{"uri":"https://github.com/org/ops.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"ops-git","type":"git","source":{"uri":"https://github.com/org/ops.git"}}]}}`))
 		}
 		rd := reqStartDispatcherEnv(t, bin, map[string]string{
 			"CONCOURSE_URL":  atc.server.URL,
@@ -1657,8 +1657,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/c256.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/c256.git"}}]}}`))
 		}
 		rd := reqStartDispatcher(t, bin, atc.server.URL)
 
@@ -1816,8 +1816,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/leak.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/leak.git"}}]}}`))
 		}
 		rd := reqStartDispatcher(t, bin, atc.server.URL)
 
@@ -2080,8 +2080,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			gotEscapedPath.Store(r.URL.EscapedPath())
 			_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/slash.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/slash.git"}}]}}`))
 		}
 		rd := reqStartDispatcherEnv(t, bin, map[string]string{
 			"CONCOURSE_URL":  atc.server.URL,
@@ -2148,8 +2148,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			sawAuth.Store(r.Header.Get("Authorization"))
 			_, _ = w.Write([]byte(`[{"name":"sec-p","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"sec-r","type":"git","source":{"uri":"https://github.com/org/sec.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"sec-r","type":"git","source":{"uri":"https://github.com/org/sec.git"}}]}}`))
 		}
 		rd := reqStartDispatcherEnv(t, bin, map[string]string{
 			"CONCOURSE_URL":  atc.server.URL,
@@ -2199,8 +2199,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			}
 			_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/ops-ci.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/ops-ci.git"}}]}}`))
 		}
 		atc.checkHandler = func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, foreign.URL+"/leak", http.StatusFound)
@@ -2272,8 +2272,8 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"rel-p","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"rel-g","type":"git","source":{"uri":"https://github.com/org/rel.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"rel-g","type":"git","source":{"uri":"https://github.com/org/rel.git"}}]}}`))
 		}
 		rd := reqStartDispatcherEnv(t, staticBin, map[string]string{
 			"CONCOURSE_URL":  atc.server.URL,
@@ -2334,7 +2334,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 				{"name":"svc-canary","archived":false,"instance_vars":{"env":"staging"}}
 			]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, r *http.Request, pipeline string) {
+		atc.configHandler = func(w http.ResponseWriter, r *http.Request, pipeline string) {
 			auth := r.Header.Get("Authorization")
 			if auth == "Bearer tok-1" || !strings.HasPrefix(auth, "Bearer ") {
 				http.Error(w, "token revoked", http.StatusUnauthorized)
@@ -2342,18 +2342,18 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			}
 			switch pipeline {
 			case "svc-main":
-				_, _ = w.Write([]byte(`[
+				_, _ = w.Write([]byte(`{"config":{"resources":[
 					{"name":"core-git","type":"git","source":{"uri":"https://github.com/org/core.git"}},
 					{"name":"core-pr","type":"github-pr","source":{"repository":"org/core"}}
-				]`))
+				]}}`))
 			case "svc-canary":
 				if r.URL.Query().Get("vars.env") != `"staging"` {
 					http.Error(w, "missing vars.env", http.StatusBadRequest)
 					return
 				}
-				_, _ = w.Write([]byte(`[
+				_, _ = w.Write([]byte(`{"config":{"resources":[
 					{"name":"canary-git","type":"git","source":{"uri":"https://github.com/org/core.git"}}
-				]`))
+				]}}`))
 			default:
 				http.NotFound(w, r)
 			}

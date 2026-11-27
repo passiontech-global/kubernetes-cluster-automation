@@ -240,7 +240,7 @@ type mockATC struct {
 
 	tokenHandler     func(w http.ResponseWriter, r *http.Request, path string)
 	pipelinesHandler func(w http.ResponseWriter, r *http.Request)
-	resourcesHandler func(w http.ResponseWriter, r *http.Request, pipeline string)
+	configHandler    func(w http.ResponseWriter, r *http.Request, pipeline string)
 	checkHandler     func(w http.ResponseWriter, r *http.Request)
 }
 
@@ -269,18 +269,18 @@ func newMockATC(t *testing.T) *mockATC {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`[]`))
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/teams/main/pipelines/") && strings.HasSuffix(r.URL.Path, "/resources"):
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/teams/main/pipelines/") && strings.HasSuffix(r.URL.Path, "/config"):
 			trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/teams/main/pipelines/")
-			pipeline := strings.TrimSuffix(trimmed, "/resources")
+			pipeline := strings.TrimSuffix(trimmed, "/config")
 			m.mu.Lock()
-			h := m.resourcesHandler
+			h := m.configHandler
 			m.mu.Unlock()
 			if h != nil {
 				h(w, r, pipeline)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`[]`))
+			_, _ = w.Write([]byte(`{"config":{"resources":[]}}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/check/webhook"):
 			m.mu.Lock()
 			m.calls = append(m.calls, webhookCall{
@@ -377,8 +377,8 @@ func TestE2EDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"app-ci","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"repo-git","type":"git","source":{"uri":"https://github.com/org/demo.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"repo-git","type":"git","source":{"uri":"https://github.com/org/demo.git"}}]}}`))
 		}
 		rd := startDispatcher(t, bin, atc.server.URL)
 
@@ -506,21 +506,21 @@ func TestE2EDispatcher(t *testing.T) {
 				{"name":"old-pipe","archived":true}
 			]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, r *http.Request, pipeline string) {
+		atc.configHandler = func(w http.ResponseWriter, r *http.Request, pipeline string) {
 			switch pipeline {
 			case "main-pipe":
-				_, _ = w.Write([]byte(`[
+				_, _ = w.Write([]byte(`{"config":{"resources":[
 					{"name":"src-git","type":"git","source":{"uri":"git@github.com:org/service.git"}},
 					{"name":"pr-check","type":"github-pr","source":{"repository":"org/service"}}
-				]`))
+				]}}`))
 			case "inst-pipe":
 				if r.URL.Query().Get("vars.env") != `"prod"` {
 					http.Error(w, "missing instance vars", http.StatusBadRequest)
 					return
 				}
-				_, _ = w.Write([]byte(`[
+				_, _ = w.Write([]byte(`{"config":{"resources":[
 					{"name":"inst-git","type":"git","source":{"uri":"https://github.com/org/service.git"}}
-				]`))
+				]}}`))
 			case "old-pipe":
 				http.Error(w, "archived pipeline must not be queried", http.StatusInternalServerError)
 			}
@@ -618,13 +618,13 @@ func TestE2EDispatcher(t *testing.T) {
 				}
 				_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 			}
-			atc.resourcesHandler = func(w http.ResponseWriter, r *http.Request, _ string) {
-				// Revoke tok-1 on /resources so getJSON triggers 401 -> invalidate -> re-mint tok-2.
+			atc.configHandler = func(w http.ResponseWriter, r *http.Request, _ string) {
+				// Revoke tok-1 on /config so getJSON triggers 401 -> invalidate -> re-mint tok-2.
 				if r.Header.Get("Authorization") != "Bearer tok-2" {
 					http.Error(w, "token revoked", http.StatusUnauthorized)
 					return
 				}
-				_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/recover.git"}}]`))
+				_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/recover.git"}}]}}`))
 			}
 			rd := startDispatcher(t, bin, atc.server.URL)
 
@@ -681,7 +681,7 @@ func TestE2EDispatcher(t *testing.T) {
 				}
 				_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 			}
-			atc.resourcesHandler = func(w http.ResponseWriter, r *http.Request, _ string) {
+			atc.configHandler = func(w http.ResponseWriter, r *http.Request, _ string) {
 				auth := r.Header.Get("Authorization")
 				if strings.HasPrefix(auth, "Basic ") {
 					sawBasicOnAPI.Store(true)
@@ -698,12 +698,12 @@ func TestE2EDispatcher(t *testing.T) {
 					http.Error(w, "unauthorized", http.StatusUnauthorized)
 					return
 				}
-				_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/bearer.git"}}]`))
+				_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/bearer.git"}}]}}`))
 			}
 
 			rd := startDispatcher(t, bin, atc.server.URL)
 
-			// Delivery 1: obtains tok-1, then hits 401 on /resources while token endpoints 404/405.
+			// Delivery 1: obtains tok-1, then hits 401 on /config while token endpoints 404/405.
 			body := []byte(`{"repository":{"full_name":"org/bearer"}}`)
 			code1, resp1 := rd.postWebhook(t, "push", "d-f9-1", signPayload(e2eSecret, body), body)
 			if code1 != http.StatusBadGateway {
@@ -755,7 +755,7 @@ func TestE2EDispatcher(t *testing.T) {
 				sawBasicOnPipelines.Store(true)
 				_, _ = w.Write([]byte(`[{"name":"p1","archived":false}]`))
 			}
-			atc.resourcesHandler = func(w http.ResponseWriter, r *http.Request, _ string) {
+			atc.configHandler = func(w http.ResponseWriter, r *http.Request, _ string) {
 				auth := r.Header.Get("Authorization")
 				if strings.HasPrefix(auth, "Basic ") {
 					// ATC upgraded to require OIDC Bearer token while Basic was latched.
@@ -768,7 +768,7 @@ func TestE2EDispatcher(t *testing.T) {
 					return
 				}
 				sawBearerOnResources.Store(true)
-				_, _ = w.Write([]byte(`[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/basic-recover.git"}}]`))
+				_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"r1","type":"git","source":{"uri":"https://github.com/org/basic-recover.git"}}]}}`))
 			}
 
 			rd := startDispatcher(t, bin, atc.server.URL)
@@ -812,15 +812,15 @@ func TestE2EDispatcher(t *testing.T) {
 			// Include duplicate keys + lone UTF-16 surrogate + raw invalid UTF-8 from ATC.
 			_, _ = w.Write([]byte(`[{"name":"p-stale","name":"p1","archived":false,"note":"bad \uD83D ` + "\xff" + `"}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[
 				{"name":"obj-uri","type":"git","source":{"uri":{"url":"https://github.com/org/ignored.git"}}},
 				{"name":"arr-uri","type":"git","source":{"uri":["https://github.com/org/ignored2.git"]}},
 				{"name":"num-uri","type":"git","source":{"uri":42}},
 				{"name":"evil-query","type":"git","source":{"uri":"https://evil.com?x=@github.com/org/victim.git"}},
 				{"name":"evil-frag","type":"git","source":{"uri":"https://evil.com#x@github.com/org/victim2.git"}},
 				{"name":"legit-old","name":"legit","type":"git","source":{"note":"` + "\xff" + `\uD83D","uri":"https://github.com/org/wrong.git","uri":"https://github.com/org/legit.git"}}
-			]`))
+			]}}`))
 		}
 		rd := startDispatcher(t, bin, atc.server.URL)
 
@@ -897,8 +897,8 @@ func TestE2EDispatcher(t *testing.T) {
 		atc.pipelinesHandler = func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`[{"name":"burst-pipe","archived":false}]`))
 		}
-		atc.resourcesHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
-			_, _ = w.Write([]byte(`[{"name":"burst-git","type":"git","source":{"uri":"https://github.com/org/burst.git"}}]`))
+		atc.configHandler = func(w http.ResponseWriter, _ *http.Request, _ string) {
+			_, _ = w.Write([]byte(`{"config":{"resources":[{"name":"burst-git","type":"git","source":{"uri":"https://github.com/org/burst.git"}}]}}`))
 		}
 		var checkStarted atomic.Int32
 		releaseCheck := make(chan struct{})

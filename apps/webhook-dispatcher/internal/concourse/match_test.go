@@ -169,15 +169,48 @@ func TestSourceRepo(t *testing.T) {
 	}
 }
 
-func TestFetchIndexToleratesNonStringSourceFields(t *testing.T) {
+func TestFetchIndexUsesConfigEndpointWhenResourcesOmitsSource(t *testing.T) {
+	// Regression: real Concourse ATC /pipelines/<p>/resources omits "source"
+	// completely; fetchIndex must read /pipelines/<p>/config instead.
 	stub := newATCStub(t, map[string]string{
 		"/api/v1/teams/main/pipelines": `[{"name":"p1"}]`,
 		"/api/v1/teams/main/pipelines/p1/resources": `[
+			{"name":"real-git","pipeline_name":"p1","team_name":"main","type":"git","last_checked":1795768279}
+		]`,
+		"/api/v1/teams/main/pipelines/p1/config": `{"config":{
+			"jobs":[{"name":"build"}],
+			"resources":[
+				{"name":"real-git","type":"git","webhook_token":"((ci.github_webhook_token))","source":{"uri":"git@github.com:org/repo.git","private_key":"((ci.github_private_key))"}},
+				{"name":"real-pr","type":"github-pr","webhook_token":"((ci.github_webhook_token))","source":{"repository":"org/repo"}}
+			]
+		}}`,
+	})
+	c := &Client{BaseURL: stub.srv.URL, Team: "main", User: "u", Password: "p"}
+
+	index, err := c.Resources(t.Context())
+	if err != nil {
+		t.Fatalf("Resources failed: %v", err)
+	}
+	if len(index) != 2 {
+		t.Fatalf("index=%+v want 2 resources from /config", index)
+	}
+	if stub.hitCount("/api/v1/teams/main/pipelines/p1/config") != 1 {
+		t.Fatalf("expected 1 hit to /config, got %d", stub.hitCount("/api/v1/teams/main/pipelines/p1/config"))
+	}
+	if stub.hitCount("/api/v1/teams/main/pipelines/p1/resources") != 0 {
+		t.Fatalf("expected 0 hits to /resources, got %d", stub.hitCount("/api/v1/teams/main/pipelines/p1/resources"))
+	}
+}
+
+func TestFetchIndexToleratesNonStringSourceFields(t *testing.T) {
+	stub := newATCStub(t, map[string]string{
+		"/api/v1/teams/main/pipelines": `[{"name":"p1"}]`,
+		"/api/v1/teams/main/pipelines/p1/config": `{"config":{"resources":[
 			{"name":"custom-obj-uri","type":"custom","source":{"uri":{"nested":1},"repository":"org/repo"}},
 			{"name":"custom-num-repo","type":"custom","source":{"repository":42}},
 			{"name":"null-source","type":"time","source":null},
 			{"name":"real-git","type":"git","source":{"uri":"https://github.com/org/repo"}}
-		]`,
+		]}}`,
 	})
 	c := &Client{BaseURL: stub.srv.URL, Team: "main", User: "u", Password: "p"}
 
@@ -197,7 +230,7 @@ func TestSourceDecodeToleratesUnknownFields(t *testing.T) {
 	// "repository" when both are present — the map decode's precedence.
 	stub := newATCStub(t, map[string]string{
 		"/api/v1/teams/main/pipelines": `[{"name":"p1"}]`,
-		"/api/v1/teams/main/pipelines/p1/resources": `[
+		"/api/v1/teams/main/pipelines/p1/config": `{"config":{"jobs":[{"name":"build"}],"resources":[
 			{"name":"both","type":"git","source":{
 				"uri":"git@github.com:org/repo.git",
 				"repository":"org/other",
@@ -208,7 +241,7 @@ func TestSourceDecodeToleratesUnknownFields(t *testing.T) {
 				"api_key":"secret-value"}},
 			{"name":"norepo","type":"time","source":{
 				"interval":"1h","days":["sunday"]}}
-		]`,
+		]}}`,
 	})
 	c := &Client{BaseURL: stub.srv.URL, Team: "main", User: "u", Password: "p"}
 

@@ -290,9 +290,9 @@ func (c *Client) fetchIndex(ctx context.Context,
 	if err := c.getJSON(ctx, c.apiPath("pipelines"), &pipelines); err != nil {
 		return nil, err
 	}
-	// Archived pipelines are gone for check purposes — listing their
-	// resources would index dead entries (and their /resources calls
-	// can 404 or hang on the archived flag). Drop them up front.
+	// Archived pipelines are gone for check purposes — reading their
+	// config would index dead entries (and their /config calls can
+	// 404 or hang on the archived flag). Drop them up front.
 	live := pipelines[:0]
 	for _, p := range pipelines {
 		if !p.Archived {
@@ -321,7 +321,7 @@ func (c *Client) fetchIndex(ctx context.Context,
 	results := make([][]Resource, len(pipelines))
 	// varsQuery[i] is the pipeline's instance_vars rendered as the
 	// ATC dot-notation query fragment — instanced pipelines only
-	// resolve /resources and check webhooks under ?vars.<key>=, so
+	// resolve /config and check webhooks under ?vars.<key>=, so
 	// the same fragment rides every Resource and both call sites.
 	// Empty for non-instanced pipelines.
 	varsQuery := make([]string, len(pipelines))
@@ -352,16 +352,23 @@ func (c *Client) fetchIndex(ctx context.Context,
 		wg.Go(func() {
 			for i := range jobs {
 				p := pipelines[i]
-				var resources []struct {
-					Name   string `json:"name"`
-					Type   string `json:"type"`
-					Source source `json:"source"`
+				// Concourse's /pipelines/<p>/resources endpoint omits
+				// resource source configs (uri/repository); only
+				// /pipelines/<p>/config carries .config.resources[].source.
+				var cfg struct {
+					Config struct {
+						Resources []struct {
+							Name   string `json:"name"`
+							Type   string `json:"type"`
+							Source source `json:"source"`
+						} `json:"resources"`
+					} `json:"config"`
 				}
-				path := "pipelines/" + url.PathEscape(p.Name) + "/resources"
+				path := "pipelines/" + url.PathEscape(p.Name) + "/config"
 				if varsQuery[i] != "" {
 					path += "?" + varsQuery[i]
 				}
-				if err := c.getJSON(ctx, c.apiPath(path), &resources); err != nil {
+				if err := c.getJSON(ctx, c.apiPath(path), &cfg); err != nil {
 					var se *statusError
 					if errors.As(err, &se) && se.status == http.StatusNotFound {
 						// The pipeline was deleted between the pipeline
@@ -395,7 +402,7 @@ func (c *Client) fetchIndex(ctx context.Context,
 						"pipeline", p.Name, "error", err)
 					continue
 				}
-				for _, r := range resources {
+				for _, r := range cfg.Config.Resources {
 					repo := NormalizeRepo(sourceRepo(r.Source))
 					if repo == "" {
 						continue

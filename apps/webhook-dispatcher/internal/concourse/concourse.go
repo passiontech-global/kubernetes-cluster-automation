@@ -34,9 +34,9 @@ type Resource struct {
 	// InstanceVarsQuery is the pipeline's instance_vars rendered as
 	// the ATC dot-notation query fragment ("vars.k=<json>&…", "" for
 	// non-instanced pipelines). Instanced pipelines only resolve
-	// their resources/checks under ?vars.<key>=, so the fragment
-	// rides every Resource and is appended to both the /resources
-	// listing and the check-webhook POST.
+	// their config/checks under ?vars.<key>=, so the fragment
+	// rides every Resource and is appended to both the /config
+	// fetch and the check-webhook POST.
 	InstanceVarsQuery string
 }
 

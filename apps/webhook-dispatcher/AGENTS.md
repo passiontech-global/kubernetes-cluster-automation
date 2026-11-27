@@ -79,7 +79,7 @@ optional via `envx.String`. Env is read in exactly one place —
   HTTP basic permanently when both token endpoints 404/405.
   Archived pipelines are skipped; instanced pipelines carry
   `instance_vars` flattened to ATC dot-notation
-  (`Resource.InstanceVarsQuery`) into both the `/resources` listing
+  (`Resource.InstanceVarsQuery`) into both the `/config` fetch
   and the check-webhook POST — one `vars.<key>=<json>` param per
   leaf, nested maps flattened to dot paths, separator chars in a
   segment %q-quoted (mirrors `atc/pipeline.go` `QueryParams` over

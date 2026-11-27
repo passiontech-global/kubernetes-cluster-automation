@@ -165,7 +165,7 @@ func TestFetchIndexRetainsResourcesForFailedPipeline(t *testing.T) {
 	// the refreshed index must carry p2's last-known resources over
 	// instead of silently unregistering them (the fetch succeeds as
 	// a whole, so a partial result would overwrite the cache).
-	stub.fail("/api/v1/teams/main/pipelines/p2/resources", 500)
+	stub.fail("/api/v1/teams/main/pipelines/p2/config", 500)
 	index, err := c.Resources(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -223,8 +223,8 @@ func TestRefreshBypassesTTL(t *testing.T) {
 	}
 	// A resource set after the index was cached; the TTL would hide
 	// it from Resources for an hour.
-	stub.setRoute("/api/v1/teams/main/pipelines/p2/resources",
-		`[{"name":"new","type":"git","source":{"uri":"org/new"}}]`)
+	stub.setRoute("/api/v1/teams/main/pipelines/p2/config",
+		`{"config":{"resources":[{"name":"new","type":"git","source":{"uri":"org/new"}}]}}`)
 	// Past BOTH throttle windows — lastForceRefreshAt (Refresh's own
 	// clock) and fetchedAt (a successful fetch moments ago already
 	// IS the fresh index Refresh exists to produce).
@@ -319,7 +319,7 @@ func TestFetchIndexColdStartListingFailureErrors(t *testing.T) {
 	// would stamp fetchedAt and answer 202/resources_matched:0 for
 	// the TTL window, silently dropping build triggers.
 	stub := newATCStub(t, stubRoutes())
-	stub.fail("/api/v1/teams/main/pipelines/p1/resources", 500)
+	stub.fail("/api/v1/teams/main/pipelines/p1/config", 500)
 	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Hour}
 
 	if _, err := c.Resources(t.Context()); err == nil {
@@ -335,7 +335,7 @@ func TestFetchIndexColdStartListingFailureErrors(t *testing.T) {
 	// ATC recovered — shares the just-failed fetch's error inside
 	// NegCacheTTL instead of stampeding a fresh rebuild (the
 	// concurrent-first-delivery retry storm this cache exists for).
-	stub.unfail("/api/v1/teams/main/pipelines/p1/resources")
+	stub.unfail("/api/v1/teams/main/pipelines/p1/config")
 	if _, err := c.Resources(t.Context()); err == nil {
 		t.Fatal("retry inside NegCacheTTL want shared error, got nil")
 	}
@@ -437,8 +437,8 @@ func TestRefreshFailedAttemptBacksOff(t *testing.T) {
 
 func TestEmptyIndexIsCached(t *testing.T) {
 	stub := newATCStub(t, map[string]string{
-		"/api/v1/teams/main/pipelines":              `[{"name":"p1"}]`,
-		"/api/v1/teams/main/pipelines/p1/resources": `[]`,
+		"/api/v1/teams/main/pipelines":           `[{"name":"p1"}]`,
+		"/api/v1/teams/main/pipelines/p1/config": `{"config":{"resources":[]}}`,
 	})
 	c := &Client{BaseURL: stub.srv.URL, Team: "main", IndexTTL: time.Hour}
 
@@ -675,11 +675,11 @@ func TestFetchIndexPipeline404DropsGhosts(t *testing.T) {
 	if _, err := c.Resources(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	// p2 is deleted between the pipeline listing and its resource
-	// fetch: the listing still returns it, but its resources endpoint
+	// p2 is deleted between the pipeline listing and its config
+	// fetch: the listing still returns it, but its config endpoint
 	// 404s. The refreshed index must drop p2's ghost resources
 	// entirely — not carry them over, and not fail the fetch.
-	stub.fail("/api/v1/teams/main/pipelines/p2/resources", http.StatusNotFound)
+	stub.fail("/api/v1/teams/main/pipelines/p2/config", http.StatusNotFound)
 	// Age fetchedAt past the forced-refresh throttle — a fetch that
 	// just succeeded would otherwise satisfy Refresh without a
 	// network call.
@@ -707,7 +707,7 @@ func TestFetchIndexUsesCallerSnapshotForCarryover(t *testing.T) {
 	if _, err := c.Resources(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	stub.fail("/api/v1/teams/main/pipelines/p1/resources", 500)
+	stub.fail("/api/v1/teams/main/pipelines/p1/config", 500)
 	c.mu.Lock()
 	snap := append([]Resource(nil), c.index...)
 	c.mu.Unlock()
@@ -742,7 +742,7 @@ func TestFetchIndexManyPipelinesErrorsDoNotDeadlock(t *testing.T) {
 	}
 	stub := newATCStub(t, routes)
 	for i := range 16 {
-		path := fmt.Sprintf("/api/v1/teams/main/pipelines/p%02d/resources", i)
+		path := fmt.Sprintf("/api/v1/teams/main/pipelines/p%02d/config", i)
 		if i%2 == 0 {
 			stub.fail(path, http.StatusNotFound)
 		} else {
@@ -768,7 +768,7 @@ func TestFetchIndexManyPipelinesErrorsDoNotDeadlock(t *testing.T) {
 	}
 	// Every pipeline's listing was attempted — no worker bailed early.
 	for i := range 16 {
-		path := fmt.Sprintf("/api/v1/teams/main/pipelines/p%02d/resources", i)
+		path := fmt.Sprintf("/api/v1/teams/main/pipelines/p%02d/config", i)
 		if got := stub.hitCount(path); got != 1 {
 			t.Fatalf("%s hits=%d want 1", path, got)
 		}
@@ -868,9 +868,9 @@ func TestResourcesCallerCancelNotAnATCFailure(t *testing.T) {
 			<-g
 		}
 		body := pipelinesBody
-		if strings.HasSuffix(r.URL.Path, "/pipelines/p1/resources") {
+		if strings.HasSuffix(r.URL.Path, "/pipelines/p1/config") {
 			body = p1Body
-		} else if strings.HasSuffix(r.URL.Path, "/pipelines/p2/resources") {
+		} else if strings.HasSuffix(r.URL.Path, "/pipelines/p2/config") {
 			body = p2Body
 		}
 		fmt.Fprint(w, body)
@@ -1000,7 +1000,7 @@ func TestColdStartWaiterSurfacesFlightError(t *testing.T) {
 }
 
 // TestFetchIndexInstancedPipeline: an instanced pipeline's
-// /resources listing must carry the vars.<key>= fragment, the
+// /config fetch must carry the vars.<key>= fragment, the
 // Resource must retain it, and the check webhook must re-append it —
 // without it the ATC cannot resolve which instance to check.
 func TestFetchIndexInstancedPipeline(t *testing.T) {
@@ -1013,9 +1013,9 @@ func TestFetchIndexInstancedPipeline(t *testing.T) {
 		switch {
 		case r.URL.Path == "/api/v1/teams/main/pipelines":
 			fmt.Fprint(w, `[{"name":"p1","instance_vars":{"release":{"line":"1.2"},"channel":"stable"}}]`)
-		case r.URL.Path == "/api/v1/teams/main/pipelines/p1/resources":
+		case r.URL.Path == "/api/v1/teams/main/pipelines/p1/config":
 			resQueries = append(resQueries, r.URL.RawQuery)
-			fmt.Fprint(w, `[{"name":"repo-git","type":"git","source":{"uri":"git@github.com:org/repo.git"}}]`)
+			fmt.Fprint(w, `{"config":{"resources":[{"name":"repo-git","type":"git","source":{"uri":"git@github.com:org/repo.git"}}]}}`)
 		case strings.HasSuffix(r.URL.Path, "/check/webhook"):
 			checkQueries = append(checkQueries, r.URL.RawQuery)
 			w.WriteHeader(http.StatusCreated)
@@ -1064,8 +1064,8 @@ func TestFetchIndexInstancedPipeline(t *testing.T) {
 }
 
 // TestFetchIndexSkipsArchived: archived pipelines are dropped before
-// their /resources is ever listed — their entries are dead weight
-// and their listings can 404/hang.
+// their /config is ever fetched — their entries are dead weight
+// and their fetches can 404/hang.
 func TestFetchIndexSkipsArchived(t *testing.T) {
 	var mu sync.Mutex
 	var listed []string
@@ -1077,7 +1077,7 @@ func TestFetchIndexSkipsArchived(t *testing.T) {
 			fmt.Fprint(w, `[{"name":"live"},{"name":"dead","archived":true}]`)
 		case strings.HasPrefix(r.URL.Path, "/api/v1/teams/main/pipelines/"):
 			listed = append(listed, r.URL.Path)
-			fmt.Fprint(w, `[{"name":"repo-git","type":"git","source":{"uri":"git@github.com:org/repo.git"}}]`)
+			fmt.Fprint(w, `{"config":{"resources":[{"name":"repo-git","type":"git","source":{"uri":"git@github.com:org/repo.git"}}]}}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
