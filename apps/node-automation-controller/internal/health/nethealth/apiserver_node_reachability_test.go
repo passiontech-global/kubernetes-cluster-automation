@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -453,10 +454,13 @@ func TestApiserverDarkUntaintsNotReadyNodeOnHealthzOK(t *testing.T) {
 		probeGap: time.Millisecond,
 	}
 
+	var probedMu sync.Mutex
 	probed := map[string]bool{}
 	check := probetest.MustCheck[*apiserverNodeReachabilityCheck](t, p)
 	check.probeFn = func(ctx context.Context, node string) bool {
+		probedMu.Lock()
 		probed[node] = true
+		probedMu.Unlock()
 		return probeHelper.probe(ctx, node)
 	}
 
