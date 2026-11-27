@@ -81,10 +81,19 @@ const (
 	// kubernetes-replicator annotation marking a replicated copy
 	// (replicator-cert-drift).
 	replicatedFromAnno = "replicator.v1.mittwald.de/replicated-from"
+	// replicateToAnno carries a comma-separated list of target
+	// namespaces (or regexes) on a push-source Secret.
+	replicateToAnno = "replicator.v1.mittwald.de/replicate-to"
 	// replicationDriftScans is how many consecutive sweeps a tls.crt
-	// mismatch must persist before the drift gauge fires — a
-	// single-scan diff just catches the replicator mid-sync.
+	// mismatch (or missing replicate-to target) must persist before the
+	// drift gauge fires — a single-scan diff just catches the
+	// replicator mid-sync.
 	replicationDriftScans = 2
+	// replicationDirectSyncScans is how many consecutive drifted sweeps
+	// must elapse before cert-drift-auditor falls back to direct
+	// merge-patching data from the source Secret (2 full sweeps / 30m+
+	// after stripping replicated-from-version at scan 2).
+	replicationDirectSyncScans = 4
 	// replicatedFromVersionAnno is the replicator's source-version
 	// stamp — removing it on a drifted destination forces
 	// kubernetes-replicator to resync the copy (issuer-serial-watch).
@@ -140,6 +149,13 @@ type replicatedSecretRef struct {
 	dest                    []byte
 }
 
+// replicateToSourceRef is one push-source TLS Secret carrying literal
+// namespace names in replicator.v1.mittwald.de/replicate-to.
+type replicateToSourceRef struct {
+	namespace, name string
+	targets         []string
+}
+
 // webhookEntry flattens the two webhook entry types (MutatingWebhook /
 // ValidatingWebhook share WebhookClientConfig) down to the fields this
 // audit compares.
@@ -190,6 +206,10 @@ type certDriftAuditor struct {
 	// resyncHeals: replicationMetricKey → last replicated-from-
 	// version annotation strip (1h cooldown, in-RAM only).
 	resyncHeals state.CooldownSet
+	// directSyncHeals: replicationMetricKey → last direct fallback
+	// data merge-patch (1h cooldown, in-RAM only).
+	directSyncHeals             state.CooldownSet
+	disableReplicatedDirectSync bool
 	// linkerdIssuerSerial: the tracked issuer fingerprint;
 	// linkerdIssuerHeals is the last rollout-stamp moment — the
 	// WIDER of the in-RAM stamp and the
@@ -278,23 +298,32 @@ type secretCAMemo struct {
 	ok bool
 }
 
+type certDriftConfig struct {
+	liveRolloutEnabled          bool
+	replicatedDirectSyncEnabled bool
+}
+
 // Setup registers the 15m sweep — or nothing when the
 // cluster opts out (CERT_DRIFT_AUDITOR_ENABLED=false, resolved by
 // setupModules into Deps.Disabled): same disabled-flag pattern as
 // certmanager-reaper.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	return shared.SetupWithConfig(d, func() bool {
-		return envx.Gate("CERT_LIVE_DRIFT_ROLLOUT_ENABLED", true)
-	}, func(liveRolloutEnabled bool) error {
+	return shared.SetupWithConfig(d, func() certDriftConfig {
+		return certDriftConfig{
+			liveRolloutEnabled:          envx.Gate("CERT_LIVE_DRIFT_ROLLOUT_ENABLED", true),
+			replicatedDirectSyncEnabled: envx.Gate("CERT_REPLICATED_DIRECT_SYNC_ENABLED", true),
+		}
+	}, func(cfg certDriftConfig) error {
 		a := &certDriftAuditor{
-			verdict:            d.Maintenance,
-			cs:                 cs,
-			dyn:                dyn,
-			nodeReader:         d.CachedClient(),
-			queue:              d.Name,
-			now:                shared.SystemClock,
-			disableLiveRollout: !liveRolloutEnabled,
+			verdict:                     d.Maintenance,
+			cs:                          cs,
+			dyn:                         dyn,
+			nodeReader:                  d.CachedClient(),
+			queue:                       d.Name,
+			now:                         shared.SystemClock,
+			disableLiveRollout:          !cfg.liveRolloutEnabled,
+			disableReplicatedDirectSync: !cfg.replicatedDirectSyncEnabled,
 		}
 		return shared.AddPeriodic(mgr, a.queue, 15*time.Minute, a.run)
 	})

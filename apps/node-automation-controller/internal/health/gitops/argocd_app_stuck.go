@@ -178,6 +178,7 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		}
 		reasonSet := map[string]bool{}
 		hasComparisonError := false
+		hasTransientComparisonError := false
 		for _, c := range kube.Conditions(app.Object, "status", "conditions") {
 			typ := c.Type
 			lower := strings.ToLower(typ)
@@ -206,6 +207,9 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 			if isCmp {
 				reasonSet["comparison_error"] = true
 				hasComparisonError = true
+				if !isPermanentComparisonError(c.Message) {
+					hasTransientComparisonError = true
+				}
 			} else {
 				reasonSet["invalid_spec_error"] = true
 			}
@@ -235,8 +239,14 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 		for r := range reasonSet {
 			reasons = append(reasons, r)
 		}
-		if hasComparisonError {
-			comparisonErrors++ // count APPS, not conditions
+		if hasTransientComparisonError {
+			comparisonErrors++ // count APPS with transient ComparisonErrors, not conditions
+		} else if hasComparisonError {
+			// Permanent repository/manifest content errors cannot be cured by
+			// restarting argocd-repo-server; keep alerting/refresh unchanged
+			// while excluding them from the stale-cache restart threshold.
+			log.V(1).Info("skipping repo-server restart count for permanent ComparisonError",
+				"application", ns+"/"+name)
 		}
 		if len(reasons) == 0 {
 			continue
@@ -251,10 +261,40 @@ func (p *argoCDAppStuckCheck) Run(ctx context.Context) probefw.Result {
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
 	rep.Close(&p.emitted, argoCDAppStuckGauge.DeleteLabelValues)
 
-	// >=2 simultaneous ComparisonErrors = shared stale repo-server
+	// >=2 simultaneous transient ComparisonErrors = shared stale repo-server
 	// cache — restart the oldest repo-server pod to flush it.
 	if comparisonErrors >= 2 {
 		p.restartArgoCDRepoServer(ctx, log, now)
 	}
 	return rep.Verdict("argocd applications stuck: ", ", ")
+}
+
+// permanentComparisonErrorSubstrings lists deterministic repository and
+// manifest content error phrases reported by argocd-repo-server in
+// ComparisonError messages. Restarting argocd-repo-server cannot create a
+// missing path, chart, or git revision, so matching errors are excluded from
+// the >=2 stale-cache repo-server restart trigger while still surfaced via
+// node_automation_argocd_app_stuck and Check failure.
+var permanentComparisonErrorSubstrings = []string{
+	"app path does not exist",
+	"path does not exist",
+	"does not exist in repository",
+	"no such file or directory",
+	"unable to resolve revision",
+	"unknown revision",
+	"chart not found",
+	"not found in repository",
+}
+
+// isPermanentComparisonError reports whether a ComparisonError condition
+// message describes a deterministic repository/manifest content failure rather
+// than a transient or stale-cache repo-server failure.
+func isPermanentComparisonError(msg string) bool {
+	lower := strings.ToLower(msg)
+	for _, substr := range permanentComparisonErrorSubstrings {
+		if strings.Contains(lower, substr) {
+			return true
+		}
+	}
+	return false
 }

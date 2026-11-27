@@ -214,7 +214,7 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 	}
 
 	for _, node := range activeNodes {
-		candidates := eligibleOverloadPods(podsByNode[node.Name], rsByKey, deployByKey, pdbs)
+		candidates := eligibleOverloadPods(podsByNode[node.Name], pods, rsByKey, deployByKey, pdbs)
 		if len(candidates) == 0 {
 			continue
 		}
@@ -261,8 +261,73 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 	}
 }
 
+func podDeploymentKey(
+	pod *corev1.Pod,
+	rsByKey map[string]*metav1.PartialObjectMetadata,
+) (string, bool) {
+	podCtrl := metav1.GetControllerOf(pod)
+	if podCtrl == nil || podCtrl.Kind != "ReplicaSet" {
+		return "", false
+	}
+	rs := rsByKey[pod.Namespace+"/"+podCtrl.Name]
+	if rs == nil {
+		return "", false
+	}
+	rsCtrl := metav1.GetControllerOf(rs)
+	if rsCtrl == nil || rsCtrl.Kind != "Deployment" {
+		return "", false
+	}
+	return pod.Namespace + "/" + rsCtrl.Name, true
+}
+
+// colocatedDeploymentsOnNode returns the set of "namespace/deployment" keys
+// whose Running+Ready pods (>= 2) are 100% co-located on nodeName. Evicting
+// from these first immediately breaks single-node SPOFs before touching
+// already well-spread Deployments.
+func colocatedDeploymentsOnNode(
+	allPods []corev1.Pod,
+	rsByKey map[string]*metav1.PartialObjectMetadata,
+	nodeName string,
+) map[string]bool {
+	if nodeName == "" {
+		return nil
+	}
+	type placement struct {
+		readyCount int
+		nodes      map[string]struct{}
+	}
+	byDeploy := map[string]*placement{}
+	for i := range allPods {
+		pod := &allPods[i]
+		if !probefw.PodRunningReady(pod) {
+			continue
+		}
+		depKey, ok := podDeploymentKey(pod, rsByKey)
+		if !ok {
+			continue
+		}
+		p := byDeploy[depKey]
+		if p == nil {
+			p = &placement{nodes: map[string]struct{}{}}
+			byDeploy[depKey] = p
+		}
+		p.readyCount++
+		p.nodes[pod.Spec.NodeName] = struct{}{}
+	}
+	colocated := map[string]bool{}
+	for depKey, p := range byDeploy {
+		if p.readyCount >= 2 && len(p.nodes) == 1 {
+			if _, onNode := p.nodes[nodeName]; onNode {
+				colocated[depKey] = true
+			}
+		}
+	}
+	return colocated
+}
+
 func eligibleOverloadPods(
 	nodePods []*corev1.Pod,
+	allPods []corev1.Pod,
 	rsByKey map[string]*metav1.PartialObjectMetadata,
 	deployByKey map[string]*appsv1.Deployment,
 	pdbs []policyv1.PodDisruptionBudget,
@@ -274,7 +339,21 @@ func eligibleOverloadPods(
 		}
 		out = append(out, pod)
 	}
+	if len(out) <= 1 {
+		return out
+	}
+	colocated := colocatedDeploymentsOnNode(allPods, rsByKey, out[0].Spec.NodeName)
 	slices.SortFunc(out, func(a, b *corev1.Pod) int {
+		aDep, _ := podDeploymentKey(a, rsByKey)
+		bDep, _ := podDeploymentKey(b, rsByKey)
+		aColoc := colocated[aDep]
+		bColoc := colocated[bDep]
+		if aColoc != bColoc {
+			if aColoc {
+				return -1
+			}
+			return 1
+		}
 		if c := cmp.Compare(a.Namespace, b.Namespace); c != 0 {
 			return c
 		}
@@ -312,19 +391,11 @@ func podEligibleForOverloadShed(
 		}
 	}
 	// ONLY Deployment-owned Ready pods: ReplicaSet -> Deployment with readyReplicas >= 2.
-	podCtrl := metav1.GetControllerOf(pod)
-	if podCtrl == nil || podCtrl.Kind != "ReplicaSet" {
+	depKey, ok := podDeploymentKey(pod, rsByKey)
+	if !ok {
 		return false
 	}
-	rs := rsByKey[pod.Namespace+"/"+podCtrl.Name]
-	if rs == nil {
-		return false
-	}
-	rsCtrl := metav1.GetControllerOf(rs)
-	if rsCtrl == nil || rsCtrl.Kind != "Deployment" {
-		return false
-	}
-	dep := deployByKey[pod.Namespace+"/"+rsCtrl.Name]
+	dep := deployByKey[depKey]
 	if dep == nil || dep.Status.ReadyReplicas < 2 {
 		return false
 	}

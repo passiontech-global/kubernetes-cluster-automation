@@ -41,6 +41,8 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	// are a handful per cluster; holding every TLS secret's PEM for
 	// the whole audit was the map this used to keep).
 	var replicated []replicatedSecretRef
+	var replicateToSources []replicateToSourceRef
+	presentTLS := map[secretMetricKey]bool{}
 	// Server-side type filter + continue-token pagination: the
 	// all-namespaces secret read is the biggest this module makes —
 	// page it at kube.DefaultListPageSize so no single response dominates.
@@ -58,10 +60,18 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 				if s.Type != corev1.SecretTypeTLS {
 					continue
 				}
+				presentTLS[secretMetricKey{s.Namespace, s.Name}] = true
 				if src := strings.TrimSpace(s.Annotations[replicatedFromAnno]); src != "" {
 					replicated = append(replicated, replicatedSecretRef{
 						namespace: s.Namespace, name: s.Name,
 						source: src, dest: s.Data["tls.crt"],
+					})
+				}
+				if targets := parseLiteralReplicateTo(s.Namespace, s.Annotations[replicateToAnno]); len(targets) > 0 {
+					replicateToSources = append(replicateToSources, replicateToSourceRef{
+						namespace: s.Namespace,
+						name:      s.Name,
+						targets:   targets,
 					})
 				}
 				block, _ := pem.Decode(s.Data["tls.crt"])
@@ -133,8 +143,10 @@ func (a *certDriftAuditor) auditTLSSecrets(ctx context.Context) error {
 	// replicator-cert-drift — the replicator drift diff rides the same read: every
 	// replicated destination's tls.crt is compared against its
 	// source via a direct Get (replicated secrets are rare — a
-	// cluster-wide tls.crt byte map was not worth retaining).
-	a.auditReplicatedSecrets(ctx, replicated)
+	// cluster-wide tls.crt byte map was not worth retaining), and
+	// missing literal replicate-to targets are checked against active
+	// namespaces.
+	a.auditReplicatedSecrets(ctx, replicated, replicateToSources, presentTLS)
 	return nil
 }
 

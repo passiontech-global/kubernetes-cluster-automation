@@ -437,6 +437,11 @@ const KuredLockAnno = "weave.works/kured-node-lock"
 // rebooting (weave.works/kured-node-reboot).
 const KuredRebootTaintKey = "weave.works/kured-node-reboot"
 
+// KuredRebootInProgressAnno is the RFC3339 timestamp annotation kured
+// writes on a node when initiating a reboot drain. If kured crashes or
+// aborts mid-drain, the annotation can remain stranded indefinitely.
+const KuredRebootInProgressAnno = "weave.works/kured-reboot-in-progress"
+
 // CoordVerdict is the decoded Cluster→Node maintenance state both
 // apps derive from the same annotation pair (and optional node taints)
 // — the L1 nodecoord cache and any L3 re-derivation must agree

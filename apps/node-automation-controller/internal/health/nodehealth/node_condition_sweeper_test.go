@@ -5,12 +5,15 @@
 package nodehealth
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -516,4 +519,275 @@ func TestNodeCondSweeperMixedZombieAndExpiredRemediation(t *testing.T) {
 			t.Fatalf("%s not cleared to False: %+v", condType, c)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Stale kured-reboot-in-progress annotation cleanup: kured stamps an
+// RFC3339 timestamp when starting a reboot drain; if kured crashes or
+// aborts mid-drain, the annotation remains stranded indefinitely.
+// ---------------------------------------------------------------------------
+
+func kuredNode(name string, ready bool, annos map[string]string, taints ...corev1.Taint) *corev1.Node {
+	n := probetest.ReadyWorkerNode(name, "", 0, false)
+	if !ready {
+		for i := range n.Status.Conditions {
+			if n.Status.Conditions[i].Type == corev1.NodeReady {
+				n.Status.Conditions[i].Status = corev1.ConditionFalse
+			}
+		}
+	}
+	n.Annotations = annos
+	n.Spec.Taints = taints
+	return n
+}
+
+func kuredDS(annos map[string]string) *appsv1.DaemonSet {
+	return &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        kuredDaemonSetName,
+			Namespace:   kuredDaemonSetNS,
+			Annotations: annos,
+		},
+	}
+}
+
+func TestNodeCondSweeperClearsStaleKuredAnnotation(t *testing.T) {
+	staleStamp := time.Now().Add(-kuredRebootInProgressMaxAge - 5*time.Minute).UTC().Format(time.RFC3339)
+	cases := []struct {
+		name string
+		ds   *appsv1.DaemonSet
+	}{
+		{name: "no kured DaemonSet", ds: nil},
+		{name: "kured DaemonSet without lock", ds: kuredDS(nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nodeName := "w-kured-stale-" + strings.ReplaceAll(tc.name, " ", "-")
+			n := kuredNode(nodeName, true, map[string]string{
+				nodecond.KuredRebootInProgressAnno: staleStamp,
+				"keep.example.com/other":           "preserved",
+			})
+			objs := []runtime.Object{n}
+			if tc.ds != nil {
+				objs = append(objs, tc.ds)
+			}
+			cs := fake.NewSimpleClientset(objs...)
+			p := testProberDyn(cs, probetest.OpDyn())
+			sweepCtx := probetest.SweepCtx(ctx, p.Deps)
+			before := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues(nodeName, "kured-reboot-in-progress"))
+			if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(sweepCtx); !res.Pass {
+				t.Fatalf("stale kured annotation cleanup must pass silently, got: %+v", res)
+			}
+			if delta := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues(nodeName, "kured-reboot-in-progress")) - before; delta != 1 {
+				t.Fatalf("sweeps_total delta = %v, want 1", delta)
+			}
+			got, err := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := got.Annotations[nodecond.KuredRebootInProgressAnno]; ok {
+				t.Fatalf("stale %s annotation still present: %v",
+					nodecond.KuredRebootInProgressAnno, got.Annotations)
+			}
+			if got.Annotations["keep.example.com/other"] != "preserved" {
+				t.Fatalf("unrelated annotation lost: %v", got.Annotations)
+			}
+			if eff := kube.EffectiveAnno(sweepCtx, n, nodecond.KuredRebootInProgressAnno); eff != "" {
+				t.Fatalf("sweep overlay EffectiveAnno = %q, want empty after patch", eff)
+			}
+		})
+	}
+}
+
+func TestNodeCondSweeperKeepsFreshOrUnparseableKuredAnnotation(t *testing.T) {
+	freshStamp := time.Now().Add(-kuredRebootInProgressMaxAge + 10*time.Minute).UTC().Format(time.RFC3339)
+	cases := []struct {
+		name  string
+		stamp string
+	}{
+		{name: "fresh under 2h", stamp: freshStamp},
+		{name: "unparseable", stamp: "not-a-timestamp"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nodeName := "w-kured-" + strings.ReplaceAll(tc.name, " ", "-")
+			n := kuredNode(nodeName, true, map[string]string{
+				nodecond.KuredRebootInProgressAnno: tc.stamp,
+			})
+			cs := fake.NewSimpleClientset(n)
+			var dsGets int
+			cs.PrependReactor("get", "daemonsets", func(ktesting.Action) (bool, runtime.Object, error) {
+				dsGets++
+				return false, nil, nil
+			})
+			p := testProberDyn(cs, probetest.OpDyn())
+			before := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues(nodeName, "kured-reboot-in-progress"))
+			if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+				t.Fatalf("unexpected failure: %+v", res)
+			}
+			if dsGets != 0 {
+				t.Fatalf("kured DaemonSet fetched %d times with no candidate nodes, want 0", dsGets)
+			}
+			if delta := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues(nodeName, "kured-reboot-in-progress")) - before; delta != 0 {
+				t.Fatalf("sweeps_total delta = %v, want 0", delta)
+			}
+			got, _ := cs.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+			if got.Annotations[nodecond.KuredRebootInProgressAnno] != tc.stamp {
+				t.Fatalf("annotation changed = %q, want %q untouched",
+					got.Annotations[nodecond.KuredRebootInProgressAnno], tc.stamp)
+			}
+		})
+	}
+}
+
+func TestNodeCondSweeperSkipsNotReadyNodeKuredAnnotation(t *testing.T) {
+	staleStamp := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
+	n := kuredNode("w-kured-notready", false, map[string]string{
+		nodecond.KuredRebootInProgressAnno: staleStamp,
+	})
+	cs := fake.NewSimpleClientset(n)
+	p := testProberDyn(cs, probetest.OpDyn())
+	before := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues("w-kured-notready", "kured-reboot-in-progress"))
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("unexpected failure: %+v", res)
+	}
+	if delta := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues("w-kured-notready", "kured-reboot-in-progress")) - before; delta != 0 {
+		t.Fatalf("sweeps_total delta = %v, want 0", delta)
+	}
+	got, _ := cs.CoreV1().Nodes().Get(ctx, "w-kured-notready", metav1.GetOptions{})
+	if got.Annotations[nodecond.KuredRebootInProgressAnno] != staleStamp {
+		t.Fatalf("NotReady node annotation modified: %v", got.Annotations)
+	}
+}
+
+func TestNodeCondSweeperSkipsKuredAnnotationWhenNodeLockedOrTainted(t *testing.T) {
+	staleStamp := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
+	nLock := kuredNode("w-node-lock", true, map[string]string{
+		nodecond.KuredRebootInProgressAnno: staleStamp,
+		nodecond.KuredLockAnno:             `{"nodeID":"w-node-lock"}`,
+	})
+	nTaint := kuredNode("w-node-taint", true, map[string]string{
+		nodecond.KuredRebootInProgressAnno: staleStamp,
+	}, corev1.Taint{Key: nodecond.KuredRebootTaintKey, Effect: corev1.TaintEffectNoSchedule})
+
+	cs := fake.NewSimpleClientset(nLock, nTaint)
+	p := testProberDyn(cs, probetest.OpDyn())
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("unexpected failure: %+v", res)
+	}
+	for _, name := range []string{"w-node-lock", "w-node-taint"} {
+		got, _ := cs.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		if got.Annotations[nodecond.KuredRebootInProgressAnno] != staleStamp {
+			t.Fatalf("%s annotation cleared despite node-level lock/taint", name)
+		}
+	}
+}
+
+func TestNodeCondSweeperRespectsKuredDaemonSetLockScope(t *testing.T) {
+	staleStamp := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
+
+	// DS holds lock for w-locked: w-locked is skipped, w-other is cleaned,
+	// and the DS lookup happens at most once per sweep.
+	nLocked := kuredNode("w-locked", true, map[string]string{
+		nodecond.KuredRebootInProgressAnno: staleStamp,
+	})
+	nOther := kuredNode("w-other", true, map[string]string{
+		nodecond.KuredRebootInProgressAnno: staleStamp,
+	})
+	ds := kuredDS(map[string]string{
+		nodecond.KuredLockAnno: `{"nodeID":"w-locked"}`,
+	})
+	cs := fake.NewSimpleClientset(nLocked, nOther, ds)
+	var dsGets int
+	cs.PrependReactor("get", "daemonsets", func(ktesting.Action) (bool, runtime.Object, error) {
+		dsGets++
+		return false, nil, nil
+	})
+	p := testProberDyn(cs, probetest.OpDyn())
+	beforeLocked := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues("w-locked", "kured-reboot-in-progress"))
+	beforeOther := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues("w-other", "kured-reboot-in-progress"))
+	if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+		t.Fatalf("unexpected failure: %+v", res)
+	}
+	if dsGets != 1 {
+		t.Fatalf("kured DaemonSet fetched %d times, want 1", dsGets)
+	}
+	if delta := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues("w-locked", "kured-reboot-in-progress")) - beforeLocked; delta != 0 {
+		t.Fatalf("w-locked sweeps_total delta = %v, want 0", delta)
+	}
+	if delta := ptestutil.ToFloat64(nodeCondSweepsTotal.WithLabelValues("w-other", "kured-reboot-in-progress")) - beforeOther; delta != 1 {
+		t.Fatalf("w-other sweeps_total delta = %v, want 1", delta)
+	}
+	gotLocked, _ := cs.CoreV1().Nodes().Get(ctx, "w-locked", metav1.GetOptions{})
+	if gotLocked.Annotations[nodecond.KuredRebootInProgressAnno] != staleStamp {
+		t.Fatalf("w-locked annotation cleared while DS holds its lock: %v", gotLocked.Annotations)
+	}
+	gotOther, _ := cs.CoreV1().Nodes().Get(ctx, "w-other", metav1.GetOptions{})
+	if _, ok := gotOther.Annotations[nodecond.KuredRebootInProgressAnno]; ok {
+		t.Fatalf("w-other annotation not cleared while DS lock targets w-locked: %v", gotOther.Annotations)
+	}
+}
+
+func TestNodeCondSweeperFailsClosedOnUnparseableLockOrDSError(t *testing.T) {
+	staleStamp := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
+
+	t.Run("unparseable DS lock", func(t *testing.T) {
+		n := kuredNode("w-unparseable", true, map[string]string{
+			nodecond.KuredRebootInProgressAnno: staleStamp,
+		})
+		ds := kuredDS(map[string]string{
+			nodecond.KuredLockAnno: `{not-valid-json`,
+		})
+		cs := fake.NewSimpleClientset(n, ds)
+		p := testProberDyn(cs, probetest.OpDyn())
+		if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+			t.Fatalf("unexpected failure: %+v", res)
+		}
+		got, _ := cs.CoreV1().Nodes().Get(ctx, "w-unparseable", metav1.GetOptions{})
+		if got.Annotations[nodecond.KuredRebootInProgressAnno] != staleStamp {
+			t.Fatalf("annotation cleared despite unparseable DS lock")
+		}
+	})
+
+	t.Run("unscoped JSON DS lock", func(t *testing.T) {
+		n := kuredNode("w-unscoped", true, map[string]string{
+			nodecond.KuredRebootInProgressAnno: staleStamp,
+		})
+		ds := kuredDS(map[string]string{
+			nodecond.KuredLockAnno: `{}`,
+		})
+		cs := fake.NewSimpleClientset(n, ds)
+		p := testProberDyn(cs, probetest.OpDyn())
+		if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+			t.Fatalf("unexpected failure: %+v", res)
+		}
+		got, _ := cs.CoreV1().Nodes().Get(ctx, "w-unscoped", metav1.GetOptions{})
+		if got.Annotations[nodecond.KuredRebootInProgressAnno] != staleStamp {
+			t.Fatalf("annotation cleared despite unscoped DS lock")
+		}
+	})
+
+	t.Run("DS Get API error", func(t *testing.T) {
+		n := kuredNode("w-ds-err", true, map[string]string{
+			nodecond.KuredRebootInProgressAnno: staleStamp,
+		})
+		cs := fake.NewSimpleClientset(n)
+		cs.PrependReactor("get", "daemonsets", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(errors.New("apiserver timeout"))
+		})
+		p := testProberDyn(cs, probetest.OpDyn())
+		if res := probetest.MustCheck[*nodeCondSweepCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps)); !res.Pass {
+			t.Fatalf("unexpected failure: %+v", res)
+		}
+		got, _ := cs.CoreV1().Nodes().Get(ctx, "w-ds-err", metav1.GetOptions{})
+		if got.Annotations[nodecond.KuredRebootInProgressAnno] != staleStamp {
+			t.Fatalf("annotation cleared despite DS Get error")
+		}
+		// Ensure error does not panic and no patch was issued.
+		for _, act := range cs.Actions() {
+			if act.GetVerb() == "patch" && act.GetResource().Resource == "nodes" {
+				t.Fatalf("unexpected node patch on DS Get error: %+v", act)
+			}
+		}
+	})
 }

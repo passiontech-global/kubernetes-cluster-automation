@@ -9,6 +9,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -300,5 +303,204 @@ func TestIntegrityStreakNeededOneActsImmediately(t *testing.T) {
 		},
 	}).Check(ctx); o != OutcomeRemediated {
 		t.Fatalf("zero threshold o=%v want remediated", o)
+	}
+}
+
+func TestIntegrityDeepRemedyEscalationAndHealthyReset(t *testing.T) {
+	deepCalls := 0
+	deepPruned := 2
+	var deepErr error
+	var deepActions, deepDone int
+	var deepFails []error
+
+	ig, rec := newTestIntegrity(t, "corrupt", nil, nil, func(cfg *IntegrityConfig) {
+		cfg.StreakNeeded = 1
+		cfg.DeepRemedy = func(context.Context) (int, error) {
+			deepCalls++
+			return deepPruned, deepErr
+		}
+		cfg.Sink.DeepAction = func(Verdict) { deepActions++ }
+		cfg.Sink.DeepRemedyDone = func(p int) { deepDone += p }
+		cfg.Sink.DeepRemedyFailed = func(err error) { deepFails = append(deepFails, err) }
+	})
+
+	ctx := context.Background()
+	// Round 1: standard --rotate --vacuum-time=3d.
+	if _, o := ig.Check(ctx); o != OutcomeRemediated {
+		t.Fatalf("round1 o=%v want remediated", o)
+	}
+	if len(rec.remedyArgv) != 1 || deepCalls != 0 {
+		t.Fatalf("round1 should run Remedy only: remedy=%v deep=%d", rec.remedyArgv, deepCalls)
+	}
+
+	// Round 2 (persistent corruption without becoming healthy): escalates to DeepRemedy.
+	if _, o := ig.Check(ctx); o != OutcomeRemediated {
+		t.Fatalf("round2 o=%v want remediated", o)
+	}
+	if len(rec.remedyArgv) != 1 || deepCalls != 1 || deepActions != 1 || deepDone != 2 {
+		t.Fatalf("round2 escalation mismatch: remedy=%v deep=%d actions=%d done=%d",
+			rec.remedyArgv, deepCalls, deepActions, deepDone)
+	}
+
+	// Round 3: DeepRemedy error path fires DeepRemedyFailed.
+	deepErr = errors.New("verify boom")
+	if _, o := ig.Check(ctx); o != OutcomeRemediated {
+		t.Fatalf("round3 o=%v want remediated", o)
+	}
+	if len(deepFails) != 1 || deepCalls != 2 {
+		t.Fatalf("round3 failure mismatch: fails=%v deep=%d", deepFails, deepCalls)
+	}
+	deepErr = nil
+
+	// Healthy read resets escalation back to Round 1.
+	ig.cfg.Probe = func(context.Context) (string, error) { return "ok line", nil }
+	if _, o := ig.Check(ctx); o != OutcomeHealthy {
+		t.Fatalf("healthy read o=%v want healthy", o)
+	}
+
+	// New corruption episode starts at Round 1 again.
+	ig.cfg.Probe = func(context.Context) (string, error) { return "corrupt", nil }
+	if _, o := ig.Check(ctx); o != OutcomeRemediated {
+		t.Fatalf("post-reset round1 o=%v want remediated", o)
+	}
+	if len(rec.remedyArgv) != 2 || deepCalls != 2 {
+		t.Fatalf("post-reset should return to Round 1: remedy=%v deep=%d", rec.remedyArgv, deepCalls)
+	}
+}
+
+func TestParseCorruptVerifyPaths(t *testing.T) {
+	out := strings.Join([]string{
+		"PASS: /var/log/journal/0123456789abcdef0123456789abcdef/user-1000.journal",
+		"File corruption detected at /var/log/journal/0123456789abcdef0123456789abcdef/system@0001-0002.journal:123456 (of 8388608 bytes, 1%).",
+		"FAIL: /var/log/journal/0123456789abcdef0123456789abcdef/system@0001-0002.journal (Bad message)",
+		"FAIL: /run/log/journal/0123456789abcdef0123456789abcdef/system.journal~:",
+		"1234: File corruption detected at /var/log/journal/0123456789abcdef0123456789abcdef/system.journal:0 (of 20971520 bytes, 0%)",
+		"FAIL: relative/path.journal~",
+	}, "\n")
+	got := ParseCorruptVerifyPaths(out)
+	want := []string{
+		"/var/log/journal/0123456789abcdef0123456789abcdef/system@0001-0002.journal",
+		"/run/log/journal/0123456789abcdef0123456789abcdef/system.journal~",
+		"/var/log/journal/0123456789abcdef0123456789abcdef/system.journal",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParseCorruptVerifyPaths = %v, want %v", got, want)
+	}
+}
+
+func TestIsSafeArchivedJournalPath(t *testing.T) {
+	hostRoot := t.TempDir()
+	const mid = "0123456789abcdef0123456789abcdef"
+
+	cases := []struct {
+		name     string
+		hostPath string
+		root     string
+		want     bool
+	}{
+		{"var_archived_at", "/var/log/journal/" + mid + "/system@1234.journal", hostRoot, true},
+		{"var_archived_tilde", "/var/log/journal/" + mid + "/system.journal~", hostRoot, true},
+		{"run_archived_at", "/run/log/journal/" + mid + "/user-1000@999.journal", hostRoot, true},
+		{"run_archived_tilde", "/run/log/journal/" + mid + "/system.journal~", hostRoot, true},
+		{"active_system", "/var/log/journal/" + mid + "/system.journal", hostRoot, false},
+		{"active_user", "/var/log/journal/" + mid + "/user-1000.journal", hostRoot, false},
+		{"empty_root", "/var/log/journal/" + mid + "/system.journal~", "", false},
+		{"relative_path", "var/log/journal/" + mid + "/system.journal~", hostRoot, false},
+		{"traversal_escape", "/var/log/journal/" + mid + "/../../etc/passwd", hostRoot, false},
+		{"traversal_to_journal_like", "/var/log/journal/" + mid + "/../" + mid + "/system.journal~", hostRoot, false},
+		{"outside_etc", "/etc/system.journal~", hostRoot, false},
+		{"too_shallow", "/var/log/journal/system.journal~", hostRoot, false},
+		{"too_deep", "/var/log/journal/" + mid + "/sub/system.journal~", hostRoot, false},
+		{"non_journal_ext", "/var/log/journal/" + mid + "/system@123.txt", hostRoot, false},
+		{"bare_tilde", "/var/log/journal/" + mid + "/.journal~", hostRoot, false},
+		{"bare_at", "/var/log/journal/" + mid + "/@.journal", hostRoot, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsSafeArchivedJournalPath(tc.hostPath, tc.root); got != tc.want {
+				t.Fatalf("IsSafeArchivedJournalPath(%q, %q) = %v, want %v",
+					tc.hostPath, tc.root, got, tc.want)
+			}
+		})
+	}
+
+	// Symlink escape inside journal dir must be rejected.
+	jDir := filepath.Join(hostRoot, "var", "log", "journal", mid)
+	if err := os.MkdirAll(jDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(hostRoot, "secret")
+	if err := os.WriteFile(secret, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(jDir, "evil@1.journal")); err != nil {
+		t.Fatal(err)
+	}
+	if IsSafeArchivedJournalPath("/var/log/journal/"+mid+"/evil@1.journal", hostRoot) {
+		t.Fatal("symlink target must be rejected")
+	}
+}
+
+func TestPruneCorruptJournalFiles(t *testing.T) {
+	hostRoot := t.TempDir()
+	const mid = "0123456789abcdef0123456789abcdef"
+	varDir := filepath.Join(hostRoot, "var", "log", "journal", mid)
+	runDir := filepath.Join(hostRoot, "run", "log", "journal", mid)
+	etcDir := filepath.Join(hostRoot, "etc")
+	for _, d := range []string{varDir, runDir, etcDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mustWrite := func(path string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	activeSys := filepath.Join(varDir, "system.journal")
+	activeUser := filepath.Join(varDir, "user-1000.journal")
+	corruptArchive := filepath.Join(varDir, "system@0001-0002.journal")
+	corruptTildeVar := filepath.Join(varDir, "system.journal~")
+	corruptTildeRun := filepath.Join(runDir, "system.journal~")
+	outside := filepath.Join(etcDir, "important.journal~")
+	secret := filepath.Join(etcDir, "secret")
+	symArchive := filepath.Join(varDir, "evil@1.journal")
+
+	for _, p := range []string{activeSys, activeUser, corruptArchive, corruptTildeVar, corruptTildeRun, outside, secret} {
+		mustWrite(p)
+	}
+	if err := os.Symlink(secret, symArchive); err != nil {
+		t.Fatal(err)
+	}
+
+	verifyOut := strings.Join([]string{
+		"File corruption detected at /var/log/journal/" + mid + "/system@0001-0002.journal:4096 (of 8388608 bytes, 0%)",
+		"FAIL: /var/log/journal/" + mid + "/system.journal (Bad message)",
+		"FAIL: /var/log/journal/" + mid + "/user-1000.journal",
+		"FAIL: /var/log/journal/" + mid + "/../../etc/important.journal~",
+		"FAIL: /etc/important.journal~",
+		"FAIL: /var/log/journal/" + mid + "/evil@1.journal",
+		"FAIL: /var/log/journal/" + mid + "/missing@999.journal",
+	}, "\n")
+
+	pruned, err := PruneCorruptJournalFiles(hostRoot, verifyOut)
+	if err != nil {
+		t.Fatalf("PruneCorruptJournalFiles error: %v", err)
+	}
+	if pruned != 3 {
+		t.Fatalf("pruned = %d, want 3", pruned)
+	}
+
+	for _, gone := range []string{corruptArchive, corruptTildeVar, corruptTildeRun} {
+		if _, statErr := os.Stat(gone); !os.IsNotExist(statErr) {
+			t.Fatalf("expected %s to be removed, stat err=%v", gone, statErr)
+		}
+	}
+	for _, kept := range []string{activeSys, activeUser, outside, secret, symArchive} {
+		if _, statErr := os.Lstat(kept); statErr != nil {
+			t.Fatalf("expected %s to be preserved, lstat err=%v", kept, statErr)
+		}
 	}
 }

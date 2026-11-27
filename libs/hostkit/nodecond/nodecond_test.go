@@ -592,3 +592,15 @@ func TestEvaluateCoord(t *testing.T) {
 		t.Fatalf("live maintenance + nil taints: %+v, want active non-kured", v)
 	}
 }
+
+func TestKuredRebootInProgressAnno(t *testing.T) {
+	if KuredRebootInProgressAnno != "weave.works/kured-reboot-in-progress" {
+		t.Fatalf("KuredRebootInProgressAnno = %q, want weave.works/kured-reboot-in-progress",
+			KuredRebootInProgressAnno)
+	}
+	want := time.Date(2026, 11, 14, 20, 4, 4, 0, time.UTC)
+	got, ok := ParseAnnoTime("2026-11-14T20:04:04Z")
+	if !ok || !got.Equal(want) {
+		t.Fatalf("ParseAnnoTime(kured stamp) = (%v, %v), want (%v, true)", got, ok, want)
+	}
+}

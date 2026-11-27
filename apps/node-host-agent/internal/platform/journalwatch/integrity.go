@@ -24,6 +24,9 @@ package journalwatch
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -102,6 +105,14 @@ type IntegritySink struct {
 	RemedyFailed func(out string, err error)
 	// RemedyDone fires on a successful remedy exec.
 	RemedyDone func()
+	// DeepAction fires right before the Round 2+ deep-prune remedy
+	// runs (persistent corruption after rotate+vacuum).
+	DeepAction func(v Verdict)
+	// DeepRemedyFailed fires when DeepRemedy returned an error.
+	DeepRemedyFailed func(err error)
+	// DeepRemedyDone fires when DeepRemedy succeeded, with the count
+	// of pruned archived journal files.
+	DeepRemedyDone func(pruned int)
 }
 
 // IntegrityConfig parameterizes the probe + remedy per call site.
@@ -141,6 +152,15 @@ type IntegrityConfig struct {
 	// transport is wired: a confirmed streak reports OutcomeGated
 	// (no budget spend, no action line) instead of attempting.
 	Remedy func(ctx context.Context, args ...string) (string, error)
+	// DeepRemedy escalates Round 2+ remediation when corruption
+	// persists across consecutive remedy rounds without ever becoming
+	// healthy (e.g. rotating and pruning corrupt archived journal
+	// files that `--vacuum-time` left behind). nil disables escalation.
+	DeepRemedy func(ctx context.Context) (pruned int, err error)
+	// InitialConsecutiveRemedies seeds consecutiveRemedies when a
+	// caller constructs a fresh Integrity per cycle (e.g. hostconfig
+	// persisting the count across cycles).
+	InitialConsecutiveRemedies int
 	// SpendBudget consumes one remedy slot; false = in cooldown —
 	// the helper skips the remedy (BudgetSkipped) and keeps the
 	// streak armed. Each site keeps its own budget name, window and
@@ -180,8 +200,9 @@ const (
 // per check/cycle loop; the streak lives here (ex the checks'
 // hand-rolled fails counters).
 type Integrity struct {
-	cfg   IntegrityConfig
-	fails int
+	cfg                 IntegrityConfig
+	fails               int
+	consecutiveRemedies int
 }
 
 // NewIntegrity builds the pipeline. A StreakNeeded <= 0 means "act on
@@ -190,7 +211,8 @@ func NewIntegrity(cfg IntegrityConfig) *Integrity {
 	if cfg.StreakNeeded <= 0 {
 		cfg.StreakNeeded = 1
 	}
-	return &Integrity{cfg: cfg}
+	consec := max(cfg.InitialConsecutiveRemedies, 0)
+	return &Integrity{cfg: cfg, consecutiveRemedies: consec}
 }
 
 // Classify runs one probe read and classifies it: corruption markers
@@ -248,6 +270,7 @@ func (ig *Integrity) Act(ctx context.Context, v Verdict) Outcome {
 		return OutcomeInconclusive
 	default:
 		ig.fails = 0
+		ig.consecutiveRemedies = 0
 		return OutcomeHealthy
 	}
 	if ig.cfg.Remedy == nil {
@@ -258,6 +281,22 @@ func (ig *Integrity) Act(ctx context.Context, v Verdict) Outcome {
 			ig.cfg.Sink.BudgetSkipped()
 		}
 		return OutcomeBudget
+	}
+	if ig.consecutiveRemedies >= 1 && ig.cfg.DeepRemedy != nil {
+		if ig.cfg.Sink.DeepAction != nil {
+			ig.cfg.Sink.DeepAction(v)
+		}
+		pruned, derr := ig.cfg.DeepRemedy(ctx)
+		if derr != nil {
+			if ig.cfg.Sink.DeepRemedyFailed != nil {
+				ig.cfg.Sink.DeepRemedyFailed(derr)
+			}
+		} else if ig.cfg.Sink.DeepRemedyDone != nil {
+			ig.cfg.Sink.DeepRemedyDone(pruned)
+		}
+		ig.consecutiveRemedies++
+		ig.fails = 0
+		return OutcomeRemediated
 	}
 	if ig.cfg.Sink.Action != nil {
 		ig.cfg.Sink.Action(v)
@@ -270,6 +309,7 @@ func (ig *Integrity) Act(ctx context.Context, v Verdict) Outcome {
 	} else if ig.cfg.Sink.RemedyDone != nil {
 		ig.cfg.Sink.RemedyDone()
 	}
+	ig.consecutiveRemedies++
 	ig.fails = 0
 	return OutcomeRemediated
 }
@@ -279,4 +319,199 @@ func (ig *Integrity) Act(ctx context.Context, v Verdict) Outcome {
 func (ig *Integrity) Check(ctx context.Context) (Verdict, Outcome) {
 	v := ig.Classify(ctx)
 	return v, ig.Act(ctx, v)
+}
+
+// ParseCorruptVerifyPaths extracts unique host file paths from
+// `journalctl --verify` output lines matching `FAIL: /...` or
+// `File corruption detected at /...`, stripping optional trailing `:`
+// or `:offset` suffixes.
+func ParseCorruptVerifyPaths(verifyOut string) []string {
+	var paths []string
+	seen := map[string]struct{}{}
+	prefixes := []string{"FAIL: ", "File corruption detected at "}
+	for line := range strings.SplitSeq(verifyOut, "\n") {
+		for _, prefix := range prefixes {
+			idx := strings.Index(line, prefix)
+			if idx < 0 {
+				continue
+			}
+			rest := strings.TrimLeft(line[idx+len(prefix):], " \t")
+			fields := strings.Fields(rest)
+			if len(fields) == 0 {
+				break
+			}
+			tok := stripVerifyPathSuffix(fields[0])
+			if !strings.HasPrefix(tok, "/") {
+				break
+			}
+			if _, ok := seen[tok]; !ok {
+				seen[tok] = struct{}{}
+				paths = append(paths, tok)
+			}
+			break
+		}
+	}
+	return paths
+}
+
+func stripVerifyPathSuffix(tok string) string {
+	tok = strings.TrimRight(tok, ".,")
+	if i := strings.LastIndexByte(tok, ':'); i > 0 {
+		rest := tok[i+1:]
+		allDigits := true
+		for j := range len(rest) {
+			if rest[j] < '0' || rest[j] > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			tok = tok[:i]
+		}
+	}
+	return tok
+}
+
+// IsSafeArchivedJournalPath reports whether hostPath (a host-namespace
+// path such as `/var/log/journal/<machine-id>/system@123.journal`) is
+// strictly safe to unlink under hostRoot:
+//   - hostRoot and hostPath are non-empty, with no `..` traversal;
+//   - canonicalized path sits strictly one subdir deep under
+//     /var/log/journal/ or /run/log/journal/;
+//   - no existing component under hostRoot is a symlink;
+//   - basename is an archived journal (`*.journal~` or `*@*.journal`),
+//     never an active `system.journal` or `user-*.journal`.
+func IsSafeArchivedJournalPath(hostPath, hostRoot string) bool {
+	if hostRoot == "" || hostPath == "" || !strings.HasPrefix(hostPath, "/") {
+		return false
+	}
+	if strings.ContainsRune(hostPath, '\x00') {
+		return false
+	}
+	for seg := range strings.SplitSeq(hostPath, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	cleanHost := filepath.Clean(hostPath)
+	cleanRoot := filepath.Clean(hostRoot)
+
+	var relRoot, sub string
+	switch {
+	case strings.HasPrefix(cleanHost, "/var/log/journal/"):
+		relRoot = "var/log/journal"
+		sub = strings.TrimPrefix(cleanHost, "/var/log/journal/")
+	case strings.HasPrefix(cleanHost, "/run/log/journal/"):
+		relRoot = "run/log/journal"
+		sub = strings.TrimPrefix(cleanHost, "/run/log/journal/")
+	default:
+		return false
+	}
+
+	parts := strings.Split(sub, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	mid, base := parts[0], parts[1]
+	if mid == "" || mid == "." || mid == ".." ||
+		base == "" || base == "." || base == ".." {
+		return false
+	}
+	if !isArchivedJournalName(base) {
+		return false
+	}
+
+	rel := filepath.Join(relRoot, mid, base)
+	target := filepath.Join(cleanRoot, rel)
+	relCheck, err := filepath.Rel(cleanRoot, target)
+	if err != nil || relCheck == "." || strings.HasPrefix(relCheck, "..") {
+		return false
+	}
+
+	cur := cleanRoot
+	for seg := range strings.SplitSeq(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, seg)
+		fi, lerr := os.Lstat(cur)
+		if lerr != nil {
+			if errors.Is(lerr, os.ErrNotExist) {
+				continue
+			}
+			return false
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+	}
+	if fi, lerr := os.Lstat(target); lerr == nil && !fi.Mode().IsRegular() {
+		return false
+	}
+	return true
+}
+
+func isArchivedJournalName(base string) bool {
+	if strings.HasSuffix(base, ".journal~") {
+		return len(base) > len(".journal~")
+	}
+	return strings.Contains(base, "@") &&
+		strings.HasSuffix(base, ".journal") &&
+		!strings.HasPrefix(base, "@")
+}
+
+// PruneCorruptJournalFiles removes archived corrupt journal files
+// identified from `journalctl --verify` output plus any `*.journal~`
+// uncleanly-rotated archives under `<hostRoot>/var/log/journal/*/` and
+// `<hostRoot>/run/log/journal/*/`. Every candidate is filtered through
+// IsSafeArchivedJournalPath before removal.
+func PruneCorruptJournalFiles(hostRoot, verifyOut string) (int, error) {
+	if hostRoot == "" {
+		return 0, nil
+	}
+	cleanRoot := filepath.Clean(hostRoot)
+	var candidates []string
+	seen := map[string]struct{}{}
+	add := func(hostPath string) {
+		c := filepath.Clean(hostPath)
+		if _, ok := seen[c]; ok {
+			return
+		}
+		seen[c] = struct{}{}
+		candidates = append(candidates, c)
+	}
+
+	for _, p := range ParseCorruptVerifyPaths(verifyOut) {
+		add(p)
+	}
+	for _, pat := range []string{
+		filepath.Join(cleanRoot, "var", "log", "journal", "*", "*.journal~"),
+		filepath.Join(cleanRoot, "run", "log", "journal", "*", "*.journal~"),
+	} {
+		matches, err := filepath.Glob(pat)
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			rel, rerr := filepath.Rel(cleanRoot, m)
+			if rerr != nil {
+				continue
+			}
+			add("/" + filepath.ToSlash(rel))
+		}
+	}
+
+	pruned := 0
+	var errs []error
+	for _, hostPath := range candidates {
+		if !IsSafeArchivedJournalPath(hostPath, cleanRoot) {
+			continue
+		}
+		fullPath := filepath.Join(cleanRoot, strings.TrimPrefix(hostPath, "/"))
+		if err := os.Remove(fullPath); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		pruned++
+	}
+	return pruned, errors.Join(errs...)
 }

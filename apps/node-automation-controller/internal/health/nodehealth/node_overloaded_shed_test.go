@@ -292,3 +292,29 @@ func TestNodeOverloadedShedRespectsClusterHeadroomAndPDB(t *testing.T) {
 		}
 	})
 }
+
+func TestNodeOverloadedShedPrioritizesColocatedHADeployment(t *testing.T) {
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-ov")
+
+	// Alphabetically earlier Deployment is well-spread (1 pod on w-ov, 1 pod on w-ok).
+	depAlpha, rsAlpha, podAlphaOv := makeDeployChain("apps", "alpha", 2, "w-ov", "alpha-1")
+	_, _, podAlphaOk := makeDeployChain("apps", "alpha", 2, "w-ok", "alpha-2")
+
+	// Alphabetically later HA Deployment is 100% co-located on w-ov (2/2 Ready pods on w-ov).
+	depZeta, rsZeta, podZeta1 := makeDeployChain("zeta", "argocd-server", 2, "w-ov", "argocd-server-1")
+	_, _, podZeta2 := makeDeployChain("zeta", "argocd-server", 2, "w-ov", "argocd-server-2")
+
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-ov", nodecond.NodeOverloaded, 20*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false),
+		depAlpha, rsAlpha, podAlphaOv, podAlphaOk,
+		depZeta, rsZeta, podZeta1, podZeta2,
+	)
+	evicted := captureEvictions(cs)
+	p := testProberDyn(cs, probetest.OpDyn())
+	_ = probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+
+	if len(*evicted) != 1 || (*evicted)[0] != "zeta/argocd-server-1" {
+		t.Fatalf("evicted = %v, want [zeta/argocd-server-1] (100%% co-located HA Deployment prioritized)", *evicted)
+	}
+}

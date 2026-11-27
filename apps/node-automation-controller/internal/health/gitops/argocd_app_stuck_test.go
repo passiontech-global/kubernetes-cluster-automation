@@ -557,6 +557,162 @@ func TestArgoCDDownscaledLookupMemoizedPerSweep(t *testing.T) {
 	}
 }
 
+func TestArgoCDPermanentComparisonErrorsDoNotRestartRepoServer(t *testing.T) {
+	base := time.Now()
+	cond := func(msg string) map[string]any {
+		return map[string]any{
+			"type":               "ComparisonError",
+			"message":            msg,
+			"lastTransitionTime": base.Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+		}
+	}
+	appA := argoCDApplication("argocd", "perm-a", "",
+		cond("Manifest generation error (cached): passiontech/charts/foo: app path does not exist"))
+	appB := argoCDApplication("argocd", "perm-b", "",
+		cond("rpc error: code = Unknown desc = unable to resolve revision main"))
+	dyn := testutil.NewDynamicClient(appA, appB)
+
+	repoPod := probetest.PodWithPhase("argocd", "argocd-repo-server-0", corev1.PodRunning, true, 2*time.Hour)
+	repoPod.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}
+	repoPod.OwnerReferences = repoServerOwnerRef("argocd-repo-server-0")
+	cs := fake.NewSimpleClientset(repoPod)
+	p := testProberDyn(cs, dyn)
+	probetest.FreezeNow(p.Deps, base)
+	testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "perm-a", "comparison_error")
+	testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "perm-b", "comparison_error")
+
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatalf("permanent ComparisonErrors must still FAIL: %+v", res)
+	}
+	for _, appName := range []string{"perm-a", "perm-b"} {
+		if m := probetest.FindMetric(t, "node_automation_argocd_app_stuck",
+			map[string]string{"namespace": "argocd", "name": appName, "reason": "comparison_error"}); m == nil {
+			t.Fatalf("expected gauge emitted for %s", appName)
+		}
+	}
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, "argocd-repo-server-0", metav1.GetOptions{}); err != nil {
+		t.Fatalf("repo-server pod must NOT be deleted for permanent ComparisonErrors: %v", err)
+	}
+}
+
+func TestArgoCDTransientComparisonErrorsRestartRepoServer(t *testing.T) {
+	base := time.Now()
+	cond := func(msg string) map[string]any {
+		return map[string]any{
+			"type":               "ComparisonError",
+			"message":            msg,
+			"lastTransitionTime": base.Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+		}
+	}
+	appA := argoCDApplication("argocd", "trans-a", "",
+		cond("rpc error: code = DeadlineExceeded desc = context deadline exceeded"))
+	appB := argoCDApplication("argocd", "trans-b", "", cond(""))
+	dyn := testutil.NewDynamicClient(appA, appB)
+
+	repoPod := probetest.PodWithPhase("argocd", "argocd-repo-server-0", corev1.PodRunning, true, 2*time.Hour)
+	repoPod.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}
+	repoPod.OwnerReferences = repoServerOwnerRef("argocd-repo-server-0")
+	cs := fake.NewSimpleClientset(repoPod)
+	p := testProberDyn(cs, dyn)
+	probetest.FreezeNow(p.Deps, base)
+	testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "trans-a", "comparison_error")
+	testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "trans-b", "comparison_error")
+
+	res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatalf("two transient ComparisonErrors must FAIL: %+v", res)
+	}
+	if _, err := cs.CoreV1().Pods("argocd").Get(ctx, "argocd-repo-server-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("repo-server pod must be deleted for >=2 transient ComparisonErrors, err=%v", err)
+	}
+}
+
+func TestArgoCDMixedComparisonErrorsThreshold(t *testing.T) {
+	base := time.Now()
+	cond := func(msg string) map[string]any {
+		return map[string]any{
+			"type":               "ComparisonError",
+			"message":            msg,
+			"lastTransitionTime": base.Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+		}
+	}
+	newRepoPod := func() *corev1.Pod {
+		pod := probetest.PodWithPhase("argocd", "argocd-repo-server-0", corev1.PodRunning, true, 2*time.Hour)
+		pod.Labels = map[string]string{"app.kubernetes.io/name": "argocd-repo-server"}
+		pod.OwnerReferences = repoServerOwnerRef("argocd-repo-server-0")
+		return pod
+	}
+
+	t.Run("1 permanent + 1 transient does not delete repo-server", func(t *testing.T) {
+		appPerm := argoCDApplication("argocd", "mix-perm", "",
+			cond("Manifest generation error (cached): passiontech/charts/foo: app path does not exist"))
+		appTrans := argoCDApplication("argocd", "mix-trans-1", "",
+			cond("rpc error: code = DeadlineExceeded desc = context deadline exceeded"))
+		dyn := testutil.NewDynamicClient(appPerm, appTrans)
+		cs := fake.NewSimpleClientset(newRepoPod())
+		p := testProberDyn(cs, dyn)
+		probetest.FreezeNow(p.Deps, base)
+		testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "mix-perm", "comparison_error")
+		testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "mix-trans-1", "comparison_error")
+
+		res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+		if res.Pass {
+			t.Fatalf("mixed ComparisonErrors must FAIL: %+v", res)
+		}
+		if _, err := cs.CoreV1().Pods("argocd").Get(ctx, "argocd-repo-server-0", metav1.GetOptions{}); err != nil {
+			t.Fatalf("repo-server pod must NOT be deleted with only 1 transient error: %v", err)
+		}
+	})
+
+	t.Run("1 permanent + 2 transient deletes repo-server", func(t *testing.T) {
+		appPerm := argoCDApplication("argocd", "mix-perm-2", "",
+			cond("helm chart not found in repository"))
+		appTrans1 := argoCDApplication("argocd", "mix-trans-a", "",
+			cond("rpc error: code = DeadlineExceeded desc = context deadline exceeded"))
+		appTrans2 := argoCDApplication("argocd", "mix-trans-b", "", cond(""))
+		dyn := testutil.NewDynamicClient(appPerm, appTrans1, appTrans2)
+		cs := fake.NewSimpleClientset(newRepoPod())
+		p := testProberDyn(cs, dyn)
+		probetest.FreezeNow(p.Deps, base)
+		testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "mix-perm-2", "comparison_error")
+		testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "mix-trans-a", "comparison_error")
+		testutil.CleanupMetric(t, argoCDAppStuckGauge, "argocd", "mix-trans-b", "comparison_error")
+
+		res := probetest.MustCheck[*argoCDAppStuckCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+		if res.Pass {
+			t.Fatalf("mixed ComparisonErrors must FAIL: %+v", res)
+		}
+		if _, err := cs.CoreV1().Pods("argocd").Get(ctx, "argocd-repo-server-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("repo-server pod must be deleted with 2 transient errors, err=%v", err)
+		}
+	})
+}
+
+func TestIsPermanentComparisonError(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{"Manifest generation error (cached): passiontech/charts/foo: app path does not exist", true},
+		{"Path Does Not Exist", true},
+		{"file does not exist in repository", true},
+		{"open /tmp/repo/foo: no such file or directory", true},
+		{"Unable to resolve revision HEAD", true},
+		{"unknown revision feature/missing", true},
+		{"Chart Not Found", true},
+		{"path not found in repository", true},
+		{"rpc error: code = DeadlineExceeded desc = context deadline exceeded", false},
+		{"connection refused", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isPermanentComparisonError(tc.msg); got != tc.want {
+			t.Errorf("isPermanentComparisonError(%q) = %v, want %v", tc.msg, got, tc.want)
+		}
+	}
+}
+
 // argoCDApplication builds an ArgoCD Application unstructured carrying the
 // given health status and conditions.
 func argoCDApplication(ns, name, health string, conds ...map[string]any) *unstructured.Unstructured {

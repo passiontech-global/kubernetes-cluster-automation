@@ -153,8 +153,9 @@ func (r *Reconciler) machineID() string {
 // the same budget for the silent-journald restart remedy
 // (last-journald-restart).
 const (
-	journaldRotateCooldown  = time.Hour
-	journaldRestartCooldown = time.Hour
+	journaldRotateCooldown      = time.Hour
+	journaldRestartCooldown     = time.Hour
+	journaldRotateConsecCounter = "consecutive-journald-rotate"
 )
 
 // journaldIntegrity is the cheap journald probe groupBase runs every
@@ -220,10 +221,25 @@ func (c *cyc) journaldIntegrity() {
 		// unit-scoped A5 probe's ConsecNeeded streak).
 		StreakNeeded: 1,
 		VacuumAge:    "3d",
+		// Persist the consecutive-remedy count across cycles via
+		// r.state so Round 2+ escalates to DeepRemedy when corruption
+		// survives the initial rotate+vacuum without ever turning healthy.
+		InitialConsecutiveRemedies: r.state.Counter(journaldRotateConsecCounter),
 		// runLong: vacuum of a multi-GB journal on a slow disk blows
 		// past the interactive command budget.
 		Remedy: func(rctx context.Context, args ...string) (string, error) {
 			return r.runLong(rctx, "journalctl", args...)
+		},
+		DeepRemedy: func(rctx context.Context) (int, error) {
+			if _, err := r.run(rctx, "journalctl", "--rotate"); err != nil {
+				return 0, err
+			}
+			verifyOut, _ := r.runLong(rctx, "journalctl", "--verify")
+			pruned, err := journalwatch.PruneCorruptJournalFiles(r.cfg.HostRoot, verifyOut)
+			if pruned > 0 {
+				_, _ = r.run(rctx, "journalctl", "--flush")
+			}
+			return pruned, err
 		},
 		// Spend on the attempt: a failing rotate retries next cycle no
 		// more than once per cooldown window. The last-* name is
@@ -256,6 +272,24 @@ func (c *cyc) journaldIntegrity() {
 				c.err("base: journalctl rotate/vacuum failed",
 					"out", out, "error", err)
 			},
+			DeepAction: func(v journalwatch.Verdict) {
+				logger().Warn("base: journald journal still corrupt after rotate+vacuum — deep-pruning corrupt archived files",
+					"action", "journald-deep-prune",
+					"probe_out", v.Out)
+			},
+			DeepRemedyFailed: func(err error) {
+				c.err("base: journald deep-prune failed", "error", err)
+			},
+			DeepRemedyDone: func(pruned int) {
+				if pruned > 0 {
+					logger().Warn("base: journald deep-prune removed corrupt archived files",
+						"action", "journald-deep-prune",
+						"pruned", pruned)
+					r.actions.WithLabelValues("journald-deep-prune").Inc()
+				} else {
+					logger().Info("base: journald deep-prune found no corrupt archived files")
+				}
+			},
 		},
 	})
 	v := ig.Classify(ctx)
@@ -270,7 +304,13 @@ func (c *cyc) journaldIntegrity() {
 		// CORRUPT — immediate (StreakNeeded 1) and budget-gated; a
 		// healthy or inconclusive read falls through the helper
 		// without action.
-		ig.Act(ctx, v)
+		switch ig.Act(ctx, v) {
+		case journalwatch.OutcomeHealthy:
+			r.state.ResetCounter(journaldRotateConsecCounter)
+		case journalwatch.OutcomeRemediated:
+			_ = r.ensureDir(watchdogStateDir, 0o755)
+			_ = r.state.Incr(journaldRotateConsecCounter)
+		}
 		return
 	}
 	if c.journaldRestarted {

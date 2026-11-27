@@ -20,10 +20,13 @@ import (
 	"context"
 	json "encoding/json/v2"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -65,6 +68,17 @@ const nodeCondSweepHeartbeatMaxAge = 25 * time.Minute
 // remediation's next stamp, short enough that a finished episode
 // stops reading as in-progress within one incident review.
 const nodeCondRemediationSweepMaxAge = 10 * time.Minute
+
+// kuredRebootInProgressMaxAge is how old weave.works/kured-reboot-in-progress
+// may sit on a Ready node without an active kured lock or reboot taint
+// before the sweeper clears it — well above kured's lockTtl (30m) +
+// drainTimeout (10m).
+const kuredRebootInProgressMaxAge = 2 * time.Hour
+
+const (
+	kuredDaemonSetNS   = "kube-system"
+	kuredDaemonSetName = "kured"
+)
 
 // nodeCondSweptConds is the sweeper's allowlist — every condition
 // nodereporter owns and re-stamps lastHeartbeatTime on while alive
@@ -205,5 +219,102 @@ func (p *nodeCondSweepCheck) Run(ctx context.Context) probefw.Result {
 			}
 		}
 	}
+	p.sweepStaleKuredAnnotations(ctx, log, nodes, now)
 	return rep.Verdict("zombie node conditions cleared: ", ", ")
+}
+
+// sweepStaleKuredAnnotations clears weave.works/kured-reboot-in-progress
+// timestamps stranded on Ready nodes past kuredRebootInProgressMaxAge
+// when neither the node nor the kube-system/kured DaemonSet holds an
+// active reboot lock or reboot taint for that node. Fails closed on API
+// errors or unparseable/unscoped locks, and silently auto-heals without
+// failing the node-condition-sweeper check.
+func (p *nodeCondSweepCheck) sweepStaleKuredAnnotations(
+	ctx context.Context, log logr.Logger, nodes []corev1.Node, now time.Time,
+) {
+	var (
+		dsChecked bool
+		dsLockRaw string
+	)
+	for i := range nodes {
+		n := &nodes[i]
+		if !kube.NodeReady(n) {
+			continue
+		}
+		raw := kube.EffectiveAnno(ctx, n, nodecond.KuredRebootInProgressAnno)
+		if raw == "" {
+			continue
+		}
+		ts, ok := nodecond.ParseAnnoTime(raw)
+		if !ok || now.Sub(ts) < kuredRebootInProgressMaxAge {
+			continue
+		}
+		if kube.EffectiveAnno(ctx, n, nodecond.KuredLockAnno) != "" ||
+			kube.HasTaint(n.Spec.Taints, nodecond.KuredRebootTaintKey) {
+			continue
+		}
+		if !dsChecked {
+			ds, err := p.CS.AppsV1().DaemonSets(kuredDaemonSetNS).Get(
+				ctx, kuredDaemonSetName, metav1.GetOptions{})
+			switch {
+			case apierrors.IsNotFound(err):
+				dsLockRaw = ""
+			case err != nil:
+				log.Info("WARN: kured DaemonSet lookup failed — skipping stale kured annotation sweep",
+					"error", err)
+				metrics.IncError(p.Name)
+				return
+			default:
+				dsLockRaw = ds.Annotations[nodecond.KuredLockAnno]
+			}
+			dsChecked = true
+		}
+		if kuredLockBlocksNode(dsLockRaw, n.Name) {
+			continue
+		}
+		payload, err := kube.MergePatchAnnos(map[string]any{
+			nodecond.KuredRebootInProgressAnno: nil,
+		})
+		if err != nil {
+			metrics.IncError(p.Name)
+			log.Error(err, "kured-reboot-in-progress annotation patch marshal failed",
+				"node", n.Name)
+			continue
+		}
+		if _, err := p.CS.CoreV1().Nodes().Patch(ctx, n.Name,
+			types.MergePatchType, payload, metav1.PatchOptions{}); err != nil {
+			metrics.IncError(p.Name)
+			log.Error(err, "kured-reboot-in-progress annotation patch failed",
+				"node", n.Name)
+			continue
+		}
+		kube.RecordAnnoPatch(ctx, n, payload)
+		p.InvalidateNodes(ctx)
+		nodeCondSweepsTotal.WithLabelValues(n.Name, "kured-reboot-in-progress").Inc()
+		log.Info("ACTION: cleared stale kured-reboot-in-progress annotation",
+			"node", n.Name, "staleSince", ts.Format(time.RFC3339))
+	}
+}
+
+// kuredLockBlocksNode checks whether the kured DaemonSet's lock annotation
+// applies to nodeName (matching maintenance.kuredLockNodeID JSON parsing).
+// Fails closed on unparseable or unscoped lock payloads.
+func kuredLockBlocksNode(raw, nodeName string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, "{") {
+		var lock struct {
+			NodeID string `json:"nodeID,case:ignore"`
+		}
+		if err := json.Unmarshal([]byte(raw), &lock); err != nil || lock.NodeID == "" {
+			return true
+		}
+		return lock.NodeID == nodeName
+	}
+	if strings.ContainsAny(raw, " \t\n\r\"'{}[](),:;") {
+		return true
+	}
+	return raw == nodeName
 }

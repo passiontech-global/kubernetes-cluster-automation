@@ -58,11 +58,28 @@ type JournaldCheck struct {
 // ApplyDefaults has already filled both by the time initChecks runs.
 func newJournaldIntegrity(c *JournaldCheck) *journalwatch.Integrity {
 	d := c.d
-	var remedy func(ctx context.Context, args ...string) (string, error)
+	var (
+		remedy     func(ctx context.Context, args ...string) (string, error)
+		deepRemedy func(ctx context.Context) (int, error)
+	)
 	if d.Cfg.Systemd != nil {
 		sd := d.Cfg.Systemd
 		remedy = func(ctx context.Context, args ...string) (string, error) {
 			return sd.Exec(ctx, "journalctl", args...)
+		}
+		deepRemedy = func(ctx context.Context) (int, error) {
+			if _, err := sd.Exec(ctx, "journalctl", "--rotate"); err != nil {
+				return 0, err
+			}
+			// journalctl --verify exits non-zero whenever any corrupt file
+			// is found and reports diagnostics on stderr+stdout; parse
+			// verifyOut regardless of exit status.
+			verifyOut, _ := sd.ExecCombined(ctx, "journalctl", "--verify")
+			pruned, err := journalwatch.PruneCorruptJournalFiles(d.Cfg.HostRoot, verifyOut)
+			if pruned > 0 {
+				_, _ = sd.Exec(ctx, "journalctl", "--flush")
+			}
+			return pruned, err
 		}
 	}
 	return journalwatch.NewIntegrity(journalwatch.IntegrityConfig{
@@ -126,6 +143,7 @@ func newJournaldIntegrity(c *JournaldCheck) *journalwatch.Integrity {
 		StreakNeeded: d.Cfg.ConsecNeeded,
 		VacuumAge:    journaldVacuumAge,
 		Remedy:       remedy,
+		DeepRemedy:   deepRemedy,
 		// Atomic try-and-spend: a confirmed streak without budget is
 		// skipped (and logged) without burning a slot.
 		SpendBudget: func() bool {
@@ -153,6 +171,20 @@ func newJournaldIntegrity(c *JournaldCheck) *journalwatch.Integrity {
 			},
 			RemedyDone: func() {
 				d.Actions.WithLabelValues(wdeps.CheckJournald, "rotate_vacuum").Inc()
+			},
+			DeepAction: func(_ journalwatch.Verdict) {
+				d.State.AppendLog("ACTION: journald deep-prune — rotating and removing corrupt archived journal files after rotate+vacuum failed to clear corruption")
+			},
+			DeepRemedyFailed: func(err error) {
+				d.State.AppendLog(fmt.Sprintf("suspect: journald deep-prune failed: %v", err))
+			},
+			DeepRemedyDone: func(pruned int) {
+				if pruned > 0 {
+					d.State.AppendLog(fmt.Sprintf("ACTION: journald deep-prune removed %d corrupt archived file(s)", pruned))
+					d.Actions.WithLabelValues(wdeps.CheckJournald, "prune_corrupt").Inc()
+				} else {
+					d.State.AppendLog("ACTION: journald deep-prune — no corrupt archived files found")
+				}
 			},
 		},
 	})

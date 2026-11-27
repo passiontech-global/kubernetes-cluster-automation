@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
@@ -241,5 +244,69 @@ func TestJournaldOrphanFold(t *testing.T) {
 	}
 	if hostExists(r, "/var/log/journal/"+oldMid+"/user.journal") {
 		t.Fatal("source orphan journal still present after fold")
+	}
+}
+
+func TestJournaldPersistentCorruptionEscalatesToDeepPruneAndResets(t *testing.T) {
+	const mid = "0123456789abcdef0123456789abcdef"
+	now := time.Unix(1_700_000_000, 0)
+	res := map[string]string{
+		"journalctl -n 5": "File corruption detected at /var/log/journal/" + mid + "/system.journal:0",
+		"journalctl --verify": "File corruption detected at /var/log/journal/" + mid + "/system@0001-0002.journal:128\n" +
+			"FAIL: /var/log/journal/" + mid + "/system.journal (Bad message)\n",
+	}
+	c, r, sr := journaldEnv(t, res, map[string]bool{})
+	r.cfg.Clock.Set(func() time.Time { return now })
+
+	hostWrite(t, r, "/var/log/journal/"+mid+"/system.journal", "active")
+	hostWrite(t, r, "/var/log/journal/"+mid+"/system@0001-0002.journal", "corrupt-archive")
+	hostWrite(t, r, "/var/log/journal/"+mid+"/system.journal~", "corrupt-tilde")
+
+	// Round 1: standard rotate+vacuum.
+	c.groupBase()
+	if len(sr.CallsMatching("journalctl --rotate --vacuum-time=3d")) != 1 {
+		t.Fatalf("round 1 did not run rotate --vacuum-time=3d: %v", sr.Calls())
+	}
+	if len(sr.CallsMatching("journalctl --verify")) != 0 {
+		t.Fatalf("round 1 must not escalate to deep-prune: %v", sr.Calls())
+	}
+
+	// Advance past 1h cooldown; corruption persists -> Round 2 escalates.
+	now = now.Add(61 * time.Minute)
+	sr.ClearLog()
+	c.groupBase()
+	if len(sr.CallsMatching("journalctl --rotate --vacuum-time=3d")) != 0 {
+		t.Fatalf("round 2 should escalate instead of repeating rotate+vacuum: %v", sr.Calls())
+	}
+	if len(sr.CallsMatching("journalctl --verify")) != 1 || len(sr.CallsMatching("journalctl --flush")) != 1 {
+		t.Fatalf("round 2 should run verify and flush: %v", sr.Calls())
+	}
+	if hostExists(r, "/var/log/journal/"+mid+"/system@0001-0002.journal") {
+		t.Fatal("corrupt archive not pruned")
+	}
+	if hostExists(r, "/var/log/journal/"+mid+"/system.journal~") {
+		t.Fatal("corrupt tilde archive not pruned")
+	}
+	if !hostExists(r, "/var/log/journal/"+mid+"/system.journal") {
+		t.Fatal("active system.journal must be preserved")
+	}
+	if got := promtestutil.ToFloat64(r.actions.WithLabelValues("journald-deep-prune")); got != 1 {
+		t.Fatalf("journald-deep-prune action metric = %v, want 1", got)
+	}
+
+	// Healthy probe resets the consecutive-remedy counter.
+	sr.On("journalctl -n 5", "Oct 01 10:00:00 node-b systemd[1]: healthy")
+	c.groupBase()
+
+	// Next episode after cooldown starts back at Round 1.
+	now = now.Add(61 * time.Minute)
+	sr.On("journalctl -n 5", "File corruption detected at /var/log/journal/"+mid+"/system.journal:0")
+	sr.ClearLog()
+	c.groupBase()
+	if len(sr.CallsMatching("journalctl --rotate --vacuum-time=3d")) != 1 {
+		t.Fatalf("post-recovery corruption should restart at Round 1: %v", sr.Calls())
+	}
+	if len(sr.CallsMatching("journalctl --verify")) != 0 {
+		t.Fatalf("post-recovery Round 1 must not escalate: %v", sr.Calls())
 	}
 }
