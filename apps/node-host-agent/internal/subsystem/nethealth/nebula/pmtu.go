@@ -10,7 +10,37 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/watchdogconf"
 )
+
+// pickNebulaPMTUTarget selects the DF PMTU probe target in priority order:
+//  1. First alive target in wd.OverlayProbeMarkers (guaranteed to traverse
+//     the neb1 overlay tunnel, never raw underlay ICMP — incident 2026-11-27
+//     production/nonprod: ISP peering filters raw underlay ICMP >=100B while
+//     full 1500B UDP overlay passes cleanly).
+//  2. First alive target in wd.OverlaySiteMarkers (same-site overlay tunnel).
+//  3. First alive target in targets (backward-compatible fallback when wd is
+//     nil or no markers are configured/alive).
+func pickNebulaPMTUTarget(wd *watchdogconf.Config,
+	targets []string, results map[string]PingResult) string {
+	firstAlive := func(list []string) string {
+		for _, t := range list {
+			if t != "" && results[t].Ok {
+				return t
+			}
+		}
+		return ""
+	}
+	if wd != nil {
+		if t := firstAlive(wd.OverlayProbeMarkers); t != "" {
+			return t
+		}
+		if t := firstAlive(wd.OverlaySiteMarkers); t != "" {
+			return t
+		}
+	}
+	return firstAlive(targets)
+}
 
 // checkNebulaPMTU is the overlay-mtu-guard double-encapsulation PMTU probe:
 // small-packet overlay pings keep passing while a 1200-byte
@@ -24,14 +54,8 @@ import (
 // state-nebula-pmtu-blackhole; a passing probe (or no alive
 // target) clears it.
 func (n *Deps) checkNebulaPMTU(ctx context.Context,
-	targets []string, results map[string]PingResult) {
-	target := ""
-	for _, t := range targets {
-		if results[t].Ok {
-			target = t
-			break
-		}
-	}
+	wd *watchdogconf.Config, targets []string, results map[string]PingResult) {
+	target := pickNebulaPMTUTarget(wd, targets, results)
 	if target == "" {
 		// No alive overlay peer this cycle — the isolation /
 		// degraded verdicts own the diagnosis; a PMTU streak

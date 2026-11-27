@@ -19,6 +19,7 @@ package watchdogs
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -83,7 +84,12 @@ const (
 // precisely so its ABSENCE proves the alert pipeline is broken.
 // count() >= 1 keeps the pipeline alive; an empty vector is the worst
 // signal here.
-const obsWatchdogQuery = `count(ALERTS{alertname="Watchdog",alertstate="firing"})`
+const (
+	obsWatchdogQuery          = `count(ALERTS{alertname="Watchdog",alertstate="firing"})`
+	obsVMDownTargetsByNSQuery = `count by (namespace) (up == 0)`
+	labelPlatformTier         = "platform.passiontech.dev/tier"
+	tierTenant                = "tenant"
+)
 
 type obsPipelineCounter struct {
 	component string
@@ -259,6 +265,11 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 		if len(series) == 0 {
 			continue
 		}
+		if backend == promq.BackendVictoriaMetrics &&
+			q.component == "vmagent_scrapes_failed" &&
+			p.vmScrapeFailuresTenantOnly(ctx, log) {
+			continue
+		}
 		degraded[q.component] = true
 		p.degrade(ctx, log, &rep, backend, q.component, q.desc)
 	}
@@ -274,6 +285,57 @@ func (p *observabilityPipelineCheck) Run(ctx context.Context) probefw.Result {
 	}
 	return rep.Result(&p.emitted, obsPipelineDegradedGauge.DeleteLabelValues,
 		"observability pipeline degraded: ", ", ")
+}
+
+// vmScrapeFailuresTenantOnly reports whether every currently down scrape
+// target (`up == 0`) belongs exclusively to namespaces labeled
+// platform.passiontech.dev/tier=tenant. Fails closed (returns false) on any
+// query or list error, empty result, unlabeled/cluster-scoped target, or
+// non-tenant namespace so real platform scrape outages still degrade
+// ObservabilityPipelineDegraded (incident 2026-11-27 production & nonprod:
+// 67-83 tenant pods with VMServiceScrape enabled without /metrics returned
+// HTTP 404 and fired CRITICAL 24/7 with zero platform targets down).
+func (p *observabilityPipelineCheck) vmScrapeFailuresTenantOnly(
+	ctx context.Context, log logr.Logger,
+) bool {
+	downSeries, err := p.PromQuery(ctx, obsVMDownTargetsByNSQuery)
+	if err != nil {
+		log.V(1).Info("vmagent_scrapes_failed tenant-only check query failed — failing closed",
+			"error", err)
+		return false
+	}
+	if len(downSeries) == 0 {
+		return false
+	}
+	namespaces, err := p.AllNamespaces(ctx)
+	if err != nil {
+		log.V(1).Info("vmagent_scrapes_failed tenant-only namespace list failed — failing closed",
+			"error", err)
+		return false
+	}
+	tenantNS := make(map[string]bool, len(namespaces))
+	for i := range namespaces {
+		ns := &namespaces[i]
+		if ns.Labels[labelPlatformTier] == tierTenant {
+			tenantNS[ns.Name] = true
+		}
+	}
+	seen := make(map[string]struct{}, len(downSeries))
+	var tenantNames []string
+	for _, s := range downSeries {
+		ns := s.Label("namespace")
+		if ns == "" || !tenantNS[ns] {
+			return false
+		}
+		if _, dup := seen[ns]; !dup {
+			seen[ns] = struct{}{}
+			tenantNames = append(tenantNames, ns)
+		}
+	}
+	slices.Sort(tenantNames)
+	log.Info("INFO: vmagent_scrapes_failed confined exclusively to tenant-tier namespaces — suppressing platform pipeline degradation",
+		"namespaces", tenantNames)
+	return true
 }
 
 // degrade flags one pipeline component — the gauge emission plus the

@@ -5,6 +5,7 @@ package hostconfig
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 	"strings"
 	"time"
@@ -32,9 +33,9 @@ func (c *cyc) groupCoreDNS() {
 	if len(firstUpstream) > 0 {
 		pub1 = firstUpstream[0]
 	}
-	net := defStr(c.v("interdc_nebula_net"), "interdc")
+	nebNet := defStr(c.v("interdc_nebula_net"), "interdc")
 	// Stub unit After= follows the ACTIVE overlay (ansible template).
-	afterUnit := "nebula@" + net + ".service"
+	afterUnit := "nebula@" + nebNet + ".service"
 	if t.Overlay != "nebula" {
 		afterUnit = "tinc@" + defStr(c.v("interdc_tinc_net"), "interdc") + ".service"
 	}
@@ -57,10 +58,10 @@ func (c *cyc) groupCoreDNS() {
 	zone = cgate("zone", zone)
 	upstream = cgate("interdc_stub_public_upstream", upstream)
 	pub1 = cgate("interdc_stub_public_upstream[0]", pub1)
-	// net is consumed only through afterUnit (rendered above, gated
+	// nebNet is consumed only through afterUnit (rendered above, gated
 	// there) — gate it for the refusal accounting without re-binding
 	// the variable (an assignment nothing reads is a lint failure).
-	if !c.cfgScalar("coredns: interdc_nebula_net", net) {
+	if !c.cfgScalar("coredns: interdc_nebula_net", nebNet) {
 		cfgOK = false
 	}
 	afterUnit = cgate("overlay unit", afterUnit)
@@ -82,6 +83,19 @@ func (c *cyc) groupCoreDNS() {
 	}
 	if !isHub && len(t.DNSResolvers) == 0 {
 		return // T9 gates entirely on interdc_dns_resolvers | length > 0
+	}
+	var cpEndpoint, vip string
+	if !isHub {
+		cpEndpoint = strings.TrimSpace(c.v("cp_endpoint"))
+		vip = strings.TrimSpace(c.t.Vars.StrDef("api_lb_vip_ip", ""))
+		// Gate optional underlay fallback scalars only when api_lb_vip_ip
+		// is configured so workers without it keep exact existing behavior.
+		if vip != "" {
+			vip = cgate("api_lb_vip_ip", vip)
+		}
+		if vip != "" && cpEndpoint != "" {
+			cpEndpoint = cgate("cp_endpoint", cpEndpoint)
+		}
 	}
 	if !cfgOK {
 		logger().Warn("coredns: render skipped — unsafe value refused, keeping previous config")
@@ -121,12 +135,28 @@ func (c *cyc) groupCoreDNS() {
 			logger().Warn("coredns: render skipped — unsafe value refused, keeping previous config")
 			return
 		}
+		hostsBlock := ""
+		if vip != "" && cpEndpoint != "" &&
+			net.ParseIP(vip) != nil &&
+			strings.HasSuffix(cpEndpoint, "."+zone) &&
+			len(cpEndpoint) > len(zone)+1 &&
+			!strings.ContainsAny(cpEndpoint, " \t") {
+			// Underlay fallback (incident 2026-11-27 cicd): when the
+			// sole Nebula lighthouse is unreachable, forwarding zone
+			// queries returns SERVFAIL (rcode 2) and blocks T9's
+			// cp_endpoint probe and resolv.conf converge. Answering
+			// cp_endpoint locally with the underlay API LB VIP keeps
+			// the stub healthy while fallthrough forwards all other
+			// zone records to the mesh resolvers.
+			hostsBlock = fmt.Sprintf("    hosts {\n        %s %s\n        fallthrough\n    }\n",
+				vip, cpEndpoint)
+		}
 		corefile = fmt.Sprintf(`# Managed by node-config-agent (T9) - local stub, domain-aware
 # routing: %s -> mesh resolvers; "." -> public
 # upstreams, then the mesh (rescue via tinc).
 %s {
     bind 127.0.0.1
-    forward . %s {
+%s    forward . %s {
         policy sequential
         health_check 10s
     }
@@ -143,7 +173,7 @@ func (c *cyc) groupCoreDNS() {
     }
     errors
 }
-`, zone, zone, resolvers, upstream, resolvers)
+`, zone, zone, hostsBlock, resolvers, upstream, resolvers)
 	}
 
 	cfgChanged := false

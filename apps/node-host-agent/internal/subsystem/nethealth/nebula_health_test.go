@@ -802,3 +802,91 @@ func TestProbeNebulaOverlayDeduplicatesTargets(t *testing.T) {
 		t.Fatal("nil stats")
 	}
 }
+
+// TestNebulaHubIsolatedPreservesLiveSiteMesh — incident 2026-11-27 cicd:
+// when the remote hub/lighthouse is unreachable (dpAlive==0, mkAlive==0)
+// but same-site peers (OverlaySiteMarkers) are STILL alive, local
+// nebula@interdc dataplane works. The check must STILL arm
+// state-nebula-isolated (and clear degraded), flush conntrack ONLY for
+// the dead remote/hub peers on the isolation edge (never live site
+// peers), log the hold suspect line, and NOT restart nebula@interdc even
+// after ConsecNeeded cycles.
+func TestNebulaHubIsolatedPreservesLiveSiteMesh(t *testing.T) {
+	e := nebulaEnv(t, func(wd *watchdogconf.Config) {
+		wd.OverlayProbeTargets = []string{"103.186.101.30"}
+		wd.OverlayProbeMarkers = []string{"172.29.0.3"}
+		wd.OverlaySiteMarkers = []string{"172.29.0.10"}
+		wd.OverlayEgressRelays = []string{"198.51.100.10"} // live site peer underlay
+	})
+	nebulaStaticMapEnv(t, e, map[string]string{
+		"172.29.0.3":  "103.186.101.31:45670", // dead hub marker underlay
+		"172.29.0.10": "198.51.100.10:45670",  // live site peer underlay — must NOT be flushed
+	})
+	e.pingOK["103.186.101.30|false"] = false
+	e.pingOK["172.29.0.3|false"] = false
+	e.pingOK["172.29.0.10|false"] = true
+	e.pingRTT["172.29.0.10|false"] = 2
+	// Keep overlay-egress direct probe green for 198.51.100.10 so any flush of
+	// it would strictly come from nebula-health (proving nebulaPeerUnderlayIPs
+	// was NOT flushed on the site-alive isolation edge).
+	e.pingOK["198.51.100.10|true"] = true
+
+	// Seed a stale degraded latch + streak to verify both clear on isolation.
+	testutil.WriteFile(t, filepath.Join(e.state, "state-nebula-degraded"), "1\n")
+	e.n.neb.NebulaDeg = 2
+
+	// Run past ConsecNeeded (2) cycles — restart must remain held.
+	for i := range 3 {
+		e.n.Cycle(context.Background())
+		if !stateExists(e, "nebula-isolated") {
+			t.Fatalf("cycle %d: nebula-isolated latch missing", i+1)
+		}
+		if stateExists(e, "nebula-degraded") || e.n.neb.NebulaDeg != 0 {
+			t.Fatalf("cycle %d: degraded latch/counter not cleared (deg=%d)", i+1, e.n.neb.NebulaDeg)
+		}
+	}
+	if e.sd.Ran("restart nebula") {
+		t.Fatalf("nebula@interdc restarted despite live site-mesh, cmds=%v", e.sd.Cmds())
+	}
+	// Dead hub underlay (direct target + static_host_map resolved marker)
+	// flushed on the isolation edge; live site peer untouched.
+	for _, dead := range []string{"103.186.101.30", "103.186.101.31"} {
+		if !e.host.Ran("conntrack -D -p udp --dport 45670 -d "+dead) ||
+			!e.host.Ran("conntrack -D -p udp --dport 45670 -s "+dead) {
+			t.Fatalf("dead hub peer %s not flushed, cmds=%v", dead, e.host.Cmds())
+		}
+	}
+	if e.host.Ran("198.51.100.10") {
+		t.Fatalf("live site peer underlay was flushed, cmds=%v", e.host.Cmds())
+	}
+	if logs := logLines(t, e); !strings.Contains(logs,
+		"suspect: nebula-hub-isolated-site-alive pub=0/1 marker=0/1 site=1/1 — holding nebula restart to preserve site-mesh") {
+		t.Fatalf("missing site-alive hold suspect log:\n%s", logs)
+	}
+}
+
+// TestNebulaHubAndSiteMeshBothDeadRestarts verifies that when BOTH the
+// remote hub AND the local site-mesh markers are dead (siteAlive==0),
+// the existing full dataplane-dead restart fires after ConsecNeeded.
+func TestNebulaHubAndSiteMeshBothDeadRestarts(t *testing.T) {
+	e := nebulaEnv(t, func(wd *watchdogconf.Config) {
+		wd.OverlayProbeTargets = []string{"103.186.101.30"}
+		wd.OverlayProbeMarkers = []string{"172.29.0.3"}
+		wd.OverlaySiteMarkers = []string{"172.29.0.10"}
+	})
+	e.pingOK["103.186.101.30|false"] = false
+	e.pingOK["172.29.0.3|false"] = false
+	e.pingOK["172.29.0.10|false"] = false // site-mesh also dead
+
+	e.n.Cycle(context.Background())
+	if !stateExists(e, "nebula-isolated") {
+		t.Fatal("nebula-isolated latch missing when hub + site-mesh both dead")
+	}
+	if e.sd.Ran("restart nebula") {
+		t.Fatal("restarted before ConsecNeeded")
+	}
+	e.n.Cycle(context.Background())
+	if !e.sd.Ran("restart nebula@interdc") {
+		t.Fatalf("nebula@interdc not restarted when hub + site-mesh both dead, cmds=%v", e.sd.Cmds())
+	}
+}

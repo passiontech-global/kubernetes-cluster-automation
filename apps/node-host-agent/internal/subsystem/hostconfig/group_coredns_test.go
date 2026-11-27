@@ -70,6 +70,147 @@ test.internal {
 	}
 }
 
+// TestCoreDNSWorkerStubUnderlayFallback — incident 2026-11-27 cicd:
+// when api_lb_vip_ip is a valid IP and cp_endpoint sits inside the
+// internal zone, the worker stub Corefile renders a local hosts block
+// with fallthrough BEFORE forward so T9 keeps answering cp_endpoint
+// even when the sole Nebula lighthouse is unreachable.
+func TestCoreDNSWorkerStubUnderlayFallback(t *testing.T) {
+	vars := writeVarsDir(t, "api_lb_vip_ip: \"203.0.113.14\"\n")
+	sr := newScripted(map[string]string{
+		"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
+	}, nil)
+	r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+		VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr,
+		DownloadDir: t.TempDir(), DNSProbe: dnsProbeAnyOK()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := loadCyc(t, r, vars, "node-b")
+	c.groupCoreDNS()
+
+	want := `# Managed by node-config-agent (T9) - local stub, domain-aware
+# routing: test.internal -> mesh resolvers; "." -> public
+# upstreams, then the mesh (rescue via tinc).
+test.internal {
+    bind 127.0.0.1
+    hosts {
+        203.0.113.14 api.test.internal
+        fallthrough
+    }
+    forward . 172.29.0.10 {
+        policy sequential
+        health_check 10s
+    }
+    errors
+}
+. {
+    bind 127.0.0.1
+    forward . 1.1.1.1 8.8.8.8 172.29.0.10 {
+        policy sequential
+        health_check 10s
+    }
+    cache 300 {
+        serve_stale 1h
+    }
+    errors
+}
+`
+	got := hostRead(t, r, "/etc/coredns/Corefile")
+	if got != want {
+		t.Fatalf("Corefile mismatch:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	if c.errs != 0 {
+		t.Fatalf("unexpected cycle errors: %d", c.errs)
+	}
+}
+
+// TestCoreDNSWorkerStubUnderlayFallbackGuards verifies all boundary
+// cases of the underlay hosts fallback:
+//   - unsafe api_lb_vip_ip (quote/newline injection) fails closed
+//     (counted error, no Corefile written),
+//   - malformed non-IP api_lb_vip_ip, empty api_lb_vip_ip, or a
+//     cp_endpoint outside zone keeps the exact legacy Corefile without
+//     rendering a hosts block.
+func TestCoreDNSWorkerStubUnderlayFallbackGuards(t *testing.T) {
+	t.Run("unsafe_vip_fails_closed", func(t *testing.T) {
+		for name, poisoned := range map[string]string{
+			"quote":   `api_lb_vip_ip: '203.0.113.14"; bad'`,
+			"newline": "api_lb_vip_ip: |-\n  203.0.113.14\n  1.2.3.4 evil.test.internal",
+		} {
+			t.Run(name, func(t *testing.T) {
+				vars := writeVarsDir(t, poisoned+"\n")
+				sr := newScripted(map[string]string{
+					"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
+				}, nil)
+				r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+					VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr,
+					DownloadDir: t.TempDir(), DNSProbe: dnsProbeAnyOK()}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c := loadCyc(t, r, vars, "node-b")
+				c.groupCoreDNS()
+				if hostExists(r, "/etc/coredns/Corefile") {
+					t.Fatalf("Corefile written despite refused api_lb_vip_ip (%s)", name)
+				}
+				if c.errs == 0 {
+					t.Fatal("refused api_lb_vip_ip not counted as cycle error")
+				}
+			})
+		}
+	})
+
+	wantNoHosts := `# Managed by node-config-agent (T9) - local stub, domain-aware
+# routing: test.internal -> mesh resolvers; "." -> public
+# upstreams, then the mesh (rescue via tinc).
+test.internal {
+    bind 127.0.0.1
+    forward . 172.29.0.10 {
+        policy sequential
+        health_check 10s
+    }
+    errors
+}
+. {
+    bind 127.0.0.1
+    forward . 1.1.1.1 8.8.8.8 172.29.0.10 {
+        policy sequential
+        health_check 10s
+    }
+    cache 300 {
+        serve_stale 1h
+    }
+    errors
+}
+`
+	for name, cluster := range map[string]string{
+		"empty_vip":        "api_lb_vip_ip: \"\"\n",
+		"malformed_ip":     "api_lb_vip_ip: \"not-an-ip\"\n",
+		"outside_zone":     "api_lb_vip_ip: \"203.0.113.14\"\ncp_endpoint: \"api.other.example\"\n",
+		"bare_zone_suffix": "api_lb_vip_ip: \"203.0.113.14\"\ncp_endpoint: \"test.internal\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			vars := writeVarsDir(t, cluster)
+			sr := newScripted(map[string]string{
+				"/usr/local/bin/coredns -version": "CoreDNS-1.14.7",
+			}, nil)
+			r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+				VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr,
+				DownloadDir: t.TempDir(), DNSProbe: dnsProbeAnyOK()}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := loadCyc(t, r, vars, "node-b")
+			c.groupCoreDNS()
+			got := hostRead(t, r, "/etc/coredns/Corefile")
+			if got != wantNoHosts {
+				t.Fatalf("%s Corefile mismatch:\n--- got ---\n%s\n--- want ---\n%s", name, got, wantNoHosts)
+			}
+		})
+	}
+}
+
 // TestCoreDNSInjectionFailsClosed: a quote/newline in an upstream,
 // marker or resolver value would inject arbitrary Corefile
 // directives (bind/forward interpolate the scalars verbatim). The

@@ -14,8 +14,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -180,4 +182,118 @@ func TestCiliumMissingCEPForbiddenSkipsAndCarries(t *testing.T) {
 		t.Fatalf("transient census failure must report Infra, got %+v", res)
 	}
 	ciliumMissingCEPPodsGauge.DeleteLabelValues("apps", "app-bare", "w1")
+}
+
+func makeOwnedPodWithNet(ns, name, node, podIP, hostIP string, uid types.UID) *corev1.Pod {
+	pod := probetest.PodWithPhase(ns, name, corev1.PodRunning, true, time.Hour)
+	pod.UID = uid
+	pod.Spec.NodeName = node
+	pod.Status.PodIP = podIP
+	pod.Status.HostIP = hostIP
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1",
+		Kind:       "ReplicaSet",
+		Name:       name + "-rs",
+		UID:        "rs-uid-" + uid,
+		Controller: ptr.To(true),
+	}}
+	return pod
+}
+
+func cepObjFull(ns, name string, identityID int64, ipv4, nodeIP string, ownerPodUID types.UID) *unstructured.Unstructured {
+	netObj := map[string]any{
+		"addressing": []any{map[string]any{"ipv4": ipv4}},
+	}
+	if nodeIP != "" {
+		netObj["node"] = nodeIP
+	}
+	obj := testutil.Unstructured(
+		kube.GVRCiliumEndpoint.GroupVersion().WithKind("CiliumEndpoint"), ns, name,
+		map[string]any{"status": map[string]any{
+			"identity":   map[string]any{"id": identityID},
+			"networking": netObj,
+		}})
+	if ownerPodUID != "" {
+		obj.SetOwnerReferences([]metav1.OwnerReference{{
+			APIVersion: "v1",
+			Kind:       "Pod",
+			Name:       name,
+			UID:        ownerPodUID,
+		}})
+	}
+	return obj
+}
+
+func TestCiliumStaleCEPMismatchDetectionAndHeal(t *testing.T) {
+	t.Run("stale CEP PodIP detected after 2 sweeps and pod deleted", func(t *testing.T) {
+		pod := makeOwnedPodWithNet("apps", "adapter-1", "lanit-02", "10.0.0.89", "172.29.0.16", "pod-uid-live")
+		cep := cepObjFull("apps", "adapter-1", 4242, "10.0.0.74", "172.29.0.16", "pod-uid-live")
+		cs := fake.NewSimpleClientset(pod)
+		p := testProberDyn(cs, probetest.OpDyn(cep))
+		chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
+
+		if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+			t.Fatalf("first sighting inside streak window must pass: %+v", res)
+		}
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res.Pass {
+			t.Fatalf("stale CEP PodIP mismatch must fail on 2nd sweep: %+v", res)
+		}
+		if _, err := cs.CoreV1().Pods("apps").Get(ctx, "adapter-1", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("pod with stale CEP PodIP should be deleted to heal, err=%v", err)
+		}
+		ciliumMissingCEPPodsGauge.DeleteLabelValues("apps", "adapter-1", "lanit-02")
+	})
+
+	t.Run("stale CEP HostIP/node detected after 2 sweeps and pod deleted", func(t *testing.T) {
+		pod := makeOwnedPodWithNet("apps", "adapter-2", "lanit-02", "10.0.0.89", "172.29.0.16", "pod-uid-2")
+		cep := cepObjFull("apps", "adapter-2", 4242, "10.0.0.89", "172.29.0.15", "pod-uid-2")
+		cs := fake.NewSimpleClientset(pod)
+		p := testProberDyn(cs, probetest.OpDyn(cep))
+		chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
+
+		chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res.Pass {
+			t.Fatalf("stale CEP networking.node mismatch must fail on 2nd sweep: %+v", res)
+		}
+		if _, err := cs.CoreV1().Pods("apps").Get(ctx, "adapter-2", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("pod with stale CEP HostIP should be deleted to heal, err=%v", err)
+		}
+		ciliumMissingCEPPodsGauge.DeleteLabelValues("apps", "adapter-2", "lanit-02")
+	})
+
+	t.Run("stale CEP ownerReferences Pod UID mismatch detected after 2 sweeps and pod deleted", func(t *testing.T) {
+		pod := makeOwnedPodWithNet("apps", "adapter-3", "lanit-02", "10.0.0.89", "172.29.0.16", "pod-uid-new")
+		cep := cepObjFull("apps", "adapter-3", 4242, "10.0.0.89", "172.29.0.16", "pod-uid-old")
+		cs := fake.NewSimpleClientset(pod)
+		p := testProberDyn(cs, probetest.OpDyn(cep))
+		chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
+
+		chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res.Pass {
+			t.Fatalf("stale CEP ownerReference Pod UID mismatch must fail on 2nd sweep: %+v", res)
+		}
+		if _, err := cs.CoreV1().Pods("apps").Get(ctx, "adapter-3", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("pod with stale CEP owner UID should be deleted to heal, err=%v", err)
+		}
+		ciliumMissingCEPPodsGauge.DeleteLabelValues("apps", "adapter-3", "lanit-02")
+	})
+
+	t.Run("matching PodIP HostIP and owner UID passes cleanly", func(t *testing.T) {
+		pod := makeOwnedPodWithNet("apps", "adapter-ok", "lanit-02", "10.0.0.89", "172.29.0.16", "pod-uid-ok")
+		cep := cepObjFull("apps", "adapter-ok", 4242, "10.0.0.89", "172.29.0.16", "pod-uid-ok")
+		cs := fake.NewSimpleClientset(pod)
+		p := testProberDyn(cs, probetest.OpDyn(cep))
+		chk := probetest.MustCheck[*ciliumMissingEndpointsCheck](t, p)
+
+		chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+		if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+			t.Fatalf("matching CEP must pass cleanly: %+v", res)
+		}
+		if _, err := cs.CoreV1().Pods("apps").Get(ctx, "adapter-ok", metav1.GetOptions{}); err != nil {
+			t.Fatalf("healthy pod must not be deleted: %v", err)
+		}
+	})
 }

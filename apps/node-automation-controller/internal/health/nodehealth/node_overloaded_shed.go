@@ -5,14 +5,24 @@
 // already-scheduled pods keep pinning CPU/memory/IO until load subsides.
 // When NODE_OVERLOADED_EVICT_ENABLED is on (default true) and at least one
 // other Ready, uncordoned, non-overloaded worker exists to absorb rescheduled
-// pods, this pass evicts AT MOST 1 eligible stateless Deployment pod per
+// pods, this pass evicts AT MOST 1 eligible stateless HA Deployment or
+// stateless HA StatefulSet pod (zero PVCs, zero VolumeClaimTemplates) per
 // overloaded node per sweep (with a 10m per-node cooldown) via policy/v1
 // Eviction (respecting PDBs atomically).
+//
+// Candidate ordering (incident 2026-11-27 production lanit-02 & nonprod
+// worker-02 — alphabetical ordering nibbled 10m pods while 587m vmagent and
+// 363m stateless vmselect-1 kept PSI at 42.4%):
+//  1. 100%-colocated multi-replica HA workloads on this node first,
+//  2. Highest CPU first (live 5m Prometheus rate when available, else sum of
+//     container CPU requests),
+//  3. Deterministic (namespace, name) tie-break.
 package nodehealth
 
 import (
 	"cmp"
 	"context"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -33,6 +43,8 @@ import (
 
 const (
 	nodeOverloadedShedCooldown    = 10 * time.Minute
+	overloadPodCPUQuery           = `sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{container!~"POD|"}[5m]))`
+	overloadPodCPUQueryTimeout    = 2 * time.Second
 	annoSafeToEvict               = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 	annoNoOverloadEvict           = "passiontech.dev/no-overload-evict"
 	prioritySystemClusterCritical = "system-cluster-critical"
@@ -99,9 +111,10 @@ func hasHealthyReceiverWorker(nodes []corev1.Node, excludeName string) bool {
 	return false
 }
 
-// shedOverloadedNodes evicts at most 1 eligible stateless Deployment pod per
-// sustained-NodeOverloaded worker per sweep (10m per-node cooldown) when the
-// cluster has at least one healthy receiver worker.
+// shedOverloadedNodes evicts at most 1 eligible stateless HA Deployment or
+// stateless HA StatefulSet pod per sustained-NodeOverloaded worker per sweep
+// (10m per-node cooldown) when the cluster has at least one healthy receiver
+// worker.
 func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger,
 	nodes []corev1.Node, now time.Time) {
 
@@ -186,6 +199,12 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 		log.Info("WARN: list deployments for overload shedding failed — shedding deferred", "error", err)
 		return
 	}
+	statefulSets, err := p.AllStatefulSets(ctx)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list statefulsets for overload shedding failed — shedding deferred", "error", err)
+		return
+	}
 	pdbs, err := p.AllPDBs(ctx)
 	if err != nil {
 		metrics.IncError(p.Name)
@@ -203,6 +222,15 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 		d := &deployments[i]
 		deployByKey[d.Namespace+"/"+d.Name] = d
 	}
+	stsByKey := make(map[string]*appsv1.StatefulSet, len(statefulSets))
+	for i := range statefulSets {
+		s := &statefulSets[i]
+		stsByKey[s.Namespace+"/"+s.Name] = s
+	}
+
+	// Best-effort live 5m CPU usage (millicores) per pod; falls back to pod CPU
+	// requests when Prometheus is unconfigured, unreachable, or slow.
+	liveCPU := p.overloadPodCPUMilli(ctx, log)
 
 	podsByNode := map[string][]*corev1.Pod{}
 	for i := range pods {
@@ -214,7 +242,8 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 	}
 
 	for _, node := range activeNodes {
-		candidates := eligibleOverloadPods(podsByNode[node.Name], pods, rsByKey, deployByKey, pdbs)
+		candidates := eligibleOverloadPods(
+			podsByNode[node.Name], pods, rsByKey, deployByKey, stsByKey, pdbs, liveCPU)
 		if len(candidates) == 0 {
 			continue
 		}
@@ -252,8 +281,9 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 				continue
 			case evicted:
 				metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameNodeHang).Inc()
-				log.Info("EVICT: shed stateless Deployment pod from sustained NodeOverloaded worker",
-					"node", node.Name, "pod", pod.Namespace+"/"+pod.Name)
+				log.Info("EVICT: shed stateless workload pod from sustained NodeOverloaded worker",
+					"node", node.Name, "pod", pod.Namespace+"/"+pod.Name,
+					"cpuMilli", int64(math.Round(podCPUScoreMilli(pod, liveCPU))))
 				goto nextNode
 			}
 		}
@@ -261,30 +291,67 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 	}
 }
 
-func podDeploymentKey(
+// overloadPodCPUMilli queries live 5m CPU usage (in millicores) per
+// namespace/pod via one best-effort Prometheus instant query per sweep.
+// Any error is absorbed at V(1) so shedding falls back cleanly to pod CPU
+// requests without ever failing or stalling on an unreachable Prometheus.
+func (p *nodeHangCheck) overloadPodCPUMilli(ctx context.Context, log logr.Logger) map[string]float64 {
+	qctx, cancel := context.WithTimeout(ctx, overloadPodCPUQueryTimeout)
+	defer cancel()
+	samples, err := p.PromQuery(qctx, overloadPodCPUQuery)
+	if err != nil {
+		log.V(1).Info("overload shed live CPU query unavailable — falling back to pod CPU requests",
+			"error", err)
+		return nil
+	}
+	if len(samples) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(samples))
+	for _, s := range samples {
+		ns := s.Label("namespace")
+		podName := s.Label("pod")
+		if ns == "" || podName == "" || s.Value <= 0 || math.IsNaN(s.Value) || math.IsInf(s.Value, 0) {
+			continue
+		}
+		out[ns+"/"+podName] = s.Value * 1000
+	}
+	return out
+}
+
+// podWorkloadKey returns a canonical workload identifier for pods owned by a
+// Deployment ("deploy/<ns>/<name>") or StatefulSet ("sts/<ns>/<name>").
+func podWorkloadKey(
 	pod *corev1.Pod,
 	rsByKey map[string]*metav1.PartialObjectMetadata,
 ) (string, bool) {
 	podCtrl := metav1.GetControllerOf(pod)
-	if podCtrl == nil || podCtrl.Kind != "ReplicaSet" {
+	if podCtrl == nil {
 		return "", false
 	}
-	rs := rsByKey[pod.Namespace+"/"+podCtrl.Name]
-	if rs == nil {
+	switch podCtrl.Kind {
+	case "ReplicaSet":
+		rs := rsByKey[pod.Namespace+"/"+podCtrl.Name]
+		if rs == nil {
+			return "", false
+		}
+		rsCtrl := metav1.GetControllerOf(rs)
+		if rsCtrl == nil || rsCtrl.Kind != "Deployment" {
+			return "", false
+		}
+		return "deploy/" + pod.Namespace + "/" + rsCtrl.Name, true
+	case "StatefulSet":
+		return "sts/" + pod.Namespace + "/" + podCtrl.Name, true
+	default:
 		return "", false
 	}
-	rsCtrl := metav1.GetControllerOf(rs)
-	if rsCtrl == nil || rsCtrl.Kind != "Deployment" {
-		return "", false
-	}
-	return pod.Namespace + "/" + rsCtrl.Name, true
 }
 
-// colocatedDeploymentsOnNode returns the set of "namespace/deployment" keys
+// colocatedWorkloadsOnNode returns the set of podWorkloadKey identifiers
 // whose Running+Ready pods (>= 2) are 100% co-located on nodeName. Evicting
 // from these first immediately breaks single-node SPOFs before touching
-// already well-spread Deployments.
-func colocatedDeploymentsOnNode(
+// already well-spread workloads.
+func colocatedWorkloadsOnNode(
 	allPods []corev1.Pod,
 	rsByKey map[string]*metav1.PartialObjectMetadata,
 	nodeName string,
@@ -296,33 +363,50 @@ func colocatedDeploymentsOnNode(
 		readyCount int
 		nodes      map[string]struct{}
 	}
-	byDeploy := map[string]*placement{}
+	byWorkload := map[string]*placement{}
 	for i := range allPods {
 		pod := &allPods[i]
 		if !probefw.PodRunningReady(pod) {
 			continue
 		}
-		depKey, ok := podDeploymentKey(pod, rsByKey)
+		wlKey, ok := podWorkloadKey(pod, rsByKey)
 		if !ok {
 			continue
 		}
-		p := byDeploy[depKey]
+		p := byWorkload[wlKey]
 		if p == nil {
 			p = &placement{nodes: map[string]struct{}{}}
-			byDeploy[depKey] = p
+			byWorkload[wlKey] = p
 		}
 		p.readyCount++
 		p.nodes[pod.Spec.NodeName] = struct{}{}
 	}
 	colocated := map[string]bool{}
-	for depKey, p := range byDeploy {
+	for wlKey, p := range byWorkload {
 		if p.readyCount >= 2 && len(p.nodes) == 1 {
 			if _, onNode := p.nodes[nodeName]; onNode {
-				colocated[depKey] = true
+				colocated[wlKey] = true
 			}
 		}
 	}
 	return colocated
+}
+
+func podCPURequestMilli(pod *corev1.Pod) int64 {
+	var total int64
+	for i := range pod.Spec.Containers {
+		if q, ok := pod.Spec.Containers[i].Resources.Requests[corev1.ResourceCPU]; ok {
+			total += q.MilliValue()
+		}
+	}
+	return total
+}
+
+func podCPUScoreMilli(pod *corev1.Pod, liveCPU map[string]float64) float64 {
+	if v, ok := liveCPU[pod.Namespace+"/"+pod.Name]; ok && v > 0 {
+		return v
+	}
+	return float64(podCPURequestMilli(pod))
 }
 
 func eligibleOverloadPods(
@@ -330,11 +414,13 @@ func eligibleOverloadPods(
 	allPods []corev1.Pod,
 	rsByKey map[string]*metav1.PartialObjectMetadata,
 	deployByKey map[string]*appsv1.Deployment,
+	stsByKey map[string]*appsv1.StatefulSet,
 	pdbs []policyv1.PodDisruptionBudget,
+	liveCPU map[string]float64,
 ) []*corev1.Pod {
 	var out []*corev1.Pod
 	for _, pod := range nodePods {
-		if !podEligibleForOverloadShed(pod, rsByKey, deployByKey, pdbs) {
+		if !podEligibleForOverloadShed(pod, rsByKey, deployByKey, stsByKey, pdbs) {
 			continue
 		}
 		out = append(out, pod)
@@ -342,17 +428,22 @@ func eligibleOverloadPods(
 	if len(out) <= 1 {
 		return out
 	}
-	colocated := colocatedDeploymentsOnNode(allPods, rsByKey, out[0].Spec.NodeName)
+	colocated := colocatedWorkloadsOnNode(allPods, rsByKey, out[0].Spec.NodeName)
 	slices.SortFunc(out, func(a, b *corev1.Pod) int {
-		aDep, _ := podDeploymentKey(a, rsByKey)
-		bDep, _ := podDeploymentKey(b, rsByKey)
-		aColoc := colocated[aDep]
-		bColoc := colocated[bDep]
+		aWL, _ := podWorkloadKey(a, rsByKey)
+		bWL, _ := podWorkloadKey(b, rsByKey)
+		aColoc := colocated[aWL]
+		bColoc := colocated[bWL]
 		if aColoc != bColoc {
 			if aColoc {
 				return -1
 			}
 			return 1
+		}
+		aCPU := podCPUScoreMilli(a, liveCPU)
+		bCPU := podCPUScoreMilli(b, liveCPU)
+		if c := cmp.Compare(bCPU, aCPU); c != 0 {
+			return c
 		}
 		if c := cmp.Compare(a.Namespace, b.Namespace); c != 0 {
 			return c
@@ -366,6 +457,7 @@ func podEligibleForOverloadShed(
 	pod *corev1.Pod,
 	rsByKey map[string]*metav1.PartialObjectMetadata,
 	deployByKey map[string]*appsv1.Deployment,
+	stsByKey map[string]*appsv1.StatefulSet,
 	pdbs []policyv1.PodDisruptionBudget,
 ) bool {
 	if !probefw.PodRunningReady(pod) {
@@ -390,13 +482,35 @@ func podEligibleForOverloadShed(
 			return false
 		}
 	}
-	// ONLY Deployment-owned Ready pods: ReplicaSet -> Deployment with readyReplicas >= 2.
-	depKey, ok := podDeploymentKey(pod, rsByKey)
-	if !ok {
+	// ONLY HA stateless Deployment or stateless StatefulSet Ready pods:
+	//   - ReplicaSet -> Deployment with readyReplicas >= 2, OR
+	//   - StatefulSet with readyReplicas >= 2, zero PVC volumes (checked above),
+	//     and zero VolumeClaimTemplates (belt-and-suspenders against shedding
+	//     stateful data pods such as vmstorage).
+	podCtrl := metav1.GetControllerOf(pod)
+	if podCtrl == nil {
 		return false
 	}
-	dep := deployByKey[depKey]
-	if dep == nil || dep.Status.ReadyReplicas < 2 {
+	switch podCtrl.Kind {
+	case "ReplicaSet":
+		rs := rsByKey[pod.Namespace+"/"+podCtrl.Name]
+		if rs == nil {
+			return false
+		}
+		rsCtrl := metav1.GetControllerOf(rs)
+		if rsCtrl == nil || rsCtrl.Kind != "Deployment" {
+			return false
+		}
+		dep := deployByKey[pod.Namespace+"/"+rsCtrl.Name]
+		if dep == nil || dep.Status.ReadyReplicas < 2 {
+			return false
+		}
+	case "StatefulSet":
+		sts := stsByKey[pod.Namespace+"/"+podCtrl.Name]
+		if sts == nil || sts.Status.ReadyReplicas < 2 || len(sts.Spec.VolumeClaimTemplates) > 0 {
+			return false
+		}
+	default:
 		return false
 	}
 	return overloadPDBAllows(pdbs, pod)

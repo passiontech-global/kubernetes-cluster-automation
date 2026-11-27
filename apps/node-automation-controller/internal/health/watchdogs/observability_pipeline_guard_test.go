@@ -398,6 +398,206 @@ func TestObservabilityPipelineGuardVictoriaMetrics(t *testing.T) {
 			t.Fatalf("healthy VM pipeline must pass: %+v", res)
 		}
 	})
+
+	t.Run("vmagent_scrapes_failed suppressed when 100% of down targets are tier=tenant namespaces", func(t *testing.T) {
+		srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+			switch {
+			case query == "count(vm_app_version)":
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "Watchdog"):
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "vm_promscrape_scrapes_failed_total"):
+				return []probetest.PromTestSample{{Value: 0.25}}
+			case query == obsVMDownTargetsByNSQuery:
+				return []probetest.PromTestSample{
+					{Labels: map[string]string{"namespace": "passiontech-production"}, Value: 67},
+					{Labels: map[string]string{"namespace": "gsw-production"}, Value: 12},
+				}
+			}
+			return nil
+		})
+		cs := fake.NewSimpleClientset(
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name:   "passiontech-production",
+				Labels: map[string]string{labelPlatformTier: tierTenant},
+			}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name:   "gsw-production",
+				Labels: map[string]string{labelPlatformTier: tierTenant},
+			}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name:   "kube-system",
+				Labels: map[string]string{labelPlatformTier: "platform"},
+			}},
+		)
+		p := testProber(cs)
+		p.Cfg.HTTPContent.URL = srv.URL + "/health"
+		p.HTTPClient = srv.Client()
+
+		res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+		if !res.Pass {
+			t.Fatalf("tenant-only vmagent_scrapes_failed must not degrade platform pipeline: %+v", res)
+		}
+		if obsPipelineDegradedGauge.DeleteLabelValues("vmagent_scrapes_failed") {
+			t.Fatal("tenant-only scrape failures wrongly emitted vmagent_scrapes_failed degraded gauge")
+		}
+		evs, err := cs.EventsV1().Events(obsVMEventNS).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evs.Items) != 0 {
+			t.Fatalf("tenant-only scrape failures must emit 0 warning events, got %d", len(evs.Items))
+		}
+	})
+
+	t.Run("vmagent_scrapes_failed still degrades when platform or unlabeled target is down", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			samples []probetest.PromTestSample
+		}{
+			{
+				name: "mixed tenant + platform namespace",
+				samples: []probetest.PromTestSample{
+					{Labels: map[string]string{"namespace": "passiontech-production"}, Value: 67},
+					{Labels: map[string]string{"namespace": "kube-system"}, Value: 1},
+				},
+			},
+			{
+				name: "unlabeled namespace",
+				samples: []probetest.PromTestSample{
+					{Labels: map[string]string{"namespace": "unlabeled-ns"}, Value: 2},
+				},
+			},
+			{
+				name: "empty namespace label (cluster-scoped target)",
+				samples: []probetest.PromTestSample{
+					{Labels: map[string]string{"namespace": "passiontech-production"}, Value: 67},
+					{Labels: map[string]string{}, Value: 1},
+				},
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+					switch {
+					case query == "count(vm_app_version)":
+						return []probetest.PromTestSample{{Value: 1}}
+					case strings.Contains(query, "Watchdog"):
+						return []probetest.PromTestSample{{Value: 1}}
+					case strings.Contains(query, "vm_promscrape_scrapes_failed_total"):
+						return []probetest.PromTestSample{{Value: 0.20}}
+					case query == obsVMDownTargetsByNSQuery:
+						return tc.samples
+					}
+					return nil
+				})
+				cs := fake.NewSimpleClientset(
+					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+						Name:   "passiontech-production",
+						Labels: map[string]string{labelPlatformTier: tierTenant},
+					}},
+					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+						Name:   "kube-system",
+						Labels: map[string]string{labelPlatformTier: "platform"},
+					}},
+					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+						Name: "unlabeled-ns",
+					}},
+				)
+				p := testProber(cs)
+				p.Cfg.HTTPContent.URL = srv.URL + "/health"
+				p.HTTPClient = srv.Client()
+
+				res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+				if res.Pass {
+					t.Fatalf("case %q must still degrade pipeline", tc.name)
+				}
+				if !obsPipelineDegradedGauge.DeleteLabelValues("vmagent_scrapes_failed") {
+					t.Fatalf("case %q missing degraded gauge for vmagent_scrapes_failed", tc.name)
+				}
+			})
+		}
+	})
+
+	t.Run("vmagent_scrapes_failed fails closed when up==0 query is empty or errors", func(t *testing.T) {
+		t.Run("empty up==0 series", func(t *testing.T) {
+			srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+				switch {
+				case query == "count(vm_app_version)":
+					return []probetest.PromTestSample{{Value: 1}}
+				case strings.Contains(query, "Watchdog"):
+					return []probetest.PromTestSample{{Value: 1}}
+				case strings.Contains(query, "vm_promscrape_scrapes_failed_total"):
+					return []probetest.PromTestSample{{Value: 0.15}}
+				case query == obsVMDownTargetsByNSQuery:
+					return nil
+				}
+				return nil
+			})
+			cs := fake.NewSimpleClientset(
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+					Name:   "passiontech-production",
+					Labels: map[string]string{labelPlatformTier: tierTenant},
+				}},
+			)
+			p := testProber(cs)
+			p.Cfg.HTTPContent.URL = srv.URL + "/health"
+			p.HTTPClient = srv.Client()
+
+			res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+			if res.Pass {
+				t.Fatal("empty up==0 result must fail closed and still degrade")
+			}
+			if !obsPipelineDegradedGauge.DeleteLabelValues("vmagent_scrapes_failed") {
+				t.Fatal("missing degraded gauge for vmagent_scrapes_failed on empty up==0")
+			}
+		})
+
+		t.Run("up==0 query returns HTTP error", func(t *testing.T) {
+			srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+				switch {
+				case query == "count(vm_app_version)":
+					return []probetest.PromTestSample{{Value: 1}}
+				case strings.Contains(query, "Watchdog"):
+					return []probetest.PromTestSample{{Value: 1}}
+				case strings.Contains(query, "vm_promscrape_scrapes_failed_total"):
+					return []probetest.PromTestSample{{Value: 0.15}}
+				}
+				return nil
+			})
+			baseRT := srv.Client().Transport
+			if baseRT == nil {
+				baseRT = http.DefaultTransport
+			}
+			client := &http.Client{Transport: obsPipelineRTFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/api/v1/query" && r.URL.Query().Get("query") == obsVMDownTargetsByNSQuery {
+					return &http.Response{
+						StatusCode: http.StatusInternalServerError,
+						Body:       io.NopCloser(strings.NewReader("query error")),
+						Header:     make(http.Header),
+					}, nil
+				}
+				return baseRT.RoundTrip(r)
+			})}
+			cs := fake.NewSimpleClientset(
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+					Name:   "passiontech-production",
+					Labels: map[string]string{labelPlatformTier: tierTenant},
+				}},
+			)
+			p := testProber(cs)
+			p.Cfg.HTTPContent.URL = srv.URL + "/health"
+			p.HTTPClient = client
+
+			res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+			if res.Pass {
+				t.Fatal("up==0 query error must fail closed and still degrade")
+			}
+			if !obsPipelineDegradedGauge.DeleteLabelValues("vmagent_scrapes_failed") {
+				t.Fatal("missing degraded gauge for vmagent_scrapes_failed on query error")
+			}
+		})
+	})
 }
 
 // failingHTTPClient returns an HTTP client whose transport always

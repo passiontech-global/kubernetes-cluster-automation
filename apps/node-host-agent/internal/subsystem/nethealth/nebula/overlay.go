@@ -41,12 +41,13 @@ type PingResult struct {
 // counts, the dead-peer sets (nebula-conntrack-flush evicts only
 // these), and the slowpath/siteedge evidence strings.
 type NebulaOverlayStats struct {
-	dpAlive, dpTotal int
-	mkAlive, mkTotal int
-	deadUnderlay     []string
-	deadOverlay      []string
-	slowpath         []string
-	siteedge         []string
+	dpAlive, dpTotal     int
+	mkAlive, mkTotal     int
+	siteAlive, siteTotal int
+	deadUnderlay         []string
+	deadOverlay          []string
+	slowpath             []string
+	siteedge             []string
 }
 
 // uniqueProbeTargets collects OverlayProbeTargets, OverlayProbeMarkers,
@@ -153,12 +154,14 @@ func AggregateNebulaOverlay(wd *watchdogconf.Config,
 		}
 	}
 	for _, t := range wd.OverlaySiteMarkers {
+		st.siteTotal++
 		r := results[t]
 		if !r.Ok {
 			st.siteedge = append(st.siteedge, t+"=dead")
 			st.deadOverlay = append(st.deadOverlay, t)
 			continue
 		}
+		st.siteAlive++
 		if r.Rtt >= 0 && r.Rtt > wd.OverlaySiteedgeRTTms {
 			st.siteedge = append(st.siteedge,
 				fmt.Sprintf("%s=%.1fms", t, r.Rtt))
@@ -212,12 +215,33 @@ func (n *Deps) NebulaOverlayVerdict(ctx context.Context,
 	switch {
 	case (st.dpTotal > 0 && st.dpAlive == 0) ||
 		(st.mkTotal > 0 && st.mkAlive == 0):
-		reason = fmt.Sprintf("nebula-dataplane-dead pub=%d/%d marker=%d/%d",
-			st.dpAlive, st.dpTotal, st.mkAlive, st.mkTotal)
-		dpFail = true
 		isolated = true
 		n.NebulaDeg = 0
 		n.StateExit(latchdefs.LatchNebulaDegraded)
+		if st.siteTotal > 0 && st.siteAlive > 0 {
+			// Incident 2026-11-27 cicd: when the remote hub/lighthouse
+			// became unreachable, local site-mesh peers were STILL alive,
+			// proving local nebula@interdc dataplane works. Restarting
+			// nebula@ would wipe learned peer addresses and destroy the
+			// surviving site-mesh too. Still arm LatchNebulaIsolated for
+			// cross-DC alerting, flush conntrack ONLY for dead remote/hub
+			// peers on the isolation edge, and return reason="" so
+			// CheckNebulaHealth holds the restart.
+			if !n.State.Exists(latchdefs.LatchNebulaIsolated) {
+				if peers := n.resolveDeadNebulaPeers(wd, st.deadUnderlay, st.deadOverlay); len(peers) > 0 {
+					n.FlushPeerNebulaConntrack(ctx, checkNebula, peers...)
+				}
+			}
+			n.State.SuspectLog(latchdefs.LatchNebulaIsolated, fmt.Sprintf(
+				"suspect: nebula-hub-isolated-site-alive pub=%d/%d marker=%d/%d site=%d/%d — holding nebula restart to preserve site-mesh",
+				st.dpAlive, st.dpTotal, st.mkAlive, st.mkTotal, st.siteAlive, st.siteTotal),
+				suspectLogCadence)
+			n.State.Enter(latchdefs.LatchNebulaIsolated, "hub isolated (site-mesh alive)")
+			return "", false, true
+		}
+		reason = fmt.Sprintf("nebula-dataplane-dead pub=%d/%d marker=%d/%d",
+			st.dpAlive, st.dpTotal, st.mkAlive, st.mkTotal)
+		dpFail = true
 		if !n.State.Exists(latchdefs.LatchNebulaIsolated) {
 			// B3: on the isolation edge the conntrack entries
 			// learned on the dead path keep the tunnel blackholed
@@ -276,7 +300,7 @@ func (n *Deps) remediateNebulaOverlay(ctx context.Context,
 	// probe at near-MTU size blackholes — the double-encap path
 	// MTU sits below the overlay's. Total overlay failure belongs
 	// to the isolated/degraded verdicts above, not to a PMTU latch.
-	n.checkNebulaPMTU(ctx, targets, results)
+	n.checkNebulaPMTU(ctx, wd, targets, results)
 }
 
 // evalNebulaOverlay is the dataplane evaluation pipeline:
@@ -292,6 +316,33 @@ func (n *Deps) evalNebulaOverlay(ctx context.Context,
 	reason, dpFail, isolated := n.NebulaOverlayVerdict(ctx, wd, st)
 	n.remediateNebulaOverlay(ctx, wd, targets, results, st, isolated)
 	return reason, dpFail
+}
+
+// resolveDeadNebulaPeers combines dead underlay targets with dead
+// overlay markers resolved through static_host_map. Unresolvable
+// markers are logged and skipped rather than guessed — flushing an
+// overlay IP hits nothing, and guessing could evict a live peer's
+// conntrack entries.
+func (n *Deps) resolveDeadNebulaPeers(wd *watchdogconf.Config,
+	deadUnderlay, deadOverlay []string) []string {
+	peers := append([]string{}, deadUnderlay...)
+	if len(deadOverlay) > 0 {
+		staticMap := n.NebulaUnderlayPeers(wd.NebulaNet)
+		var unresolved []string
+		for _, ov := range deadOverlay {
+			if under, ok := staticMap[ov]; ok && len(under) > 0 {
+				peers = append(peers, under...)
+			} else {
+				unresolved = append(unresolved, ov)
+			}
+		}
+		if len(unresolved) > 0 {
+			n.State.SuspectLog("nebula-dead-peer-resolve", fmt.Sprintf(
+				"suspect: dead overlay peers %s have no static_host_map underlay — conntrack flush skipped for them",
+				strings.Join(unresolved, " ")), suspectLogCadence)
+		}
+	}
+	return peers
 }
 
 // flushDeadNebulaPeers — nebula-conntrack-flush: the targeted per-peer conntrack
@@ -317,21 +368,7 @@ func (n *Deps) flushDeadNebulaPeers(ctx context.Context,
 	if !confirmed || (len(deadUnderlay) == 0 && len(deadOverlay) == 0) {
 		return
 	}
-	peers := append([]string{}, deadUnderlay...)
-	staticMap := n.NebulaUnderlayPeers(wd.NebulaNet)
-	var unresolved []string
-	for _, ov := range deadOverlay {
-		if under, ok := staticMap[ov]; ok && len(under) > 0 {
-			peers = append(peers, under...)
-		} else {
-			unresolved = append(unresolved, ov)
-		}
-	}
-	if len(unresolved) > 0 {
-		n.State.SuspectLog("nebula-dead-peer-resolve", fmt.Sprintf(
-			"suspect: dead overlay peers %s have no static_host_map underlay — conntrack flush skipped for them",
-			strings.Join(unresolved, " ")), suspectLogCadence)
-	}
+	peers := n.resolveDeadNebulaPeers(wd, deadUnderlay, deadOverlay)
 	if len(peers) == 0 {
 		return
 	}

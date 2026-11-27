@@ -72,12 +72,21 @@ func init() {
 }
 
 // ciliumCEPUnprogrammed reports whether the CiliumEndpoint is present
-// but useless: the security identity is unassigned or pinned to a
-// reserved value (0 = unassigned, 2 = reserved:world — the Monzo-style
-// split-brain where the pod gets world-classified and intra-cluster
-// network policies drop its traffic), or the endpoint carries no
-// addressing IP at all.
-func ciliumCEPUnprogrammed(cep *unstructured.Unstructured) bool {
+// but useless or stale relative to pod:
+//   - the security identity is unassigned or pinned to a reserved value
+//     (0 = unassigned, 2 = reserved:world — the Monzo-style split-brain
+//     where the pod gets world-classified and intra-cluster network
+//     policies drop its traffic),
+//   - the endpoint carries no addressing IP at all,
+//   - PodIP mismatch: pod.Status.PodIP is populated and none of
+//     status.networking.addressing[].{ipv4,ipv6} matches it (incident
+//     2026-11-27 production lanit-02: CEP held stale IP 10.0.0.74 while
+//     live pod held 10.0.0.89 and cilium failed CEP ownership sync),
+//   - HostIP/node mismatch: pod.Status.HostIP and status.networking.node
+//     are both populated and differ, or
+//   - OwnerReference Pod UID mismatch: pod.UID is populated and the CEP
+//     carries a Kind=Pod ownerReference with a different non-empty UID.
+func ciliumCEPUnprogrammed(cep *unstructured.Unstructured, pod *corev1.Pod) bool {
 	id, ok := kube.NestedInt64(cep.Object, "status", "identity", "id")
 	if !ok || id == 0 || id == 2 {
 		return true
@@ -86,17 +95,45 @@ func ciliumCEPUnprogrammed(cep *unstructured.Unstructured) bool {
 	if len(addrs) == 0 {
 		return true
 	}
+	hasAddr := false
+	podIP := ""
+	if pod != nil {
+		podIP = pod.Status.PodIP
+	}
+	podIPMatched := podIP == ""
 	for _, a := range addrs {
-		if m, ok := a.(map[string]any); ok {
-			if ip, _ := kube.NestedString(m, "ipv4"); ip != "" {
-				return false
-			}
-			if ip, _ := kube.NestedString(m, "ipv6"); ip != "" {
-				return false
+		m, ok := a.(map[string]any)
+		if !ok {
+			continue
+		}
+		v4, _ := kube.NestedString(m, "ipv4")
+		v6, _ := kube.NestedString(m, "ipv6")
+		if v4 != "" || v6 != "" {
+			hasAddr = true
+		}
+		if podIP != "" && (v4 == podIP || v6 == podIP) {
+			podIPMatched = true
+		}
+	}
+	if !hasAddr || !podIPMatched {
+		return true
+	}
+	if pod == nil {
+		return false
+	}
+	if pod.Status.HostIP != "" {
+		if cepNode, _ := kube.NestedString(cep.Object, "status", "networking", "node"); cepNode != "" && cepNode != pod.Status.HostIP {
+			return true
+		}
+	}
+	if pod.UID != "" {
+		for _, ref := range cep.GetOwnerReferences() {
+			if ref.Kind == "Pod" && ref.UID != "" && ref.UID != pod.UID {
+				return true
 			}
 		}
 	}
-	return true
+	return false
 }
 
 // checkCiliumMissingEndpoints cross-references every Running
@@ -171,7 +208,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		}
 		key := pod.Namespace + "/" + pod.Name
 		cep, found := cepByKey[key]
-		if found && !ciliumCEPUnprogrammed(cep) {
+		if found && !ciliumCEPUnprogrammed(cep, pod) {
 			continue // programmed endpoint — healthy
 		}
 		sig := key + "/" + string(pod.UID)

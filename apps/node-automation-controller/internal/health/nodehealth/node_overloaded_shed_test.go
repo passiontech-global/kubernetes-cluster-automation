@@ -3,12 +3,14 @@
 package nodehealth
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -317,4 +319,188 @@ func TestNodeOverloadedShedPrioritizesColocatedHADeployment(t *testing.T) {
 	if len(*evicted) != 1 || (*evicted)[0] != "zeta/argocd-server-1" {
 		t.Fatalf("evicted = %v, want [zeta/argocd-server-1] (100%% co-located HA Deployment prioritized)", *evicted)
 	}
+}
+
+func setPodCPURequest(pod *corev1.Pod, cpuQty string) {
+	pod.Spec.Containers = []corev1.Container{{
+		Name: "app",
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse(cpuQty),
+			},
+		},
+	}}
+}
+
+func makeStatefulSetChain(
+	ns, stsName string,
+	readyReplicas int32,
+	hasVCT bool,
+	nodeName, podName string,
+) (*appsv1.StatefulSet, *corev1.Pod) {
+	stsUID := types.UID("sts-" + ns + "-" + stsName)
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: ns, UID: stsUID},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: readyReplicas},
+	}
+	if hasVCT {
+		sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{
+			ObjectMeta: metav1.ObjectMeta{Name: "data"},
+		}}
+	}
+	pod := probetest.PodWithPhase(ns, podName, corev1.PodRunning, true, 30*time.Minute)
+	pod.UID = types.UID("pod-" + ns + "-" + podName)
+	pod.Spec.NodeName = nodeName
+	pod.Labels = map[string]string{"app": stsName}
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		Kind:       "StatefulSet",
+		Name:       stsName,
+		UID:        stsUID,
+		Controller: ptr.To(true),
+	}}
+	return sts, pod
+}
+
+func TestNodeOverloadedShedPrioritizesHighestCPURequest(t *testing.T) {
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-ov")
+
+	// Alphabetically earlier pod has tiny 50m request; vmagent in victoria-metrics
+	// has 500m request -> vmagent must be shed first when Prometheus is unavailable.
+	depAlpha, rsAlpha, podAlpha := makeDeployChain("apps", "alpha", 2, "w-ov", "alpha-1")
+	setPodCPURequest(podAlpha, "50m")
+	_, _, podAlphaOther := makeDeployChain("apps", "alpha", 2, "w-ok", "alpha-2")
+
+	depVM, rsVM, podVM := makeDeployChain("victoria-metrics", "vmagent", 2, "w-ov", "vmagent-1")
+	setPodCPURequest(podVM, "500m")
+	_, _, podVMOther := makeDeployChain("victoria-metrics", "vmagent", 2, "w-ok", "vmagent-2")
+
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-ov", nodecond.NodeOverloaded, 20*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false),
+		depAlpha, rsAlpha, podAlpha, podAlphaOther,
+		depVM, rsVM, podVM, podVMOther,
+	)
+	evicted := captureEvictions(cs)
+	p := testProberDyn(cs, probetest.OpDyn())
+	_ = probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+
+	if len(*evicted) != 1 || (*evicted)[0] != "victoria-metrics/vmagent-1" {
+		t.Fatalf("evicted = %v, want [victoria-metrics/vmagent-1] (highest CPU request)", *evicted)
+	}
+}
+
+func TestNodeOverloadedShedPrioritizesLivePrometheusCPUOverRequest(t *testing.T) {
+	testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-ov")
+
+	// podHighReq requests 200m but burns only 20m live CPU.
+	// podHot requests 100m but burns 600m live CPU -> must be shed first.
+	depHighReq, rsHighReq, podHighReq := makeDeployChain("apps", "aaa-idle", 2, "w-ov", "aaa-idle-1")
+	setPodCPURequest(podHighReq, "200m")
+	_, _, podHighReqOther := makeDeployChain("apps", "aaa-idle", 2, "w-ok", "aaa-idle-2")
+
+	depHot, rsHot, podHot := makeDeployChain("victoria-metrics", "vmagent", 2, "w-ov", "vmagent-1")
+	setPodCPURequest(podHot, "100m")
+	_, _, podHotOther := makeDeployChain("victoria-metrics", "vmagent", 2, "w-ok", "vmagent-2")
+
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		if strings.Contains(query, "container_cpu_usage_seconds_total") {
+			return []probetest.PromTestSample{
+				{Labels: map[string]string{"namespace": "apps", "pod": "aaa-idle-1"}, Value: 0.02},
+				{Labels: map[string]string{"namespace": "victoria-metrics", "pod": "vmagent-1"}, Value: 0.60},
+			}
+		}
+		return nil
+	})
+
+	cs := fake.NewSimpleClientset(
+		probetest.ReadyWorkerNode("w-ov", nodecond.NodeOverloaded, 20*time.Minute, false),
+		probetest.ReadyWorkerNode("w-ok", "", 0, false),
+		depHighReq, rsHighReq, podHighReq, podHighReqOther,
+		depHot, rsHot, podHot, podHotOther,
+	)
+	evicted := captureEvictions(cs)
+	p := testProberDyn(cs, probetest.OpDyn())
+	p.Cfg.HTTPContent.URL = srv.URL + "/health"
+	p.HTTPClient = srv.Client()
+
+	_ = probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+
+	if len(*evicted) != 1 || (*evicted)[0] != "victoria-metrics/vmagent-1" {
+		t.Fatalf("evicted = %v, want [victoria-metrics/vmagent-1] (live 600m CPU overrides 200m idle request)", *evicted)
+	}
+}
+
+func TestNodeOverloadedShedStatelessStatefulSetEligibility(t *testing.T) {
+	t.Run("sheds stateless HA StatefulSet when highest CPU and skips PVC-backed StatefulSets", func(t *testing.T) {
+		testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-ov")
+
+		// Small Deployment pod (50m).
+		depSmall, rsSmall, podSmall := makeDeployChain("apps", "alpha", 2, "w-ov", "alpha-1")
+		setPodCPURequest(podSmall, "50m")
+		_, _, podSmallOther := makeDeployChain("apps", "alpha", 2, "w-ok", "alpha-2")
+
+		// Stateless HA StatefulSet (vmselect: ReadyReplicas=2, emptyDir only, no VolumeClaimTemplates, 400m).
+		stsStateless, podVMSelect := makeStatefulSetChain("victoria-metrics", "vmselect", 2, false, "w-ov", "vmselect-1")
+		podVMSelect.Spec.Volumes = []corev1.Volume{{
+			Name:         "cache",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		}}
+		setPodCPURequest(podVMSelect, "400m")
+		_, podVMSelectOther := makeStatefulSetChain("victoria-metrics", "vmselect", 2, false, "w-ok", "vmselect-0")
+
+		// StatefulSet with VolumeClaimTemplates (vmstorage: 2000m) — MUST NEVER be shed even though CPU is higher.
+		stsVCT, podVMStorage := makeStatefulSetChain("victoria-metrics", "vmstorage", 2, true, "w-ov", "vmstorage-1")
+		setPodCPURequest(podVMStorage, "2000m")
+
+		// StatefulSet without VolumeClaimTemplates but with PVC volume (1500m) — MUST NEVER be shed.
+		stsPVC, podPVCMount := makeStatefulSetChain("victoria-metrics", "manual-pvc", 2, false, "w-ov", "manual-pvc-1")
+		podPVCMount.Spec.Volumes = []corev1.Volume{{
+			Name: "data",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data-0"},
+			},
+		}}
+		setPodCPURequest(podPVCMount, "1500m")
+
+		// Single-replica stateless StatefulSet (1000m) — MUST NEVER be shed.
+		stsSingle, podSingleSts := makeStatefulSetChain("victoria-metrics", "single-sts", 1, false, "w-ov", "single-sts-0")
+		setPodCPURequest(podSingleSts, "1000m")
+
+		cs := fake.NewSimpleClientset(
+			probetest.ReadyWorkerNode("w-ov", nodecond.NodeOverloaded, 20*time.Minute, false),
+			probetest.ReadyWorkerNode("w-ok", "", 0, false),
+			depSmall, rsSmall, podSmall, podSmallOther,
+			stsStateless, podVMSelect, podVMSelectOther,
+			stsVCT, podVMStorage,
+			stsPVC, podPVCMount,
+			stsSingle, podSingleSts,
+		)
+		evicted := captureEvictions(cs)
+		p := testProberDyn(cs, probetest.OpDyn())
+		_ = probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+
+		if len(*evicted) != 1 || (*evicted)[0] != "victoria-metrics/vmselect-1" {
+			t.Fatalf("evicted = %v, want [victoria-metrics/vmselect-1] (stateless HA StatefulSet)", *evicted)
+		}
+	})
+
+	t.Run("never sheds PVC-backed StatefulSet when it is the only pod on node", func(t *testing.T) {
+		testutil.CleanupMetric(t, nodeHangCordonsTotal, "w-ov")
+
+		stsVCT, podVMStorage := makeStatefulSetChain("victoria-metrics", "vmstorage", 2, true, "w-ov", "vmstorage-1")
+		setPodCPURequest(podVMStorage, "2000m")
+
+		cs := fake.NewSimpleClientset(
+			probetest.ReadyWorkerNode("w-ov", nodecond.NodeOverloaded, 20*time.Minute, false),
+			probetest.ReadyWorkerNode("w-ok", "", 0, false),
+			stsVCT, podVMStorage,
+		)
+		evicted := captureEvictions(cs)
+		p := testProberDyn(cs, probetest.OpDyn())
+		_ = probetest.MustCheck[*nodeHangCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+
+		if len(*evicted) != 0 {
+			t.Fatalf("evicted PVC-backed StatefulSet pod: %v", *evicted)
+		}
+	})
 }

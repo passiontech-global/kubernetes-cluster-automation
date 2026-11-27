@@ -44,8 +44,8 @@ func TestNebulaPMTUDFProbeLatchesBlackhole(t *testing.T) {
 	if !stateExists(e, "nebula-pmtu-blackhole") {
 		t.Fatal("no nebula-pmtu-blackhole latch after ConsecNeeded DF failures")
 	}
-	if !dfProbeRan(e, "10.8.0.1") {
-		t.Fatalf("DF probe did not target the first alive overlay target; cmds=%v", e.host.Cmds())
+	if !dfProbeRan(e, "10.8.1.1") {
+		t.Fatalf("DF probe did not target the first alive overlay marker; cmds=%v", e.host.Cmds())
 	}
 	// Neither isolated nor degraded may fire — the small pings are
 	// all green; PMTU owns this diagnosis alone.
@@ -128,18 +128,77 @@ func TestNebulaPMTUClearedWhenOverlayLeavesNebula(t *testing.T) {
 }
 
 // TestNebulaPMTUFirstAliveTarget: the probe picks the FIRST
-// reachable target in probe order — a dead lead target must not
-// waste the probe on an unreachable address.
+// reachable overlay marker in priority order — a dead lead marker
+// must not waste the probe on an unreachable address.
 func TestNebulaPMTUFirstAliveTarget(t *testing.T) {
 	e := nebulaEnv(t, nil)
-	// 10.8.0.1 dead; 10.8.0.2 + markers alive → probe hits 10.8.0.2.
-	e.pingOK["10.8.0.1|false"] = false
+	// 10.8.1.1 dead; 10.8.1.2 + underlay targets alive → probe hits 10.8.1.2.
+	e.pingOK["10.8.1.1|false"] = false
 	e.host.FailOn("-M do", errCmdFail)
 	e.n.Cycle(context.Background())
+	if !dfProbeRan(e, "10.8.1.2") {
+		t.Fatalf("DF probe did not target the first ALIVE overlay marker; cmds=%v", e.host.Cmds())
+	}
+	if dfProbeRan(e, "10.8.1.1") {
+		t.Fatal("DF probe ran against a dead marker")
+	}
+}
+
+// TestNebulaPMTUPrefersOverlayMarkerOverUnderlay — incident 2026-11-27
+// production/nonprod: ISP peering filters raw underlay ICMP >=100B while
+// full 1500B UDP overlay passes cleanly. When both public underlay
+// targets and overlay markers are alive, checkNebulaPMTU must pick the
+// overlay marker IP (guaranteed to traverse neb1).
+func TestNebulaPMTUPrefersOverlayMarkerOverUnderlay(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	e.n.Cycle(context.Background())
+	if !dfProbeRan(e, "10.8.1.1") {
+		t.Fatalf("DF probe did not prefer OverlayProbeMarkers[0] (10.8.1.1); cmds=%v", e.host.Cmds())
+	}
+	if dfProbeRan(e, "10.8.0.1") || dfProbeRan(e, "10.8.0.2") {
+		t.Fatalf("DF probe targeted raw underlay target despite live overlay markers; cmds=%v", e.host.Cmds())
+	}
+}
+
+// TestNebulaPMTUPrefersSiteMarkerWhenProbeMarkersDead verifies priority
+// tier 2: when cross-site OverlayProbeMarkers are dead but a same-site
+// OverlaySiteMarkers peer is alive, checkNebulaPMTU probes the site
+// marker instead of falling back to a raw underlay public IP.
+func TestNebulaPMTUPrefersSiteMarkerWhenProbeMarkersDead(t *testing.T) {
+	e := nebulaEnv(t, func(wd *watchdogconf.Config) {
+		wd.OverlaySiteMarkers = []string{"10.9.0.1"}
+	})
+	e.pingOK["10.8.1.1|false"] = false
+	e.pingOK["10.8.1.2|false"] = false
+	e.pingOK["10.9.0.1|false"] = true
+	e.pingRTT["10.9.0.1|false"] = 2
+
+	e.n.Cycle(context.Background())
+	if !dfProbeRan(e, "10.9.0.1") {
+		t.Fatalf("DF probe did not prefer alive site marker 10.9.0.1; cmds=%v", e.host.Cmds())
+	}
+	if dfProbeRan(e, "10.8.0.1") || dfProbeRan(e, "10.8.0.2") {
+		t.Fatalf("DF probe fell back to underlay IP while site marker was alive; cmds=%v", e.host.Cmds())
+	}
+}
+
+// TestNebulaPMTUUnmarkedFallbackToPublicTarget verifies backward
+// compatibility: when no overlay or site markers are alive (or none are
+// configured), checkNebulaPMTU falls back to the first alive target in
+// OverlayProbeTargets.
+func TestNebulaPMTUUnmarkedFallbackToPublicTarget(t *testing.T) {
+	e := nebulaEnv(t, func(wd *watchdogconf.Config) {
+		wd.OverlayProbeMarkers = nil
+		wd.OverlaySiteMarkers = nil
+	})
+	e.pingOK["10.8.0.1|false"] = false
+	e.pingOK["10.8.0.2|false"] = true
+
+	e.n.Cycle(context.Background())
 	if !dfProbeRan(e, "10.8.0.2") {
-		t.Fatalf("DF probe did not target the first ALIVE target; cmds=%v", e.host.Cmds())
+		t.Fatalf("DF probe did not fall back to first alive public target 10.8.0.2; cmds=%v", e.host.Cmds())
 	}
 	if dfProbeRan(e, "10.8.0.1") {
-		t.Fatal("DF probe ran against a dead target")
+		t.Fatal("DF probe ran against a dead public target")
 	}
 }
