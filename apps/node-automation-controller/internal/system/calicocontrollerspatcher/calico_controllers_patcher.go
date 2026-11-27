@@ -33,6 +33,11 @@ const (
 	calicoControllersName      = "calico-kube-controllers"
 	calicoControllersContainer = "calico-kube-controllers"
 
+	calicoNodeName      = "calico-node"
+	calicoNodeContainer = "calico-node"
+	calicoIPAutoEnvName = "IP_AUTODETECTION_METHOD"
+	calicoIPAutoEnvWant = "kubernetes-internal-ip"
+
 	calicoReadinessTimeoutSeconds   int32 = 5
 	calicoReadinessFailureThreshold int32 = 6
 )
@@ -41,6 +46,11 @@ const (
 // Merges only timeoutSeconds and failureThreshold inside readinessProbe so the
 // probe handler (exec/httpGet) and other fields remain untouched.
 var calicoControllersPatch = []byte(`{"spec":{"template":{"spec":{"containers":[{"name":"calico-kube-controllers","readinessProbe":{"timeoutSeconds":5,"failureThreshold":6}}]}}}}`)
+
+// Strategic-merge patch targeting container "calico-node" by name to pin
+// IP_AUTODETECTION_METHOD=kubernetes-internal-ip so Calico binds the node's
+// declared InternalIP instead of auto-detecting neb1 (2026-11-27 cicd incident).
+var calicoNodePatch = []byte(`{"spec":{"template":{"spec":{"containers":[{"name":"calico-node","env":[{"name":"IP_AUTODETECTION_METHOD","value":"kubernetes-internal-ip"}]}]}}}}`)
 
 // onlyCalicoControllersDeployment pins the For() watch to
 // kube-system/calico-kube-controllers — the informer sees every kube-system
@@ -70,10 +80,13 @@ func Setup(d shared.Deps) error {
 	})
 }
 
-// Reconcile delegates to the shared pinned-Deployment skeleton. Replicas is
-// left zero so .spec.replicas is never pinned or modified.
+// Reconcile delegates to the shared pinned-Deployment skeleton for
+// calico-kube-controllers (replicas left zero so .spec.replicas is never
+// pinned) and then reconciles kube-system/calico-node DaemonSet to keep
+// IP_AUTODETECTION_METHOD=kubernetes-internal-ip pinned against k0s stack
+// applier reverts. Both skip cleanly on NotFound (Cilium clusters).
 func (r *calicoControllersPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ctrl.Result, error) {
-	return pinnedworkload.DeploymentSpec{
+	res, err := pinnedworkload.DeploymentSpec{
 		CS:         r.cs,
 		Reader:     r.reader,
 		Namespace:  calicoControllersNamespace,
@@ -83,6 +96,41 @@ func (r *calicoControllersPatcher) Reconcile(ctx context.Context, _ reconcile.Re
 		Drifted:    calicoControllersNeedsPatch,
 		PatchBody:  calicoControllersPatchBody,
 	}.Reconcile(ctx)
+	if err != nil {
+		return res, err
+	}
+	if _, dsErr := (pinnedworkload.DaemonSetSpec{
+		CS:         r.cs,
+		Namespace:  calicoControllersNamespace,
+		Name:       calicoNodeName,
+		Container:  calicoNodeContainer,
+		NoDriftLog: "IP_AUTODETECTION_METHOD already pinned - nothing to do",
+		PatchLog:   "PATCH: calico-node IP_AUTODETECTION_METHOD drifted — rollout settled, restoring kubernetes-internal-ip",
+		Settled:    kube.DaemonSetSettled,
+		Drifted:    calicoNodeNeedsPatch,
+		Patch:      calicoNodePatch,
+	}).Reconcile(ctx); dsErr != nil {
+		return ctrl.Result{}, dsErr
+	}
+	return res, nil
+}
+
+// calicoNodeNeedsPatch reports whether kube-system/calico-node lacks
+// IP_AUTODETECTION_METHOD=kubernetes-internal-ip on the calico-node container.
+func calicoNodeNeedsPatch(ds *appsv1.DaemonSet) bool {
+	for i := range ds.Spec.Template.Spec.Containers {
+		c := &ds.Spec.Template.Spec.Containers[i]
+		if c.Name != calicoNodeContainer {
+			continue
+		}
+		for _, env := range c.Env {
+			if env.Name == calicoIPAutoEnvName {
+				return env.Value != calicoIPAutoEnvWant
+			}
+		}
+		return true
+	}
+	return true
 }
 
 func calicoControllersPatchBody(_ int32) ([]byte, error) {

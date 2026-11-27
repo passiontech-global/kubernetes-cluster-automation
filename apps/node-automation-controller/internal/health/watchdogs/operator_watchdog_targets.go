@@ -50,6 +50,10 @@ const (
 	// status.conditions both absent — the operator never completed
 	// a reconcile pass on either channel (operator-workqueue-watchdog).
 	opReasonNoStatus = "no_status_at_all"
+	// opReasonStuckRemediation is the FAR remediation-wedge signature:
+	// a FenceAgentsRemediation CR stuck terminating on its finalizer
+	// or marked nhc-timed-out without reaching Succeeded=True.
+	opReasonStuckRemediation = "stuck_remediation"
 )
 
 // ---------------------------------------------------------------------------

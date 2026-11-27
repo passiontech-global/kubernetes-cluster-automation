@@ -241,7 +241,12 @@ func init() {
 // heartbeat-freshness gate rejected — a frozen or absent heartbeat
 // means the writer may be dead and the True value a zombie, so it
 // warns instead of cordoning.
-func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
+//
+// When ignoreNebulaIsolated is true (mesh-wide NebulaIsolated partition,
+// >=2 workers and >=50% of workers affected), NebulaIsolated is skipped
+// so an upstream overlay outage cannot cordon healthy workers serving
+// traffic over underlay (2026-11-27 cicd DataHub UDP/45670 incident).
+func nodeHangLatch(n *corev1.Node, now time.Time, ignoreNebulaIsolated bool) (latch, stale string) {
 	fused := func(t corev1.NodeConditionType, fuse time.Duration) *corev1.NodeCondition {
 		c := kube.NodeCondition(n, t)
 		if c == nil || c.Status != corev1.ConditionTrue ||
@@ -252,6 +257,9 @@ func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 		return c
 	}
 	for _, t := range nodeHangConds {
+		if ignoreNebulaIsolated && string(t) == nodecond.NebulaIsolated {
+			continue
+		}
 		if c := fused(t, nodeHangCondMinAge); c != nil {
 			if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
 				return string(t), stale
@@ -312,8 +320,11 @@ func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 // conservative (a dead reporter can't prove the node recovered;
 // lifting the cordon on stale data would reschedule onto a node
 // that may still be hung).
-func nodeHangLatchActive(n *corev1.Node) bool {
+func nodeHangLatchActive(n *corev1.Node, ignoreNebulaIsolated bool) bool {
 	for _, t := range nodeHangConds {
+		if ignoreNebulaIsolated && string(t) == nodecond.NebulaIsolated {
+			continue
+		}
 		if c := kube.NodeCondition(n, t); c != nil &&
 			c.Status == corev1.ConditionTrue {
 			return true
@@ -369,7 +380,23 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list nodes: %w", err)}
 	}
-	workers, cordoned := 0, 0
+	workers, cordoned, nebulaIsolated := 0, 0, 0
+	for i := range nodes {
+		n := &nodes[i]
+		if kube.IsControlPlane(n) {
+			continue
+		}
+		workers++
+		if c := kube.NodeCondition(n, corev1.NodeConditionType(nodecond.NebulaIsolated)); c != nil &&
+			c.Status == corev1.ConditionTrue {
+			nebulaIsolated++
+		}
+	}
+	meshWideNebulaIsolated := nebulaIsolated >= 2 && nebulaIsolated*2 >= workers
+	if meshWideNebulaIsolated {
+		log.Info("mesh-wide NebulaIsolated partition — ignoring NebulaIsolated for node-hang-precordon",
+			"nebulaIsolated", nebulaIsolated, "workers", workers)
+	}
 	var rep probefw.SweepReport
 	var uncordon, staleStamp []string
 	// The full node census backs the counter-series carry-forward —
@@ -382,7 +409,6 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 		if kube.IsControlPlane(n) {
 			continue
 		}
-		workers++
 		if n.Spec.Unschedulable {
 			cordoned++
 		}
@@ -390,13 +416,13 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 		// cordoned carry the stamp; everything else is left alone.
 		if kube.EffectiveAnno(ctx, n, nodeHangPreCordonAnno) == nodeHangPreCordonValue {
 			switch {
-			case n.Spec.Unschedulable && !nodeHangLatchActive(n):
+			case n.Spec.Unschedulable && !nodeHangLatchActive(n, meshWideNebulaIsolated):
 				uncordon = append(uncordon, n.Name)
 			case !n.Spec.Unschedulable:
 				staleStamp = append(staleStamp, n.Name)
 			}
 		}
-		latch, stale := nodeHangLatch(n, now)
+		latch, stale := nodeHangLatch(n, now, meshWideNebulaIsolated)
 		if stale != "" {
 			// Stale heartbeat = the condition's writer may be dead —
 			// the True value is not cordon evidence, but a dead

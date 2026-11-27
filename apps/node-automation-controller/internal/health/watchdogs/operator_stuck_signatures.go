@@ -135,6 +135,33 @@ func noStatusAtAll(o *unstructured.Unstructured) bool {
 	return !hasStatusSignals(o)
 }
 
+// fluxOperatorStaleGen is staleObservedGeneration with the flux-operator
+// reconcile brake honored: annotation fluxcd.controlplane.io/reconcile=disabled
+// deliberately parks reconciliation — parked objects are not stuck.
+func fluxOperatorStaleGen(o *unstructured.Unstructured) bool {
+	if o.GetAnnotations()["fluxcd.controlplane.io/reconcile"] == "disabled" {
+		return false
+	}
+	return staleObservedGeneration(o)
+}
+
+// farRemediationStuck catches a FenceAgentsRemediation CR that already
+// received an initial status (so noStatusAtAll stays false) yet wedged
+// mid-remediation or mid-deletion: either DeletionTimestamp is set (stuck
+// on fence-agents-remediation.medik8s.io/far-finalizer, e.g. RBAC/watch
+// wedge), or NHC stamped remediation.medik8s.io/nhc-timed-out without
+// Succeeded=True.
+func farRemediationStuck(o *unstructured.Unstructured) bool {
+	if o.GetDeletionTimestamp() != nil {
+		return true
+	}
+	if o.GetAnnotations()["remediation.medik8s.io/nhc-timed-out"] == "" {
+		return false
+	}
+	cond, ok := kube.ConditionOf(o.Object, "Succeeded")
+	return !ok || cond.Status != "True"
+}
+
 // perconaUnpausedStaleGen is staleObservedGeneration with the Percona
 // pause brake honored: spec.pause=true (and psmdb's spec.mode=paused)
 // parks reconciliation deliberately — paused clusters are parked,

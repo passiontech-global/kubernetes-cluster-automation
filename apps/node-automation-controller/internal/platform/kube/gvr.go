@@ -53,6 +53,10 @@ var (
 	GVRFluxHelmRepository = schema.GroupVersionResource{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmrepositories"}
 	GVRFluxOCIRepository  = schema.GroupVersionResource{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories"}
 	GVRFluxBucket         = schema.GroupVersionResource{Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "buckets"}
+	// Flux Operator (fluxcd.controlplane.io/v1) — operator-workqueue-watchdog.
+	GVRFluxInstance                 = schema.GroupVersionResource{Group: "fluxcd.controlplane.io", Version: "v1", Resource: "fluxinstances"}
+	GVRFluxResourceSet              = schema.GroupVersionResource{Group: "fluxcd.controlplane.io", Version: "v1", Resource: "resourcesets"}
+	GVRFluxResourceSetInputProvider = schema.GroupVersionResource{Group: "fluxcd.controlplane.io", Version: "v1", Resource: "resourcesetinputproviders"}
 
 	// ---------------------------------------------------------------
 	// cert-manager + ACME (certmanager-reaper, cert-drift-auditor,

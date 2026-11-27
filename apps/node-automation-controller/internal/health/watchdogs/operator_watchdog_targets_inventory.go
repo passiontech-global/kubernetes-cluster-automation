@@ -100,6 +100,27 @@ var operatorTargets = []operatorTarget{
 				reason: kcmReasonStaleGen, stuck: fluxUnsuspendedStaleGen},
 		},
 	},
+	{
+		// flux-operator reconciles FluxInstance, ResourceSet, and
+		// ResourceSetInputProvider in flux-system. Runs with optional
+		// leader-election lease ("flux-operator", empty holder when
+		// replicas:1 / leader-elect disabled), so leaseOptional lets
+		// the Running-pod fallback prove liveness.
+		name:          "flux-operator",
+		leaseNS:       "flux-system",
+		leaseNames:    []string{"flux-operator"},
+		podSelector:   "app.kubernetes.io/name=flux-operator",
+		leaseOptional: true,
+		stuckMinAge:   operatorStuckMinAge,
+		resources: []opStuckResource{
+			{gvr: kube.GVRFluxInstance,
+				reason: kcmReasonStaleGen, stuck: fluxOperatorStaleGen},
+			{gvr: kube.GVRFluxResourceSet,
+				reason: kcmReasonStaleGen, stuck: fluxOperatorStaleGen},
+			{gvr: kube.GVRFluxResourceSetInputProvider,
+				reason: kcmReasonStaleGen, stuck: fluxOperatorStaleGen},
+		},
+	},
 	// notification-controller is deliberately absent: its v1beta3
 	// Alert/Provider/Receiver are static objects — the API version
 	// dropped their reconcilers, so no controller ever writes
@@ -433,22 +454,29 @@ var operatorTargets = []operatorTarget{
 	{
 		// fence-agents-remediation (W20): the FAR operator in
 		// operators — medik8s election ids are per-operator hashes
-		// (e1f13584/547f6cb6.medik8s.io for NHC/SNR, c21c06a5 for
-		// FAR); the pinned lease restores the stale-Lease check and
-		// cooldown-annotation heal the pod fallback cannot provide,
-		// while leaseOptional still covers a future id rotation.
-		// The CR signature is the same sparse-status medik8s variant
-		// noStatusAtAll covers.
+		// (e1f13584/547f6cb6.medik8s.io for NHC/SNR; v0.8.0 FAR uses
+		// cb305759.medik8s.io, legacy c21c06a5.medik8s.io); the pinned
+		// lease restores the stale-Lease check and cooldown-annotation
+		// heal the pod fallback cannot provide, while leaseOptional
+		// still covers a future id rotation. Covers both empty-status
+		// CRs (noStatusAtAll) and wedged terminating/nhc-timed-out CRs
+		// (farRemediationStuck — 2026-11-27 nonprod datahub-03 incident).
 		name:          "fence-agents-remediation-operator",
 		leaseNS:       "operators",
-		leaseNames:    []string{"c21c06a5.medik8s.io"},
+		leaseNames:    []string{"cb305759.medik8s.io", "c21c06a5.medik8s.io"},
 		podSelector:   "app.kubernetes.io/name=fence-agents-remediation-operator",
 		leaseOptional: true,
 		stuckMinAge:   operatorStuckMinAge,
-		resources: []opStuckResource{{
-			gvr:    kube.GVRFenceAgentsRemediation,
-			reason: opReasonNoStatus, stuck: noStatusAtAll,
-		}},
+		resources: []opStuckResource{
+			{
+				gvr:    kube.GVRFenceAgentsRemediation,
+				reason: opReasonNoStatus, stuck: noStatusAtAll,
+			},
+			{
+				gvr:    kube.GVRFenceAgentsRemediation,
+				reason: opReasonStuckRemediation, stuck: farRemediationStuck,
+			},
+		},
 	},
 	{
 		// liqo-controller-manager (W20): the Liqo control plane in

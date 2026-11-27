@@ -68,6 +68,14 @@ func (p *operatorWorkqueueCheck) operatorLiveness(ctx context.Context,
 	lease *coordinationv1.Lease, carry, reset bool) {
 
 	lease, lerr := p.operatorLease(ctx, op)
+	// An unheld placeholder Lease (empty holder + nil renewTime, e.g.
+	// flux-operator running with leader-election disabled) carries no
+	// election proof — treat it as absent under leaseOptional so the
+	// Running-pod fallback evaluates liveness instead of resetting forever.
+	if lease != nil && op.leaseOptional && lease.Spec.RenewTime == nil &&
+		(lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "") {
+		lease = nil
+	}
 	switch {
 	case lerr != nil:
 		rep.InfraErr(lerr)

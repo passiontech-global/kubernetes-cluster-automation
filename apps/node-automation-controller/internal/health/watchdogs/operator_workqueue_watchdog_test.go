@@ -44,14 +44,14 @@ func TestOperatorWatchdogTargetsComplete(t *testing.T) {
 		}
 		seen[op.name] = true
 	}
-	if len(operatorTargets) != 29 {
-		t.Fatalf("operatorTargets = %d, want 29", len(operatorTargets))
+	if len(operatorTargets) != 30 {
+		t.Fatalf("operatorTargets = %d, want 30", len(operatorTargets))
 	}
 	for _, want := range []string{
 		"source-controller", "cert-manager",
 		"external-secrets", "rabbitmq-cluster-operator", "keda-operator",
 		"argocd-operator", "kargo-controller", "everest-operator",
-		"shipwright-build-controller",
+		"shipwright-build-controller", "flux-operator",
 		// operator-workqueue-watchdog additions.
 		"notification-controller", "node-healthcheck-operator",
 		"self-node-remediation-operator",

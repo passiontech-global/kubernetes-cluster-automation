@@ -238,6 +238,7 @@ func TestVeleroAutoRetryRespectsCooldown(t *testing.T) {
 	base := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
 	sched := veleroScheduleWithTemplate("velero", "daily", false, "", nil)
 	failed1 := veleroBackup("velero", "daily-failed-1", "daily", "Failed", 2*time.Hour, 0, 0, 1, 0)
+	failed1.SetCreationTimestamp(metav1.NewTime(base.Add(-2 * time.Hour)))
 	bsl := veleroBSL("velero", "default", "Available")
 
 	dyn := newDynFake(sched, failed1, bsl)

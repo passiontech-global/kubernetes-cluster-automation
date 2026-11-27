@@ -82,6 +82,9 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Kind: "Alert"},
 	{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Kind: "Provider"},
 	{Group: "notification.toolkit.fluxcd.io", Version: "v1beta3", Kind: "Receiver"},
+	{Group: "fluxcd.controlplane.io", Version: "v1", Kind: "FluxInstance"},
+	{Group: "fluxcd.controlplane.io", Version: "v1", Kind: "ResourceSet"},
+	{Group: "fluxcd.controlplane.io", Version: "v1", Kind: "ResourceSetInputProvider"},
 
 	// velero + percona everest (velerobackupauditor).
 	{Group: "velero.io", Version: "v1", Kind: "Schedule"},

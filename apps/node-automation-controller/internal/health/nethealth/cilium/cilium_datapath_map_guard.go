@@ -156,6 +156,7 @@ func (p *ciliumDatapathMapCheck) Run(ctx context.Context) probefw.Result {
 				"nat_ct_map_exhaustion (drops from NAT/CT map exhaustion (SNAT port or conntrack table full))")
 		}
 	}
+	p.checkPodAPIServerBlackhole(ctx, log, last, &rep)
 	return rep.Result(&p.emitted, ciliumDatapathDegradedGauge.DeleteLabelValues,
 		"cilium datapath degraded: ", ", ")
 }

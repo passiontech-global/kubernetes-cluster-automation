@@ -298,7 +298,7 @@ func TestOperatorTargetsW21SelectorsAndLeases(t *testing.T) {
 			[]string{"01a9b2d1.shipwright.io"}},
 		{"fence-agents-remediation-operator",
 			"app.kubernetes.io/name=fence-agents-remediation-operator",
-			[]string{"c21c06a5.medik8s.io"}},
+			[]string{"cb305759.medik8s.io", "c21c06a5.medik8s.io"}},
 	} {
 		op, ok := byName[tc.name]
 		if !ok {
