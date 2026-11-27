@@ -111,15 +111,16 @@ type conditionClass struct {
 	clockSkew        bool // ClockSkewPreCordonNames — the longer clock fuse
 	diskPreFail      bool // DiskPreFailPreCordonNames — the 15m pre-fail disk fuse
 	networkMountHung bool // NetworkMountHungPreCordonNames — the 5m network/FUSE mount hang fuse
+	nodeOverloaded   bool // NodeOverloadedPreCordonNames — the 15m sustained load fuse
 }
 
 // conditionClasses is the exhaustive {Partition, StormGate,
-// HangPreCordon, ClockSkew, DiskPreFail, NetworkMountHung} matrix for
-// HeartbeatSweptNames. Names absent from every list (NodeOverloaded,
-// DNSFallbackActive, …) carry the all-false row — silence is a decision
-// too.
+// HangPreCordon, ClockSkew, DiskPreFail, NetworkMountHung,
+// NodeOverloaded} matrix for HeartbeatSweptNames. Names absent from
+// every list (DNSFallbackActive, …) carry the all-false row — silence
+// is a decision too.
 var conditionClasses = map[string]conditionClass{
-	NodeOverloaded:              {},
+	NodeOverloaded:              {stormGate: true, nodeOverloaded: true},
 	WatchdogStale:               {stormGate: true},
 	CiliumAgentDown:             {stormGate: true, hangPreCordon: true},
 	CiliumInitStuck:             {stormGate: true, hangPreCordon: true},
@@ -246,6 +247,7 @@ func TestAllConditionsExplicitlyClassified(t *testing.T) {
 		{"ClockSkewPreCordonNames", ClockSkewPreCordonNames, func(c conditionClass) bool { return c.clockSkew }},
 		{"DiskPreFailPreCordonNames", DiskPreFailPreCordonNames, func(c conditionClass) bool { return c.diskPreFail }},
 		{"NetworkMountHungPreCordonNames", NetworkMountHungPreCordonNames, func(c conditionClass) bool { return c.networkMountHung }},
+		{"NodeOverloadedPreCordonNames", NodeOverloadedPreCordonNames, func(c conditionClass) bool { return c.nodeOverloaded }},
 	}
 	for _, l := range lists {
 		inList := make(map[string]bool, len(l.list))
@@ -269,6 +271,7 @@ func TestListsHaveNoDuplicateEntries(t *testing.T) {
 		"ClockSkewPreCordonNames":        ClockSkewPreCordonNames,
 		"DiskPreFailPreCordonNames":      DiskPreFailPreCordonNames,
 		"NetworkMountHungPreCordonNames": NetworkMountHungPreCordonNames,
+		"NodeOverloadedPreCordonNames":   NodeOverloadedPreCordonNames,
 		"StormGateNames":                 StormGateNames,
 		"PartitionNames":                 PartitionNames,
 	}
@@ -298,6 +301,7 @@ func TestListEntriesAreDeclaredConstantsOrPinnedForeign(t *testing.T) {
 		"ClockSkewPreCordonNames":        ClockSkewPreCordonNames,
 		"DiskPreFailPreCordonNames":      DiskPreFailPreCordonNames,
 		"NetworkMountHungPreCordonNames": NetworkMountHungPreCordonNames,
+		"NodeOverloadedPreCordonNames":   NodeOverloadedPreCordonNames,
 		"StormGateNames":                 StormGateNames,
 		"PartitionNames":                 PartitionNames,
 	}
@@ -365,6 +369,7 @@ func TestHangAndClockSkewListsDisjoint(t *testing.T) {
 		{"ClockSkewPreCordonNames", ClockSkewPreCordonNames},
 		{"DiskPreFailPreCordonNames", DiskPreFailPreCordonNames},
 		{"NetworkMountHungPreCordonNames", NetworkMountHungPreCordonNames},
+		{"NodeOverloadedPreCordonNames", NodeOverloadedPreCordonNames},
 	}
 	owner := make(map[string]string)
 	for _, l := range lists {
@@ -401,6 +406,7 @@ func TestLegacyControllerSpellingsAbsent(t *testing.T) {
 		"ClockSkewPreCordonNames":        ClockSkewPreCordonNames,
 		"DiskPreFailPreCordonNames":      DiskPreFailPreCordonNames,
 		"NetworkMountHungPreCordonNames": NetworkMountHungPreCordonNames,
+		"NodeOverloadedPreCordonNames":   NodeOverloadedPreCordonNames,
 		"StormGateNames":                 StormGateNames,
 		"PartitionNames":                 PartitionNames,
 	}
@@ -433,7 +439,7 @@ func TestAllPreCordonConditionsInStormGate(t *testing.T) {
 	for _, name := range StormGateNames {
 		gate[name] = true
 	}
-	for _, list := range [][]string{HangPreCordonNames, ClockSkewPreCordonNames, DiskPreFailPreCordonNames, NetworkMountHungPreCordonNames} {
+	for _, list := range [][]string{HangPreCordonNames, ClockSkewPreCordonNames, DiskPreFailPreCordonNames, NetworkMountHungPreCordonNames, NodeOverloadedPreCordonNames} {
 		for _, name := range list {
 			if !gate[name] {
 				t.Errorf("StormGateNames must contain pre-cordon condition %q", name)

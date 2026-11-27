@@ -422,6 +422,20 @@ func TestPullSecretPrivateRegistryDetection(t *testing.T) {
 			wantPass: true,
 		},
 		{
+			name: "private registry.passiontech.xyz Pod without pull secret fails",
+			objs: []runtime.Object{
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "pt-priv-pod", UID: "u-pt"},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "registry.passiontech.xyz/platform/app:v1.0.0"}}},
+					Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+				},
+			},
+			wantPass: false,
+			wantKind: "Pod",
+			wantObj:  "pt-priv-pod",
+			wantReg:  "registry.passiontech.xyz",
+		},
+		{
 			name: "public registries, short DockerHub names, and localhost pass without pull secrets",
 			objs: []runtime.Object{
 				&corev1.Pod{
@@ -440,6 +454,9 @@ func TestPullSecretPrivateRegistryDetection(t *testing.T) {
 							{Name: "j", Image: "docker.dragonflydb.io/dragonflydb/dragonfly:v1.26"},
 							{Name: "k", Image: "cr.strrl.dev/strrl/cloudflare-tunnel-ingress-controller:v0.0.19"},
 							{Name: "l", Image: "ecr-public.aws.com/org/app:v1"},
+							{Name: "m", Image: "us-docker.pkg.dev/fairwinds-ops/oss/goldilocks:v4.14.0"},
+							{Name: "n", Image: "europe-docker.pkg.dev/gardener-project/releases/gardener/network-problem-detector:v0.20.0"},
+							{Name: "o", Image: "asia-docker.pkg.dev/oss-project/app:v1"},
 						},
 					},
 					Status: corev1.PodStatus{Phase: corev1.PodRunning},

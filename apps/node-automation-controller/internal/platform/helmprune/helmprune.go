@@ -73,43 +73,45 @@ type HelmSecretPruneHooks struct {
 var helmSecretsGVR = corev1.SchemeGroupVersion.WithResource("secrets")
 
 // PruneSupersededHelmSecrets caps the superseded helm release secrets
-// kept per release, deleting the OLDEST excess with a UID
-// precondition, and returns the helm-typed secrets it listed (the
-// census consumer counts them into api_object_count).
+// kept per release (and prunes stale failed revisions strictly older
+// than the currently deployed revision), deleting the OLDEST excess
+// with a UID precondition, and returns the helm-typed secrets it listed
+// (the census consumer counts them into api_object_count).
 //
-// The read is cluster-wide and server-side filtered to SUPERSEDED
-// revisions — owner=helm is the same label the unlocker's unlock()
-// selects on, and every superseded revision also carries
-// status=superseded (helm v3's standard pair, same labels the test
-// fixtures build), so the live deployed/pending/failed revisions
-// never cross the wire. The per-release `highest` computation then
-// runs over superseded revisions only: the delete set is unchanged —
-// the "never touch the newest rollback point" guard still skips the
-// top superseded revision, and a live deployed revision was never a
-// candidate anyway. Paged like every cluster-wide list here.
+// The read is cluster-wide and server-side filtered to owner=helm +
+// type=helm.sh/release.v1 via PartialObjectMetadata so zero .Data
+// crosses the wire while still seeing deployed, superseded, failed,
+// and pending-* revisions per release.
 //
-// For every release — grouped by storage namespace + the `name`
-// label, the same identity unlock() scopes its revision scan to —
-// secrets with status=="superseded" and a valid integer `version`
-// label are sorted ascending; when a release holds more than
-// maxSuperseded the OLDEST excess are deleted with a UID
-// precondition. deployed, pending-*, and failed secrets are NEVER
-// touched — they are live install/rollback state, not history — and
-// neither is the highest-version secret of the release, which stays
-// the newest rollback point even when it is itself superseded. A
-// NotFound delete means another actor won the race — the prune goal
-// is met, not an error.
+// For every release — grouped by storage namespace + the `name` label,
+// the same identity unlock() scopes its revision scan to — we first
+// compute highestDeployed (max integer `version` with
+// status=="deployed", or -1 if none exists):
+//   - status=="deployed", status=="pending-*", and any revision
+//     v >= highestDeployed (when highestDeployed >= 0) are NEVER touched.
+//   - status=="failed" with v < highestDeployed is always pruned (stale
+//     failed attempts superseded by a later deployed revision); when
+//     highestDeployed < 0 (e.g. failed initial install), failed secrets
+//     are NEVER deleted so operators keep them for debugging.
+//   - status=="superseded" (with v < highestDeployed when deployed
+//     exists) is sorted ascending and pruned oldest-first down to
+//     keepCap (which largeCap can tighten to 0 when highestDeployed >= 0
+//     and the release's serialized JSON size reaches largeCap.Threshold).
+//     When highestDeployed < 0, the highest superseded revision is always
+//     preserved as the sole fallback rollback point.
 //
-// Only the LIST error is returned (the caller owns its failure
-// posture); delete failures surface through hooks.DeleteFailed and
-// never abort the sweep.
+// A NotFound delete means another actor won the race — the prune goal
+// is met, not an error. Only the LIST error is returned (the caller
+// owns its failure posture); delete failures surface through
+// hooks.DeleteFailed and never abort the sweep.
 //
 // This is the typed-only entry kept for callers that have no
 // metadata client to hand (and every fake-clientset unit test):
 // meta/dyn are nil, so the read stays the typed kube.ListAll. Callers
 // holding a metadata.Interface (Deps.Meta / the check's p.Meta)
-// should call PruneSupersededHelmSecretsMeta instead — same
-// contract, metadata-only wire read.
+// should call PruneSupersededHelmSecretsMeta or
+// PruneSupersededHelmSecretsMetaWithCap instead — same contract,
+// metadata-only wire read.
 func PruneSupersededHelmSecrets(ctx context.Context,
 	cs kubernetes.Interface, maxSuperseded int,
 	hooks HelmSecretPruneHooks) ([]corev1.Secret, error) {
@@ -118,10 +120,24 @@ func PruneSupersededHelmSecrets(ctx context.Context,
 		maxSuperseded, hooks)
 }
 
-// LargeSecretCap tightens maxSuperseded for releases whose secret payload
-// exceeds Threshold bytes (e.g. >512 KiB Kine large-object guard) so giant
-// charts do not retain 10 multi-hundred-KiB rows in Kine. A zero Threshold
-// disables size-based tightening.
+// DefaultLargeSecretThreshold is the 512 KiB serialized-JSON row guard
+// matching sprawl's kineLargeObjectThreshold (512 KiB).
+const DefaultLargeSecretThreshold = 512 * 1024
+
+// DefaultLargeSecretCap tightens oversized (>= 512 KiB serialized JSON)
+// Helm release secrets to keep 0 superseded revisions whenever a live
+// deployed revision exists (matching maxHistory: 1 and clearing
+// KineLargeObjectDetected automatically).
+var DefaultLargeSecretCap = LargeSecretCap{
+	Threshold:     DefaultLargeSecretThreshold,
+	MaxSuperseded: 0,
+}
+
+// LargeSecretCap tightens maxSuperseded for releases whose serialized
+// JSON Secret size reaches Threshold bytes (e.g. >=512 KiB Kine
+// large-object guard, matching kube.JSONSize / kine_large_objects.go)
+// so giant charts do not retain multi-hundred-KiB rows in Kine. A zero
+// Threshold disables size-based tightening.
 type LargeSecretCap struct {
 	Threshold     int
 	MaxSuperseded int
@@ -145,8 +161,8 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 }
 
 // PruneSupersededHelmSecretsMetaWithCap extends PruneSupersededHelmSecretsMeta
-// with an optional tighter keep cap for releases whose secret data size
-// exceeds largeCap.Threshold bytes.
+// with an optional tighter keep cap for releases whose serialized JSON
+// secret size reaches largeCap.Threshold bytes.
 func PruneSupersededHelmSecretsMetaWithCap(ctx context.Context,
 	meta metadata.Interface, cs kubernetes.Interface,
 	dyn dynamic.Interface, maxSuperseded int,
@@ -156,9 +172,12 @@ func PruneSupersededHelmSecretsMetaWithCap(ctx context.Context,
 	// The field selector pushes the Secret.type filter to the
 	// apiserver — helm release secrets are a tiny slice of the
 	// secrets table, and the compressed chart payloads behind every
-	// other type never cross the wire.
+	// other type never cross the wire. Selecting owner=helm (without
+	// status=superseded) lets us see deployed and failed revisions
+	// per release while still transferring zero .Data via
+	// PartialObjectMetadata.
 	opts := metav1.ListOptions{
-		LabelSelector: "owner=helm,status=superseded",
+		LabelSelector: "owner=helm",
 		FieldSelector: "type=" + helmReleaseSecretType,
 		Limit:         kube.DefaultListPageSize}
 
@@ -190,52 +209,121 @@ func PruneSupersededHelmSecretsMetaWithCap(ctx context.Context,
 	}
 	secrets = nil // release the cluster-wide slice before issuing deletes
 
-	type supersededSecret struct {
+	type revisionSecret struct {
 		s *corev1.Secret
 		v int
 	}
 	for k, relSecrets := range byRelease {
-		// Highest revision across ALL statuses — the one secret that
-		// is never pruned even when it is itself superseded.
-		highest := -1
-		var highestSec *corev1.Secret
-		var superseded []supersededSecret
+		// Pass 1: find highestDeployed (max version with status=="deployed").
+		highestDeployed := -1
+		for i := range relSecrets {
+			s := &relSecrets[i]
+			if s.Labels["status"] != "deployed" {
+				continue
+			}
+			v, err := strconv.Atoi(s.Labels["version"])
+			if err != nil {
+				continue
+			}
+			if v > highestDeployed {
+				highestDeployed = v
+			}
+		}
+
+		// Pass 2: collect prunable superseded and stale failed revisions.
+		// Never touch deployed, pending-*, or any revision v >= highestDeployed.
+		// When highestDeployed < 0, never touch failed revisions and record
+		// highestSuperseded so the newest superseded revision stays protected.
+		highestSuperseded := -1
+		var highestSupersededSec *corev1.Secret
+		var superseded []revisionSecret
+		var oldFailed []revisionSecret
 		for i := range relSecrets {
 			s := &relSecrets[i]
 			v, err := strconv.Atoi(s.Labels["version"])
 			if err != nil {
 				continue // unversioned — never ours to judge
 			}
-			if v > highest {
-				highest = v
-				highestSec = s
+			if highestDeployed >= 0 && v >= highestDeployed {
+				continue
 			}
-			if s.Labels["status"] == "superseded" {
-				superseded = append(superseded, supersededSecret{s, v})
+			switch s.Labels["status"] {
+			case "superseded":
+				superseded = append(superseded, revisionSecret{s, v})
+				if v > highestSuperseded {
+					highestSuperseded = v
+					highestSupersededSec = s
+				}
+			case "failed":
+				if highestDeployed >= 0 {
+					oldFailed = append(oldFailed, revisionSecret{s, v})
+				}
 			}
 		}
+
+		deleteCandidate := func(cand revisionSecret, total int) bool {
+			if hooks.PreDelete != nil {
+				hooks.PreDelete(cand.s, cand.v, total)
+			}
+			err := cs.CoreV1().Secrets(cand.s.Namespace).Delete(ctx,
+				cand.s.Name, kube.UIDDeleteOptions(cand.s.UID, ""))
+			if apierrors.IsNotFound(err) {
+				// Already gone — another actor won the race; the
+				// prune goal for this slot is met.
+				return true
+			}
+			if err != nil {
+				if hooks.DeleteFailed != nil {
+					hooks.DeleteFailed(cand.s, err)
+				}
+				return false // try the next-oldest instead of giving up
+			}
+			if hooks.Deleted != nil {
+				hooks.Deleted(cand.s, cand.v)
+			}
+			return true
+		}
+
+		// Prune all stale failed revisions strictly older than highestDeployed.
+		if len(oldFailed) > 0 {
+			slices.SortFunc(oldFailed, func(a, b revisionSecret) int {
+				return cmp.Compare(a.v, b.v)
+			})
+			for _, cand := range oldFailed {
+				deleteCandidate(cand, len(oldFailed))
+			}
+		}
+
 		keepCap := maxSuperseded
-		if largeCap.Threshold > 0 && largeCap.MaxSuperseded < keepCap &&
-			len(superseded) > largeCap.MaxSuperseded {
+		effectiveLargeCap := largeCap.MaxSuperseded
+		if highestDeployed < 0 && effectiveLargeCap < 1 {
+			// No deployed revision exists — keep the highest superseded
+			// revision as a fallback rollback point and avoid spurious
+			// excess findings when only that single revision remains.
+			effectiveLargeCap = 1
+		}
+		if largeCap.Threshold > 0 && effectiveLargeCap < keepCap &&
+			len(superseded) > effectiveLargeCap {
 			isLarge := false
 			if dataSizes != nil {
 				for _, cand := range superseded {
-					if dataSizes[cand.s.Namespace+"/"+cand.s.Name] > largeCap.Threshold {
+					if dataSizes[cand.s.Namespace+"/"+cand.s.Name] >= largeCap.Threshold {
 						isLarge = true
 						break
 					}
 				}
-			} else if highestSec != nil {
+			} else if highestSupersededSec != nil {
 				// PartialObjectMetadata omits .Data — fetch only the
-				// newest superseded revision for releases above largeCap
-				// to check whether the release exceeds the byte guard.
-				if full, gerr := cs.CoreV1().Secrets(highestSec.Namespace).
-					Get(ctx, highestSec.Name, metav1.GetOptions{}); gerr == nil {
-					isLarge = secretDataSize(full) > largeCap.Threshold
+				// newest prunable superseded revision for releases above
+				// effectiveLargeCap to measure its serialized JSON size
+				// (matching kine_large_objects.go 1:1).
+				if full, gerr := cs.CoreV1().Secrets(highestSupersededSec.Namespace).
+					Get(ctx, highestSupersededSec.Name, metav1.GetOptions{}); gerr == nil {
+					isLarge = secretJSONSize(full) >= largeCap.Threshold
 				}
 			}
 			if isLarge {
-				keepCap = largeCap.MaxSuperseded
+				keepCap = effectiveLargeCap
 			}
 		}
 		excess := len(superseded) - keepCap
@@ -245,7 +333,7 @@ func PruneSupersededHelmSecretsMetaWithCap(ctx context.Context,
 		if hooks.Excess != nil {
 			hooks.Excess(k.ns, k.name, len(superseded), keepCap)
 		}
-		slices.SortFunc(superseded, func(a, b supersededSecret) int {
+		slices.SortFunc(superseded, func(a, b revisionSecret) int {
 			return cmp.Compare(a.v, b.v)
 		})
 		toDelete := excess
@@ -253,33 +341,12 @@ func PruneSupersededHelmSecretsMetaWithCap(ctx context.Context,
 			if toDelete <= 0 {
 				break
 			}
-			if cand.v == highest {
-				continue // never touch the highest-version secret
+			if highestDeployed < 0 && cand.v == highestSuperseded {
+				continue // no deployed revision — never delete the highest superseded secret
 			}
-			if hooks.PreDelete != nil {
-				hooks.PreDelete(cand.s, cand.v, len(superseded))
-			}
-			err := cs.CoreV1().Secrets(cand.s.Namespace).Delete(ctx,
-				cand.s.Name, kube.UIDDeleteOptions(cand.s.UID, ""))
-			if apierrors.IsNotFound(err) {
-				// Already gone — another actor won the race; the
-				// prune goal for this slot is met, so it still
-				// counts toward toDelete. Skipping the decrement
-				// would delete one secret too many — a newer
-				// revision than the cap requires.
+			if deleteCandidate(cand, len(superseded)) {
 				toDelete--
-				continue
 			}
-			if err != nil {
-				if hooks.DeleteFailed != nil {
-					hooks.DeleteFailed(cand.s, err)
-				}
-				continue // try the next-oldest instead of giving up
-			}
-			if hooks.Deleted != nil {
-				hooks.Deleted(cand.s, cand.v)
-			}
-			toDelete--
 		}
 	}
 	return helmTyped, nil
@@ -292,10 +359,10 @@ func PruneSupersededHelmSecretsMetaWithCap(ctx context.Context,
 // drop it). Secret.Type is not ObjectMeta and cannot cross the
 // metadata endpoint, so the projected kube.Secrets carry the helm type
 // the field selector already guaranteed server-side; on the
-// unfiltered BadRequest retry the owner=helm,status=superseded
-// label pair is the remaining guard (same exposure the typed
-// path's client-side check covers for fakes — a secret wearing
-// helm's full label set is already impersonating a revision).
+// unfiltered BadRequest retry the owner=helm label is the remaining
+// guard (same exposure the typed path's client-side check covers for
+// fakes — a secret wearing helm's full label set is already
+// impersonating a revision).
 func listHelmSecretsPartial(ctx context.Context,
 	meta metadata.Interface, cs kubernetes.Interface,
 	dyn dynamic.Interface, opts metav1.ListOptions) ([]corev1.Secret, error) {
@@ -327,13 +394,16 @@ func listHelmSecretsPartial(ctx context.Context,
 	return secrets, nil
 }
 
-// secretDataSize returns the total payload byte size across a Secret's
-// Data and StringData maps — matching the payload accounting used by the
-// 512 KiB Kine large-object guard without marshalling the whole object.
-func secretDataSize(s *corev1.Secret) int {
+// secretJSONSize returns s's serialized JSON byte size via kube.JSONSize,
+// matching sprawl's kine_large_objects.go 1:1 (including base64 expansion
+// of Secret.Data, which adds ~33% over raw len(v), plus ObjectMeta).
+func secretJSONSize(s *corev1.Secret) int {
+	if n, err := kube.JSONSize(s); err == nil {
+		return int(n)
+	}
 	n := 0
 	for _, v := range s.Data {
-		n += len(v)
+		n += ((len(v) + 2) / 3) * 4
 	}
 	for _, v := range s.StringData {
 		n += len(v)
@@ -375,7 +445,7 @@ func listHelmSecretsTyped(ctx context.Context, cs kubernetes.Interface,
 			continue
 		}
 		if recordSizes {
-			sizes[s.Namespace+"/"+s.Name] = secretDataSize(s)
+			sizes[s.Namespace+"/"+s.Name] = secretJSONSize(s)
 		}
 		// The decision needs only metadata — each revision embeds
 		// the compressed chart (MBs). Drop the payload before the

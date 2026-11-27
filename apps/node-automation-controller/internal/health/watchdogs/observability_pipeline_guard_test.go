@@ -298,14 +298,17 @@ func TestObservabilityPipelineGuardVictoriaMetrics(t *testing.T) {
 	})
 
 	t.Run("VMSingle resolves Regarding Kind=VMSingle when vmsingle pod exists", func(t *testing.T) {
+		const wantScrapesFailedQuery = `(sum(increase(vm_promscrape_scrapes_failed_total[10m])) / clamp_min(sum(increase(vm_promscrape_scrape_requests_total[10m])) or vector(1), 1)) > 0.05 and sum(increase(vm_promscrape_scrapes_failed_total[10m])) > 10`
+		var sawExactQuery atomic.Bool
 		srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
 			switch {
 			case query == "count(vm_app_version)":
 				return []probetest.PromTestSample{{Value: 1}}
 			case strings.Contains(query, "Watchdog"):
 				return []probetest.PromTestSample{{Value: 1}}
-			case strings.Contains(query, "vm_promscrape_scrapes_failed_total"):
-				return []probetest.PromTestSample{{Value: 5}}
+			case query == wantScrapesFailedQuery:
+				sawExactQuery.Store(true)
+				return []probetest.PromTestSample{{Value: 0.12}}
 			}
 			return nil
 		})
@@ -322,13 +325,58 @@ func TestObservabilityPipelineGuardVictoriaMetrics(t *testing.T) {
 		if res.Pass {
 			t.Fatal("degraded VMSingle pipeline must fail the check")
 		}
-		obsPipelineDegradedGauge.DeleteLabelValues("vmagent_scrapes_failed")
+		if !sawExactQuery.Load() {
+			t.Fatalf("expected vmagent_scrapes_failed query %q to be issued", wantScrapesFailedQuery)
+		}
+		if !obsPipelineDegradedGauge.DeleteLabelValues("vmagent_scrapes_failed") {
+			t.Fatal("missing degraded series for vmagent_scrapes_failed")
+		}
 		evs, err := cs.EventsV1().Events(obsVMEventNS).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(evs.Items) != 1 || evs.Items[0].Regarding.Kind != "VMSingle" {
 			t.Fatalf("events = %+v, want 1 event Regarding Kind=VMSingle", evs.Items)
+		}
+	})
+
+	t.Run("vmagent_scrapes_failed uses ratio+floor query and stays quiet below threshold", func(t *testing.T) {
+		var mu sync.Mutex
+		var scrapeQuery string
+		srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+			if strings.Contains(query, "vm_promscrape_scrapes_failed_total") {
+				mu.Lock()
+				scrapeQuery = query
+				mu.Unlock()
+				// Empty vector models Prometheus/VM filtering out transient
+				// scrape errors below the >5% ratio and >10 failures floor.
+				return nil
+			}
+			switch {
+			case query == "count(vm_app_version)":
+				return []probetest.PromTestSample{{Value: 1}}
+			case strings.Contains(query, "Watchdog"):
+				return []probetest.PromTestSample{{Value: 1}}
+			}
+			return nil
+		})
+		cs := fake.NewSimpleClientset()
+		p := testProber(cs)
+		p.Cfg.HTTPContent.URL = srv.URL + "/health"
+		p.HTTPClient = srv.Client()
+		res := probetest.MustCheck[*observabilityPipelineCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+		if !res.Pass {
+			t.Fatalf("below-threshold vmagent scrape noise must pass: %+v", res)
+		}
+		mu.Lock()
+		got := scrapeQuery
+		mu.Unlock()
+		want := `(sum(increase(vm_promscrape_scrapes_failed_total[10m])) / clamp_min(sum(increase(vm_promscrape_scrape_requests_total[10m])) or vector(1), 1)) > 0.05 and sum(increase(vm_promscrape_scrapes_failed_total[10m])) > 10`
+		if got != want {
+			t.Fatalf("vmagent_scrapes_failed query = %q, want %q", got, want)
+		}
+		if obsPipelineDegradedGauge.DeleteLabelValues("vmagent_scrapes_failed") {
+			t.Fatal("below-threshold scrape error wrongly emitted degraded gauge")
 		}
 	})
 

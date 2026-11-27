@@ -19,6 +19,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cloudflared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/connectionskew"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/gateway"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/linkerd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/liqo"
@@ -152,4 +153,5 @@ var healthRows = []shared.Module{
 	{Name: "dra-claim-wedge-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_DRA_CLAIM_WEDGE_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: nodehealth.CheckNameDRAClaimWedgeGuard, New: nodehealth.NewDRAClaimWedgeGuardCheck}},
 	{Name: "pod-resize-wedge-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_POD_RESIZE_WEDGE_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNamePodResizeWedgeGuard, New: watchdogs.NewPodResizeWedgeGuardCheck}},
 	{Name: "ingress-nginx-retirement-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_INGRESS_NGINX_RETIREMENT_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: watchdogs.CheckNameIngressNginxRetirementGuard, New: watchdogs.NewIngressNginxRetirementGuardCheck}},
+	{Name: "workload-connection-skew-guard", Group: groupHealth, GateEnv: "NODE_AUTOMATION_WORKLOAD_CONNECTION_SKEW_GUARD_ENABLED", DefaultOn: true, CheckReg: &shared.CheckReg{Name: connectionskew.CheckNameWorkloadConnectionSkewGuard, New: connectionskew.NewWorkloadConnectionSkewGuardCheck}},
 }

@@ -136,8 +136,8 @@ var obsPipelineVMCounters = []obsPipelineCounter{
 		`sum(increase(vmagent_remotewrite_errors_total[10m])) > 0`,
 		"vmagent failing remote-write delivery to vmstorage/hub"},
 	{"vmagent_scrapes_failed",
-		`sum(increase(vm_promscrape_scrapes_failed_total[10m])) > 0`,
-		"vmagent target scrapes failing"},
+		`(sum(increase(vm_promscrape_scrapes_failed_total[10m])) / clamp_min(sum(increase(vm_promscrape_scrape_requests_total[10m])) or vector(1), 1)) > 0.05 and sum(increase(vm_promscrape_scrapes_failed_total[10m])) > 10`,
+		"vmagent target scrapes failing (>5% failure rate and >10 failures in 10m)"},
 }
 
 func obsCountersForBackend(backend promq.BackendKind) []obsPipelineCounter {

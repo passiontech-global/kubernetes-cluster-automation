@@ -736,3 +736,192 @@ func TestHPAScalingGuardCrossKindIsolation(t *testing.T) {
 		}
 	})
 }
+
+func TestHPAScalingGuardKEDAAndScaleToZero(t *testing.T) {
+	newZeroDep := func(name string) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: name},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: ptr.To(int32(0)),
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
+				},
+			},
+		}
+	}
+
+	t.Run("KEDA HPA with ScalingDisabled passes and does not rescue", func(t *testing.T) {
+		variants := []struct {
+			name string
+			hpa  func() *unstructured.Unstructured
+		}{
+			{
+				name: "ownerReference ScaledObject",
+				hpa: func() *unstructured.Unstructured {
+					h := hpaObj("apps", "worker-hpa", "Deployment", "worker",
+						map[string]string{"type": "ScalingActive", "status": "False", "reason": "ScalingDisabled"},
+						map[string]string{"type": "AbleToScale", "status": "False", "reason": "ScalingDisabled"})
+					h.SetOwnerReferences([]metav1.OwnerReference{{
+						APIVersion: "keda.sh/v1alpha1",
+						Kind:       "ScaledObject",
+						Name:       "worker",
+					}})
+					return h
+				},
+			},
+			{
+				name: "keda-hpa name prefix",
+				hpa: func() *unstructured.Unstructured {
+					return hpaObj("apps", "keda-hpa-worker", "Deployment", "worker",
+						map[string]string{"type": "ScalingActive", "status": "False", "reason": "ScalingDisabled"})
+				},
+			},
+			{
+				name: "keda-operator managed-by label",
+				hpa: func() *unstructured.Unstructured {
+					h := hpaObj("apps", "worker-hpa", "Deployment", "worker",
+						map[string]string{"type": "ScalingActive", "status": "False", "reason": "ScalingDisabled"})
+					h.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "keda-operator"})
+					return h
+				},
+			},
+			{
+				name: "scaledobject.keda.sh/name label",
+				hpa: func() *unstructured.Unstructured {
+					h := hpaObj("apps", "worker-hpa", "Deployment", "worker",
+						map[string]string{"type": "ScalingActive", "status": "False", "reason": "ScalingDisabled"})
+					h.SetLabels(map[string]string{"scaledobject.keda.sh/name": "worker"})
+					return h
+				},
+			},
+		}
+
+		for _, tc := range variants {
+			t.Run(tc.name, func(t *testing.T) {
+				hpaScalingUnhealthyGauge.Reset()
+				hpa := tc.hpa()
+				dep := newZeroDep("worker")
+				cs, ch := hpaDeps(hpa, dep)
+				base := time.Now()
+
+				probetest.FreezeNow(ch.Deps, base)
+				if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
+					t.Fatalf("first sweep must pass for idle KEDA HPA: %+v", res)
+				}
+				probetest.FreezeNow(ch.Deps, base.Add(hpaUnhealthyMinAge+time.Minute))
+				if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
+					t.Fatalf("past-window sweep must pass for idle KEDA HPA: %+v", res)
+				}
+				got, err := cs.AppsV1().Deployments("apps").Get(ctx, "worker", metav1.GetOptions{})
+				if err != nil {
+					t.Fatalf("get deployment: %v", err)
+				}
+				if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+					t.Fatalf("idle KEDA target was rescued to %v, want 0", got.Spec.Replicas)
+				}
+			})
+		}
+	})
+
+	t.Run("HPA with minReplicas 0 and ScalingDisabled passes", func(t *testing.T) {
+		hpaScalingUnhealthyGauge.Reset()
+		hpa := hpaObj("apps", "zero-hpa", "Deployment", "zero-app",
+			map[string]string{"type": "ScalingActive", "status": "False", "reason": "ScalingDisabled"},
+			map[string]string{"type": "AbleToScale", "status": "False", "reason": "ScalingDisabled"})
+		if err := unstructured.SetNestedField(hpa.Object, int64(0), "spec", "minReplicas"); err != nil {
+			t.Fatal(err)
+		}
+		dep := newZeroDep("zero-app")
+		cs, ch := hpaDeps(hpa, dep)
+		base := time.Now()
+
+		probetest.FreezeNow(ch.Deps, base)
+		if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
+			t.Fatalf("first sweep must pass for minReplicas=0 HPA: %+v", res)
+		}
+		probetest.FreezeNow(ch.Deps, base.Add(hpaUnhealthyMinAge+time.Minute))
+		if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
+			t.Fatalf("past-window sweep must pass for minReplicas=0 HPA: %+v", res)
+		}
+		got, err := cs.AppsV1().Deployments("apps").Get(ctx, "zero-app", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get deployment: %v", err)
+		}
+		if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+			t.Fatalf("minReplicas=0 target was rescued to %v, want 0", got.Spec.Replicas)
+		}
+	})
+
+	t.Run("KEDA HPA with FailedGetExternalMetric still flags unhealthy without rescuing target", func(t *testing.T) {
+		hpaScalingUnhealthyGauge.Reset()
+		hpa := hpaObj("apps", "keda-hpa-broken", "Deployment", "broken",
+			map[string]string{"type": "ScalingActive", "status": "False", "reason": "FailedGetExternalMetric"})
+		hpa.SetOwnerReferences([]metav1.OwnerReference{{
+			APIVersion: "keda.sh/v1alpha1",
+			Kind:       "ScaledObject",
+			Name:       "broken",
+		}})
+		dep := newZeroDep("broken")
+		cs, ch := hpaDeps(hpa, dep)
+		base := time.Now()
+
+		probetest.FreezeNow(ch.Deps, base)
+		if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
+			t.Fatalf("first sighting arms window, must pass: %+v", res)
+		}
+		probetest.FreezeNow(ch.Deps, base.Add(hpaUnhealthyMinAge+time.Minute))
+		res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
+		if res.Pass {
+			t.Fatal("KEDA HPA with FailedGetExternalMetric past window must flag unhealthy")
+		}
+		m := probetest.FindMetric(t, "node_automation_hpa_scaling_unhealthy",
+			map[string]string{"namespace": "apps", "name": "keda-hpa-broken",
+				"reason": "scaling_active_false"})
+		if m == nil {
+			t.Fatal("scaling_active_false gauge missing for broken KEDA HPA")
+		}
+		got, err := cs.AppsV1().Deployments("apps").Get(ctx, "broken", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get deployment: %v", err)
+		}
+		if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+			t.Fatalf("KEDA target was rescued to %v, want 0 (KEDA errors belong to keda-scaledobject-guard)", got.Spec.Replicas)
+		}
+	})
+
+	t.Run("non-KEDA HPA with minReplicas 0 and FailedGetScale flags unhealthy without rescuing target", func(t *testing.T) {
+		hpaScalingUnhealthyGauge.Reset()
+		hpa := hpaObj("apps", "zero-broken-hpa", "Deployment", "zero-broken",
+			map[string]string{"type": "AbleToScale", "status": "False", "reason": "FailedGetScale"})
+		if err := unstructured.SetNestedField(hpa.Object, int64(0), "spec", "minReplicas"); err != nil {
+			t.Fatal(err)
+		}
+		dep := newZeroDep("zero-broken")
+		cs, ch := hpaDeps(hpa, dep)
+		base := time.Now()
+
+		probetest.FreezeNow(ch.Deps, base)
+		if res := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res.Pass {
+			t.Fatalf("first sighting arms window, must pass: %+v", res)
+		}
+		probetest.FreezeNow(ch.Deps, base.Add(hpaUnhealthyMinAge+time.Minute))
+		res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
+		if res.Pass {
+			t.Fatal("non-KEDA HPA with minReplicas=0 and FailedGetScale past window must flag unhealthy")
+		}
+		m := probetest.FindMetric(t, "node_automation_hpa_scaling_unhealthy",
+			map[string]string{"namespace": "apps", "name": "zero-broken-hpa",
+				"reason": "able_to_scale_false"})
+		if m == nil {
+			t.Fatal("able_to_scale_false gauge missing for broken minReplicas=0 HPA")
+		}
+		got, err := cs.AppsV1().Deployments("apps").Get(ctx, "zero-broken", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get deployment: %v", err)
+		}
+		if got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+			t.Fatalf("minReplicas=0 target was rescued to %v on FailedGetScale, want 0", got.Spec.Replicas)
+		}
+	})
+}

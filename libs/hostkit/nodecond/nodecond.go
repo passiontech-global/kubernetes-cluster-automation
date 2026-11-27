@@ -325,6 +325,16 @@ var NetworkMountHungPreCordonNames = []string{
 	CondNetworkMountHung,
 }
 
+// NodeOverloadedPreCordonNames is the PSI hysteresis load condition
+// on its own 15-minute fuse — transient load spikes clear quickly,
+// whereas a sustained NodeOverloaded condition needs pre-cordon and
+// guarded stateless pod shedding until load subsides and auto-uncordon
+// restores scheduling. Separate list for the same reason
+// DiskPreFailPreCordonNames and NetworkMountHungPreCordonNames exist.
+var NodeOverloadedPreCordonNames = []string{
+	NodeOverloaded,
+}
+
 // StormGateNames are the node-unhealthy conditions the
 // descheduler-storm-gate treats as "rebalancing is actively
 // harmful": while any is True (or a storm taint sits on the node)
@@ -390,6 +400,10 @@ var StormGateNames = []string{
 	// CondK8s135ReadinessDrift is an upgrade-readiness posture audit
 	// and stays out so it does not freeze the cluster-wide descheduler.
 	CondKMSv2Unhealthy,
+	// NodeOverloaded joins the storm gate alongside its 15m precordon
+	// fuse: while a worker is actively overloaded, descheduler must not
+	// pile additional pods onto it.
+	NodeOverloaded,
 }
 
 // PartitionNames are the network-partition conditions the

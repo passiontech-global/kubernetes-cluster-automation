@@ -159,6 +159,7 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"dra-claim-wedge-guard",
 		"pod-resize-wedge-guard",
 		"ingress-nginx-retirement-guard",
+		"workload-connection-skew-guard",
 	}
 	var got []string
 	for _, m := range Modules {

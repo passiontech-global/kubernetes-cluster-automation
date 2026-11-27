@@ -318,8 +318,8 @@ func TestSetupModules(t *testing.T) {
 		if err := SetupModules(testDeps(m), Modules); err != nil {
 			t.Fatalf("SetupModules: %v", err)
 		}
-		if len(m.Added) != 32 {
-			t.Fatalf("registered %d runnables, want 32", len(m.Added))
+		if len(m.Added) != 33 {
+			t.Fatalf("registered %d runnables, want 33", len(m.Added))
 		}
 		for i, r := range m.Added {
 			if r == nil {

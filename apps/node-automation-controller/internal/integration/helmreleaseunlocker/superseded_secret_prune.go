@@ -33,13 +33,13 @@ const (
 func (u *helmReleaseUnlocker) pruneSupersededSecrets(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	pruned := 0
-	_, err := helmprune.PruneSupersededHelmSecretsMeta(ctx, u.meta, u.cs, u.dyn,
-		maxSupersededSecrets, helmprune.HelmSecretPruneHooks{
+	_, err := helmprune.PruneSupersededHelmSecretsMetaWithCap(ctx, u.meta, u.cs, u.dyn,
+		maxSupersededSecrets, helmprune.DefaultLargeSecretCap, helmprune.HelmSecretPruneHooks{
 			PreDelete: func(s *corev1.Secret, version, supersededTotal int) {
 				log.Info("ACTION: prune superseded helm release secret",
 					"release", s.Namespace+"/"+s.Labels["name"],
-					"secret", s.Name, "version", version,
-					"supersededTotal", supersededTotal)
+					"secret", s.Name, "status", s.Labels["status"],
+					"version", version, "supersededTotal", supersededTotal)
 			},
 			Deleted: func(s *corev1.Secret, _ int) {
 				metrics.HelmSecretsPrunedTotal.WithLabelValues(s.Namespace).Inc()

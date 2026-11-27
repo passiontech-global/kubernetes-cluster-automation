@@ -109,9 +109,9 @@ func TestPruneSupersededHelmSecrets_TypedSelectionAndHooks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// All 6 matching helm-typed secrets (label selector filters status=superseded) should be returned, with Data cleared.
-	if len(listed) != 6 {
-		t.Fatalf("expected 6 helm-typed secrets, got %d", len(listed))
+	// All 7 matching helm-typed secrets (label selector filters owner=helm) should be returned, with Data cleared.
+	if len(listed) != 7 {
+		t.Fatalf("expected 7 helm-typed secrets, got %d", len(listed))
 	}
 	for _, s := range listed {
 		if s.Data != nil {
@@ -309,4 +309,153 @@ func TestPruneSupersededHelmSecretsMetaWithCap_LargeViaMetaPath(t *testing.T) {
 	if !slices.Equal(deleted, []int{1, 2}) {
 		t.Fatalf("large release via meta path deleted %v, want [1 2]", deleted)
 	}
+}
+
+func TestPruneSupersededHelmSecrets_FailedRevisionSemantics(t *testing.T) {
+	t.Parallel()
+
+	// Release "with-deployed": v1 failed, v2 superseded, v3 failed, v4 deployed,
+	// v5 pending-upgrade, v6 failed (newer than deployed).
+	// -> v1 and v3 (failed < highestDeployed=4) MUST be pruned with UID precondition.
+	// -> v4 (deployed), v5 (pending-upgrade), v6 (failed >= 4), and v2 (under cap) survive.
+	//
+	// Release "failed-install" (highestDeployed < 0): v1 failed, v2 failed.
+	// -> NEVER pruned (kept for debugging failed initial installs).
+	objs := []runtime.Object{
+		helmSecret("ns1", "sh.helm.release.v1.with-deployed.v1", "with-deployed", 1, "failed"),
+		helmSecret("ns1", "sh.helm.release.v1.with-deployed.v2", "with-deployed", 2, "superseded"),
+		helmSecret("ns1", "sh.helm.release.v1.with-deployed.v3", "with-deployed", 3, "failed"),
+		helmSecret("ns1", "sh.helm.release.v1.with-deployed.v4", "with-deployed", 4, "deployed"),
+		helmSecret("ns1", "sh.helm.release.v1.with-deployed.v5", "with-deployed", 5, "pending-upgrade"),
+		helmSecret("ns1", "sh.helm.release.v1.with-deployed.v6", "with-deployed", 6, "failed"),
+		helmSecret("ns1", "sh.helm.release.v1.failed-install.v1", "failed-install", 1, "failed"),
+		helmSecret("ns1", "sh.helm.release.v1.failed-install.v2", "failed-install", 2, "failed"),
+	}
+	cs := fake.NewClientset(objs...)
+
+	var deletedNames []string
+	var deleteUIDs []types.UID
+	cs.PrependReactor("delete", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		da := action.(k8stesting.DeleteAction)
+		if da.GetDeleteOptions().Preconditions != nil && da.GetDeleteOptions().Preconditions.UID != nil {
+			deleteUIDs = append(deleteUIDs, *da.GetDeleteOptions().Preconditions.UID)
+		}
+		return false, nil, nil
+	})
+
+	_, err := PruneSupersededHelmSecrets(context.Background(), cs, 10, HelmSecretPruneHooks{
+		Deleted: func(s *corev1.Secret, _ int) { deletedNames = append(deletedNames, s.Name) },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantDeleted := []string{
+		"sh.helm.release.v1.with-deployed.v1",
+		"sh.helm.release.v1.with-deployed.v3",
+	}
+	if !slices.Equal(deletedNames, wantDeleted) {
+		t.Fatalf("deleted = %v, want %v", deletedNames, wantDeleted)
+	}
+	if len(deleteUIDs) != 2 ||
+		deleteUIDs[0] != "uid-ns1-sh.helm.release.v1.with-deployed.v1" ||
+		deleteUIDs[1] != "uid-ns1-sh.helm.release.v1.with-deployed.v3" {
+		t.Fatalf("unexpected UID preconditions: %v", deleteUIDs)
+	}
+	for _, keep := range []string{
+		"sh.helm.release.v1.with-deployed.v2",
+		"sh.helm.release.v1.with-deployed.v4",
+		"sh.helm.release.v1.with-deployed.v5",
+		"sh.helm.release.v1.with-deployed.v6",
+		"sh.helm.release.v1.failed-install.v1",
+		"sh.helm.release.v1.failed-install.v2",
+	} {
+		if _, err := cs.CoreV1().Secrets("ns1").Get(context.Background(), keep, metav1.GetOptions{}); err != nil {
+			t.Fatalf("secret %s must survive: %v", keep, err)
+		}
+	}
+}
+
+func TestPruneSupersededHelmSecrets_Base64JSONSizeAndZeroCap(t *testing.T) {
+	t.Parallel()
+
+	// 420 KiB raw payload: < 512 KiB raw len(v), but ~560 KiB serialized JSON
+	// after base64 expansion — must trigger DefaultLargeSecretCap (512 KiB)
+	// and prune down to 0 superseded when a deployed revision exists, while
+	// preserving highest superseded when no deployed revision exists.
+	raw420KiB := make([]byte, 420*1024)
+	mk := func(rel string, v int, status string) *corev1.Secret {
+		s := helmSecret("ns1", "sh.helm.release.v1."+rel+".v"+strconv.Itoa(v), rel, v, status)
+		s.Data = map[string][]byte{"release": raw420KiB}
+		return s
+	}
+
+	t.Run("typed path prunes 420KiB-raw superseded to 0 when deployed exists", func(t *testing.T) {
+		t.Parallel()
+		cs := fake.NewClientset(
+			mk("big", 1, "superseded"),
+			mk("big", 2, "superseded"),
+			mk("big", 3, "deployed"),
+			// No deployed revision: highest superseded (v2) must survive.
+			mk("nodeploy", 1, "superseded"),
+			mk("nodeploy", 2, "superseded"),
+		)
+		var deleted []string
+		_, err := PruneSupersededHelmSecretsMetaWithCap(context.Background(), nil, cs, nil,
+			10, DefaultLargeSecretCap, HelmSecretPruneHooks{
+				Deleted: func(s *corev1.Secret, _ int) { deleted = append(deleted, s.Name) },
+			})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		slices.Sort(deleted)
+		want := []string{
+			"sh.helm.release.v1.big.v1",
+			"sh.helm.release.v1.big.v2",
+			"sh.helm.release.v1.nodeploy.v1",
+		}
+		if !slices.Equal(deleted, want) {
+			t.Fatalf("deleted = %v, want %v", deleted, want)
+		}
+		for _, keep := range []string{
+			"sh.helm.release.v1.big.v3",
+			"sh.helm.release.v1.nodeploy.v2",
+		} {
+			if _, err := cs.CoreV1().Secrets("ns1").Get(context.Background(), keep, metav1.GetOptions{}); err != nil {
+				t.Fatalf("secret %s must survive: %v", keep, err)
+			}
+		}
+	})
+
+	t.Run("meta path prunes 420KiB-raw superseded to 0 and skips >= highestDeployed", func(t *testing.T) {
+		t.Parallel()
+		s1 := mk("big", 1, "superseded")
+		s2 := mk("big", 2, "superseded")
+		s3 := mk("big", 3, "deployed")
+		// Superseded revision newer than deployed must never be touched.
+		s4 := mk("big", 4, "superseded")
+		meta := testhelp.NewMetaClient(
+			testhelp.MetaObj("v1", "Secret", s1.ObjectMeta),
+			testhelp.MetaObj("v1", "Secret", s2.ObjectMeta),
+			testhelp.MetaObj("v1", "Secret", s3.ObjectMeta),
+			testhelp.MetaObj("v1", "Secret", s4.ObjectMeta),
+		)
+		cs := fake.NewClientset(s1, s2, s3, s4)
+
+		var deleted []int
+		_, err := PruneSupersededHelmSecretsMetaWithCap(context.Background(), meta, cs, nil,
+			10, DefaultLargeSecretCap, HelmSecretPruneHooks{
+				Deleted: func(_ *corev1.Secret, v int) { deleted = append(deleted, v) },
+			})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !slices.Equal(deleted, []int{1, 2}) {
+			t.Fatalf("meta path deleted %v, want [1 2]", deleted)
+		}
+		for _, keep := range []string{s3.Name, s4.Name} {
+			if _, err := cs.CoreV1().Secrets("ns1").Get(context.Background(), keep, metav1.GetOptions{}); err != nil {
+				t.Fatalf("secret %s must survive: %v", keep, err)
+			}
+		}
+	})
 }

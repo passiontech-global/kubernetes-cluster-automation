@@ -16,7 +16,9 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
@@ -26,13 +28,22 @@ type nodeHangCheck struct {
 	// hangCounters is the {node} counter-series bookkeeping for the
 	// cordon/uncordon vecs — see hangCounterLedger.
 	hangCounters hangCounterLedger
+
+	// overloadEvictEnabled gates the guarded stateless pod shedding pass
+	// for sustained NodeOverloaded workers (NODE_OVERLOADED_EVICT_ENABLED).
+	overloadEvictEnabled bool
+	// overloadShedCooldown enforces the 10m per-node shedding cooldown.
+	overloadShedCooldown state.CooldownSet
 }
 
-// newNodeHangCheck builds the node-hang-precordon watchdog — it reads only Deps;
-// hangCounters arms lazily on the first cordon/uncordon Inc (zero
-// value ready, the platform/state convention).
+// NewNodeHangCheck builds the node-hang-precordon watchdog — resolves
+// NODE_OVERLOADED_EVICT_ENABLED at construction; ledgers arm lazily on
+// first use (zero value ready, the platform/state convention).
 func NewNodeHangCheck(d *probefw.Deps) probefw.Check {
-	return &nodeHangCheck{Deps: d}
+	return &nodeHangCheck{
+		Deps:                 d,
+		overloadEvictEnabled: envx.Gate("NODE_OVERLOADED_EVICT_ENABLED", true),
+	}
 }
 
 // hangCounterLedger tracks which {node} series the check has emitted
@@ -125,6 +136,12 @@ const (
 	// D-state ContainerCreating and needs pre-cordon + auto-uncordon.
 	nodeNetworkMountHungCordonAge = 5 * time.Minute
 
+	// node-overloaded-precordon — sustained NodeOverloaded gets a 15-minute
+	// fuse: transient CPU/IO/memory spikes clear on their own, whereas a
+	// worker overloaded for >=15m needs pre-cordon (and guarded stateless
+	// pod shedding) until load subsides and auto-uncordon lifts it.
+	nodeOverloadedCordonAge = 15 * time.Minute
+
 	// nodeHangCondHeartbeatMaxAge is how old a condition's
 	// lastHeartbeatTime may be before the value stops being cordon
 	// evidence: the writer (nodereporter refreshes it every ~2m on
@@ -181,6 +198,10 @@ var nodeDiskPreFailConds = kube.CondTypes(nodecond.DiskPreFailPreCordonNames)
 // nodeNetworkMountHungConds is the hung network filesystem latch on
 // its own 5-minute fuse (nodecond.NetworkMountHungPreCordonNames).
 var nodeNetworkMountHungConds = kube.CondTypes(nodecond.NetworkMountHungPreCordonNames)
+
+// nodeOverloadedConds is the sustained PSI load latch on its own
+// 15-minute fuse (nodecond.NodeOverloadedPreCordonNames).
+var nodeOverloadedConds = kube.CondTypes(nodecond.NodeOverloadedPreCordonNames)
 
 var (
 	// node-hang-precordon — worker nodes patched spec.unschedulable after a
@@ -270,6 +291,16 @@ func nodeHangLatch(n *corev1.Node, now time.Time) (latch, stale string) {
 			}
 		}
 	}
+	for _, t := range nodeOverloadedConds {
+		if c := fused(t, nodeOverloadedCordonAge); c != nil {
+			if kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now) {
+				return string(t), stale
+			}
+			if stale == "" {
+				stale = string(t)
+			}
+		}
+	}
 	return "", stale
 }
 
@@ -301,6 +332,12 @@ func nodeHangLatchActive(n *corev1.Node) bool {
 		}
 	}
 	for _, t := range nodeNetworkMountHungConds {
+		if c := kube.NodeCondition(n, t); c != nil &&
+			c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	for _, t := range nodeOverloadedConds {
 		if c := kube.NodeCondition(n, t); c != nil &&
 			c.Status == corev1.ConditionTrue {
 			return true
@@ -377,10 +414,12 @@ func (p *nodeHangCheck) Run(ctx context.Context) probefw.Result {
 
 	// Write passes (node_hang_writes.go) — lift our own cordons
 	// first so freed capacity counts toward the 35% ratio, clean
-	// stale stamps, then the ratio-capped cordon pass.
+	// stale stamps, then the ratio-capped cordon pass, then guarded
+	// stateless pod shedding on sustained NodeOverloaded workers.
 	cordoned = p.uncordonCleared(ctx, log, uncordon, cordoned, nodes)
 	p.clearStaleStamps(ctx, log, staleStamp, nodes)
 	p.cordonLatched(ctx, log, &rep, nodes, workers, cordoned, now)
+	p.shedOverloadedNodes(ctx, log, nodes, now)
 	// Complete sweep — retire cordon/uncordon series whose node has
 	// now missed two consecutive censuses (the churn guard; see
 	// hangCounterLedger).

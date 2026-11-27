@@ -39,6 +39,7 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"metrics-server-patcher", "system"},
 	{"cf-tunnel-proxy-watchdog", "system"},
 	{"statefulset-ondelete-roller", "system"},
+	{"calico-controllers-patcher", "system"},
 	{"cilium-taint-reaper", "node"},
 	{"descheduler-storm-gate", "node"},
 	{"node-labeler", "node"},
@@ -156,6 +157,7 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"dra-claim-wedge-guard", "health"},
 	{"pod-resize-wedge-guard", "health"},
 	{"ingress-nginx-retirement-guard", "health"},
+	{"workload-connection-skew-guard", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -367,6 +369,7 @@ var goldenMetricFamilies = []string{
 	"node_automation_dra_claim_heals_total",
 	"node_automation_velero_restore_stuck",
 	"node_automation_orphan_scrape_crd_count",
+	"node_automation_workload_connection_skew",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key

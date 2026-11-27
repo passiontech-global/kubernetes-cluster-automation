@@ -1,0 +1,352 @@
+// node_overloaded_shed.go — guarded stateless pod shedding for worker nodes
+// with sustained NodeOverloaded=True (>=15m, fresh heartbeat).
+//
+// Pre-cordoning stops NEW pods from landing on an overloaded worker, but
+// already-scheduled pods keep pinning CPU/memory/IO until load subsides.
+// When NODE_OVERLOADED_EVICT_ENABLED is on (default true) and at least one
+// other Ready, uncordoned, non-overloaded worker exists to absorb rescheduled
+// pods, this pass evicts AT MOST 1 eligible stateless Deployment pod per
+// overloaded node per sweep (with a 10m per-node cooldown) via policy/v1
+// Eviction (respecting PDBs atomically).
+package nodehealth
+
+import (
+	"cmp"
+	"context"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
+)
+
+const (
+	nodeOverloadedShedCooldown    = 10 * time.Minute
+	annoSafeToEvict               = "cluster-autoscaler.kubernetes.io/safe-to-evict"
+	annoNoOverloadEvict           = "passiontech.dev/no-overload-evict"
+	prioritySystemClusterCritical = "system-cluster-critical"
+	prioritySystemNodeCritical    = "system-node-critical"
+	annoMirrorPod                 = "kubernetes.io/config.mirror"
+)
+
+var nodeOverloadedExcludedNamespaces = map[string]bool{
+	"kube-system":      true,
+	"linkerd":          true,
+	"linkerd-viz":      true,
+	"cert-manager":     true,
+	"external-secrets": true,
+	"operators":        true,
+	"node-ops":         true,
+}
+
+func isNodeOverloadedExcludedNamespace(ns string) bool {
+	return nodeOverloadedExcludedNamespaces[ns] || strings.HasPrefix(ns, "cilium")
+}
+
+func nodeSustainedOverloaded(n *corev1.Node, now time.Time) bool {
+	c := kube.NodeCondition(n, corev1.NodeConditionType(nodecond.NodeOverloaded))
+	return c != nil &&
+		c.Status == corev1.ConditionTrue &&
+		!c.LastTransitionTime.IsZero() &&
+		now.Sub(c.LastTransitionTime.Time) >= nodeOverloadedCordonAge &&
+		kube.CondHeartbeatLive(c, nodeHangCondHeartbeatMaxAge, now)
+}
+
+func nodeIsOverloaded(n *corev1.Node) bool {
+	c := kube.NodeCondition(n, corev1.NodeConditionType(nodecond.NodeOverloaded))
+	return c != nil && c.Status == corev1.ConditionTrue
+}
+
+func nodeIsReady(n *corev1.Node) bool {
+	c := kube.NodeCondition(n, corev1.NodeReady)
+	return c != nil && c.Status == corev1.ConditionTrue
+}
+
+func nodeTaintKeys(n *corev1.Node) []string {
+	if len(n.Spec.Taints) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(n.Spec.Taints))
+	for _, t := range n.Spec.Taints {
+		keys = append(keys, t.Key)
+	}
+	return keys
+}
+
+// hasHealthyReceiverWorker reports whether at least one worker other than
+// excludeName is Ready, schedulable (uncordoned), and not NodeOverloaded.
+func hasHealthyReceiverWorker(nodes []corev1.Node, excludeName string) bool {
+	for i := range nodes {
+		w := &nodes[i]
+		if w.Name == excludeName || kube.IsControlPlane(w) {
+			continue
+		}
+		if nodeIsReady(w) && !w.Spec.Unschedulable && !nodeIsOverloaded(w) {
+			return true
+		}
+	}
+	return false
+}
+
+// shedOverloadedNodes evicts at most 1 eligible stateless Deployment pod per
+// sustained-NodeOverloaded worker per sweep (10m per-node cooldown) when the
+// cluster has at least one healthy receiver worker.
+func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger,
+	nodes []corev1.Node, now time.Time) {
+
+	if !p.overloadEvictEnabled {
+		return
+	}
+	p.overloadShedCooldown.PruneExpired(now, nodeOverloadedShedCooldown)
+
+	// Fast path: 0 sustained-overloaded workers pays zero extra API reads.
+	var overloadedNames []string
+	for i := range nodes {
+		n := &nodes[i]
+		if kube.IsControlPlane(n) || !nodeSustainedOverloaded(n, now) {
+			continue
+		}
+		overloadedNames = append(overloadedNames, n.Name)
+	}
+	if len(overloadedNames) == 0 {
+		return
+	}
+	slices.Sort(overloadedNames)
+
+	// Re-read nodes after uncordonCleared/cordonLatched invalidated the census
+	// so the headroom check reflects the live post-cordon unschedulable state.
+	freshNodes, err := p.AllNodes(ctx)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list nodes for overload shedding failed — shedding deferred", "error", err)
+		return
+	}
+
+	// Filter overloaded nodes that still qualify (headroom, no L1/kured hold,
+	// not in 10m cooldown) before paying pod/workload list calls.
+	var activeNodes []*corev1.Node
+	for _, name := range overloadedNames {
+		n := nodeByName(freshNodes, name)
+		if n == nil || !nodeSustainedOverloaded(n, now) {
+			continue
+		}
+		if !n.Spec.Unschedulable {
+			continue
+		}
+		if nodeLocalRemediationActive(ctx, n, now) {
+			log.Info("YIELD: node-host-agent local remediation in flight — overload shed deferred",
+				"node", name)
+			continue
+		}
+		if nodecond.EvaluateCoord(n.Annotations, nodeTaintKeys(n), now).Active {
+			log.Info("DEFER: node under maintenance/kured lock — overload shed deferred",
+				"node", name)
+			continue
+		}
+		if p.overloadShedCooldown.CooledDown(name, nodeOverloadedShedCooldown, now) {
+			continue
+		}
+		if !hasHealthyReceiverWorker(freshNodes, name) {
+			log.Info("skip overload shed: no other Ready uncordoned non-overloaded worker available",
+				"node", name)
+			continue
+		}
+		activeNodes = append(activeNodes, n)
+	}
+	if len(activeNodes) == 0 {
+		return
+	}
+
+	pods, err := p.AllPods(ctx)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list pods for overload shedding failed — shedding deferred", "error", err)
+		return
+	}
+	replicaSets, err := p.AllReplicaSets(ctx)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list replicasets for overload shedding failed — shedding deferred", "error", err)
+		return
+	}
+	deployments, err := p.AllDeployments(ctx)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list deployments for overload shedding failed — shedding deferred", "error", err)
+		return
+	}
+	pdbs, err := p.AllPDBs(ctx)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list pdbs for overload shedding failed — shedding deferred", "error", err)
+		return
+	}
+
+	rsByKey := make(map[string]*metav1.PartialObjectMetadata, len(replicaSets))
+	for i := range replicaSets {
+		rs := &replicaSets[i]
+		rsByKey[rs.Namespace+"/"+rs.Name] = rs
+	}
+	deployByKey := make(map[string]*appsv1.Deployment, len(deployments))
+	for i := range deployments {
+		d := &deployments[i]
+		deployByKey[d.Namespace+"/"+d.Name] = d
+	}
+
+	podsByNode := map[string][]*corev1.Pod{}
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Spec.NodeName == "" {
+			continue
+		}
+		podsByNode[pod.Spec.NodeName] = append(podsByNode[pod.Spec.NodeName], pod)
+	}
+
+	for _, node := range activeNodes {
+		candidates := eligibleOverloadPods(podsByNode[node.Name], rsByKey, deployByKey, pdbs)
+		if len(candidates) == 0 {
+			continue
+		}
+		for _, pod := range candidates {
+			// HealAllowedClusterWideOnly defers on cluster-wide maintenance
+			// (autopilot Plan, unscoped kured lock, unresolvable medik8s CR)
+			// and enforces the global heal budget + 10m per-node cooldown
+			// without deadlocking on the precordon we just placed on this node.
+			proceed, unverifiable := p.HealAllowedClusterWideOnly(ctx, log,
+				&p.overloadShedCooldown, node.Name, nodeOverloadedShedCooldown, now)
+			if unverifiable {
+				metrics.IncError(p.Name)
+				return
+			}
+			if !proceed {
+				break
+			}
+			evicted, refused, notFound, err := heal.EvictPodNotFound(ctx, p.CS,
+				&p.overloadShedCooldown, node.Name, pod, now)
+			switch {
+			case err != nil:
+				metrics.IncError(p.Name)
+				log.Error(err, "overload pod eviction failed",
+					"node", node.Name, "pod", pod.Namespace+"/"+pod.Name)
+				goto nextNode
+			case refused:
+				heal.RefundGrant(now)
+				if notFound {
+					log.V(1).Info("DEFER: overload shed target vanished before eviction",
+						"node", node.Name, "pod", pod.Namespace+"/"+pod.Name)
+				} else {
+					log.Info("DEFER: overload shed eviction refused (PDB/hold/quorum)",
+						"node", node.Name, "pod", pod.Namespace+"/"+pod.Name)
+				}
+				continue
+			case evicted:
+				metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameNodeHang).Inc()
+				log.Info("EVICT: shed stateless Deployment pod from sustained NodeOverloaded worker",
+					"node", node.Name, "pod", pod.Namespace+"/"+pod.Name)
+				goto nextNode
+			}
+		}
+	nextNode:
+	}
+}
+
+func eligibleOverloadPods(
+	nodePods []*corev1.Pod,
+	rsByKey map[string]*metav1.PartialObjectMetadata,
+	deployByKey map[string]*appsv1.Deployment,
+	pdbs []policyv1.PodDisruptionBudget,
+) []*corev1.Pod {
+	var out []*corev1.Pod
+	for _, pod := range nodePods {
+		if !podEligibleForOverloadShed(pod, rsByKey, deployByKey, pdbs) {
+			continue
+		}
+		out = append(out, pod)
+	}
+	slices.SortFunc(out, func(a, b *corev1.Pod) int {
+		if c := cmp.Compare(a.Namespace, b.Namespace); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+	return out
+}
+
+func podEligibleForOverloadShed(
+	pod *corev1.Pod,
+	rsByKey map[string]*metav1.PartialObjectMetadata,
+	deployByKey map[string]*appsv1.Deployment,
+	pdbs []policyv1.PodDisruptionBudget,
+) bool {
+	if !probefw.PodRunningReady(pod) {
+		return false
+	}
+	if isNodeOverloadedExcludedNamespace(pod.Namespace) {
+		return false
+	}
+	if pod.Annotations[annoMirrorPod] != "" {
+		return false
+	}
+	if pod.Spec.PriorityClassName == prioritySystemClusterCritical ||
+		pod.Spec.PriorityClassName == prioritySystemNodeCritical {
+		return false
+	}
+	if pod.Annotations[annoSafeToEvict] == "false" ||
+		pod.Annotations[annoNoOverloadEvict] == "true" {
+		return false
+	}
+	for _, vol := range pod.Spec.Volumes {
+		if vol.PersistentVolumeClaim != nil {
+			return false
+		}
+	}
+	// ONLY Deployment-owned Ready pods: ReplicaSet -> Deployment with readyReplicas >= 2.
+	podCtrl := metav1.GetControllerOf(pod)
+	if podCtrl == nil || podCtrl.Kind != "ReplicaSet" {
+		return false
+	}
+	rs := rsByKey[pod.Namespace+"/"+podCtrl.Name]
+	if rs == nil {
+		return false
+	}
+	rsCtrl := metav1.GetControllerOf(rs)
+	if rsCtrl == nil || rsCtrl.Kind != "Deployment" {
+		return false
+	}
+	dep := deployByKey[pod.Namespace+"/"+rsCtrl.Name]
+	if dep == nil || dep.Status.ReadyReplicas < 2 {
+		return false
+	}
+	return overloadPDBAllows(pdbs, pod)
+}
+
+func overloadPDBAllows(pdbs []policyv1.PodDisruptionBudget, pod *corev1.Pod) bool {
+	for i := range pdbs {
+		pdb := &pdbs[i]
+		if pdb.Namespace != pod.Namespace {
+			continue
+		}
+		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			sel = labels.Everything() // unparseable selector -> fail closed
+		}
+		if !sel.Matches(labels.Set(pod.Labels)) {
+			continue
+		}
+		if pdb.Status.DisruptionsAllowed < 1 {
+			return false
+		}
+	}
+	return true
+}

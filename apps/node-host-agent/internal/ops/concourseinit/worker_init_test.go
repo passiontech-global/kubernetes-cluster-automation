@@ -241,6 +241,7 @@ func TestWorkerInitInstallsRunc(t *testing.T) {
 func TestWorkerInitBtrfsCleanup(t *testing.T) {
 	var deleted []string
 	cfg := testConfig(t, func(c *Config) {
+		c.isBtrfs = func(string) bool { return true }
 		c.listSubvols = func(context.Context, string) ([]string, error) {
 			return []string{"volumes/sub-a", "sub-b"}, nil
 		}
@@ -260,6 +261,30 @@ func TestWorkerInitBtrfsCleanup(t *testing.T) {
 	}
 	if !slices.Equal(deleted, want) {
 		t.Fatalf("deleted %v, want %v", deleted, want)
+	}
+}
+
+// Non-btrfs work dir (e.g. ext4 / openebs-hostpath): WorkerInit gates
+// btrfs cleanup behind statfs(BTRFS_SUPER_MAGIC) and never invokes
+// listSubvols.
+func TestWorkerInitSkipsBtrfsOnNonBtrfsFS(t *testing.T) {
+	listCalled := false
+	cfg := testConfig(t, func(c *Config) {
+		c.listSubvols = func(context.Context, string) ([]string, error) {
+			listCalled = true
+			return []string{"volumes/should-not-run"}, nil
+		}
+	})
+	seedWorkDir(t, cfg.WorkDir)
+	if isBtrfsFS(cfg.WorkDir) {
+		t.Skip("tempdir resides on btrfs; skipping non-btrfs statfs assertion")
+	}
+
+	if err := WorkerInit(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if listCalled {
+		t.Fatal("listSubvols was invoked on a non-btrfs filesystem")
 	}
 }
 
@@ -427,7 +452,7 @@ func TestApplyDefaults(t *testing.T) {
 	if c.Mode != cachePerm {
 		t.Fatalf("mode default = %o want %o", c.Mode, cachePerm)
 	}
-	if c.listSubvols == nil || c.deleteSubvol == nil || c.chown == nil {
+	if c.isBtrfs == nil || c.listSubvols == nil || c.deleteSubvol == nil || c.chown == nil {
 		t.Fatal("seams not defaulted")
 	}
 	c = Config{OwnerUID: -1}
@@ -452,6 +477,7 @@ func TestWorkerInitUnsafeWorkDir(t *testing.T) {
 // any wipe or scaffold work runs.
 func TestWorkerInitBtrfsLoopCtxCancel(t *testing.T) {
 	cfg := testConfig(t, func(c *Config) {
+		c.isBtrfs = func(string) bool { return true }
 		c.listSubvols = func(context.Context, string) ([]string, error) {
 			return []string{"v1", "v2"}, nil
 		}

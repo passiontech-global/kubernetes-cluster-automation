@@ -21,6 +21,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/concourse"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
@@ -51,6 +53,7 @@ type Config struct {
 	Mode          os.FileMode // default 0o777
 
 	// Test seams — nil selects the production implementation.
+	isBtrfs      func(dir string) bool
 	listSubvols  func(ctx context.Context, dir string) ([]string, error)
 	deleteSubvol func(ctx context.Context, path string) error
 	chown        func(name string, fd int, uid, gid int) error
@@ -78,6 +81,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Mode == 0 {
 		c.Mode = cachePerm
+	}
+	if c.isBtrfs == nil {
+		c.isBtrfs = isBtrfsFS
 	}
 	if c.listSubvols == nil {
 		c.listSubvols = btrfsListSubvols
@@ -138,15 +144,19 @@ func WorkerInit(ctx context.Context, cfg Config) error {
 	// tree below.
 
 	// btrfs subvolume cleanup — inherited from the chart's built-in
-	// init-rm. Fail-open: `btrfs subvolume list || true` yields an
-	// empty list on non-btrfs filesystems, and each delete is best-
-	// effort (`show && delete --recursive || true`).
-	vols, _ := cfg.listSubvols(ctx, cfg.WorkDir)
-	for _, v := range vols {
-		if err := ctx.Err(); err != nil {
-			return err
+	// init-rm. Gate on statfs(BTRFS_SUPER_MAGIC) so ext4 / openebs-hostpath
+	// work dirs never invoke `btrfs` or print "ERROR: not a btrfs
+	// filesystem" to stderr. Still fail-open on btrfs: `btrfs subvolume
+	// list || true` yields an empty list on error, and each delete is
+	// best-effort (`show && delete --recursive || true`).
+	if cfg.isBtrfs(cfg.WorkDir) {
+		vols, _ := cfg.listSubvols(ctx, cfg.WorkDir)
+		for _, v := range vols {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			_ = cfg.deleteSubvol(ctx, filepath.Join(cfg.WorkDir, v))
 		}
-		_ = cfg.deleteSubvol(ctx, filepath.Join(cfg.WorkDir, v))
 	}
 
 	// Soft-reset: rm -rf every top-level entry EXCEPT shared-cache
@@ -280,6 +290,17 @@ func wipeExcept(ctx context.Context, dir string, keep map[string]bool) error {
 		}
 	}
 	return nil
+}
+
+// isBtrfsFS reports whether dir resides on a btrfs filesystem.
+// Non-btrfs filesystems (e.g. ext4 on openebs-hostpath) and missing
+// paths return false so WorkerInit skips invoking `btrfs`.
+func isBtrfsFS(dir string) bool {
+	var st unix.Statfs_t
+	if err := unix.Statfs(dir, &st); err != nil {
+		return false
+	}
+	return uint64(st.Type) == uint64(unix.BTRFS_SUPER_MAGIC)
 }
 
 // btrfsListSubvols is `btrfs subvolume list --sort=-ogen <dir> |

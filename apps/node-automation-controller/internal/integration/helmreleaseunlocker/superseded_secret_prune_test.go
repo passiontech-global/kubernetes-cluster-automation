@@ -122,3 +122,47 @@ func TestHelmReleaseUnlockerPrunerKeepsHighestAndCap(t *testing.T) {
 		}
 	}
 }
+
+// Large (>=512 KiB serialized JSON, incl. 420 KiB raw after base64) superseded
+// secrets tighten down to 0 when a deployed revision exists, and stale failed
+// revisions strictly older than deployed are pruned too.
+func TestHelmReleaseUnlockerPrunesLargeSupersededAndOldFailed(t *testing.T) {
+	raw420KiB := make([]byte, 420*1024)
+	mkBig := func(rel string, v int, status string) *corev1.Secret {
+		s := helmRelSecret("apps", "sh.helm.release.v1."+rel+".v"+strconv.Itoa(v), rel, v, status)
+		s.Data = map[string][]byte{"release": raw420KiB}
+		return s
+	}
+
+	cs := kfake.NewSimpleClientset(
+		mkBig("big", 1, "failed"),
+		mkBig("big", 2, "superseded"),
+		mkBig("big", 3, "superseded"),
+		mkBig("big", 4, "deployed"),
+		mkBig("big", 5, "failed"),
+		// Failed initial install (no deployed revision): must survive.
+		helmRelSecret("apps", "sh.helm.release.v1.initfail.v1", "initfail", 1, "failed"),
+	)
+	u := newUnlocker(cs, newDynFake(), 0, "")
+	if err := u.pruneSupersededSecrets(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, pruned := range []string{
+		"sh.helm.release.v1.big.v1",
+		"sh.helm.release.v1.big.v2",
+		"sh.helm.release.v1.big.v3",
+	} {
+		if secretExists(t, cs, "apps", pruned) {
+			t.Fatalf("%s must be pruned", pruned)
+		}
+	}
+	for _, keep := range []string{
+		"sh.helm.release.v1.big.v4",
+		"sh.helm.release.v1.big.v5",
+		"sh.helm.release.v1.initfail.v1",
+	} {
+		if !secretExists(t, cs, "apps", keep) {
+			t.Fatalf("%s must survive", keep)
+		}
+	}
+}

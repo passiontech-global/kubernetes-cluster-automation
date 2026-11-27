@@ -236,15 +236,16 @@ func TestSprawlGCPrunesSupersededHelmSecrets(t *testing.T) {
 	}
 }
 
-// Large Helm release secrets (>512 KiB) tighten the superseded keep cap from
-// 10 down to 2 (preserving deployed + 2 newest superseded rollback points),
-// while small releases (<=512 KiB) keep the standard cap of 10.
-func TestSprawlGCPrunesLargeHelmSecretsToTwoAndKeepsSmallAtTen(t *testing.T) {
+// Large Helm release secrets (>=512 KiB serialized JSON) tighten the
+// superseded keep cap from 10 down to 0 when a live deployed revision
+// exists (preserving deployed untouched and clearing KineLargeObjectDetected),
+// while small releases (<512 KiB JSON) keep the standard cap of 10.
+func TestSprawlGCPrunesLargeHelmSecretsToZeroAndKeepsSmallAtTen(t *testing.T) {
 	largeBlob := make([]byte, kineLargeObjectThreshold+1024)
 	smallBlob := []byte("small-chart-payload")
 
 	var objs []runtime.Object
-	// Large release ("external-secrets"): 6 superseded + 1 deployed -> keep 2 superseded.
+	// Large release ("external-secrets"): 6 superseded + 1 deployed -> keep 0 superseded.
 	for v := 1; v <= 6; v++ {
 		s := helmSecret("external-secrets", "external-secrets", v, "superseded")
 		s.Data = map[string][]byte{"release": largeBlob}
@@ -266,6 +267,7 @@ func TestSprawlGCPrunesLargeHelmSecretsToTwoAndKeepsSmallAtTen(t *testing.T) {
 
 	testutil.CleanupMetric(t, helmSecretsExcessGauge, "external-secrets", "external-secrets")
 	testutil.CleanupMetric(t, helmSecretsExcessGauge, "apps", "small-app")
+	testutil.CleanupMetric(t, kineLargeObjectBytesGauge, "secret", "external-secrets", "sh.helm.release.v1.external-secrets.v7")
 
 	cs := fake.NewSimpleClientset(objs...)
 	p := testProberDyn(cs, sprawlDyn())
@@ -274,7 +276,7 @@ func TestSprawlGCPrunesLargeHelmSecretsToTwoAndKeepsSmallAtTen(t *testing.T) {
 		t.Fatalf("excess superseded secrets must fail: %+v", res)
 	}
 
-	// Verify large release kept exactly 2 superseded (v5, v6) + deployed (v7).
+	// Verify large release pruned all 6 superseded (v1..v6) and kept deployed (v7).
 	largeList, err := cs.CoreV1().Secrets("external-secrets").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list external-secrets: %v", err)
@@ -288,22 +290,19 @@ func TestSprawlGCPrunesLargeHelmSecretsToTwoAndKeepsSmallAtTen(t *testing.T) {
 	if largeSuperseded != sprawlLargeMaxSuperseded {
 		t.Fatalf("large release superseded count = %d, want %d", largeSuperseded, sprawlLargeMaxSuperseded)
 	}
-	for _, mustKeep := range []string{
-		"sh.helm.release.v1.external-secrets.v5",
-		"sh.helm.release.v1.external-secrets.v6",
-		"sh.helm.release.v1.external-secrets.v7",
-	} {
-		if _, err := cs.CoreV1().Secrets("external-secrets").Get(ctx, mustKeep, metav1.GetOptions{}); err != nil {
-			t.Fatalf("large release secret %s must survive: %v", mustKeep, err)
+	if _, err := cs.CoreV1().Secrets("external-secrets").Get(ctx,
+		"sh.helm.release.v1.external-secrets.v7", metav1.GetOptions{}); err != nil {
+		t.Fatalf("large release deployed v7 must survive: %v", err)
+	}
+	for v := 1; v <= 6; v++ {
+		name := fmt.Sprintf("sh.helm.release.v1.external-secrets.v%d", v)
+		if _, err := cs.CoreV1().Secrets("external-secrets").Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("large release %s should be pruned, err=%v", name, err)
 		}
 	}
-	if _, err := cs.CoreV1().Secrets("external-secrets").Get(ctx,
-		"sh.helm.release.v1.external-secrets.v4", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("large release v4 should be pruned, err=%v", err)
-	}
 	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_helm_release_secrets_excess",
-		map[string]string{"namespace": "external-secrets", "release": "external-secrets"}); !ok || v != 4 {
-		t.Fatalf("large release excess gauge = %v,%v want 4,true", v, ok)
+		map[string]string{"namespace": "external-secrets", "release": "external-secrets"}); !ok || v != 6 {
+		t.Fatalf("large release excess gauge = %v,%v want 6,true", v, ok)
 	}
 
 	// Verify small release kept 10 superseded (v3..v12) + deployed (v13).
@@ -323,6 +322,76 @@ func TestSprawlGCPrunesLargeHelmSecretsToTwoAndKeepsSmallAtTen(t *testing.T) {
 	if _, err := cs.CoreV1().Secrets("apps").Get(ctx,
 		"sh.helm.release.v1.small-app.v13", metav1.GetOptions{}); err != nil {
 		t.Fatalf("small release deployed v13 must survive: %v", err)
+	}
+}
+
+// Sprawl GC prunes stale status=failed Helm secrets strictly older than
+// highestDeployed, preserves failed secrets when no deployed revision exists
+// (highestDeployed < 0) or when v >= highestDeployed, and measures serialized
+// base64 JSON size (420 KiB raw -> ~560 KiB JSON > 512 KiB guard).
+func TestSprawlGCHelmFailedAndBase64JSONSizePrune(t *testing.T) {
+	// 420 KiB raw payload: below 512 KiB raw, but ~560 KiB once base64-encoded
+	// into Kubernetes Secret JSON — must trigger large-secret pruning to 0.
+	raw420KiB := make([]byte, 420*1024)
+	smallBlob := []byte("small-payload")
+
+	// Release "b64-rel": v1 failed (420 KiB), v2 superseded (420 KiB),
+	// v3 deployed (small — shrunk on upgrade), v4 failed (small, newer than deployed).
+	// -> v1 (old failed < 3) and v2 (large superseded < 3) must be pruned before
+	//    auditKineLargeObjects runs, so neither fires kineLargeObjectBytesGauge!
+	// -> v3 (deployed) and v4 (failed >= 3) must survive.
+	b64v1 := helmSecret("apps", "b64-rel", 1, "failed")
+	b64v1.Data = map[string][]byte{"release": raw420KiB}
+	b64v2 := helmSecret("apps", "b64-rel", 2, "superseded")
+	b64v2.Data = map[string][]byte{"release": raw420KiB}
+	b64v3 := helmSecret("apps", "b64-rel", 3, "deployed")
+	b64v3.Data = map[string][]byte{"release": smallBlob}
+	b64v4 := helmSecret("apps", "b64-rel", 4, "failed")
+	b64v4.Data = map[string][]byte{"release": smallBlob}
+
+	// Release "init-fail" (highestDeployed < 0): v1 failed, v2 failed.
+	// -> Must NEVER be deleted (preserved for debugging failed initial installs).
+	initFail1 := helmSecret("apps", "init-fail", 1, "failed")
+	initFail1.Data = map[string][]byte{"release": smallBlob}
+	initFail2 := helmSecret("apps", "init-fail", 2, "failed")
+	initFail2.Data = map[string][]byte{"release": smallBlob}
+
+	testutil.CleanupMetric(t, helmSecretsExcessGauge, "apps", "b64-rel")
+	testutil.CleanupMetric(t, kineLargeObjectBytesGauge, "secret", "apps", b64v1.Name)
+	testutil.CleanupMetric(t, kineLargeObjectBytesGauge, "secret", "apps", b64v2.Name)
+
+	cs := fake.NewSimpleClientset(b64v1, b64v2, b64v3, b64v4, initFail1, initFail2)
+	p := testProberDyn(cs, sprawlDyn())
+	chk := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p)
+
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if res.Pass {
+		t.Fatalf("first sweep with large superseded excess must fail: %+v", res)
+	}
+
+	// v1 (failed < 3) and v2 (420 KiB raw / >512 KiB JSON superseded < 3) are gone.
+	for _, pruned := range []string{b64v1.Name, b64v2.Name} {
+		if _, err := cs.CoreV1().Secrets("apps").Get(ctx, pruned, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("%s should be pruned, err=%v", pruned, err)
+		}
+		if _, ok := testutil.GaugeSeriesValue(t, "node_automation_kine_large_object_bytes",
+			map[string]string{"kind": "secret", "namespace": "apps", "name": pruned}); ok {
+			t.Fatalf("pruned secret %s must not linger in kineLargeObjectBytesGauge", pruned)
+		}
+	}
+
+	// Deployed v3, newer failed v4, and failed-initial-install secrets survive.
+	for _, keep := range []string{b64v3.Name, b64v4.Name, initFail1.Name, initFail2.Name} {
+		if _, err := cs.CoreV1().Secrets("apps").Get(ctx, keep, metav1.GetOptions{}); err != nil {
+			t.Fatalf("%s must survive: %v", keep, err)
+		}
+	}
+
+	// Second sweep: all oversized superseded/failed revisions are gone -> passes cleanly.
+	chk.kineCycle = 0
+	res2 := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if !res2.Pass {
+		t.Fatalf("second sweep after auto-GC must pass: %+v", res2)
 	}
 }
 

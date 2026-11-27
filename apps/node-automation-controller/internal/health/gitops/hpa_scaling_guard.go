@@ -131,10 +131,10 @@ func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 			return err
 		}
 		var reasons []string
-		if c, ok := kube.ConditionOf(hpa.Object, "AbleToScale"); ok && c.Status == "False" {
+		if c, ok := kube.ConditionOf(hpa.Object, "AbleToScale"); ok && c.Status == "False" && !isScaleToZeroIdleHPA(hpa, c) {
 			reasons = append(reasons, "able_to_scale_false")
 		}
-		if c, ok := kube.ConditionOf(hpa.Object, "ScalingActive"); ok && c.Status == "False" {
+		if c, ok := kube.ConditionOf(hpa.Object, "ScalingActive"); ok && c.Status == "False" && !isScaleToZeroIdleHPA(hpa, c) {
 			reasons = append(reasons, "scaling_active_false")
 		}
 		if len(reasons) == 0 {
@@ -187,6 +187,39 @@ func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 		fmt.Sprintf("hpas scaling-unhealthy >=%s: ", hpaUnhealthyMinAge), ", ")
 }
 
+// isKEDAManagedHPA reports whether hpa is owned or managed by KEDA.
+// KEDA intentionally scales idle targets to 0, causing Kubernetes HPA to
+// report Reason=ScalingDisabled; genuine KEDA failures are owned by
+// keda-scaledobject-guard.
+func isKEDAManagedHPA(hpa *unstructured.Unstructured) bool {
+	for _, ref := range hpa.GetOwnerReferences() {
+		if ref.Kind == "ScaledObject" || strings.HasPrefix(ref.APIVersion, "keda.sh/") {
+			return true
+		}
+	}
+	labels := hpa.GetLabels()
+	if labels["app.kubernetes.io/managed-by"] == "keda-operator" ||
+		labels["scaledobject.keda.sh/name"] != "" {
+		return true
+	}
+	return strings.HasPrefix(hpa.GetName(), "keda-hpa-")
+}
+
+// isScaleToZeroIdleHPA reports whether a False HPA condition reflects an
+// intentional scale-to-zero idle state (Reason=ScalingDisabled on an HPA
+// with spec.minReplicas==0 or managed by KEDA) rather than a wedged scaler.
+// Non-KEDA HPAs with minReplicas>=1 still flag and qualify for cold-start
+// rescue.
+func isScaleToZeroIdleHPA(hpa *unstructured.Unstructured, c kube.Condition) bool {
+	if c.Reason != "ScalingDisabled" {
+		return false
+	}
+	if minRep, found := kube.NestedInt64(hpa.Object, "spec", "minReplicas"); found && minRep == 0 {
+		return true
+	}
+	return isKEDAManagedHPA(hpa)
+}
+
 // rescueZeroTarget lifts a scale target wedged at spec.replicas==0
 // back to max(hpa.spec.minReplicas, 1) — the HPA-side cold-start
 // deadlock twin of the KEDA rescue. Deployment/StatefulSet targets
@@ -197,6 +230,15 @@ func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 // per sweep).
 func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 	log logr.Logger, hpa *unstructured.Unstructured, now time.Time) bool {
+
+	// Never wake up idle KEDA workloads or intentionally scale-to-zero HPAs;
+	// keda-scaledobject-guard owns genuine KEDA errors and recovery.
+	if isKEDAManagedHPA(hpa) {
+		return false
+	}
+	if minRep, found := kube.NestedInt64(hpa.Object, "spec", "minReplicas"); found && minRep == 0 {
+		return false
+	}
 
 	ns := hpa.GetNamespace()
 	target, ok := kube.NestedString(hpa.Object, "spec", "scaleTargetRef", "name")

@@ -42,6 +42,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node/partitionevictor"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/node/pdbdeadlockwatchdog"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/calicocontrollerspatcher"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/cftunnelproxywatchdog"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/corednspatcher"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/system/corednswatchdog"
@@ -122,6 +123,7 @@ var moduleRows = []shared.Module{
 	{Name: "metrics-server-patcher", Group: groupSystem, GateEnv: "METRICS_SERVER_PATCHER_ENABLED", DefaultOn: true, Setup: metricsserverpatcher.Setup},
 	{Name: "cf-tunnel-proxy-watchdog", Group: groupSystem, GateEnv: "CF_TUNNEL_WATCHDOG_ENABLED", DefaultOn: true, Setup: cftunnelproxywatchdog.Setup},
 	{Name: "statefulset-ondelete-roller", Group: groupSystem, GateEnv: "STATEFULSET_ONDELETE_ROLLER_ENABLED", DefaultOn: true, Setup: statefulsetroller.Setup},
+	{Name: "calico-controllers-patcher", Group: groupSystem, GateEnv: "CALICO_CONTROLLERS_PATCHER_ENABLED", DefaultOn: true, Setup: calicocontrollerspatcher.Setup},
 
 	// Node lifecycle and health sweeps.
 	{Name: "cilium-taint-reaper", Group: groupNode, GateEnv: "CILIUM_TAINT_REAPER_ENABLED", Setup: ciliumtaintreaper.Setup},
