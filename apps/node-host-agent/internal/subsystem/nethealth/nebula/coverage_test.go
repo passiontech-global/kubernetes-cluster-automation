@@ -138,6 +138,7 @@ func TestDirectTCPAndHasRule(t *testing.T) {
 	env.deps.Rules = func(int) ([]netlink.Rule, error) {
 		return []netlink.Rule{
 			{Priority: 1499, Dport: &netlink.RulePortRange{Start: 443, End: 443}},
+			{Priority: 1499, Sport: &netlink.RulePortRange{Start: 443, End: 443}},
 		}, nil
 	}
 	ipCalls := 0
@@ -149,16 +150,16 @@ func TestDirectTCPAndHasRule(t *testing.T) {
 		return "", nil
 	}
 	env.deps.CheckNebulaDirectTCP(context.Background())
-	if ipCalls != 1 {
-		t.Fatalf("expected 1 IP add call for port 6443, got %d", ipCalls)
+	if ipCalls != 2 {
+		t.Fatalf("expected 2 IP add calls for port 6443 (dport+sport), got %d", ipCalls)
 	}
 	// Second run with IP succeeding.
 	env.deps.CheckNebulaDirectTCP(context.Background())
-	if ipCalls != 2 {
-		t.Fatalf("expected 2 IP add calls total, got %d", ipCalls)
+	if ipCalls != 4 {
+		t.Fatalf("expected 4 IP add calls total, got %d", ipCalls)
 	}
 
-	if hasDirectTCPRule([]netlink.Rule{{Priority: 1499, Dport: &netlink.RulePortRange{Start: 100, End: 200}}}, 100) {
+	if hasDirectTCPRule([]netlink.Rule{{Priority: 1499, Dport: &netlink.RulePortRange{Start: 100, End: 200}}}, 100, directTCPDirections[0].getPort) {
 		t.Fatal("range rule should not match single-port check")
 	}
 }

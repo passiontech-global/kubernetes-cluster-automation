@@ -179,12 +179,14 @@ func (c *cyc) nebulaRouting() {
 				mb, mark)
 		}
 		// pref-1499 Direct-Underlay TCP bypass: management/CP TCP
-		// dports must never be sucked into the tunnel — rule them
-		// into the main table (nethealth re-adds lost ones).
+		// dport+sport must never be asymmetric-routed into the tunnel
+		// — rule them into the main table (nethealth re-adds lost ones).
 		for _, p := range c.nebulaDirectTCPPorts() {
-			fmt.Fprintf(&rs,
-				`ip rule list pref 1499 | grep -q "ipproto tcp dport %s " || ip rule add pref 1499 ipproto tcp dport %s lookup main`+"\n",
-				p, p)
+			for _, dir := range []string{"dport", "sport"} {
+				fmt.Fprintf(&rs,
+					`ip rule list pref 1499 | grep -q "ipproto tcp %s %s " || ip rule add pref 1499 ipproto tcp %s %s lookup main`+"\n",
+					dir, p, dir, p)
+			}
 		}
 		// flush foreign dev tables (stale nebula-era tables).
 		fmt.Fprintf(&rs,
@@ -193,8 +195,10 @@ func (c *cyc) nebulaRouting() {
 	} else {
 		// overlay=tinc: pref-1499 bypass rules go too.
 		for _, p := range c.nebulaDirectTCPPorts() {
-			fmt.Fprintf(&rs,
-				`ip rule del pref 1499 ipproto tcp dport %s lookup main 2>/dev/null || true`+"\n", p)
+			for _, dir := range []string{"dport", "sport"} {
+				fmt.Fprintf(&rs,
+					`ip rule del pref 1499 ipproto tcp %s %s lookup main 2>/dev/null || true`+"\n", dir, p)
+			}
 		}
 		// overlay=tinc rollback: drop nebula-owned rules.
 		fmt.Fprintf(&rs,

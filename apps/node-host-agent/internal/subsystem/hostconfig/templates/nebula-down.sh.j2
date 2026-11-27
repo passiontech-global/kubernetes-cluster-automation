@@ -12,7 +12,9 @@ ip rule list pref 1500 | sed -n 's/.*to \([0-9./]*\).*/\1/p' | while read -r d; 
 done
 ip rule del pref 1490 to {{ interdc_marker_base }}.0/24 lookup {{ interdc_nebula_table_marker }} 2>/dev/null
 for p in {{ nebula_direct_tcp_ports | default([22, 6443, 8132, 9443, 39901]) | join(' ') }}; do
-  ip rule del pref 1499 ipproto tcp dport $p lookup main 2>/dev/null
+  for dir in dport sport; do
+    ip rule del pref 1499 ipproto tcp $dir $p lookup main 2>/dev/null
+  done
 done
 for p in dport sport; do
   iptables -w 5 -t mangle -D OUTPUT -p udp --$p {{ interdc_nebula_port }} -j MARK --set-mark 0x1000 2>/dev/null

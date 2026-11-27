@@ -923,7 +923,8 @@ func TestNebulaRoutingTincRollback(t *testing.T) {
 	}
 	c := loadCyc(t, r, vars, "node-b")
 	c.nebulaRouting()
-	if len(sr.CallsMatching("ip rule del pref 1499 ipproto tcp dport")) == 0 {
+	if len(sr.CallsMatching("ip rule del pref 1499 ipproto tcp dport")) == 0 ||
+		len(sr.CallsMatching("ip rule del pref 1499 ipproto tcp sport")) == 0 {
 		t.Fatal("tinc rollback kept the pref-1499 direct-underlay bypass")
 	}
 	if len(sr.CallsMatching("ip rule add pref 1500")) > 0 {

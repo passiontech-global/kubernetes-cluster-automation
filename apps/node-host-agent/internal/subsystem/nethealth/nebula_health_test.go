@@ -421,14 +421,15 @@ func TestDirectTCPSkipsInvalidPorts(t *testing.T) {
 	e := directTCPEnv(t)
 	e.n.cfg.NebulaDirectTCPPorts = []int{0, -22, 70000, 22}
 	e.n.checkNebulaDirectTCP(context.Background())
-	if !e.host.Ran("rule add pref 1499 ipproto tcp dport 22 lookup main") {
+	if !e.host.Ran("rule add pref 1499 ipproto tcp dport 22 lookup main") ||
+		!e.host.Ran("rule add pref 1499 ipproto tcp sport 22 lookup main") {
 		t.Fatalf("in-range port not enforced: %v", e.host.Cmds())
 	}
 	for _, c := range e.host.Cmds() {
 		joined := strings.Join(c, " ")
-		if strings.Contains(joined, "dport 0") ||
-			strings.Contains(joined, "dport 70000") ||
-			strings.Contains(joined, "dport -22") {
+		if strings.Contains(joined, "port 0") ||
+			strings.Contains(joined, "port 70000") ||
+			strings.Contains(joined, "port -22") {
 			t.Fatalf("invalid port reached ip: %v", c)
 		}
 	}
@@ -439,18 +440,19 @@ func TestDirectTCPSkipsInvalidPorts(t *testing.T) {
 func TestDirectTCPSkipsPresentRules(t *testing.T) {
 	e := directTCPEnv(t)
 	e.n.cfg.rulesFn = func(int) ([]netlink.Rule, error) {
-		return []netlink.Rule{{
-			Priority: 1499,
-			Dport:    &netlink.RulePortRange{Start: 22, End: 22},
-		}}, nil
+		return []netlink.Rule{
+			{Priority: 1499, Dport: &netlink.RulePortRange{Start: 22, End: 22}},
+			{Priority: 1499, Sport: &netlink.RulePortRange{Start: 22, End: 22}},
+		}, nil
 	}
 	e.n.cfg.NebulaDirectTCPPorts = []int{22, 6443}
 	e.n.checkNebulaDirectTCP(context.Background())
-	if e.host.Ran("dport 22") {
-		t.Fatal("already-present dport 22 rule re-added")
+	if e.host.Ran("dport 22") || e.host.Ran("sport 22") {
+		t.Fatal("already-present dport/sport 22 rule re-added")
 	}
-	if !e.host.Ran("rule add pref 1499 ipproto tcp dport 6443 lookup main") {
-		t.Fatalf("missing dport 6443 rule not added: %v", e.host.Cmds())
+	if !e.host.Ran("rule add pref 1499 ipproto tcp dport 6443 lookup main") ||
+		!e.host.Ran("rule add pref 1499 ipproto tcp sport 6443 lookup main") {
+		t.Fatalf("missing dport/sport 6443 rule not added: %v", e.host.Cmds())
 	}
 }
 
@@ -461,14 +463,15 @@ func TestDirectTCPAddFailureLogged(t *testing.T) {
 	e.host.FailOn("rule add pref 1499", errCmdFail)
 	e.n.cfg.NebulaDirectTCPPorts = []int{22, 6443}
 	e.n.checkNebulaDirectTCP(context.Background())
-	if got := strings.Count(e.host.Joined(), "rule add pref 1499"); got != 2 {
-		t.Fatalf("rule add attempts=%d want 2 (per port)", got)
+	if got := strings.Count(e.host.Joined(), "rule add pref 1499"); got != 4 {
+		t.Fatalf("rule add attempts=%d want 4 (dport+sport per port)", got)
 	}
 	if got := promtest.ToFloat64(e.n.cycles.WithLabelValues(
-		checkNebTCP, "restore_error")); got != 2 {
-		t.Fatalf("restore_error metric=%v want 2", got)
+		checkNebTCP, "restore_error")); got != 4 {
+		t.Fatalf("restore_error metric=%v want 4", got)
 	}
-	if !strings.Contains(logLines(t, e), "dport 22 failed") {
+	if !strings.Contains(logLines(t, e), "dport 22 failed") ||
+		!strings.Contains(logLines(t, e), "sport 22 failed") {
 		t.Fatalf("missing add-failure log:\n%s", logLines(t, e))
 	}
 }
