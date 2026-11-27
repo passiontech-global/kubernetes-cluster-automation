@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +23,12 @@ const (
 	// checkClockSync's own 30m because the broken handshake is the
 	// live outage; the latch just explains it.
 	nebulaNTPRestartInterval = 10 * time.Minute
+	// nebulaMinTxQueueLen is the minimum TUN txqueuelen enforced live
+	// on neb1 (incident 2026-11-27 production: default 500 overflowed
+	// under Cilium Geneve GSO bursts at 40-240 pkt/s; raising hitless
+	// to 4096 dropped TX drops immediately to 0).
+	nebulaMinTxQueueLen       = 4096
+	nebulaTxQueueHealCooldown = 10 * time.Minute
 )
 
 // udpSocketBound parses /proc/net/udp[6] for a socket bound to port —
@@ -134,6 +142,12 @@ func (n *Deps) CheckNebulaHealth(ctx context.Context) {
 		}
 	}
 
+	// Hitless live txqueuelen floor on neb1 (prevents Geneve GSO burst drops
+	// even before a nebula@interdc config reload/restart).
+	if reason == "" && wd.NebulaDev != "" {
+		n.ensureNebulaTxQueueLen(ctx, wd.NebulaDev)
+	}
+
 	// Dataplane probes — ONLY while nebula is the active overlay.
 	if reason == "" && wd.OverlayActive == "nebula" &&
 		(len(wd.OverlayProbeTargets)+len(wd.OverlayProbeMarkers)) > 0 {
@@ -201,6 +215,47 @@ func (n *Deps) CheckNebulaHealth(ctx context.Context) {
 			checkkit.Progress(*fails, n.ConsecNeeded()))
 	}
 	n.Cycles.WithLabelValues(checkNebula, "ok").Inc()
+}
+
+// ensureNebulaTxQueueLen checks <hostRoot>/sys/class/net/<dev>/tx_queue_len
+// and raises it hitlessly to nebulaMinTxQueueLen when below the floor.
+// Missing sysfs files (e.g. unit tests or unmounted host sysfs) are no-ops.
+func (n *Deps) ensureNebulaTxQueueLen(ctx context.Context, dev string) {
+	if n.IP == nil {
+		return
+	}
+	root := "/"
+	if n.HostRoot != nil {
+		if r := n.HostRoot(); r != "" {
+			root = r
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "sys", "class", "net", dev, "tx_queue_len"))
+	if err != nil {
+		return
+	}
+	cur, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || cur <= 0 || cur >= nebulaMinTxQueueLen {
+		return
+	}
+	if n.holdEmergencyHeal(ctx) {
+		return
+	}
+	if !n.State.RateOK("last-nebula-txqueue", nebulaTxQueueHealCooldown) {
+		return
+	}
+	if out, err := n.IP(ctx, "link", "set", "dev", dev, "txqueuelen",
+		strconv.Itoa(nebulaMinTxQueueLen)); err != nil {
+		n.State.SuspectLog("nebula-txqueue",
+			fmt.Sprintf("suspect: nebula txqueuelen raise failed dev=%s %d->%d: %v (%s)",
+				dev, cur, nebulaMinTxQueueLen, err, n.TrimRunErr(out)),
+			suspectLogCadence)
+		return
+	}
+	n.State.RateSpend("last-nebula-txqueue")
+	n.Actions.WithLabelValues(checkNebula, "txqueuelen").Inc()
+	n.State.AppendLog(fmt.Sprintf("ACTION: nebula txqueuelen raised dev=%s %d->%d",
+		dev, cur, nebulaMinTxQueueLen))
 }
 
 // RestartTimesyncdOnClockLatch — nebula-conntrack-flush: when the Nebula check is

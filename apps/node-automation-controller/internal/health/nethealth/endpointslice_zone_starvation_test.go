@@ -282,3 +282,44 @@ func TestEndpointSliceZoneStarvedGaugeClears(t *testing.T) {
 		t.Fatal("starved-zone gauge not cleared after re-cover")
 	}
 }
+
+// TestEndpointSliceStripsConflictingTopologyMode — incident 2026-11-27
+// nonprod rabbitmq-dev: a Service migrated to spec.trafficDistribution
+// (PreferSameZone/PreferClose) while still carrying legacy
+// service.kubernetes.io/topology-mode=Auto must have the conflicting
+// annotation stripped automatically; a Service relying only on the
+// legacy annotation without trafficDistribution must remain untouched.
+func TestEndpointSliceStripsConflictingTopologyMode(t *testing.T) {
+	nA, nB, cA, cB := twoActiveZones()
+	conflict := topologyService("rabbitmq", "rabbitmq-dev")
+	conflict.Spec.TrafficDistribution = ptr.To(corev1.ServiceTrafficDistributionPreferSameZone)
+	legacyOnly := topologyService("apps", "legacy-svc")
+
+	s1 := hintedSlice("rabbitmq", "rmq-1", "rabbitmq-dev", true,
+		map[string][]string{"10.0.0.1": {"zone-a"}, "10.0.0.2": {"zone-b"}})
+	s2 := hintedSlice("apps", "legacy-1", "legacy-svc", true,
+		map[string][]string{"10.0.0.3": {"zone-a"}, "10.0.0.4": {"zone-b"}})
+
+	cs := fake.NewSimpleClientset(nA, nB, cA, cB, conflict, legacyOnly, s1, s2)
+	p := testProber(cs)
+	chk := probetest.MustCheck[*endpointSliceZoneStarvationCheck](t, p)
+	if res := chk.Run(probetest.SweepCtx(ctx, chk.Deps)); !res.Pass {
+		t.Fatalf("covered services must pass: %+v", res)
+	}
+
+	gotConflict, err := cs.CoreV1().Services("rabbitmq").Get(ctx, "rabbitmq-dev", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get rabbitmq-dev: %v", err)
+	}
+	if v, exists := gotConflict.Annotations[corev1.AnnotationTopologyMode]; exists {
+		t.Fatalf("conflicting topology-mode annotation not stripped: got %q", v)
+	}
+
+	gotLegacy, err := cs.CoreV1().Services("apps").Get(ctx, "legacy-svc", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get legacy-svc: %v", err)
+	}
+	if got := gotLegacy.Annotations[corev1.AnnotationTopologyMode]; got != topologyModeAuto {
+		t.Fatalf("legacy-only topology-mode annotation altered: got %q want %q", got, topologyModeAuto)
+	}
+}

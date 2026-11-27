@@ -23,14 +23,18 @@ package nethealth
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -70,6 +74,13 @@ const (
 	// topologyModeAuto is the service.kubernetes.io/topology-mode
 	// value that opts a Service into topology-aware routing.
 	topologyModeAuto = "Auto"
+
+	// topologyModeStripCooldown rate-limits stripping legacy
+	// service.kubernetes.io/topology-mode annotations that conflict
+	// with spec.trafficDistribution (incident 2026-11-27 nonprod
+	// rabbitmq-dev: operator kept topology-mode=Auto after switching
+	// to PreferSameZone, causing K8s to drop hints for both zones).
+	topologyModeStripCooldown = 10 * time.Minute
 )
 
 var (
@@ -86,6 +97,21 @@ func init() {
 		serviceTopologyZoneStarvedGauge)
 }
 
+// hasTrafficDistribution reports whether spec.trafficDistribution
+// requests same-zone preference (PreferClose or PreferSameZone).
+func hasTrafficDistribution(svc *corev1.Service) bool {
+	td := svc.Spec.TrafficDistribution
+	return td != nil && (*td == corev1.ServiceTrafficDistributionPreferClose ||
+		*td == corev1.ServiceTrafficDistributionPreferSameZone)
+}
+
+// hasConflictingTopologyMode reports whether a Service carries both a
+// native spec.trafficDistribution and a legacy topology-mode annotation.
+func hasConflictingTopologyMode(svc *corev1.Service) bool {
+	return hasTrafficDistribution(svc) &&
+		svc.Annotations[corev1.AnnotationTopologyMode] != ""
+}
+
 // topologyAuditedService reports whether the Service opted into
 // topology-aware routing: the service.kubernetes.io/topology-mode
 // annotation set to Auto, or spec.trafficDistribution requesting
@@ -96,9 +122,7 @@ func topologyAuditedService(svc *corev1.Service) bool {
 	if svc.Annotations[corev1.AnnotationTopologyMode] == topologyModeAuto {
 		return true
 	}
-	td := svc.Spec.TrafficDistribution
-	return td != nil && (*td == corev1.ServiceTrafficDistributionPreferClose ||
-		*td == corev1.ServiceTrafficDistributionPreferSameZone)
+	return hasTrafficDistribution(svc)
 }
 
 // checkEndpointSliceZoneStarvation computes the active zone set
@@ -160,8 +184,12 @@ func (p *endpointSliceZoneStarvationCheck) Run(ctx context.Context) probefw.Resu
 	// Services, so a hinted slice proves the service is in play even
 	// when the opt-in lives on a field this census missed.
 	audited := map[svcKey]bool{}
+	now := p.Now()
 	for i := range svcs {
 		svc := &svcs[i]
+		if hasConflictingTopologyMode(svc) {
+			p.stripConflictingTopologyMode(ctx, log, svc, now)
+		}
 		if topologyAuditedService(svc) {
 			audited[svcKey{svc.Namespace, svc.Name}] = true
 		}
@@ -225,6 +253,36 @@ func (p *endpointSliceZoneStarvationCheck) Run(ctx context.Context) probefw.Resu
 	p.evented.Prune(func(k string) bool { return live[k] })
 	return rep.Result(&p.emitted, serviceTopologyZoneStarvedGauge.DeleteLabelValues,
 		"topology-routed services starving an active zone: ", ", ")
+}
+
+// stripConflictingTopologyMode removes the legacy
+// service.kubernetes.io/topology-mode annotation when a Service already
+// declares native spec.trafficDistribution (PreferClose/PreferSameZone).
+// Best-effort under the standard maintenance + cooldown gates.
+func (p *endpointSliceZoneStarvationCheck) stripConflictingTopologyMode(
+	ctx context.Context, log logr.Logger, svc *corev1.Service, now time.Time) {
+
+	if p.CS == nil {
+		return
+	}
+	key := "topology-mode-strip:" + svc.Namespace + "/" + svc.Name
+	proceed, _ := heal.AllowedV(ctx, log, p.Maintenance, p.CS, p.Dyn,
+		&p.Heals, key, topologyModeStripCooldown, now)
+	if !proceed {
+		return
+	}
+	patch := []byte(`{"metadata":{"annotations":{"service.kubernetes.io/topology-mode":null}}}`)
+	if _, err := p.CS.CoreV1().Services(svc.Namespace).Patch(
+		ctx, svc.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		log.Error(err, "strip conflicting topology-mode annotation failed",
+			"service", svc.Namespace+"/"+svc.Name)
+		return
+	}
+	p.Heals.Stamp(key, now)
+	log.Info("stripped legacy service.kubernetes.io/topology-mode annotation conflicting with spec.trafficDistribution",
+		"service", svc.Namespace+"/"+svc.Name,
+		"legacyMode", svc.Annotations[corev1.AnnotationTopologyMode],
+		"trafficDistribution", *svc.Spec.TrafficDistribution)
 }
 
 // emitStarvedEvent stamps the EndpointSliceZoneHintStarved Warning

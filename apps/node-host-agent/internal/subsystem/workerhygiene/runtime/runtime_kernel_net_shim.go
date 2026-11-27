@@ -45,8 +45,15 @@ const (
 	// shimRSSMaxBytes trips the latch on a single shim's VmRSS —
 	// a healthy containerd-shim-runc-v2 sits at tens of MiB.
 	shimRSSMaxBytes = 200 << 20 // 200 MiB
-	// shimRSSTotalBytes trips on the node-wide shim RSS sum.
+	// shimRSSTotalBytes is the floor for the node-wide shim RSS sum.
 	shimRSSTotalBytes = 1536 << 20 // 1.5 GiB
+	// shimRSSPerShimBudgetBytes scales the node-wide total budget on
+	// high-density workers (>76 pods) so healthy ~13-15 MiB shims do
+	// not false-positive (incident 2026-11-27 nonprod worker-06: 117
+	// healthy k8s.io shims summed to 1556 MiB with worst=15 MiB).
+	shimRSSPerShimBudgetBytes = 20 << 20 // 20 MiB per k8s.io shim
+	// k8sContainerdNamespace is the containerd namespace owned by k0s/kubelet.
+	k8sContainerdNamespace = "k8s.io"
 )
 
 // KernelNetShimCheck is the kernel drop + shim RSS guard. It keeps
@@ -124,6 +131,10 @@ func (c *KernelNetShimCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	}
 	var maxRSS, totalRSS int64
 	worstPID, worstTask := 0, ""
+	k8sShimCount := 0
+	nonK8sCount, nonK8sPID := 0, 0
+	nonK8sNS, nonK8sTask := "", ""
+	var nonK8sRSS int64
 	shimInconclusive := false
 	for _, pid := range pids {
 		isShim, readErr := isContainerdShimChecked(d, e, pid)
@@ -142,17 +153,39 @@ func (c *KernelNetShimCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		if !rssOK {
 			continue
 		}
+		ns, task := shimTaskMeta(d, pid)
+		if ns != "" && ns != k8sContainerdNamespace {
+			nonK8sCount++
+			if nonK8sPID == 0 || rss > nonK8sRSS {
+				nonK8sPID = pid
+				nonK8sNS = ns
+				nonK8sTask = task
+				nonK8sRSS = rss
+			}
+		} else {
+			k8sShimCount++
+		}
 		totalRSS += rss
 		if rss > maxRSS {
 			maxRSS = rss
 			worstPID = pid
-			worstTask = shimTaskID(d, pid)
+			worstTask = task
 		}
 	}
 	if !shimInconclusive {
 		d.Series.ContainerdShimMaxRSSBytes = maxRSS
 		d.Series.ContainerdShimTotalRSSBytes = totalRSS
 	}
+	if nonK8sCount > 0 {
+		degraded = true
+		evidence = append(evidence, fmt.Sprintf(
+			"non-k8s containerd-shim pid=%d ns=%s task=%s rss=%dMiB (count=%d)",
+			nonK8sPID, nonK8sNS, nonK8sTask, nonK8sRSS>>20, nonK8sCount))
+		d.State.AppendLogWarn(fmt.Sprintf(
+			"kernel-net-shim: rogue non-k8s containerd-shim pid=%d ns=%s task=%s VmRSS=%dMiB (count=%d)",
+			nonK8sPID, nonK8sNS, nonK8sTask, nonK8sRSS>>20, nonK8sCount))
+	}
+	totalLimit := max(shimRSSTotalBytes, int64(k8sShimCount)*shimRSSPerShimBudgetBytes)
 	switch {
 	case maxRSS > shimRSSMaxBytes:
 		degraded = true
@@ -162,14 +195,14 @@ func (c *KernelNetShimCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 		d.State.AppendLogWarn(fmt.Sprintf(
 			"kernel-net-shim: containerd-shim pid=%d task=%s VmRSS=%dMiB exceeds %dMiB",
 			worstPID, worstTask, maxRSS>>20, shimRSSMaxBytes>>20))
-	case totalRSS > shimRSSTotalBytes:
+	case totalRSS > totalLimit:
 		degraded = true
 		evidence = append(evidence, fmt.Sprintf(
 			"shim total rss=%dMiB over %dMiB (worst pid=%d task=%s)",
-			totalRSS>>20, shimRSSTotalBytes>>20, worstPID, worstTask))
+			totalRSS>>20, totalLimit>>20, worstPID, worstTask))
 		d.State.AppendLogWarn(fmt.Sprintf(
 			"kernel-net-shim: containerd-shim total VmRSS=%dMiB exceeds %dMiB (worst pid=%d task=%s)",
-			totalRSS>>20, shimRSSTotalBytes>>20, worstPID, worstTask))
+			totalRSS>>20, totalLimit>>20, worstPID, worstTask))
 	}
 
 	inconclusive := dropInconclusive || shimInconclusive
@@ -380,24 +413,35 @@ func shimRSSBytes(d *wdeps.Deps, pid int) (bytes int64, ok, readErr bool) {
 	return 0, false, false
 }
 
-// shimTaskID pulls the containerd task id out of the shim argv —
+// shimTaskMeta pulls the containerd namespace and task id out of the shim argv —
 // `containerd-shim-runc-v2 -namespace k8s.io -id <id> -address ...`.
-func shimTaskID(d *wdeps.Deps, pid int) string {
+// Skips reading cmdline on D/Z/X states so mmap_lock cannot block the agent.
+func shimTaskMeta(d *wdeps.Deps, pid int) (ns, task string) {
 	if st, ok := d.Proc.Stat(pid); ok {
 		if len(st.Fields) > 0 &&
 			(st.Fields[0] == "D" || st.Fields[0] == "Z" || st.Fields[0] == "X" || st.Fields[0] == "x") {
-			return "unknown"
+			return "", "unknown"
 		}
 	} else if shimFileReadNonENOENT(d.Proc.File(pid, "stat")) {
-		return "unknown"
+		return "", "unknown"
 	}
 	args := d.Proc.Cmdline(pid)
+	task = "unknown"
 	for i, a := range args {
-		if a == "-id" && i+1 < len(args) {
-			return args[i+1]
+		if a == "-namespace" && i+1 < len(args) {
+			ns = args[i+1]
+		} else if a == "-id" && i+1 < len(args) {
+			task = args[i+1]
 		}
 	}
-	return "unknown"
+	return ns, task
+}
+
+// shimTaskID pulls the containerd task id out of the shim argv —
+// `containerd-shim-runc-v2 -namespace k8s.io -id <id> -address ...`.
+func shimTaskID(d *wdeps.Deps, pid int) string {
+	_, task := shimTaskMeta(d, pid)
+	return task
 }
 
 // readProcInt returns a sysctl file's trimmed contents under

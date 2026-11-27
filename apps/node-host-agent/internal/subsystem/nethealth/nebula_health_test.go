@@ -890,3 +890,43 @@ func TestNebulaHubAndSiteMeshBothDeadRestarts(t *testing.T) {
 		t.Fatalf("nebula@interdc not restarted when hub + site-mesh both dead, cmds=%v", e.sd.Cmds())
 	}
 }
+
+// TestNebulaTxQueueLenAutoRaised — incident 2026-11-27 production: when
+// neb1 is up with tx_queue_len below 4096 (e.g. default 500), nebula-health
+// raises it hitlessly via `ip link set dev neb1 txqueuelen 4096`, logs the
+// ACTION, increments the txqueuelen action counter, and respects the
+// cooldown / already-compliant ceiling.
+func TestNebulaTxQueueLenAutoRaised(t *testing.T) {
+	e := nebulaEnv(t, nil)
+	root := t.TempDir()
+	e.n.cfg.HostRoot = root
+	txqPath := filepath.Join(root, "sys", "class", "net", "neb1", "tx_queue_len")
+	testutil.WriteFile(t, txqPath, "500\n")
+
+	e.n.Cycle(context.Background())
+	if !e.host.Ran("ip link set dev neb1 txqueuelen 4096") {
+		t.Fatalf("expected hitless txqueuelen raise, cmds=%v", e.host.Cmds())
+	}
+	if got := promtest.ToFloat64(e.n.actions.WithLabelValues(nebula.CheckNebula, "txqueuelen")); got != 1 {
+		t.Fatalf("txqueuelen action counter=%v want 1", got)
+	}
+	if logs := logLines(t, e); !strings.Contains(logs, "ACTION: nebula txqueuelen raised dev=neb1 500->4096") {
+		t.Fatalf("missing txqueuelen ACTION log:\n%s", logs)
+	}
+
+	// Second cycle inside cooldown must not repeat even if sysfs still reads 500.
+	e.n.Cycle(context.Background())
+	if got := promtest.ToFloat64(e.n.actions.WithLabelValues(nebula.CheckNebula, "txqueuelen")); got != 1 {
+		t.Fatalf("txqueuelen action counter=%v want 1 (cooldown)", got)
+	}
+
+	// Already >= 4096 on a fresh env must be a complete no-op.
+	e2 := nebulaEnv(t, nil)
+	root2 := t.TempDir()
+	e2.n.cfg.HostRoot = root2
+	testutil.WriteFile(t, filepath.Join(root2, "sys", "class", "net", "neb1", "tx_queue_len"), "4096\n")
+	e2.n.Cycle(context.Background())
+	if e2.host.Ran("txqueuelen") {
+		t.Fatalf("txqueuelen touched when already 4096, cmds=%v", e2.host.Cmds())
+	}
+}

@@ -145,3 +145,68 @@ func TestKernelNetShimHygieneCheck(t *testing.T) {
 		}
 	}
 }
+
+func mkShimNS(t *testing.T, e *env, pid, rssKB int, ns, task string) {
+	t.Helper()
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, fmt.Sprint(pid), "comm"),
+		"containerd-shim\n")
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, fmt.Sprint(pid), "status"),
+		fmt.Sprintf("Name:\tcontainerd-shim\nVmRSS:\t%d kB\n", rssKB))
+	wdepstest.WriteFile(t, filepath.Join(e.ProcDir, fmt.Sprint(pid), "cmdline"),
+		"/usr/bin/containerd-shim-runc-v2\x00-namespace\x00"+ns+"\x00-id\x00"+task+
+			"\x00-address\x00/run/containerd/containerd.sock")
+	e.Live[pid] = true
+}
+
+// TestKernelNetShimHighDensityHealthyNoFalsePositive — incident 2026-11-27
+// nonprod worker-06: 120 healthy k8s.io shims at 14 MiB each (1680 MiB total,
+// above the 1536 MiB floor but under 120 * 20 MiB = 2400 MiB) must NOT latch.
+// Pushing them to 22 MiB each (2640 MiB > 2400 MiB) must still trip the latch.
+func TestKernelNetShimHighDensityHealthyNoFalsePositive(t *testing.T) {
+	e := fixture(t)
+	writeNetstat(t, e.ProcDir, 10, 0)
+	writeSoftnet(t, e.ProcDir, "00000064 00000000 00000000 00000000 00000000")
+	for i := range 120 {
+		mkShim(t, e, 2000+i, 14*1024, fmt.Sprintf("pod-task-%d", i))
+	}
+	latchPath := filepath.Join(e.StateDir,
+		latchdefs.LatchFilePrefix+latchdefs.LatchKernelNetShim)
+
+	e.H.Cycle(context.Background())
+	if _, err := os.Stat(latchPath); !os.IsNotExist(err) {
+		t.Fatalf("high-density healthy k8s.io shims (120x14MiB) falsely latched")
+	}
+
+	// Now leak every shim past 20 MiB (22 MiB * 120 = 2640 MiB > 2400 MiB).
+	for i := range 120 {
+		wdepstest.WriteFile(t, filepath.Join(e.ProcDir, fmt.Sprint(2000+i), "status"),
+			fmt.Sprintf("Name:\tcontainerd-shim\nVmRSS:\t%d kB\n", 22*1024))
+	}
+	e.H.Cycle(context.Background())
+	if _, err := os.Stat(latchPath); err != nil {
+		t.Fatal("leaking high-density k8s.io shims (120x22MiB) failed to latch")
+	}
+}
+
+// TestKernelNetShimDetectsNonK8sRogueDockerShim — incident 2026-11-27
+// nonprod worker-06: a non-k8s containerd-shim (-namespace moby from a
+// host Docker container outside k0s) must latch KernelNetShimDegraded
+// with explicit ns=moby evidence regardless of small RSS.
+func TestKernelNetShimDetectsNonK8sRogueDockerShim(t *testing.T) {
+	e := fixture(t)
+	writeNetstat(t, e.ProcDir, 10, 0)
+	writeSoftnet(t, e.ProcDir, "00000064 00000000 00000000 00000000 00000000")
+	mkShim(t, e, 3001, 14*1024, "k8s-task-1")
+	mkShimNS(t, e, 3002, 11*1024, "moby", "9d2e662123e5")
+	latchPath := filepath.Join(e.StateDir,
+		latchdefs.LatchFilePrefix+latchdefs.LatchKernelNetShim)
+
+	e.H.Cycle(context.Background())
+	if _, err := os.Stat(latchPath); err != nil {
+		t.Fatal("rogue non-k8s moby shim did not enter KernelNetShimDegraded latch")
+	}
+	if log := e.LogLines(t); !strings.Contains(log, "ns=moby") ||
+		!strings.Contains(log, "pid=3002") || !strings.Contains(log, "task=9d2e662123e5") {
+		t.Fatalf("watchdog warning missing rogue non-k8s shim details:\n%s", log)
+	}
+}
