@@ -62,6 +62,12 @@ type apiObjectSprawlReportGCCheck struct {
 	// historyGCEnabled is NODE_AUTOMATION_SPRAWL_HISTORY_GC_ENABLED
 	// resolved once at construction (default true).
 	historyGCEnabled bool
+	// orphanScrapeGCEnabled is ORPHAN_SCRAPE_CRD_GC_ENABLED resolved
+	// once at construction (default false — detect-only).
+	orphanScrapeGCEnabled bool
+	// emittedOrphanScrapes tracks node_automation_orphan_scrape_crd_count
+	// tuples ("kind/namespace/name") so resolved orphans prune cleanly.
+	emittedOrphanScrapes state.GaugeLedger[string]
 	// emittedHistorySprawl tracks node_automation_api_object_sprawl_count
 	// tuples by kind so resolved sprawl kinds prune cleanly.
 	emittedHistorySprawl state.GaugeLedger[string]
@@ -80,8 +86,9 @@ type apiObjectSprawlReportGCCheck struct {
 // because the GC is idempotent (the object is simply gone next sweep).
 func NewAPIObjectSprawlReportGCCheck(d *probefw.Deps) probefw.Check {
 	return &apiObjectSprawlReportGCCheck{
-		Deps:             d,
-		historyGCEnabled: envx.Gate("NODE_AUTOMATION_SPRAWL_HISTORY_GC_ENABLED", true),
+		Deps:                  d,
+		historyGCEnabled:      envx.Gate("NODE_AUTOMATION_SPRAWL_HISTORY_GC_ENABLED", true),
+		orphanScrapeGCEnabled: envx.Gate("ORPHAN_SCRAPE_CRD_GC_ENABLED", false),
 	}
 }
 
@@ -202,7 +209,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 
-	var objects, orphans, helmRep, kineRep, historyRep probefw.SweepReport
+	var objects, orphans, helmRep, kineRep, historyRep, orphanScrapeRep probefw.SweepReport
 	orphanBudget := sprawlMaxOrphanDeletes
 	p.ownerSeen = map[string]bool{}
 	for _, rk := range sprawlReportKinds {
@@ -347,6 +354,10 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: err}
 	}
 
+	if err := p.auditOrphanScrapeCRDs(ctx, log, now, &objects, &orphanScrapeRep); err != nil {
+		return probefw.Result{Infra: err}
+	}
+
 	p.historyCycle++
 	if p.historyCycle%probefw.HeavyScanCycles == 1 {
 		if err := p.gcWorkloadHistorySprawl(ctx, log, now, &objects, &historyRep); err != nil {
@@ -409,6 +420,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 	helmRep.Close(&p.emittedHelm, helmSecretsExcessGauge.DeleteLabelValues)
 	kineRep.Close(&p.emittedLargeObjects, kineLargeObjectBytesGauge.DeleteLabelValues)
 	historyRep.Close(&p.emittedHistorySprawl, apiObjectSprawlCountGauge.DeleteLabelValues)
+	orphanScrapeRep.Close(&p.emittedOrphanScrapes, orphanScrapeCRDCountGauge.DeleteLabelValues)
 	return objects.Verdict("api object sprawl: ", ", ")
 }
 

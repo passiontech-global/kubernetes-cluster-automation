@@ -32,6 +32,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
 )
 
 // konnectivityTunnelHealthCheck is the konnectivity-tunnel-health half-open tunnel
@@ -49,6 +50,10 @@ type konnectivityTunnelHealthCheck struct {
 	// being reported gets DeleteLabelValues'd rather than leaking a
 	// stale 1 (zero value usable; the serial sweep needs no lock).
 	emitted state.GaugeLedger[string]
+	// podLogFn fetches the recent log tail of a konnectivity-agent pod
+	// for split-brain detection. Nil in production -> reads the last 50
+	// lines via kube.ReadPodLogText; injectable in tests.
+	podLogFn func(ctx context.Context, pod *corev1.Pod) (string, error)
 }
 
 // NewKonnectivityTunnelHealthCheck builds the konnectivity-tunnel-health check — its
@@ -74,6 +79,17 @@ const (
 	// still fires for every persisted agent; only the heal is
 	// capped, with the remainder retried next sweep.
 	konnHealCapPerSweep = 2
+
+	// Split-brain detection knobs: when any agent shows a connection
+	// deficit OR server backend connections are imbalanced across
+	// controllers (one == 0 while another > 0), inspect the last 50 log
+	// lines of each konnectivity-agent pod. >=5 occurrences of
+	// "duplicate server connection attempt" proves the agent is stuck in
+	// a split-brain reconnect loop and triggers bounded rolling-delete.
+	konnSplitBrainLogTailLines = int64(50)
+	konnSplitBrainMarker       = "duplicate server connection attempt"
+	konnSplitBrainMinMatches   = 5
+	konnLogScanWorkers         = 4
 )
 
 var (
@@ -212,14 +228,29 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 			expectedConns = 1
 		}
 	}
-	// Cheap exit first: with no series below the expected count
-	// there is nothing to evaluate — the pods List (needed only to
-	// map a deficit onto live pods for the node label, the peer
-	// proof and the heal target) is skipped on the common path. A
-	// wholly empty result reads as healthy here: konnectivity-agent
-	// never scraped is a monitoring gap, not tunnel evidence.
-	// (rep was declared above for the Prometheus-error carry path —
-	// this sweep's emits reuse it.)
+	// Check konnectivity-server ready backend connections for controller
+	// imbalance (one server == 0 while another > 0) — the split-brain
+	// signature where agents stay pinned to a subset of servers even
+	// when open_server_connections looks nominal. Query failure or empty
+	// result fails open (no imbalance signal) so the half-open path stays
+	// unaffected on clusters without server metrics.
+	serverImbalance := false
+	if srvSeries, serr := p.PromQuery(ctx,
+		`konnectivity_network_proxy_server_ready_backend_connections`); serr != nil {
+		log.V(1).Info("konnectivity server backend connections query failed — skipping imbalance check",
+			"error", serr)
+	} else {
+		serverImbalance = hasServerBackendImbalance(srvSeries)
+	}
+
+	// Cheap exit first: with no series below the expected count and no
+	// server backend imbalance there is nothing to evaluate — the pods
+	// List (needed only to map a deficit/split-brain onto live pods for
+	// the node label, the peer proof and the heal target) is skipped on
+	// the common path. A wholly empty result reads as healthy here:
+	// konnectivity-agent never scraped is a monitoring gap, not tunnel
+	// evidence. (rep was declared above for the Prometheus-error carry
+	// path — this sweep's emits reuse it.)
 	deficit := false
 	for _, v := range conns {
 		if v < expectedConns {
@@ -227,7 +258,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 			break
 		}
 	}
-	if !deficit && len(p.emitted.Last()) == 0 {
+	if !deficit && !serverImbalance && len(p.emitted.Last()) == 0 {
 		// Healthy AND nothing held from last sweep — but the
 		// reconcile still owes the ledgers: seen entries must drop
 		// so a recovering agent re-arms the window. (Returning Pass
@@ -248,6 +279,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 	}
 
 	halfOpen := map[string]bool{} // live-key set for the seen prune
+	var liveAgents []*corev1.Pod
 	var targets []*corev1.Pod
 	healthyPeer := false
 	for i := range pods {
@@ -256,6 +288,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 			pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
+		liveAgents = append(liveAgents, pod)
 		v, ok := conns[pod.Name]
 		if !ok {
 			// The pod has no series — inconclusive, never evidence:
@@ -283,9 +316,50 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		targets = append(targets, pod)
 	}
 
+	// Split-brain log scan: when any agent has a connection deficit OR
+	// konnectivity-servers show ready-backend imbalance across
+	// controllers, inspect the last 50 log lines of each live agent.
+	// >=5 "duplicate server connection attempt" matches marks the pod
+	// as split-brain for bounded rolling-delete.
+	splitBrain := map[string]int{}
+	if (deficit || serverImbalance) && len(liveAgents) > 0 {
+		scans := kube.ScanPodLogs(ctx, liveAgents, konnLogScanWorkers, p.readAgentLogs)
+		for i, sc := range scans {
+			pod := liveAgents[i]
+			key := pod.Namespace + "/" + pod.Name
+			if sc.Err != nil {
+				log.V(1).Info("WARN: konnectivity-agent log read failed — split-brain check skipped for pod",
+					"pod", key, "error", sc.Err)
+				continue
+			}
+			if n := countDuplicateServerAttempts(sc.Value); n >= konnSplitBrainMinMatches {
+				splitBrain[key] = n
+			}
+		}
+	}
+
 	healedThisSweep := 0
+	handled := map[string]bool{}
 	for _, pod := range targets {
 		key := pod.Namespace + "/" + pod.Name
+		if dupCount := splitBrain[key]; dupCount >= konnSplitBrainMinMatches {
+			handled[key] = true
+			rep.Emit(konnAgentHalfOpenGauge, key,
+				[]string{pod.Name, pod.Spec.NodeName},
+				fmt.Sprintf("%s(split-brain: duplicate_server_connection=%d connections=%.0f/%.0f node=%s)",
+					key, dupCount, conns[pod.Name], expectedConns, pod.Spec.NodeName))
+			if healedThisSweep >= konnHealCapPerSweep {
+				log.Info("DEFER: konnectivity heal cap reached this sweep — retry next sweep",
+					"pod", key, "cap", konnHealCapPerSweep, "reason", "split-brain")
+				continue
+			}
+			targetKey := kube.PodControllerKey(pod) + "/" + pod.Spec.NodeName
+			if p.DeletePodHealOnNode(ctx, log, CheckNameKonnectivityTunnelHealth,
+				targetKey, pod, konnHealCool, now) {
+				healedThisSweep++
+			}
+			continue
+		}
 		if !probefw.Persisted(&p.seen, key, now, konnHalfOpenMinAge, log) {
 			continue
 		}
@@ -318,7 +392,68 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 			healedThisSweep++
 		}
 	}
+	// Remaining split-brain agents that were not in half-open targets
+	// (e.g. triggered via server backend imbalance while open_server_connections
+	// stayed >= expectedConns).
+	for _, pod := range liveAgents {
+		key := pod.Namespace + "/" + pod.Name
+		if handled[key] {
+			continue
+		}
+		dupCount := splitBrain[key]
+		if dupCount < konnSplitBrainMinMatches {
+			continue
+		}
+		rep.Emit(konnAgentHalfOpenGauge, key,
+			[]string{pod.Name, pod.Spec.NodeName},
+			fmt.Sprintf("%s(split-brain: duplicate_server_connection=%d node=%s)",
+				key, dupCount, pod.Spec.NodeName))
+		if healedThisSweep >= konnHealCapPerSweep {
+			log.Info("DEFER: konnectivity heal cap reached this sweep — retry next sweep",
+				"pod", key, "cap", konnHealCapPerSweep, "reason", "split-brain")
+			continue
+		}
+		targetKey := kube.PodControllerKey(pod) + "/" + pod.Spec.NodeName
+		if p.DeletePodHealOnNode(ctx, log, CheckNameKonnectivityTunnelHealth,
+			targetKey, pod, konnHealCool, now) {
+			healedThisSweep++
+		}
+	}
 	p.seen.Prune(func(k string) bool { return halfOpen[k] })
 	return rep.Result(&p.emitted, konnAgentHalfOpenGauge.DeleteLabelValues,
 		"konnectivity-agent pods with half-open tunnels: ", ", ")
+}
+
+// hasServerBackendImbalance reports whether konnectivity-server backend
+// connection series show at least one controller with 0 ready backends
+// while another controller holds >0.
+func hasServerBackendImbalance(series []promq.Sample) bool {
+	hasZero, hasPositive := false, false
+	for _, s := range series {
+		if s.Value == 0 {
+			hasZero = true
+		} else if s.Value > 0 {
+			hasPositive = true
+		}
+	}
+	return hasZero && hasPositive
+}
+
+// readAgentLogs fetches the last 50 log lines of a konnectivity-agent pod
+// through the injectable test seam or kube.ReadPodLogText in production.
+func (p *konnectivityTunnelHealthCheck) readAgentLogs(ctx context.Context, pod *corev1.Pod) (string, error) {
+	if p.podLogFn != nil {
+		return p.podLogFn(ctx, pod)
+	}
+	return kube.ReadPodLogText(ctx, p.CS, pod, kube.PodLogOpts{
+		TailLines: konnSplitBrainLogTailLines,
+		MaxBytes:  probefw.LogMaxBytes,
+		Timeout:   probefw.LogTimeout,
+	})
+}
+
+// countDuplicateServerAttempts counts occurrences of the konnectivity-agent
+// split-brain log marker ("duplicate server connection attempt").
+func countDuplicateServerAttempts(logText string) int {
+	return strings.Count(strings.ToLower(logText), konnSplitBrainMarker)
 }

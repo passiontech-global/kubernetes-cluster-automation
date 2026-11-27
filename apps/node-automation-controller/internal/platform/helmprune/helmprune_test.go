@@ -278,3 +278,35 @@ func TestPruneSupersededHelmSecretsMeta_PartialReadAndRetry(t *testing.T) {
 		t.Fatal("expected error from listHelmSecretsPartial")
 	}
 }
+
+func TestPruneSupersededHelmSecretsMetaWithCap_LargeViaMetaPath(t *testing.T) {
+	t.Parallel()
+
+	bigPayload := make([]byte, 600*1024)
+	mkBig := func(v int) *corev1.Secret {
+		s := helmSecret("ns1", "sh.helm.release.v1.big.v"+strconv.Itoa(v), "big", v, "superseded")
+		s.Data = map[string][]byte{"release": bigPayload}
+		return s
+	}
+	s1, s2, s3, s4 := mkBig(1), mkBig(2), mkBig(3), mkBig(4)
+	meta := testhelp.NewMetaClient(
+		testhelp.MetaObj("v1", "Secret", s1.ObjectMeta),
+		testhelp.MetaObj("v1", "Secret", s2.ObjectMeta),
+		testhelp.MetaObj("v1", "Secret", s3.ObjectMeta),
+		testhelp.MetaObj("v1", "Secret", s4.ObjectMeta),
+	)
+	cs := fake.NewClientset(s1, s2, s3, s4)
+
+	var deleted []int
+	_, err := PruneSupersededHelmSecretsMetaWithCap(context.Background(), meta, cs, nil,
+		10, LargeSecretCap{Threshold: 524288, MaxSuperseded: 2},
+		HelmSecretPruneHooks{
+			Deleted: func(_ *corev1.Secret, v int) { deleted = append(deleted, v) },
+		})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !slices.Equal(deleted, []int{1, 2}) {
+		t.Fatalf("large release via meta path deleted %v, want [1 2]", deleted)
+	}
+}

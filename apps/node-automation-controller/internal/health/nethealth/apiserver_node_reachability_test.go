@@ -335,7 +335,7 @@ func mustNode(t *testing.T, cs *fake.Clientset, name string) *corev1.Node {
 func TestApiserverNodeReachabilityProbe(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "ok-node") {
-			_, _ = w.Write([]byte("ok"))
+			_, _ = w.Write([]byte("ok\n"))
 			return
 		}
 		http.Error(w, "unreachable", http.StatusBadGateway)
@@ -346,12 +346,135 @@ func TestApiserverNodeReachabilityProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewForConfig: %v", err)
 	}
-	chk := &apiserverNodeReachabilityCheck{Deps: probetest.NewDeps(cs, nil)}
+	chk := &apiserverNodeReachabilityCheck{
+		Deps:     probetest.NewDeps(cs, nil),
+		probeGap: time.Millisecond,
+	}
 	if !chk.probe(ctx, "ok-node") {
-		t.Fatal("expected ok-node probe to return true")
+		t.Fatal("expected ok-node probe (\"ok\\n\") to return true")
 	}
 	if chk.probe(ctx, "bad-node") {
 		t.Fatal("expected bad-node probe to return false")
+	}
+}
+
+// Transient 1-shot / 2-shot proxy blips must be absorbed by the 3-attempt
+// retry loop before marking a node dark; 3 consecutive failures return false.
+func TestApiserverNodeReachabilityProbeRetriesBlip(t *testing.T) {
+	attempts := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "flaky-node"):
+			attempts["flaky-node"]++
+			if attempts["flaky-node"] < 3 {
+				http.Error(w, "blip", http.StatusBadGateway)
+				return
+			}
+			_, _ = w.Write([]byte(" ok \n"))
+		case strings.Contains(r.URL.Path, "dead-node"):
+			attempts["dead-node"]++
+			http.Error(w, "timeout", http.StatusGatewayTimeout)
+		}
+	}))
+	defer srv.Close()
+
+	cs, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatalf("NewForConfig: %v", err)
+	}
+	chk := &apiserverNodeReachabilityCheck{
+		Deps:     probetest.NewDeps(cs, nil),
+		probeGap: time.Millisecond,
+	}
+	if !chk.probe(ctx, "flaky-node") {
+		t.Fatal("expected flaky-node to succeed on 3rd attempt")
+	}
+	if attempts["flaky-node"] != 3 {
+		t.Fatalf("flaky-node attempts = %d, want 3", attempts["flaky-node"])
+	}
+	if chk.probe(ctx, "dead-node") {
+		t.Fatal("expected dead-node to fail after 3 attempts")
+	}
+	if attempts["dead-node"] != 3 {
+		t.Fatalf("dead-node attempts = %d, want 3", attempts["dead-node"])
+	}
+}
+
+// Production regression: a worker node whose Ready condition is False
+// while still carrying passiontech.dev/apiserver-unreachable must still be
+// probed and untainted as soon as kubelet /proxy/healthz answers "ok\n".
+// Control-plane nodes remain skipped.
+func TestApiserverDarkUntaintsNotReadyNodeOnHealthzOK(t *testing.T) {
+	base := time.Now()
+	notReadyWorker := probetest.ReadyWorkerNode("w1", "", 0, false)
+	notReadyWorker.Status.Conditions = []corev1.NodeCondition{{
+		Type:   corev1.NodeReady,
+		Status: corev1.ConditionFalse,
+	}}
+	notReadyWorker.Spec.Taints = []corev1.Taint{{
+		Key:    kube.TaintApiserverUnreachable,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}}
+	notReadyCP := probetest.ReadyWorkerNode("cp1", "", 0, false)
+	notReadyCP.Labels = map[string]string{"node-role.kubernetes.io/control-plane": ""}
+	notReadyCP.Status.Conditions = []corev1.NodeCondition{{
+		Type:   corev1.NodeReady,
+		Status: corev1.ConditionFalse,
+	}}
+	notReadyCP.Spec.Taints = []corev1.Taint{{
+		Key:    kube.TaintApiserverUnreachable,
+		Value:  "true",
+		Effect: corev1.TaintEffectNoSchedule,
+	}}
+
+	cs := fake.NewSimpleClientset(
+		notReadyWorker,
+		notReadyCP,
+		probetest.ReadyWorkerNode("w2", "", 0, false),
+		anrNodeLease("w1", base),
+		anrNodeLease("w2", base),
+	)
+	p := testProber(cs)
+	probetest.FreezeNow(p.Deps, base)
+
+	// Wire a real HTTP healthz server returning "ok\n" to exercise the
+	// TrimSpace("ok\n") path end-to-end inside probeFn.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	}))
+	defer srv.Close()
+	probeCS, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatalf("NewForConfig: %v", err)
+	}
+	probeHelper := &apiserverNodeReachabilityCheck{
+		Deps:     probetest.NewDeps(probeCS, nil),
+		probeGap: time.Millisecond,
+	}
+
+	probed := map[string]bool{}
+	check := probetest.MustCheck[*apiserverNodeReachabilityCheck](t, p)
+	check.probeFn = func(ctx context.Context, node string) bool {
+		probed[node] = true
+		return probeHelper.probe(ctx, node)
+	}
+
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if !res.Pass {
+		t.Fatalf("sweep with recovered NotReady worker must pass: %+v", res)
+	}
+	if !probed["w1"] {
+		t.Fatal("NotReady worker carrying apiserver-unreachable taint was not probed")
+	}
+	if probed["cp1"] {
+		t.Fatal("control-plane node must remain skipped")
+	}
+	if kube.HasTaint(mustNode(t, cs, "w1").Spec.Taints, kube.TaintApiserverUnreachable) {
+		t.Fatal("apiserver-unreachable taint was not removed from NotReady worker after healthz returned ok\\n")
+	}
+	if !kube.HasTaint(mustNode(t, cs, "cp1").Spec.Taints, kube.TaintApiserverUnreachable) {
+		t.Fatal("control-plane node must not be untainted by worker check")
 	}
 }
 

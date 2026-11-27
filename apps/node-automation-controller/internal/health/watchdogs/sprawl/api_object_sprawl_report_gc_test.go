@@ -236,6 +236,96 @@ func TestSprawlGCPrunesSupersededHelmSecrets(t *testing.T) {
 	}
 }
 
+// Large Helm release secrets (>512 KiB) tighten the superseded keep cap from
+// 10 down to 2 (preserving deployed + 2 newest superseded rollback points),
+// while small releases (<=512 KiB) keep the standard cap of 10.
+func TestSprawlGCPrunesLargeHelmSecretsToTwoAndKeepsSmallAtTen(t *testing.T) {
+	largeBlob := make([]byte, kineLargeObjectThreshold+1024)
+	smallBlob := []byte("small-chart-payload")
+
+	var objs []runtime.Object
+	// Large release ("external-secrets"): 6 superseded + 1 deployed -> keep 2 superseded.
+	for v := 1; v <= 6; v++ {
+		s := helmSecret("external-secrets", "external-secrets", v, "superseded")
+		s.Data = map[string][]byte{"release": largeBlob}
+		objs = append(objs, s)
+	}
+	deployedLarge := helmSecret("external-secrets", "external-secrets", 7, "deployed")
+	deployedLarge.Data = map[string][]byte{"release": largeBlob}
+	objs = append(objs, deployedLarge)
+
+	// Small release ("small-app"): 12 superseded + 1 deployed -> keep 10 superseded.
+	for v := 1; v <= 12; v++ {
+		s := helmSecret("apps", "small-app", v, "superseded")
+		s.Data = map[string][]byte{"release": smallBlob}
+		objs = append(objs, s)
+	}
+	deployedSmall := helmSecret("apps", "small-app", 13, "deployed")
+	deployedSmall.Data = map[string][]byte{"release": smallBlob}
+	objs = append(objs, deployedSmall)
+
+	testutil.CleanupMetric(t, helmSecretsExcessGauge, "external-secrets", "external-secrets")
+	testutil.CleanupMetric(t, helmSecretsExcessGauge, "apps", "small-app")
+
+	cs := fake.NewSimpleClientset(objs...)
+	p := testProberDyn(cs, sprawlDyn())
+	res := probetest.MustCheck[*apiObjectSprawlReportGCCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Pass {
+		t.Fatalf("excess superseded secrets must fail: %+v", res)
+	}
+
+	// Verify large release kept exactly 2 superseded (v5, v6) + deployed (v7).
+	largeList, err := cs.CoreV1().Secrets("external-secrets").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list external-secrets: %v", err)
+	}
+	largeSuperseded := 0
+	for _, s := range largeList.Items {
+		if s.Labels["status"] == "superseded" {
+			largeSuperseded++
+		}
+	}
+	if largeSuperseded != sprawlLargeMaxSuperseded {
+		t.Fatalf("large release superseded count = %d, want %d", largeSuperseded, sprawlLargeMaxSuperseded)
+	}
+	for _, mustKeep := range []string{
+		"sh.helm.release.v1.external-secrets.v5",
+		"sh.helm.release.v1.external-secrets.v6",
+		"sh.helm.release.v1.external-secrets.v7",
+	} {
+		if _, err := cs.CoreV1().Secrets("external-secrets").Get(ctx, mustKeep, metav1.GetOptions{}); err != nil {
+			t.Fatalf("large release secret %s must survive: %v", mustKeep, err)
+		}
+	}
+	if _, err := cs.CoreV1().Secrets("external-secrets").Get(ctx,
+		"sh.helm.release.v1.external-secrets.v4", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("large release v4 should be pruned, err=%v", err)
+	}
+	if v, ok := testutil.GaugeSeriesValue(t, "node_automation_helm_release_secrets_excess",
+		map[string]string{"namespace": "external-secrets", "release": "external-secrets"}); !ok || v != 4 {
+		t.Fatalf("large release excess gauge = %v,%v want 4,true", v, ok)
+	}
+
+	// Verify small release kept 10 superseded (v3..v12) + deployed (v13).
+	smallList, err := cs.CoreV1().Secrets("apps").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list apps secrets: %v", err)
+	}
+	smallSuperseded := 0
+	for _, s := range smallList.Items {
+		if s.Labels["status"] == "superseded" {
+			smallSuperseded++
+		}
+	}
+	if smallSuperseded != sprawlMaxSuperseded {
+		t.Fatalf("small release superseded count = %d, want %d", smallSuperseded, sprawlMaxSuperseded)
+	}
+	if _, err := cs.CoreV1().Secrets("apps").Get(ctx,
+		"sh.helm.release.v1.small-app.v13", metav1.GetOptions{}); err != nil {
+		t.Fatalf("small release deployed v13 must survive: %v", err)
+	}
+}
+
 // Kine large-object census — ConfigMap/Secret objects above the 512 KiB Kine row guard
 // emit node_automation_kine_large_object_bytes and fail the check;
 // objects at or below the threshold stay silent; shrinking (here:

@@ -6,6 +6,7 @@
 package nethealth
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -14,7 +15,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 )
@@ -354,5 +357,222 @@ func TestIsKonnectivityAgentPod(t *testing.T) {
 				t.Fatalf("isKonnectivityAgentPod = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// konnPromServerWithBackends answers both open_server_connections and
+// konnectivity_network_proxy_server_ready_backend_connections.
+func konnPromServerWithBackends(t *testing.T,
+	byPod map[string]float64,
+	byServer map[string]float64) *httptest.Server {
+	t.Helper()
+	srv, _ := probetest.PromTestServer(t, func(query string) []probetest.PromTestSample {
+		switch {
+		case strings.Contains(query, "open_server_connections"):
+			var out []probetest.PromTestSample
+			for pod, v := range byPod {
+				out = append(out, probetest.PromTestSample{
+					Labels: map[string]string{
+						"namespace": "kube-system", "pod": pod},
+					Value: v})
+			}
+			return out
+		case strings.Contains(query, "server_ready_backend_connections"):
+			var out []probetest.PromTestSample
+			for inst, v := range byServer {
+				out = append(out, probetest.PromTestSample{
+					Labels: map[string]string{"instance": inst},
+					Value:  v})
+			}
+			return out
+		default:
+			return nil
+		}
+	})
+	return srv
+}
+
+// Split-brain detection via server imbalance + agent logs containing
+// >=5 "duplicate server connection attempt" lines: deletes pods with
+// UID preconditions, respects per-sweep cap (2), skips pods with <5
+// matches, and heals remaining pods on the next sweep.
+func TestKonnectivitySplitBrainRollingDeleteCapCooldownAndUID(t *testing.T) {
+	base := time.Now()
+	// All agents report 2 open connections, but cp-2 has 0 ready backends
+	// while cp-1 has 4 — server imbalance triggers the log scan.
+	srv := konnPromServerWithBackends(t,
+		map[string]float64{
+			"konnectivity-agent-a": 2,
+			"konnectivity-agent-b": 2,
+			"konnectivity-agent-c": 2,
+			"konnectivity-agent-d": 2,
+		},
+		map[string]float64{
+			"cp-1:8133": 4,
+			"cp-2:8133": 0,
+		},
+	)
+	mkPod := func(name, node string) *corev1.Pod {
+		p := konnAgentPod(name, node)
+		p.UID = types.UID("uid-" + name)
+		return p
+	}
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		konnCPNode("cp-1"), konnCPNode("cp-2"),
+		mkPod("konnectivity-agent-a", "w1"),
+		mkPod("konnectivity-agent-b", "w2"),
+		mkPod("konnectivity-agent-c", "w3"),
+		mkPod("konnectivity-agent-d", "w4"),
+	}...)
+
+	deletedUIDs := map[string]types.UID{}
+	cs.PrependReactor("delete", "pods", func(action ktesting.Action) (bool, runtime.Object, error) {
+		da := action.(ktesting.DeleteAction)
+		opts := da.GetDeleteOptions()
+		if opts.Preconditions == nil || opts.Preconditions.UID == nil {
+			t.Errorf("pod %s deleted without UID precondition", da.GetName())
+		} else {
+			deletedUIDs[da.GetName()] = *opts.Preconditions.UID
+		}
+		return false, nil, nil
+	})
+
+	p := konnProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
+
+	dup5 := strings.Repeat("E1127 duplicate server connection attempt from agent\n", 5)
+	dup4 := strings.Repeat("E1127 duplicate server connection attempt from agent\n", 4)
+	check.podLogFn = func(_ context.Context, pod *corev1.Pod) (string, error) {
+		if pod.Name == "konnectivity-agent-d" {
+			return dup4, nil // below threshold
+		}
+		return dup5, nil
+	}
+
+	// Sweep 1: 3 split-brain pods (a, b, c) — cap 2 deletes exactly 2.
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if res.Pass {
+		t.Fatal("split-brain agents must FAIL the sweep")
+	}
+	if len(deletedUIDs) != konnHealCapPerSweep {
+		t.Fatalf("sweep 1 deleted %d pods (%v), want cap %d",
+			len(deletedUIDs), deletedUIDs, konnHealCapPerSweep)
+	}
+	for name, uid := range deletedUIDs {
+		if want := types.UID("uid-" + name); uid != want {
+			t.Fatalf("pod %s deleted with UID %q, want %q", name, uid, want)
+		}
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "konnectivity-agent-d", metav1.GetOptions{}); err != nil {
+		t.Fatalf("agent with only 4 duplicate lines must survive: %v", err)
+	}
+
+	var leftover string
+	for _, name := range []string{"konnectivity-agent-a", "konnectivity-agent-b", "konnectivity-agent-c"} {
+		if _, wasDeleted := deletedUIDs[name]; !wasDeleted {
+			leftover = name
+		}
+	}
+
+	// Sweep 2 (5m later): leftover 3rd pod heals on its own node.
+	probetest.FreezeNow(p.Deps, base.Add(5*time.Minute))
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, leftover, metav1.GetOptions{}); err == nil {
+		t.Fatalf("remaining split-brain pod %s must be healed on next sweep", leftover)
+	}
+}
+
+// Per-node 30m cooldown prevents re-deleting a DaemonSet-recreated
+// split-brain pod on the same node inside the window, then allows
+// healing once the cooldown expires.
+func TestKonnectivitySplitBrainPerNodeCooldown(t *testing.T) {
+	base := time.Now()
+	srv := konnPromServerWithBackends(t,
+		map[string]float64{"konnectivity-agent-a": 2},
+		map[string]float64{"cp-1:8133": 2, "cp-2:8133": 0},
+	)
+	mkDSPod := func(name, node string) *corev1.Pod {
+		p := konnAgentPod(name, node)
+		p.UID = types.UID("uid-" + name)
+		ctrl := true
+		p.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "apps/v1",
+			Kind:       "DaemonSet",
+			Name:       "konnectivity-agent",
+			Controller: &ctrl,
+		}}
+		return p
+	}
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		konnCPNode("cp-1"), konnCPNode("cp-2"),
+		mkDSPod("konnectivity-agent-a", "w1"),
+	}...)
+	p := konnProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
+	check.podLogFn = func(_ context.Context, _ *corev1.Pod) (string, error) {
+		return strings.Repeat("duplicate server connection attempt\n", 5), nil
+	}
+
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "konnectivity-agent-a", metav1.GetOptions{}); err == nil {
+		t.Fatal("sweep 1 must delete split-brain DaemonSet pod")
+	}
+
+	// DaemonSet recreates pod on w1 5m later (inside 30m cooldown) -> must survive.
+	reborn := mkDSPod("konnectivity-agent-a-new", "w1")
+	if _, err := cs.CoreV1().Pods("kube-system").Create(ctx, reborn, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create replacement pod: %v", err)
+	}
+	probetest.FreezeNow(p.Deps, base.Add(5*time.Minute))
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, reborn.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("replacement pod on w1 must not be deleted inside 30m cooldown: %v", err)
+	}
+
+	// Past 30m cooldown -> allowed to delete again.
+	probetest.FreezeNow(p.Deps, base.Add(31*time.Minute))
+	_ = check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, reborn.Name, metav1.GetOptions{}); err == nil {
+		t.Fatal("replacement pod on w1 must be healed after 30m cooldown expires")
+	}
+}
+
+// Deficit-triggered split-brain heals even without waiting 10m or having
+// a healthy peer when agent logs prove >=5 duplicate server connection attempts.
+func TestKonnectivitySplitBrainTriggeredByDeficit(t *testing.T) {
+	base := time.Now()
+	srv := konnPromServer(t, map[string]float64{
+		"konnectivity-agent-a": 1,
+		"konnectivity-agent-b": 1,
+	})
+	podA := konnAgentPod("konnectivity-agent-a", "w1")
+	podA.UID = "uid-a"
+	podB := konnAgentPod("konnectivity-agent-b", "w2")
+	podB.UID = "uid-b"
+	cs := fake.NewSimpleClientset([]runtime.Object{
+		konnCPNode("cp-1"), konnCPNode("cp-2"),
+		podA, podB,
+	}...)
+	p := konnProber(cs, srv)
+	probetest.FreezeNow(p.Deps, base)
+	check := probetest.MustCheck[*konnectivityTunnelHealthCheck](t, p)
+	check.podLogFn = func(_ context.Context, pod *corev1.Pod) (string, error) {
+		if pod.Name == "konnectivity-agent-a" {
+			return strings.Repeat("duplicate server connection attempt\n", 5), nil
+		}
+		return "normal log\n", nil
+	}
+
+	res := check.Run(probetest.SweepCtx(ctx, check.Deps))
+	if res.Pass {
+		t.Fatal("split-brain agent must fail sweep")
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "konnectivity-agent-a", metav1.GetOptions{}); err == nil {
+		t.Fatal("split-brain agent with >=5 duplicate server connection attempts must be deleted")
+	}
+	if _, err := cs.CoreV1().Pods("kube-system").Get(ctx, "konnectivity-agent-b", metav1.GetOptions{}); err != nil {
+		t.Fatalf("non-split-brain agent must survive: %v", err)
 	}
 }

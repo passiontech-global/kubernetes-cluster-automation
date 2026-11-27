@@ -204,6 +204,13 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "apiregistration.k8s.io", Version: "v1", Kind: "APIService"},
 	{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshot"},
 	{Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshotContent"},
+
+	// VictoriaMetrics & Prometheus Operator scrape CRDs
+	// (api-object-sprawl-report-gc orphan scrape CRD auditor).
+	{Group: "operator.victoriametrics.com", Version: "v1beta1", Kind: "VMServiceScrape"},
+	{Group: "operator.victoriametrics.com", Version: "v1beta1", Kind: "VMPodScrape"},
+	{Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor"},
+	{Group: "monitoring.coreos.com", Version: "v1", Kind: "PodMonitor"},
 }
 
 // buildDynScheme assembles the scheme NewDynamicClient and DynScheme

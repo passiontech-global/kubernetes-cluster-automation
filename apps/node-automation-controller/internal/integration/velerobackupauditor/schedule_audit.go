@@ -14,10 +14,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
@@ -25,12 +29,17 @@ import (
 // Schedules and owns their ledger lifecycle: the paused>24h clock
 // (firstSeenPaused measures the real pause duration — a Schedule
 // carries no "paused since" timestamp) and the latest-backup rot
-// signature via flagBadBackup / flagMissingBackups. The trailing
-// prunes clear series whose condition resolved — an unpaused
-// Schedule or a fresh healthy backup must not pin the gauge at 1.
+// signature via flagBadBackup / flagMissingBackups. When retryEnabled
+// is set, unpaused Schedules whose latest Backup failed are also
+// evaluated for a guarded one-shot retry. The trailing prunes clear
+// series whose condition resolved — an unpaused Schedule or a fresh
+// healthy backup must not pin the gauge at 1.
 func (a *veleroBackupAuditor) auditSchedules(ctx context.Context,
-	latest map[string]*unstructured.Unstructured, log logr.Logger) (bool, int, error) {
+	latest map[string]*unstructured.Unstructured,
+	activeSchedules map[string]bool,
+	log logr.Logger) (bool, int, error) {
 	pausedNow := map[string]bool{}
+	bslCache := map[string]bool{}
 	count := 0
 	err := a.veleroListEach(ctx, veleroScheduleGVR,
 		func(page []unstructured.Unstructured) error {
@@ -73,6 +82,9 @@ func (a *veleroBackupAuditor) auditSchedules(ctx context.Context,
 					continue
 				}
 				a.flagBadBackup(ctx, s, b, ns, name)
+				if a.retryEnabled && !isPaused {
+					a.maybeRetryFailedBackup(ctx, s, b, ns, name, activeSchedules, bslCache, log)
+				}
 			}
 			return nil
 		})
@@ -251,4 +263,179 @@ func scheduleRunsWeeklyOrMonthly(s *unstructured.Unstructured) bool {
 	// like "0 0 ? * MON" is still weekly via its day-of-week.
 	restricted := func(v string) bool { return v != "*" && v != "?" }
 	return restricted(dom) || restricted(dow)
+}
+
+// isFailedBackupPhase reports whether phase is one of Velero's terminal
+// failure phases eligible for automatic one-shot retry.
+func isFailedBackupPhase(phase string) bool {
+	return phase == "Failed" || phase == "PartiallyFailed" || phase == "FailedValidation"
+}
+
+// maybeRetryFailedBackup creates one replacement velero.io/v1 Backup when an
+// unpaused Schedule's latest Backup failed, subject to five safety gates:
+//  1. Target BSL (schedule.spec.template.storageLocation, default "default")
+//     is currently phase=Available.
+//  2. No Backup for this Schedule is currently InProgress / New /
+//     WaitingForPluginOperations.
+//  3. The Schedule has not already retried this exact Backup
+//     (AnnoLastVeleroBackupRetry != latestBackup.Name).
+//  4. Per-Schedule retry cooldown (>= RetryCooldown, default 2h) has elapsed.
+//  5. Maintenance mutex + heal budget pass via heal.AllowedV.
+func (a *veleroBackupAuditor) maybeRetryFailedBackup(ctx context.Context,
+	s, latestBackup *unstructured.Unstructured, ns, schedule string,
+	activeSchedules map[string]bool, bslCache map[string]bool, log logr.Logger) {
+
+	phase, _ := kube.NestedString(latestBackup.Object, "status", "phase")
+	if !isFailedBackupPhase(phase) {
+		return
+	}
+	schedKey := ns + "/" + schedule
+	if activeSchedules[schedKey] {
+		log.V(1).Info("skip velero backup retry: schedule already has an active backup",
+			"schedule", schedKey, "failedBackup", latestBackup.GetName())
+		return
+	}
+	if s.GetAnnotations()[kube.AnnoLastVeleroBackupRetry] == latestBackup.GetName() {
+		log.V(1).Info("skip velero backup retry: failed backup already retried",
+			"schedule", schedKey, "failedBackup", latestBackup.GetName())
+		return
+	}
+	bslName, _ := kube.NestedString(s.Object, "spec", "template", "storageLocation")
+	if bslName == "" {
+		bslName = "default"
+	}
+	if !a.isBSLAvailable(ctx, ns, bslName, bslCache, log) {
+		log.Info("skip velero backup retry: target BSL not Available",
+			"schedule", schedKey, "bsl", ns+"/"+bslName, "failedBackup", latestBackup.GetName())
+		return
+	}
+
+	now := a.now.Now()
+	cooldownKey := "backup-retry/" + schedKey
+	proceed, unverifiable := heal.AllowedV(ctx, log, a.verdict, a.cs, a.dyn,
+		&a.backupRetried, cooldownKey, a.backupRetryCooldown(), now)
+	switch {
+	case unverifiable:
+		metrics.IncError(a.queue)
+		return
+	case !proceed:
+		return
+	}
+
+	retryBackup := buildRetryBackup(s, latestBackup, ns, schedule, now)
+	if _, err := a.dyn.Resource(veleroBackupGVR).Namespace(ns).Create(
+		ctx, retryBackup, metav1.CreateOptions{}); err != nil {
+		heal.RefundGrant(now)
+		metrics.IncError(a.queue)
+		log.Error(err, "failed to create retry velero backup",
+			"schedule", schedKey, "failedBackup", latestBackup.GetName(),
+			"retryBackup", retryBackup.GetName())
+		return
+	}
+	a.backupRetried.Stamp(cooldownKey, now)
+
+	patch, err := kube.MergePatchAnnos(map[string]any{
+		kube.AnnoLastVeleroBackupRetry: latestBackup.GetName(),
+	})
+	if err != nil {
+		metrics.IncError(a.queue)
+		log.Error(err, "failed to encode velero schedule retry annotation patch",
+			"schedule", schedKey)
+		return
+	}
+	if _, err := a.dyn.Resource(veleroScheduleGVR).Namespace(ns).Patch(
+		ctx, schedule, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		metrics.IncError(a.queue)
+		log.Error(err, "failed to patch retry annotation on velero schedule",
+			"schedule", schedKey, "failedBackup", latestBackup.GetName())
+		return
+	}
+	log.Info("ACTION: auto-retried failed velero scheduled backup",
+		"schedule", schedKey, "failedBackup", latestBackup.GetName(),
+		"retryBackup", retryBackup.GetName(), "bsl", bslName)
+}
+
+// isBSLAvailable checks whether the named BackupStorageLocation in ns
+// reports status.phase == "Available", memoized per sweep in bslCache.
+// Any lookup failure or missing BSL fails closed (false).
+func (a *veleroBackupAuditor) isBSLAvailable(ctx context.Context,
+	ns, name string, cache map[string]bool, log logr.Logger) bool {
+	key := ns + "/" + name
+	if avail, ok := cache[key]; ok {
+		return avail
+	}
+	bsl, err := a.dyn.Resource(veleroBSLGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		log.V(1).Info("velero BSL lookup failed — treating as unavailable",
+			"bsl", key, "error", err)
+		cache[key] = false
+		return false
+	}
+	phase, _ := kube.NestedString(bsl.Object, "status", "phase")
+	avail := phase == "Available"
+	cache[key] = avail
+	return avail
+}
+
+// veleroRetryBackupName constructs a DNS-1123 safe backup name of the form
+// "<schedule>-retry-<unix>" bounded to <= 63 characters.
+func veleroRetryBackupName(schedule string, now time.Time) string {
+	const maxLen = 63
+	suffix := fmt.Sprintf("-retry-%d", now.Unix())
+	maxPrefix := maxLen - len(suffix)
+	prefix := schedule
+	if len(prefix) > maxPrefix {
+		prefix = strings.TrimRight(prefix[:maxPrefix], "-.")
+	}
+	if prefix == "" {
+		prefix = "velero"
+	}
+	return prefix + suffix
+}
+
+// truncateDNSLabel trims a Kubernetes label value to <= 63 chars with valid
+// trailing alphanumeric characters.
+func truncateDNSLabel(v string) string {
+	const maxLen = 63
+	if len(v) <= maxLen {
+		return v
+	}
+	return strings.TrimRight(v[:maxLen], "-._")
+}
+
+// buildRetryBackup constructs the unstructured velero.io/v1 Backup for a
+// failed-backup retry, copying spec from schedule.spec.template and stamping
+// velero.io/schedule-name + passiontech.dev/retry-of labels.
+func buildRetryBackup(scheduleObj, failedBackup *unstructured.Unstructured,
+	ns, schedule string, now time.Time) *unstructured.Unstructured {
+	labels := map[string]string{}
+	if tplMeta, ok, _ := unstructured.NestedStringMap(
+		scheduleObj.Object, "spec", "template", "metadata", "labels"); ok {
+		for k, v := range tplMeta {
+			labels[k] = v
+		}
+	}
+	labels[veleroScheduleLabel] = schedule
+	labels[kube.LabelVeleroRetryOf] = truncateDNSLabel(failedBackup.GetName())
+
+	specCopy := map[string]any{}
+	if rawTpl, found, _ := unstructured.NestedMap(scheduleObj.Object, "spec", "template"); found && rawTpl != nil {
+		if copied, ok := runtime.DeepCopyJSONValue(rawTpl).(map[string]any); ok {
+			specCopy = copied
+		}
+	}
+
+	u := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": veleroBackupGVR.GroupVersion().String(),
+			"kind":       "Backup",
+			"metadata": map[string]any{
+				"name":      veleroRetryBackupName(schedule, now),
+				"namespace": ns,
+			},
+			"spec": specCopy,
+		},
+	}
+	u.SetLabels(labels)
+	return u
 }

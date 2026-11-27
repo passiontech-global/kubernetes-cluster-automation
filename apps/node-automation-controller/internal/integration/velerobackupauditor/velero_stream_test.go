@@ -40,7 +40,7 @@ func TestCollectBackupsStreamsEveryPage(t *testing.T) {
 		})
 	a := newVeleroAuditor(dyn, now)
 
-	latest, stuck, err := a.collectBackups(ctx)
+	latest, _, stuck, err := a.collectBackups(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestAuditSchedulesStreamsEveryPage(t *testing.T) {
 	a := newVeleroAuditor(dyn, now)
 	a.seenPaused.Begin()
 
-	present, count, err := a.auditSchedules(ctx, nil, logf.FromContext(ctx))
+	present, count, err := a.auditSchedules(ctx, nil, nil, logf.FromContext(ctx))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestInFlightSubsetCollectedFromEveryPage(t *testing.T) {
 		})
 	a := newVeleroAuditor(dyn, now)
 
-	_, stuck, err := a.collectBackups(ctx)
+	_, _, stuck, err := a.collectBackups(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

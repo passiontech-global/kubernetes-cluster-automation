@@ -80,6 +80,8 @@ type apiserverNodeReachabilityCheck struct {
 	// the fake clientset cannot serve); a field so tests stub the
 	// outcome per node, the kubeletreaper seam.
 	probeFn func(ctx context.Context, node string) bool
+	// probeGap overrides probeRetryGap in tests (0 = default probeRetryGap).
+	probeGap time.Duration
 }
 
 // NewApiserverNodeReachabilityCheck builds the apiserver-node-reachability check.
@@ -112,6 +114,11 @@ const (
 	// can sit for the full 8s KubeletHealthz timeout, so an unbounded
 	// fan-out on a large fleet is the apiserver's biggest burst.
 	probeWorkers = 8
+	// probeAttempts retries 2 times (3 total attempts) before marking a
+	// node dark so one-shot proxy/network blips do not false-positive.
+	probeAttempts = 3
+	// probeRetryGap is the short backoff between healthz retry attempts.
+	probeRetryGap = 2 * time.Second
 )
 
 var (
@@ -131,15 +138,45 @@ func init() {
 
 // probe reports whether the apiserver can reach the node's kubelet
 // through its proxy path — the same hop kubectl logs/exec take.
-// KubeletHealthz returns the raw body; healthy kubelets answer "ok".
+// KubeletHealthz returns the raw body; healthy kubelets answer "ok"
+// (often with a trailing newline). Retries twice (3 attempts total)
+// with a short backoff before returning false to absorb one-shot blips.
 func (c *apiserverNodeReachabilityCheck) probe(ctx context.Context, node string) bool {
-	body, err := kube.KubeletHealthz(ctx, c.Deps.CS, node)
-	return err == nil && strings.HasPrefix(string(body), "ok")
+	gapDur := probeRetryGap
+	if c.probeGap > 0 {
+		gapDur = c.probeGap
+	}
+	var gap *time.Timer
+	defer func() {
+		if gap != nil {
+			gap.Stop()
+		}
+	}()
+	for i := range probeAttempts {
+		if i > 0 {
+			if gap == nil {
+				gap = time.NewTimer(gapDur)
+			} else {
+				gap.Reset(gapDur)
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case <-gap.C:
+			}
+		}
+		body, err := kube.KubeletHealthz(ctx, c.Deps.CS, node)
+		if err == nil && strings.TrimSpace(string(body)) == "ok" {
+			return true
+		}
+	}
+	return false
 }
 
-// Run executes one reachability sweep: probe every Ready worker,
-// fence persisted-dark nodes, then evacuate their Fail-policy
-// webhook backends.
+// Run executes one reachability sweep: probe every Ready worker (plus any
+// non-control-plane node still carrying TaintApiserverUnreachable so
+// recovery untaint runs even if Ready is currently False), fence
+// persisted-dark nodes, then evacuate their Fail-policy webhook backends.
 func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := c.Now()
@@ -151,7 +188,10 @@ func (c *apiserverNodeReachabilityCheck) Run(ctx context.Context) probefw.Result
 	var candidates []corev1.Node
 	for i := range nodes {
 		n := &nodes[i]
-		if kube.IsControlPlane(n) || !kube.NodeReady(n) {
+		if kube.IsControlPlane(n) {
+			continue
+		}
+		if !kube.NodeReady(n) && !kube.HasTaint(n.Spec.Taints, kube.TaintApiserverUnreachable) {
 			continue
 		}
 		candidates = append(candidates, *n)
@@ -356,7 +396,7 @@ func (c *apiserverNodeReachabilityCheck) untaintRecovered(ctx context.Context,
 	rep *probefw.SweepReport, nodes []corev1.Node, dark map[string]bool) {
 	for i := range nodes {
 		n := &nodes[i]
-		if kube.IsControlPlane(n) || !kube.NodeReady(n) {
+		if kube.IsControlPlane(n) {
 			continue
 		}
 		if !kube.HasTaint(n.Spec.Taints, kube.TaintApiserverUnreachable) ||

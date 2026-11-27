@@ -368,4 +368,17 @@ var (
 	// ---------------------------------------------------------------
 	GVRResourceClaim = schema.GroupVersionResource{
 		Group: "resource.k8s.io", Version: "v1", Resource: "resourceclaims"}
+
+	// ---------------------------------------------------------------
+	// VictoriaMetrics & Prometheus Operator scrape CRDs
+	// (api-object-sprawl-report-gc orphan scrape CRD auditor).
+	// ---------------------------------------------------------------
+	GVRVMServiceScrape = schema.GroupVersionResource{
+		Group: "operator.victoriametrics.com", Version: "v1beta1", Resource: "vmservicescrapes"}
+	GVRVMPodScrape = schema.GroupVersionResource{
+		Group: "operator.victoriametrics.com", Version: "v1beta1", Resource: "vmpodscrapes"}
+	GVRServiceMonitor = schema.GroupVersionResource{
+		Group: "monitoring.coreos.com", Version: "v1", Resource: "servicemonitors"}
+	GVRPodMonitor = schema.GroupVersionResource{
+		Group: "monitoring.coreos.com", Version: "v1", Resource: "podmonitors"}
 )

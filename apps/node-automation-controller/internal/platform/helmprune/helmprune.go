@@ -118,6 +118,15 @@ func PruneSupersededHelmSecrets(ctx context.Context,
 		maxSuperseded, hooks)
 }
 
+// LargeSecretCap tightens maxSuperseded for releases whose secret payload
+// exceeds Threshold bytes (e.g. >512 KiB Kine large-object guard) so giant
+// charts do not retain 10 multi-hundred-KiB rows in Kine. A zero Threshold
+// disables size-based tightening.
+type LargeSecretCap struct {
+	Threshold     int
+	MaxSuperseded int
+}
+
 // PruneSupersededHelmSecretsMeta is PruneSupersededHelmSecrets with
 // the metadata client threaded through: meta feeds
 // kube.ListPartialOrFallback's preferred read (PartialObjectMetadata —
@@ -131,6 +140,19 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 	dyn dynamic.Interface, maxSuperseded int,
 	hooks HelmSecretPruneHooks) ([]corev1.Secret, error) {
 
+	return PruneSupersededHelmSecretsMetaWithCap(ctx, meta, cs, dyn,
+		maxSuperseded, LargeSecretCap{}, hooks)
+}
+
+// PruneSupersededHelmSecretsMetaWithCap extends PruneSupersededHelmSecretsMeta
+// with an optional tighter keep cap for releases whose secret data size
+// exceeds largeCap.Threshold bytes.
+func PruneSupersededHelmSecretsMetaWithCap(ctx context.Context,
+	meta metadata.Interface, cs kubernetes.Interface,
+	dyn dynamic.Interface, maxSuperseded int,
+	largeCap LargeSecretCap,
+	hooks HelmSecretPruneHooks) ([]corev1.Secret, error) {
+
 	// The field selector pushes the Secret.type filter to the
 	// apiserver — helm release secrets are a tiny slice of the
 	// secrets table, and the compressed chart payloads behind every
@@ -141,11 +163,12 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 		Limit:         kube.DefaultListPageSize}
 
 	var secrets []corev1.Secret
+	var dataSizes map[string]int
 	var err error
 	if meta != nil {
 		secrets, err = listHelmSecretsPartial(ctx, meta, cs, dyn, opts)
 	} else {
-		secrets, err = listHelmSecretsTyped(ctx, cs, opts)
+		secrets, dataSizes, err = listHelmSecretsTyped(ctx, cs, opts, largeCap.Threshold > 0)
 	}
 	if err != nil {
 		return nil, err
@@ -175,6 +198,7 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 		// Highest revision across ALL statuses — the one secret that
 		// is never pruned even when it is itself superseded.
 		highest := -1
+		var highestSec *corev1.Secret
 		var superseded []supersededSecret
 		for i := range relSecrets {
 			s := &relSecrets[i]
@@ -184,17 +208,42 @@ func PruneSupersededHelmSecretsMeta(ctx context.Context,
 			}
 			if v > highest {
 				highest = v
+				highestSec = s
 			}
 			if s.Labels["status"] == "superseded" {
 				superseded = append(superseded, supersededSecret{s, v})
 			}
 		}
-		excess := len(superseded) - maxSuperseded
+		keepCap := maxSuperseded
+		if largeCap.Threshold > 0 && largeCap.MaxSuperseded < keepCap &&
+			len(superseded) > largeCap.MaxSuperseded {
+			isLarge := false
+			if dataSizes != nil {
+				for _, cand := range superseded {
+					if dataSizes[cand.s.Namespace+"/"+cand.s.Name] > largeCap.Threshold {
+						isLarge = true
+						break
+					}
+				}
+			} else if highestSec != nil {
+				// PartialObjectMetadata omits .Data — fetch only the
+				// newest superseded revision for releases above largeCap
+				// to check whether the release exceeds the byte guard.
+				if full, gerr := cs.CoreV1().Secrets(highestSec.Namespace).
+					Get(ctx, highestSec.Name, metav1.GetOptions{}); gerr == nil {
+					isLarge = secretDataSize(full) > largeCap.Threshold
+				}
+			}
+			if isLarge {
+				keepCap = largeCap.MaxSuperseded
+			}
+		}
+		excess := len(superseded) - keepCap
 		if excess <= 0 {
 			continue
 		}
 		if hooks.Excess != nil {
-			hooks.Excess(k.ns, k.name, len(superseded), maxSuperseded)
+			hooks.Excess(k.ns, k.name, len(superseded), keepCap)
 		}
 		slices.SortFunc(superseded, func(a, b supersededSecret) int {
 			return cmp.Compare(a.v, b.v)
@@ -278,6 +327,20 @@ func listHelmSecretsPartial(ctx context.Context,
 	return secrets, nil
 }
 
+// secretDataSize returns the total payload byte size across a Secret's
+// Data and StringData maps — matching the payload accounting used by the
+// 512 KiB Kine large-object guard without marshalling the whole object.
+func secretDataSize(s *corev1.Secret) int {
+	n := 0
+	for _, v := range s.Data {
+		n += len(v)
+	}
+	for _, v := range s.StringData {
+		n += len(v)
+	}
+	return n
+}
+
 // listHelmSecretsTyped is the no-metadata-client read — the path
 // every fake-clientset unit test takes. It stays a typed kube.ListAll
 // (NOT kube.ListPartialOrFallback's typed fallback, which would project
@@ -287,7 +350,7 @@ func listHelmSecretsPartial(ctx context.Context,
 // .Data still decodes on this path, but it only ever serves tests
 // and meta-less degraded wiring; production always has Deps.Meta.
 func listHelmSecretsTyped(ctx context.Context, cs kubernetes.Interface,
-	opts metav1.ListOptions) ([]corev1.Secret, error) {
+	opts metav1.ListOptions, recordSizes bool) ([]corev1.Secret, map[string]int, error) {
 
 	raw, err := kube.ListAll(ctx, opts, kube.Secrets(cs, metav1.NamespaceAll))
 	if err != nil && apierrors.IsBadRequest(err) {
@@ -299,13 +362,20 @@ func listHelmSecretsTyped(ctx context.Context, cs kubernetes.Interface,
 		raw, err = kube.ListAll(ctx, opts, kube.Secrets(cs, metav1.NamespaceAll))
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	secrets := make([]corev1.Secret, 0, len(raw))
+	var sizes map[string]int
+	if recordSizes {
+		sizes = make(map[string]int, len(raw))
+	}
 	for i := range raw {
 		s := &raw[i]
 		if s.Type != corev1.SecretType(helmReleaseSecretType) {
 			continue
+		}
+		if recordSizes {
+			sizes[s.Namespace+"/"+s.Name] = secretDataSize(s)
 		}
 		// The decision needs only metadata — each revision embeds
 		// the compressed chart (MBs). Drop the payload before the
@@ -314,5 +384,5 @@ func listHelmSecretsTyped(ctx context.Context, cs kubernetes.Interface,
 		s.Data = nil
 		secrets = append(secrets, *s)
 	}
-	return secrets, nil
+	return secrets, sizes, nil
 }

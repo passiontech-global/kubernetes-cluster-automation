@@ -237,6 +237,13 @@ const (
 	// AnnoMutableImageExempt exempts a workload/pod from
 	// image-resilience-auditor checks when set to "true".
 	AnnoMutableImageExempt = "passiontech.dev/mutable-image-exempt"
+	// AnnoLastVeleroBackupRetry records the name of the failed Velero Backup
+	// that velero-backup-auditor last auto-retried for this Schedule so the
+	// same failed backup is never retried twice.
+	AnnoLastVeleroBackupRetry = "passiontech.dev/last-velero-backup-retry"
+	// LabelVeleroRetryOf labels an auto-retried Velero Backup with the name
+	// of the failed Backup it replaces.
+	LabelVeleroRetryOf = "passiontech.dev/retry-of"
 )
 
 // ---------------------------------------------------------------------------

@@ -145,6 +145,11 @@ const veleroRepoNotReadyMinAge = 30 * time.Minute
 // but is not delete-looped.
 const veleroRepoHealedCooldown = 2 * time.Hour
 
+// veleroBackupRetryCooldownDefault is the default minimum interval
+// between automatic failed-backup retries on the same Schedule
+// (VELERO_FAILED_BACKUP_RETRY_COOLDOWN).
+const veleroBackupRetryCooldownDefault = 2 * time.Hour
+
 // veleroListEach pages a full dynamic List through the shared page
 // bound and visits EVERY PAGE in the callback — it never accumulates
 // a whole []unstructured.Unstructured in RAM. Each caller keeps only
@@ -303,6 +308,12 @@ type veleroBackupAuditor struct {
 	// the 2h cooldown that stops a still-broken repo being
 	// delete-looped.
 	repoHealed state.CooldownSet
+	// retryEnabled / retryCooldown / backupRetried drive automatic
+	// one-shot retry of Failed/PartiallyFailed/FailedValidation
+	// scheduled backups when their target BSL is Available.
+	retryEnabled  bool
+	retryCooldown time.Duration
+	backupRetried state.CooldownSet
 	// verdict memoizes the maintenance-mutex evaluation for the
 	// sweep's PVB-cleanup preambles — the deletes below are
 	// destructive (a PVB object AND a live node-agent pod), so they
@@ -320,22 +331,43 @@ func (a *veleroBackupAuditor) veleroInstallNS() string {
 	return a.veleroNS
 }
 
+// backupRetryCooldown returns the effective per-schedule retry cooldown
+// (zero value defaults to veleroBackupRetryCooldownDefault for tests).
+func (a *veleroBackupAuditor) backupRetryCooldown() time.Duration {
+	if a.retryCooldown <= 0 {
+		return veleroBackupRetryCooldownDefault
+	}
+	return a.retryCooldown
+}
+
+type veleroSetupConfig struct {
+	veleroNS      string
+	retryEnabled  bool
+	retryCooldown time.Duration
+}
+
 // Setup registers the 15m sweep — or nothing when
 // the cluster opts out (VELERO_BACKUP_AUDITOR_ENABLED=false, resolved
 // by setupModules into Deps.Disabled): same disabled-flag pattern as
 // cert-drift-auditor.
 func Setup(d shared.Deps) error {
 	mgr, cs, dyn := d.Mgr, d.CS, d.Dyn
-	return shared.SetupWithConfig(d, func() string {
-		return envx.Getenv("VELERO_NAMESPACE", veleroInstallNSDefault)
-	}, func(veleroNS string) error {
+	return shared.SetupWithConfig(d, func() veleroSetupConfig {
+		return veleroSetupConfig{
+			veleroNS:      envx.Getenv("VELERO_NAMESPACE", veleroInstallNSDefault),
+			retryEnabled:  envx.Gate("VELERO_FAILED_BACKUP_RETRY_ENABLED", true),
+			retryCooldown: envx.GetenvDuration("VELERO_FAILED_BACKUP_RETRY_COOLDOWN", veleroBackupRetryCooldownDefault),
+		}
+	}, func(cfg veleroSetupConfig) error {
 		a := &veleroBackupAuditor{
-			verdict:  d.Maintenance,
-			cs:       cs,
-			dyn:      dyn,
-			veleroNS: veleroNS,
-			now:      shared.SystemClock,
-			queue:    d.Name,
+			verdict:       d.Maintenance,
+			cs:            cs,
+			dyn:           dyn,
+			veleroNS:      cfg.veleroNS,
+			retryEnabled:  cfg.retryEnabled,
+			retryCooldown: cfg.retryCooldown,
+			now:           shared.SystemClock,
+			queue:         d.Name,
 		}
 		return shared.AddPeriodic(mgr, a.queue, veleroAuditInterval, a.run)
 	})
@@ -379,13 +411,16 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 	restoreErr := a.auditRestores(ctx)
 
 	// Stream the Backup census once, keeping only the newest Backup
-	// per Schedule (for the rot checks) and the in-flight-phase subset
-	// (for the wedge audit) instead of a whole UnstructuredList.
-	latest, stuckBackups, err := a.collectBackups(ctx)
+	// per Schedule (for the rot checks), the set of Schedules with an
+	// active Backup in flight (for auto-retry safety), and the
+	// in-flight-phase subset (for the wedge audit) instead of a whole
+	// UnstructuredList.
+	latest, activeSchedules, stuckBackups, err := a.collectBackups(ctx)
 	if err != nil {
 		return errors.Join(dbErr, restoreErr, err)
 	}
-	present, scheduleCount, err := a.auditSchedules(ctx, latest, log)
+	a.backupRetried.PruneExpired(a.now.Now(), a.backupRetryCooldown())
+	present, scheduleCount, err := a.auditSchedules(ctx, latest, activeSchedules, log)
 	if err != nil {
 		return errors.Join(dbErr, restoreErr, err)
 	}
@@ -456,13 +491,15 @@ func (a *veleroBackupAuditor) run(ctx context.Context) error {
 // A missing Backups CRD is tolerated — the paused-schedule check
 // still runs on an empty backup view; any other list error aborts.
 func (a *veleroBackupAuditor) collectBackups(ctx context.Context) (
-	map[string]*unstructured.Unstructured, []*unstructured.Unstructured, error) {
+	map[string]*unstructured.Unstructured, map[string]bool, []*unstructured.Unstructured, error) {
 	latest := map[string]*unstructured.Unstructured{}
+	activeSchedules := map[string]bool{}
 	stuck := []*unstructured.Unstructured{}
 	err := a.veleroListEach(ctx, veleroBackupGVR,
 		func(page []unstructured.Unstructured) error {
 			for i := range page {
 				b := &page[i]
+				phase, _ := kube.NestedString(b.Object, "status", "phase")
 				if sched := b.GetLabels()[veleroScheduleLabel]; sched != "" {
 					key := b.GetNamespace() + "/" + sched
 					cur, ok := latest[key]
@@ -470,18 +507,22 @@ func (a *veleroBackupAuditor) collectBackups(ctx context.Context) (
 						b.GetCreationTimestamp().After(cur.GetCreationTimestamp().Time) {
 						latest[key] = b.DeepCopy()
 					}
+					switch phase {
+					case "InProgress", "New", "WaitingForPluginOperations":
+						activeSchedules[key] = true
+					}
 				}
-				if phase, _ := kube.NestedString(b.Object, "status", "phase"); phase == "InProgress" || phase == "Deleting" {
+				if phase == "InProgress" || phase == "Deleting" {
 					stuck = append(stuck, b.DeepCopy())
 				}
 			}
 			return nil
 		})
 	if kube.IsCRDAbsent(err) {
-		return latest, stuck, nil
+		return latest, activeSchedules, stuck, nil
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("list velero backups: %w", err)
+		return nil, nil, nil, fmt.Errorf("list velero backups: %w", err)
 	}
-	return latest, stuck, nil
+	return latest, activeSchedules, stuck, nil
 }

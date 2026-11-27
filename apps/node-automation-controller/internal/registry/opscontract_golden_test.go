@@ -366,6 +366,7 @@ var goldenMetricFamilies = []string{
 	"node_automation_dra_claim_wedged",
 	"node_automation_dra_claim_heals_total",
 	"node_automation_velero_restore_stuck",
+	"node_automation_orphan_scrape_crd_count",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key
@@ -457,6 +458,8 @@ var goldenAnnoKeys = []struct{ Key, Value string }{
 	{"AnnoMassPruneExpected", "passiontech.dev/mass-prune-expected"},
 	{"AnnoMassPruneSuspendedBy", "passiontech.dev/mass-prune-suspended-by"},
 	{"AnnoMutableImageExempt", "passiontech.dev/mutable-image-exempt"},
+	{"AnnoLastVeleroBackupRetry", "passiontech.dev/last-velero-backup-retry"},
+	{"LabelVeleroRetryOf", "passiontech.dev/retry-of"},
 }
 
 func TestGoldenRegistryRows(t *testing.T) {
@@ -772,6 +775,10 @@ func annoKeyFor(t *testing.T, name string) string {
 		return kube.AnnoMassPruneSuspendedBy
 	case "AnnoMutableImageExempt":
 		return kube.AnnoMutableImageExempt
+	case "AnnoLastVeleroBackupRetry":
+		return kube.AnnoLastVeleroBackupRetry
+	case "LabelVeleroRetryOf":
+		return kube.LabelVeleroRetryOf
 	default:
 		t.Fatalf("golden key %s no longer exists as an exported const in internal/platform/kube/annos.go — update the golden consciously", name)
 		return ""

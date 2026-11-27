@@ -19,8 +19,15 @@ import (
 
 const (
 	// sprawlMaxSuperseded is the per-release keep cap for superseded
-	// helm revision secrets.
+	// helm revision secrets of normal size (<= kineLargeObjectThreshold).
 	sprawlMaxSuperseded = 10
+
+	// sprawlLargeMaxSuperseded tightens the superseded keep cap for Helm
+	// release secrets whose data payload exceeds kineLargeObjectThreshold
+	// (512 KiB — e.g. external-secrets, argocd, cert-manager, cilium) so
+	// large charts keep at most 2 rollback revisions instead of 10 giant
+	// Kine rows while preserving the deployed revision untouched.
+	sprawlLargeMaxSuperseded = 2
 
 	// sprawlHelmSecretsResource is the resource label the census
 	// reports helm release secrets under (they are core Secrets, so
@@ -55,8 +62,11 @@ func init() {
 func (p *apiObjectSprawlReportGCCheck) pruneHelmSecrets(ctx context.Context,
 	log logr.Logger, objects, helmRep *probefw.SweepReport) error {
 
-	secrets, err := helmprune.PruneSupersededHelmSecretsMeta(ctx, p.Meta, p.CS, p.Dyn,
-		sprawlMaxSuperseded, helmprune.HelmSecretPruneHooks{
+	secrets, err := helmprune.PruneSupersededHelmSecretsMetaWithCap(ctx, p.Meta, p.CS, p.Dyn,
+		sprawlMaxSuperseded, helmprune.LargeSecretCap{
+			Threshold:     kineLargeObjectThreshold,
+			MaxSuperseded: sprawlLargeMaxSuperseded,
+		}, helmprune.HelmSecretPruneHooks{
 			Excess: func(ns, release string, superseded, cap int) {
 				helmRep.Set(helmSecretsExcessGauge,
 					float64(superseded-cap), ns+"/"+release,
