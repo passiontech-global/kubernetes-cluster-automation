@@ -328,6 +328,15 @@ func (f *Fixture) MkProc(t *testing.T, pid int, comm string, args []string, age 
 		"0::/system.slice/k0scontroller.service\n")
 }
 
+// SetProcRSS writes /proc/<pid>/status with VmRSS set to rssBytes
+// (rounded down to KiB, matching Linux's "VmRSS: <n> kB" format).
+func (f *Fixture) SetProcRSS(t *testing.T, pid int, rssBytes uint64) {
+	t.Helper()
+	d := filepath.Join(f.Proc, strconv.Itoa(pid))
+	testutil.WriteFile(t, filepath.Join(d, "status"),
+		fmt.Sprintf("VmRSS:\t%d kB\n", rssBytes>>10))
+}
+
 // MkSock links one fd to a socket inode and appends a net/tcp row
 // to remote port dbPort (ESTABLISHED).
 func (f *Fixture) MkSock(t *testing.T, pid int, fd int, inode string, dbPort int) {

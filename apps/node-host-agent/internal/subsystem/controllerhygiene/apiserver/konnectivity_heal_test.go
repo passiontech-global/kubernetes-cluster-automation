@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
@@ -644,5 +645,226 @@ func TestKonnectivityReadyWorkersDrainsBody(t *testing.T) {
 				t.Fatalf("expected 0 kills on 0 ready workers, got %v", e.Kills)
 			}
 		})
+	}
+}
+
+// --- konnectivity-server goroutine & RSS leak guard ---
+
+func setupHealthyKonnectivityTunnel(t *testing.T, e *env) {
+	t.Helper()
+	runDir := t.TempDir()
+	e.H.Cfg.K0sRunDir = runDir
+	if err := os.MkdirAll(filepath.Join(runDir, "konnectivity-server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "konnectivity-server",
+		"konnectivity-server.sock"), []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.H.Client = &http.Client{Transport: nodesTransport{readyWorkers: 2}}
+	e.MkProc(t, 4242, "konnectivity-se",
+		[]string{"/var/lib/k0s/bin/konnectivity-server", "--uds-name=x"}, 600)
+}
+
+func TestKonnectivityLeakGuardNormalNoop(t *testing.T) {
+	e := fixture(t)
+	setupHealthyKonnectivityTunnel(t, e)
+	e.SetProcRSS(t, 4242, 42<<20) // 42 MiB — normal
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 2\n" +
+				"go_goroutines 199\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	for range 5 {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 0 {
+		t.Fatalf("normal konnectivity-server triggered kill: %v", e.Kills)
+	}
+}
+
+func TestKonnectivityLeakGuardGoroutinesSIGTERM(t *testing.T) {
+	e := fixture(t)
+	setupHealthyKonnectivityTunnel(t, e)
+	e.SetProcRSS(t, 4242, 42<<20) // RSS normal; goroutines leaking
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "# HELP go_goroutines Number of goroutines.\n" +
+				"konnectivity_network_proxy_server_ready_backend_connections 2\n" +
+				"go_goroutines 60254\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	// Cycles 1 & 2: below 3-cycle streak -> no SIGTERM.
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 0 {
+		t.Fatalf("kill fired before 3-cycle streak: %v", e.Kills)
+	}
+	// Cycle 3: 3 consecutive leak cycles -> SIGTERM.
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 || e.Kills[0].PID != 4242 || e.Kills[0].Sig != syscall.SIGTERM {
+		t.Fatalf("kills=%v want [{4242 SIGTERM}]", e.Kills)
+	}
+	log := e.LogLines()
+	if !strings.Contains(log, "ACTION:") || !strings.Contains(log, "goroutines=60254>10000") {
+		t.Fatalf("ACTION log missing goroutines reason:\n%s", log)
+	}
+}
+
+func TestKonnectivityLeakGuardRSSSIGTERM(t *testing.T) {
+	e := fixture(t)
+	setupHealthyKonnectivityTunnel(t, e)
+	e.SetProcRSS(t, 4242, 1844<<20) // 1844 MiB > 512 MiB
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 2\n" +
+				"go_goroutines 199\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 0 {
+		t.Fatalf("RSS kill fired before 3-cycle streak: %v", e.Kills)
+	}
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 1 || e.Kills[0].PID != 4242 || e.Kills[0].Sig != syscall.SIGTERM {
+		t.Fatalf("kills=%v want [{4242 SIGTERM}]", e.Kills)
+	}
+	log := e.LogLines()
+	if !strings.Contains(log, "ACTION:") || !strings.Contains(log, "rss_mib=1844>512") {
+		t.Fatalf("ACTION log missing rss_mib reason:\n%s", log)
+	}
+}
+
+func TestKonnectivityLeakGuardSpikeOneCycleNoKill(t *testing.T) {
+	e := fixture(t)
+	setupHealthyKonnectivityTunnel(t, e)
+	e.SetProcRSS(t, 4242, 42<<20)
+	goroutines := 60254
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return fmt.Sprintf("konnectivity_network_proxy_server_ready_backend_connections 2\n"+
+				"go_goroutines %d\n", goroutines), nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	// Spike 1 cycle -> recover -> 2 leak cycles: never reaches 3 consecutive.
+	e.H.Cycle(context.Background())
+	goroutines = 199
+	e.H.Cycle(context.Background())
+	goroutines = 60254
+	e.H.Cycle(context.Background())
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 0 {
+		t.Fatalf("transient 1-cycle spike caused kill: %v", e.Kills)
+	}
+}
+
+func TestKonnectivityLeakGuardCooldownActiveNoDoubleKill(t *testing.T) {
+	e := fixture(t)
+	setupHealthyKonnectivityTunnel(t, e)
+	e.SetProcRSS(t, 4242, 1844<<20)
+	e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+		if url == "http://127.0.0.1:8091/metrics" {
+			return "konnectivity_network_proxy_server_ready_backend_connections 2\n" +
+				"go_goroutines 60254\n", nil
+		}
+		return "", errors.New("unexpected scrape " + url)
+	}
+	// First 3 cycles -> first SIGTERM.
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 1 || e.Kills[0].Sig != syscall.SIGTERM {
+		t.Fatalf("first kill missing: %v", e.Kills)
+	}
+	// Still inside 30m cooldown -> 3 more leak cycles must NOT double kill.
+	e.Now = e.Now.Add(15 * time.Minute)
+	for range 3 {
+		e.H.Cycle(context.Background())
+	}
+	if len(e.Kills) != 1 {
+		t.Fatalf("cooldown failed to suppress double kill: %v", e.Kills)
+	}
+	// Past 30m cooldown -> next leak cycle kills again.
+	e.Now = e.Now.Add(20 * time.Minute)
+	e.H.Cycle(context.Background())
+	if len(e.Kills) != 2 || e.Kills[1].Sig != syscall.SIGTERM {
+		t.Fatalf("expected second SIGTERM after cooldown, got %v", e.Kills)
+	}
+}
+
+func TestKonnectivityLeakGuardDisabledWhenKnobZero(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(e *env)
+	}{
+		{
+			name: "goroutines_disabled",
+			mut: func(e *env) {
+				e.H.Cfg.CPFreeze.KonnectivityMaxGoroutines = 0
+				e.SetProcRSS(t, 4242, 42<<20)
+			},
+		},
+		{
+			name: "rss_disabled",
+			mut: func(e *env) {
+				e.H.Cfg.CPFreeze.KonnectivityMaxRSSMiB = 0
+				e.SetProcRSS(t, 4242, 1844<<20)
+				e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+					if url == "http://127.0.0.1:8091/metrics" {
+						return "konnectivity_network_proxy_server_ready_backend_connections 2\n" +
+							"go_goroutines 199\n", nil
+					}
+					return "", errors.New("unexpected scrape " + url)
+				}
+			},
+		},
+		{
+			name: "both_disabled",
+			mut: func(e *env) {
+				e.H.Cfg.CPFreeze.KonnectivityMaxGoroutines = 0
+				e.H.Cfg.CPFreeze.KonnectivityMaxRSSMiB = 0
+				e.SetProcRSS(t, 4242, 1844<<20)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			setupHealthyKonnectivityTunnel(t, e)
+			e.H.Cfg.KCMMetricsFn = func(_ context.Context, url string) (string, error) {
+				if url == "http://127.0.0.1:8091/metrics" {
+					return "konnectivity_network_proxy_server_ready_backend_connections 2\n" +
+						"go_goroutines 60254\n", nil
+				}
+				return "", errors.New("unexpected scrape " + url)
+			}
+			tc.mut(e)
+			for range 4 {
+				e.H.Cycle(context.Background())
+			}
+			if len(e.Kills) != 0 {
+				t.Fatalf("%s: disabled knob still killed: %v", tc.name, e.Kills)
+			}
+		})
+	}
+}
+
+func TestParseKonnectivityGoroutines(t *testing.T) {
+	if v, ok := apiserver.ParseKonnectivityGoroutines("# go_goroutines 99999\ngo_goroutines_extra 99999\ngo_goroutines 60254\n"); !ok || v != 60254 {
+		t.Fatalf("got (%v, %v), want (60254, true)", v, ok)
+	}
+	if v, ok := apiserver.ParseKonnectivityGoroutines("go_goroutines 6.0254e+04\n"); !ok || v != 60254 {
+		t.Fatalf("scientific notation: got (%v, %v), want (60254, true)", v, ok)
+	}
+	if _, ok := apiserver.ParseKonnectivityGoroutines("go_goroutines\n"); ok {
+		t.Fatal("valueless go_goroutines parsed")
+	}
+	if _, ok := apiserver.ParseKonnectivityGoroutines("other_metric 1\n"); ok {
+		t.Fatal("absent go_goroutines parsed")
 	}
 }

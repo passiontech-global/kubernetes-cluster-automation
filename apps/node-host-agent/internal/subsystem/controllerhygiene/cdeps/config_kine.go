@@ -44,6 +44,24 @@ func (c *Config) applyKineTTLDefaults() {
 	}
 }
 
+const (
+	// DefaultKineMaxRSSMiB is the HA-gated kine RSS leak guard
+	// threshold in MiB (0 = disabled).
+	DefaultKineMaxRSSMiB = 1536
+	// DefaultKineRSSCooldown is the rate budget for HA kine RSS heals.
+	DefaultKineRSSCooldown = time.Hour
+	defaultKineRSSCycles   = 3
+)
+
+// KineRSSConfig is the HA-gated kine RSS leak guard
+// (NODE_HOST_AGENT_KINE_MAX_RSS_MIB / NODE_HOST_AGENT_KINE_RSS_COOLDOWN).
+type KineRSSConfig struct {
+	MaxRSSMiB    int           // MiB threshold; 0 = disabled (default 1536)
+	maxRSSMiBSet bool          // true once resolved by ConfigFromEnv
+	Cooldown     time.Duration // last-kine-rss-heal budget (default 1h)
+	Cycles       int           // consecutive over-threshold cycles (default 3)
+}
+
 func (c *Config) applyKinePoolDefaults() {
 	if c.KinePool.Mode == "" {
 		c.KinePool.Mode = ModeOff
@@ -59,5 +77,17 @@ func (c *Config) applyKinePoolDefaults() {
 	}
 	if c.KinePool.DBPortFallback <= 0 {
 		c.KinePool.DBPortFallback = defaultDBPortFallback
+	}
+}
+
+func (c *Config) applyKineRSSDefaults() {
+	if !c.KineRSS.maxRSSMiBSet && c.KineRSS.MaxRSSMiB == 0 {
+		c.KineRSS.MaxRSSMiB = DefaultKineMaxRSSMiB
+	}
+	if c.KineRSS.Cooldown <= 0 {
+		c.KineRSS.Cooldown = DefaultKineRSSCooldown
+	}
+	if c.KineRSS.Cycles <= 0 {
+		c.KineRSS.Cycles = defaultKineRSSCycles
 	}
 }

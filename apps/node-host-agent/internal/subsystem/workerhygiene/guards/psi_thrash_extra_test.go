@@ -83,4 +83,90 @@ func TestDentryStateUnusedAndGuardNegativeDentry(t *testing.T) {
 			t.Fatalf("drop_caches = %q, want %q", got, "2\n")
 		}
 	})
+
+	t.Run("guardNegativeDentry_proactive_defrag", func(t *testing.T) {
+		const giB = 1024 * 1024 // kB per GiB
+
+		cases := []struct {
+			name      string
+			nrUnused  string
+			mem       memInfo
+			wantDrop  bool
+			wantCount int64
+		}{
+			{
+				name:     "high_avail_40pct_nr_unused_3M_reclaims",
+				nrUnused: "3500000 3000000 45 0 0 0\n",
+				// MemAvailable = 40%, SReclaimable = 512 MiB (well under 2 GiB)
+				mem:       memInfo{totalKB: 10 * giB, availKB: 4 * giB, slabRecKB: 512 * 1024},
+				wantDrop:  true,
+				wantCount: 3_000_000,
+			},
+			{
+				name:     "high_avail_40pct_nr_unused_1.8M_sreclaimable_2.5GiB_reclaims",
+				nrUnused: "2200000 1800000 45 0 0 0\n",
+				// MemAvailable = 40%, SReclaimable = 2.5 GiB (> 2 GiB)
+				mem:       memInfo{totalKB: 10 * giB, availKB: 4 * giB, slabRecKB: 2560 * 1024},
+				wantDrop:  true,
+				wantCount: 1_800_000,
+			},
+			{
+				name:     "high_avail_40pct_nr_unused_1.8M_sreclaimable_1.5GiB_skips",
+				nrUnused: "2200000 1800000 45 0 0 0\n",
+				// MemAvailable = 40%, SReclaimable = 1.5 GiB (<= 2 GiB)
+				mem:       memInfo{totalKB: 10 * giB, availKB: 4 * giB, slabRecKB: 1536 * 1024},
+				wantDrop:  false,
+				wantCount: 1_800_000,
+			},
+			{
+				name:      "nr_unused_1M_even_with_low_avail_and_high_slab_skips",
+				nrUnused:  "1500000 1000000 45 0 0 0\n",
+				mem:       memInfo{totalKB: 10 * giB, availKB: 1 * giB, slabRecKB: 4 * giB},
+				wantDrop:  false,
+				wantCount: 1_000_000,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				d, _ := gDeps(t)
+				d.Cfg.ProcRoot = t.TempDir()
+				dentryPath := filepath.Join(d.Cfg.ProcRoot, "sys", "fs", "dentry-state")
+				dropPath := filepath.Join(d.Cfg.ProcRoot, "sys", "vm", "drop_caches")
+				if err := os.MkdirAll(filepath.Dir(dentryPath), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Dir(dropPath), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(dentryPath, []byte(tc.nrUnused), 0o644); err != nil {
+					t.Fatal(err)
+				}
+
+				guardNegativeDentry(d, tc.mem)
+				if d.Series.DentryUnusedCount != tc.wantCount {
+					t.Fatalf("DentryUnusedCount = %d, want %d", d.Series.DentryUnusedCount, tc.wantCount)
+				}
+				got, err := os.ReadFile(dropPath)
+				if tc.wantDrop {
+					if err != nil {
+						t.Fatalf("expected drop_caches write, got err: %v", err)
+					}
+					if string(got) != "2\n" {
+						t.Fatalf("drop_caches = %q, want %q", got, "2\n")
+					}
+					// Cooldown (30m) must suppress immediate second write.
+					if err := os.Remove(dropPath); err != nil {
+						t.Fatal(err)
+					}
+					guardNegativeDentry(d, tc.mem)
+					if _, err := os.Stat(dropPath); err == nil {
+						t.Fatal("drop_caches re-written inside 30m cooldown")
+					}
+				} else if err == nil {
+					t.Fatalf("unexpected drop_caches write: %q", got)
+				}
+			})
+		}
+	})
 }

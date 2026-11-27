@@ -32,6 +32,12 @@ const lastHostOOMEventFile = "last-host-oom-event"
 // page allocation while it runs.
 const memoryCompactEvery = 30 * time.Minute
 
+// compactDropDentryThreshold is the /proc/sys/fs/dentry-state nr_unused
+// watermark above which compactMemory drops slab dentries/inodes
+// (vm.drop_caches=2) before writing vm.compact_memory=1 so unlinked
+// slab objects do not pin pages and block high-order coalescing.
+const compactDropDentryThreshold = 500_000
+
 // HostOOMCheck is the kernel-dmesg hostmetrics kmsg-marker consumer as
 // a Check (no streak — the dedup marker file is the state). It also
 // owns the kernel-pressure memory-compaction remedy, consuming the
@@ -117,6 +123,22 @@ func (c *HostOOMCheck) compactMemory() {
 	}
 	if !c.d.State.RateTrySpend("last-memory-compact", memoryCompactEvery) {
 		return
+	}
+	// When the dentry slab holds >500k unused dentries, flush slab
+	// dentries/inodes (vm.drop_caches=2) BEFORE compacting so direct
+	// compaction can coalesce freed pages into high-order blocks.
+	if nrUnused := wdeps.DentryStateUnused(c.d.Cfg.ProcRoot); nrUnused > compactDropDentryThreshold {
+		dropPath := filepath.Join(c.d.Cfg.ProcRoot, "sys", "vm", "drop_caches")
+		if err := os.WriteFile(dropPath, []byte("2\n"), 0o644); err != nil {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"suspect: page-alloc-failure pre-compact drop_caches write %s failed (nr_unused=%d): %v",
+				dropPath, nrUnused, err))
+		} else {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"ACTION: page-alloc-failure dropped slab dentries (vm.drop_caches=2, nr_unused=%d) before vm.compact_memory",
+				nrUnused))
+			c.d.Actions.WithLabelValues(wdeps.CheckHostOOM, "drop_caches").Inc()
+		}
 	}
 	if err := os.WriteFile(target, []byte("1"), 0o644); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(

@@ -1187,3 +1187,128 @@ func TestEtcdGuardSnapshotHardeningDir0700AndAtomicTmp(t *testing.T) {
 		t.Fatal(".tmp left behind after rename")
 	}
 }
+
+// --- Fragmentation-ratio auto-defrag ---
+
+func TestEtcdGuardFragDefragTriggersOnHighFrag(t *testing.T) {
+	e := fixture(t)
+	g := &etcdGuardFake{
+		// 824 MiB file / 197 MiB in-use => ~76% fragmented (>= 50% and >= 512 MiB).
+		status: etcdStatusJSON(824<<20, 197<<20),
+		alarms: "",
+	}
+	e.wireEtcdGuard(t, g)
+	e.H.Cycle(context.Background())
+
+	if g.purges != 0 {
+		t.Fatalf("frag defrag should not run eventpurge, got purges=%d", g.purges)
+	}
+	if len(g.rescues) != 1 {
+		t.Fatalf("frag defrag rescues=%d want 1", len(g.rescues))
+	}
+	if !g.rescues[0].OnlineOnly {
+		t.Fatal("frag defrag ran without OnlineOnly=true")
+	}
+	log := e.LogLines()
+	if !strings.Contains(log, "ACTION: etcdguard frag defrag") ||
+		!strings.Contains(log, "db_size=824MiB") ||
+		!strings.Contains(log, "in_use=197MiB") ||
+		!strings.Contains(log, "frag_ratio=0.76") {
+		t.Fatalf("frag defrag ACTION log missing expected fields:\n%s", log)
+	}
+}
+
+func TestEtcdGuardFragDefragSkipsLowFragAndSmallDB(t *testing.T) {
+	cases := []struct {
+		name   string
+		dbMiB  int64
+		useMiB int64
+	}{
+		{"low_frag_201_193", 201, 193},           // ~4% unused, < 512 MiB
+		{"below_min_size_400_100", 400, 100},     // 75% unused, but < 512 MiB
+		{"large_but_low_frag_800_500", 800, 500}, // >= 512 MiB, but 37.5% < 50%
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := fixture(t)
+			g := &etcdGuardFake{
+				status: etcdStatusJSON(tc.dbMiB<<20, tc.useMiB<<20),
+				alarms: "",
+			}
+			e.wireEtcdGuard(t, g)
+			e.H.Cycle(context.Background())
+			if g.purges != 0 || len(g.rescues) != 0 {
+				t.Fatalf("%s triggered defrag: purges=%d rescues=%d",
+					tc.name, g.purges, len(g.rescues))
+			}
+		})
+	}
+}
+
+func TestEtcdGuardFragDefragCooldownRespected(t *testing.T) {
+	e := fixture(t)
+	g := &etcdGuardFake{
+		status: etcdStatusJSON(824<<20, 197<<20),
+		alarms: "",
+	}
+	e.wireEtcdGuard(t, g)
+
+	// Cycle 1: triggers frag defrag and spends last-etcd-frag-defrag (6h).
+	e.H.Cycle(context.Background())
+	if len(g.rescues) != 1 {
+		t.Fatalf("first frag defrag rescues=%d want 1", len(g.rescues))
+	}
+	// 3h later: still inside 6h cooldown -> skip.
+	e.Now = e.Now.Add(3 * time.Hour)
+	e.H.Cycle(context.Background())
+	if len(g.rescues) != 1 {
+		t.Fatalf("cooldown did not suppress second frag defrag: rescues=%d", len(g.rescues))
+	}
+	if !strings.Contains(e.LogLines(), "but in cooldown") {
+		t.Fatalf("cooldown skip not logged:\n%s", e.LogLines())
+	}
+	// 6h+ later: cooldown elapsed -> runs again.
+	e.Now = e.Now.Add(3*time.Hour + time.Minute)
+	e.H.Cycle(context.Background())
+	if len(g.rescues) != 2 {
+		t.Fatalf("frag defrag did not re-run after cooldown: rescues=%d want 2", len(g.rescues))
+	}
+}
+
+func TestEtcdGuardFragDefragDisabledAndCorruptBlocked(t *testing.T) {
+	t.Run("disabled_zero", func(t *testing.T) {
+		e := fixture(t)
+		g := &etcdGuardFake{
+			status: etcdStatusJSON(824<<20, 197<<20),
+			alarms: "",
+		}
+		e.wireEtcdGuard(t, g)
+		e.H.Cfg.EtcdGuard.DefragMinSizeMiB = 0
+		e.H.Cycle(context.Background())
+		if len(g.rescues) != 0 {
+			t.Fatalf("disabled frag defrag ran: rescues=%d", len(g.rescues))
+		}
+	})
+
+	t.Run("alarm_read_error_blocks", func(t *testing.T) {
+		e := fixture(t)
+		g := &etcdGuardFake{
+			status: etcdStatusJSON(824<<20, 197<<20),
+		}
+		e.wireEtcdGuard(t, g)
+		origCtl := e.H.Cfg.EtcdctlFn
+		e.H.Cfg.EtcdctlFn = func(ctx context.Context, args ...string) ([]byte, error) {
+			if strings.Contains(strings.Join(args, " "), "alarm list") {
+				return nil, errors.New("alarm list timeout")
+			}
+			return origCtl(ctx, args...)
+		}
+		e.H.Cycle(context.Background())
+		if len(g.rescues) != 0 {
+			t.Fatalf("unverifiable alarm allowed frag defrag: rescues=%d", len(g.rescues))
+		}
+		if !strings.Contains(e.LogLines(), "blocking frag defrag") {
+			t.Fatalf("alarm block not logged:\n%s", e.LogLines())
+		}
+	})
+}

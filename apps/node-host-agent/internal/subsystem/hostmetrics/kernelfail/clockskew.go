@@ -54,13 +54,12 @@ const (
 // remain the last resort when chronyc is absent or unparseable
 // (Timex.Offset µs is the kernel's offset estimate, STA_UNSYNC the
 // sync verdict — enough to makestep and, past 2s, to latch).
-// hostHasChronyc reports whether the host mount namespace actually ships a
-// chronyc binary. Hosts running systemd-timesyncd (the default on cluster
-// nodes) do not install chrony, so probing/stepping with chronyc would
-// unconditionally fail with exit 127 ("No such file or directory").
-func (r *Runner) hostHasChronyc() bool {
+// hostHasBinary reports whether the host mount namespace actually ships a
+// given binary (e.g. chronyc or timedatectl). Checking host presence avoids
+// unconditional exit-127 forks on nodes that don't install the tool.
+func (r *Runner) hostHasBinary(name string) bool {
 	if r.deps.HostRoot == "/" {
-		_, err := exec.LookPath("chronyc")
+		_, err := exec.LookPath(name)
 		return err == nil
 	}
 	root := strings.TrimRight(r.deps.HostRoot, "/")
@@ -69,17 +68,31 @@ func (r *Runner) hostHasChronyc() bool {
 		root = "/host"
 	}
 	for _, rel := range []string{
-		"usr/bin/chronyc",
-		"usr/sbin/chronyc",
-		"bin/chronyc",
-		"sbin/chronyc",
-		"usr/local/bin/chronyc",
+		filepath.Join("usr", "bin", name),
+		filepath.Join("usr", "sbin", name),
+		filepath.Join("bin", name),
+		filepath.Join("sbin", name),
+		filepath.Join("usr", "local", "bin", name),
 	} {
 		if fi, err := os.Stat(filepath.Join(root, rel)); err == nil && !fi.IsDir() {
 			return true
 		}
 	}
 	return false
+}
+
+// hostHasChronyc reports whether the host mount namespace actually ships a
+// chronyc binary. Hosts running systemd-timesyncd (the default on cluster
+// nodes) do not install chrony, so probing/stepping with chronyc would
+// unconditionally fail with exit 127 ("No such file or directory").
+func (r *Runner) hostHasChronyc() bool {
+	return r.hostHasBinary("chronyc")
+}
+
+// hostHasTimedatectl reports whether the host mount namespace ships
+// timedatectl for probing systemd-timesyncd status.
+func (r *Runner) hostHasTimedatectl() bool {
+	return r.hostHasBinary("timedatectl")
 }
 
 // timexOffsetSeconds converts unix.Timex.Offset to seconds. Per Linux
@@ -95,18 +108,51 @@ func timexOffsetSeconds(tx *unix.Timex) float64 {
 	return float64(tx.Offset) / 1e6
 }
 
+// probeTimesyncdOffset queries `timedatectl timesync-status` via the host
+// command transport to detect silent systemd-timesyncd stalls (where the
+// kernel's adjtimex STA_UNSYNC stays 0 and Offset decays near 0 even though
+// timesyncd has a large measured offset, lost its Server, or received 0
+// packets). Returns ok=false when timedatectl is absent, errors out, or
+// produces unparseable output so callers safely fall back to adjtimex.
+func (r *Runner) probeTimesyncdOffset(ctx context.Context) (float64, bool, bool) {
+	if !r.hostHasTimedatectl() {
+		return 0, false, false
+	}
+	out, err := r.deps.RunHostCmd(ctx, "timedatectl", "timesync-status")
+	if err != nil {
+		return 0, false, false
+	}
+	return parseTimesyncStatusOffset(out)
+}
+
 func (r *Runner) clockSkewProbe(ctx context.Context) (float64, bool, bool) {
 	var tx unix.Timex
 	txOK := false
+	var txOff float64
+	var txSynced bool
 	if _, err := r.deps.Adjtimex(&tx); err == nil {
 		txOK = true
-		off := timexOffsetSeconds(&tx)
-		if tx.Status&unix.STA_UNSYNC == 0 &&
-			math.Abs(off) <= clockSkewStepOffset {
-			return off, true, true
-		}
+		txOff = timexOffsetSeconds(&tx)
+		txSynced = tx.Status&unix.STA_UNSYNC == 0
 	}
-	if r.hostHasChronyc() {
+	hasChronyc := r.hostHasChronyc()
+	if txOK && txSynced && math.Abs(txOff) <= clockSkewStepOffset {
+		if hasChronyc {
+			return txOff, true, true
+		}
+		// Without chronyc, systemd-timesyncd can silently stall under CPU
+		// steal while adjtimex still reports STA_UNSYNC==0 and a tiny offset.
+		// Cross-check timedatectl timesync-status when available.
+		if tsOff, tsSynced, tsOK := r.probeTimesyncdOffset(ctx); tsOK {
+			off := txOff
+			if math.Abs(tsOff) > math.Abs(txOff) {
+				off = tsOff
+			}
+			return off, txSynced && tsSynced, true
+		}
+		return txOff, true, true
+	}
+	if hasChronyc {
 		out, err := r.deps.RunHostCmd(ctx, "chronyc", "tracking")
 		if err == nil {
 			if off, synced, ok := parseChronycTracking(out); ok {
@@ -114,11 +160,139 @@ func (r *Runner) clockSkewProbe(ctx context.Context) (float64, bool, bool) {
 			}
 		}
 	}
+	// Chronyc absent or failed — consult timedatectl timesync-status before
+	// falling back to raw adjtimex.
+	if tsOff, tsSynced, tsOK := r.probeTimesyncdOffset(ctx); tsOK {
+		if !txOK {
+			return tsOff, tsSynced, true
+		}
+		off := txOff
+		if math.Abs(tsOff) > math.Abs(txOff) {
+			off = tsOff
+		}
+		return off, txSynced && tsSynced, true
+	}
 	if !txOK {
 		return 0, false, false
 	}
-	return timexOffsetSeconds(&tx),
-		tx.Status&unix.STA_UNSYNC == 0, true
+	return txOff, txSynced, true
+}
+
+// timesyncDurationTokenRe matches one token of systemd's format_timespan
+// output (e.g. "1.238ms", "40.430ms", "7.803s", "500us", "2min", "1h", "1d").
+var timesyncDurationTokenRe = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)(min|ms|us|µs|μs|s|h|d)$`)
+
+// parseTimesyncDuration parses a signed systemd timespan string such as
+// "+1.238ms", "-40.430ms", "-7.803s", "+500us", "-2min", or compound spans
+// like "-1min 7.803s" into signed seconds.
+func parseTimesyncDuration(raw string) (float64, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, false
+	}
+	sign := 1.0
+	switch s[0] {
+	case '+':
+		s = strings.TrimSpace(s[1:])
+	case '-':
+		sign = -1.0
+		s = strings.TrimSpace(s[1:])
+	}
+	if s == "" {
+		return 0, false
+	}
+	if s == "0" {
+		return 0, true
+	}
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return 0, false
+	}
+	var total float64
+	for _, tok := range fields {
+		m := timesyncDurationTokenRe.FindStringSubmatch(tok)
+		if m == nil {
+			return 0, false
+		}
+		v, err := strconv.ParseFloat(m[1], 64)
+		if err != nil {
+			return 0, false
+		}
+		switch m[2] {
+		case "us", "µs", "μs":
+			total += v * 1e-6
+		case "ms":
+			total += v * 1e-3
+		case "s":
+			total += v
+		case "min":
+			total += v * 60
+		case "h":
+			total += v * 3600
+		case "d":
+			total += v * 86400
+		}
+	}
+	return sign * total, true
+}
+
+// parseTimesyncStatusOffset extracts (offsetSeconds, synced, ok) from
+// `timedatectl timesync-status` output.
+//   - Offset: signed seconds parsed from the `Offset:` line (us/ms/s/min/h/d).
+//   - synced: false whenever `Server:` is missing/empty/n/a/(null) OR
+//     `Packet count:` is 0 (silent timesyncd stall indicators).
+//   - ok: false on empty/garbage output or when status claims synced without
+//     a parseable `Offset:` line.
+func parseTimesyncStatusOffset(out string) (float64, bool, bool) {
+	var (
+		off             float64
+		hasOffset       bool
+		sawOffsetLine   bool
+		sawStatus       bool
+		serverOK        bool
+		packetCountZero bool
+	)
+	for ln := range strings.SplitSeq(out, "\n") {
+		key, val, found := strings.Cut(strings.TrimSpace(ln), ":")
+		if !found {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		switch key {
+		case "Server":
+			sawStatus = true
+			lower := strings.ToLower(val)
+			if val != "" && lower != "n/a" && lower != "(null)" && lower != "none" {
+				serverOK = true
+			}
+		case "Packet count":
+			sawStatus = true
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil && n == 0 {
+				packetCountZero = true
+			}
+		case "Poll interval":
+			sawStatus = true
+		case "Offset":
+			sawOffsetLine = true
+			if v, ok := parseTimesyncDuration(val); ok {
+				off = v
+				hasOffset = true
+				sawStatus = true
+			}
+		}
+	}
+	if !sawStatus {
+		return 0, false, false
+	}
+	synced := serverOK && !packetCountZero
+	if sawOffsetLine && !hasOffset && synced {
+		return 0, false, false
+	}
+	if !hasOffset && synced {
+		return 0, false, false
+	}
+	return off, synced, true
 }
 
 // chronycSystemTimeRe parses "System time     : 0.0012 seconds fast

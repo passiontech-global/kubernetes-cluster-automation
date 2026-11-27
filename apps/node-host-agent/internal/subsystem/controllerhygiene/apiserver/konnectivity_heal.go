@@ -22,6 +22,7 @@ import (
 	json "encoding/json/v2"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,24 +39,43 @@ import (
 )
 
 const (
-	konnMetricsURL    = "http://127.0.0.1:8091/metrics"
-	konnReadyMetric   = "konnectivity_network_proxy_server_ready_backend_connections"
-	konnUDSRel        = "konnectivity-server/konnectivity-server.sock"
-	konnBadCyclesNeed = 3
-	konnRestartBudget = 30 * time.Minute
+	konnMetricsURL       = "http://127.0.0.1:8091/metrics"
+	konnReadyMetric      = "konnectivity_network_proxy_server_ready_backend_connections"
+	konnGoroutinesMetric = "go_goroutines"
+	konnUDSRel           = "konnectivity-server/konnectivity-server.sock"
+	konnBadCyclesNeed    = 3
+	konnRestartBudget    = 30 * time.Minute
 )
 
-// probeKonnectivityServer refreshes the ready-backends gauge and the
-// unhealthy streak, then heals when the streak and the ready-worker
-// evidence both hold.
+// probeKonnectivityServer scrapes :8091/metrics once per cycle, refreshes
+// the ready-backends gauge, checks tunnel health (UDS + ready backends),
+// and checks for goroutine/RSS leaks.
 func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 	d := c.d
-	backends, ok := c.konnReadyBackends(ctx)
+	body, err := d.Cfg.KCMMetricsFn(ctx, konnMetricsURL)
+	var (
+		backends     float64
+		ok           bool
+		goroutines   float64
+		goroutinesOK bool
+	)
+	if err == nil {
+		backends, ok = ParseKonnectivityReadyBackends(body)
+		goroutines, goroutinesOK = ParseKonnectivityGoroutines(body)
+	}
 	if ok {
 		d.KonnReadyBackends.Set(backends)
 	} else {
 		d.KonnReadyBackends.Set(-1)
 	}
+	c.probeKonnectivityTunnel(ctx, backends, ok)
+	c.probeKonnectivityLeak(ctx, goroutines, goroutinesOK)
+}
+
+// probeKonnectivityTunnel heals a dead/unconnected tunnel (missing UDS or
+// ready_backend_connections==0 for 3 cycles while >=1 Ready worker exists).
+func (c *FreezeCheck) probeKonnectivityTunnel(ctx context.Context, backends float64, ok bool) {
+	d := c.d
 	// The ready-backends gauge and the agent UDS are the evidence —
 	// no healthz GET: it fed no verdict (an absent listener on an
 	// older konnectivity build was not evidence either way), so the
@@ -135,15 +155,112 @@ func (c *FreezeCheck) probeKonnectivityServer(ctx context.Context) {
 	}
 }
 
-// konnReadyBackends scrapes the konnectivity-server metrics endpoint
-// and reads the ready-backend gauge. ok=false on a scrape or parse
-// failure — the series is exported as -1, never a fabricated 0.
-func (c *FreezeCheck) konnReadyBackends(ctx context.Context) (float64, bool) {
-	body, err := c.d.Cfg.KCMMetricsFn(ctx, konnMetricsURL)
-	if err != nil {
-		return 0, false
+// probeKonnectivityLeak detects sustained goroutine or RSS leaks in the
+// konnectivity-server child process (3 consecutive cycles over either
+// configured threshold) and sends SIGTERM under the shared 30m
+// last-konnectivity-server-restart budget so k0s supervisor respawns a
+// clean instance without touching kube-apiserver.
+func (c *FreezeCheck) probeKonnectivityLeak(ctx context.Context, goroutines float64, goroutinesOK bool) {
+	d := c.d
+	maxGoroutines := d.Cfg.CPFreeze.KonnectivityMaxGoroutines
+	maxRSSMiB := d.Cfg.CPFreeze.KonnectivityMaxRSSMiB
+	if maxGoroutines <= 0 && maxRSSMiB <= 0 {
+		c.konnLeakCycles = 0
+		return
 	}
-	return ParseKonnectivityReadyBackends(body)
+	var (
+		pid       int
+		origStart string
+		rssBytes  uint64
+		rssOK     bool
+	)
+	if maxRSSMiB > 0 {
+		pid, origStart = c.konnectivityPID()
+		if pid != 0 {
+			rssBytes, rssOK = d.ProcVMRSS(pid)
+		}
+	}
+	goroutineLeak := maxGoroutines > 0 && goroutinesOK && goroutines > float64(maxGoroutines)
+	rssLeak := maxRSSMiB > 0 && rssOK && rssBytes > uint64(maxRSSMiB)<<20
+	if goroutineLeak || rssLeak {
+		c.konnLeakCycles++
+	} else {
+		c.konnLeakCycles = 0
+		return
+	}
+	if c.konnLeakCycles < konnBadCyclesNeed {
+		return
+	}
+	if pid == 0 {
+		pid, origStart = c.konnectivityPID()
+	}
+	if pid == 0 {
+		d.State.AppendLog("suspect: konnectivity-server process not found — nothing to kill")
+		return
+	}
+	if d.HoldEmergencyHeal(ctx) {
+		d.State.AppendLog("suspect: konnectivity-server leak detected but cluster maintenance in progress — holding SIGTERM")
+		return
+	}
+	var reasons []string
+	if goroutineLeak {
+		reasons = append(reasons, fmt.Sprintf("goroutines=%.0f>%d", goroutines, maxGoroutines))
+	}
+	if rssLeak {
+		reasons = append(reasons, fmt.Sprintf("rss_mib=%d>%d", rssBytes>>20, maxRSSMiB))
+	}
+	reason := strings.Join(reasons, " ")
+
+	switch d.Cfg.Sig13.Mode {
+	case cdeps.ModeEnforce:
+		if !c.verifyKonnectivityPID(pid, origStart) {
+			d.State.AppendLog(fmt.Sprintf(
+				"suspect: konnectivity-server pid=%d identity changed before SIGTERM — skipped", pid))
+			return
+		}
+		if !d.State.RateTrySpend(cdeps.FileRateKonnRestart, konnRestartBudget) {
+			return
+		}
+		if err := d.Cfg.KillFn(pid, syscall.SIGTERM); err != nil {
+			d.State.AppendLogWarn(fmt.Sprintf(
+				"suspect: konnectivity-server SIGTERM pid=%d failed: %v", pid, err))
+			return
+		}
+		d.State.AppendLog(fmt.Sprintf(
+			"ACTION: terminated konnectivity-server pid=%d (SIGTERM) — %s leak_cycles=%d (k0s supervisor respawns it)",
+			pid, reason, c.konnLeakCycles))
+		c.konnLeakCycles = 0
+		d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "konn_server_leak_kill").Inc()
+	case cdeps.ModeDryRun:
+		d.State.AppendLog(fmt.Sprintf(
+			"DRY-RUN: would terminate konnectivity-server pid=%d (SIGTERM) — %s leak_cycles=%d",
+			pid, reason, c.konnLeakCycles))
+		d.Actions.WithLabelValues(cdeps.CheckCPFreeze, "dryrun").Inc()
+		c.konnLeakCycles = 0
+	default:
+		// off — observe only.
+	}
+}
+
+// ParseKonnectivityGoroutines reads the go_goroutines gauge sample out of
+// the konnectivity-server :8091/metrics response. ok=false when absent or
+// unparseable.
+func ParseKonnectivityGoroutines(body string) (float64, bool) {
+	for ln := range strings.SplitSeq(body, "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "#") || !strings.HasPrefix(ln, konnGoroutinesMetric) {
+			continue
+		}
+		f := strings.Fields(ln)
+		if len(f) < 2 || f[0] != konnGoroutinesMetric {
+			continue
+		}
+		if v, err := strconv.ParseFloat(f[1], 64); err == nil &&
+			!math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 {
+			return v, true
+		}
+	}
+	return 0, false
 }
 
 // ParseKonnectivityReadyBackends reads the

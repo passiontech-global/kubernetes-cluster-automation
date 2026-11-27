@@ -115,7 +115,7 @@ func (c *GuardCheck) Run(ctx context.Context) {
 	case st.dbSize >= c.d.Cfg.EtcdGuard.DBSizeLimit:
 		reason = fmt.Sprintf("dbSize=%d>=%d", st.dbSize, c.d.Cfg.EtcdGuard.DBSizeLimit)
 	default:
-		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "ok").Inc()
+		c.maybeFragDefrag(ctx, st, aerr)
 		return
 	}
 
@@ -226,6 +226,67 @@ func (c *GuardCheck) Run(ctx context.Context) {
 	}
 	c.d.Actions.WithLabelValues(cdeps.CheckEtcd, "evpurge_rescue").Inc()
 	if remediated {
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "ok").Inc()
+	} else {
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "remediate_error").Inc()
+	}
+}
+
+// maybeFragDefrag handles the non-emergency fragmentation-ratio path:
+// when dbSize >= DefragMinSizeMiB (0 = disabled), dbInUse > 0, and the
+// unused fraction (dbSize-dbInUse)/dbSize >= DefragFragRatio, run
+// ONLINE-ONLY compact+defrag under the dedicated last-etcd-frag-defrag
+// cooldown (default 6h), gated by the same CORRUPT/alarm safety check
+// and pre-maintenance snapshot requirement as the emergency path.
+func (c *GuardCheck) maybeFragDefrag(ctx context.Context, st etcdStatusInfo, aerr error) {
+	minBytes := c.d.Cfg.EtcdGuard.DefragMinSizeMiB << 20
+	if minBytes <= 0 || st.dbSize < minBytes || st.dbUse <= 0 || st.dbSize < st.dbUse {
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "ok").Inc()
+		return
+	}
+	fragRatio := float64(st.dbSize-st.dbUse) / float64(st.dbSize)
+	if fragRatio < c.d.Cfg.EtcdGuard.DefragFragRatio {
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "ok").Inc()
+		return
+	}
+	if aerr != nil || c.corruptBlocked() {
+		c.d.State.AppendLog(
+			"ACTION: etcdguard alarm state unverifiable/CORRUPT — blocking frag defrag to preserve BoltDB/WAL evidence")
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "alarm_blocked").Inc()
+		return
+	}
+	if !c.d.State.RateOK(cdeps.FileRateEtcdFragDefrag, c.d.Cfg.EtcdGuard.DefragCooldown) {
+		c.d.State.SuspectLog(cdeps.CheckEtcd+"-frag", fmt.Sprintf(
+			"etcdguard: frag defrag needed (db_size=%dMiB in_use=%dMiB frag_ratio=%.2f) but in cooldown (<%s), skip",
+			st.dbSize>>20, st.dbUse>>20, fragRatio, c.d.Cfg.EtcdGuard.DefragCooldown),
+			c.d.Cfg.SuspectLogCadence)
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "frag_cooldown").Inc()
+		return
+	}
+	c.d.State.AppendLog(fmt.Sprintf(
+		"ACTION: etcdguard frag defrag — db_size=%dMiB in_use=%dMiB frag_ratio=%.2f (>=%.2f) — ONLINE-ONLY compact+defrag",
+		st.dbSize>>20, st.dbUse>>20, fragRatio, c.d.Cfg.EtcdGuard.DefragFragRatio))
+	c.d.State.RateSpend(cdeps.FileRateEtcdFragDefrag)
+
+	gctx, gcancel := context.WithTimeout(ctx, cdeps.DefaultEtcdGuardBudget)
+	defer gcancel()
+	if !c.savePreMaintSnapshot(gctx) {
+		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "snapshot_error").Inc()
+		return
+	}
+	out := &guardLogWriter{d: c.d}
+	rerr := c.d.Cfg.EtcdRescueFn(gctx, etcdmaint.Config{
+		K0sDir:      c.d.Cfg.K0sDir,
+		Endpoint:    c.d.Cfg.EtcdGuard.Endpoint,
+		OnlineOnly:  true,
+		CallTimeout: cdeps.DefaultEtcdGuardCallTimeout,
+	}, out)
+	out.flush()
+	if rerr != nil {
+		c.d.State.AppendLogWarn(fmt.Sprintf("etcdguard: frag defrag incomplete: %v", rerr))
+	}
+	c.d.Actions.WithLabelValues(cdeps.CheckEtcd, "frag_defrag").Inc()
+	if rerr == nil {
 		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "ok").Inc()
 	} else {
 		c.d.Cycles.WithLabelValues(cdeps.CheckEtcd, "remediate_error").Inc()

@@ -530,6 +530,96 @@ func TestHostOOMCompactMemory(t *testing.T) {
 	}
 }
 
+func TestHostOOMCompactMemoryPreDropDentries(t *testing.T) {
+	t.Run("nr_unused > 500k drops slab dentries before compact_memory", func(t *testing.T) {
+		d, f := rtDeps(t)
+		c := NewHostOOM(d)
+		compactPath := filepath.Join(d.Cfg.ProcRoot, "sys", "vm", "compact_memory")
+		dropPath := filepath.Join(d.Cfg.ProcRoot, "sys", "vm", "drop_caches")
+		dentryPath := filepath.Join(d.Cfg.ProcRoot, "sys", "fs", "dentry-state")
+
+		wdepstest.WriteFile(t, compactPath, "0\n")
+		wdepstest.WriteFile(t, dentryPath, "900000 750000 45 0 0 0\n")
+		wdepstest.WriteFile(t, rtLatchPath(t, d, latchdefs.LatchPageAllocFailure), "1\n")
+
+		c.compactMemory()
+
+		if got := readFileT(t, dropPath); got != "2" {
+			t.Fatalf("drop_caches = %q, want 2", got)
+		}
+		if got := readFileT(t, compactPath); got != "1" {
+			t.Fatalf("compact_memory = %q, want 1", got)
+		}
+		if c.d.MemoryCompactionRuns != 1 {
+			t.Fatalf("MemoryCompactionRuns = %d, want 1", c.d.MemoryCompactionRuns)
+		}
+		rtRequireLatch(t, d, latchdefs.LatchPageAllocFailure, false)
+
+		// Verify log ordering: drop_caches=2 ACTION must precede compact_memory ACTION.
+		logData := rtLog(t, f)
+		dropIdx := strings.Index(logData, "dropped slab dentries (vm.drop_caches=2, nr_unused=750000) before vm.compact_memory")
+		compactIdx := strings.Index(logData, "triggered vm.compact_memory")
+		if dropIdx < 0 || compactIdx < 0 || dropIdx >= compactIdx {
+			t.Fatalf("expected drop_caches log before compact_memory log (dropIdx=%d compactIdx=%d):\n%s",
+				dropIdx, compactIdx, logData)
+		}
+	})
+
+	t.Run("drop_caches executes before compact_memory attempt even if compact_memory write fails", func(t *testing.T) {
+		d, _ := rtDeps(t)
+		c := NewHostOOM(d)
+		compactPath := filepath.Join(d.Cfg.ProcRoot, "sys", "vm", "compact_memory")
+		dropPath := filepath.Join(d.Cfg.ProcRoot, "sys", "vm", "drop_caches")
+		dentryPath := filepath.Join(d.Cfg.ProcRoot, "sys", "fs", "dentry-state")
+
+		wdepstest.WriteFile(t, compactPath, "0\n")
+		if err := os.Chmod(compactPath, 0o444); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(compactPath, 0o644) })
+		wdepstest.WriteFile(t, dentryPath, "900000 600000 45 0 0 0\n")
+		wdepstest.WriteFile(t, rtLatchPath(t, d, latchdefs.LatchPageAllocFailure), "1\n")
+
+		c.compactMemory()
+
+		// drop_caches=2 must have landed BEFORE compact_memory failed.
+		if got := readFileT(t, dropPath); got != "2" {
+			t.Fatalf("drop_caches = %q, want 2 even when compact_memory fails", got)
+		}
+		if c.d.MemoryCompactionRuns != 0 {
+			t.Fatalf("MemoryCompactionRuns = %d, want 0 after failed compact_memory write", c.d.MemoryCompactionRuns)
+		}
+	})
+
+	t.Run("nr_unused <= 500k skips drop_caches and only writes compact_memory", func(t *testing.T) {
+		for _, nr := range []string{"500000", "250000"} {
+			t.Run("nr_unused_"+nr, func(t *testing.T) {
+				d, _ := rtDeps(t)
+				c := NewHostOOM(d)
+				compactPath := filepath.Join(d.Cfg.ProcRoot, "sys", "vm", "compact_memory")
+				dropPath := filepath.Join(d.Cfg.ProcRoot, "sys", "vm", "drop_caches")
+				dentryPath := filepath.Join(d.Cfg.ProcRoot, "sys", "fs", "dentry-state")
+
+				wdepstest.WriteFile(t, compactPath, "0\n")
+				wdepstest.WriteFile(t, dentryPath, "800000 "+nr+" 45 0 0 0\n")
+				wdepstest.WriteFile(t, rtLatchPath(t, d, latchdefs.LatchPageAllocFailure), "1\n")
+
+				c.compactMemory()
+
+				if _, err := os.Stat(dropPath); !os.IsNotExist(err) {
+					t.Fatalf("drop_caches unexpectedly written for nr_unused=%s", nr)
+				}
+				if got := readFileT(t, compactPath); got != "1" {
+					t.Fatalf("compact_memory = %q, want 1", got)
+				}
+				if c.d.MemoryCompactionRuns != 1 {
+					t.Fatalf("MemoryCompactionRuns = %d, want 1", c.d.MemoryCompactionRuns)
+				}
+			})
+		}
+	})
+}
+
 func readFileT(t *testing.T, p string) string {
 	t.Helper()
 	data, err := os.ReadFile(p)

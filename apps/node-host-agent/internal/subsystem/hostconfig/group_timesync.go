@@ -48,6 +48,13 @@ func (c *cyc) groupTimesync() {
 		if len(fallback) > 0 {
 			b.WriteString("FallbackNTP=" + strings.Join(fallback, " ") + "\n")
 		}
+		// VPS CPU-steal tuning: cap poll interval at 256s (default 2048s =
+		// 34m drifts too far under steal bursts) and raise RootDistanceMaxSec
+		// from 5s to 10s so transient steal-induced RTT spikes don't drop
+		// valid NTP samples and silently stall timesyncd.
+		b.WriteString("PollIntervalMinSec=32\n")
+		b.WriteString("PollIntervalMaxSec=256\n")
+		b.WriteString("RootDistanceMaxSec=10\n")
 		// timesyncd only re-reads config on start; the changed
 		// drop-in is worthless until the bounce lands.
 		if ch, _ := r.writeManaged(timesyncDropin, []byte(b.String()), 0o644); ch {

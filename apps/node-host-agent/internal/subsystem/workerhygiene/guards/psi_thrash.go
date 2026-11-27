@@ -22,16 +22,21 @@ const (
 	slabLeakEnterRatio     = 0.35
 	slabLeakClearRatio     = 0.25
 	slabDropCachesInterval = time.Hour
-	// selfheal-alert-coverage negative-dentry reclaim thresholds: /proc/sys/fs/dentry-state
-	// nr_unused above 1.5M with >3GiB of reclaimable slab and memory
-	// already under 15% available means the kernel is about to PSI-
-	// thrash on dentries it could have dropped — drop_caches=2 hands
-	// them back BEFORE the thrash latch arms. The 30m budget keeps a
-	// permanently dentry-heavy node from write-looping the sysctl.
-	dentryUnusedMin     = 1_500_000
-	dentryReclaimMinKB  = 3 * 1024 * 1024 // 3 GiB of SReclaimable
-	dentryMemAvailRatio = 0.15
-	dentryDropInterval  = 30 * time.Minute
+	// selfheal-alert-coverage negative-dentry reclaim thresholds:
+	// /proc/sys/fs/dentry-state nr_unused can balloon to 2M-11M+ even on
+	// nodes with plenty of MemAvailable (>15%), fragmenting the buddy
+	// allocator until high-order allocations fail (KernelPageAllocFailure
+	// order:5 on cilium-agent). Reclaim proactively via drop_caches=2 when:
+	//   - legacy low-memory pressure: nr_unused > 1.5M && SReclaimable > 3 GiB && MemAvailable < 15%, OR
+	//   - proactive defrag high-water: nr_unused > 2.5M (regardless of MemAvailable/SReclaimable), OR
+	//   - proactive slab bloat: nr_unused > 1.5M && SReclaimable > 2 GiB (regardless of MemAvailable).
+	// The 30m budget keeps a permanently dentry-heavy node from write-looping the sysctl.
+	dentryUnusedMin          = 1_500_000
+	dentryUnusedHighWater    = 2_500_000
+	dentryReclaimMinKB       = 3 * 1024 * 1024 // 3 GiB of SReclaimable (low-MemAvailable path)
+	dentryProactiveReclaimKB = 2 * 1024 * 1024 // 2 GiB of SReclaimable (proactive defrag path)
+	dentryMemAvailRatio      = 0.15
+	dentryDropInterval       = 30 * time.Minute
 )
 
 // psiMemoryFullAvg60 parses <ProcRoot>/pressure/memory — the
@@ -168,35 +173,21 @@ func dropKernelCaches(d *wdeps.Deps) {
 
 // dentryStateUnused reads <ProcRoot>/sys/fs/dentry-state field 2
 // (nr_unused — dentries the kernel has already unlinked but not yet
-// reclaimed). The file carries six counters
-// (nr_dentry nr_unused age_limit want_pages nr_negative
-// nr_unused_negative); a short/unparseable read reports -1 so the
-// caller can tell "no data" from "zero unused".
+// reclaimed). Delegates to the shared wdeps helper.
 func dentryStateUnused(d *wdeps.Deps) int64 {
-	data, err := os.ReadFile(filepath.Join(
-		d.Cfg.ProcRoot, "sys", "fs", "dentry-state"))
-	if err != nil {
-		return -1
-	}
-	f := strings.Fields(string(data))
-	if len(f) < 2 {
-		return -1
-	}
-	n, err := strconv.ParseInt(f[1], 10, 64)
-	if err != nil {
-		return -1
-	}
-	return n
+	return wdeps.DentryStateUnused(d.Cfg.ProcRoot)
 }
 
 // guardNegativeDentry is the selfheal-alert-coverage negative-dentry SLAB reclaim: churn
 // workloads (build pods, log shippers, volume mounts) leave millions
-// of unlinked dentries/inodes sitting in reclaimable slab. While
-// nr_unused is past dentryUnusedMin AND the kernel still holds
-// >3GiB of SReclaimable AND MemAvailable already sits under 15% of
-// MemTotal, the node is one allocation burst away from PSI thrash
-// the slab could have prevented — drop_caches=2 frees dentries and
-// inodes (NOT pagecache, so no re-read storm) on a 30m budget.
+// of unlinked dentries/inodes sitting in reclaimable slab. Even when
+// MemAvailable is still healthy (>15%), millions of unused dentries
+// fragment the buddy allocator and trigger high-order page allocation
+// failures. Reclaim triggers on a 30m budget via drop_caches=2 (frees
+// dentries and inodes, NOT pagecache, so no re-read storm) when either:
+//   - legacy low-memory pressure: nr_unused > 1.5M && SReclaimable > 3GiB && MemAvailable < 15%
+//   - proactive defrag: nr_unused > 2.5M (any MemAvailable/SReclaimable), or
+//     nr_unused > 1.5M && SReclaimable > 2GiB (any MemAvailable).
 //
 // The gauge (node_agent_dentry_unused_count) publishes EVERY
 // readable cycle — the alert watches the pressure even when the
@@ -209,9 +200,12 @@ func guardNegativeDentry(d *wdeps.Deps, m memInfo) {
 	}
 	d.Series.DentryUnusedCount = n
 	availRatio := float64(m.availKB) / float64(m.totalKB)
-	if n <= dentryUnusedMin ||
-		m.slabRecKB <= dentryReclaimMinKB ||
-		availRatio >= dentryMemAvailRatio {
+	lowMemPressure := n > dentryUnusedMin &&
+		m.slabRecKB > dentryReclaimMinKB &&
+		availRatio < dentryMemAvailRatio
+	proactiveDefrag := n > dentryUnusedHighWater ||
+		(n > dentryUnusedMin && m.slabRecKB > dentryProactiveReclaimKB)
+	if !lowMemPressure && !proactiveDefrag {
 		return
 	}
 	if !d.State.RateTrySpend("last-dentry-drop-caches", dentryDropInterval) {

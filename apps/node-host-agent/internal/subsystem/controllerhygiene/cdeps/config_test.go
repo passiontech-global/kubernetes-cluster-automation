@@ -72,6 +72,10 @@ func TestApplyDefaultsFullTable(t *testing.T) {
 		c.KinePool.DBPortFallback != 6432 {
 		t.Errorf("KinePool=%+v", c.KinePool)
 	}
+	if c.KineRSS.MaxRSSMiB != 1536 || c.KineRSS.Cooldown != time.Hour ||
+		c.KineRSS.Cycles != 3 {
+		t.Errorf("KineRSS=%+v", c.KineRSS)
+	}
 	// OOMLoop (config_oomloop).
 	if c.OOMLoop.Mode != cdeps.ModeOff || c.OOMLoop.MinKills != 3 ||
 		c.OOMLoop.Window != time.Hour ||
@@ -99,6 +103,9 @@ func TestApplyDefaultsFullTable(t *testing.T) {
 	if c.EtcdGuard.Endpoint != cdeps.DefaultEtcdEndpoint ||
 		c.EtcdGuard.DBSizeLimit != int64(1610612736) ||
 		c.EtcdGuard.MinRun != time.Hour ||
+		c.EtcdGuard.DefragMinSizeMiB != 512 ||
+		c.EtcdGuard.DefragFragRatio != 0.50 ||
+		c.EtcdGuard.DefragCooldown != 6*time.Hour ||
 		c.EtcdBackupDir != "/var/backups/etcd" {
 		t.Errorf("EtcdGuard=%+v backup=%s", c.EtcdGuard, c.EtcdBackupDir)
 	}
@@ -110,7 +117,9 @@ func TestApplyDefaultsFullTable(t *testing.T) {
 		c.CPFreeze.SchedHealthURL != "https://127.0.0.1:10259/healthz" ||
 		c.CPFreeze.KCMMetricsURL != "https://127.0.0.1:10257/metrics" ||
 		c.CPFreeze.Cycles != 3 || c.CPFreeze.QuietFor != 10*time.Minute ||
-		c.CPFreeze.MinRestart != 2*time.Hour {
+		c.CPFreeze.MinRestart != 2*time.Hour ||
+		c.CPFreeze.KonnectivityMaxGoroutines != 10000 ||
+		c.CPFreeze.KonnectivityMaxRSSMiB != 512 {
 		t.Errorf("CPFreeze=%+v", c.CPFreeze)
 	}
 	// PKIDrift (config_pki): the four default pairs derive from K0sDir.

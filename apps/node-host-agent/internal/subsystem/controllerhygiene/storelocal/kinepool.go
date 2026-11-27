@@ -71,6 +71,11 @@ func (c *PoolCheck) Name() string { return cdeps.CheckKinePool }
 // a SIGTERM delivered on a cancelled context races the supervisor's
 // own shutdown stop.
 func (c *PoolCheck) Run(ctx context.Context) {
+	// HA-gated kine RSS leak guard runs before the in-unit kine early
+	// return so both embedded kine (k0scontroller) and split standalone
+	// kine.service hosts are covered without altering subframe order.
+	c.checkKineRSS(ctx)
+
 	// cgroup-scoped lookup: a same-named process outside
 	// k0scontroller.service (foreign daemon, recycled pid) must
 	// never inherit the kill trust.

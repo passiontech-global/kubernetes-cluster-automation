@@ -97,6 +97,9 @@ const (
 	FileRateTTLKill   = "last-ttl-restart"
 	FileRatePoolKill  = "last-kinepool-kill"
 	FileRateEtcdGuard = "last-etcd-guard" // eventpurge+rescue budget
+	// FileRateEtcdFragDefrag is the fragmentation-ratio online defrag
+	// cooldown under WatchdogStateDir (default 6h).
+	FileRateEtcdFragDefrag = "last-etcd-frag-defrag"
 	// FileRateEtcdPreMaintSnap is the pre-maintenance snapshot
 	// budget — one etcdctl snapshot save per hour ahead of the
 	// online compact+defrag.
@@ -105,11 +108,15 @@ const (
 	// budget — one heal per 30 minutes; the k0s supervisor owns the
 	// restart itself.
 	FileRateKonnRestart = "last-konnectivity-server-restart"
+	// FileRateKineRSSHeal is the HA-gated kine RSS leak heal budget
+	// (default 1h).
+	FileRateKineRSSHeal = "last-kine-rss-heal"
 	FileCtrGap          = "consecutive-sig13-gap"
 	FileCtrFrozen       = "consecutive-sig13-frozen"
 	FileCtrPeerFrozen   = "consecutive-sig13-peer-frozen"
 	FileCtrDead         = "consecutive-sig13-dead"
 	FileCtrPool         = "consecutive-kine-pool"
+	FileCtrKineRSS      = "consecutive-kine-rss"
 	FileCtrTTLRewedge   = "consecutive-ttl-rewedge"
 	FileLastRVC         = "last-rvc"
 	FileLastPRVC        = "last-prvc"

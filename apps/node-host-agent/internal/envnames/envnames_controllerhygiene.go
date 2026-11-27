@@ -41,4 +41,14 @@ const (
 	EnvEtcdLearnerMaxAge      = "NODE_HOST_AGENT_ETCD_LEARNER_MAX_AGE"
 	EnvEtcdFsyncP99MaxSeconds = "NODE_HOST_AGENT_ETCD_FSYNC_P99_MAX_SECONDS"
 	EnvEtcdMetricsURL         = "NODE_HOST_AGENT_ETCD_METRICS_URL"
+	// konnectivity-server goroutine & RSS leak guard.
+	EnvKonnectivityMaxGoroutines = "NODE_HOST_AGENT_KONNECTIVITY_MAX_GOROUTINES"
+	EnvKonnectivityMaxRSSMiB     = "NODE_HOST_AGENT_KONNECTIVITY_MAX_RSS_MIB"
+	// embedded etcd fragmentation-ratio auto-defrag.
+	EnvEtcdDefragMinSizeMiB = "NODE_HOST_AGENT_ETCD_DEFRAG_MIN_SIZE_MIB"
+	EnvEtcdDefragFragRatio  = "NODE_HOST_AGENT_ETCD_DEFRAG_FRAG_RATIO"
+	EnvEtcdDefragCooldown   = "NODE_HOST_AGENT_ETCD_DEFRAG_COOLDOWN"
+	// HA-gated kine RSS leak guard.
+	EnvKineMaxRSSMiB   = "NODE_HOST_AGENT_KINE_MAX_RSS_MIB"
+	EnvKineRSSCooldown = "NODE_HOST_AGENT_KINE_RSS_COOLDOWN"
 )

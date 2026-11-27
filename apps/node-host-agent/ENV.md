@@ -10,7 +10,7 @@ contract); call sites — `envx.*`/`envx.*Knob` declarations,
 bespoke `{Name: ...}` knob rows and `os.Getenv`/`getenv`
 calls in non-test `*.go` files — reference the const. The tables
 below group knobs by the package(s) referencing them, listing the
-source location of every reference in that package (215 knobs
+source location of every reference in that package (222 knobs
 referenced across 17 packages). The
 `NODE_HOST_AGENT_ENABLE_*` tri-state gates live in their own table:
 they come from the `Descriptor` registry, not a `config_env.go`.
@@ -104,24 +104,31 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_CONTROLLER_INSECURE_TLS` — `env.go:135`
 - `NODE_HOST_AGENT_CONTROLLER_INTERVAL` — `env.go:94`
 - `NODE_HOST_AGENT_ETCD_DB_SIZE_LIMIT` — `env.go:147`
+- `NODE_HOST_AGENT_ETCD_DEFRAG_COOLDOWN` — `env.go:182`
+- `NODE_HOST_AGENT_ETCD_DEFRAG_FRAG_RATIO` — `env.go:171`
+- `NODE_HOST_AGENT_ETCD_DEFRAG_MIN_SIZE_MIB` — `env.go:162`
 - `NODE_HOST_AGENT_ETCD_ENDPOINT` — `env.go:146`
 - `NODE_HOST_AGENT_ETCD_FSYNC_P99_MAX_SECONDS` — `env.go:149`
 - `NODE_HOST_AGENT_ETCD_LEARNER_MAX_AGE` — `env.go:148`
 - `NODE_HOST_AGENT_ETCD_METRICS_URL` — `env.go:160`
-- `NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR` — `env.go:165`
+- `NODE_HOST_AGENT_ETCD_SNAPSHOT_DIR` — `env.go:217`
 - `NODE_HOST_AGENT_FROZEN_CYCLES` — `env.go:110`
 - `NODE_HOST_AGENT_GAP_CYCLES` — `env.go:108`
 - `NODE_HOST_AGENT_GAP_MIN` — `env.go:106`
 - `NODE_HOST_AGENT_K0S_DIR` — `env.go:144`
 - `NODE_HOST_AGENT_KINE_DB_PROBE` — `env.go:102`
+- `NODE_HOST_AGENT_KINE_MAX_RSS_MIB` — `env.go:203`
 - `NODE_HOST_AGENT_KINE_POOL_AUTOFIX` — `env.go:123`
 - `NODE_HOST_AGENT_KINE_POOL_CYCLES` — `env.go:126`
 - `NODE_HOST_AGENT_KINE_POOL_MAX_CONNS` — `env.go:124`
 - `NODE_HOST_AGENT_KINE_POOL_MIN_RESTART_S` — `env.go:128`
+- `NODE_HOST_AGENT_KINE_RSS_COOLDOWN` — `env.go:212`
 - `NODE_HOST_AGENT_KINE_TTL_AUTOFIX` — `env.go:116`
 - `NODE_HOST_AGENT_KINE_TTL_CTL_RESTART_S` — `env.go:119`
 - `NODE_HOST_AGENT_KINE_TTL_MIN_RESTART_S` — `env.go:117`
 - `NODE_HOST_AGENT_KINE_TTL_REWEDGE_CYCLES` — `env.go:121`
+- `NODE_HOST_AGENT_KONNECTIVITY_MAX_GOROUTINES` — `env.go:184`
+- `NODE_HOST_AGENT_KONNECTIVITY_MAX_RSS_MIB` — `env.go:193`
 - `NODE_HOST_AGENT_OOMLOOP_AUTOFIX` — `env.go:130`
 - `NODE_HOST_AGENT_OOMLOOP_MIN_KILLS` — `env.go:131`
 - `NODE_HOST_AGENT_OOMLOOP_WINDOW_S` — `env.go:133`
@@ -130,7 +137,7 @@ subsystem has no env gate.
 - `NODE_HOST_AGENT_SIG13_MIN_RESTART_S` — `env.go:114`
 - `NODE_HOST_AGENT_SOLO_CYCLES` — `env.go:112`
 - `NODE_HOST_AGENT_STALE_MIN_ERRS` — `env.go:104`
-- `NODE_HOST_AGENT_TOTAL_CONTROLLERS` — `env.go:164`
+- `NODE_HOST_AGENT_TOTAL_CONTROLLERS` — `env.go:216`
 
 ### `internal/subsystem/hostconfig`
 

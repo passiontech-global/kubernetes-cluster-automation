@@ -45,6 +45,11 @@ const (
 	DefaultEtcdMetricsURL     = "https://127.0.0.1:2379/metrics"
 	defaultEtcdLearnerMaxAge  = 30 * time.Minute
 	defaultEtcdFsyncP99MaxSec = 0.10
+
+	// Fragmentation-ratio auto-defrag defaults.
+	DefaultEtcdDefragMinSizeMiB = int64(512)
+	DefaultEtcdDefragFragRatio  = 0.50
+	DefaultEtcdDefragCooldown   = 6 * time.Hour
 )
 
 // EtcdGuardConfig is the embedded-etcd quota self-defence (k0s
@@ -52,7 +57,9 @@ const (
 // <K0sDir>/bin/etcdctl + pki/etcd/ca.crt). Trigger = NOSPACE alarm or
 // dbSize >= DBSizeLimit → eventpurge + ONLINE-ONLY etcd rescue under the
 // last-etcd-guard budget (the offline defrag stops k0scontroller and
-// stays a manual action).
+// stays a manual action). When below the emergency trigger, sustained
+// BoltDB fragmentation (>=DefragMinSizeMiB and >=DefragFragRatio unused)
+// runs ONLINE-ONLY compact+defrag under the last-etcd-frag-defrag budget.
 type EtcdGuardConfig struct {
 	Endpoint    string // "" → https://127.0.0.1:2379
 	DBSizeLimit int64  // dbSize trigger bytes; <=0 → 1.5 GiB
@@ -62,6 +69,11 @@ type EtcdGuardConfig struct {
 	LearnerMaxAge      time.Duration // <=0 → 30m
 	FsyncP99MaxSeconds float64       // <=0 → 0.10s
 	MetricsURL         string        // "" → https://127.0.0.1:2379/metrics (mTLS)
+	// Fragmentation-ratio auto-defrag knobs (0 MinSizeMiB = disabled).
+	DefragMinSizeMiB int64         // default 512 MiB; 0 = disabled
+	defragMinSizeSet bool          // true once resolved by ConfigFromEnv
+	DefragFragRatio  float64       // default 0.50 (>=50% unused)
+	DefragCooldown   time.Duration // default 6h (last-etcd-frag-defrag)
 }
 
 func (c *Config) applyEtcdGuardDefaults() {
@@ -82,6 +94,15 @@ func (c *Config) applyEtcdGuardDefaults() {
 	}
 	if c.EtcdGuard.MetricsURL == "" {
 		c.EtcdGuard.MetricsURL = DefaultEtcdMetricsURL
+	}
+	if !c.EtcdGuard.defragMinSizeSet && c.EtcdGuard.DefragMinSizeMiB == 0 {
+		c.EtcdGuard.DefragMinSizeMiB = DefaultEtcdDefragMinSizeMiB
+	}
+	if c.EtcdGuard.DefragFragRatio <= 0 {
+		c.EtcdGuard.DefragFragRatio = DefaultEtcdDefragFragRatio
+	}
+	if c.EtcdGuard.DefragCooldown <= 0 {
+		c.EtcdGuard.DefragCooldown = DefaultEtcdDefragCooldown
 	}
 	if c.EtcdBackupDir == "" {
 		c.EtcdBackupDir = defaultEtcdBackupDir

@@ -228,6 +228,9 @@ type Config struct {
 	// KinePool is the kine -> DB connection-spiral guard
 	// (NODE_HOST_AGENT_KINE_POOL_*).
 	KinePool KinePoolConfig
+	// KineRSS is the HA-gated kine RSS leak guard
+	// (NODE_HOST_AGENT_KINE_MAX_RSS_MIB / NODE_HOST_AGENT_KINE_RSS_COOLDOWN).
+	KineRSS KineRSSConfig
 	// OOMLoop is the cgroup OOM-loop detector + shield
 	// (NODE_HOST_AGENT_OOMLOOP_*).
 	OOMLoop OOMLoopConfig
@@ -313,6 +316,7 @@ func (c *Config) ApplyDefaults() {
 	c.applySig13Defaults()
 	c.applyKineTTLDefaults()
 	c.applyKinePoolDefaults()
+	c.applyKineRSSDefaults()
 	c.applyOOMLoopDefaults()
 	c.applyFeederDefaults()
 	if c.K0sDir == "" {

@@ -9,9 +9,33 @@ package wdeps
 import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+// DentryStateUnused reads <procRoot>/sys/fs/dentry-state field 2
+// (nr_unused — dentries the kernel has already unlinked but not yet
+// reclaimed). The file carries six counters
+// (nr_dentry nr_unused age_limit want_pages nr_negative
+// nr_unused_negative); a short/unparseable read reports -1 so the
+// caller can tell "no data" from "zero unused".
+func DentryStateUnused(procRoot string) int64 {
+	data, err := os.ReadFile(filepath.Join(procRoot, "sys", "fs", "dentry-state"))
+	if err != nil {
+		return -1
+	}
+	f := strings.Fields(string(data))
+	if len(f) < 2 {
+		return -1
+	}
+	n, err := strconv.ParseInt(f[1], 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
 
 // ParseWGAllowedIPs counts peers carrying a real allowed-ips set —
 // `wg show <iface> allowed-ips` prints "<pubkey>\t<ip,ip,...>" per

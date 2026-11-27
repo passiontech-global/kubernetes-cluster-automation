@@ -84,8 +84,18 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 		t.Errorf("Sig13 defaults: %+v", cfg.Sig13)
 	}
 	if cfg.EtcdGuard.Endpoint != cdeps.DefaultEtcdEndpoint ||
-		cfg.EtcdGuard.DBSizeLimit != 0 {
+		cfg.EtcdGuard.DBSizeLimit != 0 ||
+		cfg.EtcdGuard.DefragMinSizeMiB != 512 ||
+		cfg.EtcdGuard.DefragFragRatio != 0.50 ||
+		cfg.EtcdGuard.DefragCooldown != 6*time.Hour {
 		t.Errorf("EtcdGuard: %+v", cfg.EtcdGuard)
+	}
+	if cfg.CPFreeze.KonnectivityMaxGoroutines != 10000 ||
+		cfg.CPFreeze.KonnectivityMaxRSSMiB != 512 {
+		t.Errorf("CPFreeze konnectivity defaults: %+v", cfg.CPFreeze)
+	}
+	if cfg.KineRSS.MaxRSSMiB != 1536 || cfg.KineRSS.Cooldown != time.Hour {
+		t.Errorf("KineRSS defaults: %+v", cfg.KineRSS)
 	}
 	if cfg.TotalControllers != 0 || cfg.EtcdSnapshotDir != "" {
 		t.Errorf("topology knobs: %d %q", cfg.TotalControllers, cfg.EtcdSnapshotDir)
@@ -210,5 +220,30 @@ func TestConfigFromEnvGarbageIntFallsBack(t *testing.T) {
 	cfg := cdeps.ConfigFromEnv(envDeps(nil, nil))
 	if cfg.Sig13.StaleMinErrs != 15 {
 		t.Errorf("garbage env int produced %d want default 15", cfg.Sig13.StaleMinErrs)
+	}
+}
+
+// Explicit "0" disables leak/defrag guards and must survive ApplyDefaults.
+func TestConfigFromEnvZeroDisablesGuardsAcrossApplyDefaults(t *testing.T) {
+	t.Setenv(envnames.EnvKonnectivityMaxGoroutines, "0")
+	t.Setenv(envnames.EnvKonnectivityMaxRSSMiB, "0")
+	t.Setenv(envnames.EnvEtcdDefragMinSizeMiB, "0")
+	t.Setenv(envnames.EnvEtcdDefragFragRatio, "0.65")
+	t.Setenv(envnames.EnvEtcdDefragCooldown, "4h")
+	t.Setenv(envnames.EnvKineMaxRSSMiB, "0")
+	t.Setenv(envnames.EnvKineRSSCooldown, "2h")
+
+	cfg := cdeps.ConfigFromEnv(envDeps(nil, nil))
+	cfg.ApplyDefaults()
+
+	if cfg.CPFreeze.KonnectivityMaxGoroutines != 0 || cfg.CPFreeze.KonnectivityMaxRSSMiB != 0 {
+		t.Fatalf("konnectivity zero-disabled overwritten by ApplyDefaults: %+v", cfg.CPFreeze)
+	}
+	if cfg.EtcdGuard.DefragMinSizeMiB != 0 || cfg.EtcdGuard.DefragFragRatio != 0.65 ||
+		cfg.EtcdGuard.DefragCooldown != 4*time.Hour {
+		t.Fatalf("etcd frag knobs wrong after ApplyDefaults: %+v", cfg.EtcdGuard)
+	}
+	if cfg.KineRSS.MaxRSSMiB != 0 || cfg.KineRSS.Cooldown != 2*time.Hour {
+		t.Fatalf("kine RSS knobs wrong after ApplyDefaults: %+v", cfg.KineRSS)
 	}
 }

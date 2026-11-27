@@ -158,6 +158,58 @@ func ConfigFromEnv(d EnvDeps) Config {
 			}
 		}},
 		envx.StringKnob(envnames.EnvEtcdMetricsURL, &cfg.EtcdGuard.MetricsURL, DefaultEtcdMetricsURL),
+		// embedded etcd fragmentation-ratio auto-defrag knobs.
+		{Name: envnames.EnvEtcdDefragMinSizeMiB, Resolve: func(name string) {
+			cfg.EtcdGuard.DefragMinSizeMiB = DefaultEtcdDefragMinSizeMiB
+			cfg.EtcdGuard.defragMinSizeSet = true
+			if v := envx.String(name, ""); v != "" {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+					cfg.EtcdGuard.DefragMinSizeMiB = n
+				}
+			}
+		}},
+		{Name: envnames.EnvEtcdDefragFragRatio, Resolve: func(name string) {
+			cfg.EtcdGuard.DefragFragRatio = DefaultEtcdDefragFragRatio
+			if v := envx.String(name, ""); v != "" {
+				if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 &&
+					!math.IsNaN(f) && !math.IsInf(f, 0) && f <= 1.0 {
+					cfg.EtcdGuard.DefragFragRatio = f
+				} else {
+					envx.Warnf("invalid %s (want 0 < f <= 1): %q — using default", name, v)
+				}
+			}
+		}},
+		envx.DurationKnob(envnames.EnvEtcdDefragCooldown, &cfg.EtcdGuard.DefragCooldown, DefaultEtcdDefragCooldown),
+		// konnectivity-server goroutine & RSS leak guard knobs.
+		{Name: envnames.EnvKonnectivityMaxGoroutines, Resolve: func(name string) {
+			cfg.CPFreeze.KonnectivityMaxGoroutines = DefaultKonnectivityMaxGoroutines
+			cfg.CPFreeze.konnMaxGoroutinesSet = true
+			if v := envx.String(name, ""); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+					cfg.CPFreeze.KonnectivityMaxGoroutines = n
+				}
+			}
+		}},
+		{Name: envnames.EnvKonnectivityMaxRSSMiB, Resolve: func(name string) {
+			cfg.CPFreeze.KonnectivityMaxRSSMiB = DefaultKonnectivityMaxRSSMiB
+			cfg.CPFreeze.konnMaxRSSMiBSet = true
+			if v := envx.String(name, ""); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+					cfg.CPFreeze.KonnectivityMaxRSSMiB = n
+				}
+			}
+		}},
+		// HA-gated kine RSS leak guard knobs.
+		{Name: envnames.EnvKineMaxRSSMiB, Resolve: func(name string) {
+			cfg.KineRSS.MaxRSSMiB = DefaultKineMaxRSSMiB
+			cfg.KineRSS.maxRSSMiBSet = true
+			if v := envx.String(name, ""); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+					cfg.KineRSS.MaxRSSMiB = n
+				}
+			}
+		}},
+		envx.DurationKnob(envnames.EnvKineRSSCooldown, &cfg.KineRSS.Cooldown, DefaultKineRSSCooldown),
 		// spof-streak + backup-health: the single-controller SPOF override
 		// (0 = auto — an unset PeerAPI means single-controller) and
 		// the etcd snapshot verifier dir ("" = the k0s defaults).

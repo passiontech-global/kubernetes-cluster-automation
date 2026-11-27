@@ -30,12 +30,49 @@ ntp_fallback_servers: [pool.example.org]
 	c.groupTimesync()
 
 	dropin := hostRead(t, r, "/etc/systemd/timesyncd.conf.d/50-node-config-agent.conf")
-	if !strings.Contains(dropin, "[Time]\nNTP=10.0.0.1 10.0.0.2\n") ||
-		!strings.Contains(dropin, "FallbackNTP=pool.example.org\n") {
-		t.Fatalf("bad timesyncd drop-in:\n%s", dropin)
+	for _, want := range []string{
+		"[Time]\nNTP=10.0.0.1 10.0.0.2\n",
+		"FallbackNTP=pool.example.org\n",
+		"PollIntervalMinSec=32\n",
+		"PollIntervalMaxSec=256\n",
+		"RootDistanceMaxSec=10\n",
+	} {
+		if !strings.Contains(dropin, want) {
+			t.Fatalf("timesyncd drop-in missing %q:\n%s", want, dropin)
+		}
 	}
 	// timesyncd re-reads config only on start — the changed drop-in
 	// must bounce the unit exactly once.
+	if n := len(sr.CallsMatching("systemctl restart systemd-timesyncd.service")); n != 1 {
+		t.Fatalf("timesyncd restarts = %d, want 1: %v", n, sr.CallsMatching("systemctl"))
+	}
+	// Second cycle with identical vars is idempotent — no extra restart.
+	c.groupTimesync()
+	if n := len(sr.CallsMatching("systemctl restart systemd-timesyncd.service")); n != 1 {
+		t.Fatalf("timesyncd restarts after second cycle = %d, want 1: %v", n, sr.CallsMatching("systemctl"))
+	}
+}
+
+func TestTimesyncFallbackOnlyIncludesStealTuning(t *testing.T) {
+	c, r, sr := timesyncEnv(t, `
+ntp_fallback_servers: [time.cloudflare.com]
+`, nil)
+	c.groupTimesync()
+
+	dropin := hostRead(t, r, "/etc/systemd/timesyncd.conf.d/50-node-config-agent.conf")
+	if strings.Contains(dropin, "\nNTP=") {
+		t.Fatalf("unexpected empty NTP= line:\n%s", dropin)
+	}
+	for _, want := range []string{
+		"[Time]\nFallbackNTP=time.cloudflare.com\n",
+		"PollIntervalMinSec=32\n",
+		"PollIntervalMaxSec=256\n",
+		"RootDistanceMaxSec=10\n",
+	} {
+		if !strings.Contains(dropin, want) {
+			t.Fatalf("timesyncd drop-in missing %q:\n%s", want, dropin)
+		}
+	}
 	if n := len(sr.CallsMatching("systemctl restart systemd-timesyncd.service")); n != 1 {
 		t.Fatalf("timesyncd restarts = %d, want 1: %v", n, sr.CallsMatching("systemctl"))
 	}

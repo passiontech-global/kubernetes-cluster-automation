@@ -297,6 +297,10 @@ type FreezeCheck struct {
 	// like the other streaks: a restart just re-arms the 3-cycle
 	// debounce.
 	konnBadCycles int
+	// konnLeakCycles is the konnectivity-server goroutine/RSS leak
+	// streak — consecutive cycles exceeding KonnectivityMaxGoroutines
+	// or KonnectivityMaxRSSMiB (konnectivity_heal.go).
+	konnLeakCycles int
 }
 
 // Name returns the check label / log context.
