@@ -35,7 +35,7 @@ subsystem has no env gate.
 | `NODE_HOST_AGENT_ENABLE_REPORTER` | nodereporter | `on` (pod) / `off` (standalone) |
 | `NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE` | controllerhygiene | `auto` |
 | `NODE_HOST_AGENT_ENABLE_HOSTCONFIG` | hostconfig | `auto` |
-| — | hubsync | — |
+| `NODE_HOST_AGENT_ENABLE_HUBSYNC` | hubsync | `on` |
 | `NODE_HOST_AGENT_ENABLE_KINEDB` | kinedb | `auto` |
 | `NODE_HOST_AGENT_ENABLE_FEEDER` | — | — |
 

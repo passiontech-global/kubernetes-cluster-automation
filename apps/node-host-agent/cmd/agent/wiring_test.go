@@ -47,6 +47,7 @@ func enableBothKubeConsumers(t *testing.T) {
 	disableAllSubsystems(t)
 	t.Setenv(envnames.EnvEnableSweeper, "true")
 	t.Setenv(envnames.EnvEnableHygiene, "true")
+	t.Setenv(envnames.EnvEnableHubsync, "true")
 }
 
 // TestCsOnceSharesOneClientset: sweeper and workerhygiene both consume
@@ -235,6 +236,9 @@ func TestKineDBGating(t *testing.T) {
 
 func TestHubsyncGating(t *testing.T) {
 	disableAllSubsystems(t)
+	// Reset hubsync flag so subtests verify the default ModeOn behaviour
+	// unless overridden explicitly.
+	t.Setenv(envnames.EnvEnableHubsync, "")
 	sandboxed := t.TempDir()
 	t.Setenv(envnames.EnvWatchdogConf, filepath.Join(sandboxed, "no.conf"))
 	t.Setenv(envnames.EnvAPIGuardConf, filepath.Join(sandboxed, "no.conf"))
@@ -243,6 +247,63 @@ func TestHubsyncGating(t *testing.T) {
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
 	t.Setenv("KUBECONFIG", "")
+
+	t.Run("disabled via NODE_HOST_AGENT_ENABLE_HUBSYNC=false", func(t *testing.T) {
+		calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return testutil.FakeKube(), nil
+		})
+		t.Setenv(envnames.EnvConvergeSSHKey, writeEd25519Key(t))
+		t.Setenv(envnames.EnvEnableHubsync, "false")
+		cfg, report := testBuildAgentConfig("n", "pod-a", false)
+		for _, n := range subsystemNames(cfg) {
+			if n == "hubsync" {
+				t.Fatal("hubsync must be excluded when NODE_HOST_AGENT_ENABLE_HUBSYNC=false")
+			}
+		}
+		if *calls != 0 {
+			t.Fatalf("kubeClient calls=%d want 0 when hubsync disabled", *calls)
+		}
+		foundOff := false
+		for _, n := range report.Off {
+			if n == "hubsync" {
+				foundOff = true
+				break
+			}
+		}
+		if !foundOff {
+			t.Fatalf("report.Off=%v missing hubsync", report.Off)
+		}
+	})
+
+	t.Run("disabled via NODE_HOST_AGENT_ENABLE_HUBSYNC=off", func(t *testing.T) {
+		calls := stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return testutil.FakeKube(), nil
+		})
+		t.Setenv(envnames.EnvConvergeSSHKey, writeEd25519Key(t))
+		t.Setenv(envnames.EnvEnableHubsync, "off")
+		cfg, _ := testBuildAgentConfig("n", "pod-a", false)
+		for _, n := range subsystemNames(cfg) {
+			if n == "hubsync" {
+				t.Fatal("hubsync must be excluded when NODE_HOST_AGENT_ENABLE_HUBSYNC=off")
+			}
+		}
+		if *calls != 0 {
+			t.Fatalf("kubeClient calls=%d want 0 when hubsync off", *calls)
+		}
+	})
+
+	t.Run("enabled explicitly via NODE_HOST_AGENT_ENABLE_HUBSYNC=true", func(t *testing.T) {
+		stubKubeClient(t, func() (kubernetes.Interface, error) {
+			return testutil.FakeKube(), nil
+		})
+		t.Setenv(envnames.EnvConvergeSSHKey, writeEd25519Key(t))
+		t.Setenv(envnames.EnvEnableHubsync, "true")
+		cfg, _ := testBuildAgentConfig("n", "pod-a", false)
+		got := subsystemNames(cfg)
+		if len(got) != 1 || got[0] != "hubsync" {
+			t.Fatalf("subsystems=%v want [hubsync]", got)
+		}
+	})
 
 	t.Run("no key → registered, polls for key", func(t *testing.T) {
 		stubKubeClient(t, func() (kubernetes.Interface, error) {

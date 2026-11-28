@@ -38,6 +38,7 @@ const (
 	EnvEnableReporter          = "NODE_HOST_AGENT_ENABLE_REPORTER"
 	EnvEnableControllerhygiene = "NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE"
 	EnvEnableHostconfig        = "NODE_HOST_AGENT_ENABLE_HOSTCONFIG"
+	EnvEnableHubsync           = "NODE_HOST_AGENT_ENABLE_HUBSYNC"
 	EnvEnableKinedb            = "NODE_HOST_AGENT_ENABLE_KINEDB"
 	// EnvEnableFeeder gates the standalone api-backend feeder
 	// inside controllerhygiene — read directly via envx.BoolKnob
