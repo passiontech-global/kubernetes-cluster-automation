@@ -249,21 +249,40 @@ func Duration(key string, def time.Duration) time.Duration {
 	return durationValue(key, os.Getenv(key), def)
 }
 
-// List parses a comma-separated env var, trimming spaces and dropping
-// empty entries; unset/empty → nil (the consumer applies its own
-// defaults — nil vs empty slice matters to callers).
-func List(key string) []string {
-	v := os.Getenv(key)
-	if v == "" {
+// SplitCommaList splits a comma-separated string, trimming spaces and
+// dropping empty entries; empty or whitespace/comma-only input → nil.
+func SplitCommaList(raw string) []string {
+	if raw == "" {
 		return nil
 	}
 	var out []string
-	for p := range strings.SplitSeq(v, ",") {
+	for p := range strings.SplitSeq(raw, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// ParseCommaSet parses a comma-separated string into a set of trimmed
+// non-empty tokens; returns nil when no non-empty tokens are present.
+func ParseCommaSet(raw string) map[string]bool {
+	items := SplitCommaList(raw)
+	if len(items) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(items))
+	for _, item := range items {
+		set[item] = true
+	}
+	return set
+}
+
+// List parses a comma-separated env var, trimming spaces and dropping
+// empty entries; unset/empty → nil (the consumer applies its own
+// defaults — nil vs empty slice matters to callers).
+func List(key string) []string {
+	return SplitCommaList(os.Getenv(key))
 }
 
 // IntList parses a comma-separated env var of ints; unset/empty → nil.

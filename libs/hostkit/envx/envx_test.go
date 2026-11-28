@@ -594,6 +594,29 @@ func TestIntListKnob(t *testing.T) {
 	}
 }
 
+func TestSplitCommaListAndParseCommaSet(t *testing.T) {
+	if got := SplitCommaList(""); got != nil {
+		t.Fatalf("SplitCommaList(\"\") = %v, want nil", got)
+	}
+	if got := SplitCommaList(" , , "); got != nil {
+		t.Fatalf("SplitCommaList(whitespace) = %v, want nil", got)
+	}
+	if got := SplitCommaList(" alpha , beta, ,gamma "); !slices.Equal(got, []string{"alpha", "beta", "gamma"}) {
+		t.Fatalf("SplitCommaList = %v", got)
+	}
+
+	if got := ParseCommaSet(""); got != nil {
+		t.Fatalf("ParseCommaSet(\"\") = %v, want nil", got)
+	}
+	if got := ParseCommaSet(" , "); got != nil {
+		t.Fatalf("ParseCommaSet(whitespace) = %v, want nil", got)
+	}
+	set := ParseCommaSet(" ns-a , ns-b , ns-a ")
+	if len(set) != 2 || !set["ns-a"] || !set["ns-b"] || set["ns-c"] {
+		t.Fatalf("ParseCommaSet = %v", set)
+	}
+}
+
 func TestModeKnob(t *testing.T) {
 	const key = "ENVX_TEST_MODE_KNOB"
 	var m Mode

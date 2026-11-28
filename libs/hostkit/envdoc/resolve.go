@@ -86,6 +86,10 @@ func EnvxHelpers(envxDir string) (map[string]bool, error) {
 func PackageStringConsts(files []*ast.File) map[string]string {
 	consts := make(map[string]string)
 	pending := make(map[string]ast.Expr)
+	lookupConst := func(id *ast.Ident) (string, bool) {
+		v, ok := consts[id.Name]
+		return v, ok
+	}
 	for _, f := range files {
 		for _, decl := range f.Decls {
 			gen, ok := decl.(*ast.GenDecl)
@@ -105,7 +109,7 @@ func PackageStringConsts(files []*ast.File) map[string]string {
 					if i >= len(vals) {
 						continue
 					}
-					if v, ok := evalStaticStringExpr(vals[i], consts); ok {
+					if v, ok := evalStaticStringExpr(vals[i], lookupConst); ok {
 						consts[n.Name] = v
 					} else {
 						pending[n.Name] = vals[i]
@@ -117,7 +121,7 @@ func PackageStringConsts(files []*ast.File) map[string]string {
 	for len(pending) > 0 {
 		progressed := false
 		for name, expr := range pending {
-			if v, ok := evalStaticStringExpr(expr, consts); ok {
+			if v, ok := evalStaticStringExpr(expr, lookupConst); ok {
 				consts[name] = v
 				delete(pending, name)
 				progressed = true
@@ -130,7 +134,7 @@ func PackageStringConsts(files []*ast.File) map[string]string {
 	return consts
 }
 
-func evalStaticStringExpr(expr ast.Expr, consts map[string]string) (string, bool) {
+func evalStaticStringExpr(expr ast.Expr, resolveIdent func(*ast.Ident) (string, bool)) (string, bool) {
 	switch e := expr.(type) {
 	case *ast.BasicLit:
 		if e.Kind != token.STRING {
@@ -139,16 +143,15 @@ func evalStaticStringExpr(expr ast.Expr, consts map[string]string) (string, bool
 		v, err := strconv.Unquote(e.Value)
 		return v, err == nil
 	case *ast.ParenExpr:
-		return evalStaticStringExpr(e.X, consts)
+		return evalStaticStringExpr(e.X, resolveIdent)
 	case *ast.Ident:
-		v, ok := consts[e.Name]
-		return v, ok
+		return resolveIdent(e)
 	case *ast.BinaryExpr:
 		if e.Op != token.ADD {
 			return "", false
 		}
-		l, lok := evalStaticStringExpr(e.X, consts)
-		r, rok := evalStaticStringExpr(e.Y, consts)
+		l, lok := evalStaticStringExpr(e.X, resolveIdent)
+		r, rok := evalStaticStringExpr(e.Y, resolveIdent)
 		if lok && rok {
 			return l + r, true
 		}
