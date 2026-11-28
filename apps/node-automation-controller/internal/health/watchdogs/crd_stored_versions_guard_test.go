@@ -4,22 +4,30 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
@@ -439,6 +447,91 @@ func TestCRDStoredVersionsGuard403GracefulSkipAndBudgetRefund(t *testing.T) {
 		svs, _, _ := unstructured.NestedStringSlice(gotCRD.Object, "status", "storedVersions")
 		if len(svs) != 2 {
 			t.Fatalf("terminating unmigrated CR must block /status storedVersions prune, got %v", svs)
+		}
+	})
+}
+
+func TestCRDStoredVersionsGuardNodeReaderAndConsistentCRList(t *testing.T) {
+	t.Cleanup(crdStoredVerDriftGauge.Reset)
+	t.Run("uses NodeReader when CRDInformerEnabled and does not pin dynamic CRD list", func(t *testing.T) {
+		kube.SetCRDInformerEnabled(true)
+		t.Cleanup(func() { kube.SetCRDInformerEnabled(false) })
+
+		scheme := runtime.NewScheme()
+		_ = apiextensionsv1.AddToScheme(scheme)
+		typedCRD := &apiextensionsv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{Name: "foos.example.com"},
+			Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+				Group: "example.com",
+				Names: apiextensionsv1.CustomResourceDefinitionNames{Plural: "foos", Kind: "Foo"},
+				Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+					{Name: "v1alpha1", Served: true, Storage: false},
+					{Name: "v1", Served: true, Storage: true},
+				},
+			},
+			Status: apiextensionsv1.CustomResourceDefinitionStatus{
+				StoredVersions: []string{"v1alpha1", "v1"},
+			},
+		}
+		var reader client.Reader = ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(typedCRD).Build()
+		dyn := testutil.NewDynamicClientWithCRDs()
+		var dynCRDLists atomic.Int32
+		dyn.PrependReactor("list", "customresourcedefinitions", func(ktesting.Action) (bool, runtime.Object, error) {
+			dynCRDLists.Add(1)
+			return false, nil, nil
+		})
+		p := probetest.NewCheckProber(fake.NewSimpleClientset(), dyn, NewCRDStoredVersionsGuardCheck)
+		p.NodeReader = reader
+		chk := probetest.MustCheck[*crdStoredVerCheck](t, p)
+
+		res := probetest.RunCheck(ctx, chk.Deps, chk)
+		if res.Pass || !strings.Contains(res.Why, "foos.example.com(multi_stored_versions") {
+			t.Fatalf("expected multi_stored_versions finding from NodeReader, got %+v", res)
+		}
+		if dynCRDLists.Load() != 0 {
+			t.Fatalf("expected 0 dynamic CRD lists when NodeReader+CRDInformerEnabled succeeded, got %d", dynCRDLists.Load())
+		}
+	})
+
+	t.Run("CR list before /status prune uses empty ResourceVersion (consistent read)", func(t *testing.T) {
+		t.Setenv("NODE_AUTOMATION_CRD_STORED_VERSIONS_MIGRATE_ENABLED", "true")
+		var crdRV, crRV string
+		var gotCRList, gotStatusPatch bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/apis/apiextensions.k8s.io/v1/customresourcedefinitions":
+				crdRV = r.URL.Query().Get("resourceVersion")
+				_, _ = w.Write([]byte(`{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinitionList","items":[{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"foos.example.com"},"spec":{"group":"example.com","names":{"plural":"foos","kind":"Foo"},"versions":[{"name":"v1alpha1","served":true,"storage":false},{"name":"v1","served":true,"storage":true}]},"status":{"storedVersions":["v1alpha1","v1"]}}]}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/apis/example.com/v1/foos":
+				gotCRList = true
+				crRV = r.URL.Query().Get("resourceVersion")
+				_, _ = w.Write([]byte(`{"apiVersion":"example.com/v1","kind":"FooList","items":[]}`))
+			case r.Method == http.MethodPatch && r.URL.Path == "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/foos.example.com/status":
+				gotStatusPatch = true
+				_, _ = w.Write([]byte(`{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"foos.example.com"},"status":{"storedVersions":["v1"]}}`))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+
+		dyn, err := dynamic.NewForConfig(&rest.Config{Host: srv.URL})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := probetest.NewCheckProber(fake.NewSimpleClientset(), dyn, NewCRDStoredVersionsGuardCheck)
+		chk := probetest.MustCheck[*crdStoredVerCheck](t, p)
+		_ = probetest.RunCheck(ctx, chk.Deps, chk)
+
+		if !gotCRList || !gotStatusPatch {
+			t.Fatalf("expected CR list (%v) and CRD status patch (%v)", gotCRList, gotStatusPatch)
+		}
+		if crdRV != "0" {
+			t.Fatalf("CRD list resourceVersion = %q, want \"0\"", crdRV)
+		}
+		if crRV != "" {
+			t.Fatalf("CR list before /status prune resourceVersion = %q, want \"\" (quorum read)", crRV)
 		}
 	})
 }

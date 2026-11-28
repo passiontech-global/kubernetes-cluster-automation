@@ -180,13 +180,15 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node,
 		// moment a probe succeeds (the ok branch above), so a
 		// kubelet restart ends the episode instead of banking
 		// against the next one.
-		if allowed, reason := heal.TryAcquireTarget(r.queue, name, r.now.Now()); !allowed {
+		now := r.now.Now()
+		if allowed, reason := heal.TryAcquireTarget(r.queue, name, now); !allowed {
 			log.Info("DEFER: heal target circuit open — taint skipped",
 				"node", name, "reason", reason)
 			return nil
 		}
 		if err := kube.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
 			corev1.TaintEffectNoSchedule); err != nil {
+			heal.RefundTarget(r.queue, name, now)
 			return fmt.Errorf("taint %s on node %s: %w",
 				kubeletReaperTaint, name, err)
 		}

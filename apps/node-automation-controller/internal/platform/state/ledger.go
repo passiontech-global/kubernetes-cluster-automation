@@ -118,6 +118,7 @@ func (l *GaugeLedger[K]) Last() map[K][]string {
 // BEFORE calling — Reconcile only manages series existence.
 func (l *GaugeLedger[K]) Reconcile(current map[K][]string,
 	delete func(labelValues ...string) bool) int {
+	l.Begin()
 	for k, lv := range current {
 		l.Emit(k, lv...)
 	}

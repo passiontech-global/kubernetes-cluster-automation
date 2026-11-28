@@ -454,6 +454,100 @@ func TestNetpolEgressLockoutGuard(t *testing.T) {
 			t.Fatalf("expected dns_egress_blocked when CNP toEndpoints lacks kube-system namespace, got %+v", res3)
 		}
 	})
+
+	t.Run("CiliumClusterwideNetworkPolicy evaluated and nodeSelector host policies ignored", func(t *testing.T) {
+		pod := netpolLockoutPod("apps", "web-1", map[string]string{"app": "web"})
+		ccnpNodeOnly := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "cilium.io/v2",
+			"kind":       "CiliumClusterwideNetworkPolicy",
+			"metadata":   map[string]any{"name": "host-fw"},
+			"spec": map[string]any{
+				"nodeSelector": map[string]any{"matchLabels": map[string]any{"role": "worker"}},
+				"egress":       []any{},
+			},
+		}}
+		ccnpPodLockout := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "cilium.io/v2",
+			"kind":       "CiliumClusterwideNetworkPolicy",
+			"metadata":   map[string]any{"name": "cluster-deny-dns"},
+			"spec": map[string]any{
+				"endpointSelector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
+				"egress":           []any{},
+			},
+		}}
+
+		cs := fake.NewSimpleClientset(pod)
+		pHost := netpolLockoutTestProber(t, cs, testutil.NewDynamicClientWithCRDs(ccnpNodeOnly), now)
+		chkHost := probetest.MustCheck[*netpolLockoutCheck](t, pHost)
+		if res := chkHost.Run(probetest.SweepCtx(context.Background(), chkHost.Deps)); !res.Pass {
+			t.Fatalf("nodeSelector-only CCNP must not flag pod: %+v", res)
+		}
+
+		pLock := netpolLockoutTestProber(t, cs, testutil.NewDynamicClientWithCRDs(ccnpPodLockout), now)
+		chkLock := probetest.MustCheck[*netpolLockoutCheck](t, pLock)
+		res := chkLock.Run(probetest.SweepCtx(context.Background(), chkLock.Deps))
+		if res.Pass || !strings.Contains(res.Why, "CiliumClusterwideNetworkPolicy/cluster-deny-dns") {
+			t.Fatalf("expected CCNP lockout finding, got %+v", res)
+		}
+	})
+
+	t.Run("partial 403 carries forward held tuples without clearing", func(t *testing.T) {
+		pod := netpolLockoutPod("apps", "web-1", map[string]string{"app": "web"})
+		denyCNP := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "cilium.io/v2",
+			"kind":       "CiliumNetworkPolicy",
+			"metadata":   map[string]any{"namespace": "apps", "name": "deny-all"},
+			"spec": map[string]any{
+				"endpointSelector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
+				"egress":           []any{},
+			},
+		}}
+		cs := fake.NewSimpleClientset(pod)
+		dyn := testutil.NewDynamicClientWithCRDs(denyCNP)
+		p := netpolLockoutTestProber(t, cs, dyn, now)
+		chk := probetest.MustCheck[*netpolLockoutCheck](t, p)
+
+		// Sweep 1 flags via CNP.
+		if res := chk.Run(probetest.SweepCtx(context.Background(), chk.Deps)); res.Pass {
+			t.Fatalf("expected FAIL on sweep 1, got %+v", res)
+		}
+
+		// Sweep 2: NP succeeds (empty), CNP returns 403 -> partial 403 must carry held tuple.
+		dyn.PrependReactor("list", "ciliumnetworkpolicies", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "cilium.io", Resource: "ciliumnetworkpolicies"}, "", apierrors.NewUnauthorized("rbac"))
+		})
+		res2 := chk.Run(probetest.SweepCtx(context.Background(), chk.Deps))
+		if !res2.Pass || res2.Infra != nil {
+			t.Fatalf("expected PASS with nil Infra on partial 403 carry, got %+v", res2)
+		}
+		if m := probetest.FindMetric(t, "node_automation_netpol_egress_lockout", map[string]string{
+			"namespace": "apps", "pod": "web-1", "reason": netpolLockoutReasonDNS,
+		}); m == nil || m.GetGauge().GetValue() != 1 {
+			t.Fatalf("expected held dns_egress_blocked=1 carried on partial 403, got %v", m)
+		}
+	})
+
+	t.Run("ordinary Helm workload with non-default SA without API signals does not flag apiserver lockout", func(t *testing.T) {
+		helmPod := netpolLockoutPod("apps", "my-nginx-0", map[string]string{"app": "nginx"})
+		helmPod.Spec.ServiceAccountName = "my-nginx-sa"
+		denyNP := &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "default-deny-egress"},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			},
+		}
+		cs := fake.NewSimpleClientset(helmPod, denyNP)
+		p := netpolLockoutTestProber(t, cs, testutil.NewDynamicClientWithCRDs(), now)
+		chk := probetest.MustCheck[*netpolLockoutCheck](t, p)
+		res := chk.Run(probetest.SweepCtx(context.Background(), chk.Deps))
+		if res.Pass {
+			t.Fatalf("expected dns_egress_blocked failure, got %+v", res)
+		}
+		if strings.Contains(res.Why, netpolLockoutReasonAPIServer) {
+			t.Fatalf("ordinary Helm pod with non-default SA must not flag apiserver_egress_blocked: %q", res.Why)
+		}
+	})
 }
 
 type netpolLockoutRoundTripFunc func(*http.Request) (*http.Response, error)

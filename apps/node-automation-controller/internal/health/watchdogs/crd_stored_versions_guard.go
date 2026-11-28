@@ -25,6 +25,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -52,6 +53,7 @@ const (
 	crdStoredVerEventCooldown       = 6 * time.Hour
 	crdStoredVerMaxCRDsPerSweep     = 1
 	crdStoredVerMaxCRsPerSweep      = 50
+	crdStoredVerPageSize            = 25
 	crdStoredVerReasonMulti         = "multi_stored_versions"
 	crdStoredVerReasonUnserved      = "unserved_stored_version"
 )
@@ -83,8 +85,23 @@ func NewCRDStoredVersionsGuardCheck(d *probefw.Deps) probefw.Check {
 	}
 }
 
+type crdStoredVerSpecVersion struct {
+	name    string
+	served  bool
+	storage bool
+}
+
+type crdStoredVerSummary struct {
+	meta           metav1.PartialObjectMetadata
+	group          string
+	plural         string
+	kind           string
+	versions       []crdStoredVerSpecVersion
+	storedVersions []string
+}
+
 type crdStoredVerFinding struct {
-	crd        *unstructured.Unstructured
+	meta       metav1.PartialObjectMetadata
 	name       string
 	group      string
 	plural     string
@@ -106,7 +123,7 @@ func (c *crdStoredVerCheck) Run(ctx context.Context) probefw.Result {
 		return probefw.Result{Infra: fmt.Errorf("no dynamic client — %s unverifiable", CheckNameCRDStoredVersionsGuard)}
 	}
 
-	crds, err := c.AllUnstructured(ctx, kube.GVRCustomResourceDefinition)
+	crds, err := c.collectCRDStoredVerSummaries(ctx, log)
 	if err != nil {
 		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
 			log.V(1).Info("CustomResourceDefinition list skipped", "error", err)
@@ -122,11 +139,8 @@ func (c *crdStoredVerCheck) Run(ctx context.Context) probefw.Result {
 
 	var candidates []crdStoredVerFinding
 	for i := range crds {
-		crd := &crds[i]
-		if crd.GetDeletionTimestamp() != nil {
-			continue
-		}
-		finding, drifted := crdStoredVerInspect(crd)
+		summary := &crds[i]
+		finding, drifted := crdStoredVerInspect(summary)
 		if !drifted {
 			continue
 		}
@@ -137,9 +151,9 @@ func (c *crdStoredVerCheck) Run(ctx context.Context) probefw.Result {
 		rep.Find(fmt.Sprintf("%s(%s; stored=%s)",
 			finding.name, strings.Join(finding.reasons, "+"), strings.Join(finding.stored, ",")))
 
-		c.crdStoredVerEmitEvent(ctx, log, now, crd, finding)
+		c.crdStoredVerEmitEvent(ctx, log, now, &summary.meta, finding)
 
-		if finding.canMigrate && c.crdStoredVerShouldMigrate(crd) {
+		if finding.canMigrate && c.crdStoredVerShouldMigrate(ctx, &summary.meta) {
 			candidates = append(candidates, finding)
 		}
 	}
@@ -155,8 +169,117 @@ func (c *crdStoredVerCheck) Run(ctx context.Context) probefw.Result {
 		"crd storedVersions drift: ", ", ")
 }
 
-func crdStoredVerInspect(crd *unstructured.Unstructured) (crdStoredVerFinding, bool) {
-	stored, _ := kube.NestedStringSlice(crd.Object, "status", "storedVersions")
+func (c *crdStoredVerCheck) collectCRDStoredVerSummaries(
+	ctx context.Context,
+	log logr.Logger,
+) ([]crdStoredVerSummary, error) {
+	if c.NodeReader != nil && kube.CRDInformerEnabled() {
+		var list apiextensionsv1.CustomResourceDefinitionList
+		if err := c.NodeReader.List(ctx, &list); err == nil {
+			out := make([]crdStoredVerSummary, 0, len(list.Items))
+			for i := range list.Items {
+				crd := &list.Items[i]
+				if crd.DeletionTimestamp != nil {
+					continue
+				}
+				versions := make([]crdStoredVerSpecVersion, 0, len(crd.Spec.Versions))
+				for _, v := range crd.Spec.Versions {
+					versions = append(versions, crdStoredVerSpecVersion{
+						name:    v.Name,
+						served:  v.Served,
+						storage: v.Storage,
+					})
+				}
+				out = append(out, crdStoredVerSummary{
+					meta: metav1.PartialObjectMetadata{
+						TypeMeta: metav1.TypeMeta{
+							APIVersion: "apiextensions.k8s.io/v1",
+							Kind:       "CustomResourceDefinition",
+						},
+						ObjectMeta: crd.ObjectMeta,
+					},
+					group:          crd.Spec.Group,
+					plural:         crd.Spec.Names.Plural,
+					kind:           crd.Spec.Names.Kind,
+					versions:       versions,
+					storedVersions: slices.Clone(crd.Status.StoredVersions),
+				})
+			}
+			return out, nil
+		} else {
+			log.V(1).Info("CRD informer cache read failed — falling back to paged dynamic list", "error", err)
+		}
+	}
+
+	var out []crdStoredVerSummary
+	err := kube.ListEach(ctx,
+		metav1.ListOptions{
+			Limit:           crdStoredVerPageSize,
+			ResourceVersion: "0",
+		},
+		kube.DynamicPage(c.Dyn.Resource(kube.GVRCustomResourceDefinition)),
+		func(page []unstructured.Unstructured) error {
+			for i := range page {
+				crd := &page[i]
+				if crd.GetDeletionTimestamp() != nil {
+					continue
+				}
+				stored, _ := kube.NestedStringSlice(crd.Object, "status", "storedVersions")
+				if len(stored) == 0 {
+					continue
+				}
+				rawVersions, _ := kube.NestedSlice(crd.Object, "spec", "versions")
+				versions := make([]crdStoredVerSpecVersion, 0, len(rawVersions))
+				for _, rawVer := range rawVersions {
+					vm, ok := rawVer.(map[string]any)
+					if !ok {
+						continue
+					}
+					vName, _ := kube.NestedString(vm, "name")
+					if vName == "" {
+						continue
+					}
+					isServed, _ := kube.NestedBool(vm, "served")
+					isStorage, _ := kube.NestedBool(vm, "storage")
+					versions = append(versions, crdStoredVerSpecVersion{
+						name:    vName,
+						served:  isServed,
+						storage: isStorage,
+					})
+				}
+				group, _ := kube.NestedString(crd.Object, "spec", "group")
+				plural, _ := kube.NestedString(crd.Object, "spec", "names", "plural")
+				kind, _ := kube.NestedString(crd.Object, "spec", "names", "kind")
+				out = append(out, crdStoredVerSummary{
+					meta: metav1.PartialObjectMetadata{
+						TypeMeta: metav1.TypeMeta{
+							APIVersion: "apiextensions.k8s.io/v1",
+							Kind:       "CustomResourceDefinition",
+						},
+						ObjectMeta: metav1.ObjectMeta{
+							Name:              crd.GetName(),
+							UID:               crd.GetUID(),
+							Annotations:       crd.GetAnnotations(),
+							DeletionTimestamp: crd.GetDeletionTimestamp(),
+						},
+					},
+					group:          group,
+					plural:         plural,
+					kind:           kind,
+					versions:       versions,
+					storedVersions: stored,
+				})
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func crdStoredVerInspect(crd *crdStoredVerSummary) (crdStoredVerFinding, bool) {
+	stored := crd.storedVersions
 	if len(stored) == 0 {
 		return crdStoredVerFinding{}, false
 	}
@@ -165,25 +288,17 @@ func crdStoredVerInspect(crd *unstructured.Unstructured) (crdStoredVerFinding, b
 	var storageServed []string
 	var storageTotal int
 
-	versions, _ := kube.NestedSlice(crd.Object, "spec", "versions")
-	for _, rawVer := range versions {
-		vm, ok := rawVer.(map[string]any)
-		if !ok {
+	for _, v := range crd.versions {
+		if v.name == "" {
 			continue
 		}
-		vName, _ := kube.NestedString(vm, "name")
-		if vName == "" {
-			continue
+		if v.served {
+			served[v.name] = true
 		}
-		isServed, _ := kube.NestedBool(vm, "served")
-		isStorage, _ := kube.NestedBool(vm, "storage")
-		if isServed {
-			served[vName] = true
-		}
-		if isStorage {
+		if v.storage {
 			storageTotal++
-			if isServed {
-				storageServed = append(storageServed, vName)
+			if v.served {
+				storageServed = append(storageServed, v.name)
 			}
 		}
 	}
@@ -202,25 +317,23 @@ func crdStoredVerInspect(crd *unstructured.Unstructured) (crdStoredVerFinding, b
 		return crdStoredVerFinding{}, false
 	}
 
-	group, _ := kube.NestedString(crd.Object, "spec", "group")
-	plural, _ := kube.NestedString(crd.Object, "spec", "names", "plural")
-	kind, _ := kube.NestedString(crd.Object, "spec", "names", "kind")
+	kind := crd.kind
 	if kind == "" {
-		kind = plural
+		kind = crd.plural
 	}
 
 	var storageVer string
 	canMigrate := false
-	if storageTotal == 1 && len(storageServed) == 1 && group != "" && plural != "" {
+	if storageTotal == 1 && len(storageServed) == 1 && crd.group != "" && crd.plural != "" {
 		storageVer = storageServed[0]
 		canMigrate = true
 	}
 
 	return crdStoredVerFinding{
-		crd:        crd,
-		name:       crd.GetName(),
-		group:      group,
-		plural:     plural,
+		meta:       crd.meta,
+		name:       crd.meta.Name,
+		group:      crd.group,
+		plural:     crd.plural,
 		kind:       kind,
 		storageVer: storageVer,
 		canMigrate: canMigrate,
@@ -229,8 +342,8 @@ func crdStoredVerInspect(crd *unstructured.Unstructured) (crdStoredVerFinding, b
 	}, true
 }
 
-func (c *crdStoredVerCheck) crdStoredVerShouldMigrate(crd *unstructured.Unstructured) bool {
-	annos := crd.GetAnnotations()
+func (c *crdStoredVerCheck) crdStoredVerShouldMigrate(ctx context.Context, meta metav1.Object) bool {
+	annos := kube.EffectiveAnnos(ctx, meta)
 	if val, ok := annos[crdStoredVerAnnoAutoMigrate]; ok {
 		switch val {
 		case "false":
@@ -283,7 +396,7 @@ func (c *crdStoredVerCheck) crdStoredVerRunMigration(
 		}
 		list, err := kube.ListAllUnstructured(ctx, c.Dyn.Resource(crGVR), metav1.ListOptions{
 			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
+			ResourceVersion: "",
 		})
 		if err != nil {
 			heal.RefundTarget(CheckNameCRDStoredVersionsGuard, cand.name, now)
@@ -307,7 +420,7 @@ func (c *crdStoredVerCheck) crdStoredVerRunMigration(
 			return cmp.Compare(a.GetName(), b.GetName())
 		})
 
-		explicitOptIn := cand.crd.GetAnnotations()[crdStoredVerAnnoAutoMigrate] == "true"
+		explicitOptIn := kube.EffectiveAnno(ctx, &cand.meta, crdStoredVerAnnoAutoMigrate) == "true"
 		patchPayload, err := json.Marshal(map[string]any{
 			"metadata": map[string]any{
 				"annotations": map[string]any{
@@ -438,7 +551,7 @@ func (c *crdStoredVerCheck) crdStoredVerEmitEvent(
 	ctx context.Context,
 	log logr.Logger,
 	now time.Time,
-	crd *unstructured.Unstructured,
+	crd metav1.Object,
 	finding crdStoredVerFinding,
 ) {
 	cooldownKey := "crd.storedversions." + finding.name

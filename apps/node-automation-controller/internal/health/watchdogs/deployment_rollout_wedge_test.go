@@ -596,3 +596,33 @@ func TestRolloutWedgeStage3GateOrderingRefundAndReservation(t *testing.T) {
 		}
 	})
 }
+
+func TestRolloutWedgeDoesNotLeakGaugeOnPodsInInfraError(t *testing.T) {
+	t.Cleanup(deploymentRolloutWedgeGauge.Reset)
+	dep := wedgeDep("apps", "wedged-leak", 3, "ProgressDeadlineExceeded",
+		corev1.ConditionFalse, rolloutWedgeMinAge+time.Minute)
+	cs := fake.NewSimpleClientset(dep)
+	cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("pod list failed")
+	})
+	d := probetest.NewDeps(cs, probetest.OpDyn())
+	ch := &deploymentRolloutWedgeCheck{Deps: d}
+
+	res := ch.Run(probetest.SweepCtx(ctx, ch.Deps))
+	if res.Infra == nil {
+		t.Fatalf("expected Infra error, got %+v", res)
+	}
+
+	// Recover Deployment and PodsIn on next sweep -> reconciled ledger must delete gauge.
+	cs.ReactionChain = cs.ReactionChain[1:]
+	healthy := wedgeDep("apps", "wedged-leak", 3, "Available", corev1.ConditionTrue, time.Hour)
+	_, _ = cs.AppsV1().Deployments("apps").Update(ctx, healthy, metav1.UpdateOptions{})
+	if res2 := ch.Run(probetest.SweepCtx(ctx, ch.Deps)); !res2.Pass {
+		t.Fatalf("expected PASS after recovery, got %+v", res2)
+	}
+	if m := probetest.FindMetric(t, "node_automation_deployment_rollout_wedged", map[string]string{
+		"namespace": "apps", "deployment": "wedged-leak", "reason": "progress_deadline_exceeded",
+	}); m != nil {
+		t.Fatalf("orphaned gauge leaked after PodsIn Infra error: %v", m)
+	}
+}

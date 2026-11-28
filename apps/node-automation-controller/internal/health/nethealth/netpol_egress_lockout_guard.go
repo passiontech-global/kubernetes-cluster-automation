@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -88,10 +89,11 @@ type netpolLockoutPolicyMeta struct {
 }
 
 type netpolLockoutParsedCNP struct {
-	name      string
-	namespace string
-	createdAt time.Time
-	specs     []map[string]any
+	name        string
+	namespace   string
+	clusterwide bool
+	createdAt   time.Time
+	specs       []map[string]any
 }
 
 func (c *netpolLockoutCheck) Run(ctx context.Context) probefw.Result {
@@ -125,13 +127,22 @@ func (c *netpolLockoutCheck) Run(ctx context.Context) probefw.Result {
 		return netpolLockoutCarryOnErr(&c.emitted, npErr)
 	}
 
-	cnps, cnpBlocked, cnpErr := c.netpolLockoutListCiliumPolicies(ctx, log)
+	cnps, cnpBlocked, cnpErr := c.netpolLockoutListCiliumPolicies(ctx, log,
+		kube.GVRCiliumNetworkPolicy, "CiliumNetworkPolicy")
 	if cnpErr != nil {
 		return netpolLockoutCarryOnErr(&c.emitted, cnpErr)
 	}
 
-	// If both policy sources were RBAC-blocked, carry held tuples and avoid false clearing.
-	if npBlocked && cnpBlocked {
+	ccnps, ccnpBlocked, ccnpErr := c.netpolLockoutListCiliumPolicies(ctx, log,
+		kube.GVRCiliumClusterwideNetworkPolicy, "CiliumClusterwideNetworkPolicy")
+	if ccnpErr != nil {
+		return netpolLockoutCarryOnErr(&c.emitted, ccnpErr)
+	}
+
+	// If any policy source was RBAC-blocked (partial or full 403), carry held
+	// tuples rather than false-clearing or false-flagging against an unreadable
+	// companion allow policy.
+	if npBlocked || cnpBlocked || ccnpBlocked {
 		for k, lv := range c.emitted.Last() {
 			rep.Carry(k, lv)
 		}
@@ -160,20 +171,21 @@ func (c *netpolLockoutCheck) Run(ctx context.Context) probefw.Result {
 	cnpsByNS := make(map[string][]netpolLockoutParsedCNP)
 	for i := range cnps {
 		u := &cnps[i]
-		specs := netpolLockoutExtractCiliumSpecs(u)
-		var egressSpecs []map[string]any
-		for _, sp := range specs {
-			if netpolLockoutCiliumSpecHasEgress(sp) {
-				egressSpecs = append(egressSpecs, sp)
-			}
+		if parsed, ok := parseCiliumEgressPolicy(u, false); ok {
+			cnpsByNS[u.GetNamespace()] = append(cnpsByNS[u.GetNamespace()], parsed)
 		}
-		if len(egressSpecs) > 0 {
-			cnpsByNS[u.GetNamespace()] = append(cnpsByNS[u.GetNamespace()], netpolLockoutParsedCNP{
-				name:      u.GetName(),
-				namespace: u.GetNamespace(),
-				createdAt: u.GetCreationTimestamp().Time,
-				specs:     egressSpecs,
-			})
+	}
+
+	var parsedCCNPs []netpolLockoutParsedCNP
+	ccnpByName := make(map[string]netpolLockoutPolicyMeta)
+	for i := range ccnps {
+		u := &ccnps[i]
+		if parsed, ok := parseCiliumEgressPolicy(u, true); ok {
+			parsedCCNPs = append(parsedCCNPs, parsed)
+			ccnpByName["CiliumClusterwideNetworkPolicy/"+parsed.name] = netpolLockoutPolicyMeta{
+				displayName: "CiliumClusterwideNetworkPolicy/" + parsed.name,
+				createdAt:   parsed.createdAt,
+			}
 		}
 	}
 
@@ -184,7 +196,7 @@ func (c *netpolLockoutCheck) Run(ctx context.Context) probefw.Result {
 	for ns, nsPods := range podsByNS {
 		nsNPs := npsByNS[ns]
 		nsCNPs := cnpsByNS[ns]
-		if len(nsNPs) == 0 && len(nsCNPs) == 0 {
+		if len(nsNPs) == 0 && len(nsCNPs) == 0 && len(parsedCCNPs) == 0 {
 			continue
 		}
 		for _, np := range nsNPs {
@@ -200,15 +212,22 @@ func (c *netpolLockoutCheck) Run(ctx context.Context) probefw.Result {
 			})
 		}
 
+		seenCCNP := map[string]bool{}
 		for _, pod := range nsPods {
 			if strings.EqualFold(strings.TrimSpace(kube.EffectiveAnno(ctx, pod, netpolLockoutIgnoreAnno)), "true") {
 				continue
 			}
 			selected, dnsAllowed, apiAllowed, matchedPolicies := netpolLockoutEvaluatePod(
-				pod, nsNPs, nsCNPs, kubeSystemLabels,
+				pod, nsNPs, nsCNPs, parsedCCNPs, kubeSystemLabels,
 			)
 			if !selected {
 				continue
+			}
+			for _, mp := range matchedPolicies {
+				if pm, ok := ccnpByName[mp]; ok && !seenCCNP[mp] {
+					seenCCNP[mp] = true
+					policyMetaByNS[ns] = append(policyMetaByNS[ns], pm)
+				}
 			}
 			if !dnsAllowed {
 				hasFindings = true
@@ -330,23 +349,49 @@ func (c *netpolLockoutCheck) netpolLockoutListNetworkPolicies(
 	return items, false, nil
 }
 
+func parseCiliumEgressPolicy(u *unstructured.Unstructured, clusterwide bool) (netpolLockoutParsedCNP, bool) {
+	specs := netpolLockoutExtractCiliumSpecs(u)
+	var egressSpecs []map[string]any
+	for _, sp := range specs {
+		if netpolLockoutCiliumSpecHasEgress(sp) {
+			egressSpecs = append(egressSpecs, sp)
+		}
+	}
+	if len(egressSpecs) == 0 {
+		return netpolLockoutParsedCNP{}, false
+	}
+	ns := u.GetNamespace()
+	if clusterwide {
+		ns = ""
+	}
+	return netpolLockoutParsedCNP{
+		name:        u.GetName(),
+		namespace:   ns,
+		clusterwide: clusterwide,
+		createdAt:   u.GetCreationTimestamp().Time,
+		specs:       egressSpecs,
+	}, true
+}
+
 func (c *netpolLockoutCheck) netpolLockoutListCiliumPolicies(
 	ctx context.Context,
 	log logr.Logger,
+	gvr schema.GroupVersionResource,
+	kind string,
 ) (cnps []unstructured.Unstructured, blocked bool, infraErr error) {
 	if c.Dyn == nil {
 		return nil, false, nil
 	}
-	items, err := c.AllUnstructured(ctx, kube.GVRCiliumNetworkPolicy)
+	items, err := c.AllUnstructured(ctx, gvr)
 	if err != nil {
 		if kube.IsCRDAbsent(err) {
 			return nil, false, nil
 		}
 		if apierrors.IsForbidden(err) {
-			log.V(1).Info("CiliumNetworkPolicy list skipped (403)", "error", err)
+			log.V(1).Info(kind+" list skipped (403)", "error", err)
 			return nil, true, nil
 		}
-		return nil, true, fmt.Errorf("list ciliumnetworkpolicies: %w", err)
+		return nil, true, fmt.Errorf("list %s: %w", gvr.Resource, err)
 	}
 	return items, false, nil
 }
@@ -420,6 +465,7 @@ func netpolLockoutEvaluatePod(
 	pod *corev1.Pod,
 	nsNPs []*networkingv1.NetworkPolicy,
 	nsCNPs []netpolLockoutParsedCNP,
+	ccnps []netpolLockoutParsedCNP,
 	kubeSystemLabels map[string]string,
 ) (selected, dnsAllowed, apiAllowed bool, matchedPolicies []string) {
 	podLabels := labels.Set(pod.Labels)
@@ -445,39 +491,43 @@ func netpolLockoutEvaluatePod(
 		}
 	}
 
-	for _, cnp := range nsCNPs {
-		cnpMatched := false
-		for _, sp := range cnp.specs {
-			if !netpolLockoutCiliumSpecMatchesPod(sp, pod.Namespace, podLabels) {
-				continue
-			}
-			if _, hasEgress := sp["egress"]; hasEgress && sp["egress"] != nil {
-				hasAllowPolicy = true
-				cnpMatched = true
-				for _, rule := range netpolLockoutCiliumEgressRules(sp) {
-					if netpolLockoutCiliumRuleAllowsDNS(rule, cnp.namespace) {
-						dnsAllowed = true
-					}
-					if netpolLockoutCiliumRuleAllowsAPIServer(rule, cnp.namespace) {
-						apiAllowed = true
-					}
+	evalCiliumList := func(list []netpolLockoutParsedCNP, prefix string) {
+		for _, cnp := range list {
+			cnpMatched := false
+			for _, sp := range cnp.specs {
+				if !netpolLockoutCiliumSpecMatchesPod(sp, pod.Namespace, podLabels, cnp.clusterwide) {
+					continue
 				}
-			}
-			for _, denyRule := range netpolLockoutCiliumEgressDenyRules(sp) {
-				if netpolLockoutCiliumDenyRuleBlocksDNS(denyRule, cnp.namespace) {
-					dnsDenied = true
+				if _, hasEgress := sp["egress"]; hasEgress && sp["egress"] != nil {
+					hasAllowPolicy = true
 					cnpMatched = true
+					for _, rule := range netpolLockoutCiliumEgressRules(sp) {
+						if netpolLockoutCiliumRuleAllowsDNS(rule, cnp.namespace) {
+							dnsAllowed = true
+						}
+						if netpolLockoutCiliumRuleAllowsAPIServer(rule, cnp.namespace) {
+							apiAllowed = true
+						}
+					}
 				}
-				if netpolLockoutCiliumDenyRuleBlocksAPIServer(denyRule, cnp.namespace) {
-					apiDenied = true
-					cnpMatched = true
+				for _, denyRule := range netpolLockoutCiliumEgressDenyRules(sp) {
+					if netpolLockoutCiliumDenyRuleBlocksDNS(denyRule, cnp.namespace) {
+						dnsDenied = true
+						cnpMatched = true
+					}
+					if netpolLockoutCiliumDenyRuleBlocksAPIServer(denyRule, cnp.namespace) {
+						apiDenied = true
+						cnpMatched = true
+					}
 				}
 			}
-		}
-		if cnpMatched {
-			matchedPolicies = append(matchedPolicies, "CiliumNetworkPolicy/"+cnp.name)
+			if cnpMatched {
+				matchedPolicies = append(matchedPolicies, prefix+cnp.name)
+			}
 		}
 	}
+	evalCiliumList(nsCNPs, "CiliumNetworkPolicy/")
+	evalCiliumList(ccnps, "CiliumClusterwideNetworkPolicy/")
 
 	if !hasAllowPolicy && !dnsDenied && !apiDenied {
 		return false, true, true, nil
@@ -696,10 +746,14 @@ func netpolLockoutCiliumSpecHasEgress(sp map[string]any) bool {
 	return false
 }
 
-func netpolLockoutCiliumSpecMatchesPod(sp map[string]any, ns string, podLabels labels.Set) bool {
+func netpolLockoutCiliumSpecMatchesPod(sp map[string]any, ns string, podLabels labels.Set, clusterwide bool) bool {
+	if clusterwide && sp["nodeSelector"] != nil && sp["endpointSelector"] == nil {
+		return false
+	}
 	epRaw, hasEP := sp["endpointSelector"].(map[string]any)
 	if !hasEP {
-		// CiliumNetworkPolicy with empty/omitted endpointSelector defaults to selecting all endpoints in namespace.
+		// CiliumNetworkPolicy / CiliumClusterwideNetworkPolicy with empty/omitted
+		// endpointSelector defaults to selecting all endpoints in scope.
 		return sp["nodeSelector"] == nil
 	}
 	ls, ok := netpolLockoutCiliumSelectorToK8s(epRaw, ns)
@@ -1210,10 +1264,6 @@ func netpolLockoutNeedsAPIServer(pod *corev1.Pod) bool {
 	}
 	// Explicit opt-in to ServiceAccount token mount.
 	if pod.Spec.AutomountServiceAccountToken != nil && *pod.Spec.AutomountServiceAccountToken {
-		return true
-	}
-	// Non-default ServiceAccount indicates RBAC / Kubernetes API usage.
-	if pod.Spec.ServiceAccountName != "" && pod.Spec.ServiceAccountName != "default" {
 		return true
 	}
 	for _, c := range append(slices.Clone(pod.Spec.InitContainers), pod.Spec.Containers...) {

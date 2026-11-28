@@ -264,7 +264,7 @@ func Setup(d shared.Deps) error {
 				slowPoll:       cjSlowPoll,
 			},
 		}
-		return shared.AddPeriodic(mgr, j.queue, 30*time.Minute, j.run)
+		return shared.AddPeriodicWithTimeout(mgr, j.queue, 30*time.Minute, j.cfg.runTimeout, j.run)
 	})
 }
 

@@ -325,6 +325,7 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	seenKeys := map[string]bool{}
+	flaggedKeys := map[string]bool{}
 	reloads := 0
 	podsByNS := map[string][]*corev1.Pod{}
 	for _, w := range active {
@@ -350,6 +351,7 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 		if now.Sub(p.driftSince[key]) < subPathDriftMinAge {
 			continue
 		}
+		flaggedKeys[key] = true
 		rep.Flag(subPathConfigDriftGauge, key,
 			[]string{w.ns, w.name, w.kind})
 		rep.Find(key)
@@ -366,7 +368,14 @@ func (p *subpathConfigDriftCheck) Run(ctx context.Context) probefw.Result {
 			// drift pays for it, and only once per namespace per scan.
 			pods, err = p.PodsIn(ctx, w.ns)
 			if err != nil {
-				return probefw.Result{Infra: fmt.Errorf("list pods: %w", err)}
+				for k, lv := range p.emitted.Last() {
+					if !flaggedKeys[k] {
+						rep.Carry(k, lv)
+					}
+				}
+				rep.InfraErr(fmt.Errorf("list pods: %w", err))
+				return rep.Result(&p.emitted, subPathConfigDriftGauge.DeleteLabelValues,
+					"subpath config drift: ", ", ")
 			}
 			podsByNS[w.ns] = pods
 		}
@@ -652,6 +661,9 @@ func (p *subpathConfigDriftCheck) stampSubPathReload(ctx context.Context,
 	case "DaemonSet":
 		_, err = p.CS.AppsV1().DaemonSets(w.ns).Patch(ctx, w.name,
 			types.MergePatchType, data, metav1.PatchOptions{})
+	}
+	if err == nil {
+		kube.RecordAnnoPatch(ctx, w.obj, data)
 	}
 	return err
 }

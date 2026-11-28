@@ -438,6 +438,7 @@ func (p *cjForbidZombieCheck) clearGhostActiveRef(ctx context.Context,
 		return
 	}
 	p.Heals.Stamp(healKey, now)
+	p.InvalidateCronJobs(ctx)
 	rep.Find("healed: cleared ghost active ref " + jobName + " on " + key)
 	log.Info("ACTION: cleared ghost status.active ref on Forbid CronJob",
 		"cronjob", key, "job", jobName)
@@ -489,6 +490,7 @@ func (p *cjForbidZombieCheck) deleteStalledJob(ctx context.Context,
 		return
 	}
 	p.Heals.Stamp(healKey, now)
+	p.InvalidateJobs(ctx)
 	rep.Find("healed: deleted stalled job " + job.Namespace + "/" +
 		job.Name + " on " + key)
 	log.Info("ACTION: deleted stalled Job to unblock Forbid CronJob",

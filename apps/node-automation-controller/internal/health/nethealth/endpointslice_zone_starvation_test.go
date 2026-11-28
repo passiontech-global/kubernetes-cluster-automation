@@ -15,6 +15,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // zonedWorker builds a Ready worker node labeled into zone.
@@ -321,5 +322,21 @@ func TestEndpointSliceStripsConflictingTopologyMode(t *testing.T) {
 	}
 	if got := gotLegacy.Annotations[corev1.AnnotationTopologyMode]; got != topologyModeAuto {
 		t.Fatalf("legacy-only topology-mode annotation altered: got %q want %q", got, topologyModeAuto)
+	}
+}
+
+func TestEndpointSliceEffectiveAnnoOverlay(t *testing.T) {
+	svc := topologyService("apps", "svc-ov")
+	sctx := probetest.SweepCtx(ctx, nil)
+	if !topologyAuditedService(sctx, svc) {
+		t.Fatal("expected topologyAuditedService true before overlay null")
+	}
+	payload, err := kube.MergePatchAnnos(map[string]any{corev1.AnnotationTopologyMode: nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kube.RecordAnnoPatch(sctx, svc, payload)
+	if topologyAuditedService(sctx, svc) {
+		t.Fatal("topologyAuditedService must honor mid-sweep overlay deletion")
 	}
 }

@@ -5,6 +5,7 @@
 package cilium
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -12,11 +13,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
 
 // l2Lease builds a cilium-l2announce Lease held by holder.
@@ -316,5 +320,21 @@ func TestCiliumL2LeaseGuardMaxSurgeDeterminism(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCiliumL2LeaseGuardDeleteErrorIncrementsIncError(t *testing.T) {
+	t.Cleanup(ciliumL2StaleLeaseGauge.Reset)
+	cs := fake.NewSimpleClientset(l2Lease("cilium-l2announce-web_dead", "w-gone"))
+	cs.PrependReactor("delete", "leases", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver delete failed")
+	})
+	p := testProber(cs)
+	chk := probetest.MustCheck[*ciliumL2LeaseGuardCheck](t, p)
+
+	before := testutil.QueueErrorCount(t, chk.Name)
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if got := testutil.QueueErrorCount(t, chk.Name) - before; got != 1 {
+		t.Fatalf("Lease delete error incremented IncError by %v, want 1", got)
 	}
 }

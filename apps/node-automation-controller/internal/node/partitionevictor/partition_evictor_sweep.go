@@ -244,6 +244,8 @@ func (s *partitionSweep) taintFlagged(ctx context.Context) {
 		}
 		s.breakerCharged[name] = true // grant consumed — evict rides it
 		if err := kube.TaintNode(ctx, s.e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
+			heal.RefundTarget(s.e.queue, name, s.now)
+			s.breakerCharged[name] = false
 			metrics.IncError(s.e.queue)
 			s.log.Error(err, "taint failed", "node", name)
 		} else {

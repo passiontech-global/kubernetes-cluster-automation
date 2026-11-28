@@ -12,6 +12,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/testutil"
 )
@@ -75,5 +76,31 @@ func TestPartitionEvictorPodListErrorContinues(t *testing.T) {
 		if !kube.HasTaint(testutil.GetNode(t, cs, name).Spec.Taints, partitionTaintKey) {
 			t.Fatalf("flagged node %s not tainted", name)
 		}
+	}
+}
+
+func TestPartitionEvictorRefundsTargetBreakerOnTaintError(t *testing.T) {
+	objs := []runtime.Object{
+		pePartitionedNode("p1", "HostNetworkProblems", 20*time.Minute),
+	}
+	objs = append(objs, peHealthyNodes("h", 3)...)
+	cs := fake.NewSimpleClientset(objs...)
+	cs.PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver patch failed")
+	})
+	now := time.Now()
+	heal.ConfigureTargetBreaker(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+
+	e := &partitionEvictor{
+		cs:    cs,
+		queue: "partition-pod-evictor",
+		now:   func() time.Time { return now },
+	}
+	if err := e.run(ctx); err != nil {
+		t.Fatalf("run must absorb taint failure: %v", err)
+	}
+	if allowed, reason := heal.TryAcquireTarget(e.queue, "p1", now); !allowed {
+		t.Fatalf("expected TargetBreaker refunded on TaintNode failure, got reason=%q", reason)
 	}
 }

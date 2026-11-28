@@ -763,8 +763,12 @@ func TestKedaRescueCrossKindIsolation(t *testing.T) {
 
 				probetest.FreezeNow(p.Deps, base)
 				chk.Run(probetest.SweepCtx(ctx, chk.Deps))
-				probetest.FreezeNow(p.Deps, base.Add(16*time.Minute))
-				chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+				// Per-sweep rescue cap bounds to 1 rescue per sweep; run 3 sweeps to
+				// rescue each distinct kind without cross-kind FluxPatchGate collision.
+				for step := range order {
+					probetest.FreezeNow(p.Deps, base.Add(16*time.Minute+time.Duration(step)*time.Second))
+					chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+				}
 
 				for _, kind := range order {
 					if r := replicasOf(t, cs, p.Deps, kind); r != 1 {
@@ -845,12 +849,15 @@ func TestKedaRescueCrossKindIsolation(t *testing.T) {
 				}
 
 				// Flux reverts its target to 0, while non-Flux siblings wedge at 0 inside 30m cooldown.
+				// Run one sweep per non-Flux sibling (per-sweep rescue cap = 1).
 				revertZero(t, cs, p.Deps, fluxKind)
 				for _, ok := range otherKinds {
 					revertZero(t, cs, p.Deps, ok)
 				}
-				probetest.FreezeNow(p.Deps, t1.Add(time.Minute))
-				chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+				for step := range otherKinds {
+					probetest.FreezeNow(p.Deps, t1.Add(time.Minute+time.Duration(step)*time.Second))
+					chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+				}
 				for _, ok := range otherKinds {
 					if r := replicasOf(t, cs, p.Deps, ok); r != 1 {
 						t.Fatalf("non-Flux %s rescue replicas=%d, want 1", ok, r)
@@ -886,8 +893,10 @@ func TestKedaRescueCrossKindIsolation(t *testing.T) {
 
 				t1 := base.Add(16 * time.Minute)
 				chk.Heals.Stamp(probefw.SelfHealKey(CheckNameKedaScaledObjectGuard, "apps/"+cooledKind+"/web"), t1)
-				probetest.FreezeNow(p.Deps, t1.Add(time.Minute))
-				chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+				for step := range 2 {
+					probetest.FreezeNow(p.Deps, t1.Add(time.Minute+time.Duration(step)*time.Second))
+					chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+				}
 
 				for _, kind := range []string{"Deployment", "StatefulSet", "Rollout"} {
 					got := replicasOf(t, cs, p.Deps, kind)
@@ -902,4 +911,33 @@ func TestKedaRescueCrossKindIsolation(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestKedaGuardPerSweepRescueCap(t *testing.T) {
+	so1 := kedaObj("apps", "so-a", "dep-a", 1, "False", "")
+	so2 := kedaObj("apps", "so-b", "dep-b", 1, "False", "")
+	dep1 := zeroDeploy("apps", "dep-a", nil)
+	dep2 := zeroDeploy("apps", "dep-b", nil)
+	cs := fake.NewSimpleClientset(dep1, dep2)
+	p := testProberDyn(cs, probetest.OpDyn(so1, so2))
+	base := time.Now()
+	p.Now = func() time.Time { return base }
+	chk := probetest.MustCheck[*kedaScaledObjectGuardCheck](t, p)
+
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	p.Now = func() time.Time { return base.Add(16 * time.Minute) }
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+
+	g1, _ := cs.AppsV1().Deployments("apps").Get(ctx, "dep-a", metav1.GetOptions{})
+	g2, _ := cs.AppsV1().Deployments("apps").Get(ctx, "dep-b", metav1.GetOptions{})
+	rescued := 0
+	if g1.Spec.Replicas != nil && *g1.Spec.Replicas == 1 {
+		rescued++
+	}
+	if g2.Spec.Replicas != nil && *g2.Spec.Replicas == 1 {
+		rescued++
+	}
+	if rescued != 1 {
+		t.Fatalf("expected exactly 1 rescued target per sweep due to per-sweep cap, got %d", rescued)
+	}
 }

@@ -58,6 +58,7 @@ func init() {
 type rootCADriftCheck struct {
 	*probefw.Deps
 
+	driftSeen     state.FirstSeenLedger
 	emitted       state.GaugeLedger[string]
 	eventCooldown state.CooldownSet
 }
@@ -139,6 +140,7 @@ func (c *rootCADriftCheck) Run(ctx context.Context) probefw.Result {
 	})
 
 	eventsSent := 0
+	seenKeep := map[string]bool{}
 	for i := range namespaces {
 		ns := &namespaces[i]
 		if ns.DeletionTimestamp != nil || ns.Status.Phase == corev1.NamespaceTerminating {
@@ -172,12 +174,22 @@ func (c *rootCADriftCheck) Run(ctx context.Context) probefw.Result {
 		}
 
 		tupleKey := ns.Name + "/" + reason
+		// Gate empty & hash_mismatch behind a 2m persistence window
+		// (matching rootCAMissingMinAge) so mid-rotation kube-root-ca.crt
+		// propagation sweeps do not false-alarm.
+		if reason == rootCAReasonEmpty || reason == rootCAReasonMismatch {
+			seenKeep[tupleKey] = true
+			if !probefw.Persisted(&c.driftSeen, tupleKey, now, rootCAMissingMinAge, log) {
+				continue
+			}
+		}
 		rep.Emit(rootCADriftGauge, tupleKey, []string{ns.Name, reason}, detail)
 
 		if eventsSent < rootCAMaxEventsSweep && c.rootCAEmitWarning(ctx, log, now, ns, reason, detail) {
 			eventsSent++
 		}
 	}
+	c.driftSeen.Prune(func(k string) bool { return seenKeep[k] })
 
 	return rep.Result(&c.emitted, rootCADriftGauge.DeleteLabelValues,
 		"kube-root-ca.crt drift: ", ", ")

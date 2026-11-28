@@ -182,3 +182,25 @@ func TestGaugeLedgerEmitClonesLabelValues(t *testing.T) {
 		t.Fatalf("deleted = %v — stored label values were not cloned", deleted)
 	}
 }
+
+func TestGaugeLedgerReconcileDropsAbortedSweep(t *testing.T) {
+	var led GaugeLedger[string]
+	var deleted [][]string
+	del := recordingDelete(&deleted)
+
+	// Sweep 1 committed "a".
+	led.Reconcile(map[string][]string{"a": {"A"}}, del)
+	// Sweep 2 started emitting "aborted" then failed before Prune.
+	led.Emit("aborted", "ABORTED")
+	// Sweep 3 reconciles only "b" — "aborted" must NOT leak into emitted, and "a" must prune.
+	deleted = nil
+	if n := led.Reconcile(map[string][]string{"b": {"B"}}, del); n != 1 {
+		t.Fatalf("Reconcile pruned %d, want 1", n)
+	}
+	if fmt.Sprint(deleted) != "[[A]]" {
+		t.Fatalf("deleted = %v, want [[A]]", deleted)
+	}
+	if _, ok := led.Last()["aborted"]; ok {
+		t.Fatal("aborted-sweep Emit leaked across Reconcile")
+	}
+}

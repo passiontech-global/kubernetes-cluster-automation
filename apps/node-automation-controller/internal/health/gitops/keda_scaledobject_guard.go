@@ -110,6 +110,7 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 
 	var rep probefw.SweepReport
 	seenKeep := map[string]bool{}
+	var unhealthy []*unstructured.Unstructured
 	for i := range sos {
 		so := &sos[i]
 		key := so.GetNamespace() + "/" + so.GetName()
@@ -160,9 +161,24 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 				[]string{so.GetNamespace(), so.GetName(), reason})
 		}
 		rep.Find(key + "(" + strings.Join(reasons, ",") + ")")
-		p.rescueZeroTarget(ctx, log, so, now)
+		unhealthy = append(unhealthy, so)
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
+
+	// Cap to at most ONE budgeted cold-start rescue per sweep (matching
+	// hpa-scaling-guard) so a fleet-wide KEDA signature cannot drain
+	// the entire heal budget in one pass; refunded grants keep trying.
+	grantSpent := false
+	for _, so := range unhealthy {
+		if grantSpent {
+			log.Info("SKIP: heal budget already spent this sweep — cold-start rescues deferred",
+				"scaledobject", so.GetNamespace()+"/"+so.GetName())
+			continue
+		}
+		if p.rescueZeroTarget(ctx, log, so, now) {
+			grantSpent = true
+		}
+	}
 	return rep.Result(&p.emitted, kedaScaledObjectUnhealthyGauge.DeleteLabelValues,
 		fmt.Sprintf("scaledobjects unhealthy >=%s: ", kedaUnhealthyMinAge), ", ")
 }
@@ -180,12 +196,12 @@ func (p *kedaScaledObjectGuardCheck) Run(ctx context.Context) probefw.Result {
 // spec) is skipped: that zero
 // is intent, and un-parking it fights the downscaler's own schedule.
 func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
-	log logr.Logger, so *unstructured.Unstructured, now time.Time) {
+	log logr.Logger, so *unstructured.Unstructured, now time.Time) bool {
 
 	ns := so.GetNamespace()
 	target, ok := kube.NestedString(so.Object, "spec", "scaleTargetRef", "name")
 	if !ok || target == "" {
-		return
+		return false
 	}
 	minReplicas, _ := kube.NestedInt64(so.Object, "spec", "minReplicaCount")
 	rescue := minReplicas
@@ -229,7 +245,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	if want == "" || want == "Deployment" {
 		dep, err := p.Deployment(ctx, ns, target)
 		if err != nil {
-			return // census unreadable — inconclusive, retry next sweep
+			return false // census unreadable — inconclusive, retry next sweep
 		}
 		if dep != nil {
 			kind = "Deployment"
@@ -242,7 +258,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	if kind == "" && (want == "" || want == "StatefulSet") {
 		sts, serr := p.StatefulSet(ctx, ns, target)
 		if serr != nil {
-			return // census unreadable — inconclusive
+			return false // census unreadable — inconclusive
 		}
 		if sts != nil {
 			kind = "StatefulSet"
@@ -259,7 +275,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		// census stays inconclusive, not "not at zero".
 		ros, rerr := p.AllUnstructured(ctx, kube.GVRArgoRollout)
 		if rerr != nil {
-			return // census unreadable — inconclusive
+			return false // census unreadable — inconclusive
 		}
 		for i := range ros {
 			r := &ros[i]
@@ -277,23 +293,23 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		}
 	}
 	if kind == "" {
-		return // target unresolvable this sweep — inconclusive
+		return false // target unresolvable this sweep — inconclusive
 	}
 	if replicas == nil || *replicas != 0 {
-		return // not wedged at zero — nothing to rescue
+		return false // not wedged at zero — nothing to rescue
 	}
 	if kube.IsIntentionallyDownscaled(annotations, replicas) {
-		return // downscaler-managed zero — the workload is asleep on purpose
+		return false // downscaler-managed zero — the workload is asleep on purpose
 	}
 	ck := probefw.SelfHealKey(CheckNameKedaScaledObjectGuard, ns+"/"+kind+"/"+target)
 	proceed, unverifiable := p.HealAllowed(ctx, log,
 		&p.Heals, ck, kedaRescueCooldown, now)
 	if unverifiable {
 		metrics.IncError(p.Name)
-		return
+		return false
 	}
 	if !proceed {
-		return
+		return false
 	}
 	// spec.replicas is Git-owned on Flux-managed targets — gate the
 	// write so a Git-vs-heal ping-pong cannot storm the apiserver.
@@ -302,7 +318,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		heal.RefundGrant(now) // Flux gate denied — no patch attempted
 		log.Info("SKIP: keda zero-rescue blocked by flux conflict gate",
 			"target", kind+" "+ns+"/"+target)
-		return
+		return false
 	}
 	// metadata.resourceVersion pins the write — a legitimate
 	// scale-up (HPA, GitOps, manual) landing between the census
@@ -314,7 +330,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	})
 	if err != nil {
 		heal.RefundGrant(now) // no patch attempted — hand the token back
-		return
+		return false
 	}
 	switch kind {
 	case "Deployment":
@@ -332,12 +348,12 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 			heal.RefundGrant(now)
 			log.Info("SKIP: keda zero-rescue raced (target changed or gone)",
 				"target", kind+" "+ns+"/"+target)
-			return
+			return false
 		}
 		metrics.IncError(p.Name)
 		log.Error(err, "keda zero-rescue scale patch failed",
 			"target", kind+" "+ns+"/"+target, "replicas", rescue)
-		return
+		return true
 	}
 	// The spec patch landed — drop the workload census memo so later
 	// checks this sweep see the rescued replica count, not the
@@ -353,4 +369,5 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	p.Heals.Stamp(ck, now)
 	log.Info("SCALE: keda cold-start rescue — target wedged at 0 while the scaler is unhealthy",
 		"target", kind+" "+ns+"/"+target, "replicas", rescue)
+	return true
 }

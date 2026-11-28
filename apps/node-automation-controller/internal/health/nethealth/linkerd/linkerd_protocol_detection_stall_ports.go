@@ -63,6 +63,7 @@ func portSetString(set map[int]bool) string {
 	for p := range set {
 		ports = append(ports, p)
 	}
+	slices.Sort(ports)
 	return joinPorts(ports)
 }
 

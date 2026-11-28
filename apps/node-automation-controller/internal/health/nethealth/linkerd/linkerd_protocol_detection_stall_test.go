@@ -595,3 +595,12 @@ func TestLinkerdOpaquePortsUncoveredTemplateNoCooldownStamp(t *testing.T) {
 		t.Fatalf("second sweep must still fail (re-evaluated, not cooled down): %+v", res)
 	}
 }
+
+func TestLinkerdPortSetStringSorted(t *testing.T) {
+	set := map[int]bool{9042: true, 3306: true, 6379: true, 5432: true, 4222: true}
+	for range 20 {
+		if got := portSetString(set); got != "3306,4222,5432,6379,9042" {
+			t.Fatalf("portSetString = %q, want sorted 3306,4222,5432,6379,9042", got)
+		}
+	}
+}

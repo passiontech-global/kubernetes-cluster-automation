@@ -740,3 +740,36 @@ func argoCDApplication(ns, name, health string, conds ...map[string]any) *unstru
 	}
 	return &unstructured.Unstructured{Object: obj}
 }
+
+func TestArgoCDAppStuckRolloutOverlayDownscaled(t *testing.T) {
+	ro := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Rollout",
+		"metadata":   map[string]any{"namespace": "web", "name": "ro-app", "uid": "ro-uid"},
+		"spec":       map[string]any{"replicas": int64(0)},
+	}}
+	app := argoCDApplication("argocd", "ro-overlay", "Progressing")
+	app.Object["status"].(map[string]any)["resources"] = []any{
+		map[string]any{
+			"kind": "Rollout", "namespace": "web", "name": "ro-app",
+			"health": map[string]any{"status": "Suspended"},
+		},
+	}
+	dyn := probetest.OpDyn(app, ro)
+	p := testProberDyn(fake.NewSimpleClientset(), dyn)
+	chk := probetest.MustCheck[*argoCDAppStuckCheck](t, p)
+
+	sctx := probetest.SweepCtx(ctx, chk.Deps)
+	ros, err := chk.AllUnstructured(sctx, kube.GVRArgoRollout)
+	if err != nil || len(ros) != 1 {
+		t.Fatalf("AllUnstructured rollouts = %d, err=%v", len(ros), err)
+	}
+	payload, err := kube.MergePatchAnnos(map[string]any{"downscaler/downtime": "22:00-06:00"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kube.RecordAnnoPatch(sctx, &ros[0], payload)
+	if !chk.argocdAppOnlyDownscaled(sctx, app) {
+		t.Fatal("argocdWorkloadDownscaled Rollout branch must consult kube.EffectiveAnnos overlay")
+	}
+}

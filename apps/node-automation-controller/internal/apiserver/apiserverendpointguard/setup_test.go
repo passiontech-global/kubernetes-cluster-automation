@@ -4,6 +4,7 @@ package apiserverendpointguard
 
 import (
 	"testing"
+	"time"
 
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -31,5 +32,9 @@ func TestSetup(t *testing.T) {
 	}
 	if g.probeFn == nil {
 		t.Fatal("probeFn seam not wired to g.probe")
+	}
+	if headroom := endpointGuardRunTimeout - endpointGuardProbeBudget; headroom < 15*time.Second {
+		t.Fatalf("endpointGuardRunTimeout (%s) - endpointGuardProbeBudget (%s) = %s, want >= 15s",
+			endpointGuardRunTimeout, endpointGuardProbeBudget, headroom)
 	}
 }

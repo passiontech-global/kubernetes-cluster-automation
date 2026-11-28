@@ -169,6 +169,11 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 		rsByDep[c.UID] = append(rsByDep[c.UID], row)
 	}
 
+	type wedgedDep struct {
+		dep    *appsv1.Deployment
+		rsList []rsCensusRow
+	}
+	var wedged []wedgedDep
 	var findings []string
 	for i := range deps {
 		d := &deps[i]
@@ -212,8 +217,12 @@ func (p *deploymentRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 		finding := key + "(" + strings.Join(reasons, ",") + ")"
 		findings = append(findings, finding)
 		rep.Find(finding)
-		if err := p.unwedgeDeployment(ctx, log, d, rsList, now); err != nil {
-			return probefw.Result{Infra: err}
+		wedged = append(wedged, wedgedDep{dep: d, rsList: rsList})
+	}
+	for _, w := range wedged {
+		if err := p.unwedgeDeployment(ctx, log, w.dep, w.rsList, now); err != nil {
+			rep.InfraErr(err)
+			break
 		}
 	}
 	p.emitWedgeEvent(ctx, log, findings, now)

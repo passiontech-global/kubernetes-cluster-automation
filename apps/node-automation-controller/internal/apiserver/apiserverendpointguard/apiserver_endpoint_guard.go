@@ -107,7 +107,7 @@ const (
 
 	endpointGuardInterval           = 30 * time.Second
 	endpointGuardQuarantineInterval = 10 * time.Second
-	endpointGuardRunTimeout         = 25 * time.Second
+	endpointGuardRunTimeout         = 40 * time.Second
 	endpointGuardErrCycles          = 2
 	endpointGuardProbeTO            = 8 * time.Second // same budget as the kubelet reaper probes
 	// endpointGuardFrozenCyc: consecutive cycles the watch-cache RV

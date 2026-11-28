@@ -109,9 +109,9 @@ func hasTrafficDistribution(svc *corev1.Service) bool {
 
 // hasConflictingTopologyMode reports whether a Service carries both a
 // native spec.trafficDistribution and a legacy topology-mode annotation.
-func hasConflictingTopologyMode(svc *corev1.Service) bool {
+func hasConflictingTopologyMode(ctx context.Context, svc *corev1.Service) bool {
 	return hasTrafficDistribution(svc) &&
-		svc.Annotations[corev1.AnnotationTopologyMode] != ""
+		kube.EffectiveAnno(ctx, svc, corev1.AnnotationTopologyMode) != ""
 }
 
 // topologyAuditedService reports whether the Service opted into
@@ -120,8 +120,8 @@ func hasConflictingTopologyMode(svc *corev1.Service) bool {
 // same-zone preference (PreferClose is the original spelling of
 // PreferSameZone — both opt the EndpointSlice controller into
 // writing hints.forZones).
-func topologyAuditedService(svc *corev1.Service) bool {
-	if svc.Annotations[corev1.AnnotationTopologyMode] == topologyModeAuto {
+func topologyAuditedService(ctx context.Context, svc *corev1.Service) bool {
+	if kube.EffectiveAnno(ctx, svc, corev1.AnnotationTopologyMode) == topologyModeAuto {
 		return true
 	}
 	return hasTrafficDistribution(svc)
@@ -189,10 +189,10 @@ func (p *endpointSliceZoneStarvationCheck) Run(ctx context.Context) probefw.Resu
 	now := p.Now()
 	for i := range svcs {
 		svc := &svcs[i]
-		if hasConflictingTopologyMode(svc) {
+		if hasConflictingTopologyMode(ctx, svc) {
 			p.stripConflictingTopologyMode(ctx, log, svc, now)
 		}
-		if topologyAuditedService(svc) {
+		if topologyAuditedService(ctx, svc) {
 			audited[svcKey{svc.Namespace, svc.Name}] = true
 		}
 	}
@@ -287,11 +287,12 @@ func (p *endpointSliceZoneStarvationCheck) stripConflictingTopologyMode(
 			"service", svc.Namespace+"/"+svc.Name)
 		return
 	}
+	legacyMode := kube.EffectiveAnno(ctx, svc, corev1.AnnotationTopologyMode)
 	kube.RecordAnnoPatch(ctx, svc, patch)
 	p.Heals.Stamp(key, now)
 	log.Info("stripped legacy service.kubernetes.io/topology-mode annotation conflicting with spec.trafficDistribution",
 		"service", svc.Namespace+"/"+svc.Name,
-		"legacyMode", svc.Annotations[corev1.AnnotationTopologyMode],
+		"legacyMode", legacyMode,
 		"trafficDistribution", *svc.Spec.TrafficDistribution)
 }
 

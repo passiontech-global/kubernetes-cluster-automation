@@ -230,3 +230,23 @@ func TestMaybeRefreshKargoWarehousePatchError(t *testing.T) {
 		t.Fatal("failed patch stamped the cooldown — next sweep would skip the nudge")
 	}
 }
+
+func TestKargoPromotionHealthNoGaugeLeakOnLaterCRDListError(t *testing.T) {
+	t.Cleanup(kargoPromotionStuckGauge.Reset)
+	dyn := probetest.OpDyn(
+		kargoPromotion("kargo", "promo-stuck-leak", "prod", "Running", 2*time.Hour),
+	)
+	dyn.PrependReactor("list", "warehouses", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver timeout listing warehouses")
+	})
+	p := testProberDyn(fake.NewSimpleClientset(), dyn)
+	res := probetest.MustCheck[*kargoPromotionHealthCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if res.Infra == nil {
+		t.Fatalf("expected Infra error on warehouse list failure, got %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_kargo_promotion_stuck", map[string]string{
+		"namespace": "kargo", "name": "promo-stuck-leak", "stage": "prod",
+	}); m != nil {
+		t.Fatalf("kargoPromotionStuckGauge leaked on warehouse list failure: %v", m)
+	}
+}

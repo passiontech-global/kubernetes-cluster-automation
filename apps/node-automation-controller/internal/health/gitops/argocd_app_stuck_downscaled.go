@@ -104,7 +104,7 @@ func (p *argoCDAppStuckCheck) argocdWorkloadDownscaled(ctx context.Context,
 		}
 		replicas, found := kube.NestedInt64(r.Object, "spec", "replicas")
 		v = found && replicas == 0 &&
-			kube.IsIntentionallyDownscaled(r.GetAnnotations(), &rolloutZeroReplicas)
+			kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, r), &rolloutZeroReplicas)
 	}
 	if p.downscaledSeen == nil {
 		p.downscaledSeen = map[string]bool{} // lazy init — Run seeds it

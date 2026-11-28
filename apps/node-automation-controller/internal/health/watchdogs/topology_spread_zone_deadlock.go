@@ -646,6 +646,7 @@ func (c *topologySpreadZoneDeadlockCheck) relaxDeployment(ctx context.Context, l
 		return
 	}
 	c.healCooldowns.Stamp(wKey, now)
+	kube.RecordAnnoPatch(ctx, dep, payload)
 	c.InvalidateDeployments(ctx)
 	log.Info("ACTION: relaxed zone TopologySpreadConstraints DoNotSchedule -> ScheduleAnyway during dead zone", "workload", wKey)
 }
@@ -687,6 +688,7 @@ func (c *topologySpreadZoneDeadlockCheck) relaxStatefulSet(ctx context.Context, 
 		return
 	}
 	c.healCooldowns.Stamp(wKey, now)
+	kube.RecordAnnoPatch(ctx, sts, payload)
 	c.InvalidateStatefulSets(ctx)
 	log.Info("ACTION: relaxed zone TopologySpreadConstraints DoNotSchedule -> ScheduleAnyway during dead zone", "workload", wKey)
 }
@@ -732,6 +734,7 @@ func (c *topologySpreadZoneDeadlockCheck) restoreRelaxedWorkloads(ctx context.Co
 			continue
 		}
 		c.healCooldowns.Stamp(wKey, now)
+		kube.RecordAnnoPatch(ctx, dep, payload)
 		c.InvalidateDeployments(ctx)
 		log.Info("ACTION: restored zone TopologySpreadConstraints ScheduleAnyway -> DoNotSchedule after zone recovery", "workload", wKey)
 	}
@@ -772,6 +775,7 @@ func (c *topologySpreadZoneDeadlockCheck) restoreRelaxedWorkloads(ctx context.Co
 			continue
 		}
 		c.healCooldowns.Stamp(wKey, now)
+		kube.RecordAnnoPatch(ctx, sts, payload)
 		c.InvalidateStatefulSets(ctx)
 		log.Info("ACTION: restored zone TopologySpreadConstraints ScheduleAnyway -> DoNotSchedule after zone recovery", "workload", wKey)
 	}

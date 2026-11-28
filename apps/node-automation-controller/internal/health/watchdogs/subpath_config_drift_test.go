@@ -1274,3 +1274,88 @@ func TestSubPathFreshPodsEmptyTemplateSelectorDoesNotMatchOtherPods(t *testing.T
 		t.Fatalf("empty template selector matched unrelated pod: allFresh=%v total=%d", allFresh, total)
 	}
 }
+
+func TestSubPathDoesNotLeakGaugeOnPodsInInfraError(t *testing.T) {
+	t.Cleanup(subPathConfigDriftGauge.Reset)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "leak-app"},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "leak-app"}},
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{{
+					Name: "cfg",
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "leak-cfg"},
+						},
+					},
+				}},
+				Containers: []corev1.Container{{
+					Name:         "app",
+					VolumeMounts: []corev1.VolumeMount{{Name: "cfg", MountPath: "/etc/app", SubPath: "k"}},
+				}},
+			},
+		}},
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "leak-cfg"},
+		Data:       map[string]string{"k": "v1"},
+	}
+	cs := fake.NewSimpleClientset(dep, cm)
+	d := probetest.NewDeps(cs, probetest.OpDyn())
+	now := time.Now()
+	probetest.FreezeNow(d, now)
+	chk := &subpathConfigDriftCheck{Deps: d, hashes: map[string]string{}, driftSince: map[string]time.Time{}}
+
+	// Seed baseline.
+	chk.Run(probetest.SweepCtx(ctx, d))
+	changed := cm.DeepCopy()
+	changed.Data["k"] = "v2"
+	_, _ = cs.CoreV1().ConfigMaps("apps").Update(ctx, changed, metav1.UpdateOptions{})
+	probetest.FreezeNow(d, now.Add(subPathScanInterval+time.Minute))
+	chk.Run(probetest.SweepCtx(ctx, d)) // sets driftSince
+
+	// Fail PodsIn after rep.Flag fires.
+	cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("pod list failed")
+	})
+	probetest.FreezeNow(d, now.Add(2*subPathScanInterval+2*time.Minute))
+	res := chk.Run(probetest.SweepCtx(ctx, d))
+	if res.Infra == nil {
+		t.Fatalf("expected Infra error on PodsIn failure, got %+v", res)
+	}
+
+	// Recover CM + PodsIn -> next sweep must prune the gauge series cleanly.
+	cs.ReactionChain = cs.ReactionChain[1:]
+	reverted := cm.DeepCopy()
+	reverted.Data["k"] = "v1"
+	_, _ = cs.CoreV1().ConfigMaps("apps").Update(ctx, reverted, metav1.UpdateOptions{})
+	probetest.FreezeNow(d, now.Add(3*subPathScanInterval+3*time.Minute))
+	if res2 := chk.Run(probetest.SweepCtx(ctx, d)); !res2.Pass {
+		t.Fatalf("expected PASS after CM reverted, got %+v", res2)
+	}
+	if m := probetest.FindMetric(t, "node_automation_subpath_config_drift", map[string]string{
+		"namespace": "apps", "workload": "leak-app", "kind": "Deployment",
+	}); m != nil {
+		t.Fatalf("orphaned subpath drift gauge leaked after PodsIn Infra error: %v", m)
+	}
+}
+
+func TestSubPathStampReloadRecordsAnnoPatchInOverlay(t *testing.T) {
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "web", UID: "dep-uid"}}
+	cs := fake.NewSimpleClientset(dep)
+	d := probetest.NewDeps(cs, probetest.OpDyn())
+	chk := &subpathConfigDriftCheck{Deps: d}
+	sctx := probetest.SweepCtx(ctx, d)
+
+	payload, err := kube.MergePatchAnnos(map[string]any{kube.AnnoLastSubPathReload: "2026-11-28T10:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := chk.stampSubPathReload(sctx, subPathWorkload{kind: "Deployment", ns: "apps", name: "web", obj: dep}, payload); err != nil {
+		t.Fatalf("stampSubPathReload: %v", err)
+	}
+	if got := kube.EffectiveAnno(sctx, dep, kube.AnnoLastSubPathReload); got != "2026-11-28T10:00:00Z" {
+		t.Fatalf("EffectiveAnno = %q, want 2026-11-28T10:00:00Z", got)
+	}
+}

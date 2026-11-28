@@ -202,13 +202,26 @@ func TestServiceTrafficPolicyStuckTerminatingEndpoints(t *testing.T) {
 	if res.Pass {
 		t.Fatal("expected failure for stuck terminating endpoints")
 	}
-	for _, svcName := range []string{"svc-missing", "svc-uid", "svc-stuck"} {
+	for _, svcName := range []string{"svc-uid", "svc-stuck"} {
 		if v, ok := endpointSliceTerminatingStuckSeries(t, "apps", svcName); !ok || v != 1 {
 			t.Fatalf("missing stuck terminating series for %s: v=%v ok=%v", svcName, v, ok)
 		}
 	}
+	// pod == nil must gate behind 2m FirstSeenLedger before flagging.
+	if _, ok := endpointSliceTerminatingStuckSeries(t, "apps", "svc-missing"); ok {
+		t.Fatal("svc-missing (pod == nil) must arm inside 2m window before flagging")
+	}
 	if _, ok := endpointSliceTerminatingStuckSeries(t, "apps", "svc-grace"); ok {
 		t.Fatal("pod still within terminationGracePeriodSeconds+60s must not be flagged")
+	}
+
+	probetest.FreezeNow(p.Deps, now.Add(stuckTerminatingMissingMinAge+time.Second))
+	res2 := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if res2.Pass {
+		t.Fatal("expected failure after 2m missing-pod window")
+	}
+	if v, ok := endpointSliceTerminatingStuckSeries(t, "apps", "svc-missing"); !ok || v != 1 {
+		t.Fatalf("missing stuck terminating series for svc-missing after 2m: v=%v ok=%v", v, ok)
 	}
 
 	// Clean up stuck slices -> series must be deleted.
@@ -592,5 +605,14 @@ func TestServiceTrafficPolicyGuardIngressListUsesResourceVersionZero(t *testing.
 	}
 	if rec.ingOpts[0].Limit != 0 {
 		t.Fatalf("ingresses List Limit = %d, want 0 (cleared by kube.pageOpts when RV=0)", rec.ingOpts[0].Limit)
+	}
+}
+
+func TestReadyEndpointBackendKeyDefaultsEmptyNonPodNamespace(t *testing.T) {
+	ep := &discoveryv1.Endpoint{
+		TargetRef: &corev1.ObjectReference{Kind: "Node", Name: "node-1"},
+	}
+	if got := readyEndpointBackendKey("s1", 0, "prod", ep); got != "ref/Node/prod/node-1" {
+		t.Fatalf("readyEndpointBackendKey = %q, want ref/Node/prod/node-1", got)
 	}
 }

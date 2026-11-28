@@ -109,18 +109,26 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 	now := p.Now()
 	p.warehouseRefreshHealed.PruneExpired(now, kargoWarehouseRefreshCool)
 
+	// List all 3 CRD families BEFORE emitting any gauges so a later list
+	// error cannot leave orphaned series in Prometheus without reconciling
+	// its GaugeLedger. Each family tolerates NotFound/NoMatch (CRD absent).
+	promotions, promErr := p.AllUnstructured(ctx, kube.GVRKargoPromotion)
+	if promErr != nil && !kube.IsCRDAbsent(promErr) {
+		return probefw.Result{Infra: fmt.Errorf("list kargo promotions: %w", promErr)}
+	}
+	warehouses, whErr := p.AllUnstructured(ctx, kube.GVRKargoWarehouse)
+	if whErr != nil && !kube.IsCRDAbsent(whErr) {
+		return probefw.Result{Infra: fmt.Errorf("list kargo warehouses: %w", whErr)}
+	}
+	analysisRuns, arErr := p.AllUnstructured(ctx, kube.GVRArgoAnalysisRun)
+	if arErr != nil && !kube.IsCRDAbsent(arErr) {
+		return probefw.Result{Infra: fmt.Errorf("list argo analysisruns: %w", arErr)}
+	}
+
 	var promRep, whRep, arRep probefw.SweepReport
 
-	// Promotions — Running/Pending past the hour. Each family reads
-	// the snapshot's per-GVR census; the RAW error memoizes and the
-	// NotFound/NoMatch tolerance stays per family.
-	promotions, err := p.AllUnstructured(ctx, kube.GVRKargoPromotion)
-	switch {
-	case kube.IsCRDAbsent(err):
-		// CRD absent — Kargo not installed; the family skips.
-	case err != nil:
-		return probefw.Result{Infra: fmt.Errorf("list kargo promotions: %w", err)}
-	default:
+	// Promotions — Running/Pending past the hour.
+	if promErr == nil {
 		for i := range promotions {
 			pr := &promotions[i]
 			phase, _ := kube.NestedString(pr.Object, "status", "phase")
@@ -142,12 +150,7 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 	// Warehouses — Ready=False past the half hour; each qualifying
 	// object also gets the refresh nudge under the persisted
 	// cooldown.
-	warehouses, err := p.AllUnstructured(ctx, kube.GVRKargoWarehouse)
-	switch {
-	case kube.IsCRDAbsent(err):
-	case err != nil:
-		return probefw.Result{Infra: fmt.Errorf("list kargo warehouses: %w", err)}
-	default:
+	if whErr == nil {
 		for i := range warehouses {
 			wh := &warehouses[i]
 			c, ok := kube.ConditionOf(wh.Object, "Ready")
@@ -172,12 +175,7 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	// AnalysisRuns — Running past the hour. Same lifetime-clock
 	// reasoning as Promotions.
-	analysisRuns, err := p.AllUnstructured(ctx, kube.GVRArgoAnalysisRun)
-	switch {
-	case kube.IsCRDAbsent(err):
-	case err != nil:
-		return probefw.Result{Infra: fmt.Errorf("list argo analysisruns: %w", err)}
-	default:
+	if arErr == nil {
 		for i := range analysisRuns {
 			ar := &analysisRuns[i]
 			phase, _ := kube.NestedString(ar.Object, "status", "phase")

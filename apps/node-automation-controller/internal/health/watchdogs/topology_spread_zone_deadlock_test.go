@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	ptestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/probetest"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
 
 func zoneWorkerNode(name, zone string, ready, unschedulable bool) *corev1.Node {
@@ -158,5 +160,32 @@ func TestTopologySpreadZoneDeadlockRelaxAndAutoRestore(t *testing.T) {
 	}
 	if _, ok := gotAPI.Annotations[kube.AnnoTopologyRelaxedBy]; ok {
 		t.Fatalf("expected AnnoTopologyRelaxedBy deleted after restore")
+	}
+}
+
+func TestTopologySpreadRelaxRecordsAnnoPatchInOverlay(t *testing.T) {
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "api-ov", UID: "dep-ov-uid"},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+						MaxSkew:           1,
+						TopologyKey:       topologyZoneKey,
+						WhenUnsatisfiable: corev1.DoNotSchedule,
+					}},
+				},
+			},
+		},
+	}
+	cs := fake.NewSimpleClientset(dep)
+	d := probetest.NewDeps(cs, probetest.OpDyn())
+	chk := &topologySpreadZoneDeadlockCheck{Deps: d}
+	sctx := probetest.SweepCtx(ctx, d)
+	var rep probefw.SweepReport
+
+	chk.relaxDeployment(sctx, logr.Discard(), &rep, dep, []string{"az-b"}, time.Now())
+	if got := kube.EffectiveAnno(sctx, dep, kube.AnnoTopologyRelaxedBy); got == "" {
+		t.Fatal("relaxDeployment must record AnnoTopologyRelaxedBy in sweep overlay")
 	}
 }

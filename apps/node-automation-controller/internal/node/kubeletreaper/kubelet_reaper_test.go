@@ -786,5 +786,24 @@ func TestKubeletReaperTwoWorkerClusterKeepsLastWorker(t *testing.T) {
 	}
 }
 
+func TestKubeletReaperRefundsTargetBreakerOnTaintError(t *testing.T) {
+	n := krStaleNode("w-refund")
+	cs := fake.NewSimpleClientset(n)
+	cs.PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver patch failed")
+	})
+	now := time.Now()
+	heal.ConfigureTargetBreaker(1, time.Hour)
+	t.Cleanup(func() { heal.ConfigureTargetBreaker(0, 0) })
+
+	r := krReaper(cs, now)
+	if err := r.sweep(t.Context(), n, false, nil); err == nil {
+		t.Fatal("expected TaintNode error")
+	}
+	if allowed, reason := heal.TryAcquireTarget(r.queue, "w-refund", now); !allowed {
+		t.Fatalf("expected TargetBreaker refunded on TaintNode failure, got reason=%q", reason)
+	}
+}
+
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()

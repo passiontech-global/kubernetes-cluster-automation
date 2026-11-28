@@ -75,7 +75,7 @@ func TestRootCADriftGuard(t *testing.T) {
 		objs := []runtime.Object{
 			rootCANamespace("kube-system", corev1.NamespaceActive, time.Hour, now),
 			rootCANamespace("old-missing", corev1.NamespaceActive, 5*time.Minute, now),
-			rootCANamespace("brand-new", corev1.NamespaceActive, 30*time.Second, now),
+			rootCANamespace("brand-new", corev1.NamespaceActive, 30*time.Second, now.Add(rootCAMissingMinAge)),
 			rootCANamespace("drifted", corev1.NamespaceActive, time.Hour, now),
 			rootCANamespace("empty-ca", corev1.NamespaceActive, time.Hour, now),
 			rootCANamespace("dying-ns", corev1.NamespaceTerminating, time.Hour, now),
@@ -93,22 +93,45 @@ func TestRootCADriftGuard(t *testing.T) {
 		probetest.VerifySweep(sctx)
 
 		if res.Pass {
-			t.Fatalf("expected FAIL on drifted/missing namespaces, got %+v", res)
+			t.Fatalf("expected FAIL on missing namespace, got %+v", res)
 		}
 		if !strings.Contains(res.Why, "old-missing (missing)") {
 			t.Fatalf("expected old-missing in Why, got %q", res.Why)
 		}
-		if !strings.Contains(res.Why, "drifted (sha256=") {
-			t.Fatalf("expected drifted sha256 mismatch in Why, got %q", res.Why)
-		}
-		if !strings.Contains(res.Why, "empty-ca (empty ca.crt)") {
-			t.Fatalf("expected empty-ca in Why, got %q", res.Why)
+		// hash_mismatch & empty must arm inside 2m window to avoid mid-rotation false alarms.
+		if strings.Contains(res.Why, "drifted") || strings.Contains(res.Why, "empty-ca") {
+			t.Fatalf("drifted/empty-ca must arm inside 2m persistence window, got %q", res.Why)
 		}
 		if strings.Contains(res.Why, "brand-new") {
 			t.Fatalf("brand-new namespace (<2m) must not be flagged: %q", res.Why)
 		}
 		if strings.Contains(res.Why, "dying-ns") {
 			t.Fatalf("Terminating namespace must not be flagged: %q", res.Why)
+		}
+
+		// Advance past 2m persistence window: drifted and empty-ca now flag.
+		probetest.FreezeNow(p.Deps, now.Add(rootCAMissingMinAge+time.Second))
+		sctx2 := probetest.SweepCtx(context.Background(), chk.Deps)
+		res2 := chk.Run(sctx2)
+		probetest.VerifySweep(sctx2)
+
+		if res2.Pass {
+			t.Fatalf("expected FAIL after 2m window, got %+v", res2)
+		}
+		if !strings.Contains(res2.Why, "old-missing (missing)") {
+			t.Fatalf("expected old-missing in Why, got %q", res2.Why)
+		}
+		if !strings.Contains(res2.Why, "drifted (sha256=") {
+			t.Fatalf("expected drifted sha256 mismatch in Why, got %q", res2.Why)
+		}
+		if !strings.Contains(res2.Why, "empty-ca (empty ca.crt)") {
+			t.Fatalf("expected empty-ca in Why, got %q", res2.Why)
+		}
+		if strings.Contains(res2.Why, "brand-new") {
+			t.Fatalf("brand-new namespace (<2m) must not be flagged: %q", res2.Why)
+		}
+		if strings.Contains(res2.Why, "dying-ns") {
+			t.Fatalf("Terminating namespace must not be flagged: %q", res2.Why)
 		}
 
 		for _, tc := range []struct {
@@ -128,6 +151,30 @@ func TestRootCADriftGuard(t *testing.T) {
 		evs, _ := cs.EventsV1().Events("old-missing").List(context.Background(), metav1.ListOptions{})
 		if len(evs.Items) != 1 || evs.Items[0].Reason != rootCAEventReason {
 			t.Fatalf("expected 1 RootCADrift Warning Event in old-missing, got %+v", evs.Items)
+		}
+	})
+
+	t.Run("mid-rotation hash mismatch that recovers before 2m never flags", func(t *testing.T) {
+		objs := []runtime.Object{
+			rootCANamespace("kube-system", corev1.NamespaceActive, time.Hour, now),
+			rootCANamespace("rotating", corev1.NamespaceActive, time.Hour, now),
+			rootCAConfigMap("kube-system", refCA),
+			rootCAConfigMap("rotating", "-----BEGIN CERTIFICATE-----\nOLD\n-----END CERTIFICATE-----"),
+		}
+		cs := fake.NewSimpleClientset(objs...)
+		p := rootCATestProber(t, cs, now)
+		chk := probetest.MustCheck[*rootCADriftCheck](t, p)
+
+		sctx := probetest.SweepCtx(context.Background(), chk.Deps)
+		if res := chk.Run(sctx); !res.Pass {
+			t.Fatalf("mid-rotation mismatch must pass inside 2m window: %+v", res)
+		}
+
+		// ConfigMap converges before 2m -> rotation completes quietly.
+		_, _ = cs.CoreV1().ConfigMaps("rotating").Update(context.Background(), rootCAConfigMap("rotating", refCA), metav1.UpdateOptions{})
+		probetest.FreezeNow(p.Deps, now.Add(time.Minute))
+		if res := chk.Run(probetest.SweepCtx(context.Background(), chk.Deps)); !res.Pass {
+			t.Fatalf("converged namespace must pass: %+v", res)
 		}
 	})
 

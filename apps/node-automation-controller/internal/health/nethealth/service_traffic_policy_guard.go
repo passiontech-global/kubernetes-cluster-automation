@@ -21,6 +21,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -44,10 +45,11 @@ const (
 	// CheckNameServiceTrafficPolicyGuard is the registry check name for #6/#71.
 	CheckNameServiceTrafficPolicyGuard = "service-traffic-policy-guard"
 
-	serviceTrafficPolicyMinAge = 10 * time.Minute
-	stuckTerminatingMinWindow  = 5 * time.Minute
-	stuckTerminatingGracePad   = 60 * time.Second
-	defaultTerminationGraceSec = int64(30)
+	serviceTrafficPolicyMinAge    = 10 * time.Minute
+	stuckTerminatingMinWindow     = 5 * time.Minute
+	stuckTerminatingGracePad      = 60 * time.Second
+	stuckTerminatingMissingMinAge = 2 * time.Minute
+	defaultTerminationGraceSec    = int64(30)
 )
 
 var (
@@ -78,7 +80,8 @@ func init() {
 type serviceTrafficPolicyGuardCheck struct {
 	*probefw.Deps
 
-	policySeen state.FirstSeenLedger
+	policySeen       state.FirstSeenLedger
+	stuckMissingSeen state.FirstSeenLedger
 
 	policyEmitted  state.GaugeLedger[string]
 	stuckEmitted   state.GaugeLedger[string]
@@ -130,7 +133,7 @@ func (c *serviceTrafficPolicyGuardCheck) Run(ctx context.Context) probefw.Result
 	}
 
 	c.auditLocalTrafficPolicy(ctx, log, now, svcs, slicesBySvc, nodeByName, &policyRep, &summaryRep)
-	c.auditStuckTerminatingSlices(ctx, now, slices, &stuckRep, &summaryRep)
+	c.auditStuckTerminatingSlices(ctx, log, now, slices, &stuckRep, &summaryRep)
 	c.auditMissingPreStop(ctx, log, svcs, &prestopRep, &summaryRep)
 
 	policyRep.Close(&c.policyEmitted, serviceTrafficPolicyDegradedGauge.DeleteLabelValues)
@@ -252,7 +255,11 @@ func readyEndpointBackendKey(sliceName string, idx int, defaultNS string, ep *di
 				return "pod-uid/" + string(ep.TargetRef.UID)
 			}
 		} else if ep.TargetRef.Kind != "" && ep.TargetRef.Name != "" {
-			return "ref/" + ep.TargetRef.Kind + "/" + ep.TargetRef.Namespace + "/" + ep.TargetRef.Name
+			ns := ep.TargetRef.Namespace
+			if ns == "" {
+				ns = defaultNS
+			}
+			return "ref/" + ep.TargetRef.Kind + "/" + ns + "/" + ep.TargetRef.Name
 		}
 	}
 	if len(ep.Addresses) > 0 {
@@ -273,6 +280,7 @@ func allNodesUnschedulable(readyNodes map[string]bool, nodeByName map[string]*co
 
 func (c *serviceTrafficPolicyGuardCheck) auditStuckTerminatingSlices(
 	ctx context.Context,
+	log logr.Logger,
 	now time.Time,
 	slices []discoveryv1.EndpointSlice,
 	stuckRep *probefw.SweepReport,
@@ -280,6 +288,7 @@ func (c *serviceTrafficPolicyGuardCheck) auditStuckTerminatingSlices(
 ) {
 	stuckServices := map[string]bool{}
 	podErrServices := map[string]bool{}
+	missingSeenKeep := map[string]bool{}
 
 	for i := range slices {
 		s := &slices[i]
@@ -313,7 +322,18 @@ func (c *serviceTrafficPolicyGuardCheck) auditStuckTerminatingSlices(
 				podErrServices[svcKey] = true
 				break
 			}
-			if isTerminatingEndpointStuck(now, ep, pod) {
+			var stuck bool
+			if pod == nil {
+				// Gate missing-pod terminating endpoints behind a 2m
+				// persistence window so normal Pod delete vs EndpointSlice
+				// cleanup races do not false-alarm.
+				missingKey := svcKey + "/" + refNS + "/" + ep.TargetRef.Name
+				missingSeenKeep[missingKey] = true
+				stuck = probefw.Persisted(&c.stuckMissingSeen, missingKey, now, stuckTerminatingMissingMinAge, log)
+			} else {
+				stuck = isTerminatingEndpointStuck(now, ep, pod)
+			}
+			if stuck {
 				stuckServices[svcKey] = true
 				stuckRep.Flag(endpointSliceTerminatingStuckGauge, svcKey, []string{s.Namespace, svcName})
 				summaryRep.Find(svcKey + " (stuck_terminating_endpoint)")
@@ -321,6 +341,18 @@ func (c *serviceTrafficPolicyGuardCheck) auditStuckTerminatingSlices(
 			}
 		}
 	}
+
+	c.stuckMissingSeen.Prune(func(k string) bool {
+		if missingSeenKeep[k] {
+			return true
+		}
+		for svcKey := range podErrServices {
+			if strings.HasPrefix(k, svcKey+"/") {
+				return true
+			}
+		}
+		return false
+	})
 
 	for svcKey := range podErrServices {
 		if stuckServices[svcKey] {
@@ -334,7 +366,7 @@ func (c *serviceTrafficPolicyGuardCheck) auditStuckTerminatingSlices(
 
 func isTerminatingEndpointStuck(now time.Time, ep *discoveryv1.Endpoint, pod *corev1.Pod) bool {
 	if pod == nil {
-		return true
+		return false
 	}
 	if ep.TargetRef != nil && ep.TargetRef.UID != "" && pod.UID != ep.TargetRef.UID {
 		return true

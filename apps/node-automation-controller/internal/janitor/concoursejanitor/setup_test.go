@@ -23,4 +23,18 @@ func TestSetupContract(t *testing.T) {
 		CS:   fake.NewSimpleClientset(),
 		Dyn:  testutil.StubDyn(),
 	}, "concourse-workdir-janitor", 30*time.Minute)
+
+	m := testutil.NewStubManager()
+	if err := Setup(shared.Deps{
+		Name: "concourse-workdir-janitor",
+		Mgr:  m,
+		CS:   fake.NewSimpleClientset(),
+		Dyn:  testutil.StubDyn(),
+	}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	p := m.Added[0].(*shared.Periodic)
+	if p.RunTimeout != cjRunTimeout {
+		t.Fatalf("RunTimeout = %s, want %s", p.RunTimeout, cjRunTimeout)
+	}
 }

@@ -199,6 +199,15 @@ func (d *Deps) InvalidateCronJobs(ctx context.Context) {
 	}
 }
 
+// InvalidateJobs drops the Job census and its by-namespace index —
+// a Job delete mid-sweep must be visible to later checks.
+func (d *Deps) InvalidateJobs(ctx context.Context) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.jobs.reset()
+		s.jobsIdx.reset()
+	}
+}
+
 // InvalidateUnstructured drops every per-GVR dynamic memo — the
 // unstructured twin for checks that patched a CR (CSV, InstallPlan,
 // HelmRelease, Argo Rollout) mid-sweep.

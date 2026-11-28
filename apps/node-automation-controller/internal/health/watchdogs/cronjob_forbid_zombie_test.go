@@ -377,3 +377,36 @@ func TestCronJobForbidZombieSelfHealKeyspace(t *testing.T) {
 		t.Fatal("ghost active-ref heal not stamped under SelfHealKey")
 	}
 }
+
+func TestCronJobForbidZombieInvalidatesMidSweep(t *testing.T) {
+	now := time.Now()
+	cjJobTarget := forbidCJ("batch", "nightly", "nightly-1")
+	job := cjJob("batch", "nightly-1", 2*time.Hour, batchv1.JobFailed, cjJobTarget)
+	cjGhost := forbidCJ("batch", "ghost", "ghost-1")
+	cs, chk := cjFixture(t, now, false, cjJobTarget, job, cjGhost)
+
+	var cjLists, jobLists int
+	cs.PrependReactor("list", "cronjobs", func(ktesting.Action) (bool, runtime.Object, error) {
+		cjLists++
+		return false, nil, nil
+	})
+	cs.PrependReactor("list", "jobs", func(ktesting.Action) (bool, runtime.Object, error) {
+		jobLists++
+		return false, nil, nil
+	})
+
+	chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	probetest.FreezeNow(chk.Deps, now.Add(16*time.Minute))
+	sctx := probetest.SweepCtx(ctx, chk.Deps)
+	chk.Run(sctx)
+
+	// Re-reading within the same sweep must see invalidated CronJobs and Jobs.
+	_, _ = chk.AllCronJobs(sctx)
+	_, _ = chk.AllJobs(sctx)
+	if cjLists != 3 {
+		t.Fatalf("cronjobs list count = %d, want 3 (2 sweeps + 1 post-InvalidateCronJobs)", cjLists)
+	}
+	if jobLists != 3 {
+		t.Fatalf("jobs list count = %d, want 3 (2 sweeps + 1 post-InvalidateJobs)", jobLists)
+	}
+}

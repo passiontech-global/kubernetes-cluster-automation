@@ -328,6 +328,7 @@ func (p *ciliumL2LeaseGuardCheck) deleteStaleLease(
 		heal.RefundGrant(now)
 		p.InvalidateLeases(ctx)
 	case err != nil:
+		metrics.IncError(p.Name)
 		log.Info("WARN: stale cilium L2 announce lease delete failed",
 			"lease", lease.Name, "error", err)
 	default:
