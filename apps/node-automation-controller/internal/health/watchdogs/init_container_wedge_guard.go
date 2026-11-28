@@ -80,9 +80,13 @@ type initWedgeGuardCheck struct {
 
 // NewInitContainerWedgeGuardCheck constructs the init-container-wedge-guard check.
 func NewInitContainerWedgeGuardCheck(d *probefw.Deps) probefw.Check {
+	minAge := envx.GetenvDuration("NODE_AUTOMATION_INIT_WEDGE_MIN_AGE", initWedgeDefaultMinAge)
+	if minAge <= 0 {
+		minAge = initWedgeDefaultMinAge
+	}
 	return &initWedgeGuardCheck{
 		Deps:   d,
-		minAge: envx.GetenvDuration("NODE_AUTOMATION_INIT_WEDGE_MIN_AGE", initWedgeDefaultMinAge),
+		minAge: minAge,
 	}
 }
 
@@ -213,6 +217,11 @@ func initWedgeClassifyPod(pod *corev1.Pod, now time.Time, minAge time.Duration) 
 				detail:        detail,
 			})
 		}
+		if st.State.Terminated != nil && st.State.Terminated.ExitCode == 0 && !st.State.Terminated.FinishedAt.IsZero() {
+			if st.State.Terminated.FinishedAt.Time.After(podSince) {
+				podSince = st.State.Terminated.FinishedAt.Time
+			}
+		}
 	}
 	return out
 }
@@ -272,16 +281,27 @@ func initWedgeAnyRegularRunning(pod *corev1.Pod) bool {
 }
 
 func initWedgePodSince(pod *corev1.Pod) time.Time {
+	var since time.Time
 	for _, cond := range pod.Status.Conditions {
 		if cond.Type == corev1.PodInitialized && cond.Status == corev1.ConditionFalse {
 			if !cond.LastTransitionTime.IsZero() {
-				return cond.LastTransitionTime.Time
+				since = cond.LastTransitionTime.Time
 			}
 			break
 		}
 	}
-	if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
-		return pod.Status.StartTime.Time
+	if since.IsZero() {
+		if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
+			since = pod.Status.StartTime.Time
+		} else {
+			since = pod.CreationTimestamp.Time
+		}
 	}
-	return pod.CreationTimestamp.Time
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionTrue &&
+			!cond.LastTransitionTime.IsZero() && cond.LastTransitionTime.Time.After(since) {
+			since = cond.LastTransitionTime.Time
+		}
+	}
+	return since
 }

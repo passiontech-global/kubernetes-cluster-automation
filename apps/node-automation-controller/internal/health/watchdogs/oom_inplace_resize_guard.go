@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"slices"
 	"strings"
@@ -162,6 +163,11 @@ func (c *oomResizeGuardCheck) Run(ctx context.Context) probefw.Result {
 			delete(c.baselines, k)
 		}
 	}
+	for k := range c.origLimits {
+		if !liveBaselines[k] {
+			delete(c.origLimits, k)
+		}
+	}
 
 	if len(candidates) > 0 {
 		c.applyResizeRelief(ctx, log, pods, candidates, now)
@@ -225,15 +231,11 @@ func (c *oomResizeGuardCheck) observeContainerOOM(
 		} else if delta > 0 {
 			st.prevRestartCount = cs.RestartCount
 			if isOOMTerm {
-				hitTime := now
-				if recentOOM {
-					hitTime = finishedAt
-				} else if !cs.LastTerminationState.Terminated.FinishedAt.IsZero() &&
-					kube.AgeAtLeast(cs.LastTerminationState.Terminated.FinishedAt.Time, now, oomResizeWindow) {
-					hitTime = time.Time{}
-				}
-				if !hitTime.IsZero() {
-					st.hits = append(st.hits, oomResizeHit{at: hitTime, count: delta})
+				term := cs.LastTerminationState.Terminated
+				if term.FinishedAt.IsZero() {
+					st.hits = append(st.hits, oomResizeHit{at: now, count: delta})
+				} else if recentOOM {
+					st.hits = append(st.hits, oomResizeHit{at: finishedAt, count: delta})
 				}
 			}
 		}
@@ -304,6 +306,11 @@ func (c *oomResizeGuardCheck) applyResizeRelief(
 	var eligible []oomResizeCandidate
 	for _, cand := range candidates {
 		if cand.pod.Annotations["kubernetes.io/config.mirror"] != "" {
+			continue
+		}
+		if oomResizePodHasActiveResize(cand.pod) {
+			log.V(1).Info("skip oom-inplace-resize: pod already has pending or in-progress resize",
+				"pod", cand.pod.Namespace+"/"+cand.pod.Name)
 			continue
 		}
 		if oomResizePodEligible(ctx, cand.pod, cand.container, c.healEnabled) {
@@ -465,6 +472,31 @@ func oomResizeFindSpecContainer(pod *corev1.Pod, name string) *corev1.Container 
 	return nil
 }
 
+func oomResizePodHasActiveResize(pod *corev1.Pod) bool {
+	if pod.Status.Resize != "" {
+		return true
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Status != corev1.ConditionTrue {
+			continue
+		}
+		if cond.Type == corev1.PodResizePending || cond.Type == corev1.PodResizeInProgress {
+			return true
+		}
+	}
+	return false
+}
+
+func oomResizeContainerMem(c corev1.Container) int64 {
+	if reqQty := c.Resources.Requests[corev1.ResourceMemory]; reqQty.Value() > 0 {
+		return reqQty.Value()
+	}
+	if limQty := c.Resources.Limits[corev1.ResourceMemory]; limQty.Value() > 0 {
+		return limQty.Value()
+	}
+	return 0
+}
+
 func oomResizeNodeAllocatedMem(pods []corev1.Pod) map[string]int64 {
 	used := map[string]int64{}
 	for i := range pods {
@@ -475,15 +507,23 @@ func oomResizeNodeAllocatedMem(pods []corev1.Pod) map[string]int64 {
 			p.Spec.NodeName == "" {
 			continue
 		}
-		for _, c := range p.Spec.Containers {
-			reqQty := c.Resources.Requests[corev1.ResourceMemory]
-			limQty := c.Resources.Limits[corev1.ResourceMemory]
-			if reqQty.Value() > 0 {
-				used[p.Spec.NodeName] += reqQty.Value()
-			} else if limQty.Value() > 0 {
-				used[p.Spec.NodeName] += limQty.Value()
+		var appSum, sidecarSum, regularInitMax int64
+		for _, ic := range p.Spec.InitContainers {
+			mem := oomResizeContainerMem(ic)
+			if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+				sidecarSum += mem
+			} else if mem > regularInitMax {
+				regularInitMax = mem
 			}
 		}
+		for _, c := range p.Spec.Containers {
+			appSum += oomResizeContainerMem(c)
+		}
+		podMem := max(appSum+sidecarSum, regularInitMax)
+		if oh := p.Spec.Overhead[corev1.ResourceMemory]; oh.Value() > 0 {
+			podMem += oh.Value()
+		}
+		used[p.Spec.NodeName] += podMem
 	}
 	return used
 }
@@ -519,7 +559,7 @@ func (c *oomResizeGuardCheck) resolveOrigLimit(
 			}
 		}
 	}
-	memKey := pod.Namespace + "/" + pod.Name + "/" + container
+	memKey := oomResizeBaselineKey(pod, container)
 	if q, ok := c.origLimits[memKey]; ok && q.Value() > 0 {
 		return q, false
 	}
@@ -533,7 +573,7 @@ func (c *oomResizeGuardCheck) recordOrigLimit(
 	origLimit resource.Quantity,
 	hasOrigAnno bool,
 ) {
-	memKey := pod.Namespace + "/" + pod.Name + "/" + container
+	memKey := oomResizeBaselineKey(pod, container)
 	if _, ok := c.origLimits[memKey]; !ok {
 		c.origLimits[memKey] = origLimit
 	}
@@ -571,9 +611,25 @@ func oomResizeComputeNewLimit(curLimit, origLimit resource.Quantity) resource.Qu
 	if delta < oomResizeMinBumpBytes {
 		delta = oomResizeMinBumpBytes
 	}
-	targetBytes := curBytes + delta
-	roundedBytes := ((targetBytes + oomResizeOneMiB - 1) / oomResizeOneMiB) * oomResizeOneMiB
-	maxBytes := origLimit.Value() * oomResizeMaxMultiplier
+	var targetBytes int64
+	if curBytes > math.MaxInt64-delta {
+		targetBytes = math.MaxInt64
+	} else {
+		targetBytes = curBytes + delta
+	}
+	var roundedBytes int64
+	if targetBytes > math.MaxInt64-(oomResizeOneMiB-1) {
+		roundedBytes = (math.MaxInt64 / oomResizeOneMiB) * oomResizeOneMiB
+	} else {
+		roundedBytes = ((targetBytes + oomResizeOneMiB - 1) / oomResizeOneMiB) * oomResizeOneMiB
+	}
+	origBytes := origLimit.Value()
+	var maxBytes int64
+	if origBytes > math.MaxInt64/oomResizeMaxMultiplier {
+		maxBytes = math.MaxInt64
+	} else {
+		maxBytes = origBytes * oomResizeMaxMultiplier
+	}
 	if roundedBytes > maxBytes {
 		roundedBytes = maxBytes
 	}

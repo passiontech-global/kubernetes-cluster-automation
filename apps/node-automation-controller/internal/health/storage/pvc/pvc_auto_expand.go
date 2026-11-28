@@ -182,7 +182,7 @@ func (c *pvcAutoExpandCheck) Run(ctx context.Context) probefw.Result {
 	for _, key := range keys {
 		b := breachMap[key]
 		pvc := pvcByKey[key]
-		if pvc != nil && (pvc.DeletionTimestamp != nil || pvc.Status.Phase != corev1.ClaimBound) {
+		if pvc == nil || pvc.DeletionTimestamp != nil || pvc.Status.Phase != corev1.ClaimBound {
 			continue
 		}
 		liveFirstSeen[key] = true
@@ -194,7 +194,7 @@ func (c *pvcAutoExpandCheck) Run(ctx context.Context) probefw.Result {
 			fmt.Sprintf("%s (free=%.1f%%)", key, b.freeRatio*100))
 
 		c.emitLowFreeEvent(ctx, log, pvc, b, now)
-		if pvc != nil && c.isAutoExpandEligible(ctx, pvc) {
+		if c.isAutoExpandEligible(ctx, pvc) {
 			expandCandidates = append(expandCandidates, pvc)
 		}
 	}
@@ -363,8 +363,12 @@ func (c *pvcAutoExpandCheck) expandCandidates(
 			continue
 		}
 
-		targetQty := computeExpandedStorage(curReq, maxQty)
-		if targetQty.Cmp(curReq) <= 0 {
+		effectiveCur := curReq
+		if curCap.Cmp(effectiveCur) > 0 {
+			effectiveCur = curCap
+		}
+		targetQty := computeExpandedStorage(effectiveCur, maxQty)
+		if targetQty.Cmp(effectiveCur) <= 0 {
 			c.emitPausedEvent(ctx, log, pvc, pvcAutoExpandCapReason,
 				fmt.Sprintf("PVC %s reached max auto-expand cap (%s); manual review required",
 					key, maxQty.String()),
@@ -543,10 +547,10 @@ func pvcStorageClassExpandable(
 	defaultSC *storagev1.StorageClass,
 ) bool {
 	var sc *storagev1.StorageClass
-	if pvc.Spec.StorageClassName != nil && *pvc.Spec.StorageClassName != "" {
-		sc = scMap[*pvc.Spec.StorageClassName]
-	} else {
+	if pvc.Spec.StorageClassName == nil {
 		sc = defaultSC
+	} else if *pvc.Spec.StorageClassName != "" {
+		sc = scMap[*pvc.Spec.StorageClassName]
 	}
 	return sc != nil && sc.AllowVolumeExpansion != nil && *sc.AllowVolumeExpansion
 }
@@ -582,9 +586,15 @@ func pvcMaxAllowedQuantity(
 		}
 		return q, true
 	}
-	maxBytes := baseline.Value() * pvcAutoExpandDefaultCapMult
-	if maxBytes <= 0 {
+	bVal := baseline.Value()
+	if bVal <= 0 {
 		return resource.Quantity{}, false
+	}
+	var maxBytes int64
+	if bVal > math.MaxInt64/pvcAutoExpandDefaultCapMult {
+		maxBytes = math.MaxInt64
+	} else {
+		maxBytes = bVal * pvcAutoExpandDefaultCapMult
 	}
 	return *resource.NewQuantity(maxBytes, resource.BinarySI), true
 }
@@ -595,9 +605,19 @@ func computeExpandedStorage(cur, maxQty resource.Quantity) resource.Quantity {
 	if delta < pvcAutoExpandOneGiB {
 		delta = pvcAutoExpandOneGiB
 	}
-	targetBytes := curBytes + delta
+	var targetBytes int64
+	if curBytes > math.MaxInt64-delta {
+		targetBytes = math.MaxInt64
+	} else {
+		targetBytes = curBytes + delta
+	}
 	// Round up to clean MiB boundary (GiB quantities format cleanly as Gi when exact).
-	roundedBytes := ((targetBytes + pvcAutoExpandOneMiB - 1) / pvcAutoExpandOneMiB) * pvcAutoExpandOneMiB
+	var roundedBytes int64
+	if targetBytes > math.MaxInt64-(pvcAutoExpandOneMiB-1) {
+		roundedBytes = (math.MaxInt64 / pvcAutoExpandOneMiB) * pvcAutoExpandOneMiB
+	} else {
+		roundedBytes = ((targetBytes + pvcAutoExpandOneMiB - 1) / pvcAutoExpandOneMiB) * pvcAutoExpandOneMiB
+	}
 	if roundedBytes > maxQty.Value() {
 		roundedBytes = maxQty.Value()
 	}

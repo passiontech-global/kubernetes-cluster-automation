@@ -233,4 +233,33 @@ func TestServiceCIDRExhaustionGuard(t *testing.T) {
 			t.Fatalf("expected nodeport critical gauge=1, got %v", m)
 		}
 	})
+
+	t.Run("TCP+UDP same NodePort counted once and warn > crit clamps critPct to warnPct", func(t *testing.T) {
+		t.Setenv("NODE_AUTOMATION_SERVICE_NODEPORT_RANGE", "31000-31009")
+		t.Setenv("NODE_AUTOMATION_SERVICE_CIDR_WARN_PCT", "85")
+		t.Setenv("NODE_AUTOMATION_SERVICE_CIDR_CRIT_PCT", "70")
+
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "dns", Name: "coredns-np"},
+			Spec: corev1.ServiceSpec{
+				Type: corev1.ServiceTypeNodePort,
+				Ports: []corev1.ServicePort{
+					{Port: 53, Protocol: corev1.ProtocolUDP, NodePort: 31000},
+					{Port: 53, Protocol: corev1.ProtocolTCP, NodePort: 31000},
+				},
+			},
+		}
+		cs := fake.NewSimpleClientset(svc)
+		p := svcCIDRTestProber(t, cs, now)
+		chk := probetest.MustCheck[*svcCIDRCheck](t, p)
+		if chk.warnPct != 85 || chk.critPct != 85 {
+			t.Fatalf("expected critPct clamped to warnPct=85, got warn=%d crit=%d", chk.warnPct, chk.critPct)
+		}
+		sctx := probetest.SweepCtx(context.Background(), chk.Deps)
+		res := chk.Run(sctx)
+		probetest.VerifySweep(sctx)
+		if !res.Pass {
+			t.Fatalf("single shared TCP+UDP NodePort (10%%) must pass, got %+v", res)
+		}
+	})
 }

@@ -426,9 +426,9 @@ func autoscalerPostureKEDAResources(so *unstructured.Unstructured) autoscalerPos
 		}
 		t, _ := kube.NestedString(tm, "type")
 		switch strings.ToLower(t) {
-		case "cpu":
+		case "cpu", "cpu-utilization":
 			mask.cpu = true
-		case "memory":
+		case "memory", "memory-utilization":
 			mask.memory = true
 		}
 	}
@@ -515,7 +515,7 @@ func (c *autoscalerPostureCheck) autoscalerPostureAuditQuotas(
 				continue
 			}
 		}
-		if !autoscalerPostureQuotaHasComputeHard(rq) {
+		if autoscalerPostureQuotaScopeExempt(rq) || !autoscalerPostureQuotaHasComputeHard(rq) {
 			continue
 		}
 		if nsHasComputeDefaults[rq.Namespace] {
@@ -538,6 +538,20 @@ func (c *autoscalerPostureCheck) autoscalerPostureAuditQuotas(
 			fmt.Sprintf("ResourceQuota %s enforces compute limits but namespace %s has no LimitRange defining container/pod default or defaultRequest",
 				key, rq.Namespace))
 	}
+}
+
+func autoscalerPostureQuotaScopeExempt(rq *corev1.ResourceQuota) bool {
+	if len(rq.Spec.Scopes) == 0 {
+		return false
+	}
+	for _, s := range rq.Spec.Scopes {
+		switch s {
+		case corev1.ResourceQuotaScopeBestEffort, corev1.ResourceQuotaScopeTerminating:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func autoscalerPostureQuotaHasComputeHard(rq *corev1.ResourceQuota) bool {

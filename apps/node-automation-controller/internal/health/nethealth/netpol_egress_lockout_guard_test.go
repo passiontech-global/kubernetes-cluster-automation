@@ -350,6 +350,110 @@ func TestNetpolEgressLockoutGuard(t *testing.T) {
 			t.Fatalf("expected FAIL with nil Infra when PromQL fails best-effort, got %+v", res)
 		}
 	})
+
+	t.Run("CNP egressDeny-only non-DNS does not false-positive, egressDeny DNS overrides allow, and opt-out annotation skips", func(t *testing.T) {
+		pod := netpolLockoutPod("apps", "web-1", map[string]string{"app": "web"})
+		optedOut := netpolLockoutPod("apps", "sandbox-0", map[string]string{"app": "sandbox"})
+		optedOut.Annotations = map[string]string{netpolLockoutIgnoreAnno: "true"}
+
+		// CNP with ONLY egressDeny on SMTP port 25 -> must NOT trigger DNS lockout.
+		denySMTP := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "cilium.io/v2",
+			"kind":       "CiliumNetworkPolicy",
+			"metadata":   map[string]any{"namespace": "apps", "name": "deny-smtp"},
+			"spec": map[string]any{
+				"endpointSelector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
+				"egressDeny": []any{
+					map[string]any{
+						"toPorts": []any{map[string]any{"ports": []any{map[string]any{"port": "25"}}}},
+					},
+				},
+			},
+		}}
+		// CNP in apps with egressDeny on sandbox pod (opted out) -> skipped.
+		denySandbox := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "cilium.io/v2",
+			"kind":       "CiliumNetworkPolicy",
+			"metadata":   map[string]any{"namespace": "apps", "name": "sandbox-deny"},
+			"spec": map[string]any{
+				"endpointSelector": map[string]any{"matchLabels": map[string]any{"app": "sandbox"}},
+				"egress":           []any{},
+			},
+		}}
+		cs := fake.NewSimpleClientset(pod, optedOut)
+		dyn := testutil.NewDynamicClientWithCRDs(denySMTP, denySandbox)
+		p := netpolLockoutTestProber(t, cs, dyn, now)
+		chk := probetest.MustCheck[*netpolLockoutCheck](t, p)
+
+		sctx := probetest.SweepCtx(context.Background(), chk.Deps)
+		res := chk.Run(sctx)
+		probetest.VerifySweep(sctx)
+		if !res.Pass {
+			t.Fatalf("expected PASS for egressDeny-SMTP and opted-out sandbox, got %+v", res)
+		}
+
+		// Companion allow-DNS NP + CNP egressDeny blocking port 53 -> MUST flag dns_egress_blocked!
+		allowDNS := &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "allow-dns"},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+				Egress: []networkingv1.NetworkPolicyEgressRule{{
+					Ports: []networkingv1.NetworkPolicyPort{{Port: ptr.To(intstr.FromInt32(53))}},
+				}},
+			},
+		}
+		denyDNS := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "cilium.io/v2",
+			"kind":       "CiliumNetworkPolicy",
+			"metadata":   map[string]any{"namespace": "apps", "name": "deny-dns"},
+			"spec": map[string]any{
+				"endpointSelector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
+				"egressDeny": []any{
+					map[string]any{
+						"toPorts": []any{map[string]any{"ports": []any{map[string]any{"port": "53"}}}},
+					},
+				},
+			},
+		}}
+		cs2 := fake.NewSimpleClientset(pod, allowDNS)
+		dyn2 := testutil.NewDynamicClientWithCRDs(denyDNS)
+		p2 := netpolLockoutTestProber(t, cs2, dyn2, now)
+		chk2 := probetest.MustCheck[*netpolLockoutCheck](t, p2)
+
+		sctx2 := probetest.SweepCtx(context.Background(), chk2.Deps)
+		res2 := chk2.Run(sctx2)
+		probetest.VerifySweep(sctx2)
+		if res2.Pass || !strings.Contains(res2.Why, netpolLockoutReasonDNS) {
+			t.Fatalf("expected dns_egress_blocked when egressDeny overrides allow NP, got %+v", res2)
+		}
+
+		// CNP in apps with toEndpoints: [{}] (no namespace label) does NOT reach kube-system DNS.
+		cnpSameNS := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "cilium.io/v2",
+			"kind":       "CiliumNetworkPolicy",
+			"metadata":   map[string]any{"namespace": "apps", "name": "same-ns-only"},
+			"spec": map[string]any{
+				"endpointSelector": map[string]any{"matchLabels": map[string]any{"app": "web"}},
+				"egress": []any{
+					map[string]any{
+						"toEndpoints": []any{map[string]any{}},
+						"toPorts":     []any{map[string]any{"ports": []any{map[string]any{"port": "53"}}}},
+					},
+				},
+			},
+		}}
+		cs3 := fake.NewSimpleClientset(pod)
+		dyn3 := testutil.NewDynamicClientWithCRDs(cnpSameNS)
+		p3 := netpolLockoutTestProber(t, cs3, dyn3, now)
+		chk3 := probetest.MustCheck[*netpolLockoutCheck](t, p3)
+		sctx3 := probetest.SweepCtx(context.Background(), chk3.Deps)
+		res3 := chk3.Run(sctx3)
+		probetest.VerifySweep(sctx3)
+		if res3.Pass || !strings.Contains(res3.Why, netpolLockoutReasonDNS) {
+			t.Fatalf("expected dns_egress_blocked when CNP toEndpoints lacks kube-system namespace, got %+v", res3)
+		}
+	})
 }
 
 type netpolLockoutRoundTripFunc func(*http.Request) (*http.Response, error)

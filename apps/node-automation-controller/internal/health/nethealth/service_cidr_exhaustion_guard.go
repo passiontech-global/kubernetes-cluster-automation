@@ -107,6 +107,8 @@ func NewServiceCIDRExhaustionGuardCheck(d *probefw.Deps) probefw.Check {
 		critPct = 100
 	}
 	if critPct < warnPct {
+		envx.Warnf("NODE_AUTOMATION_SERVICE_CIDR_CRIT_PCT < WARN_PCT, clamping crit to warn",
+			"warn", warnPct, "crit", critPct)
 		critPct = warnPct
 	}
 

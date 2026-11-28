@@ -599,8 +599,18 @@ func TestAdmissionSecurityGuardPriorityClassAbuse(t *testing.T) {
 		Spec:       corev1.PodSpec{PriorityClassName: "high-priority"},
 		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 	}
+	// Static/mirror pod -> excluded.
+	mirrorPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "app-ns",
+			Name:        "static-mirror",
+			Annotations: map[string]string{"kubernetes.io/config.mirror": "node-1"},
+		},
+		Spec:   corev1.PodSpec{PriorityClassName: "system-node-critical"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
 
-	cs := fake.NewSimpleClientset(badClusterCrit, badNodeCrit, optedOut, sysKube, sysK0s, terminalPod, normalPod)
+	cs := fake.NewSimpleClientset(badClusterCrit, badNodeCrit, optedOut, sysKube, sysK0s, terminalPod, normalPod, mirrorPod)
 	p := testProberDyn(cs, testutil.NewDynamicClientWithCRDs())
 	chk := probetest.MustCheck[*admissionSecurityGuardCheck](t, p)
 

@@ -482,4 +482,56 @@ func TestPVCAutoExpandCooldownRunawayFluxAndHold(t *testing.T) {
 			t.Fatalf("maintenance hold failed to block expansion: %s", req.String())
 		}
 	})
+
+	t.Run("static empty storageClassName skips default SC, cap never shrinks below capacity, and deleted PVC skips", func(t *testing.T) {
+		pvcLowFreeSpaceGauge.Reset()
+		t.Setenv("NODE_AUTOMATION_PVC_AUTO_EXPAND_HEAL_ENABLED", "true")
+
+		defaultSC := makeExpandableSC("default-expand", true)
+		defaultSC.Annotations = map[string]string{"storageclass.kubernetes.io/is-default-class": "true"}
+
+		// Explicit storageClassName="" means static binding (NO StorageClass) -> must NOT fall back to defaultSC.
+		staticPVC := makeBoundPVC("apps", "static-pvc", "", "10Gi", "10Gi", nil)
+		// curReq (10Gi) < curCap (15Gi) with max 12Gi -> must NOT shrink to 12Gi!
+		shrinkCapPVC := makeBoundPVC("apps", "shrink-cap", "default-expand", "10Gi", "15Gi", map[string]string{
+			annoPVCAutoExpandMax: "12Gi",
+		})
+		// curReq (10Gi) < curCap (15Gi) with max 30Gi -> expands from 15Gi (+25% = 18.75Gi = 19200Mi).
+		growFromCapPVC := makeBoundPVC("apps", "grow-cap", "default-expand", "10Gi", "15Gi", map[string]string{
+			annoPVCAutoExpandMax: "30Gi",
+		})
+
+		cs := fake.NewSimpleClientset(defaultSC, staticPVC, shrinkCapPVC, growFromCapPVC)
+		srv := mockPromLowFreeServer(t,
+			[3]string{"apps", "static-pvc", "0.05"},
+			[3]string{"apps", "shrink-cap", "0.05"},
+			[3]string{"apps", "grow-cap", "0.05"},
+			[3]string{"apps", "deleted-stale", "0.05"},
+		)
+		p := pvcAutoExpandProber(cs)
+		p.Cfg.HTTPContent.URL = srv.URL
+		p.HTTPClient = srv.Client()
+		chk := probetest.MustCheck[*pvcAutoExpandCheck](t, p)
+
+		probetest.FreezeNow(p.Deps, base)
+		_ = runAutoExpandSweep(chk, p.Deps)
+		probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+		res := runAutoExpandSweep(chk, p.Deps)
+
+		if strings.Contains(res.Why, "deleted-stale") {
+			t.Fatalf("stale PromQL PVC without k8s object should not alert: %q", res.Why)
+		}
+		gotStatic, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "static-pvc", metav1.GetOptions{})
+		if req := pvcReqStorage(gotStatic); req.String() != "10Gi" {
+			t.Fatalf("static storageClassName=\"\" expanded via default SC: %s", req.String())
+		}
+		gotShrink, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "shrink-cap", metav1.GetOptions{})
+		if req := pvcReqStorage(gotShrink); req.String() != "10Gi" {
+			t.Fatalf("shrink-cap mutated below capacity: %s", req.String())
+		}
+		gotGrow, _ := cs.CoreV1().PersistentVolumeClaims("apps").Get(ctx, "grow-cap", metav1.GetOptions{})
+		if req := pvcReqStorage(gotGrow); req.Value() != 19200*pvcAutoExpandOneMiB {
+			t.Fatalf("grow-cap = %s (%d), want 19200Mi", req.String(), req.Value())
+		}
+	})
 }

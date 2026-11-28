@@ -262,7 +262,11 @@ func clipEventName(name string, max int) string {
 	}
 	budget := max - len(suffix)
 	if budget <= 0 {
-		return strings.TrimRight(strings.ToValidUTF8(name[:max], ""), ".-")
+		clipped := strings.TrimRight(strings.ToValidUTF8(name[:max], ""), ".-")
+		if clipped == "" {
+			return "event"
+		}
+		return clipped
 	}
 	base := strings.TrimRight(strings.ToValidUTF8(name[:budget], ""), ".-")
 	if base == "" {

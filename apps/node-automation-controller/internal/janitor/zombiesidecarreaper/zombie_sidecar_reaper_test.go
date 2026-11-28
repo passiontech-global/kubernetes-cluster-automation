@@ -957,5 +957,97 @@ func TestZombieSidecarNativeSidecarReapAndVetoes(t *testing.T) {
 	}
 }
 
+func TestZombieSidecarEdgeGuards(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
+	always := corev1.ContainerRestartPolicyAlways
+
+	// Empty ContainerStatuses (app never started) with running native sidecar -> NOT a zombie.
+	neverStarted := zsrPod("jobs", "never-started", 10*time.Minute, 0)
+	neverStarted.Spec.Containers = []corev1.Container{{Name: "app"}}
+	neverStarted.Spec.InitContainers = []corev1.Container{
+		{Name: "linkerd-proxy", RestartPolicy: &always},
+	}
+	neverStarted.Status.ContainerStatuses = nil
+	neverStarted.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "linkerd-proxy",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+		}},
+	}}
+
+	// Zero FinishedAt on terminated app container -> fail closed, NOT reaped.
+	zeroFinished := zsrPod("jobs", "zero-finished", 10*time.Minute, 0)
+	zeroFinished.Status.ContainerStatuses[0].State.Terminated.FinishedAt = metav1.Time{}
+
+	// Mixed: finished regular init + failed regular init (OnFailure) + running native sidecar -> NOT reaped.
+	failedInit := zsrPod("jobs", "failed-init", 10*time.Minute, 0)
+	failedInit.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
+	failedInit.Spec.Containers = []corev1.Container{{Name: "app"}}
+	failedInit.Spec.InitContainers = []corev1.Container{
+		{Name: "init-prep"},
+		{Name: "linkerd-proxy", RestartPolicy: &always},
+	}
+	failedInit.Status.ContainerStatuses = failedInit.Status.ContainerStatuses[:1]
+	failedInit.Status.InitContainerStatuses = []corev1.ContainerStatus{
+		{
+			Name: "init-prep",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1, FinishedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+			}},
+		},
+		{
+			Name: "linkerd-proxy",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+				StartedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+			}},
+		},
+	}
+
+	// Mixed: finished regular init + finished app + running native sidecar -> qualifies and reaps on cycle 2.
+	mixedZombie := zsrPod("jobs", "mixed-native-zombie", 10*time.Minute, 0)
+	mixedZombie.Spec.Containers = []corev1.Container{{Name: "app"}}
+	mixedZombie.Spec.InitContainers = []corev1.Container{
+		{Name: "init-prep"},
+		{Name: "linkerd-proxy", RestartPolicy: &always},
+	}
+	mixedZombie.Status.ContainerStatuses = mixedZombie.Status.ContainerStatuses[:1]
+	mixedZombie.Status.InitContainerStatuses = []corev1.ContainerStatus{
+		{
+			Name: "init-prep",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 0, FinishedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+			}},
+		},
+		{
+			Name: "linkerd-proxy",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+				StartedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+			}},
+		},
+	}
+
+	cs := fake.NewSimpleClientset(neverStarted, zeroFinished, failedInit, mixedZombie)
+	probe := &zsrShutdownProbe{}
+	r := zsrReaper(cs, probe)
+
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(probe.calls) != 1 {
+		t.Fatalf("cycle 1 /shutdown calls = %d, want 1 (mixed-native-zombie only)", len(probe.calls))
+	}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if testutil.PodExists(t, cs, "jobs", "mixed-native-zombie") {
+		t.Fatal("mixed regular-init + native-sidecar zombie was not reaped")
+	}
+	for _, keep := range []string{"never-started", "zero-finished", "failed-init"} {
+		if !testutil.PodExists(t, cs, "jobs", keep) {
+			t.Fatalf("pod %s was falsely reaped", keep)
+		}
+	}
+}
+
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()

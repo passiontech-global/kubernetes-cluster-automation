@@ -245,6 +245,9 @@ func TestClipEventNameTrimsSeparatorsWhenBudgetExhausted(t *testing.T) {
 	if got := clipEventName("ab-cd-", 5); got != "ab-cd" {
 		t.Fatalf("clipEventName = %q, want ab-cd", got)
 	}
+	if got := clipEventName("----.12345678", 4); got != "event" {
+		t.Fatalf("clipEventName all-separator budget-exhausted = %q, want event", got)
+	}
 }
 
 func TestClipEventNameEnforces63CharLabelCap(t *testing.T) {

@@ -241,4 +241,49 @@ func TestInitContainerWedgeGuard(t *testing.T) {
 			t.Fatalf("events = %d, want cap %d", len(evs.Items), initWedgeMaxEventsPerSweep)
 		}
 	})
+
+	t.Run("newly scheduled pod and second initContainer after completed first initContainer are NOT falsely flagged", func(t *testing.T) {
+		initWedgeWedgedGauge.Reset()
+
+		// Pod sat unscheduled for 45m, scheduled 1m ago, currently pulling image -> must pass.
+		justScheduled := initWedgePod("apps", "just-sched", "u9", corev1.PodPending, base.Add(-45*time.Minute),
+			[]corev1.Container{{Name: "init-1"}},
+			[]corev1.ContainerStatus{{
+				Name:  "init-1",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}},
+			}},
+		)
+		justScheduled.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(base.Add(-1 * time.Minute))},
+			{Type: corev1.PodInitialized, Status: corev1.ConditionFalse, LastTransitionTime: metav1.NewTime(base.Add(-45 * time.Minute))},
+		}
+
+		// init-1 ran for 39m and exited 0 1m ago; init-2 just entered ContainerCreating 1m ago -> must pass.
+		multiInit := initWedgePod("apps", "multi-init", "u10", corev1.PodPending, base.Add(-40*time.Minute),
+			[]corev1.Container{{Name: "init-1"}, {Name: "init-2"}},
+			[]corev1.ContainerStatus{
+				{
+					Name: "init-1",
+					State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+						ExitCode:   0,
+						FinishedAt: metav1.NewTime(base.Add(-1 * time.Minute)),
+					}},
+				},
+				{
+					Name:  "init-2",
+					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}},
+				},
+			},
+		)
+
+		cs := fake.NewSimpleClientset(justScheduled, multiInit)
+		p := initWedgeProber(cs)
+		probetest.FreezeNow(p.Deps, base)
+		chk := probetest.MustCheck[*initWedgeGuardCheck](t, p)
+
+		res := probetest.RunCheck(ctx, chk.Deps, chk)
+		if !res.Pass || res.Infra != nil {
+			t.Fatalf("freshly scheduled / sequential second initContainer falsely flagged: %+v", res)
+		}
+	})
 }

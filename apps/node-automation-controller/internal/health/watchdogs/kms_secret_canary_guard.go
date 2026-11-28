@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -167,38 +168,38 @@ var errKMSCanaryMismatch = errors.New("quorum read payload mismatch")
 
 func (c *kmsCanaryCheck) kmsCanaryWriteAndRead(ctx context.Context, payload []byte) error {
 	secrets := c.CS.CoreV1().Secrets(c.canaryNS)
-	existing, err := secrets.Get(ctx, kmsCanarySecretName, metav1.GetOptions{ResourceVersion: ""})
-	switch {
-	case apierrors.IsNotFound(err):
-		sec := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: c.canaryNS,
-				Name:      kmsCanarySecretName,
-			},
-			Type: corev1.SecretTypeOpaque,
-			Data: map[string][]byte{
-				kmsCanaryDataKey: payload,
-			},
-		}
-		if _, cerr := secrets.Create(ctx, sec, metav1.CreateOptions{}); cerr != nil {
-			if !apierrors.IsAlreadyExists(cerr) {
-				return cerr
+	writeErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		existing, err := secrets.Get(ctx, kmsCanarySecretName, metav1.GetOptions{ResourceVersion: ""})
+		switch {
+		case apierrors.IsNotFound(err):
+			sec := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: c.canaryNS,
+					Name:      kmsCanarySecretName,
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: map[string][]byte{
+					kmsCanaryDataKey: payload,
+				},
 			}
-			// Concurrent creation race: re-fetch and update below.
-			existing, err = secrets.Get(ctx, kmsCanarySecretName, metav1.GetOptions{ResourceVersion: ""})
-			if err != nil {
-				return err
+			_, cerr := secrets.Create(ctx, sec, metav1.CreateOptions{})
+			if apierrors.IsAlreadyExists(cerr) {
+				return apierrors.NewConflict(corev1.Resource("secrets"), kmsCanarySecretName, cerr)
 			}
-			if uerr := kmsCanaryUpdateSecret(ctx, secrets, existing, payload); uerr != nil {
-				return uerr
+			return cerr
+		case err != nil:
+			return err
+		default:
+			uerr := kmsCanaryUpdateSecret(ctx, secrets, existing, payload)
+			if apierrors.IsNotFound(uerr) {
+				// Secret was deleted between Get and Update; trigger retry to re-create.
+				return apierrors.NewConflict(corev1.Resource("secrets"), kmsCanarySecretName, uerr)
 			}
-		}
-	case err != nil:
-		return err
-	default:
-		if uerr := kmsCanaryUpdateSecret(ctx, secrets, existing, payload); uerr != nil {
 			return uerr
 		}
+	})
+	if writeErr != nil {
+		return writeErr
 	}
 
 	got, err := secrets.Get(ctx, kmsCanarySecretName, metav1.GetOptions{ResourceVersion: ""})

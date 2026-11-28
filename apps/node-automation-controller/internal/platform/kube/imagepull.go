@@ -104,26 +104,31 @@ type ImagePullCensus struct {
 	RegistryOutages []RegistryPullOutage
 }
 
-// imagePullRegistryOutageMarkers are unmistakable registry-level error
-// signatures matched case-insensitively against ContainerStateWaiting.Message
-// when a container is waiting in ImagePullBackOff or ErrImagePull.
-var imagePullRegistryOutageMarkers = []string{
-	"429",
+// imagePullRegistryOutagePhrases are unmistakable multi-word / protocol
+// registry outage signatures matched case-insensitively as substrings against
+// ContainerStateWaiting.Message.
+var imagePullRegistryOutagePhrases = []string{
 	"toomanyrequests",
 	"too many requests",
 	"rate limit",
-	"503",
 	"service unavailable",
-	"502",
 	"bad gateway",
-	"504",
 	"gateway timeout",
 	"tls handshake timeout",
 	"connection refused",
 	"i/o timeout",
 	"no such host",
 	"dial tcp",
-	"eof",
+}
+
+// imagePullRegistryOutageStatusCodes are HTTP status codes matched only at
+// status-token boundaries so digits inside image names, tags, ports, or SHA256
+// digests (e.g. "svc-429", ":5030", "@sha256:...429...") never false-positive.
+var imagePullRegistryOutageStatusCodes = []string{
+	"429",
+	"503",
+	"502",
+	"504",
 }
 
 // IsRegistryOutageMessage reports whether a kubelet waiting message carries
@@ -133,12 +138,90 @@ func IsRegistryOutageMessage(msg string) bool {
 		return false
 	}
 	lower := strings.ToLower(msg)
-	for _, marker := range imagePullRegistryOutageMarkers {
-		if strings.Contains(lower, marker) {
+	for _, phrase := range imagePullRegistryOutagePhrases {
+		if strings.Contains(lower, phrase) {
 			return true
 		}
 	}
+	for _, code := range imagePullRegistryOutageStatusCodes {
+		if containsStatusCodeToken(lower, code) {
+			return true
+		}
+	}
+	return containsEOFToken(lower)
+}
+
+func containsStatusCodeToken(lower, code string) bool {
+	for start := 0; start < len(lower); {
+		idx := strings.Index(lower[start:], code)
+		if idx < 0 {
+			return false
+		}
+		pos := start + idx
+		end := pos + len(code)
+		if isStatusCodeBefore(lower, pos) && isTokenAfter(lower, end, false) {
+			return true
+		}
+		start = pos + 1
+	}
 	return false
+}
+
+func containsEOFToken(lower string) bool {
+	const tok = "eof"
+	for start := 0; start < len(lower); {
+		idx := strings.Index(lower[start:], tok)
+		if idx < 0 {
+			return false
+		}
+		pos := start + idx
+		end := pos + len(tok)
+		if isEOFBefore(lower, pos) && isTokenAfter(lower, end, true) {
+			return true
+		}
+		start = pos + 1
+	}
+	return false
+}
+
+func isStatusCodeBefore(s string, pos int) bool {
+	if pos == 0 {
+		return true
+	}
+	switch s[pos-1] {
+	case ' ', '\t', '\n', '\r', '(', '[', '=':
+		return true
+	default:
+		return false
+	}
+}
+
+func isEOFBefore(s string, pos int) bool {
+	if pos == 0 {
+		return true
+	}
+	switch s[pos-1] {
+	case ' ', '\t', '\n', '\r', '(', '[', ',':
+		return true
+	default:
+		return false
+	}
+}
+
+func isTokenAfter(s string, end int, allowBang bool) bool {
+	if end == len(s) {
+		return true
+	}
+	switch s[end] {
+	case ' ', '\t', '\n', '\r', ')', ']', ',', ';', ':':
+		return true
+	case '!':
+		return allowBang
+	case '.':
+		return end+1 == len(s) || s[end+1] == ' ' || s[end+1] == '\t' || s[end+1] == '\n' || s[end+1] == '\r'
+	default:
+		return false
+	}
 }
 
 // NormalizedRegistryHost extracts and normalizes the registry host from a
@@ -155,7 +238,7 @@ func NormalizedRegistryHost(image string) string {
 		return "docker.io"
 	}
 	first := img[:slash]
-	if !strings.ContainsAny(first, ".:") && first != "localhost" {
+	if !strings.ContainsAny(first, ".:") && !strings.EqualFold(first, "localhost") {
 		return "docker.io"
 	}
 	host := strings.ToLower(first)
@@ -193,7 +276,8 @@ func ScanImagePullCensus(ctx context.Context,
 		func(items []corev1.Pod) error {
 			for i := range items {
 				p := &items[i]
-				if p.Status.Phase == corev1.PodSucceeded ||
+				if p.DeletionTimestamp != nil ||
+					p.Status.Phase == corev1.PodSucceeded ||
 					p.Status.Phase == corev1.PodFailed {
 					continue
 				}

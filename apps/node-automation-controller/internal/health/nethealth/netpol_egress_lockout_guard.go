@@ -14,6 +14,7 @@ package nethealth
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"slices"
 	"sort"
 	"strconv"
@@ -48,6 +49,8 @@ const (
 	netpolLockoutEventCooldown   = 30 * time.Minute
 	netpolLockoutRecentPolicyAge = 15 * time.Minute
 	netpolLockoutMaxEventPods    = 5
+	netpolLockoutIgnoreAnno      = "passiontech.dev/ignore-netpol-egress-lockout"
+	netpolLockoutNodeLocalDNSIP  = "169.254.20.10"
 
 	netpolLockoutPromDropQuery = `sum by (namespace) (increase(cilium_drop_count_total{reason="Policy denied"}[15m]))`
 )
@@ -198,6 +201,9 @@ func (c *netpolLockoutCheck) Run(ctx context.Context) probefw.Result {
 		}
 
 		for _, pod := range nsPods {
+			if strings.EqualFold(strings.TrimSpace(kube.EffectiveAnno(ctx, pod, netpolLockoutIgnoreAnno)), "true") {
+				continue
+			}
 			selected, dnsAllowed, apiAllowed, matchedPolicies := netpolLockoutEvaluatePod(
 				pod, nsNPs, nsCNPs, kubeSystemLabels,
 			)
@@ -417,13 +423,16 @@ func netpolLockoutEvaluatePod(
 	kubeSystemLabels map[string]string,
 ) (selected, dnsAllowed, apiAllowed bool, matchedPolicies []string) {
 	podLabels := labels.Set(pod.Labels)
+	hasAllowPolicy := false
+	dnsDenied := false
+	apiDenied := false
 
 	for _, np := range nsNPs {
 		sel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
 		if err != nil || !sel.Matches(podLabels) {
 			continue
 		}
-		selected = true
+		hasAllowPolicy = true
 		matchedPolicies = append(matchedPolicies, "NetworkPolicy/"+np.Name)
 		for i := range np.Spec.Egress {
 			rule := &np.Spec.Egress[i]
@@ -442,14 +451,26 @@ func netpolLockoutEvaluatePod(
 			if !netpolLockoutCiliumSpecMatchesPod(sp, pod.Namespace, podLabels) {
 				continue
 			}
-			selected = true
-			cnpMatched = true
-			for _, rule := range netpolLockoutCiliumEgressRules(sp) {
-				if netpolLockoutCiliumRuleAllowsDNS(rule) {
-					dnsAllowed = true
+			if _, hasEgress := sp["egress"]; hasEgress && sp["egress"] != nil {
+				hasAllowPolicy = true
+				cnpMatched = true
+				for _, rule := range netpolLockoutCiliumEgressRules(sp) {
+					if netpolLockoutCiliumRuleAllowsDNS(rule, cnp.namespace) {
+						dnsAllowed = true
+					}
+					if netpolLockoutCiliumRuleAllowsAPIServer(rule, cnp.namespace) {
+						apiAllowed = true
+					}
 				}
-				if netpolLockoutCiliumRuleAllowsAPIServer(rule) {
-					apiAllowed = true
+			}
+			for _, denyRule := range netpolLockoutCiliumEgressDenyRules(sp) {
+				if netpolLockoutCiliumDenyRuleBlocksDNS(denyRule, cnp.namespace) {
+					dnsDenied = true
+					cnpMatched = true
+				}
+				if netpolLockoutCiliumDenyRuleBlocksAPIServer(denyRule, cnp.namespace) {
+					apiDenied = true
+					cnpMatched = true
 				}
 			}
 		}
@@ -458,8 +479,23 @@ func netpolLockoutEvaluatePod(
 		}
 	}
 
+	if !hasAllowPolicy && !dnsDenied && !apiDenied {
+		return false, true, true, nil
+	}
+	if !hasAllowPolicy {
+		dnsAllowed = !dnsDenied
+		apiAllowed = !apiDenied
+	} else {
+		if dnsDenied {
+			dnsAllowed = false
+		}
+		if apiDenied {
+			apiAllowed = false
+		}
+	}
+
 	sort.Strings(matchedPolicies)
-	return selected, dnsAllowed, apiAllowed, matchedPolicies
+	return true, dnsAllowed, apiAllowed, matchedPolicies
 }
 
 func netpolLockoutNPAffectsEgress(np *networkingv1.NetworkPolicy) bool {
@@ -489,16 +525,27 @@ func netpolLockoutNPPortsAllowDNS(ports []networkingv1.NetworkPolicyPort) bool {
 		return true
 	}
 	for i := range ports {
-		if netpolLockoutNPPortMatches(&ports[i], 53, "dns", "dns-udp", "dns-tcp") {
+		p := &ports[i]
+		if p.Protocol != nil && *p.Protocol == corev1.ProtocolSCTP {
+			continue
+		}
+		if netpolLockoutNPPortMatches(p, 53, "dns", "dns-udp", "dns-tcp") {
 			return true
 		}
 	}
 	return false
 }
 
+func netpolLockoutIPBlockEffective(ib *networkingv1.IPBlock) bool {
+	if ib == nil || ib.CIDR == "" {
+		return false
+	}
+	return !slices.Contains(ib.Except, ib.CIDR)
+}
+
 func netpolLockoutNPPeerAllowsDNS(peer *networkingv1.NetworkPolicyPeer, policyNS string, kubeSystemLabels map[string]string) bool {
 	if peer.IPBlock != nil {
-		return peer.IPBlock.CIDR != ""
+		return netpolLockoutIPBlockEffective(peer.IPBlock)
 	}
 	if peer.NamespaceSelector != nil {
 		if !netpolLockoutMatchesKubeSystem(peer.NamespaceSelector, kubeSystemLabels) {
@@ -568,7 +615,13 @@ func netpolLockoutNPRuleAllowsAPIServer(rule *networkingv1.NetworkPolicyEgressRu
 	}
 	for i := range rule.To {
 		peer := &rule.To[i]
-		if peer.IPBlock != nil && peer.IPBlock.CIDR != "" {
+		if netpolLockoutIPBlockEffective(peer.IPBlock) {
+			if pfx, err := netip.ParsePrefix(peer.IPBlock.CIDR); err == nil {
+				nodeLocalAddr := netip.MustParseAddr(netpolLockoutNodeLocalDNSIP)
+				if pfx.Bits() == 32 && pfx.Addr() == nodeLocalAddr {
+					continue
+				}
+			}
 			return true
 		}
 		if peer.NamespaceSelector != nil {
@@ -753,6 +806,40 @@ func netpolLockoutCiliumEgressRules(sp map[string]any) []map[string]any {
 	return out
 }
 
+func netpolLockoutCiliumEgressDenyRules(sp map[string]any) []map[string]any {
+	raw, ok := sp["egressDeny"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if m, ok := item.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func netpolLockoutCiliumSelectorMentionsNS(raw map[string]any) bool {
+	if mlRaw, ok := raw["matchLabels"].(map[string]any); ok {
+		for k := range mlRaw {
+			if strings.TrimPrefix(k, "k8s:") == "io.kubernetes.pod.namespace" {
+				return true
+			}
+		}
+	}
+	if exprsRaw, ok := raw["matchExpressions"].([]any); ok {
+		for _, item := range exprsRaw {
+			if m, ok := item.(map[string]any); ok {
+				if key, _ := m["key"].(string); strings.TrimPrefix(key, "k8s:") == "io.kubernetes.pod.namespace" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func netpolLockoutCiliumRuleIsAllowAll(rule map[string]any) bool {
 	for _, key := range []string{
 		"toEndpoints", "toEntities", "toCIDR", "toCIDRSet",
@@ -772,7 +859,7 @@ func netpolLockoutCiliumRuleIsAllowAll(rule map[string]any) bool {
 	return true
 }
 
-func netpolLockoutCiliumRuleAllowsDNS(rule map[string]any) bool {
+func netpolLockoutCiliumRuleAllowsDNS(rule map[string]any, policyNS string) bool {
 	if netpolLockoutCiliumRuleIsAllowAll(rule) {
 		return true
 	}
@@ -797,7 +884,7 @@ func netpolLockoutCiliumRuleAllowsDNS(rule map[string]any) bool {
 			if !ok {
 				continue
 			}
-			if netpolLockoutCiliumEndpointSelectsDNS(epMap) {
+			if netpolLockoutCiliumEndpointSelectsDNS(epMap, policyNS) {
 				return true
 			}
 		}
@@ -825,7 +912,7 @@ func netpolLockoutCiliumRuleAllowsDNS(rule map[string]any) bool {
 	return !hasDest
 }
 
-func netpolLockoutCiliumRuleAllowsAPIServer(rule map[string]any) bool {
+func netpolLockoutCiliumRuleAllowsAPIServer(rule map[string]any, policyNS string) bool {
 	if netpolLockoutCiliumRuleIsAllowAll(rule) {
 		return true
 	}
@@ -857,7 +944,7 @@ func netpolLockoutCiliumRuleAllowsAPIServer(rule map[string]any) bool {
 				if k8sSvc, ok := m["k8sService"].(map[string]any); ok {
 					svcName, _ := k8sSvc["serviceName"].(string)
 					nsName, _ := k8sSvc["namespace"].(string)
-					if svcName == "kubernetes" && (nsName == "" || nsName == "default") {
+					if svcName == "kubernetes" && (nsName == "default" || (nsName == "" && policyNS == "default")) {
 						return true
 					}
 				}
@@ -871,6 +958,9 @@ func netpolLockoutCiliumRuleAllowsAPIServer(rule map[string]any) bool {
 			if !ok {
 				continue
 			}
+			if policyNS != "default" && !netpolLockoutCiliumSelectorMentionsNS(epMap) {
+				continue
+			}
 			if ls, ok := netpolLockoutCiliumSelectorToK8s(epMap, "default"); ok {
 				if sel, err := metav1.LabelSelectorAsSelector(ls); err == nil && sel.Empty() {
 					return true
@@ -881,7 +971,172 @@ func netpolLockoutCiliumRuleAllowsAPIServer(rule map[string]any) bool {
 	return !hasDest
 }
 
-func netpolLockoutCiliumEndpointSelectsDNS(epMap map[string]any) bool {
+func netpolLockoutCiliumDenyRuleBlocksDNS(rule map[string]any, policyNS string) bool {
+	if netpolLockoutCiliumRuleIsAllowAll(rule) {
+		return true
+	}
+	if !netpolLockoutCiliumToPortsAllows(rule, 53, "dns", "dns-udp", "dns-tcp") {
+		return false
+	}
+
+	hasDest := false
+	if ents := netpolLockoutCiliumStringSlice(rule["toEntities"]); len(ents) > 0 {
+		hasDest = true
+		for _, ent := range ents {
+			switch strings.ToLower(ent) {
+			case "cluster", "all":
+				return true
+			}
+		}
+	}
+	if eps, ok := rule["toEndpoints"].([]any); ok && len(eps) > 0 {
+		hasDest = true
+		for _, item := range eps {
+			if epMap, ok := item.(map[string]any); ok && netpolLockoutCiliumEndpointSelectsDNS(epMap, policyNS) {
+				return true
+			}
+		}
+	}
+	if cidrs, ok := rule["toCIDR"].([]any); ok && len(cidrs) > 0 {
+		hasDest = true
+		if netpolLockoutCiliumCIDRsMatchAny(cidrs, netpolLockoutNodeLocalDNSIP) {
+			return true
+		}
+	}
+	if cidrSet, ok := rule["toCIDRSet"].([]any); ok && len(cidrSet) > 0 {
+		hasDest = true
+		if netpolLockoutCiliumCIDRSetMatchesAny(cidrSet, netpolLockoutNodeLocalDNSIP) {
+			return true
+		}
+	}
+	if svcs, ok := rule["toServices"].([]any); ok && len(svcs) > 0 {
+		hasDest = true
+		for _, item := range svcs {
+			if m, ok := item.(map[string]any); ok {
+				if k8sSvc, ok := m["k8sService"].(map[string]any); ok {
+					svcName, _ := k8sSvc["serviceName"].(string)
+					if svcName == "kube-dns" || svcName == "coredns" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return !hasDest
+}
+
+func netpolLockoutCiliumDenyRuleBlocksAPIServer(rule map[string]any, policyNS string) bool {
+	if netpolLockoutCiliumRuleIsAllowAll(rule) {
+		return true
+	}
+	if !netpolLockoutCiliumToPortsAllows(rule, 443, "https", "apiserver") &&
+		!netpolLockoutCiliumToPortsAllows(rule, 6443, "https", "apiserver") {
+		return false
+	}
+
+	hasDest := false
+	if ents := netpolLockoutCiliumStringSlice(rule["toEntities"]); len(ents) > 0 {
+		hasDest = true
+		for _, ent := range ents {
+			switch strings.ToLower(ent) {
+			case "kube-apiserver", "cluster", "all":
+				return true
+			}
+		}
+	}
+	if cidrs, ok := rule["toCIDR"].([]any); ok && len(cidrs) > 0 {
+		hasDest = true
+		if netpolLockoutCiliumCIDRsMatchAny(cidrs, "") {
+			return true
+		}
+	}
+	if cidrSet, ok := rule["toCIDRSet"].([]any); ok && len(cidrSet) > 0 {
+		hasDest = true
+		if netpolLockoutCiliumCIDRSetMatchesAny(cidrSet, "") {
+			return true
+		}
+	}
+	if svcs, ok := rule["toServices"].([]any); ok && len(svcs) > 0 {
+		hasDest = true
+		for _, item := range svcs {
+			if m, ok := item.(map[string]any); ok {
+				if k8sSvc, ok := m["k8sService"].(map[string]any); ok {
+					svcName, _ := k8sSvc["serviceName"].(string)
+					nsName, _ := k8sSvc["namespace"].(string)
+					if svcName == "kubernetes" && (nsName == "default" || (nsName == "" && policyNS == "default")) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	if eps, ok := rule["toEndpoints"].([]any); ok && len(eps) > 0 {
+		hasDest = true
+		for _, item := range eps {
+			epMap, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if policyNS != "default" && !netpolLockoutCiliumSelectorMentionsNS(epMap) {
+				continue
+			}
+			if ls, ok := netpolLockoutCiliumSelectorToK8s(epMap, "default"); ok {
+				if sel, err := metav1.LabelSelectorAsSelector(ls); err == nil && sel.Empty() {
+					return true
+				}
+			}
+		}
+	}
+	return !hasDest
+}
+
+func netpolLockoutCiliumCIDRsMatchAny(cidrs []any, targetIP string) bool {
+	var target netip.Addr
+	if targetIP != "" {
+		target, _ = netip.ParseAddr(targetIP)
+	}
+	for _, raw := range cidrs {
+		s, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		pfx, err := netip.ParsePrefix(strings.TrimSpace(s))
+		if err != nil {
+			continue
+		}
+		if pfx.Bits() == 0 || (target.IsValid() && pfx.Contains(target)) {
+			return true
+		}
+	}
+	return false
+}
+
+func netpolLockoutCiliumCIDRSetMatchesAny(cidrSet []any, targetIP string) bool {
+	var target netip.Addr
+	if targetIP != "" {
+		target, _ = netip.ParseAddr(targetIP)
+	}
+	for _, item := range cidrSet {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		s, _ := m["cidr"].(string)
+		pfx, err := netip.ParsePrefix(strings.TrimSpace(s))
+		if err != nil {
+			continue
+		}
+		if pfx.Bits() == 0 || (target.IsValid() && pfx.Contains(target)) {
+			return true
+		}
+	}
+	return false
+}
+
+func netpolLockoutCiliumEndpointSelectsDNS(epMap map[string]any, policyNS string) bool {
+	if policyNS != "kube-system" && !netpolLockoutCiliumSelectorMentionsNS(epMap) {
+		return false
+	}
 	ls, ok := netpolLockoutCiliumSelectorToK8s(epMap, "kube-system")
 	if !ok {
 		return false

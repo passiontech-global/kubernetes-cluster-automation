@@ -406,4 +406,30 @@ func TestPVCResizeBouncePDBCooldownAndHold(t *testing.T) {
 			t.Fatalf("maintenance hold allowed eviction: %v", *evicted)
 		}
 	})
+
+	t.Run("Job pods and PVC false opt-out precedence skipped", func(t *testing.T) {
+		pvcResizeStalledGauge.Reset()
+		t.Setenv("NODE_AUTOMATION_PVC_RESIZE_BOUNCE_ENABLED", "true")
+
+		jobOwner := &metav1.OwnerReference{Kind: "Job", Name: "migrate-db", UID: "job-uid-1", Controller: &ctrlTrue}
+		pvcJob := pvcWithCondition("db", "job-pvc", corev1.PersistentVolumeClaimFileSystemResizePending, time.Hour)
+		jobPod := makePVCStallPod("db", "migrate-db-abc", "job-pvc", jobOwner, nil)
+
+		pvcFalse := pvcWithCondition("db", "pvc-false", corev1.PersistentVolumeClaimFileSystemResizePending, time.Hour)
+		pvcFalse.Annotations = map[string]string{pvcResizeBounceAnno: "false"}
+		stsPodTrue := makePVCStallPod("db", "sts-true-0", "pvc-false", stsOwner, map[string]string{pvcResizeBounceAnno: "true"})
+
+		cs := fake.NewSimpleClientset(pvcJob, jobPod, pvcFalse, stsPodTrue)
+		evicted := capturePVCStallEvictions(cs, nil)
+		p := testProberDyn(cs, probetest.OpDyn())
+		probetest.FreezeNow(p.Deps, base)
+		chk := probetest.MustCheck[*pvcResizeStallGuardCheck](t, p)
+
+		sctx := probetest.SweepCtx(ctx, chk.Deps)
+		_ = chk.Run(sctx)
+		probetest.VerifySweep(sctx)
+		if len(*evicted) != 0 {
+			t.Fatalf("expected Job pod and PVC false-vetoed pod skipped, got evicted=%v", *evicted)
+		}
+	})
 }

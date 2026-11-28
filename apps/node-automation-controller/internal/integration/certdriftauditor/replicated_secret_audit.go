@@ -198,7 +198,7 @@ func (a *certDriftAuditor) auditMissingReplicateToTargets(ctx context.Context,
 			srcRefs[src.namespace+"/"+src.name] = true
 		}
 		for k, lv := range a.seenReplication.Last() {
-			if len(lv) >= 3 && srcRefs[lv[2]] {
+			if len(lv) >= 3 && srcRefs[lv[2]] && !presentTLS[secretMetricKey{k.namespace, k.name}] {
 				a.seenReplication.Emit(k, lv...)
 			}
 		}

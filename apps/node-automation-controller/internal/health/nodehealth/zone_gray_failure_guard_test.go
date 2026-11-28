@@ -306,4 +306,51 @@ func TestZoneGrayFailureGuardSheddingAndRecovery(t *testing.T) {
 			t.Fatal("2-zone cluster must NEVER shed a zone")
 		}
 	})
+
+	t.Run("taint-only control-plane node excluded and unrelated worker taints preserved", func(t *testing.T) {
+		t.Setenv("NODE_AUTOMATION_ZONE_GRAY_SHED_ENABLED", "true")
+
+		// Control-plane identified by taint only (no node-role label).
+		cpTaintOnly := zoneGrayTestWorker("cp-taint", "az-a", false)
+		cpTaintOnly.Spec.Taints = []corev1.Taint{{
+			Key:    "node-role.kubernetes.io/control-plane",
+			Effect: corev1.TaintEffectNoSchedule,
+		}}
+		a1 := zoneGrayTestWorker("a1", "az-a", false)
+		a1.Spec.Taints = []corev1.Taint{{Key: "dedicated", Value: "gpu", Effect: corev1.TaintEffectNoSchedule}}
+		b1 := zoneGrayTestWorker("b1", "az-b", true)
+		c1 := zoneGrayTestWorker("c1", "az-c", true)
+
+		cs := fake.NewSimpleClientset(cpTaintOnly, a1, b1, c1)
+		p := probetest.NewCheckProber(cs, nil, NewZoneGrayFailureGuardCheck)
+		base := time.Date(2026, 11, 25, 15, 0, 0, 0, time.UTC)
+		probetest.FreezeNow(p.Deps, base)
+		chk := probetest.MustCheck[*zoneGrayFailureGuardCheck](t, p)
+
+		_ = probetest.RunCheck(ctx, chk.Deps, chk)
+		probetest.FreezeNow(p.Deps, base.Add(10*time.Minute))
+		_ = probetest.RunCheck(ctx, chk.Deps, chk)
+
+		gotCP, _ := cs.CoreV1().Nodes().Get(ctx, "cp-taint", metav1.GetOptions{})
+		if kube.HasTaint(gotCP.Spec.Taints, zoneGrayTaintKey) {
+			t.Fatal("taint-only control-plane node must NEVER receive zone-gray-failure taint")
+		}
+		gotA1, _ := cs.CoreV1().Nodes().Get(ctx, "a1", metav1.GetOptions{})
+		if !kube.HasTaint(gotA1.Spec.Taints, zoneGrayTaintKey) || !kube.HasTaint(gotA1.Spec.Taints, "dedicated") {
+			t.Fatalf("expected both dedicated and zone-gray-failure taints on a1, got %+v", gotA1.Spec.Taints)
+		}
+
+		// Recover a1 and verify dedicated taint remains after zone-gray-failure untaints.
+		gotA1.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+		_, _ = cs.CoreV1().Nodes().UpdateStatus(ctx, gotA1, metav1.UpdateOptions{})
+		probetest.FreezeNow(p.Deps, base.Add(11*time.Minute))
+		_ = probetest.RunCheck(ctx, chk.Deps, chk)
+		probetest.FreezeNow(p.Deps, base.Add(27*time.Minute))
+		_ = probetest.RunCheck(ctx, chk.Deps, chk)
+
+		gotA1, _ = cs.CoreV1().Nodes().Get(ctx, "a1", metav1.GetOptions{})
+		if kube.HasTaint(gotA1.Spec.Taints, zoneGrayTaintKey) || !kube.HasTaint(gotA1.Spec.Taints, "dedicated") {
+			t.Fatalf("expected zone-gray-failure removed while preserving dedicated taint, got %+v", gotA1.Spec.Taints)
+		}
+	})
 }

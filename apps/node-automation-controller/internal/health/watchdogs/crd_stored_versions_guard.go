@@ -325,12 +325,15 @@ func (c *crdStoredVerCheck) crdStoredVerRunMigration(
 		patchedCount := 0
 		allMigrated := true
 		forbidden := false
+		hadPatchErr := false
 		for i := range items {
 			cr := &items[i]
-			if cr.GetDeletionTimestamp() != nil {
+			if cr.GetAnnotations()[crdStoredVerAnnoMigratedVersion] == cand.storageVer {
 				continue
 			}
-			if cr.GetAnnotations()[crdStoredVerAnnoMigratedVersion] == cand.storageVer {
+			if cr.GetDeletionTimestamp() != nil {
+				// Terminating CR still in etcd without migrated annotation: do not prune storedVersions yet.
+				allMigrated = false
 				continue
 			}
 			if patchedCount >= crdStoredVerMaxCRsPerSweep {
@@ -367,6 +370,7 @@ func (c *crdStoredVerCheck) crdStoredVerRunMigration(
 						"crd", cand.name, "cr", crKey, "error", perr)
 					break
 				}
+				hadPatchErr = true
 				metrics.IncError(c.Name)
 				log.Error(perr, "CRD storage migration CR patch failed",
 					"crd", cand.name, "cr", crKey)
@@ -377,11 +381,10 @@ func (c *crdStoredVerCheck) crdStoredVerRunMigration(
 
 		if !allMigrated {
 			if patchedCount == 0 {
-				heal.RefundTarget(CheckNameCRDStoredVersionsGuard, cand.name, now)
-				if forbidden {
-					heal.RefundGrant(now)
-				} else if !forbidden {
-					// If skipped solely due to FluxPatchGate (no error attempted), refund grant.
+				if forbidden || !hadPatchErr {
+					// Refund target & grant only on clean skips (403 or FluxPatchGate / terminating CR),
+					// never when an attempted CR patch failed with a real error.
+					heal.RefundTarget(CheckNameCRDStoredVersionsGuard, cand.name, now)
 					heal.RefundGrant(now)
 				}
 			} else {

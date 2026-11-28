@@ -11,9 +11,11 @@
 //     expand controller lost the claim mid-operation.
 //
 // Either condition True past PVCResizeStallMinAge (30m default) is a
-// stall: a healthy expansion is seconds-to-minutes. Detection-only —
-// the gauge node_automation_pvc_resize_stalled{namespace,pvc,
-// condition} is the alert contract; nothing here deletes or patches.
+// stall: a healthy expansion is seconds-to-minutes. Emits
+// node_automation_pvc_resize_stalled{namespace,pvc,condition}; when opt-in
+// enabled (NODE_AUTOMATION_PVC_RESIZE_BOUNCE_ENABLED=true or annotation
+// passiontech.dev/auto-bounce-for-fs-resize="true"), PDB-safely evicts at most
+// one owned non-Job pod for sustained FileSystemResizePending.
 package pvc
 
 import (
@@ -220,6 +222,7 @@ func (p *pvcResizeStallGuardCheck) bounceStalledFSResizePods(
 				continue
 			}
 			if pod.DeletionTimestamp != nil ||
+				kube.IsPodDeleted(ctx, pod.UID) ||
 				pod.Status.Phase == corev1.PodSucceeded ||
 				pod.Status.Phase == corev1.PodFailed {
 				continue
@@ -227,8 +230,9 @@ func (p *pvcResizeStallGuardCheck) bounceStalledFSResizePods(
 			if pod.Annotations["kubernetes.io/config.mirror"] != "" {
 				continue
 			}
-			// Never kill unowned standalone pods.
-			if metav1.GetControllerOf(pod) == nil {
+			// Never kill unowned standalone pods or run-to-completion Job pods.
+			ctrl := metav1.GetControllerOf(pod)
+			if ctrl == nil || ctrl.Kind == "Job" {
 				continue
 			}
 			if !slices.Contains(kube.PodClaimedPVCs(pod), pvc.Name) {

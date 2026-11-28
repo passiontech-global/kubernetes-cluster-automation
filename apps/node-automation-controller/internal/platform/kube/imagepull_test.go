@@ -128,6 +128,13 @@ func TestNormalizedRegistryHost(t *testing.T) {
 		{"GHCR.IO/org/app:v1", "ghcr.io"},
 		{"quay.io/jetstack/cert-manager:v1.14.0", "quay.io"},
 		{"localhost:5000/app:dev", "localhost:5000"},
+		{"LOCALHOST/app:dev", "localhost"},
+		{"LOCALHOST:5000/app:dev", "localhost:5000"},
+		{"registry.k8s.io/pause:3.9", "registry.k8s.io"},
+		{"registry.k8s.io/pause", "registry.k8s.io"},
+		{"myregistry:5000/foo", "myregistry:5000"},
+		{"nginx", "docker.io"},
+		{"myorg/app:5000", "docker.io"},
 		{"registry.internal:5000/team/svc:v2", "registry.internal:5000"},
 	}
 	for _, tc := range cases {
@@ -140,10 +147,13 @@ func TestNormalizedRegistryHost(t *testing.T) {
 func TestIsRegistryOutageMessage(t *testing.T) {
 	positives := []string{
 		"rpc error: code = Unknown desc = failed to pull: HTTP 429",
+		`failed to pull image "ghcr.io/org/svc-429:v1": unexpected status: 429 Too Many Requests`,
 		"toomanyrequests: You have reached your pull rate limit",
 		"429 Too Many Requests",
 		"rate limit exceeded",
 		"received unexpected HTTP status: 503 Service Unavailable",
+		"status=503",
+		"(502) Bad Gateway",
 		"502 Bad Gateway",
 		"504 Gateway Timeout",
 		"net/http: TLS handshake timeout",
@@ -151,6 +161,8 @@ func TestIsRegistryOutageMessage(t *testing.T) {
 		"i/o timeout",
 		"lookup ghcr.io: no such host",
 		"unexpected EOF",
+		"read tcp 10.0.0.1:443: EOF",
+		"EOF",
 	}
 	for _, msg := range positives {
 		if !IsRegistryOutageMessage(msg) {
@@ -162,6 +174,15 @@ func TestIsRegistryOutageMessage(t *testing.T) {
 		"back-off pulling image",
 		"manifest for ghcr.io/org/app:badtag not found: manifest unknown",
 		"pull access denied, repository does not exist or may require authorization",
+		`manifest for ghcr.io/org/app@sha256:429deadbeef5031234567890abcdef502504 not found: manifest unknown`,
+		`Failed to pull image "ghcr.io/org/svc-429:v1": manifest unknown`,
+		`Failed to pull image "ghcr.io/org/app:503": unauthorized`,
+		`Failed to pull image "ghcr.io/org/app:1.429.0": manifest unknown`,
+		`Failed to pull image "registry.internal:5030/org/app:v1": unauthorized`,
+		`Failed to pull image "ghcr.io/org/videofile:v1": manifest unknown`,
+		`Failed to pull image "ghcr.io/org/app-eof:v1": manifest unknown`,
+		`Failed to pull image "ghcr.io/org/app:eof": manifest unknown`,
+		"lack thereof in repository",
 	}
 	for _, msg := range negatives {
 		if IsRegistryOutageMessage(msg) {
@@ -171,6 +192,17 @@ func TestIsRegistryOutageMessage(t *testing.T) {
 }
 
 func TestCountImagePullRegistryOutage(t *testing.T) {
+	termNow := metav1.Now()
+	failedPod := outageStalledPod("infra", "p-failed", "ghcr.io/org/svc:v1", "ImagePullBackOff",
+		"503 Service Unavailable", "")
+	failedPod.Status.Phase = corev1.PodFailed
+	succeededPod := outageStalledPod("infra", "p-done", "ghcr.io/org/svc:v1", "ImagePullBackOff",
+		"503 Service Unavailable", "")
+	succeededPod.Status.Phase = corev1.PodSucceeded
+	deletingPod := outageStalledPod("infra", "p-del", "ghcr.io/org/svc:v1", "ImagePullBackOff",
+		"503 Service Unavailable", "")
+	deletingPod.DeletionTimestamp = &termNow
+
 	cs := fake.NewSimpleClientset(
 		outageStalledPod("apps", "p1", "nginx:1.25", "ImagePullBackOff",
 			"toomanyrequests: You have reached your pull rate limit", ""),
@@ -182,6 +214,9 @@ func TestCountImagePullRegistryOutage(t *testing.T) {
 			"dial tcp 1.2.3.4:443: i/o timeout", ""),
 		outageStalledPod("infra", "p5", "ghcr.io/org/other:v1", "ErrImagePull",
 			"manifest unknown", ""),
+		failedPod,
+		succeededPod,
+		deletingPod,
 	)
 	outages, err := CountImagePullRegistryOutage(t.Context(), cs)
 	if err != nil {

@@ -361,4 +361,52 @@ func TestReplicateToMissingTargetsDetection(t *testing.T) {
 	if got := a.replicationMismatch.Count("ns-missing/wildcard-tls/default/wildcard-tls"); got < 2 {
 		t.Fatalf("namespaces list error wiped replicationMismatch streak = %d, want >=2", got)
 	}
+
+	// A previously drifted replicated-from copy that converged in this sweep
+	// must NOT be re-carried as missing if namespaces list fails.
+	cs.ReactionChain = cs.ReactionChain[1:]
+	if _, err := cs.CoreV1().Secrets("ns-present").Update(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "ns-present",
+			Name:        "wildcard-tls",
+			Annotations: map[string]string{replicatedFromAnno: "default/wildcard-tls"},
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{"tls.crt": []byte("DRIFTED")},
+	}, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := a.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := driftGauge("ns-present", "wildcard-tls", "default/wildcard-tls"); got != 1 {
+		t.Fatalf("pre-converge replicated-from gauge = %v, want 1", got)
+	}
+	if _, err := cs.CoreV1().Secrets("ns-present").Update(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "ns-present",
+			Name:        "wildcard-tls",
+			Annotations: map[string]string{replicatedFromAnno: "default/wildcard-tls"},
+		},
+		Type: corev1.SecretTypeTLS,
+		Data: map[string][]byte{"tls.crt": []byte("CERT")},
+	}, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	cs.PrependReactor("list", "namespaces", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("namespaces list unavailable")
+	})
+	if err := a.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := driftGauge("ns-present", "wildcard-tls", "default/wildcard-tls"); got != 0 {
+		t.Fatalf("converged replicated-from gauge = %v, want 0", got)
+	}
+	if _, pinned := a.seenReplication.Last()[replicationMetricKey{
+		namespace: "ns-present", name: "wildcard-tls", source: "default/wildcard-tls",
+	}]; pinned {
+		t.Fatal("converged present secret remained pinned in seenReplication after namespace list error")
+	}
 }

@@ -76,8 +76,8 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) string {
 			return "" // app container still running or never started
 		}
 		term := st.State.Terminated
-		if now.Sub(term.FinishedAt.Time) < zombieSidecarTermAge {
-			return "" // too fresh — may still be inside normal completion
+		if !kube.AgeAtLeast(term.FinishedAt.Time, now, zombieSidecarTermAge) {
+			return "" // too fresh or missing FinishedAt — fail closed
 		}
 		if term.ExitCode != 0 && p.Spec.RestartPolicy != corev1.RestartPolicyNever {
 			return "" // non-zero exit with a restartable policy — not final
@@ -103,6 +103,9 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) string {
 		}
 		st := initStatusByName[c.Name]
 		if st == nil || st.State.Terminated == nil {
+			return ""
+		}
+		if st.State.Terminated.ExitCode != 0 && p.Spec.RestartPolicy != corev1.RestartPolicyNever {
 			return ""
 		}
 	}

@@ -410,4 +410,61 @@ func TestOOMResizeCapHeadroomErrorsAndCooldown(t *testing.T) {
 			t.Fatalf("post-cooldown resize failed, patches=%d", len(*patches))
 		}
 	})
+
+	t.Run("skips pods with active/pending resize, counts native sidecar initContainers in headroom, and resets origLimit on UID change", func(t *testing.T) {
+		oomResizeBurstGauge.Reset()
+		t.Setenv("NODE_AUTOMATION_OOM_INPLACE_RESIZE_HEAL_ENABLED", "true")
+
+		node := oomResizeMakeNode("n1", "1Gi")
+		// Native sidecar consumes 800Mi + target consumes 128Mi = 928Mi; headroom = 96Mi < needed 64Mi? Wait:
+		// make sidecar 850Mi -> used = 850 + 128 = 978Mi; headroom = 46Mi < 64Mi -> must skip!
+		always := corev1.ContainerRestartPolicyAlways
+		sidecarPod := oomResizeMakePod("apps", "sidecar-holder", "n1", "app", "128Mi", "128Mi",
+			0, base.Add(-1*time.Hour), time.Time{}, nil)
+		sidecarPod.Spec.InitContainers = []corev1.Container{{
+			Name:          "istio-proxy",
+			RestartPolicy: &always,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("850Mi")},
+			},
+		}}
+		sidecarPod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("0")
+		sidecarPod.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory] = resource.MustParse("0")
+
+		tightTarget := oomResizeMakePod("kube-system", "coredns-tight-sc", "n1", "coredns", "128Mi", "128Mi",
+			3, base.Add(-5*time.Minute), base.Add(-1*time.Minute), nil)
+
+		// Active resize on another node -> must skip.
+		node2 := oomResizeMakeNode("n2", "8Gi")
+		resizingPod := oomResizeMakePod("kube-system", "coredns-resizing", "n2", "coredns", "128Mi", "128Mi",
+			3, base.Add(-5*time.Minute), base.Add(-1*time.Minute), nil)
+		resizingPod.Status.Conditions = []corev1.PodCondition{{
+			Type:   corev1.PodResizePending,
+			Status: corev1.ConditionTrue,
+			Reason: corev1.PodReasonDeferred,
+		}}
+
+		cs := fake.NewSimpleClientset(node, node2, sidecarPod, tightTarget, resizingPod)
+		patches := oomResizeCapturePatches(cs, nil)
+		p := oomResizeTestProber(cs)
+		probetest.FreezeNow(p.Deps, base)
+		chk := probetest.MustCheck[*oomResizeGuardCheck](t, p)
+
+		_ = oomResizeRunSweep(chk, p.Deps)
+		if len(*patches) != 0 {
+			t.Fatalf("expected active-resize pod and sidecar-headroom-tight pod skipped, got %+v", *patches)
+		}
+
+		// Recreate pod with same name but new UID and smaller limit -> origLimits must not inherit old UID cap.
+		recreated := oomResizeMakePod("kube-system", "coredns-recreate", "n2", "coredns", "128Mi", "128Mi",
+			3, base.Add(-5*time.Minute), base.Add(-1*time.Minute), nil)
+		recreated.UID = "uid-old"
+		chk.origLimits[oomResizeBaselineKey(recreated, "coredns")] = resource.MustParse("64Mi")
+		recreated.UID = "uid-new"
+		_, _ = cs.CoreV1().Pods("kube-system").Create(ctx, recreated, metav1.CreateOptions{})
+		_ = oomResizeRunSweep(chk, p.Deps)
+		if len(*patches) != 1 || (*patches)[0].name != "coredns-recreate" || !strings.Contains((*patches)[0].patch, `"192Mi"`) {
+			t.Fatalf("recreated pod UID should use its own 128Mi origLimit (not old 64Mi 2x cap), got %+v", *patches)
+		}
+	})
 }

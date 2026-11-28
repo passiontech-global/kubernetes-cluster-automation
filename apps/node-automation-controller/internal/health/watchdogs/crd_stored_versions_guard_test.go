@@ -391,4 +391,54 @@ func TestCRDStoredVersionsGuard403GracefulSkipAndBudgetRefund(t *testing.T) {
 			t.Fatal("expected fleet budget grant to be refunded on 403 CR list skip")
 		}
 	})
+
+	t.Run("CR patch failure does NOT refund budget and terminating CR blocks premature /status prune", func(t *testing.T) {
+		t.Setenv("NODE_AUTOMATION_CRD_STORED_VERSIONS_MIGRATE_ENABLED", "true")
+		heal.ConfigureBudget(1, time.Hour)
+		t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
+
+		crd := crdStoredVerTestMakeCRD(
+			"foos.example.com", "example.com", "foos", "Foo",
+			[]any{
+				map[string]any{"name": "v1alpha1", "served": true, "storage": false},
+				map[string]any{"name": "v1", "served": true, "storage": true},
+			},
+			[]any{"v1alpha1", "v1"},
+			nil,
+		)
+		crErr := crdStoredVerTestMakeCR("ns1", "foo-err", nil)
+		kinds := maps.Clone(testutil.DynListKinds())
+		kinds[testutil.CRDGVR] = "CustomResourceDefinitionList"
+		kinds[crdStoredVerTestFooGVR] = "FooList"
+		dyn := testutil.NewFakeDyn(kinds, crd, crErr)
+		dyn.PrependReactor("patch", "foos", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("webhook conversion error")
+		})
+		cs := fake.NewSimpleClientset()
+		p := probetest.NewCheckProber(cs, dyn, NewCRDStoredVersionsGuardCheck)
+		base := time.Date(2026, 11, 25, 11, 0, 0, 0, time.UTC)
+		probetest.FreezeNow(p.Deps, base)
+		chk := probetest.MustCheck[*crdStoredVerCheck](t, p)
+
+		_ = probetest.RunCheck(ctx, chk.Deps, chk)
+		if ok, _ := chk.HealAllowed(ctx, logr.Discard(), nil, "sibling-key", time.Minute, base); ok {
+			t.Fatal("failed CR patch must spend fleet budget grant, not refund it")
+		}
+
+		// Terminating CR without migrated annotation must prevent /status prune.
+		heal.ConfigureBudget(5, time.Hour)
+		termCR := crdStoredVerTestMakeCR("ns1", "foo-term", nil)
+		termTime := metav1.NewTime(base.Add(-time.Minute))
+		termCR.SetDeletionTimestamp(&termTime)
+		dyn2 := testutil.NewFakeDyn(kinds, crd.DeepCopy(), termCR)
+		p2 := probetest.NewCheckProber(fake.NewSimpleClientset(), dyn2, NewCRDStoredVersionsGuardCheck)
+		probetest.FreezeNow(p2.Deps, base)
+		chk2 := probetest.MustCheck[*crdStoredVerCheck](t, p2)
+		_ = probetest.RunCheck(ctx, chk2.Deps, chk2)
+		gotCRD, _ := dyn2.Resource(testutil.CRDGVR).Get(ctx, "foos.example.com", metav1.GetOptions{})
+		svs, _, _ := unstructured.NestedStringSlice(gotCRD.Object, "status", "storedVersions")
+		if len(svs) != 2 {
+			t.Fatalf("terminating unmigrated CR must block /status storedVersions prune, got %v", svs)
+		}
+	})
 }

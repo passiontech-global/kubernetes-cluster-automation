@@ -115,10 +115,18 @@ type zoneGrayFailureGuardCheck struct {
 
 // NewZoneGrayFailureGuardCheck constructs the zone-gray-failure-guard check.
 func NewZoneGrayFailureGuardCheck(d *probefw.Deps) probefw.Check {
+	hold := envx.GetenvDuration("NODE_AUTOMATION_ZONE_GRAY_HOLD_DURATION", zoneGrayDefaultHoldDuration)
+	if hold <= 0 {
+		hold = zoneGrayDefaultHoldDuration
+	}
+	recoverDur := envx.GetenvDuration("NODE_AUTOMATION_ZONE_GRAY_RECOVER_DURATION", zoneGrayDefaultRecoverDuration)
+	if recoverDur <= 0 {
+		recoverDur = zoneGrayDefaultRecoverDuration
+	}
 	return &zoneGrayFailureGuardCheck{
 		Deps:            d,
-		holdDuration:    envx.GetenvDuration("NODE_AUTOMATION_ZONE_GRAY_HOLD_DURATION", zoneGrayDefaultHoldDuration),
-		recoverDuration: envx.GetenvDuration("NODE_AUTOMATION_ZONE_GRAY_RECOVER_DURATION", zoneGrayDefaultRecoverDuration),
+		holdDuration:    hold,
+		recoverDuration: recoverDur,
 		shedEnabled:     envx.Gate("NODE_AUTOMATION_ZONE_GRAY_SHED_ENABLED", false),
 	}
 }
@@ -152,7 +160,7 @@ func (c *zoneGrayFailureGuardCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		distinctZones[z] = true
-		if kube.IsControlPlane(n) {
+		if zoneGrayIsControlPlane(n) {
 			continue
 		}
 		b := workerZoneMap[z]
@@ -277,6 +285,12 @@ func (c *zoneGrayFailureGuardCheck) Run(ctx context.Context) probefw.Result {
 		"zone gray failure detected: ", ", ")
 }
 
+func zoneGrayIsControlPlane(n *corev1.Node) bool {
+	return kube.IsControlPlane(n) ||
+		kube.HasTaint(n.Spec.Taints, "node-role.kubernetes.io/control-plane") ||
+		kube.HasTaint(n.Spec.Taints, "node-role.kubernetes.io/master")
+}
+
 func zoneGrayNodeZone(n *corev1.Node) string {
 	if z := n.Labels[corev1.LabelTopologyZone]; z != "" {
 		return z
@@ -370,7 +384,7 @@ func (c *zoneGrayFailureGuardCheck) zoneGrayShedZone(
 ) bool {
 	var untainted []*corev1.Node
 	for _, w := range b.workers {
-		if kube.IsControlPlane(w) {
+		if zoneGrayIsControlPlane(w) {
 			continue
 		}
 		if !kube.HasTaint(w.Spec.Taints, zoneGrayTaintKey) {
@@ -431,7 +445,7 @@ func (c *zoneGrayFailureGuardCheck) zoneGrayUntaintZone(
 	allUntainted := true
 	untaintedAny := false
 	for _, w := range b.taintedWorkers {
-		if kube.IsControlPlane(w) {
+		if zoneGrayIsControlPlane(w) {
 			continue
 		}
 		if err := kube.UntaintNode(ctx, c.CS, w.Name, zoneGrayTaintKey); err != nil {

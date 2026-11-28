@@ -167,4 +167,34 @@ func TestKMSSecretCanaryGuard(t *testing.T) {
 			t.Fatalf("expected carried failure during rate-limit without extra LISTs, got res=%+v lists=%d", res2, len(isolatedNamespaces))
 		}
 	})
+
+	t.Run("409 Conflict race on Secret Update retries cleanly without Infra error", func(t *testing.T) {
+		t.Setenv("NODE_AUTOMATION_KMS_CANARY_NAMESPACE", "node-ops")
+		t.Setenv("NODE_AUTOMATION_KMS_CANARY_INTERVAL", "5m")
+
+		existing := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "node-ops", Name: kmsCanarySecretName, ResourceVersion: "1"},
+			Type:       corev1.SecretTypeOpaque,
+			Data:       map[string][]byte{kmsCanaryDataKey: []byte("old")},
+		}
+		cs := fake.NewSimpleClientset(existing)
+		attempts := 0
+		cs.PrependReactor("update", "secrets", func(action ktesting.Action) (bool, runtime.Object, error) {
+			attempts++
+			if attempts == 1 {
+				return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "secrets"}, kmsCanarySecretName, errors.New("modified"))
+			}
+			return false, nil, nil
+		})
+
+		p := kmsCanaryTestProber(t, cs, now)
+		chk := probetest.MustCheck[*kmsCanaryCheck](t, p)
+
+		sctx := probetest.SweepCtx(context.Background(), chk.Deps)
+		res := chk.Run(sctx)
+		probetest.VerifySweep(sctx)
+		if !res.Pass || res.Infra != nil || attempts != 2 {
+			t.Fatalf("expected 409 Conflict retry to pass in 2 attempts, got res=%+v attempts=%d", res, attempts)
+		}
+	})
 }

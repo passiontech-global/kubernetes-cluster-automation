@@ -606,11 +606,14 @@ func (c *admissionSecurityGuardCheck) auditSystemPriorityClass(
 		if isAdmissionSecSystemNamespace(pod.Namespace) {
 			continue
 		}
+		if pod.Annotations["kubernetes.io/config.mirror"] != "" {
+			continue
+		}
 		pc := pod.Spec.PriorityClassName
 		if pc != admissionSecSysClusterCrit && pc != admissionSecSysNodeCrit {
 			continue
 		}
-		if pod.Annotations[admissionSecAnnoAllowSysPrio] == "true" {
+		if strings.EqualFold(strings.TrimSpace(pod.Annotations[admissionSecAnnoAllowSysPrio]), "true") {
 			continue
 		}
 

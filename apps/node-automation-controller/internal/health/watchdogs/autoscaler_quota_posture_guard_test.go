@@ -325,3 +325,43 @@ func TestAutoscalerQuotaPostureGuard403And404Skip(t *testing.T) {
 		t.Fatalf("expected PASS with nil Infra on 404/403 skip, got %+v", res)
 	}
 }
+
+func TestAutoscalerQuotaPostureGuardScopesAndKEDAMemUtil(t *testing.T) {
+	// BestEffort and Terminating scoped ResourceQuotas must NOT require LimitRange.
+	rqBestEffort := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "batch", Name: "be-quota"},
+		Spec: corev1.ResourceQuotaSpec{
+			Scopes: []corev1.ResourceQuotaScope{corev1.ResourceQuotaScopeBestEffort},
+			Hard:   corev1.ResourceList{corev1.ResourceRequestsCPU: resource.MustParse("1")},
+		},
+	}
+	rqTerm := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "batch", Name: "term-quota"},
+		Spec: corev1.ResourceQuotaSpec{
+			Scopes: []corev1.ResourceQuotaScope{corev1.ResourceQuotaScopeTerminating},
+			Hard:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		},
+	}
+
+	// VPA + KEDA memory-utilization trigger conflict.
+	vpaMem := autoscalerPostureTestVPA("keda-ns", "vpa-mem", "Auto", "Deployment", "mem-worker", nil)
+	soMemUtil := autoscalerPostureTestScaledObj("keda-ns", "so-mem", "Deployment", "mem-worker", "memory-utilization")
+
+	kinds := maps.Clone(testutil.DynListKinds())
+	kinds[autoscalerPostureVPAGVR] = "VerticalPodAutoscalerList"
+	dyn := testutil.NewFakeDyn(kinds, vpaMem, soMemUtil)
+	cs := fake.NewSimpleClientset(rqBestEffort, rqTerm)
+	p := probetest.NewCheckProber(cs, dyn, NewAutoscalerQuotaPostureGuardCheck)
+	chk := probetest.MustCheck[*autoscalerPostureCheck](t, p)
+
+	res := probetest.RunCheck(ctx, chk.Deps, chk)
+	if res.Pass {
+		t.Fatal("expected FAIL for VPA + KEDA memory-utilization conflict")
+	}
+	if strings.Contains(res.Why, "batch/") {
+		t.Fatalf("BestEffort/Terminating ResourceQuota falsely flagged: %s", res.Why)
+	}
+	if !strings.Contains(res.Why, "VPA keda-ns/vpa-mem + ScaledObject so-mem on Deployment/mem-worker (memory)") {
+		t.Fatalf("missing memory-utilization conflict in Why: %s", res.Why)
+	}
+}

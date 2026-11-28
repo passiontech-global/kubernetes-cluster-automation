@@ -1325,4 +1325,127 @@ func TestPDBOverlappingDetection(t *testing.T) {
 			t.Fatalf("expected 1 %s event for empty-selector overlap, got %+v (err=%v)", pdbOverlapEventReason, evs.Items, err)
 		}
 	})
+
+	t.Run("nil selector, terminated and deleting pods not flagged; matchExpressions and resolution work", func(t *testing.T) {
+		pdbOverlappingGauge.Reset()
+		termNow := metav1.Now()
+
+		pdbNil := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "pdb-nil"},
+			Spec:       policyv1.PodDisruptionBudgetSpec{Selector: nil},
+		}
+		pdbExpr := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "pdb-expr"},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				Selector: &metav1.LabelSelector{
+					MatchExpressions: []metav1.LabelSelectorRequirement{{
+						Key:      "env",
+						Operator: metav1.LabelSelectorOpIn,
+						Values:   []string{"prod", "staging"},
+					}},
+				},
+			},
+		}
+		pdbApp := pdwSelectorPDB("apps", "pdb-app", map[string]string{"app": "api"})
+
+		// Succeeded, Failed, and Deleting pods must NOT trigger overlap even if matching both PDBs.
+		podDone := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "api-done", Labels: map[string]string{"app": "api", "env": "prod"}},
+			Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+		}
+		podFailed := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "api-fail", Labels: map[string]string{"app": "api", "env": "prod"}},
+			Status:     corev1.PodStatus{Phase: corev1.PodFailed},
+		}
+		podDel := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "api-del", DeletionTimestamp: &termNow, Labels: map[string]string{"app": "api", "env": "prod"}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		cs := fake.NewSimpleClientset(testutil.Node("n1", corev1.ConditionTrue, nil), pdbNil, pdbExpr, pdbApp, podDone, podFailed, podDel)
+		clock := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+		w := newPDWWatchdog(cs, &clock)
+
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := pdwOverlapCount(t, "apps", "pdb-app,pdb-expr"); ok {
+			t.Fatal("terminated/deleting pods unexpectedly flagged as overlapping")
+		}
+
+		// Live Running pod matching matchExpressions + MatchLabels triggers overlap.
+		podLive := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "api-live", Labels: map[string]string{"app": "api", "env": "prod"}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		if _, err := cs.CoreV1().Pods("apps").Create(ctx, podLive, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := pdwOverlapCount(t, "apps", "pdb-app,pdb-expr"); !ok || v != 1 {
+			t.Fatalf("matchExpressions overlap gauge = (%v, %v), want (1, true)", v, ok)
+		}
+
+		// Resolving the overlap (removing conflicting PDB) deletes the metric series.
+		if err := cs.PolicyV1().PodDisruptionBudgets("apps").Delete(ctx, "pdb-expr", metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := pdwOverlapCount(t, "apps", "pdb-app,pdb-expr"); ok {
+			t.Fatal("overlap gauge series leaked after overlap resolved")
+		}
+	})
+
+	t.Run("transient pod list error in one namespace preserves its series while pruning resolved healthy namespace", func(t *testing.T) {
+		pdbOverlappingGauge.Reset()
+		pdbA1 := pdwSelectorPDB("ns1", "pdb-a", map[string]string{"app": "web"})
+		pdbB1 := pdwSelectorPDB("ns1", "pdb-b", map[string]string{"tier": "fe"})
+		pod1 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns1", Name: "web-0", Labels: map[string]string{"app": "web", "tier": "fe"}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		pdbA2 := pdwSelectorPDB("ns2", "pdb-a", map[string]string{"app": "api"})
+		pdbB2 := pdwSelectorPDB("ns2", "pdb-b", map[string]string{"tier": "be"})
+		pod2 := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns2", Name: "api-0", Labels: map[string]string{"app": "api", "tier": "be"}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		cs := fake.NewSimpleClientset(testutil.Node("n1", corev1.ConditionTrue, nil), pdbA1, pdbB1, pod1, pdbA2, pdbB2, pod2)
+		clock := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+		w := newPDWWatchdog(cs, &clock)
+		w.queue = "pdb-deadlock-watchdog"
+
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := pdwOverlapCount(t, "ns1", "pdb-a,pdb-b"); !ok || v != 1 {
+			t.Fatalf("ns1 overlap = (%v, %v), want (1, true)", v, ok)
+		}
+		if v, ok := pdwOverlapCount(t, "ns2", "pdb-a,pdb-b"); !ok || v != 1 {
+			t.Fatalf("ns2 overlap = (%v, %v), want (1, true)", v, ok)
+		}
+
+		// Resolve ns1 overlap while ns2 pod list fails transiently.
+		if err := cs.PolicyV1().PodDisruptionBudgets("ns1").Delete(ctx, "pdb-b", metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		cs.PrependReactor("list", "pods", func(a ktesting.Action) (bool, runtime.Object, error) {
+			if a.GetNamespace() == "ns2" {
+				return true, nil, errors.New("ns2 pod list timeout")
+			}
+			return false, nil, nil
+		})
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := pdwOverlapCount(t, "ns1", "pdb-a,pdb-b"); ok {
+			t.Fatal("resolved ns1 overlap stayed pinned during ns2 pod list error")
+		}
+		if v, ok := pdwOverlapCount(t, "ns2", "pdb-a,pdb-b"); !ok || v != 1 {
+			t.Fatalf("ns2 overlap dropped during transient error = (%v, %v), want (1, true)", v, ok)
+		}
+	})
 }

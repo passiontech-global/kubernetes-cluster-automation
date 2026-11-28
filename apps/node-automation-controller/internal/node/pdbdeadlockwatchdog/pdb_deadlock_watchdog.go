@@ -334,7 +334,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 		}
 	}
 
-	overlapListOK := w.detectOverlappingPDBs(ctx, log, now, pdbs)
+	w.detectOverlappingPDBs(ctx, log, now, pdbs)
 	pdbs = nil
 
 	// Prune first-seen entries for reasons that stopped holding or
@@ -350,9 +350,7 @@ func (w *pdbDeadlockWatchdog) run(ctx context.Context) error {
 	// only after a complete, verified sweep: the early returns above
 	// keep a partial/failed list from pruning live series.
 	w.blockedEmitted.Prune(metrics.PDBDrainBlocked.DeleteLabelValues)
-	if overlapListOK {
-		w.overlapEmitted.Prune(pdbOverlappingGauge.DeleteLabelValues)
-	}
+	w.overlapEmitted.Prune(pdbOverlappingGauge.DeleteLabelValues)
 	// Post-prune the first-seen ledger holds exactly the keys still
 	// tracked — the same set `seen` collected this cycle.
 	log.Info("sweep done", "flagged", flagged, "tracked", len(seen))
@@ -675,10 +673,10 @@ func (w *pdbDeadlockWatchdog) patchUnhealthyEvictionPolicy(ctx context.Context,
 // detectOverlappingPDBs scans each namespace with >= 2 PDBs for
 // non-terminal pods matched by 2+ PDB selectors simultaneously (which causes
 // the Kubernetes Eviction API to return HTTP 500 during drain/deschedule).
-// Returns false if any namespace pod LIST failed so the caller skips pruning
-// previously emitted overlap gauges.
+// If a namespace pod LIST fails, previously emitted overlap series for that
+// namespace are carried forward so transient errors never drop live gauges.
 func (w *pdbDeadlockWatchdog) detectOverlappingPDBs(ctx context.Context,
-	log logr.Logger, now time.Time, pdbs []policyv1.PodDisruptionBudget) bool {
+	log logr.Logger, now time.Time, pdbs []policyv1.PodDisruptionBudget) {
 
 	byNS := map[string][]*policyv1.PodDisruptionBudget{}
 	for i := range pdbs {
@@ -693,7 +691,7 @@ func (w *pdbDeadlockWatchdog) detectOverlappingPDBs(ctx context.Context,
 		}
 	}
 	if len(namespaces) == 0 {
-		return true
+		return
 	}
 	slices.Sort(namespaces)
 
@@ -709,7 +707,6 @@ func (w *pdbDeadlockWatchdog) detectOverlappingPDBs(ctx context.Context,
 		samplePods []string
 	}
 
-	allListsOK := true
 	groups := map[string]*overlapGroup{}
 
 	for _, ns := range namespaces {
@@ -740,9 +737,13 @@ func (w *pdbDeadlockWatchdog) detectOverlappingPDBs(ctx context.Context,
 			Limit:         kube.DefaultListPageSize,
 		}, kube.Pods(w.cs, ns))
 		if err != nil {
-			allListsOK = false
 			metrics.IncError(w.queue)
 			log.Error(err, "overlap PDB check pod list failed", "namespace", ns)
+			for k, lv := range w.overlapEmitted.Last() {
+				if k.ns == ns {
+					w.overlapEmitted.Emit(k, lv...)
+				}
+			}
 			continue
 		}
 
@@ -836,5 +837,4 @@ func (w *pdbDeadlockWatchdog) detectOverlappingPDBs(ctx context.Context,
 				"namespace", g.ns, "pdbs", g.pdbNames, "affectedPods", g.podCount)
 		}
 	}
-	return allListsOK
 }
