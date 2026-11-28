@@ -8,17 +8,25 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdepstest"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/nodecond"
 )
 
 func TestPodLogDirUID(t *testing.T) {
@@ -260,4 +268,202 @@ func TestSnapshotMountIDs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDiskBloatWarnBandPreEviction(t *testing.T) {
+	setup := func(t *testing.T) (*DiskBloatCheck, *wdeps.Deps, *wdepstest.Fixture, *fake.Clientset) {
+		t.Helper()
+		f := wdepstest.New(t)
+		cfg := f.Cfg
+		cfg.ApplyDefaults()
+		cfg.Disk.BloatWatermark = 0.80
+		cfg.Disk.BloatCriticalWatermark = 0.92
+		cfg.Disk.BloatPodThresholdBytes = 100 << 20
+		cfg.Disk.BloatScanInterval = time.Minute
+		cfg.Disk.PodLogsDir = filepath.Join(t.TempDir(), "podlogs")
+		cfg.Disk.WLayerSnapshotsDir = filepath.Join(t.TempDir(), "snaps")
+		cs := fake.NewClientset()
+		cfg.Client = cs
+		d := &wdeps.Deps{Cfg: cfg, Proc: procfs.New(cfg.ProcRoot)}
+		d.State = subframe.StoreAt(cfg.WatchdogStateDir, cfg.WatchdogLogFile,
+			cfg.Seams.Host.Clock, func() *slog.Logger { return slog.Default() })
+		d.Cycles, d.Actions = subframe.Counters("workerhygiene", "c", "a")
+		f.Bind(d)
+		d.Cfg.Seams.Host.StatfsFn = func(_ string, st *unix.Statfs_t) error {
+			st.Blocks = 100
+			st.Bavail = 17 // used = 0.83 (warn band: >0.80, <=0.92)
+			return nil
+		}
+		return NewDiskBloat(d), d, f, cs
+	}
+
+	mkPod := func(ns, name, uid string, withEphemeralLimit bool) corev1.Pod {
+		p := corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: ns, UID: types.UID(uid),
+			},
+		}
+		c := corev1.Container{Name: "app"}
+		if withEphemeralLimit {
+			c.Resources.Limits = corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: *resource.NewQuantity(1<<30, resource.BinarySI),
+			}
+		}
+		p.Spec.Containers = []corev1.Container{c}
+		return p
+	}
+
+	t.Run("triggers_on_rapid_runaway_growth_without_ephemeral_limit", func(t *testing.T) {
+		c, d, f, cs := setup(t)
+		vol := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA,
+			"volumes", "kubernetes.io~empty-dir", "scratch")
+		wdepstest.WriteFile(t, filepath.Join(vol, "data"), "x")
+		pod := mkPod("app", "runaway", wdepstest.UIDA, false)
+
+		size := int64(120 << 20)
+		run := func() {
+			c.Run(context.Background(), &wdeps.CycleEnv{
+				WorkerActive: true,
+				APIOK:        true,
+				Pods:         []corev1.Pod{pod},
+				WalkOnce: func(root string) (int64, bool) {
+					if root == vol {
+						return size, false
+					}
+					return 0, false
+				},
+			})
+		}
+
+		// Scan 1: establishes prevPodBytes baseline, no pre-eviction yet.
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 0 {
+			t.Fatalf("unexpected eviction on baseline scan: %v", got)
+		}
+
+		// Scan 2: pod grew by +300 MiB (>=256 MiB) -> pre-evicts in warn band.
+		f.Now = f.Now.Add(2 * time.Minute)
+		size = 420 << 20
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 1 || got[0] != "runaway" {
+			t.Fatalf("evictions = %v, want [runaway]", got)
+		}
+		logBytes, _ := os.ReadFile(d.Cfg.WatchdogLogFile)
+		if !strings.Contains(string(logBytes), "pre-DiskPressure") {
+			t.Fatalf("missing pre-DiskPressure ACTION log:\n%s", string(logBytes))
+		}
+	})
+
+	t.Run("skips_ephemeral_limit_protected_and_steady_pods", func(t *testing.T) {
+		c, d, f, cs := setup(t)
+		volLim := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~empty-dir", "v")
+		volSys := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDB, "volumes", "kubernetes.io~empty-dir", "v")
+		volSteady := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDC, "volumes", "kubernetes.io~empty-dir", "v")
+		for _, v := range []string{volLim, volSys, volSteady} {
+			wdepstest.WriteFile(t, filepath.Join(v, "f"), "x")
+		}
+		podLim := mkPod("app", "limited", wdepstest.UIDA, true)
+		podSys := mkPod("kube-system", "sys", wdepstest.UIDB, false)
+		podSteady := mkPod("app", "steady", wdepstest.UIDC, false)
+
+		sizes := map[string]int64{
+			volLim:    50 << 20,
+			volSys:    50 << 20,
+			volSteady: 400 << 20,
+		}
+		run := func() {
+			c.Run(context.Background(), &wdeps.CycleEnv{
+				WorkerActive: true,
+				APIOK:        true,
+				Pods:         []corev1.Pod{podLim, podSys, podSteady},
+				WalkOnce: func(root string) (int64, bool) {
+					return sizes[root], false
+				},
+			})
+		}
+
+		run()
+		f.Now = f.Now.Add(2 * time.Minute)
+		// limited and sys grow rapidly (>256 MiB), steady grows only +10 MiB.
+		sizes[volLim] = 500 << 20
+		sizes[volSys] = 500 << 20
+		sizes[volSteady] = 410 << 20
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 0 {
+			t.Fatalf("expected 0 pre-evictions for limited/protected/steady pods, got %v", got)
+		}
+	})
+
+	t.Run("skips_below_40pct_share_and_respects_hold_and_cooldown", func(t *testing.T) {
+		c, d, f, cs := setup(t)
+		volA := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~empty-dir", "v")
+		volB := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDB, "volumes", "kubernetes.io~empty-dir", "v")
+		wdepstest.WriteFile(t, filepath.Join(volA, "f"), "x")
+		wdepstest.WriteFile(t, filepath.Join(volB, "f"), "x")
+		podA := mkPod("app", "minor-grower", wdepstest.UIDA, false)
+		podB := mkPod("app", "big-steady", wdepstest.UIDB, false)
+
+		sizeA := int64(50 << 20)
+		sizeB := int64(700 << 20)
+		held := false
+		d.Cfg.Coord = &nodecoord.Coord{
+			Now: func() time.Time { return f.Now },
+			GetAnnos: func(context.Context) (map[string]string, error) {
+				if held {
+					return map[string]string{nodecond.KuredLockAnno: `{"nodeID":"node-a"}`}, nil
+				}
+				return map[string]string{}, nil
+			},
+		}
+		run := func() {
+			c.Run(context.Background(), &wdeps.CycleEnv{
+				WorkerActive: true,
+				APIOK:        true,
+				Pods:         []corev1.Pod{podA, podB},
+				WalkOnce: func(root string) (int64, bool) {
+					if root == volA {
+						return sizeA, false
+					}
+					if root == volB {
+						return sizeB, false
+					}
+					return 0, false
+				},
+			})
+		}
+
+		// Baseline scan.
+		run()
+		// Scan 2: podA grows +300 MiB (total 350 MiB), but 350 / (350+700) = 33.3% < 40%.
+		f.Now = f.Now.Add(2 * time.Minute)
+		sizeA = 350 << 20
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 0 {
+			t.Fatalf("evicted pod with <40%% share: %v", got)
+		}
+
+		// Scan 3: podA grows another +300 MiB (total 650 MiB, 48% >= 40%) while held by maintenance.
+		held = true
+		f.Now = f.Now.Add(2 * time.Minute)
+		sizeA = 650 << 20
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 0 {
+			t.Fatalf("evicted pod while held by maintenance: %v", got)
+		}
+
+		// Scan 4: hold lifted -> podA grows +300 MiB (950 MiB) -> pre-evicts podA once, then cooldown blocks next scan.
+		held = false
+		f.Now = f.Now.Add(nodecoord.CacheTTL + 2*time.Minute)
+		sizeA = 950 << 20
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 1 || got[0] != "minor-grower" {
+			t.Fatalf("evictions = %v, want [minor-grower]", got)
+		}
+		f.Now = f.Now.Add(2 * time.Minute)
+		sizeA = 1250 << 20
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 1 {
+			t.Fatalf("cooldown failed, got evictions=%v", got)
+		}
+	})
 }

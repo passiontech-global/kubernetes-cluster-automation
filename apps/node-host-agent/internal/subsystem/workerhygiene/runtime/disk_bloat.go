@@ -32,6 +32,13 @@ import (
 // runaway target.
 const (
 	diskBloatEvictInterval = 15 * time.Minute // last-disk-bloat-evict budget
+	// diskBloatRunawayDeltaBytes and diskBloatRunawayMinShare* gate the
+	// Wave 6 Pre-DiskPressure runaway emptyDir/pod-log pre-eviction in
+	// the warn band (used > BloatWatermark, before kubelet DiskPressure
+	// mass-evicts innocent pods).
+	diskBloatRunawayDeltaBytes  int64 = 256 << 20 // >=256 MiB growth since previous scan
+	diskBloatRunawayMinShareNum int64 = 2         // >=40% (2/5) of total pod bytes
+	diskBloatRunawayMinShareDen int64 = 5
 	// coredumpMinAge keeps an in-progress core write from being
 	// swept the same cycle the watermark trip fires.
 	coredumpMinAge = 15 * time.Minute
@@ -196,7 +203,7 @@ func (c *DiskBloatCheck) scanBloatChecked(e *wdeps.CycleEnv, pods []corev1.Pod) 
 // "" map on an unreadable mountinfo (callers fall back to the
 // name-keyed lookup).
 func snapshotMountIDs(d *wdeps.Deps, e *wdeps.CycleEnv) map[string]string {
-	data, err := d.ReadMountinfo(e)
+	entries, _, err := d.MountinfoEntries(e)
 	if err != nil {
 		return nil
 	}
@@ -204,16 +211,11 @@ func snapshotMountIDs(d *wdeps.Deps, e *wdeps.CycleEnv) map[string]string {
 	hostSandboxRoot := fsx.HostSidePath(d.Cfg.SandboxCtlRoot)
 	hostSnapRoot := fsx.HostSidePath(d.Cfg.Disk.WLayerSnapshotsDir) + "/"
 	out := map[string]string{}
-	for ln := range strings.SplitSeq(string(data), "\n") {
-		sep := strings.LastIndex(ln, " - ")
-		if sep < 0 {
+	for _, ent := range entries {
+		if !ent.HasMount || !ent.HasSep {
 			continue
 		}
-		f := strings.Fields(ln[:sep])
-		if len(f) < 5 {
-			continue
-		}
-		mount := procfs.UnescapeMountPath(f[4])
+		mount := ent.Mountpoint
 		var taskID string
 		for _, root := range []string{hostTaskRoot, hostSandboxRoot} {
 			if strings.HasPrefix(mount, root+"/") &&
@@ -225,7 +227,7 @@ func snapshotMountIDs(d *wdeps.Deps, e *wdeps.CycleEnv) map[string]string {
 		if taskID == "" {
 			continue
 		}
-		for opt := range strings.SplitSeq(ln[sep+3:], ",") {
+		for opt := range strings.SplitSeq(ent.SuperOpts, ",") {
 			if !strings.HasPrefix(opt, "upperdir=") {
 				continue
 			}
@@ -279,8 +281,9 @@ func snapshotPodUID(d *wdeps.Deps, id string, mountIDs map[string]string) string
 // walk costs IO on the very disk that is full, so above the warn
 // watermark it runs at most once per DiskBloatScanInterval.
 type DiskBloatCheck struct {
-	d        *wdeps.Deps
-	lastScan time.Time
+	d            *wdeps.Deps
+	lastScan     time.Time
+	prevPodBytes map[string]int64
 }
 
 // Name returns the check label / WD_SIG key.
@@ -299,6 +302,7 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	if used <= c.d.Cfg.Disk.BloatWatermark {
+		c.prevPodBytes = nil
 		c.d.State.Exit(latchdefs.LatchDiskBloat, nil)
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
@@ -316,10 +320,13 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			return
 		}
 		c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
+		c.prevPodBytes = podTotals
 		c.d.State.Exit(latchdefs.LatchDiskBloat, nil)
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
+	prevPodBytes := c.prevPodBytes
+	c.prevPodBytes = podTotals
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 	c.d.State.Enter(latchdefs.LatchDiskBloat, fmt.Sprintf("targets=%d", len(hits)))
 	for _, hit := range hits {
@@ -331,27 +338,12 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			hit.label, hit.bytes, used*100))
 	}
 	c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "detect").Inc()
-	// Critical band: emergency-evict the largest non-system pod
-	// holding more than the threshold — kube-system/node-ops are
-	// never deleted by this check.
-	if used <= c.d.Cfg.Disk.BloatCriticalWatermark || !e.APIOK {
+	if !e.APIOK {
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
 	}
-	var victim *corev1.Pod
-	var victimBytes int64
-	for uid, total := range podTotals {
-		p := podByUID[uid]
-		if total <= c.d.Cfg.Disk.BloatPodThresholdBytes || p == nil ||
-			p.DeletionTimestamp != nil ||
-			wdeps.EvictProtectedNamespaces[p.Namespace] ||
-			wdeps.IsEvictProtectedPod(p) {
-			continue
-		}
-		if victim == nil || total > victimBytes {
-			victim, victimBytes = p, total
-		}
-	}
+
+	victim, victimBytes, victimDelta, preEvict := c.pickEvictVictim(used, podTotals, prevPodBytes, podByUID)
 	if victim == nil {
 		c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 		return
@@ -385,9 +377,15 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// race: a same-name pod is a different object and the apiserver
 	// refuses (kubeutil.EvictPodV1).
 	ev := kubeutil.EvictPodV1(victim)
-	c.d.State.AppendLog(fmt.Sprintf(
-		"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
-		victim.Namespace, victim.Name, victimBytes, used*100))
+	if preEvict {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: disk-bloat evicted pod %s/%s - runaway +%d bytes (total %d bytes), /var/lib/k0s at %.1f%% (pre-DiskPressure)",
+			victim.Namespace, victim.Name, victimDelta, victimBytes, used*100))
+	} else {
+		c.d.State.AppendLog(fmt.Sprintf(
+			"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
+			victim.Namespace, victim.Name, victimBytes, used*100))
+	}
 	if err := c.d.Cfg.Client.PolicyV1().Evictions(victim.Namespace).
 		Evict(ctx, ev); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
@@ -397,4 +395,66 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "pod_evict").Inc()
 	}
 	c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
+}
+
+// pickEvictVictim selects at most one eviction target:
+//   - Critical band (used > BloatCriticalWatermark): largest unprotected
+//     pod exceeding BloatPodThresholdBytes.
+//   - Warn band (used > BloatWatermark): Wave 6 pre-DiskPressure runaway
+//     pre-eviction — a single unprotected pod WITHOUT ephemeral-storage
+//     limits that grew >=256 MiB since the previous scan, holds >=40% of
+//     total bloated pod bytes, and exceeds BloatPodThresholdBytes.
+func (c *DiskBloatCheck) pickEvictVictim(
+	used float64,
+	podTotals, prevPodBytes map[string]int64,
+	podByUID map[string]*corev1.Pod,
+) (victim *corev1.Pod, victimBytes, victimDelta int64, preEvict bool) {
+	eligible := func(p *corev1.Pod, total int64) bool {
+		return total > c.d.Cfg.Disk.BloatPodThresholdBytes &&
+			p != nil &&
+			p.DeletionTimestamp == nil &&
+			!wdeps.EvictProtectedNamespaces[p.Namespace] &&
+			!wdeps.IsEvictProtectedPod(p)
+	}
+	if used > c.d.Cfg.Disk.BloatCriticalWatermark {
+		for uid, total := range podTotals {
+			p := podByUID[uid]
+			if !eligible(p, total) {
+				continue
+			}
+			if victim == nil || total > victimBytes || (total == victimBytes && uid < string(victim.UID)) {
+				victim, victimBytes = p, total
+			}
+		}
+		return victim, victimBytes, 0, false
+	}
+	if prevPodBytes == nil {
+		return nil, 0, 0, false
+	}
+	var totalPodBytes int64
+	for _, total := range podTotals {
+		if total > 0 {
+			totalPodBytes += total
+		}
+	}
+	if totalPodBytes <= 0 {
+		return nil, 0, 0, false
+	}
+	for uid, total := range podTotals {
+		p := podByUID[uid]
+		if !eligible(p, total) || podDeclaresEphemeralStorage(p) {
+			continue
+		}
+		delta := total - prevPodBytes[uid]
+		if delta < diskBloatRunawayDeltaBytes {
+			continue
+		}
+		if total*diskBloatRunawayMinShareDen < totalPodBytes*diskBloatRunawayMinShareNum {
+			continue
+		}
+		if victim == nil || delta > victimDelta || (delta == victimDelta && (total > victimBytes || (total == victimBytes && uid < string(victim.UID)))) {
+			victim, victimBytes, victimDelta = p, total, delta
+		}
+	}
+	return victim, victimBytes, victimDelta, victim != nil
 }
