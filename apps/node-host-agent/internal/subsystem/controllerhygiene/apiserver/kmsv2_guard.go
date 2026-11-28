@@ -427,6 +427,7 @@ func (c *KMSv2Check) probeHealthzProviders(ctx context.Context, count int, kmsCo
 			continue
 		}
 		httpx.DrainAndClose(resp.Body, kmsHealthzMaxRead)
+		_ = resp.Body.Close()
 		cancel()
 
 		if resp.StatusCode == http.StatusNotFound {

@@ -30,12 +30,20 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 	return &buf
 }
 
+func getWithContext(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return http.DefaultClient.Do(req)
+}
+
 func TestProbeEndpoints(t *testing.T) {
 	a := New(Config{NodeName: "node-a"})
 	srv := httptest.NewServer(a.probeMux())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/healthz")
+	resp, err := getWithContext(t.Context(), srv.URL+"/healthz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +53,7 @@ func TestProbeEndpoints(t *testing.T) {
 	}
 
 	// Not ready until Run binds the listeners.
-	resp, err = http.Get(srv.URL + "/readyz")
+	resp, err = getWithContext(t.Context(), srv.URL+"/readyz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +63,7 @@ func TestProbeEndpoints(t *testing.T) {
 	}
 
 	a.ready.Store(true)
-	resp, err = http.Get(srv.URL + "/readyz")
+	resp, err = getWithContext(t.Context(), srv.URL+"/readyz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +83,7 @@ func TestReadyzDegradedOnMaxBackoff(t *testing.T) {
 
 	a.ready.Store(true)
 	a.maxBackoffSubs.Store(1)
-	resp, err := http.Get(srv.URL + "/readyz")
+	resp, err := getWithContext(t.Context(), srv.URL+"/readyz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +92,7 @@ func TestReadyzDegradedOnMaxBackoff(t *testing.T) {
 		t.Fatalf("readyz with max-backoff subsystem: got %d, want 503",
 			resp.StatusCode)
 	}
-	resp, err = http.Get(srv.URL + "/healthz")
+	resp, err = getWithContext(t.Context(), srv.URL+"/healthz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +103,7 @@ func TestReadyzDegradedOnMaxBackoff(t *testing.T) {
 	}
 
 	a.maxBackoffSubs.Store(0)
-	resp, err = http.Get(srv.URL + "/readyz")
+	resp, err = getWithContext(t.Context(), srv.URL+"/readyz")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +120,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	srv := httptest.NewServer(a.metricsMux())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/metrics")
+	resp, err := getWithContext(t.Context(), srv.URL+"/metrics")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +210,7 @@ func TestSubsystemMetricsOnSharedRegistry(t *testing.T) {
 	srv := httptest.NewServer(a.metricsMux())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/metrics")
+	resp, err := getWithContext(t.Context(), srv.URL+"/metrics")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +344,7 @@ func TestSupervisorLogsStackOnPanic(t *testing.T) {
 }
 
 func TestRunMetricsAddrInUse(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +358,7 @@ func TestRunMetricsAddrInUse(t *testing.T) {
 }
 
 func TestRunProbeAddrInUse(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +657,7 @@ func TestMetricsEndpointExposesGoRuntimeAndPprof(t *testing.T) {
 	srv := httptest.NewServer(a.metricsMux())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/metrics")
+	resp, err := getWithContext(t.Context(), srv.URL+"/metrics")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,7 +675,7 @@ func TestMetricsEndpointExposesGoRuntimeAndPprof(t *testing.T) {
 		}
 	}
 
-	resp, err = http.Get(srv.URL + "/debug/pprof/heap?debug=1")
+	resp, err = getWithContext(t.Context(), srv.URL+"/debug/pprof/heap?debug=1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +696,7 @@ func TestPprofMuxLoopbackOnly(t *testing.T) {
 	srv := httptest.NewServer(a.pprofMux())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/debug/pprof/heap?debug=1")
+	resp, err := getWithContext(t.Context(), srv.URL+"/debug/pprof/heap?debug=1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +709,7 @@ func TestPprofMuxLoopbackOnly(t *testing.T) {
 		t.Fatalf("heap profile body missing header, got:\n%.200s", body)
 	}
 
-	resp, err = http.Get(srv.URL + "/debug/pprof/cmdline")
+	resp, err = getWithContext(t.Context(), srv.URL+"/debug/pprof/cmdline")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +724,7 @@ func TestPprofMuxLoopbackOnly(t *testing.T) {
 // would re-expose the profiles to the node network) — a
 // PprofAddr conflict must fail Run with the loopback error.
 func TestRunPprofLoopbackBindOnly(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -739,7 +747,7 @@ func TestRunPprofLoopbackServesWithZeroWriteTimeout(t *testing.T) {
 	// Pre-resolve concrete ports — Run's listeners are not
 	// reachable through a ":0" config value.
 	free := func() string {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -757,7 +765,7 @@ func TestRunPprofLoopbackServesWithZeroWriteTimeout(t *testing.T) {
 	// Poll the readiness the same way sdnotify does — the probe mux
 	// flips ready once all three listeners are bound.
 	probeReady := func() bool {
-		resp, err := http.Get("http://" + probeAddr + "/healthz")
+		resp, err := getWithContext(t.Context(), "http://"+probeAddr+"/healthz")
 		if err != nil {
 			return false
 		}
@@ -771,7 +779,7 @@ func TestRunPprofLoopbackServesWithZeroWriteTimeout(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	resp, err := http.Get("http://" + pprofAddr + "/debug/pprof/cmdline")
+	resp, err := getWithContext(t.Context(), "http://"+pprofAddr+"/debug/pprof/cmdline")
 	if err != nil {
 		t.Fatal(err)
 	}

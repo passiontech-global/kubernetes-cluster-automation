@@ -250,7 +250,7 @@ func exitStatusErr(t *testing.T, code int) error {
 	if err != nil {
 		t.Skip("no sh on PATH")
 	}
-	runErr := exec.Command(sh, "-c", "exit "+strconv.Itoa(code)).Run()
+	runErr := exec.CommandContext(t.Context(), sh, "-c", "exit "+strconv.Itoa(code)).Run()
 	var ee *exec.ExitError
 	if !errors.As(runErr, &ee) || ee.ExitCode() != code {
 		t.Fatalf("cannot synthesize exit-%d error: %v", code, runErr)
@@ -602,7 +602,7 @@ func TestEnsureSwapfileFailureArms(t *testing.T) {
 		swapFileSized(t, r, 64)
 		sr.On("fallocate", "")
 		// exit 2 = the documented no-signature answer.
-		ee := exitErr(2)
+		ee := exitErr(t, 2)
 		sr.FailOn("blkid -o value -s TYPE /swapfile", ee)
 		sr.FailOn("mkswap /swapfile", nil)
 		c.ensureSwapfile("/swapfile", 64, "10")
@@ -614,7 +614,7 @@ func TestEnsureSwapfileFailureArms(t *testing.T) {
 		r, sr, c := swapFixture(t, "")
 		sr.On("swapon --show=NAME --noheadings", "/swapfile\n")
 		swapFileSized(t, r, 64)
-		ee := exitErr(2)
+		ee := exitErr(t, 2)
 		sr.FailOn("blkid -o value -s TYPE /swapfile", ee)
 		c.ensureSwapfile("/swapfile", 64, "10")
 		if c.errs != 1 {
@@ -802,11 +802,12 @@ func TestEnsureSwapfileChmodAndFstabReadArms(t *testing.T) {
 // exitErr — a REAL *exec.ExitError with the given code (local shell,
 // no root/network): the only way blkid's exit-2 contract can be
 // recognized via errors.As.
-func exitErr(code int) error {
-	cmd := exec.Command("sh", "-c", "exit "+itoa(code))
+func exitErr(t *testing.T, code int) error {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", "exit "+itoa(code))
 	err := cmd.Run()
-	ee, ok := err.(*exec.ExitError)
-	if !ok {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
 		panic("exitErr: expected ExitError, got " + err.Error())
 	}
 	return ee

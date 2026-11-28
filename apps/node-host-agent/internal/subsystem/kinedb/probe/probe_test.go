@@ -48,7 +48,7 @@ func TestPGFirstByteOK(t *testing.T) {
 // wireListener answers every conn with resp after reading one write.
 func wireListener(t *testing.T, resp byte) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skip("no loopback")
 	}
@@ -339,7 +339,7 @@ func TestProbeNewDefaultsWireFn(t *testing.T) {
 // A pooler that takes the StartupMessage and hangs up without a
 // reply is broken — the probe's one-byte read must fail.
 func TestPGWireProbeReadFail(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +371,7 @@ func TestPGWireProbeReadFail(t *testing.T) {
 // error vs read error — so only the false verdict is asserted.
 func TestPGWireProbeReset(t *testing.T) {
 	for range 3 {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -77,7 +77,7 @@ func newFakeHAProxy(t *testing.T, rows ...[2]string) *fakeHAProxy {
 		f.servers[r[0]] = r[1]
 		f.order = append(f.order, r[0])
 	}
-	ln, err := net.Listen("unix", f.sockPath)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", f.sockPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func newAPIStubOn(t *testing.T, listenAddr string) *apiStub {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"apiVersion":"v1","kind":"List","metadata":{"resourceVersion":"%d"},"items":[]}`, rv)
 	}))
-	ln, err := net.Listen("tcp", listenAddr)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", listenAddr)
 	if err != nil {
 		t.Fatal(err)
 	}

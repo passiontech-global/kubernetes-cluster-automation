@@ -41,9 +41,11 @@ func nlmsgBody(typ uint16, payload []byte) []byte {
 // rtmsgBytes builds a struct rtmsg payload: the 12-byte fixed
 // header (family at [0], table at [4]) followed by rtattrs.
 func rtmsgBytes(family, table byte, attrs ...[]byte) []byte {
-	b := make([]byte, unix.SizeofRtMsg)
-	b[0] = family
-	b[4] = table
+	var hdr [unix.SizeofRtMsg]byte
+	hdr[0] = family
+	hdr[4] = table
+	b := make([]byte, 0, len(hdr))
+	b = append(b, hdr[:]...)
 	for _, a := range attrs {
 		b = append(b, a...)
 	}
@@ -53,8 +55,10 @@ func rtmsgBytes(family, table byte, attrs ...[]byte) []byte {
 // fibRuleBytes builds a struct fib_rule_hdr payload: same 12-byte
 // fixed size, family at [0], then rtattrs.
 func fibRuleBytes(family byte, attrs ...[]byte) []byte {
-	b := make([]byte, routewatch.FibRuleHdrLen)
-	b[0] = family
+	var hdr [routewatch.FibRuleHdrLen]byte
+	hdr[0] = family
+	b := make([]byte, 0, len(hdr))
+	b = append(b, hdr[:]...)
 	for _, a := range attrs {
 		b = append(b, a...)
 	}

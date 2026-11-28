@@ -184,7 +184,7 @@ func TestDrainClosedHandle(t *testing.T) {
 func TestDrainHardError(t *testing.T) {
 	r := &scriptReader{reads: []readResult{{err: errBoom}}}
 	data, caughtUp, err := Drain(r, 1<<20)
-	if err != errBoom || caughtUp || data != nil {
+	if !errors.Is(err, errBoom) || caughtUp || data != nil {
 		t.Fatalf("empty hard error: data=%q caughtUp=%v err=%v",
 			data, caughtUp, err)
 	}
@@ -192,7 +192,7 @@ func TestDrainHardError(t *testing.T) {
 		{data: "6,1,5,-;one\n"}, {data: "tail", err: errBoom},
 	}}
 	data, caughtUp, err = Drain(r, 1<<20)
-	if err != errBoom || caughtUp || string(data) != "6,1,5,-;one\ntail" {
+	if !errors.Is(err, errBoom) || caughtUp || string(data) != "6,1,5,-;one\ntail" {
 		t.Fatalf("sticky error: data=%q caughtUp=%v err=%v",
 			data, caughtUp, err)
 	}
@@ -204,7 +204,7 @@ func TestDrainHardError(t *testing.T) {
 		{data: "6,1,5,-;one\n"}, {err: errBoom},
 	}}
 	data, caughtUp, err = Drain(r, 1<<20)
-	if err != errBoom || caughtUp || string(data) != "6,1,5,-;one\n" {
+	if !errors.Is(err, errBoom) || caughtUp || string(data) != "6,1,5,-;one\n" {
 		t.Fatalf("mid-drain hard error: data=%q caughtUp=%v err=%v",
 			data, caughtUp, err)
 	}

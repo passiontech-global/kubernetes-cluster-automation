@@ -187,7 +187,7 @@ func countInotifyWatches(path string) (int64, bool) {
 		if atLineStart && bytes.HasPrefix(line, inotifyWDPrefix) {
 			count++
 		}
-		if err == bufio.ErrBufferFull {
+		if errors.Is(err, bufio.ErrBufferFull) {
 			atLineStart = false
 			continue
 		}
@@ -209,7 +209,7 @@ func scanBPFFDInfo(path string, progs, maps map[uint64]struct{}) bool {
 	skipLongLine := false
 	for {
 		line, err := br.ReadSlice('\n')
-		if err == bufio.ErrBufferFull {
+		if errors.Is(err, bufio.ErrBufferFull) {
 			skipLongLine = true
 			continue
 		}

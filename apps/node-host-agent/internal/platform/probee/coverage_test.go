@@ -43,7 +43,7 @@ func TestPGWireProbe(t *testing.T) {
 	}
 
 	// Start a local TCP listener that responds 'R' (healthy) then 'E' (error).
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestPGWireProbe(t *testing.T) {
 
 func TestPGWireProbeHonorsContextDeadlineAndCancel(t *testing.T) {
 	// Listener accepts connections, reads, and holds open silently without replying.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

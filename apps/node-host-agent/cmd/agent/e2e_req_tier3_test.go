@@ -429,8 +429,11 @@ exit 0
 
 		eventually(t, 7*time.Second, 100*time.Millisecond, "both etcdguard snapshot 0700/0600 and KMSv2 latch run", func() error {
 			fi, err := os.Stat(backupDir)
-			if err != nil || fi.Mode().Perm() != 0o700 {
-				return fmt.Errorf("backupDir mode=%v err=%v", fi.Mode().Perm(), err)
+			if err != nil {
+				return fmt.Errorf("stat backupDir: %w", err)
+			}
+			if fi.Mode().Perm() != 0o700 {
+				return fmt.Errorf("backupDir mode=%v want 0700", fi.Mode().Perm())
 			}
 			snaps, _ := filepath.Glob(filepath.Join(backupDir, "premaint-*.db"))
 			if len(snaps) == 0 {

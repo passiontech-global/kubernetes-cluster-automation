@@ -233,12 +233,13 @@ func (c *CSIGuardCheck) Name() string { return wdeps.CheckCSIGuard }
 // unix dial — ECONNREFUSED means the file is a stale leftover
 // (nobody listening); a successful dial or timeout means a live
 // or wedged registrar (not ours to remove).
-func (c *CSIGuardCheck) socketRefused(path string) bool {
+func (c *CSIGuardCheck) socketRefused(ctx context.Context, path string) bool {
 	probe := time.Duration(c.d.Cfg.Wave2.CSIGuardProbeSec) * time.Second
 	if probe <= 0 {
 		probe = 2 * time.Second
 	}
-	conn, err := net.DialTimeout("unix", path, probe)
+	d := net.Dialer{Timeout: probe}
+	conn, err := d.DialContext(ctx, "unix", path)
 	if err == nil {
 		_ = conn.Close()
 		return false
@@ -296,7 +297,7 @@ func (c *CSIGuardCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if drivers[drv] {
 			continue
 		}
-		if c.socketRefused(path) {
+		if c.socketRefused(ctx, path) {
 			c.refused[drv]++
 		} else {
 			c.refused[drv] = 0

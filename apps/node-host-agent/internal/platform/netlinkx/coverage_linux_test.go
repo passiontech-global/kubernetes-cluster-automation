@@ -42,7 +42,7 @@ func TestRouteHandleRulesLinkAddrsAndLinkDel(t *testing.T) {
 
 func TestListenAddrsAndDestroyListenersNoMatch(t *testing.T) {
 	pid := os.Getpid()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestListenAddrsAndDestroyListenersNoMatch(t *testing.T) {
 
 	// Pick an unused ephemeral port (bind+close) so destroyListeners finds 0 matches
 	// and succeeds without needing CAP_NET_ADMIN.
-	tmpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	tmpLn, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

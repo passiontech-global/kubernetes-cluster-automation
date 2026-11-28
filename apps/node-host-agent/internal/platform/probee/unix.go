@@ -115,6 +115,7 @@ func UnixDelete(ctx context.Context, socket, path string) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = resp.Body.Close() }()
 	httpx.DrainAndClose(resp.Body, 64<<10)
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusNoContent, http.StatusPartialContent, http.StatusNotFound:

@@ -388,7 +388,7 @@ func TestDefaultTCPProbe(t *testing.T) {
 	if err := c.tcpProbe(ctx, "127.0.0.1", "1", time.Second); err == nil {
 		t.Fatal("tcpProbe dialled a closed port successfully")
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,7 @@ func TestDefaultTCPProbeMarked(t *testing.T) {
 	c := Config{}
 	c.applyDefaults()
 	ctx := context.Background()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

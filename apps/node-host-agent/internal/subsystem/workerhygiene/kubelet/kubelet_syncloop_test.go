@@ -159,7 +159,7 @@ func TestContainerdSocketDefaultPinsK0sPath(t *testing.T) {
 // the verdict — conn.Close()'s error must not leak into the result.
 func TestProbeUnixSockDefaultReturnsNilOnConnect(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "probe.sock")
-	ln, err := net.Listen("unix", sock)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sock)
 	if err != nil {
 		t.Fatal(err)
 	}

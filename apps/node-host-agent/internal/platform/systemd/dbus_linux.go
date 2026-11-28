@@ -231,8 +231,9 @@ func (fc *dbusFrameConn) readNextFrame() error {
 // deadline-free for signal traffic. The net.Conn comes back beside
 // the godbus.Conn so systemConnLocked can arm the same bound across
 // Subscribe, which likewise runs under b.mu.
-func dialSystemdPrivate(path string) (*godbus.Conn, net.Conn, error) {
-	nc, err := net.DialTimeout("unix", path, dbusHandshakeTimeout)
+func dialSystemdPrivate(ctx context.Context, path string) (*godbus.Conn, net.Conn, error) {
+	d := net.Dialer{Timeout: dbusHandshakeTimeout}
+	nc, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -313,7 +314,7 @@ func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error)
 	var rawSys, rawSig *godbus.Conn
 	var netSys, netSig net.Conn
 	conn, err := sdbus.NewConnection(func() (*godbus.Conn, error) {
-		c, nc, err := dialSystemdPrivate(b.path)
+		c, nc, err := dialSystemdPrivate(ctx, b.path)
 		if err == nil {
 			// NewConnection dials sysconn first, sigconn second —
 			// capture each so loadUnit gets sysconn and dbusJob can
@@ -329,7 +330,7 @@ func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error)
 	})
 	if err != nil {
 		b.maybeDisable(err)
-		return nil, fmt.Errorf("%w: systemd dbus dial %s: %v",
+		return nil, fmt.Errorf("%w: systemd dbus dial %s: %w",
 			errDBusUnavailable, b.path, err)
 	}
 	// Subscribe is REQUIRED, not best-effort: without it PID 1
@@ -374,7 +375,7 @@ func (b *dbusBackend) systemConnLocked(ctx context.Context) (*sdbus.Conn, error)
 	}
 	if subErr != nil {
 		conn.Close()
-		return nil, fmt.Errorf("%w: systemd dbus subscribe: %v",
+		return nil, fmt.Errorf("%w: systemd dbus subscribe: %w",
 			errDBusUnavailable, subErr)
 	}
 	b.conn = conn

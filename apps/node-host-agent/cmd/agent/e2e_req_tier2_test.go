@@ -258,7 +258,7 @@ func runTier2Tests(t *testing.T, bin string) {
 					return fmt.Errorf("oid176-d not pruned")
 				}
 				if _, err := os.Stat(filepath.Join(sc, "go-build", oid175[:2], oid175+"-d")); err != nil {
-					return fmt.Errorf("oid175-d should be protected: %v", err)
+					return fmt.Errorf("oid175-d should be protected: %w", err)
 				}
 				return nil
 			})

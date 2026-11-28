@@ -200,7 +200,7 @@ type runningAgent struct {
 
 func startAgent(t *testing.T, bin string, env []string, expectServers []string, args ...string) *runningAgent {
 	t.Helper()
-	cmd := exec.Command(bin, args...)
+	cmd := exec.CommandContext(t.Context(), bin, args...)
 	cmd.Env = env
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -341,7 +341,11 @@ func (ra *runningAgent) stopAndWait(t *testing.T) {
 func httpGet(t *testing.T, url string) (int, string) {
 	t.Helper()
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request %s: %v", url, err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
@@ -375,7 +379,7 @@ func parseGaugeMetric(body, metricName string) (float64, bool) {
 func TestE2EAgent(t *testing.T) {
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "node-host-agent")
-	buildCmd := exec.Command("go", "build",
+	buildCmd := exec.CommandContext(t.Context(), "go", "build",
 		"-ldflags=-X main.version="+e2eVersion,
 		"-o", binPath, ".")
 	buildCmd.Env = os.Environ()

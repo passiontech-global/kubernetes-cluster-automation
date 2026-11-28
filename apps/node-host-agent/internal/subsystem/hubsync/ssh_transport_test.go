@@ -242,7 +242,7 @@ func newTestJumpBastion(t *testing.T, targetAddr string) *testJumpBastion {
 		},
 	}
 	scfg.AddHostKey(signer)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func newTestJumpBastion(t *testing.T, targetAddr string) *testJumpBastion {
 						// Blackholed bastion: leave channel open without forwarding or replying.
 						continue
 					}
-					up, derr := net.Dial("tcp", targetAddr)
+					up, derr := (&net.Dialer{}).DialContext(t.Context(), "tcp", targetAddr)
 					if derr != nil {
 						_ = ch.Reject(ssh.ConnectionFailed, derr.Error())
 						continue
@@ -447,7 +447,7 @@ func TestSSHConnStreamCmdBlackholedBastionEscalates(t *testing.T) {
 	t.Cleanup(d.closeBastions)
 
 	// Open a Bastion over blackholeNetConn so we can blackhole b.Net mid-streamCmd.
-	rawJump, err := net.Dial("tcp", jb.ln.Addr().String())
+	rawJump, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", jb.ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

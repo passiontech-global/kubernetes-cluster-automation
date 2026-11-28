@@ -137,7 +137,11 @@ func InNetNS(pid int, fn func() error) error {
 		// Restore unconditionally — even on fn error the thread
 		// must not carry the host ns into unrelated work.
 		if rerr := unix.Setns(int(self.Fd()), unix.CLONE_NEWNET); rerr != nil {
-			done <- outcome{err: fmt.Errorf("restore netns: %w (fn err: %v)", rerr, fnErr)}
+			if fnErr != nil {
+				done <- outcome{err: fmt.Errorf("restore netns: %w (fn err: %w)", rerr, fnErr)}
+			} else {
+				done <- outcome{err: fmt.Errorf("restore netns: %w", rerr)}
+			}
 			return // dirty stays true — the M is quarantined
 		}
 		dirty = false

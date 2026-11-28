@@ -126,7 +126,7 @@ func Bind(hostRoot string) (int, error) {
 			filepath.Join(hostRoot, "proc/1/ns/net")); ferr == nil {
 			return ffd, nil
 		} else {
-			err = fmt.Errorf("%w (host-root fallback: %v)", err, ferr)
+			err = fmt.Errorf("%w (host-root fallback: %w)", err, ferr)
 		}
 	}
 	return -1, err
@@ -159,7 +159,7 @@ func BindInNetns(nsPath string) (int, error) {
 	defer func() { _ = unix.Close(host) }()
 	if err := unix.Setns(host, unix.CLONE_NEWNET); err != nil {
 		runtime.UnlockOSThread()
-		return -1, fmt.Errorf("%w: setns %s: %v", ErrSetns, nsPath, err)
+		return -1, fmt.Errorf("%w: setns %s: %w", ErrSetns, nsPath, err)
 	}
 	fd, serr := bindRouteSocket()
 	if rerr := unix.Setns(self, unix.CLONE_NEWNET); rerr != nil {

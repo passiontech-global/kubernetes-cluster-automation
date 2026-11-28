@@ -57,7 +57,7 @@ func startMockKMSUnix(t *testing.T, sockPath string, hang bool) {
 	if err := os.MkdirAll(filepath.Dir(sockPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sockPath)
 	if err != nil {
 		t.Fatal(err)
 	}

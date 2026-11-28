@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"io"
 	"os"
@@ -113,7 +114,7 @@ func runMainInHelper(t *testing.T, env string, root string) (stdout, stderr stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(os.Args[0], "-test.run="+t.Name()+"$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run="+t.Name()+"$")
 	cmd.Env = append(os.Environ(), env+"=1", "GENENVDOC_ROOT="+rootAbs)
 	var so, se strings.Builder
 	cmd.Stdout = &so
@@ -122,8 +123,8 @@ func runMainInHelper(t *testing.T, env string, root string) (stdout, stderr stri
 	if err == nil {
 		return so.String(), se.String(), 0
 	}
-	exitErr, ok := err.(*exec.ExitError)
-	if !ok {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
 		t.Fatalf("helper failed without an exit status: %v", err)
 	}
 	return so.String(), se.String(), exitErr.ExitCode()

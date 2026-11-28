@@ -60,7 +60,7 @@ func newSSHTestServer(t *testing.T, mode, out string) *sshTestServer {
 		},
 	}
 	s.cfg.AddHostKey(signer)
-	s.ln, err = net.Listen("tcp", "127.0.0.1:0")
+	s.ln, err = (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func (s *sshTestServer) acceptLoop() {
 
 // bridgeChannels copies both directions until either side closes.
 func bridgeChannels(ch ssh.Channel, addr string) {
-	up, err := net.Dial("tcp", addr)
+	up, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", addr)
 	if err != nil {
 		_ = ch.Close()
 		return

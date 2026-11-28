@@ -209,7 +209,7 @@ func runTier1Tests(t *testing.T, bin string) {
 					return fmt.Errorf("unreferenced go-build output still exists")
 				}
 				if _, err := os.Stat(refData); err != nil {
-					return fmt.Errorf("referenced go-build output disappeared: %v", err)
+					return fmt.Errorf("referenced go-build output disappeared: %w", err)
 				}
 				m := ra.scrapeMetrics(t)
 				v, ok := parseMetricValue(m, "node_host_agent_concourse_cache_cycles_total", `result="ok"`)
@@ -422,7 +422,7 @@ func runTier1Tests(t *testing.T, bin string) {
 
 			eventually(t, 6*time.Second, 100*time.Millisecond, "read-only node-deps inside root pruned safely", func() error {
 				if _, err := os.Stat(cksum); !os.IsNotExist(err) {
-					return fmt.Errorf("aged node-deps dir still exists: %v", err)
+					return fmt.Errorf("aged node-deps dir still exists: %w", err)
 				}
 				return nil
 			})
@@ -2613,7 +2613,7 @@ exit 0
 			_ = os.RemoveAll(filepath.Join(sb.proc, strconv.Itoa(pinPID)))
 			eventually(t, 5*time.Second, 100*time.Millisecond, "K3 clears latch after recovery", func() error {
 				if _, err := os.Stat(latchPath); !os.IsNotExist(err) {
-					return fmt.Errorf("expected latch %s to be absent after recovery (err=%v)", latchPath, err)
+					return fmt.Errorf("expected latch %s to be absent after recovery (err=%w)", latchPath, err)
 				}
 				return nil
 			})

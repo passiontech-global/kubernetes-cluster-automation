@@ -13,6 +13,7 @@ package netlinkx
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -283,7 +284,7 @@ func TestParseDiagAck(t *testing.T) {
 	done := make([]byte, 16)
 	binary.LittleEndian.PutUint32(done[0:], 16)
 	binary.LittleEndian.PutUint16(done[4:], unix.NLMSG_DONE)
-	if err := parseDiagAck(append(done, ack...)); err != nil {
+	if err := parseDiagAck(slices.Concat(done, ack)); err != nil {
 		t.Fatalf("parseDiagAck(DONE+ACK) = %v, want nil", err)
 	}
 

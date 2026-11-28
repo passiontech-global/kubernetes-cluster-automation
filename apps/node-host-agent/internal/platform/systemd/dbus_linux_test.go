@@ -117,7 +117,7 @@ func TestSignalNumber(t *testing.T) {
 }
 
 func TestDBusHelpersAndDisabledPaths(t *testing.T) {
-	if _, _, err := dialSystemdPrivate(filepath.Join(t.TempDir(), "missing.sock")); err == nil {
+	if _, _, err := dialSystemdPrivate(t.Context(), filepath.Join(t.TempDir(), "missing.sock")); err == nil {
 		t.Fatal("expected dialSystemdPrivate on missing socket to fail")
 	}
 

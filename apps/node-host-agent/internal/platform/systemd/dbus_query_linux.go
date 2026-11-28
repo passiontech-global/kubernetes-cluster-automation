@@ -120,7 +120,7 @@ func (b *dbusBackend) getProp(parentCtx context.Context, unit, prop string,
 	}
 	if err != nil {
 		if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: dbus Get %s %s: %v",
+			return nil, fmt.Errorf("%w: dbus Get %s %s: %w",
 				errDBusUnavailable, prop, unit, err)
 		}
 		return nil, err
@@ -337,7 +337,7 @@ func (b *dbusBackend) dbusListUnitsByPatterns(parentCtx context.Context, pattern
 	}
 	if err != nil {
 		if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: dbus ListUnits: %v",
+			return nil, fmt.Errorf("%w: dbus ListUnits: %w",
 				errDBusUnavailable, err)
 		}
 		return nil, fmt.Errorf("dbus ListUnits: %w", err)
@@ -396,7 +396,7 @@ func (b *dbusBackend) dbusEnabled(parentCtx context.Context, unit string) (bool,
 			if errors.As(err, &derr) && strings.HasPrefix(derr.Name, "org.freedesktop.systemd1.") {
 				return false, fmt.Errorf("systemctl is-enabled %s: %w", unit, err)
 			}
-			return false, fmt.Errorf("%w: dbus GetUnitFileState %s: %v", errDBusUnavailable, unit, err)
+			return false, fmt.Errorf("%w: dbus GetUnitFileState %s: %w", errDBusUnavailable, unit, err)
 		}
 		if enabled, ok := parseEnabledStateWord(state); ok {
 			return enabled, nil
@@ -446,7 +446,7 @@ func (b *dbusBackend) dbusSystemState(parentCtx context.Context) (string, error)
 				continue
 			}
 			if isTransportDead(err) || errors.Is(err, context.DeadlineExceeded) {
-				return "", fmt.Errorf("%w: dbus Get SystemState: %v",
+				return "", fmt.Errorf("%w: dbus Get SystemState: %w",
 					errDBusUnavailable, err)
 			}
 			return "", fmt.Errorf("dbus Get SystemState: %w", err)

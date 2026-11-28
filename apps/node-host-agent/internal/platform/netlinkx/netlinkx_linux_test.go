@@ -63,13 +63,13 @@ func TestSockstatLive(t *testing.T) {
 // census counts them — exercises the whole nlmsghdr/inet_diag_msg
 // parse against the live kernel, not a fixture.
 func TestTCPTablesLive(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skipf("no loopback: %v", err)
 	}
 	defer ln.Close()
 
-	conn, err := net.Dial("tcp", ln.Addr().String())
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", ln.Addr().String())
 	if err != nil {
 		t.Skipf("dial: %v", err)
 	}

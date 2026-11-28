@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"os"
 	"os/exec"
@@ -95,7 +96,7 @@ func TestMainVersionFlag(t *testing.T) {
 		os.Exit(0)
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMainVersionFlag$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestMainVersionFlag$")
 	cmd.Env = append(os.Environ(), "GO_HELPER_PROCESS=1")
 	out, err := cmd.Output()
 	if err != nil {
@@ -122,7 +123,7 @@ func TestMainRunShutsDownOnSIGTERM(t *testing.T) {
 		os.Exit(0)
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMainRunShutsDownOnSIGTERM$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestMainRunShutsDownOnSIGTERM$")
 	cmd.Env = append(os.Environ(),
 		"GO_HELPER_PROCESS_RUN=1",
 		// Hermetic: no kube client attempts, no host-path probes.
@@ -198,7 +199,7 @@ func TestMainRunListenerError(t *testing.T) {
 		os.Exit(0) // unreachable: main exits 1 on Run error
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMainRunListenerError$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestMainRunListenerError$")
 	cmd.Env = append(os.Environ(),
 		"GO_HELPER_PROCESS_BADADDR=1",
 		envnames.EnvEnableSweeper+"=false",
@@ -219,8 +220,8 @@ func TestMainRunListenerError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("helper should exit non-zero on listener error:\n%s", out)
 	}
-	exitErr, ok := err.(*exec.ExitError)
-	if !ok || exitErr.ExitCode() != 1 {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
 		t.Fatalf("helper exit=%v want exit code 1:\n%s", err, out)
 	}
 	if !strings.Contains(string(out), "agent exited") {

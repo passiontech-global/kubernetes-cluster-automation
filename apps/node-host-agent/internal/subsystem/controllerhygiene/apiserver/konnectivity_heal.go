@@ -415,6 +415,7 @@ func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
 			decErr = json.UnmarshalRead(io.LimitReader(resp.Body, 8<<20), &list)
 		}
 		httpx.DrainAndClose(resp.Body, 64<<10)
+		_ = resp.Body.Close()
 		cancel()
 		if !statusOK || decErr != nil {
 			return 0

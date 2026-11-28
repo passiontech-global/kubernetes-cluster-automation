@@ -11,7 +11,7 @@ import (
 )
 
 func TestPGWire(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skip("no loopback")
 	}
@@ -33,7 +33,7 @@ func TestPGWire(t *testing.T) {
 	if !cdeps.PGWireOK(context.Background(), ln.Addr().String()) {
 		t.Fatal("cdeps.PGWireOK rejected an R response")
 	}
-	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	ln2, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skip("no loopback")
 	}

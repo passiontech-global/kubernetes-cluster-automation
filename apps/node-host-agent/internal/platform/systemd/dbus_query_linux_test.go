@@ -61,7 +61,7 @@ func startFakeDBusPeer(t *testing.T) (hostRoot string, peer *fakeDBusPeer) {
 		t.Fatal(err)
 	}
 	sockPath := filepath.Join(sockDir, "private")
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sockPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,7 +883,7 @@ func TestDBusFrameConnPartialHeaderPaddingCloseDoesNotPanic(t *testing.T) {
 		t.Fatal(err)
 	}
 	sockPath := filepath.Join(sockDir, "private")
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sockPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -961,7 +961,7 @@ func TestDBusFrameConnPartialHeaderPaddingCloseDoesNotPanic(t *testing.T) {
 		}
 	}()
 
-	c, _, err := dialSystemdPrivate(sockPath)
+	c, _, err := dialSystemdPrivate(t.Context(), sockPath)
 	if err != nil {
 		t.Fatalf("dialSystemdPrivate: %v", err)
 	}
@@ -1044,9 +1044,10 @@ func TestDBusFrameConnEdgeCases(t *testing.T) {
 			bad[0] = 'X'
 			_, _ = b.Write(bad[:])
 		}()
+		var ime godbus.InvalidMessageError
 		if _, err := godbus.DecodeMessage(fc); err == nil {
 			t.Fatal("expected error on invalid byte order")
-		} else if _, ok := err.(godbus.InvalidMessageError); !ok {
+		} else if !errors.As(err, &ime) {
 			t.Fatalf("err = %T (%v), want godbus.InvalidMessageError", err, err)
 		}
 		// Drain remaining 15 bytes of bad header before sending oversized header.
@@ -1064,7 +1065,7 @@ func TestDBusFrameConnEdgeCases(t *testing.T) {
 		}()
 		if _, err := godbus.DecodeMessage(fc); err == nil {
 			t.Fatal("expected error on oversized header")
-		} else if _, ok := err.(godbus.InvalidMessageError); !ok {
+		} else if !errors.As(err, &ime) {
 			t.Fatalf("err = %T (%v), want godbus.InvalidMessageError", err, err)
 		}
 	})
@@ -1112,7 +1113,7 @@ func TestDBusMidFramePaddingTruncateRetriesAndFallsBackToCLI(t *testing.T) {
 		if err := os.MkdirAll(sockDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		ln, err := net.Listen("unix", filepath.Join(sockDir, "private"))
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", filepath.Join(sockDir, "private"))
 		if err != nil {
 			t.Fatal(err)
 		}

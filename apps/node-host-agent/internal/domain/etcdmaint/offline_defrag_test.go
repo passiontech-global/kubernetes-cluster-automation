@@ -42,7 +42,7 @@ func TestHelperProcess(t *testing.T) {
 // the helper reports its signal disposition armed.
 func startTempProc(t *testing.T, mode string) *tempEtcdProc {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcess$")
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestHelperProcess$")
 	ready := filepath.Join(t.TempDir(), "ready")
 	cmd.Env = append(os.Environ(),
 		"GO_WANT_HELPER_PROCESS="+mode,

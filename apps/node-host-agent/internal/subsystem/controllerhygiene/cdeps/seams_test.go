@@ -206,7 +206,7 @@ func TestProbeKMSv2Socket(t *testing.T) {
 
 	t.Run("immediate close mock succeeds", func(t *testing.T) {
 		sock := filepath.Join(t.TempDir(), "kms.sock")
-		ln, err := net.Listen("unix", sock)
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sock)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -227,7 +227,7 @@ func TestProbeKMSv2Socket(t *testing.T) {
 
 	t.Run("http2 response succeeds", func(t *testing.T) {
 		sock := filepath.Join(t.TempDir(), "kms.sock")
-		ln, err := net.Listen("unix", sock)
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sock)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -249,7 +249,7 @@ func TestProbeKMSv2Socket(t *testing.T) {
 
 	t.Run("hung socket times out non-blocking", func(t *testing.T) {
 		sock := filepath.Join(t.TempDir(), "kms.sock")
-		ln, err := net.Listen("unix", sock)
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sock)
 		if err != nil {
 			t.Fatal(err)
 		}

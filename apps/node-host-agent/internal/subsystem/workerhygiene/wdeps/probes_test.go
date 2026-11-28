@@ -103,7 +103,7 @@ func TestDeletedFDStatDeletedButOpen(t *testing.T) {
 // answers nothing).
 func dnsTCPServer(t *testing.T, replyQR bool, replyLen int, delay time.Duration) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestTcpDNSQuery(t *testing.T) {
 		t.Fatal("silent listener counted as alive")
 	}
 	// Connection refused — nothing listens.
-	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	dead, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func TestTLSDialPeerCert(t *testing.T) {
 			go func(c net.Conn) {
 				defer func() { _ = c.Close() }()
 				if tc, ok := c.(*tls.Conn); ok {
-					_ = tc.Handshake()
+					_ = tc.HandshakeContext(t.Context())
 				}
 			}(conn)
 		}
@@ -303,7 +303,7 @@ func TestTLSDialPeerCert(t *testing.T) {
 		t.Fatalf("serial=%v want %v", got.SerialNumber, serial)
 	}
 
-	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	dead, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

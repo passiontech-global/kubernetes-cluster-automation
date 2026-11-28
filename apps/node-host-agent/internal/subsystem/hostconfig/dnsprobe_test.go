@@ -134,7 +134,7 @@ func TestDNSExchangeTCPFallback(t *testing.T) {
 	// TC=1 on UDP must trigger the TCP re-ask. Serve the truncated
 	// flag on UDP and the real answer on TCP at the SAME addr —
 	// bind TCP first, then UDP on its port.
-	tl, err := net.Listen("tcp", "127.0.0.1:0")
+	tl, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

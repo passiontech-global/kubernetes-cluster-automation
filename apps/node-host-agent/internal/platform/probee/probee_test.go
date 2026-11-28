@@ -186,7 +186,7 @@ func TestBodyOK(t *testing.T) {
 func unixServer(t *testing.T, h http.Handler) (socket string) {
 	t.Helper()
 	socket = filepath.Join(t.TempDir(), "test.sock")
-	ln, err := net.Listen("unix", socket)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", socket)
 	if err != nil {
 		t.Fatalf("unix listen: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestUnixDial(t *testing.T) {
 
 func TestUnixKeepAliveReusesConnection(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "reuse.sock")
-	ln, err := net.Listen("unix", socket)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", socket)
 	if err != nil {
 		t.Fatalf("unix listen: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestUnixPoolConcurrentAndServerRestart(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "restart.sock")
 	start := func(tag string) *http.Server {
 		_ = os.Remove(socket)
-		ln, err := net.Listen("unix", socket)
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", socket)
 		if err != nil {
 			t.Fatalf("unix listen: %v", err)
 		}
@@ -387,7 +387,7 @@ func TestUnixPoolConcurrentAndServerRestart(t *testing.T) {
 // unchanged (a response WITHOUT the QR bit — must not pass).
 func udpDNSFake(t *testing.T, qr bool) (addr string) {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	pc, err := (&net.ListenConfig{}).ListenPacket(t.Context(), "udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("udp listen: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestDNSQuery(t *testing.T) {
 // echoed id, "silent" never replies.
 func tcpDNSFake(t *testing.T, qr bool, mode string) (addr string) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("tcp listen: %v", err)
 	}
@@ -505,7 +505,7 @@ func tcpDNSFake(t *testing.T, qr bool, mode string) (addr string) {
 // without a full resolver. mode "silent" reads and never answers.
 func udpDNSCustom(t *testing.T, mode string) (addr string) {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	pc, err := (&net.ListenConfig{}).ListenPacket(t.Context(), "udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("udp listen: %v", err)
 	}

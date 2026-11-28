@@ -51,7 +51,7 @@ const e2eReqVersion = "v0.0.0-e2e-req"
 func TestE2ERequirements(t *testing.T) {
 	binDir := t.TempDir()
 	binPath := filepath.Join(binDir, "node-host-agent")
-	buildCmd := exec.Command("go", "build",
+	buildCmd := exec.CommandContext(t.Context(), "go", "build",
 		"-ldflags=-X main.version="+e2eReqVersion,
 		"-o", binPath, ".")
 	buildCmd.Env = os.Environ()
@@ -394,7 +394,7 @@ func startReqAgent(t *testing.T, bin string, env []string, extraArgs ...string) 
 	args = append(args, extraArgs...)
 	expectServers := []string{"metrics", "probe", "pprof-loopback"}
 
-	cmd := exec.Command(bin, args...)
+	cmd := exec.CommandContext(t.Context(), bin, args...)
 	cmd.Env = env
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -557,7 +557,11 @@ func (ra *runningReqAgent) stopAndWait(t *testing.T) {
 func reqHTTPGet(t *testing.T, url string) (int, string) {
 	t.Helper()
 	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request %s: %v", url, err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
@@ -587,7 +591,7 @@ func eventually(t *testing.T, timeout, interval time.Duration, desc string, cond
 
 func spawnDummySleep(t *testing.T, secs int) (<-chan error, int) {
 	t.Helper()
-	cmd := exec.Command("sleep", strconv.Itoa(secs))
+	cmd := exec.CommandContext(t.Context(), "sleep", strconv.Itoa(secs))
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("spawn sleep: %v", err)
 	}
@@ -1754,7 +1758,7 @@ func listenShortUnixSocket(t *testing.T, targetSockPath string) (net.Listener, s
 		listenPath = filepath.Join(shortDir, "k.sock")
 		t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
 	}
-	ln, err := net.Listen("unix", listenPath)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", listenPath)
 	if err != nil {
 		t.Fatalf("listen unix %s: %v", listenPath, err)
 	}

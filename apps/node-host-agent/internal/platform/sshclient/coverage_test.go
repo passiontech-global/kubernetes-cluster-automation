@@ -108,7 +108,7 @@ func TestLinkNewSessionAndCombinedOutputCapped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestLinkNewSessionAndCombinedOutputCapped(t *testing.T) {
 		}
 	}()
 
-	rawConn, err := net.Dial("tcp", ln.Addr().String())
+	rawConn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestCombinedOutputCappedEscalatesOnBlackholedSharedBastion(t *testing.T) {
 	srvCfg := &ssh.ServerConfig{NoClientAuth: true}
 	srvCfg.AddHostKey(hostSigner)
 
-	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	targetLn, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestCombinedOutputCappedEscalatesOnBlackholedSharedBastion(t *testing.T) {
 	}()
 
 	jumpAddr := startTestSSHJumpServer(t)
-	rawJump, err := net.Dial("tcp", jumpAddr)
+	rawJump, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", jumpAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +421,7 @@ func startTestSSHExecServer(t *testing.T, onSession func(ssh.NewChannel)) string
 	srvCfg := &ssh.ServerConfig{NoClientAuth: true}
 	srvCfg.AddHostKey(hostSigner)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +481,7 @@ func startTestSSHStallDialJumpServer(t *testing.T, stallPort int, release <-chan
 	srvCfg := &ssh.ServerConfig{NoClientAuth: true}
 	srvCfg.AddHostKey(hostSigner)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,9 +522,8 @@ func startTestSSHStallDialJumpServer(t *testing.T, stallPort int, release <-chan
 						continue
 					}
 					go ssh.DiscardRequests(creqs)
-					target, err := net.DialTimeout("tcp",
-						net.JoinHostPort(host, strconv.Itoa(int(port))),
-						5*time.Second)
+					target, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(t.Context(), "tcp",
+						net.JoinHostPort(host, strconv.Itoa(int(port))))
 					if err != nil {
 						_ = dconn.Close()
 						continue
@@ -610,7 +609,7 @@ func TestSharedBastionSurvivesTargetCtxCancel(t *testing.T) {
 		execPort := portOf(t, execAddr)
 
 		// Silent TCP server: accepts connections and holds them without sending SSH banner.
-		silentLn, err := net.Listen("tcp", "127.0.0.1:0")
+		silentLn, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -743,7 +742,7 @@ func TestBlackholedSharedBastionEscalatesAcrossOps(t *testing.T) {
 	openBlackholeBastion := func(t *testing.T, targetPort int) (Config, *Bastion, *blackholeConn) {
 		t.Helper()
 		jumpAddr := startTestSSHJumpServer(t)
-		rawJump, err := net.Dial("tcp", jumpAddr)
+		rawJump, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", jumpAddr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -788,7 +787,7 @@ func TestBlackholedSharedBastionEscalatesAcrossOps(t *testing.T) {
 	})
 
 	t.Run("Handshake_blackholed", func(t *testing.T) {
-		silentLn, err := net.Listen("tcp", "127.0.0.1:0")
+		silentLn, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}

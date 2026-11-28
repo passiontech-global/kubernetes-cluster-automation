@@ -50,7 +50,7 @@ func startTestSSHServerHostKey(t *testing.T) (string, ssh.PublicKey) {
 	srvCfg := &ssh.ServerConfig{NoClientAuth: true}
 	srvCfg.AddHostKey(hostSigner)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func startTestSSHJumpServer(t *testing.T) string {
 	srvCfg := &ssh.ServerConfig{NoClientAuth: true}
 	srvCfg.AddHostKey(hostSigner)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,9 +127,8 @@ func startTestSSHJumpServer(t *testing.T) string {
 						_ = dconn.Close()
 						continue
 					}
-					target, err := net.DialTimeout("tcp",
-						net.JoinHostPort(host, strconv.Itoa(int(port))),
-						5*time.Second)
+					target, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(t.Context(), "tcp",
+						net.JoinHostPort(host, strconv.Itoa(int(port))))
 					if err != nil {
 						_ = dconn.Close()
 						continue
@@ -260,7 +259,7 @@ func TestHandshakeDeadConnIsLoud(t *testing.T) {
 	// SetDeadline ("use of closed network connection").
 	deadConn := func() net.Conn {
 		t.Helper()
-		nc, err := net.DialTimeout("tcp", addr, cfg.Timeout)
+		nc, err := (&net.Dialer{Timeout: cfg.Timeout}).DialContext(t.Context(), "tcp", addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -297,7 +296,7 @@ func TestDialTCPRefusedTargetErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +356,7 @@ func TestDialDirectSuccess(t *testing.T) {
 // "dial <addr>:" wording both originals used.
 func TestDialDirectRefused(t *testing.T) {
 	cfg := dialTestConfig(t, nil)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +422,7 @@ func TestDialProxyJumpDialFails(t *testing.T) {
 	cfg := dialTestConfig(t, nil)
 	cfg.Port = 22
 	cfg.Timeout = 2 * time.Second
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +471,7 @@ func TestDialProxyJumpChannelFails(t *testing.T) {
 func TestDialProxyJumpHandshakeFails(t *testing.T) {
 	// Plain TCP sink: accept + close, so the forwarded conn dies
 	// before the SSH banner arrives.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

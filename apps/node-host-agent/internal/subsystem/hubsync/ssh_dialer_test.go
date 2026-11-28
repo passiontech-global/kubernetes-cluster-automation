@@ -170,7 +170,7 @@ func newTestSSHServerOpts(t *testing.T, clientKeyPath string,
 	}, opts: opts, quit: make(chan struct{}),
 		execSeen: make(chan string, 16)}
 	s.cfg.AddHostKey(hostSigner)
-	s.ln, err = net.Listen("tcp", "127.0.0.1:0")
+	s.ln, err = (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

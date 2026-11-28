@@ -76,7 +76,7 @@ func Deploy(ctx context.Context, o FileOps, path string, content []byte, mode os
 	}
 	cand := path + ".candidate"
 	if _, err := o.WriteManaged(cand, content, mode); err != nil {
-		return false, fmt.Errorf("%w: %s: %s", ErrManagedWrite, cand, err)
+		return false, fmt.Errorf("%w: %s: %w", ErrManagedWrite, cand, err)
 	}
 	if len(check) > 0 {
 		if out, err := o.Run(ctx, check[0], append(check[1:], cand)...); err != nil {
@@ -93,7 +93,7 @@ func Deploy(ctx context.Context, o FileOps, path string, content []byte, mode os
 	changed, werr := o.WriteManaged(path, content, mode)
 	_, _ = o.RemoveManaged(cand)
 	if werr != nil {
-		return false, fmt.Errorf("%w: %s: %s", ErrManagedWrite, path, werr)
+		return false, fmt.Errorf("%w: %s: %w", ErrManagedWrite, path, werr)
 	}
 	return changed, nil
 }
@@ -135,7 +135,7 @@ WantedBy=multi-user.target
 		// callers' errors.Is skip so it isn't counted twice, and
 		// fail the cycle without touching systemd. The next cycle
 		// retries the unit write.
-		return fmt.Errorf("%w: %s: %s", ErrManagedWrite, unitPath, werr)
+		return fmt.Errorf("%w: %s: %w", ErrManagedWrite, unitPath, werr)
 	}
 	if ch || uch {
 		o.DaemonReload(ctx)

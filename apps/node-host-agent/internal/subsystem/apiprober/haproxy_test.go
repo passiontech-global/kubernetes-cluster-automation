@@ -354,7 +354,7 @@ func TestSocketGateRecoversWhenSocketAppears(t *testing.T) {
 		order:    []string{"hub1"},
 		disabled: map[string]bool{},
 	}
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sockPath)
 	if err != nil {
 		t.Fatal(err)
 	}
