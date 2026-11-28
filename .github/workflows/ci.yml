@@ -114,9 +114,7 @@ jobs:
         working-directory: apps/node-automation-controller
         env:
           KO_DOCKER_REPO: ko.local
-          # .ko.yaml templates main.version from .Env.VERSION — ko
-          # renders missing map keys as an error, so the var must
-          # exist even for a throwaway CI build.
+          # Exercise .ko.yaml's .Env.VERSION ldflag template explicitly.
           VERSION: ci
         run: ko build --bare --sbom=none --push=false ./cmd/...
 
