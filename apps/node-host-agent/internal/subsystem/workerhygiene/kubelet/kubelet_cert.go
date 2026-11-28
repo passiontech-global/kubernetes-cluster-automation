@@ -206,6 +206,9 @@ func (c *CertCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 func (c *CertCheck) readCertBundleCached(path string) (*x509.Certificate, time.Time, error) {
 	key, err := fsx.FileStatKey(path)
 	if err != nil {
+		c.certMu.Lock()
+		delete(c.certCache, path)
+		c.certMu.Unlock()
 		return nil, time.Time{}, err
 	}
 	c.certMu.Lock()

@@ -305,3 +305,64 @@ func TestCountLive(t *testing.T) {
 		}
 	}
 }
+
+func TestParseMountinfoFiveFieldsAndSuperOptsDash(t *testing.T) {
+	// 5 pre-separator fields (no mount-opts field) must not panic on f[6:],
+	// and " - " inside superopts must not shift the separator split.
+	raw := []byte(strings.Join([]string{
+		"10 1 0:50 / /mnt/five-fields - overlay overlay rw,upperdir=/var/lib/snaps/1/fs",
+		"11 1 0:51 / /mnt/no-sep",
+		"12 1 0:52 / /mnt/dash-opts rw shared:42 - cifs //srv/share rw,label=a - b",
+	}, "\n"))
+	entries, lines := wdeps.ParseMountinfo(raw)
+	if lines != 3 || len(entries) != 3 {
+		t.Fatalf("ParseMountinfo=(%d entries, %d lines) want (3, 3)", len(entries), lines)
+	}
+	if !entries[0].HasMount || entries[0].Mountpoint != "/mnt/five-fields" ||
+		!entries[0].HasSep || entries[0].FSType != "overlay" || entries[0].Source != "overlay" {
+		t.Fatalf("entry[0]=%+v", entries[0])
+	}
+	if !entries[1].HasMount || entries[1].Mountpoint != "/mnt/no-sep" || entries[1].HasSep {
+		t.Fatalf("entry[1]=%+v", entries[1])
+	}
+	if !entries[2].HasSep || entries[2].FSType != "cifs" || entries[2].Source != "//srv/share" ||
+		len(entries[2].SharedGroups) != 1 || entries[2].SharedGroups[0] != "42" {
+		t.Fatalf("entry[2]=%+v", entries[2])
+	}
+}
+
+func TestMountinfoEntriesCaching(t *testing.T) {
+	e := fixture(t)
+	miPath := filepath.Join(t.TempDir(), "mountinfo")
+	wdepstest.WriteFile(t, miPath, "10 1 0:50 / /mnt/a rw - tmpfs tmpfs rw\n")
+	e.D.Cfg.MountinfoFile = miPath
+
+	// Without MountinfoOnce, each call reads MountinfoFile fresh.
+	ents1, _, err := e.D.MountinfoEntries(&wdeps.CycleEnv{})
+	if err != nil || len(ents1) != 1 || ents1[0].Mountpoint != "/mnt/a" {
+		t.Fatalf("first uncached MountinfoEntries=%+v err=%v", ents1, err)
+	}
+	wdepstest.WriteFile(t, miPath, "10 1 0:50 / /mnt/b rw - tmpfs tmpfs rw\n")
+	ents2, _, err := e.D.MountinfoEntries(&wdeps.CycleEnv{})
+	if err != nil || len(ents2) != 1 || ents2[0].Mountpoint != "/mnt/b" {
+		t.Fatalf("second uncached MountinfoEntries=%+v err=%v", ents2, err)
+	}
+
+	// With MountinfoOnce, ParseMountinfo runs once per CycleEnv.
+	reads := 0
+	env := &wdeps.CycleEnv{
+		MountinfoOnce: func() ([]byte, error) {
+			reads++
+			return []byte("10 1 0:50 / /mnt/once rw - tmpfs tmpfs rw\n"), nil
+		},
+	}
+	if got, _, err := e.D.MountinfoEntries(env); err != nil || len(got) != 1 || got[0].Mountpoint != "/mnt/once" {
+		t.Fatalf("once[1]=%+v err=%v", got, err)
+	}
+	if got, _, err := e.D.MountinfoEntries(env); err != nil || len(got) != 1 || got[0].Mountpoint != "/mnt/once" {
+		t.Fatalf("once[2]=%+v err=%v", got, err)
+	}
+	if reads != 1 {
+		t.Fatalf("MountinfoOnce called %d times, want 1", reads)
+	}
+}

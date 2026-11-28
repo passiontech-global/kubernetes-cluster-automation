@@ -199,3 +199,22 @@ func TestProbeTopChurnBackwardClockReseeds(t *testing.T) {
 		t.Fatalf("churn sampling stayed frozen after re-seed: %+v", k.d.ChurnTop)
 	}
 }
+
+func TestProbeTopChurnMissingOrCorruptHeadReseeds(t *testing.T) {
+	k, fr, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "split_part(name", Out: "pods|120\n"},
+		{Substr: "MAX(id)", Out: "9500\n"},
+	})
+	gdir := filepath.Join(dir, "guard")
+	// TS is present and past 5m, but churnFileHead is missing — must re-seed
+	// instead of running WHERE id > 0 across the entire table.
+	kdeps.WriteIntFile(filepath.Join(gdir, churnFileTS), kdepstest.TestNow-600)
+
+	k.probeTopChurn(context.Background(), "pg", "postgres", "secret", func(string) {})
+	if strings.Contains(fr.Joined(), "split_part(name") {
+		t.Fatalf("expected re-seed when churn head file missing, got full-table query:\n%s", fr.Joined())
+	}
+	if h, err := kdeps.ReadIntFile(filepath.Join(gdir, churnFileHead)); err != nil || h != 9500 {
+		t.Fatalf("churn head=%d err=%v want 9500", h, err)
+	}
+}

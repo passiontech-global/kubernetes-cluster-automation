@@ -285,3 +285,37 @@ func TestKubeconfigCertUserWithoutCert(t *testing.T) {
 		t.Fatalf("no_certs counter=%v want 1", v)
 	}
 }
+
+// External client-certificate file missing on first read and created
+// later must invalidate the cached kubeconfig entry and surface its cert.
+func TestKubeconfigCertMissingExtAppearsLater(t *testing.T) {
+	e := fixture(t)
+	root := t.TempDir()
+	k0s := filepath.Join(root, "k0s")
+	pkiDir := filepath.Join(k0s, "pki")
+	e.H.Cfg.K0sDir = k0s
+	e.H.Cfg.TextfileDir = filepath.Join(root, "textfile")
+
+	testutil.WriteFile(t, filepath.Join(pkiDir, "admin.conf"),
+		kubeconfigWithFileRef("delayed-client.pem"))
+	chk := cdepstest.Check[*pki.KubeCertCheck](e.H, cdeps.CheckKubeCert)
+
+	// Cycle 1: external cert absent -> no_certs, cached with missing ext marker.
+	chk.Run(context.Background())
+	if v := promtest.ToFloat64(e.H.Cycles.WithLabelValues(cdeps.CheckKubeCert, "no_certs")); v != 1 {
+		t.Fatalf("no_certs=%v want 1", v)
+	}
+
+	// Cycle 2: external cert appears inside warn window -> cache invalidates.
+	testutil.WriteFile(t, filepath.Join(pkiDir, "delayed-client.pem"),
+		string(testClientCertPEM(t, e.Now.Add(5*24*time.Hour))))
+	chk.Run(context.Background())
+	if !e.HasState(cdeps.StateKubeCertExpiring) {
+		t.Fatal("newly-created external client-certificate did not invalidate kubeconfig cache")
+	}
+	v, ok := textfileSample(t, e.H.Cfg.TextfileDir,
+		"node-agent-kubeconfig-cert.prom", pki.CertDaysMetric)
+	if !ok || v <= 4.9 || v > 5.0 {
+		t.Fatalf("min-days=%v ok=%v want ~5", v, ok)
+	}
+}

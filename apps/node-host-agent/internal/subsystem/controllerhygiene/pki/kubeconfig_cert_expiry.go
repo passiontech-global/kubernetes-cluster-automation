@@ -125,6 +125,9 @@ func (c *KubeCertCheck) Run(_ context.Context) {
 func (c *KubeCertCheck) kubeconfigClientCertsCached(path string) ([]*x509.Certificate, error) {
 	key, err := fsx.FileStatKey(path)
 	if err != nil {
+		c.kcMu.Lock()
+		delete(c.kcCache, path)
+		c.kcMu.Unlock()
 		return nil, err
 	}
 	c.kcMu.Lock()
@@ -134,6 +137,13 @@ func (c *KubeCertCheck) kubeconfigClientCertsCached(path string) ([]*x509.Certif
 		extMatch := true
 		for extPath, extKey := range ent.extStats {
 			k, kerr := fsx.FileStatKey(extPath)
+			if extKey == "" {
+				if kerr == nil || !os.IsNotExist(kerr) {
+					extMatch = false
+					break
+				}
+				continue
+			}
 			if kerr != nil || k != extKey {
 				extMatch = false
 				break
@@ -144,16 +154,18 @@ func (c *KubeCertCheck) kubeconfigClientCertsCached(path string) ([]*x509.Certif
 		}
 	}
 
-	certs, extStats, err := kubeconfigClientCertsWithStats(path)
+	certs, extStats, cacheable, err := kubeconfigClientCertsWithStats(path)
 	if err != nil {
 		return nil, err
 	}
-	c.kcMu.Lock()
-	if c.kcCache == nil {
-		c.kcCache = make(map[string]cachedKubeCerts)
+	if cacheable {
+		c.kcMu.Lock()
+		if c.kcCache == nil {
+			c.kcCache = make(map[string]cachedKubeCerts)
+		}
+		c.kcCache[path] = cachedKubeCerts{statKey: key, extStats: extStats, certs: certs}
+		c.kcMu.Unlock()
 	}
-	c.kcCache[path] = cachedKubeCerts{statKey: key, extStats: extStats, certs: certs}
-	c.kcMu.Unlock()
 	return certs, nil
 }
 
@@ -163,13 +175,14 @@ func (c *KubeCertCheck) kubeconfigClientCertsCached(path string) ([]*x509.Certif
 // resolved relative to the kubeconfig dir (loadCreds parity), and
 // returns stat keys for any external cert files referenced.
 // Unparseable files/certs are skipped, never fatal.
-func kubeconfigClientCertsWithStats(path string) ([]*x509.Certificate, map[string]string, error) {
+func kubeconfigClientCertsWithStats(path string) ([]*x509.Certificate, map[string]string, bool, error) {
 	kc, err := clientcmd.LoadFromFile(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	var certs []*x509.Certificate
 	var extStats map[string]string
+	cacheable := true
 	for _, a := range kc.AuthInfos {
 		var pemBytes []byte
 		switch {
@@ -177,15 +190,26 @@ func kubeconfigClientCertsWithStats(path string) ([]*x509.Certificate, map[strin
 			pemBytes = a.ClientCertificateData
 		case a.ClientCertificate != "":
 			extPath := cdeps.ResolveRel(path, a.ClientCertificate)
-			if k, kerr := fsx.FileStatKey(extPath); kerr == nil {
+			k, kerr := fsx.FileStatKey(extPath)
+			b, rerr := os.ReadFile(extPath)
+			if rerr != nil {
+				if os.IsNotExist(rerr) {
+					if extStats == nil {
+						extStats = make(map[string]string)
+					}
+					extStats[extPath] = ""
+				} else {
+					cacheable = false
+				}
+				continue
+			}
+			if kerr != nil {
+				cacheable = false
+			} else {
 				if extStats == nil {
 					extStats = make(map[string]string)
 				}
 				extStats[extPath] = k
-			}
-			b, rerr := os.ReadFile(extPath)
-			if rerr != nil {
-				continue
 			}
 			pemBytes = b
 		default:
@@ -205,5 +229,5 @@ func kubeconfigClientCertsWithStats(path string) ([]*x509.Certificate, map[strin
 			}
 		}
 	}
-	return certs, extStats, nil
+	return certs, extStats, cacheable, nil
 }

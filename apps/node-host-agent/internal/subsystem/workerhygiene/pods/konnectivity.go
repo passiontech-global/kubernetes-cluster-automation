@@ -251,7 +251,7 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			continue
 		}
 		if procStateMMUnsafe(state) {
-			if match && state == "D" {
+			if (match || !known) && state == "D" {
 				procInconclusive = true
 			}
 			continue
@@ -280,14 +280,15 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		argv := c.d.Proc.Cmdline(pid)
 		if len(argv) == 0 {
-			// Avoid touching mm-backed cmdline on D/Z/X processes; flag
-			// D-state proxy candidates and non-ENOENT cmdline errors.
-			if stOK && len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
+			// Avoid touching mm-backed cmdline on D/Z/X processes; re-check live
+			// stat in case the process entered D-state after line 262.
+			curSt, curOK := c.d.Proc.Stat(pid)
+			if curOK && len(curSt.Fields) > 0 && procStateMMUnsafe(curSt.Fields[0]) {
 				isCandidate := match
 				if !known {
-					isCandidate = !st.HasComm || isProxyAgentComm(st.Comm)
+					isCandidate = !curSt.HasComm || isProxyAgentComm(curSt.Comm)
 				}
-				if isCandidate && st.Fields[0] == "D" {
+				if isCandidate && curSt.Fields[0] == "D" {
 					procInconclusive = true
 				}
 			} else if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) ||
@@ -305,8 +306,9 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			continue
 		}
 		if phost == "" {
-			if stOK && len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
-				if st.Fields[0] == "D" {
+			curSt, curOK := c.d.Proc.Stat(pid)
+			if curOK && len(curSt.Fields) > 0 && procStateMMUnsafe(curSt.Fields[0]) {
+				if curSt.Fields[0] == "D" {
 					procInconclusive = true
 				}
 			} else if procFileReadNonENOENT(c.d.Proc.File(pid, "stat")) ||

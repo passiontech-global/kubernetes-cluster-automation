@@ -466,4 +466,174 @@ func TestDiskBloatWarnBandPreEviction(t *testing.T) {
 			t.Fatalf("cooldown failed, got evictions=%v", got)
 		}
 	})
+
+	t.Run("pre_evicts_when_init_or_sidecar_has_limit_but_main_container_lacks_limit", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			pod  func() corev1.Pod
+			want []string
+		}{
+			{
+				name: "init_limited_main_unlimited",
+				pod: func() corev1.Pod {
+					p := mkPod("app", "init-lim-only", wdepstest.UIDA, false)
+					p.Spec.InitContainers = []corev1.Container{{
+						Name: "init",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceEphemeralStorage: *resource.NewQuantity(100<<20, resource.BinarySI),
+							},
+						},
+					}}
+					return p
+				},
+				want: []string{"init-lim-only"},
+			},
+			{
+				name: "sidecar_limited_main_unlimited",
+				pod: func() corev1.Pod {
+					p := mkPod("app", "sidecar-lim-only", wdepstest.UIDA, false)
+					p.Spec.Containers = append(p.Spec.Containers, corev1.Container{
+						Name: "sidecar",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceEphemeralStorage: *resource.NewQuantity(100<<20, resource.BinarySI),
+							},
+						},
+					})
+					return p
+				},
+				want: []string{"sidecar-lim-only"},
+			},
+			{
+				name: "all_containers_limited_skipped",
+				pod: func() corev1.Pod {
+					p := mkPod("app", "all-limited", wdepstest.UIDA, true)
+					p.Spec.InitContainers = []corev1.Container{{Name: "init"}}
+					return p
+				},
+				want: nil,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				c, d, f, cs := setup(t)
+				vol := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA,
+					"volumes", "kubernetes.io~empty-dir", "scratch")
+				wdepstest.WriteFile(t, filepath.Join(vol, "data"), "x")
+				pod := tc.pod()
+				size := int64(120 << 20)
+				run := func() {
+					c.Run(context.Background(), &wdeps.CycleEnv{
+						WorkerActive: true,
+						APIOK:        true,
+						Pods:         []corev1.Pod{pod},
+						WalkOnce: func(root string) (int64, bool) {
+							if root == vol {
+								return size, false
+							}
+							return 0, false
+						},
+					})
+				}
+				run()
+				f.Now = f.Now.Add(2 * time.Minute)
+				size = 420 << 20
+				run()
+				got := wdepstest.EvictActions(cs)
+				if len(got) != len(tc.want) || (len(got) == 1 && got[0] != tc.want[0]) {
+					t.Fatalf("evictions = %v, want %v", got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("aggregates_multi_volume_pod_total_above_threshold", func(t *testing.T) {
+		c, d, f, cs := setup(t)
+		vol1 := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~empty-dir", "v1")
+		vol2 := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~empty-dir", "v2")
+		wdepstest.WriteFile(t, filepath.Join(vol1, "f"), "x")
+		wdepstest.WriteFile(t, filepath.Join(vol2, "f"), "x")
+		pod := mkPod("app", "split-bloat", wdepstest.UIDA, false)
+
+		// Threshold is 100 MiB; each dir stays <= 90 MiB so per-dir hits are empty,
+		// while their sum grows from 110 MiB -> 180 MiB? No, test +260 MiB growth
+		// across 3 dirs (90+90+90=270? No, 3 vols of 90 MiB = 270 MiB -> +270 MiB!).
+		vol3 := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~empty-dir", "v3")
+		vol4 := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~empty-dir", "v4")
+		wdepstest.WriteFile(t, filepath.Join(vol3, "f"), "x")
+		wdepstest.WriteFile(t, filepath.Join(vol4, "f"), "x")
+
+		perVol := int64(20 << 20) // baseline: 4 * 20 = 80 MiB
+		run := func() {
+			c.Run(context.Background(), &wdeps.CycleEnv{
+				WorkerActive: true,
+				APIOK:        true,
+				Pods:         []corev1.Pod{pod},
+				WalkOnce: func(root string) (int64, bool) {
+					switch root {
+					case vol1, vol2, vol3, vol4:
+						return perVol, false
+					default:
+						return 0, false
+					}
+				},
+			})
+		}
+		run()
+		f.Now = f.Now.Add(2 * time.Minute)
+		perVol = 90 << 20 // 4 * 90 = 360 MiB (+280 MiB >= 256 MiB, each dir < 100 MiB threshold)
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 1 || got[0] != "split-bloat" {
+			t.Fatalf("multi-volume split bloat evictions = %v, want [split-bloat]", got)
+		}
+	})
+
+	t.Run("scanErr_discards_partial_baseline_preventing_false_delta", func(t *testing.T) {
+		c, d, f, cs := setup(t)
+		// Create a steady pod with 400 MiB emptyDir AND a pod-logs hit, while
+		// PodLogsDir is unreadable (non-dir file -> ENOTDIR -> scanErr=true) on scan 1?
+		// Better: PodLogsDir has a hit AND PodsDir is a regular file (ENOTDIR -> scanErr=true)
+		// on scan 1, then PodsDir is restored on scan 2 with steady 400 MiB emptyDir.
+		logDir := filepath.Join(d.Cfg.Disk.PodLogsDir, "app_steady_"+wdepstest.UIDA)
+		wdepstest.WriteFile(t, filepath.Join(logDir, "0.log"), "x")
+		pod := mkPod("app", "steady-under-err", wdepstest.UIDA, false)
+
+		origPodsDir := d.Cfg.PodsDir
+		badPodsFile := filepath.Join(t.TempDir(), "not-a-dir")
+		wdepstest.WriteFile(t, badPodsFile, "x")
+		d.Cfg.PodsDir = badPodsFile
+
+		vol := filepath.Join(origPodsDir, wdepstest.UIDA, "volumes", "kubernetes.io~empty-dir", "v")
+		wdepstest.WriteFile(t, filepath.Join(vol, "data"), "x")
+
+		run := func() {
+			c.Run(context.Background(), &wdeps.CycleEnv{
+				WorkerActive: true,
+				APIOK:        true,
+				Pods:         []corev1.Pod{pod},
+				WalkOnce: func(root string) (int64, bool) {
+					switch root {
+					case logDir:
+						return 110 << 20, false
+					case vol:
+						return 400 << 20, false
+					default:
+						return 0, false
+					}
+				},
+			})
+		}
+
+		// Scan 1 has a logDir hit AND scanErr=true (PodsDir ENOTDIR): must NOT store
+		// partial baseline {UIDA: 110 MiB}.
+		run()
+		// Scan 2 restores PodsDir (total=510 MiB, which would look like +400 MiB if
+		// scan 1's partial baseline were kept): must treat scan 2 as baseline instead.
+		d.Cfg.PodsDir = origPodsDir
+		f.Now = f.Now.Add(2 * time.Minute)
+		run()
+		if got := wdepstest.EvictActions(cs); len(got) != 0 {
+			t.Fatalf("partial scanErr baseline caused false delta eviction: %v", got)
+		}
+	})
 }

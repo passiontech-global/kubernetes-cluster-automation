@@ -176,6 +176,9 @@ func CertNewerThan(disk, sock *x509.Certificate) bool {
 func (c *DriftCheck) readLeafCertCached(path string) (*x509.Certificate, error) {
 	key, err := fsx.FileStatKey(path)
 	if err != nil {
+		c.certMu.Lock()
+		delete(c.certCache, path)
+		c.certMu.Unlock()
 		return nil, err
 	}
 	c.certMu.Lock()

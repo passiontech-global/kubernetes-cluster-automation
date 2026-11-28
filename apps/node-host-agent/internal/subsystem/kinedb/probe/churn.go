@@ -48,21 +48,22 @@ func (p *Probe) probeTopChurn(ctx context.Context, pg, user, pass string,
 		return
 	}
 	dir := p.d.Cfg.GuardStateDir
-	prevHead, _ := kdeps.ReadIntFile(filepath.Join(dir, churnFileHead))
-	prevTS, _ := kdeps.ReadIntFile(filepath.Join(dir, churnFileTS))
+	prevHead, headErr := kdeps.ReadIntFile(filepath.Join(dir, churnFileHead))
+	prevTS, tsErr := kdeps.ReadIntFile(filepath.Join(dir, churnFileTS))
 	now := p.d.Cfg.Clock.Now().Unix()
 	delta := now - prevTS
-	if prevTS == 0 || delta < -60 {
-		// First sighting (or backward clock jump >60s) — seed the
-		// watermark only. A missing watermark treated as head=0 would
-		// group-by the WHOLE table (the COUNT(*) the probe budget forbids).
+	if tsErr != nil || prevTS <= 0 || headErr != nil || prevHead < 0 || delta < -60 {
+		// First sighting (missing/corrupt watermark or backward clock
+		// jump >60s) — seed the watermark only. A missing watermark
+		// treated as head=0 would group-by the WHOLE table (the
+		// COUNT(*) the probe budget forbids).
 		head, herr := p.resHead(ctx, pg, user, pass)
 		if herr != nil {
 			note(fmt.Sprintf("churn-head-query-fail: %v", herr))
 			return
 		}
-		kdeps.WriteIntFile(filepath.Join(dir, churnFileTS), now)
 		kdeps.WriteIntFile(filepath.Join(dir, churnFileHead), head)
+		kdeps.WriteIntFile(filepath.Join(dir, churnFileTS), now)
 		return
 	}
 	if delta < int64(defaultChurnWindow.Seconds()) {

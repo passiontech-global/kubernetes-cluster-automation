@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -105,6 +106,7 @@ func (c *DiskBloatCheck) scanBloatChecked(e *wdeps.CycleEnv, pods []corev1.Pod) 
 	podTotals map[string]int64, podByUID map[string]*corev1.Pod, scanErr bool) {
 	podByUID = map[string]*corev1.Pod{}
 	podTotals = map[string]int64{}
+	podHitRecorded := map[string]bool{}
 	for i := range pods {
 		podByUID[string(pods[i].UID)] = &pods[i]
 	}
@@ -130,6 +132,7 @@ func (c *DiskBloatCheck) scanBloatChecked(e *wdeps.CycleEnv, pods []corev1.Pod) 
 			size, _ := c.d.WalkBudgeted(e, vol)
 			podTotals[uid] += size
 			if size > threshold {
+				podHitRecorded[uid] = true
 				label := "pod-uid " + uid
 				if p, ok := podByUID[uid]; ok && p != nil {
 					label = "pod " + p.Namespace + "/" + p.Name
@@ -160,10 +163,14 @@ func (c *DiskBloatCheck) scanBloatChecked(e *wdeps.CycleEnv, pods []corev1.Pod) 
 		if size <= 0 {
 			continue
 		}
-		if uid := snapshotPodUID(c.d, id, mountIDs); uid != "" {
+		uid := snapshotPodUID(c.d, id, mountIDs)
+		if uid != "" {
 			podTotals[uid] += size
 		}
 		if size > threshold {
+			if uid != "" {
+				podHitRecorded[uid] = true
+			}
 			hits = append(hits, bloatHit{
 				label: "snapshot " + id, bytes: size})
 		}
@@ -184,12 +191,32 @@ func (c *DiskBloatCheck) scanBloatChecked(e *wdeps.CycleEnv, pods []corev1.Pod) 
 			podTotals[uid] += size
 		}
 		if size > threshold {
+			if uid != "" {
+				podHitRecorded[uid] = true
+			}
 			label := "pod-logs " + base
 			if p, ok := podByUID[uid]; ok && p != nil {
 				label = "pod " + p.Namespace + "/" + p.Name + " logs"
 			}
 			hits = append(hits, bloatHit{label: label, bytes: size})
 		}
+	}
+	// (4) aggregated per-pod total: a pod splitting bloat across multiple
+	// emptyDir volumes, snapshots, and logs can cross BloatPodThresholdBytes
+	// without any single directory crossing it.
+	var aggUIDs []string
+	for uid, total := range podTotals {
+		if total > threshold && !podHitRecorded[uid] {
+			aggUIDs = append(aggUIDs, uid)
+		}
+	}
+	slices.Sort(aggUIDs)
+	for _, uid := range aggUIDs {
+		label := "pod-uid " + uid
+		if p, ok := podByUID[uid]; ok && p != nil {
+			label = "pod " + p.Namespace + "/" + p.Name
+		}
+		hits = append(hits, bloatHit{label: label + " total", bytes: podTotals[uid]})
 	}
 	return hits, podTotals, podByUID, scanErr
 }
@@ -326,7 +353,14 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 	prevPodBytes := c.prevPodBytes
-	c.prevPodBytes = podTotals
+	if scanErr {
+		// Incomplete scan: discard the partial baseline so the next
+		// clean scan cannot fabricate a delta spike.
+		c.prevPodBytes = nil
+		prevPodBytes = nil
+	} else {
+		c.prevPodBytes = podTotals
+	}
 	c.lastScan = c.d.Cfg.Seams.Host.Clock.Now()
 	c.d.State.Enter(latchdefs.LatchDiskBloat, fmt.Sprintf("targets=%d", len(hits)))
 	for _, hit := range hits {
@@ -397,11 +431,40 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.CycleResult(wdeps.CheckDiskBloat, "ok")
 }
 
+// podAllContainersEphemeralLimited reports whether every active runtime
+// container of pod (all Spec.Containers, all native-sidecar InitContainers,
+// and regular InitContainers while Pending) declares a positive
+// limits.ephemeral-storage bound. A pod with an initContainer or sidecar
+// declaring a limit while another running container omits it still lacks
+// full kubelet ephemeral-storage protection and remains pre-evictable.
+func podAllContainersEphemeralLimited(pod *corev1.Pod) bool {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return false
+	}
+	hasLimit := func(c *corev1.Container) bool {
+		q, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]
+		return ok && q.Sign() > 0
+	}
+	for i := range pod.Spec.Containers {
+		if !hasLimit(&pod.Spec.Containers[i]) {
+			return false
+		}
+	}
+	for i := range pod.Spec.InitContainers {
+		ic := &pod.Spec.InitContainers[i]
+		isSidecar := ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways
+		if (isSidecar || pod.Status.Phase == corev1.PodPending) && !hasLimit(ic) {
+			return false
+		}
+	}
+	return true
+}
+
 // pickEvictVictim selects at most one eviction target:
 //   - Critical band (used > BloatCriticalWatermark): largest unprotected
 //     pod exceeding BloatPodThresholdBytes.
 //   - Warn band (used > BloatWatermark): Wave 6 pre-DiskPressure runaway
-//     pre-eviction — a single unprotected pod WITHOUT ephemeral-storage
+//     pre-eviction — a single unprotected pod WITHOUT full ephemeral-storage
 //     limits that grew >=256 MiB since the previous scan, holds >=40% of
 //     total bloated pod bytes, and exceeds BloatPodThresholdBytes.
 func (c *DiskBloatCheck) pickEvictVictim(
@@ -442,7 +505,7 @@ func (c *DiskBloatCheck) pickEvictVictim(
 	}
 	for uid, total := range podTotals {
 		p := podByUID[uid]
-		if !eligible(p, total) || podDeclaresEphemeralStorage(p) {
+		if !eligible(p, total) || podAllContainersEphemeralLimited(p) {
 			continue
 		}
 		delta := total - prevPodBytes[uid]

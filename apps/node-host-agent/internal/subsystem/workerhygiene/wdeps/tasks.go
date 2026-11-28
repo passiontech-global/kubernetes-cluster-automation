@@ -190,7 +190,7 @@ func ParseMountinfo(data []byte) ([]MountEntry, int) {
 		pre := ln
 		var post string
 		hasSep := false
-		if sep := strings.LastIndex(ln, " - "); sep >= 0 {
+		if sep := strings.Index(ln, " - "); sep >= 0 {
 			pre = ln[:sep]
 			post = ln[sep+3:]
 			hasSep = true
@@ -203,9 +203,11 @@ func ParseMountinfo(data []byte) ([]MountEntry, int) {
 		if len(f) >= 5 {
 			ent.HasMount = true
 			ent.Mountpoint = procfs.UnescapeMountPath(f[4])
-			for _, opt := range f[6:] {
-				if grp, ok := strings.CutPrefix(opt, "shared:"); ok {
-					ent.SharedGroups = append(ent.SharedGroups, grp)
+			if len(f) > 6 {
+				for _, opt := range f[6:] {
+					if grp, ok := strings.CutPrefix(opt, "shared:"); ok {
+						ent.SharedGroups = append(ent.SharedGroups, grp)
+					}
 				}
 			}
 		}
