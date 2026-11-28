@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // tcpPreflight mirrors `timeout 5 bash -c "echo >/dev/tcp/$h/$p"`.
@@ -186,7 +188,7 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		httpx.DrainAndClose(resp.Body, 64<<10)
 		fc := failStatus
 		if resp.StatusCode == http.StatusUnauthorized ||
 			resp.StatusCode == http.StatusForbidden {
@@ -227,7 +229,7 @@ func (p *Prober) listRV(ctx context.Context, addr, path string) (rv int64, fc fa
 	// the remainder of a huge items array is discarded, never
 	// buffered — and never read to EOF unboundedly either: past
 	// 64 KiB the connection is not worth keeping, Close aborts it.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	httpx.DrainAndClose(resp.Body, 64<<10)
 	rv, err = strconv.ParseInt(list.Metadata.ResourceVersion, 10, 64)
 	if err != nil {
 		return 0, failParse,

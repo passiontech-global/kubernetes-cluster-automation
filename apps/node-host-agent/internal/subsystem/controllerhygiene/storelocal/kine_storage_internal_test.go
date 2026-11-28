@@ -45,10 +45,10 @@ func TestDirSizeBounded(t *testing.T) {
 		t.Fatalf("restricted dir contributed: total=%d want 35", total)
 	}
 
-	// The file cap stops the walk early (fs.SkipAll): the first
-	// counted file is b.txt (lexical) — the walk aborts inside the
-	// next dir before any deeper file counts.
-	total, err = dirSizeBounded(root, 1)
+	// The entry cap stops the walk early (fs.SkipAll): entry 1 is root,
+	// entry 2 is b.txt (lexical) — the walk aborts at entry 3 (member/)
+	// before any deeper file counts.
+	total, err = dirSizeBounded(root, 2)
 	if err != nil {
 		t.Fatalf("capped walk err=%v", err)
 	}

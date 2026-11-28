@@ -4,7 +4,6 @@
 package hostmetrics
 
 import (
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +11,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -162,25 +163,6 @@ func (c *Collector) walkLocalPVDirs() map[string]int64 {
 // skipped — a permission-denied subtree under-counts rather than
 // failing the whole volume.
 func dirSizeBytes(root string, maxEntries int) int64 {
-	var total int64
-	n := 0
-	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			logger().Debug("hostmetrics: localpv walk entry skipped — unreadable",
-				"path", path, "error", err)
-			return nil // skip unreadable entries, never fatal
-		}
-		n++
-		if n > maxEntries {
-			return fs.SkipAll
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if fi, err := d.Info(); err == nil {
-			total += fi.Size()
-		}
-		return nil
-	})
+	total, _, _ := fsx.WalkBytesBounded(root, nil, maxEntries)
 	return total
 }

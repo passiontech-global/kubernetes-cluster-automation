@@ -1438,7 +1438,7 @@ exit 0
 			if reCopyGoWork.MatchString(stripped) || strings.Contains(stripped, "go.work") {
 				t.Fatalf("Dockerfile must not COPY go.work (CI uses GOWORK=off parity):\n%s", stripped)
 			}
-			reFromAlpine := regexp.MustCompile(`(?im)^\s*FROM\s+golang:1\.27\.4-alpine(\s|$)`)
+			reFromAlpine := regexp.MustCompile(`(?im)^\s*FROM\s+(?:--platform=\S+\s+)?golang:1\.27\.4-alpine(?:\s|$)`)
 			if !reFromAlpine.MatchString(stripped) {
 				t.Fatalf("Dockerfile builder stage must use FROM golang:1.27.4-alpine (R4.3):\n%s", stripped)
 			}

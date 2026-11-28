@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // maxListRVBody caps one RV-probe response read. With the
@@ -231,7 +233,7 @@ func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64,
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		httpx.DrainAndClose(resp.Body, 64<<10)
 		logger().Warn("controllerhygiene: rv probe non-200",
 			"endpoint", endpoint, "cached", cached,
 			"status", resp.StatusCode)
@@ -246,7 +248,7 @@ func (d *Deps) ListRV(ctx context.Context, endpoint string, cached bool) (int64,
 	decErr := json.UnmarshalRead(lr, &list,
 		jsontext.AllowInvalidUTF8(true),
 		jsontext.AllowDuplicateNames(true))
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	httpx.DrainAndClose(resp.Body, 64<<10)
 	if decErr != nil || lr.N == 0 {
 		return 0, false
 	}
@@ -295,11 +297,11 @@ func (d *Deps) APIServerReadyEndpoints(ctx context.Context) (ready int, ok bool)
 		return 0, false
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
+	body, truncated, err := httpx.ReadBounded(resp.Body, 1<<20)
+	httpx.DrainAndClose(resp.Body, 64<<10)
+	if err != nil || truncated {
 		return 0, false
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
 		logger().Warn("controllerhygiene: endpoints probe non-200",
 			"endpoint", ep, "status", resp.StatusCode)

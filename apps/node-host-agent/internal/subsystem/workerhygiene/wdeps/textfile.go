@@ -9,7 +9,6 @@ package wdeps
 import (
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // maxBloatWalkEntries is the walk cap per scanned dir — the walk
@@ -41,24 +41,9 @@ const orphanHostPathDiskHigh = 0.80
 // into the per-cycle budget. entries counts EVERY visited entry
 // (dirs included, root itself first), cap hit included.
 func (d *Deps) WalkBytes(root string) (total int64, entries int, truncated bool) {
-	_ = filepath.WalkDir(root, func(path string, de fs.DirEntry, err error) error {
-		if err != nil {
-			logger().Debug("workerhygiene: bloat walk entry skipped — unreadable",
-				"path", path, "error", err)
-			return nil // unreadable entries are skipped, never fatal
-		}
-		entries++
-		if entries > maxBloatWalkEntries {
-			truncated = true
-			return fs.SkipAll
-		}
-		if de.Type().IsRegular() {
-			if fi, ierr := de.Info(); ierr == nil {
-				total += fi.Size()
-			}
-		}
-		return nil
-	})
+	budget := maxBloatWalkEntries
+	total, truncated, _ = fsx.WalkBytesBounded(root, &budget, maxBloatWalkEntries)
+	entries = maxBloatWalkEntries - budget
 	return total, entries, truncated
 }
 
@@ -112,15 +97,17 @@ func (d *Deps) WalkBudgeted(e *CycleEnv, root string) (total int64, truncated bo
 	if r, ok := e.walkCache[root]; ok {
 		return r.total, r.truncated
 	}
-	if e.walkSpent >= MaxBloatScanEntries {
+	rem := MaxBloatScanEntries - e.walkSpent
+	if rem <= 0 {
 		// Budget exhausted: skip the walk, cache the skip so later
 		// callers of the same root are map hits, and report no data —
 		// every threshold comparison then fails toward no action.
 		e.walkCache[root] = walkResult{truncated: true}
 		return 0, true
 	}
-	total, entries, truncated := d.WalkBytes(root)
-	e.walkSpent += entries
+	budget := rem
+	total, truncated, _ = fsx.WalkBytesBounded(root, &budget, maxBloatWalkEntries)
+	e.walkSpent += rem - budget
 	e.walkCache[root] = walkResult{total: total, truncated: truncated}
 	return total, truncated
 }

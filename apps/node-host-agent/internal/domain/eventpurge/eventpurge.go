@@ -243,14 +243,14 @@ func doReq(ctx context.Context, client *http.Client, method, u, accept string) (
 		return 0, nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// Read cap+1 so an oversize body is distinguishable from one
-	// landing exactly on the cap — a LimitReader-truncated page would
+	// Read cap+1 via ReadBounded so an oversize body is distinguishable
+	// from one landing exactly on the cap — a truncated page would
 	// otherwise surface downstream as a misleading JSON syntax error.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	body, truncated, err := httpx.ReadBounded(resp.Body, maxResponseBytes)
 	if err != nil {
 		return resp.StatusCode, resp.Header, nil, err
 	}
-	if len(body) > maxResponseBytes {
+	if truncated {
 		return resp.StatusCode, resp.Header, nil, fmt.Errorf(
 			"response exceeded %dMiB cap", maxResponseBytes>>20)
 	}

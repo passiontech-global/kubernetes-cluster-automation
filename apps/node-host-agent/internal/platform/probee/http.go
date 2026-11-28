@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // httpGet is the shared scaffolding behind every exported probe —
@@ -44,10 +46,10 @@ func httpGet[V any](ctx context.Context, client *http.Client, url, bearer string
 	return verdict(resp)
 }
 
-// drainBody discards up to limit bytes of the response body so the
-// shared transport can reuse the connection on the next cycle.
+// drainBody discards up to limit bytes of the response body and closes
+// it so the shared transport can reuse the connection on the next cycle.
 func drainBody(resp *http.Response, limit int64) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, limit))
+	httpx.DrainAndClose(resp.Body, limit)
 }
 
 // probeBodyCap bounds every body a probe retains — metrics scrapes
@@ -57,14 +59,13 @@ const probeBodyCap = 4 << 20
 // readCapped reads the body up to maxBytes and reports a truncated
 // capture as an error: LimitReader alone cannot tell "exactly
 // maxBytes" from "cut off at maxBytes", and a partial metrics body
-// or healthz payload must not parse as complete evidence. Reads
-// maxBytes+1 to make the distinction.
+// or healthz payload must not parse as complete evidence.
 func readCapped(r io.Reader, maxBytes int64) ([]byte, error) {
-	b, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	b, truncated, err := httpx.ReadBounded(r, maxBytes)
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(b)) > maxBytes {
+	if truncated {
 		return nil, fmt.Errorf("response body exceeds %d byte cap", maxBytes)
 	}
 	return b, nil

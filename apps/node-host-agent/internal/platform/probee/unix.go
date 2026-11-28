@@ -7,12 +7,13 @@ package probee
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 const maxUnixClients = 64
@@ -73,18 +74,18 @@ func UnixGet(ctx context.Context, socket, path string) ([]byte, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		httpx.DrainAndClose(resp.Body, 64<<10)
 		return nil, fmt.Errorf("GET %s: status %d", path, resp.StatusCode)
 	}
-	// 4 MiB hard cap: LimitReader alone would silently hand back a
-	// truncated body — a half-parsed service map reads as "zero
-	// backends". Read one byte past the cap and fail on overflow.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20+1))
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	// 4 MiB hard cap: ReadBounded reads one byte past the cap to distinguish
+	// an exact-cap body from overflow (a half-parsed service map reads as
+	// "zero backends").
+	body, truncated, err := httpx.ReadBounded(resp.Body, 4<<20)
+	httpx.DrainAndClose(resp.Body, 64<<10)
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > 4<<20 {
+	if truncated {
 		return nil, fmt.Errorf("GET %s: body exceeds 4MiB cap", path)
 	}
 	return body, nil
@@ -114,8 +115,7 @@ func UnixDelete(ctx context.Context, socket, path string) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	httpx.DrainAndClose(resp.Body, 64<<10)
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusNoContent, http.StatusPartialContent, http.StatusNotFound:
 		return nil

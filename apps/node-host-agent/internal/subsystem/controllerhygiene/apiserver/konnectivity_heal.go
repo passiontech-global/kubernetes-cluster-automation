@@ -36,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 const (
@@ -413,8 +414,7 @@ func (c *FreezeCheck) readyWorkers(ctx context.Context) int {
 		if statusOK {
 			decErr = json.UnmarshalRead(io.LimitReader(resp.Body, 8<<20), &list)
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
+		httpx.DrainAndClose(resp.Body, 64<<10)
 		cancel()
 		if !statusOK || decErr != nil {
 			return 0

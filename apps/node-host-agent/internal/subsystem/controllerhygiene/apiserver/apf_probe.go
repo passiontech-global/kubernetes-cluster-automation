@@ -33,6 +33,7 @@ import (
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 const (
@@ -208,7 +209,7 @@ func (c *FreezeCheck) apfMetrics(ctx context.Context) (string, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		httpx.DrainAndClose(resp.Body, 64<<10)
 		return "", fmt.Errorf("apiserver /metrics status %d", resp.StatusCode)
 	}
 	return scanAPFMetrics(resp.Body)

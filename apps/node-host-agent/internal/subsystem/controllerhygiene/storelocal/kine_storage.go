@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +22,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // Kine store health knobs — package vars rather than Config fields
@@ -188,30 +188,11 @@ func (c *StorageCheck) kineStoreSizes() (dbBytes, walBytes int64, ok bool) {
 }
 
 // dirSizeBounded sums regular-file sizes under root, stopping after
-// maxFiles entries — etcd member dirs stay small; the cap keeps a
+// maxEntries visited entries — etcd member dirs stay small; the cap keeps a
 // pathological tree from stalling the cycle. Unreadable entries are
 // skipped (best-effort gauge).
-func dirSizeBounded(root string, maxFiles int) (int64, error) {
-	var total int64
-	n := 0
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			logger().Debug("controllerhygiene: kine store walk entry skipped — unreadable",
-				"path", path, "error", err)
-			return nil // skip unreadable entries
-		}
-		if d.IsDir() {
-			return nil
-		}
-		n++
-		if n > maxFiles {
-			return fs.SkipAll
-		}
-		if info, ierr := d.Info(); ierr == nil {
-			total += info.Size()
-		}
-		return nil
-	})
+func dirSizeBounded(root string, maxEntries int) (int64, error) {
+	total, _, err := fsx.WalkBytesBounded(root, nil, maxEntries)
 	return total, err
 }
 

@@ -20,6 +20,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/probee"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // deletedFDStat is the DeletedFDStatFn default: stat() the
@@ -72,7 +73,7 @@ func kubeletMetricsGet(ctx context.Context, url, bearer string,
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		httpx.DrainAndClose(resp.Body, 64<<10)
 		return "", fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
 	}
 	return scanKubeletMetrics(resp.Body)

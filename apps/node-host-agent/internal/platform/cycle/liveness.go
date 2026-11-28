@@ -26,12 +26,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 // LivenessFloor is the minimum staleness bound any loop gets —
 // below it, ordinary scheduling jitter and a couple of missed
 // ticks would look like a wedge.
-const LivenessFloor = 15 * time.Minute
+const LivenessFloor = timex.DefaultLivenessFloor
 
 // DefaultCycleBudget is the per-cycle deadline most subsystems
 // apply around fn (the CycleTimeout class of bounds) — folded
@@ -39,26 +41,35 @@ const LivenessFloor = 15 * time.Minute
 // is not reported wedged while legitimately working.
 const DefaultCycleBudget = 15 * time.Minute
 
-// Beat is one loop's last-cycle stamp — nil until the first stamp
-// lands, preserving Go's monotonic clock reading across atomic loads.
-// MaxStaleNanos carries the loop's own staleness bound (0 → the
-// reader's default).
+// Beat is one loop's last-cycle stamp backed by a monotonic *timex.Beat
+// plus StampAt/LastBeat compatibility for deterministic tests.
 type Beat struct {
+	tb            *timex.Beat
 	lastProgress  atomic.Pointer[time.Time]
 	MaxStaleNanos atomic.Int64
+	backdated     atomic.Bool
 }
 
-// Stamp records the current time (including monotonic clock reading)
-// as the beat's latest progress timestamp.
+// Stamp records the current time (and advances the underlying timex.Beat
+// monotonic timestamp) as the beat's latest progress timestamp.
 func (b *Beat) Stamp() {
-	b.StampAt(time.Now())
+	if b == nil {
+		return
+	}
+	b.backdated.Store(false)
+	if b.tb != nil {
+		b.tb.Beat()
+	}
+	t := time.Now()
+	b.lastProgress.Store(&t)
 }
 
-// StampAt records t as the beat's latest progress timestamp.
+// StampAt records t as the beat's latest progress timestamp (test hook).
 func (b *Beat) StampAt(t time.Time) {
 	if b == nil {
 		return
 	}
+	b.backdated.Store(true)
 	cp := t
 	b.lastProgress.Store(&cp)
 }
@@ -84,26 +95,56 @@ func (b *Beat) StaleAfter() time.Duration {
 	if ns := b.MaxStaleNanos.Load(); ns > 0 {
 		return time.Duration(ns)
 	}
+	if b.tb != nil {
+		return b.tb.StaleAfter()
+	}
 	return 0
 }
 
-// Liveness is one heartbeat scope: the loop beats cycle.Runner
-// registers plus the shared fallback beat bare Heartbeat(ctx)
+// Stale reports whether a once-stamped beat has exceeded its staleness budget.
+// Never-stamped beats return false. Runtime Stamp() paths use the underlying
+// timex.Beat monotonic Age(); test StampAt() paths compare against now.
+func (b *Beat) Stale(now time.Time, defaultBudget time.Duration) bool {
+	if b == nil {
+		return false
+	}
+	last := b.LastBeat()
+	if last.IsZero() {
+		return false
+	}
+	budget := b.StaleAfter()
+	if budget <= 0 {
+		budget = defaultBudget
+	}
+	if b.tb != nil && !b.backdated.Load() {
+		return b.tb.Age() > budget
+	}
+	return now.Sub(last) > budget
+}
+
+// Liveness is one heartbeat scope backed by timex.Liveness: the loop beats
+// cycle.Runner registers plus the shared fallback beat bare Heartbeat(ctx)
 // calls stamp, plus any child registries RunAll attached for its
 // non-*Runner loopers. Exempt marks the whole registry invisible
 // to /healthz (cycle.Idle — a parked, disabled loop is alive by
 // definition); an exempt registry's children are skipped too.
 type Liveness struct {
+	inner    *timex.Liveness
 	mu       sync.Mutex
 	loops    []*Beat
 	children []*Liveness
 	fallback *Beat
-	exempt   atomic.Bool
 }
 
-// NewLiveness returns an empty registry.
+// NewLiveness returns an empty registry backed by timex.Liveness.
 func NewLiveness() *Liveness {
-	return &Liveness{fallback: &Beat{}}
+	inner := timex.NewLiveness()
+	inner.Floor = LivenessFloor
+	fb := timex.NewLiveness().Register("fallback", 0)
+	return &Liveness{
+		inner:    inner,
+		fallback: &Beat{tb: fb},
+	}
 }
 
 type livenessKey struct{}
@@ -172,11 +213,9 @@ func (l *Liveness) Attach(child *Liveness) (detach func()) {
 // overwriting the first's map entry.
 func (l *Liveness) RegisterLoop(name string, interval, budget time.Duration) *Beat {
 	stale := 3*interval + budget
-	if stale < LivenessFloor {
-		stale = LivenessFloor
-	}
-	b := &Beat{}
-	b.MaxStaleNanos.Store(int64(stale))
+	tb := l.inner.Register(name, stale)
+	b := &Beat{tb: tb}
+	b.MaxStaleNanos.Store(int64(tb.StaleAfter()))
 	l.mu.Lock()
 	l.loops = append(l.loops, b)
 	l.mu.Unlock()
@@ -196,6 +235,7 @@ func (l *Liveness) Unregister(b *Beat) {
 	if b == nil {
 		return
 	}
+	l.inner.Unregister(b.tb)
 	l.mu.Lock()
 	for i, lb := range l.loops {
 		if lb == b {
@@ -211,15 +251,14 @@ func (l *Liveness) Unregister(b *Beat) {
 // (recursively). An exempt registry contributes nothing: cycle.Idle
 // parks are alive by definition.
 func (l *Liveness) LoopBeats() []*Beat {
+	if l.inner.IsExempt() {
+		return nil
+	}
 	l.mu.Lock()
 	out := make([]*Beat, 0, len(l.loops))
 	out = append(out, l.loops...)
 	children := append([]*Liveness(nil), l.children...)
-	exempt := l.exempt.Load()
 	l.mu.Unlock()
-	if exempt {
-		return nil
-	}
 	for _, c := range children {
 		out = append(out, c.LoopBeats()...)
 	}
@@ -230,14 +269,13 @@ func (l *Liveness) LoopBeats() []*Beat {
 // whole non-exempt subtree — /healthz uses it to decide whether a
 // registry's fallback beat is meaningful.
 func (l *Liveness) LoopCount() int {
+	if l.inner.IsExempt() {
+		return 0
+	}
 	l.mu.Lock()
 	n := len(l.loops)
 	children := append([]*Liveness(nil), l.children...)
-	exempt := l.exempt.Load()
 	l.mu.Unlock()
-	if exempt {
-		return 0
-	}
 	for _, c := range children {
 		n += c.LoopCount()
 	}
@@ -258,15 +296,14 @@ func (l *Liveness) Fallbacks() []*Beat {
 }
 
 func (l *Liveness) collectFallbacks(out *[]*Beat) {
+	if l.inner.IsExempt() {
+		return
+	}
 	l.mu.Lock()
 	loops := len(l.loops)
 	children := append([]*Liveness(nil), l.children...)
-	exempt := l.exempt.Load()
 	fb := l.fallback
 	l.mu.Unlock()
-	if exempt {
-		return
-	}
 	childLoops := 0
 	for _, c := range children {
 		childLoops += c.LoopCount()
@@ -286,10 +323,10 @@ func (l *Liveness) Fallback() *Beat { return l.fallback }
 
 // Exempt marks the registry invisible to /healthz — cycle.Idle
 // calls it so a parked subsystem is never reported wedged.
-func (l *Liveness) Exempt() { l.exempt.Store(true) }
+func (l *Liveness) Exempt() { l.inner.Exempt() }
 
 // IsExempt reports the exempt flag.
-func (l *Liveness) IsExempt() bool { return l.exempt.Load() }
+func (l *Liveness) IsExempt() bool { return l.inner.IsExempt() }
 
 // Heartbeat records one completed cycle on the ctx's liveness
 // beat — a no-op outside an agent-supervised ctx (tests, ops,

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1776,8 +1777,14 @@ exit 0
 				t.Fatal(err)
 			}
 			content := string(b)
-			if !strings.Contains(content, "FROM golang:1.27.4") {
-				t.Fatalf("Dockerfile missing golang:1.27.4 builder:\n%s", content)
+			if !regexp.MustCompile(`(?im)^\s*FROM\s+(?:--platform=\S+\s+)?golang:1\.27\.4-alpine(?:\s|$)`).MatchString(content) {
+				t.Fatalf("Dockerfile missing golang:1.27.4-alpine builder:\n%s", content)
+			}
+			if !strings.Contains(content, "ENV GOWORK=off") {
+				t.Fatalf("Dockerfile missing ENV GOWORK=off")
+			}
+			if !strings.Contains(content, "GOOS=${TARGETOS}") || !strings.Contains(content, "GOARCH=${TARGETARCH}") {
+				t.Fatalf("Dockerfile missing GOOS/GOARCH cross-build flags")
 			}
 			if !strings.Contains(content, "CGO_ENABLED=0") {
 				t.Fatalf("Dockerfile missing CGO_ENABLED=0")

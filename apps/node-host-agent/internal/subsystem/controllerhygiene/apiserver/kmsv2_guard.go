@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 const (
@@ -425,8 +426,7 @@ func (c *KMSv2Check) probeHealthzProviders(ctx context.Context, count int, kmsCo
 			}
 			continue
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, kmsHealthzMaxRead))
-		_ = resp.Body.Close()
+		httpx.DrainAndClose(resp.Body, kmsHealthzMaxRead)
 		cancel()
 
 		if resp.StatusCode == http.StatusNotFound {

@@ -50,15 +50,7 @@ func (a *Agent) livenessWedged() bool {
 			return true
 		}
 		stale := func(b *cycle.Beat) bool {
-			last := b.LastBeat()
-			if last.IsZero() {
-				return false
-			}
-			budget := b.StaleAfter()
-			if budget <= 0 {
-				budget = subsystemLivenessStaleAfter
-			}
-			return now.Sub(last) > budget
+			return b.Stale(now, subsystemLivenessStaleAfter)
 		}
 		for _, b := range live.LoopBeats() {
 			if stale(b) {
