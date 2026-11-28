@@ -206,9 +206,13 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		}
 		// The separator bytes count toward the output too —
 		// range(1e6) | join(sep_1MiB) passed the per-item check
-		// while strings.Join allocated ~1 TiB.
-		if total+(len(parts)-1)*len(sep) > maxStringBytes {
-			return nil, fmt.Errorf("join: output exceeds %d bytes", maxStringBytes)
+		// while strings.Join allocated ~1 TiB. Guard len(sep) >
+		// maxStringBytes before multiplying so large counts cannot
+		// overflow int.
+		if len(parts) > 1 && len(sep) > 0 {
+			if len(sep) > maxStringBytes || len(parts)-1 > (maxStringBytes-total)/len(sep) {
+				return nil, fmt.Errorf("join: output exceeds %d bytes", maxStringBytes)
+			}
 		}
 		return strings.Join(parts, sep), nil
 	case "list":
@@ -575,30 +579,57 @@ func applyFilter(name string, v any, args []any, kw map[string]any, s *scope) (a
 		// rendered with — jinja2's own default is first=False.
 		blank := Truthy(kw["blank"])
 		s := Stringify(v)
-		lines := strings.Split(s, "\n")
-		// Output ≈ input + pad per indented line — a 16MiB input of
-		// short lines under a 10KB indent is GiB-scale. Count only
-		// lines that actually receive the pad (empty lines skip it
-		// unless blank=true) and fail BEFORE the builder allocates.
-		padded := 1 // lines[0] is always indented
-		for _, ln := range lines[1:] {
-			if ln != "" || blank {
-				padded++
-			}
-		}
-		if len(s)+padded*len(pad) > maxStringBytes {
+		if len(s) > maxStringBytes {
 			return nil, fmt.Errorf("indent: output exceeds %d bytes", maxStringBytes)
+		}
+		// Output ≈ input + pad per indented line — a 16MiB input of
+		// short lines (or newlines) under a 10KB indent is GiB-scale.
+		// Count padded lines via strings.Count/scan BEFORE any split
+		// or builder allocation so a 16 MiB string of '\n' cannot
+		// allocate ~268 MiB before failing maxStringBytes.
+		padded := 1 // first line is always indented
+		if len(pad) > 0 {
+			if blank {
+				padded += strings.Count(s, "\n")
+			} else {
+				for i := 0; i < len(s); {
+					nl := strings.IndexByte(s[i:], '\n')
+					if nl < 0 {
+						break
+					}
+					idx := i + nl
+					if idx+1 < len(s) && s[idx+1] != '\n' {
+						padded++
+					}
+					i = idx + 1
+				}
+			}
+			if padded > (maxStringBytes-len(s))/len(pad) {
+				return nil, fmt.Errorf("indent: output exceeds %d bytes", maxStringBytes)
+			}
 		}
 		var sb strings.Builder
 		sb.Grow(len(s) + padded*len(pad))
 		sb.WriteString(pad)
-		sb.WriteString(lines[0])
-		for _, ln := range lines[1:] {
-			sb.WriteByte('\n')
-			if ln != "" || blank {
+		first := true
+		for i := 0; ; {
+			nl := strings.IndexByte(s[i:], '\n')
+			if nl < 0 {
+				ln := s[i:]
+				if !first && (ln != "" || blank) {
+					sb.WriteString(pad)
+				}
+				sb.WriteString(ln)
+				break
+			}
+			ln := s[i : i+nl]
+			if !first && (ln != "" || blank) {
 				sb.WriteString(pad)
 			}
 			sb.WriteString(ln)
+			sb.WriteByte('\n')
+			first = false
+			i += nl + 1
 		}
 		return sb.String(), nil
 	case "flatten":

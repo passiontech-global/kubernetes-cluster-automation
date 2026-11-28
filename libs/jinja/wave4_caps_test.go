@@ -7,6 +7,7 @@
 package jinja
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -105,4 +106,78 @@ func TestRegexFastPathsSemanticsAndCaps(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestIndentNewlineFloodBounded(t *testing.T) {
+	// 16 MiB of '\n' with blank=true or blank=false must fail the output cap
+	// without allocating a ~268 MiB []string slice from strings.Split.
+	s := strings.Repeat("\n", maxStringBytes)
+	for _, tpl := range []string{
+		`{{ s | indent(4) | length }}`,
+		`{{ s | indent(4, blank=true) | length }}`,
+	} {
+		if _, err := renderBounded(t, tpl, map[string]any{"s": s}); err == nil {
+			t.Fatalf("expected indent cap error for %s", tpl)
+		}
+	}
+	// Smaller newline-dense input that fits under maxStringBytes with blank=false
+	// must still preserve blank-line skipping while failing when blank=true.
+	dense := strings.Repeat("\n", maxStringBytes/2)
+	got, err := renderBounded(t, `{{ s | indent(4) | length }}`, map[string]any{"s": dense})
+	if err != nil {
+		t.Fatalf("indent(4) blank=false failed: %v", err)
+	}
+	wantLen := strconv.Itoa(len(dense) + 4)
+	if got != wantLen {
+		t.Fatalf("indent(4) blank=false length = %q, want %s", got, wantLen)
+	}
+	if _, err := renderBounded(t, `{{ s | indent(4, blank=true) | length }}`, map[string]any{"s": dense}); err == nil {
+		t.Fatal("expected indent(4, blank=true) on dense newlines to exceed maxStringBytes")
+	}
+}
+
+func TestJoinSeparatorCapAndLargeCount(t *testing.T) {
+	sep := strings.Repeat("s", maxStringBytes+1)
+	if _, err := renderBounded(t, `{{ ['a','b'] | join(sep) }}`, map[string]any{"sep": sep}); err == nil {
+		t.Fatal("expected join with >maxStringBytes separator to fail")
+	}
+	// Single-element join does not emit the separator.
+	got, err := renderBounded(t, `{{ ['a'] | join(sep) }}`, map[string]any{"sep": sep})
+	if err != nil {
+		t.Fatalf("single-item join failed: %v", err)
+	}
+	if got != "a" {
+		t.Fatalf("single-item join = %q, want %q", got, "a")
+	}
+	// Multiplication of (len(parts)-1)*len(sep) must fail cleanly without overflow.
+	bigSep := strings.Repeat("x", 1024)
+	if _, err := renderBounded(t, `{{ range(20000) | join(sep) | length }}`, map[string]any{"sep": bigSep}); err == nil {
+		t.Fatal("expected join output > maxStringBytes to fail")
+	}
+}
+
+func TestFormatLeftAlignSignedFlags(t *testing.T) {
+	cases := []struct {
+		tpl  string
+		want string
+	}{
+		{`{{ '%-+5d' | format(7) }}`, "+7   "},
+		{`{{ '%-+5d' | format(-7) }}`, "-7   "},
+		{`{{ '%- 5d' | format(7) }}`, " 7   "},
+		{`{{ '%- 5d' | format(-7) }}`, "-7   "},
+		{`{{ '%+-5d' | format(7) }}`, "+7   "},
+		{`{{ '%-05d' | format(7) }}`, "7    "},
+		{`{{ '%-5d' | format(7) }}`, "7    "},
+		{`{{ '%+5d' | format(7) }}`, "   +7"},
+		{`{{ '% 5d' | format(7) }}`, "    7"},
+	}
+	for _, tc := range cases {
+		got, err := renderBounded(t, tc.tpl, nil)
+		if err != nil {
+			t.Fatalf("%s failed: %v", tc.tpl, err)
+		}
+		if got != tc.want {
+			t.Fatalf("%s = %q, want %q", tc.tpl, got, tc.want)
+		}
+	}
 }

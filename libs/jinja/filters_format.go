@@ -62,11 +62,7 @@ func pyFormat(format string, args []any) (string, error) {
 			if !validFmtSpec(spec, false) {
 				return "", fmt.Errorf("format: unsupported %%%s%c spec", spec, conv)
 			}
-			if strings.Contains(spec, "-") {
-				b.WriteString(fmt.Sprintf("%-"+strconv.Itoa(specWidth(spec))+"d", iv))
-			} else {
-				b.WriteString(fmt.Sprintf("%"+safeFmtSpec(spec)+"d", iv))
-			}
+			b.WriteString(fmt.Sprintf("%"+safeFmtSpec(spec)+"d", iv))
 		case 'x', 'X':
 			iv, ok := ToInt(a)
 			if !ok {
