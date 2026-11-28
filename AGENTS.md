@@ -9,7 +9,7 @@ per-module there).
 
 | Module | Kind | Owns |
 |--------|------|------|
-| `apps/node-automation-controller` | Go module | controller-runtime operator: 32 modules + 90-check cluster-health sweep |
+| `apps/node-automation-controller` | Go module | controller-runtime operator: 32 modules + 97-check cluster-health sweep |
 | `apps/node-host-agent` | Go module | per-node agent (DaemonSet + standalone systemd unit) |
 | `apps/webhook-dispatcher` | Go module | GitHub org webhook → Concourse check fan-out |
 | `libs/hostkit` | Go module, stdlib-only leaf | `envx` (env knobs), `envdoc` (AST env-coverage scanner), `logx`, `timex`, `nodecond`, `fsx` (atomic file IO), `ledger` (cooldown/first-seen/streak/seen ledgers), `httpx` (+`pprofx`) |
