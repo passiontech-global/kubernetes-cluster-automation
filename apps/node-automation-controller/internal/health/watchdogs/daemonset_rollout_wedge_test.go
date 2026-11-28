@@ -645,3 +645,86 @@ func TestDaemonSetRolloutWedgeP07ControllerRevisionFallbackEndToEnd(t *testing.T
 		}
 	}
 }
+
+func TestDaemonSetHostPortMaxSurgeDeadlock(t *testing.T) {
+	ctx := t.Context()
+	now := time.Now()
+	t.Cleanup(func() {
+		dsRolloutDeadlockGauge.DeleteLabelValues("edge", "proxy-ds", dsReasonHostPortMaxSurge)
+	})
+
+	surge := intstr.FromInt(1)
+	maxUnavail := intstr.FromInt(0)
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "edge", Name: "proxy-ds", Generation: 2},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "proxy-ds"}},
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
+				Type: appsv1.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDaemonSet{
+					MaxUnavailable: &maxUnavail,
+					MaxSurge:       &surge,
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "proxy-ds"}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:  "proxy",
+						Image: "proxy:v2",
+						Ports: []corev1.ContainerPort{{ContainerPort: 443, HostPort: 443}},
+					}},
+				},
+			},
+		},
+		Status: appsv1.DaemonSetStatus{
+			ObservedGeneration:     2,
+			DesiredNumberScheduled: 3,
+			UpdatedNumberScheduled: 1,
+		},
+	}
+
+	pendPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "edge",
+			Name:              "proxy-ds-new",
+			CreationTimestamp: metav1.NewTime(now.Add(-20 * time.Minute)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "DaemonSet", Name: "proxy-ds", Controller: ptr.To(true),
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodPending},
+	}
+
+	evFresh := &corev1.Event{
+		ObjectMeta:     metav1.ObjectMeta{Namespace: "edge", Name: "ev-ports"},
+		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Namespace: "edge", Name: "proxy-ds-new"},
+		Reason:         "FailedScheduling",
+		Message:        "0/3 nodes are available: 3 node(s) didn't have free ports for the requested pod ports.",
+		FirstTimestamp: metav1.NewTime(now.Add(-5 * time.Minute)),
+	}
+
+	// <15m must not flag yet.
+	cs, chk := dsWedgeFixture(t, now, ds, pendPod, evFresh)
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if !res.Pass {
+		t.Fatalf("expected <15m hostPort+maxSurge event not to flag, got %+v", res)
+	}
+
+	// >=15m flags hostport_maxsurge_deadlock and emits Warning Event.
+	evFresh.FirstTimestamp = metav1.NewTime(now.Add(-20 * time.Minute))
+	_ = evFresh.ObjectMeta
+	cs2, chk2 := dsWedgeFixture(t, now, ds, pendPod, evFresh)
+	res2 := chk2.Run(probetest.SweepCtx(ctx, chk2.Deps))
+	if res2.Pass || !strings.Contains(res2.Why, dsReasonHostPortMaxSurge) {
+		t.Fatalf("expected hostport_maxsurge_deadlock failure, got %+v", res2)
+	}
+	if got := testutil.ToFloat64(dsRolloutDeadlockGauge.WithLabelValues("edge", "proxy-ds", dsReasonHostPortMaxSurge)); got != 1 {
+		t.Fatalf("dsRolloutDeadlockGauge = %v, want 1", got)
+	}
+	evs, err := cs2.EventsV1().Events("edge").List(ctx, metav1.ListOptions{})
+	if err != nil || len(evs.Items) == 0 {
+		t.Fatalf("expected Warning Event, got err=%v count=%d", err, len(evs.Items))
+	}
+	_ = cs
+}

@@ -78,6 +78,11 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 	if !certReadyFalse(cert) && !certExpiringSoon(cert, now) {
 		return false
 	}
+	if reason, paused := r.issuerPaused(ctx, cert); paused {
+		log.Info("PAUSE: safety brake active — skipping stuck-CR reap",
+			"cert", key, "reason", reason)
+		return false
+	}
 	if r.crReaped.CooledDown(key, crReapMinGap, now) {
 		log.Info("SKIP: stuck-CR reap rate-limited (max 1/6h)", "cert", key)
 		return false
@@ -121,6 +126,12 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 	orders, oerr := r.listOrdersForCert(ctx, ns, name)
 	if oerr != nil {
 		log.Error(oerr, "order attribution failed", "cert", key)
+		return false
+	}
+	if r.issuerBrakeEnabled() && anyACMERateLimited(orders) {
+		r.markIssuerRateLimited(cert, "ACME 429/rateLimited on Order")
+		log.Info("PAUSE: ACME rate-limit (429) on Order — skipping stuck-CR reap to preserve quota",
+			"cert", key)
 		return false
 	}
 	var liveOrder *unstructured.Unstructured

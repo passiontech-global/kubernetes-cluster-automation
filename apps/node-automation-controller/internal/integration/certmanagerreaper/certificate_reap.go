@@ -141,9 +141,21 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	key := ns + "/" + name
 	now := r.now.Now()
 
+	if reason, paused := r.issuerPaused(ctx, cert); paused {
+		log.Info("PAUSE: safety brake active — skipping Order reap",
+			"cert", key, "reason", reason)
+		return false
+	}
+
 	orders, err := r.listOrdersForCert(ctx, ns, name)
 	if err != nil {
 		log.Error(err, "order attribution failed", "cert", key)
+		return false
+	}
+	if r.issuerBrakeEnabled() && anyACMERateLimited(orders) {
+		r.markIssuerRateLimited(cert, "ACME 429/rateLimited on Order")
+		log.Info("PAUSE: ACME rate-limit (429) on Order — skipping reap to preserve quota",
+			"cert", key)
 		return false
 	}
 
@@ -193,6 +205,12 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 	chals, err := r.listChallenges(ctx, ns)
 	if err != nil {
 		log.Error(err, "challenge list failed", "cert", key)
+		return false
+	}
+	if r.issuerBrakeEnabled() && anyACMERateLimited(chals.Items) {
+		r.markIssuerRateLimited(cert, "ACME 429/rateLimited on Challenge")
+		log.Info("PAUSE: ACME rate-limit (429) on Challenge — skipping Order reap to preserve quota",
+			"cert", key)
 		return false
 	}
 

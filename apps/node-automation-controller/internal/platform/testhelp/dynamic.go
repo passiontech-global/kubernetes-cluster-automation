@@ -46,6 +46,8 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	// clusterhealthprobes' Certificate signature watches).
 	{Group: "cert-manager.io", Version: "v1", Kind: "Certificate"},
 	{Group: "cert-manager.io", Version: "v1", Kind: "CertificateRequest"},
+	{Group: "cert-manager.io", Version: "v1", Kind: "Issuer"},
+	{Group: "cert-manager.io", Version: "v1", Kind: "ClusterIssuer"},
 	{Group: "acme.cert-manager.io", Version: "v1", Kind: "Order"},
 	{Group: "acme.cert-manager.io", Version: "v1", Kind: "Challenge"},
 
@@ -102,8 +104,9 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "everest.percona.com", Version: "v1alpha1", Kind: "DatabaseCluster"},
 	{Group: "everest.percona.com", Version: "v1alpha1", Kind: "DatabaseClusterBackup"},
 
-	// argocd (argocd_app_stuck, operator scans).
+	// argocd (argocd_app_stuck, operator scans, gitops-mass-prune-guard).
 	{Group: "argoproj.io", Version: "v1alpha1", Kind: "Application"},
+	{Group: "argoproj.io", Version: "v1alpha1", Kind: "ApplicationSet"},
 	{Group: "argoproj.io", Version: "v1beta1", Kind: "ArgoCD"},
 
 	// olm (clusterhealthprobes' subscription-health check + the

@@ -30,13 +30,15 @@ import (
 type gatewayRouteHealthCheck struct {
 	*probefw.Deps
 
-	since         state.FirstSeenLedger
-	emitted       state.GaugeLedger[string]
-	zeroSince     state.FirstSeenLedger
-	zeroEmitted   state.GaugeLedger[string]
-	zeroLast      map[string][]string
-	liveLast      map[string][]string
-	immediateLast map[string]bool
+	since           state.FirstSeenLedger
+	emitted         state.GaugeLedger[string]
+	zeroSince       state.FirstSeenLedger
+	zeroEmitted     state.GaugeLedger[string]
+	conflictEmitted state.GaugeLedger[string]
+	eventCooldown   state.CooldownSet
+	zeroLast        map[string][]string
+	liveLast        map[string][]string
+	immediateLast   map[string]bool
 }
 
 // NewGatewayRouteHealthCheck builds the gateway-route-health check.
@@ -62,6 +64,11 @@ const (
 	routeReasonZeroEndpoints     = "backend_zero_endpoints"
 	gwReasonProgrammedFalse      = "programmed_false"
 	gwReasonClassMissing         = "gateway_class_missing"
+	gwReasonListenerConflicted   = "listener_conflicted"
+	gwReasonTLSCertMissing       = "tls_cert_missing"
+	gwReasonTLSCertExpiring      = "tls_cert_expiring"
+	gwTLSCertExpiringWindow      = 30 * 24 * time.Hour
+	gwConflictEventCooldown      = 30 * time.Minute
 )
 
 var (
@@ -73,11 +80,15 @@ var (
 		Name: "node_automation_gateway_route_zero_endpoints",
 		Help: "1 while a route backendRef Service has zero Ready endpoints past the 5m window (negative-cache-guard).",
 	}, []string{"kind", "namespace", "name", "service_namespace", "service"})
+	gatewayRouteConflictGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_gateway_route_conflict",
+		Help: "1 while >=2 namespaces attach HTTPRoutes to the identical (parentGateway, sectionName, hostname, path) tuple.",
+	}, []string{"gateway", "section", "hostname", "path"})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
-		gatewayRouteUnhealthyGauge, gatewayRouteZeroEndpointsGauge)
+		gatewayRouteUnhealthyGauge, gatewayRouteZeroEndpointsGauge, gatewayRouteConflictGauge)
 }
 
 func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
@@ -86,6 +97,7 @@ func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
 	}
 	log := logf.FromContext(ctx)
 	now := p.Now()
+	p.eventCooldown.PruneExpired(now, gwConflictEventCooldown)
 
 	census := newGatewayRouteCensus()
 	live := map[string][]string{}
@@ -93,7 +105,7 @@ func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
 	zeroNow := map[string][]string{}
 	unhealthyGatewayRefs := map[string]bool{}
 	routeCensusFailed := false
-	var rep probefw.SweepReport
+	var rep, conflictRep probefw.SweepReport
 
 	carryKind := func(kind string) {
 		prefix := kind + "/"
@@ -161,10 +173,18 @@ func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
 			routeCensusFailed = true
 			rep.InfraErr(fmt.Errorf("list %s: %w", rk.gvr.Resource, err))
 			carryKind(rk.kind)
+			if rk.kind == "HTTPRoute" {
+				for ck, clv := range p.conflictEmitted.Last() {
+					conflictRep.Carry(ck, clv)
+				}
+			}
 			continue
 		}
 		for i := range routes {
 			p.scanRoute(ctx, log, census, &routes[i], rk.kind, live, zeroNow, unhealthyGatewayRefs)
+		}
+		if rk.kind == "HTTPRoute" {
+			p.scanHTTPRouteConflicts(ctx, log, now, routes, &conflictRep, &rep)
 		}
 	}
 
@@ -197,7 +217,10 @@ func (p *gatewayRouteHealthCheck) Run(ctx context.Context) probefw.Result {
 				bounceCandidates = append(bounceCandidates, cand)
 			}
 		}
+		p.scanGatewayTLSCertRefs(ctx, log, gws, live, immediate, now)
 	}
+
+	conflictRep.Close(&p.conflictEmitted, gatewayRouteConflictGauge.DeleteLabelValues)
 
 	p.liveLast = live
 	p.immediateLast = immediate

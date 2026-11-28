@@ -134,6 +134,7 @@ var certificateGVR = kube.GVRCertificate
 // prune-sweep trivially exact (no string splitting on re-emit).
 type webhookMetricKey struct{ kind, name, webhook string }
 type secretMetricKey struct{ namespace, name string }
+type issuerMetricKey struct{ kind, namespace, name string }
 
 // replicationMetricKey is the exact label tuple of the
 // ReplicatedSecretDrift gauge — source is the verbatim
@@ -193,6 +194,8 @@ type certDriftAuditor struct {
 	// caBundle days-to-expiry and linkerd trust-bundle gauges.
 	seenWebhookExpiry state.GaugeLedger[webhookMetricKey]
 	seenTrustBundles  state.GaugeLedger[secretMetricKey]
+	seenIssuers       state.GaugeLedger[issuerMetricKey]
+	issuerFirstSeen   state.FirstSeenLedger
 	// replicationMismatch counts consecutive scans where a
 	// replicated secret's tls.crt differed from its source — drift
 	// fires only at replicationDriftScans, so a replicator mid-sync
@@ -347,7 +350,8 @@ func (a *certDriftAuditor) run(ctx context.Context) error {
 	tlsErr := a.auditTLSSecrets(ctx)
 	trustErr := a.auditTrustBundles(ctx)
 	liveErr := a.auditLiveSockets(ctx)
-	return errors.Join(webhookErr, tlsErr, trustErr, liveErr)
+	issuerErr := a.auditIssuers(ctx)
+	return errors.Join(webhookErr, tlsErr, trustErr, liveErr, issuerErr)
 }
 
 // ---------------------------------------------------------------------------

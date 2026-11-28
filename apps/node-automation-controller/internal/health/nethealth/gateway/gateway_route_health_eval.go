@@ -108,6 +108,10 @@ func (p *gatewayRouteHealthCheck) scanGateway(ctx context.Context,
 		case c.Type == "ResolvedRefs" && c.Status == "False":
 			refErr = true
 			flagGW(routeReasonResolvedRefsFalse, persistedNow)
+		case c.Type == "Conflicted" && c.Status == "True":
+			flagGW(gwReasonListenerConflicted, persistedNow)
+			p.emitGatewayWarning(ctx, log, now, gw, "GatewayListenerConflicted",
+				"Gateway listener "+ns+"/"+name+" reports Conflicted=True: "+c.Message)
 		}
 	}
 

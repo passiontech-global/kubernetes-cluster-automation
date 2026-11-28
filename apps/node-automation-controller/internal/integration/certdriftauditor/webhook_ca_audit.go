@@ -134,6 +134,27 @@ func (a *certDriftAuditor) auditWebhookCABundles(ctx context.Context) error {
 	}
 	a.liveRunCRDRefsSet = true
 
+	// Also audit apiregistration.k8s.io/v1 APIService spec.caBundle expiry
+	// and empty service-backed caBundles (same expiry/fail-closed posture).
+	if a.dyn != nil {
+		if err := kube.ListEach(ctx,
+			metav1.ListOptions{Limit: kube.DefaultListPageSize},
+			kube.DynamicPage(a.dyn.Resource(kube.GVRAPIService)),
+			func(page []unstructured.Unstructured) error {
+				for i := range page {
+					entry, ok := apiServiceCAEntry(&page[i])
+					if !ok {
+						continue
+					}
+					a.auditOneWebhookConfig(ctx, "APIService",
+						page[i].GetName(), page[i].GetAnnotations(), []webhookEntry{entry})
+				}
+				return nil
+			}); err != nil && !apierrors.IsForbidden(err) && !kube.IsCRDAbsent(err) {
+			return fmt.Errorf("list apiservices: %w", err)
+		}
+	}
+
 	// Prune series for entries no longer covered — a webhook entry
 	// deleted or an annotation removed must not pin drift=1 (or a
 	// dead expiry figure) forever.
@@ -453,4 +474,38 @@ func collectTypedCRDConversionService(crd *apiextensionsv1.CustomResourceDefinit
 		}
 		putRef(refs, svc.Namespace, svc.Name, port)
 	}
+}
+
+func apiServiceCAEntry(u *unstructured.Unstructured) (webhookEntry, bool) {
+	if u.GetDeletionTimestamp() != nil {
+		return webhookEntry{}, false
+	}
+	svcMap, hasSvc := kube.NestedMap(u.Object, "spec", "service")
+	if !hasSvc || len(svcMap) == 0 {
+		return webhookEntry{}, false
+	}
+	insecure, _ := kube.NestedBool(u.Object, "spec", "insecureSkipTLSVerify")
+	if insecure {
+		return webhookEntry{}, false
+	}
+	ns, _ := kube.NestedString(svcMap, "namespace")
+	name, _ := kube.NestedString(svcMap, "name")
+	if ns == "" || name == "" {
+		return webhookEntry{}, false
+	}
+	e := webhookEntry{
+		name:    "apiservice",
+		service: &admissionv1.ServiceReference{Namespace: ns, Name: name},
+		fail:    true,
+	}
+	if b64, ok := kube.NestedString(u.Object, "spec", "caBundle"); ok && b64 != "" {
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			logf.Log.Info("skip: APIService caBundle is not valid base64",
+				"apiservice", u.GetName())
+		} else {
+			e.caBundle = raw
+		}
+	}
+	return e, true
 }

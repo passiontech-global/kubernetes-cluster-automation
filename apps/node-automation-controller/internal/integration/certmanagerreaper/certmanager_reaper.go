@@ -39,6 +39,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/shared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
 const (
@@ -108,6 +109,12 @@ type certManagerReaper struct {
 	// namespace — reapCert and reapStuckCR share one Challenge list
 	// per namespace per sweep (same lifecycle as crCache).
 	challengeCache map[string]crListResult
+
+	// issuerBrakeDisabled opts out of the default-ON ACME/Issuer safety brake.
+	issuerBrakeDisabled bool
+	// issuerBlockedCache: per-run Issuer/ClusterIssuer readiness and ACME
+	// 429/rateLimited verdict memo keyed by "<kind>/<ns>/<name>".
+	issuerBlockedCache map[string]issuerBrakeVerdict
 }
 
 // crListResult is the cached outcome of one namespace's CR List.
@@ -122,9 +129,15 @@ type crListResult struct {
 // registration entirely.
 func Setup(d shared.Deps) error {
 	mgr, dyn := d.Mgr, d.Dyn
-	return shared.SetupNoConfig(d, func() error {
-		r := &certManagerReaper{dyn: dyn, queue: d.Name,
-			resets: map[string]*certReset{}}
+	return shared.SetupWithConfig(d, func() bool {
+		return envx.Gate("CERTMANAGER_REAPER_ISSUER_BRAKE_ENABLED", true)
+	}, func(brakeEnabled bool) error {
+		r := &certManagerReaper{
+			dyn:                 dyn,
+			queue:               d.Name,
+			resets:              map[string]*certReset{},
+			issuerBrakeDisabled: !brakeEnabled,
+		}
 		return shared.AddPeriodic(mgr, r.queue, 15*time.Minute, r.run)
 	})
 }
@@ -147,6 +160,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 	r.crCache = map[string]crListResult{}
 	r.orderCache = map[string]*orderIndex{}
 	r.challengeCache = map[string]crListResult{}
+	r.issuerBlockedCache = map[string]issuerBrakeVerdict{}
 	// Release the per-cycle caches when the sweep ends — they are
 	// rebuilt fresh next run, and between cycles they held every
 	// listed CertificateRequest/Order/Challenge object pinned for the
@@ -156,6 +170,7 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 		r.crCache = nil
 		r.orderCache = nil
 		r.challengeCache = nil
+		r.issuerBlockedCache = nil
 	}()
 	now := r.now.Now()
 

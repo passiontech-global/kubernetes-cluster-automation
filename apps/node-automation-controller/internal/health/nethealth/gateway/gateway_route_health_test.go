@@ -924,6 +924,7 @@ func TestGatewayCrossNamespaceCertRefGrant(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, "Gateway", "edge", tc.gwName, routeReasonRefNotPermitted)
+			testutil.CleanupMetric(t, gatewayRouteUnhealthyGauge, "Gateway", "edge", tc.gwName, gwReasonTLSCertMissing)
 			objs := []runtime.Object{
 				gatewayClassFixture("cilium", "io.cilium/gateway-controller", gwCondAt("Accepted", "True", "", now.Add(-30*time.Minute))),
 				makeGWWithCert("edge", tc.gwName, "certs", "tls-cert"),
@@ -933,7 +934,7 @@ func TestGatewayCrossNamespaceCertRefGrant(t *testing.T) {
 			if tc.name == "permitted_v1_grant_passes" {
 				objs[2].(*unstructured.Unstructured).SetAPIVersion("gateway.networking.k8s.io/v1")
 			}
-			p := testProberDyn(fake.NewSimpleClientset(), gwOpDyn(t, objs...))
+			p := testProberDyn(fake.NewSimpleClientset(testValidTLSSecret(t, "certs", "tls-cert", now.Add(90*24*time.Hour))), gwOpDyn(t, objs...))
 			res := driveRouteCheck(t, p, now)
 			if res.Pass != tc.wantPass {
 				t.Fatalf("Pass = %v (Why=%q), want %v", res.Pass, res.Why, tc.wantPass)

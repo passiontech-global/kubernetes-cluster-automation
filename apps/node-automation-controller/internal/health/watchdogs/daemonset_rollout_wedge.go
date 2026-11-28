@@ -37,6 +37,7 @@ package watchdogs
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -70,6 +71,10 @@ const (
 	// dsWedgeHealCooldown bounds deletes to one pod per DaemonSet
 	// per window.
 	dsWedgeHealCooldown = 30 * time.Minute
+
+	hostPortDeadlockMinAge        = 15 * time.Minute
+	hostPortDeadlockEventCooldown = 30 * time.Minute
+	dsReasonHostPortMaxSurge      = "hostport_maxsurge_deadlock"
 )
 
 // nodeRolloutState is the per-node census row the wedge check needs:
@@ -96,6 +101,10 @@ type dsRolloutWedgeCheck struct {
 	wedgeSeen state.FirstSeenLedger
 	// wedgeEmitted is the gauge ledger for the emitted series.
 	wedgeEmitted state.GaugeLedger[string]
+
+	hostPortSeen    state.FirstSeenLedger
+	hostPortEmitted state.GaugeLedger[string]
+	hostPortEvents  state.CooldownSet
 }
 
 // NewDaemonSetRolloutWedgeCheck builds the check.
@@ -113,10 +122,17 @@ var (
 		Name: "node_automation_daemonset_rollout_wedged",
 		Help: "1 while a DaemonSet RollingUpdate has been pinned >=30m short of desired by a terminating-on-dead-node or unready-on-cordoned-node pod — daemonset-rollout-wedge.",
 	}, []string{"namespace", "daemonset"})
+
+	// node_automation_daemonset_rollout_deadlock — 1 per DaemonSet pinned by
+	// hostPort + maxSurge > 0 port-collision deadlock >=15m.
+	dsRolloutDeadlockGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_daemonset_rollout_deadlock",
+		Help: "1 while a DaemonSet RollingUpdate exhibits a rollout deadlock (e.g. hostport_maxsurge_deadlock) >=15m — daemonset-rollout-wedge.",
+	}, []string{"namespace", "daemonset", "reason"})
 )
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(dsRolloutWedgedGauge)
+	ctrlmetrics.Registry.MustRegister(dsRolloutWedgedGauge, dsRolloutDeadlockGauge)
 }
 
 // Run sweeps the DaemonSet census for rollout wedges.
@@ -124,7 +140,8 @@ func (p *dsRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 	p.wedgeEmitted.Begin()
 	log := logf.FromContext(ctx)
 	now := p.Now()
-	var rep probefw.SweepReport
+	p.hostPortEvents.PruneExpired(now, hostPortDeadlockEventCooldown)
+	var rep, hostPortRep probefw.SweepReport
 
 	dsList, err := p.AllDaemonSets(ctx)
 	if err != nil {
@@ -190,6 +207,8 @@ func (p *dsRolloutWedgeCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	p.wedgeSeen.Prune(func(key string) bool { return seen[key] })
+	p.scanHostPortMaxSurgeDeadlocks(ctx, log, now, dsList, podsByDS, &hostPortRep, &rep)
+	hostPortRep.Close(&p.hostPortEmitted, dsRolloutDeadlockGauge.DeleteLabelValues)
 	rep.Close(&p.wedgeEmitted, dsRolloutWedgedGauge.DeleteLabelValues)
 	return rep.Verdict("daemonset rollout wedge: ", "; ")
 }
@@ -464,4 +483,158 @@ func (p *dsRolloutWedgeCheck) maybeHealPod(ctx context.Context,
 		pod.Name + " on " + dsKey)
 	log.Info("ACTION: deleted wedging DaemonSet pod to unstick rollout",
 		"daemonset", dsKey, "pod", pod.Namespace+"/"+pod.Name)
+}
+
+func dsHasHostPortMaxSurge(ds *appsv1.DaemonSet) bool {
+	if ds.Spec.UpdateStrategy.Type != appsv1.RollingUpdateDaemonSetStrategyType {
+		return false
+	}
+	if ds.Status.UpdatedNumberScheduled >= ds.Status.DesiredNumberScheduled {
+		return false
+	}
+	ru := ds.Spec.UpdateStrategy.RollingUpdate
+	if ru == nil || ru.MaxSurge == nil {
+		return false
+	}
+	surge, err := intstr.GetScaledValueFromIntOrPercent(
+		ru.MaxSurge, int(ds.Status.DesiredNumberScheduled), true)
+	if err != nil || surge <= 0 {
+		return false
+	}
+	return dsHasHostPort(ds)
+}
+
+func dsHasHostPort(ds *appsv1.DaemonSet) bool {
+	for _, c := range ds.Spec.Template.Spec.Containers {
+		for _, pt := range c.Ports {
+			if pt.HostPort > 0 {
+				return true
+			}
+		}
+	}
+	for _, c := range ds.Spec.Template.Spec.InitContainers {
+		for _, pt := range c.Ports {
+			if pt.HostPort > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (p *dsRolloutWedgeCheck) scanHostPortMaxSurgeDeadlocks(
+	ctx context.Context,
+	log logr.Logger,
+	now time.Time,
+	dsList []appsv1.DaemonSet,
+	podsByDS map[string][]*corev1.Pod,
+	hostPortRep *probefw.SweepReport,
+	summaryRep *probefw.SweepReport,
+) {
+	type dsCand struct {
+		ds      *appsv1.DaemonSet
+		pending []*corev1.Pod
+	}
+	var cands []dsCand
+	for i := range dsList {
+		ds := &dsList[i]
+		if !dsHasHostPortMaxSurge(ds) {
+			continue
+		}
+		key := ds.Namespace + "/" + ds.Name
+		var pend []*corev1.Pod
+		for _, pod := range podsByDS[key] {
+			if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodPending {
+				pend = append(pend, pod)
+			}
+		}
+		if len(pend) > 0 {
+			cands = append(cands, dsCand{ds: ds, pending: pend})
+		}
+	}
+	if len(cands) == 0 {
+		p.hostPortSeen.Prune(func(string) bool { return false })
+		return
+	}
+
+	events, err := p.AllEvents(ctx)
+	if err != nil {
+		summaryRep.InfraErr(fmt.Errorf("list events for hostport deadlock: %w", err))
+		for k, lv := range p.hostPortEmitted.Last() {
+			hostPortRep.Carry(k, lv)
+		}
+		return
+	}
+	eventsByPod := map[string][]*corev1.Event{}
+	for i := range events {
+		ev := &events[i]
+		if ev.InvolvedObject.Kind != "Pod" {
+			continue
+		}
+		ns := ev.InvolvedObject.Namespace
+		if ns == "" {
+			ns = ev.Namespace
+		}
+		pk := ns + "/" + ev.InvolvedObject.Name
+		eventsByPod[pk] = append(eventsByPod[pk], ev)
+	}
+
+	seen := map[string]bool{}
+	for _, cand := range cands {
+		ds := cand.ds
+		key := ds.Namespace + "/" + ds.Name
+		matched := false
+		preAged := false
+		for _, pod := range cand.pending {
+			pk := pod.Namespace + "/" + pod.Name
+			for _, ev := range eventsByPod[pk] {
+				if !strings.Contains(strings.ToLower(ev.Message), "didn't have free ports") {
+					continue
+				}
+				matched = true
+				evAgeAt := ev.FirstTimestamp.Time
+				if evAgeAt.IsZero() {
+					evAgeAt = kube.EventTime(ev)
+				}
+				if !pod.CreationTimestamp.IsZero() &&
+					now.Sub(pod.CreationTimestamp.Time) >= hostPortDeadlockMinAge &&
+					!evAgeAt.IsZero() && now.Sub(evAgeAt) >= hostPortDeadlockMinAge {
+					preAged = true
+					break
+				}
+			}
+			if preAged {
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		first, tracked := p.hostPortSeen.Observe(key, now)
+		seen[key] = true
+		if !preAged && (!tracked || now.Sub(first) < hostPortDeadlockMinAge) {
+			continue
+		}
+		hostPortRep.Flag(dsRolloutDeadlockGauge, key,
+			[]string{ds.Namespace, ds.Name, dsReasonHostPortMaxSurge})
+		summaryRep.Find("daemonset " + key + " " + dsReasonHostPortMaxSurge)
+		probefw.EmitWarningDeduped(ctx, p.CS, log, &p.hostPortEvents, key,
+			hostPortDeadlockEventCooldown, now, kube.WarningEvent{
+				Name:      kube.TruncatedEventName("ds-hostport-deadlock."+ds.Name, key, now),
+				Namespace: ds.Namespace,
+				Reason:    "DaemonSetHostPortDeadlock",
+				Note: fmt.Sprintf(
+					"DaemonSet %s/%s RollingUpdate has hostPort>0 and maxSurge>0 with Pending pods blocked on free ports >=%s; set maxSurge=0",
+					ds.Namespace, ds.Name, hostPortDeadlockMinAge),
+				Regarding: corev1.ObjectReference{
+					APIVersion: "apps/v1",
+					Kind:       "DaemonSet",
+					Namespace:  ds.Namespace,
+					Name:       ds.Name,
+					UID:        ds.UID,
+				},
+				ReportingInstance: p.Name,
+			})
+	}
+	p.hostPortSeen.Prune(func(k string) bool { return seen[k] })
 }

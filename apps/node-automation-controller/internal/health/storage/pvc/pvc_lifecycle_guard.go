@@ -69,6 +69,21 @@ var (
 		Name: "node_automation_volumesnapshot_failed",
 		Help: "1 while a non-terminating VolumeSnapshot has readyToUse!=true or status.error set past 2h.",
 	}, []string{"namespace", "snapshot"})
+
+	storageClassDefaultAnomalyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_storageclass_default_anomaly",
+		Help: "1 when default StorageClass count != 1 (multiple_defaults or zero_defaults).",
+	}, []string{"reason"})
+
+	rwoRollingUpdateDeadlockGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_rwo_rollingupdate_deadlock",
+		Help: "1 while a RollingUpdate Deployment is pinned >=10m by a ReadWriteOnce/ReadWriteOncePod Multi-Attach deadlock on a live node.",
+	}, []string{"namespace", "deployment", "pvc"})
+
+	csiVolumePressureGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_csinode_volume_pressure",
+		Help: "1 while a CSINode driver volume attachment count reaches >=90% of allocatable.count.",
+	}, []string{"node", "driver"})
 )
 
 func init() {
@@ -77,6 +92,9 @@ func init() {
 		podFSGroupStallGauge,
 		pvReleasedStaleGauge,
 		volumeSnapshotFailedGauge,
+		storageClassDefaultAnomalyGauge,
+		rwoRollingUpdateDeadlockGauge,
+		csiVolumePressureGauge,
 	)
 }
 
@@ -84,39 +102,58 @@ type pvcLifecycleGuardCheck struct {
 	*probefw.Deps
 
 	pvReleasedMaxAge time.Duration
+	rwoHealEnabled   bool
+	csiTaintEnabled  bool
 
 	pendingSeen state.FirstSeenLedger
 	fsgroupSeen state.FirstSeenLedger
+	rwoSeen     state.FirstSeenLedger
 
-	pendingEmitted state.GaugeLedger[string]
-	fsgroupEmitted state.GaugeLedger[string]
-	pvEmitted      state.GaugeLedger[string]
-	vsEmitted      state.GaugeLedger[string]
+	pendingEmitted   state.GaugeLedger[string]
+	fsgroupEmitted   state.GaugeLedger[string]
+	pvEmitted        state.GaugeLedger[string]
+	vsEmitted        state.GaugeLedger[string]
+	scDefaultEmitted state.GaugeLedger[string]
+	rwoEmitted       state.GaugeLedger[string]
+	csiEmitted       state.GaugeLedger[string]
+
+	rwoHeals      state.CooldownSet
+	csiHeals      state.CooldownSet
+	eventCooldown state.CooldownSet
 }
 
 // NewPVCLifecycleGuardCheck builds the pvc-lifecycle-guard check, resolving
-// NODE_AUTOMATION_PV_RELEASED_MAX_AGE once at construction.
+// its env knobs once at construction.
 func NewPVCLifecycleGuardCheck(d *probefw.Deps) probefw.Check {
 	return &pvcLifecycleGuardCheck{
 		Deps:             d,
 		pvReleasedMaxAge: envx.GetenvDuration("NODE_AUTOMATION_PV_RELEASED_MAX_AGE", pvcLifecycleDefaultReleasedMaxAge),
+		rwoHealEnabled:   envx.Gate("NODE_AUTOMATION_RWO_DEADLOCK_HEAL_ENABLED", false),
+		csiTaintEnabled:  envx.Gate("NODE_AUTOMATION_CSINODE_TAINT_ENABLED", false),
 	}
 }
 
 func (c *pvcLifecycleGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := c.Now()
+	c.eventCooldown.PruneExpired(now, pvcExtEventCooldown)
 
-	var pendingRep, fsgroupRep, pvRep, vsRep, summaryRep probefw.SweepReport
+	var pendingRep, fsgroupRep, pvRep, vsRep, scDefaultRep, rwoRep, csiRep, summaryRep probefw.SweepReport
 
 	c.scanPVCsAndFSGroup(ctx, log, now, &pendingRep, &fsgroupRep, &summaryRep)
 	c.scanReleasedPVs(ctx, log, now, &pvRep, &summaryRep)
 	c.scanVolumeSnapshots(ctx, log, now, &vsRep, &summaryRep)
+	c.scanDefaultStorageClasses(ctx, log, now, &scDefaultRep, &summaryRep)
+	c.scanRWORollingUpdateDeadlocks(ctx, log, now, &rwoRep, &summaryRep)
+	c.scanCSINodeVolumePressure(ctx, log, now, &csiRep, &summaryRep)
 
 	pendingRep.Close(&c.pendingEmitted, pvcPendingDeadlockGauge.DeleteLabelValues)
 	fsgroupRep.Close(&c.fsgroupEmitted, podFSGroupStallGauge.DeleteLabelValues)
 	pvRep.Close(&c.pvEmitted, pvReleasedStaleGauge.DeleteLabelValues)
 	vsRep.Close(&c.vsEmitted, volumeSnapshotFailedGauge.DeleteLabelValues)
+	scDefaultRep.Close(&c.scDefaultEmitted, storageClassDefaultAnomalyGauge.DeleteLabelValues)
+	rwoRep.Close(&c.rwoEmitted, rwoRollingUpdateDeadlockGauge.DeleteLabelValues)
+	csiRep.Close(&c.csiEmitted, csiVolumePressureGauge.DeleteLabelValues)
 	return summaryRep.Verdict("pvc lifecycle guard: ", ", ")
 }
 

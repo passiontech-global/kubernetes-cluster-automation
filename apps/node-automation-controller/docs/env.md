@@ -230,6 +230,14 @@ knobs (always-on, no gates).
 | `NODE_AUTOMATION_INIT_CONTAINER_WEDGE_GUARD_ENABLED` | init-container-wedge-guard | on unless `"false"` | Registration gate — `init-container-wedge-guard` check row (detects pods whose non-native `initContainer` blocks main containers past `NODE_AUTOMATION_INIT_WEDGE_MIN_AGE` and emits `node_automation_init_container_wedged`). Requires cluster-health-probes. |
 | `NODE_AUTOMATION_INIT_WEDGE_MIN_AGE` | cluster-health-probes (watchdogs) | `30m` | Minimum continuous age before `init-container-wedge-guard` flags a Pod whose non-native `initContainer` is stuck waiting or running continuously while blocking main containers. Resolved at check construction. |
 
+## Wave 7 — Extensions
+
+| Env var | Module | Default | Notes |
+|---|---|---|---|
+| `NODE_AUTOMATION_RWO_DEADLOCK_HEAL_ENABLED` | cluster-health-probes (storage/pvc) | off unless `"true"` | Sub-feature gate — enables opt-in UID-preconditioned deletion of the older live-node Pod holding a `ReadWriteOnce`/`ReadWriteOncePod` PVC during a `Deployment` `RollingUpdate` Multi-Attach deadlock `>=10m` (`HealAllowed` + 15m cooldown). Resolved at check construction. |
+| `NODE_AUTOMATION_CSINODE_TAINT_ENABLED` | cluster-health-probes (storage/pvc) | off unless `"true"` | Sub-feature gate — enables opt-in `passiontech.dev/csi-volume-pressure=true:PreferNoSchedule` node tainting when `CSINode` driver volume attachments reach `>=90%` of `allocatable.count` (`HealAllowed` + 30m cooldown). Resolved at check construction. |
+| `CERTMANAGER_REAPER_ISSUER_BRAKE_ENABLED` | certmanager-reaper | on unless `"false"` | Sub-feature gate — default-ON safety brake pausing `Order`/`CertificateRequest` reaps when the owning `Issuer`/`ClusterIssuer` is not `Ready=True` or any `Order`/`Challenge`/`Issuer` signals ACME `429`/`rateLimited`. Resolved at boot. |
+
 ## CLI flags (`cmd/manager/main.go`)
 
 | Flag | Default | Meaning |

@@ -43,17 +43,27 @@ const (
 	CheckNameGitOpsMassPruneGuard = "gitops-mass-prune-guard"
 
 	gitopsMassPruneMinBaseline     = 10
+	appSetMassPruneMinBaseline     = 5
 	gitopsMassPruneDropPercent     = 40
 	gitopsMassPruneEventCooldown   = 30 * time.Minute
 	gitopsMassPruneSuspendCooldown = 30 * time.Minute
 	gitopsMassPruneEventReason     = "GitOpsMassPruneDetected"
 )
 
+var argoApplicationSetGVR = schema.GroupVersionResource{
+	Group: "argoproj.io", Version: "v1alpha1", Resource: "applicationsets",
+}
+
 var (
 	gitopsMassPruneAlertGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_automation_gitops_mass_prune_alert",
-		Help: "1 while a prune-enabled Flux Kustomization or ArgoCD Application exhibits a >40% inventory drop from >=10 resources without opt-out.",
+		Help: "1 while a prune-enabled Flux Kustomization, ArgoCD Application, or ApplicationSet exhibits a >40% inventory drop without opt-out.",
 	}, []string{"kind", "namespace", "name"})
+
+	argoAppSetUnhealthyGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_gitops_applicationset_unhealthy",
+		Help: "1 while an ArgoCD ApplicationSet reports ErrorOccurred=True or lacks preserveResourcesOnDeletion on a prune-enabled template.",
+	}, []string{"namespace", "name", "reason"})
 
 	gitopsMassPruneSuspendsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "node_automation_gitops_mass_prune_suspends_total",
@@ -64,6 +74,7 @@ var (
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		gitopsMassPruneAlertGauge,
+		argoAppSetUnhealthyGauge,
 		gitopsMassPruneSuspendsTotal,
 	)
 }
@@ -74,6 +85,7 @@ type gitopsMassPruneGuardCheck struct {
 	prevInventory map[string]int
 	warmedUp      map[string]bool
 	emitted       state.GaugeLedger[string]
+	appSetEmitted state.GaugeLedger[string]
 	eventCooldown state.CooldownSet
 	suspendHealed state.CooldownSet
 }
@@ -136,11 +148,13 @@ func (c *gitopsMassPruneGuardCheck) Run(ctx context.Context) probefw.Result {
 		c.warmedUp = map[string]bool{}
 	}
 
-	var rep probefw.SweepReport
+	var rep, appSetRep probefw.SweepReport
 	for _, src := range gitopsPruneSources {
 		c.scanSource(ctx, log, now, src, &rep)
 	}
+	c.scanApplicationSets(ctx, log, now, &rep, &appSetRep)
 
+	appSetRep.Close(&c.appSetEmitted, argoAppSetUnhealthyGauge.DeleteLabelValues)
 	return rep.Result(&c.emitted, gitopsMassPruneAlertGauge.DeleteLabelValues,
 		"gitops mass-prune detected: ", ", ")
 }
@@ -363,4 +377,171 @@ func isRenderOrSourceErrToken(s string) bool {
 	return strings.Contains(s, "artifactfailed") ||
 		strings.Contains(s, "comparisonerror") ||
 		strings.Contains(s, "sourceerror")
+}
+
+func (c *gitopsMassPruneGuardCheck) scanApplicationSets(
+	ctx context.Context,
+	log logr.Logger,
+	now time.Time,
+	rep *probefw.SweepReport,
+	appSetRep *probefw.SweepReport,
+) {
+	appSets, err := c.AllUnstructured(ctx, argoApplicationSetGVR)
+	switch {
+	case kube.IsCRDAbsent(err):
+		c.resetKindBaseline("ApplicationSet")
+		return
+	case apierrors.IsForbidden(err):
+		log.V(1).Info("WARN: applicationset list skipped (403)", "error", err)
+		c.carryKindHeld("ApplicationSet", rep)
+		for k, lv := range c.appSetEmitted.Last() {
+			appSetRep.Carry(k, lv)
+		}
+		return
+	case err != nil:
+		c.carryKindHeld("ApplicationSet", rep)
+		for k, lv := range c.appSetEmitted.Last() {
+			appSetRep.Carry(k, lv)
+		}
+		rep.InfraErr(fmt.Errorf("list applicationsets: %w", err))
+		return
+	}
+
+	childCounts := map[string]int{}
+	appsKnown := false
+	apps, appsErr := c.AllUnstructured(ctx, kube.GVRArgoCDApplication)
+	switch {
+	case appsErr == nil:
+		appsKnown = true
+		for i := range apps {
+			app := &apps[i]
+			appNS := app.GetNamespace()
+			ownerName := ""
+			for _, ref := range app.GetOwnerReferences() {
+				if ref.Kind == "ApplicationSet" && ref.Name != "" {
+					ownerName = ref.Name
+					break
+				}
+			}
+			if ownerName == "" {
+				ownerName = app.GetLabels()["argocd.argoproj.io/application-set-name"]
+			}
+			if ownerName != "" {
+				childCounts[appNS+"/"+ownerName]++
+			}
+		}
+	case kube.IsCRDAbsent(appsErr):
+		appsKnown = true
+	default:
+		log.V(1).Info("WARN: applicationset child application count skipped", "error", appsErr)
+	}
+
+	seenKeys := make(map[string]bool, len(appSets))
+	kindWarmed := c.warmedUp["ApplicationSet"]
+
+	for i := range appSets {
+		as := &appSets[i]
+		if as.GetDeletionTimestamp() != nil {
+			continue
+		}
+		ns, name := as.GetNamespace(), as.GetName()
+		nsName := ns + "/" + name
+
+		if cond, ok := kube.ConditionOf(as.Object, "ErrorOccurred"); ok && strings.EqualFold(cond.Status, "True") {
+			uk := nsName + "/error_occurred"
+			appSetRep.Flag(argoAppSetUnhealthyGauge, uk, []string{ns, name, "error_occurred"})
+			rep.Find("ApplicationSet/" + nsName + "(error_occurred)")
+			c.emitAppSetEvent(ctx, log, now, as, "error_occurred",
+				fmt.Sprintf("ArgoCD ApplicationSet %s reports ErrorOccurred=True: %s", nsName, cond.Message))
+		}
+
+		if appSetPruneEnabled(as) {
+			preserve, hasPreserve := kube.NestedBool(as.Object, "spec", "syncPolicy", "preserveResourcesOnDeletion")
+			if !hasPreserve || !preserve {
+				uk := nsName + "/missing_preserve_resources_on_deletion"
+				appSetRep.Flag(argoAppSetUnhealthyGauge, uk, []string{ns, name, "missing_preserve_resources_on_deletion"})
+				rep.Find("ApplicationSet/" + nsName + "(missing_preserve_resources_on_deletion)")
+				c.emitAppSetEvent(ctx, log, now, as, "missing_preserve_resources_on_deletion",
+					fmt.Sprintf("ArgoCD ApplicationSet %s has automated prune enabled without spec.syncPolicy.preserveResourcesOnDeletion=true", nsName))
+			}
+		}
+
+		key := "ApplicationSet/" + nsName
+		if !appsKnown {
+			c.carryKindHeld("ApplicationSet", rep)
+			continue
+		}
+		seenKeys[key] = true
+		curr := childCounts[nsName]
+		prev, hasPrev := c.prevInventory[key]
+		if !kindWarmed || !hasPrev {
+			c.prevInventory[key] = curr
+			continue
+		}
+		dropped := prev >= appSetMassPruneMinBaseline &&
+			curr < prev &&
+			(prev-curr)*100 > gitopsMassPruneDropPercent*prev
+		expected := strings.EqualFold(
+			strings.TrimSpace(kube.EffectiveAnno(ctx, as, kube.AnnoMassPruneExpected)),
+			"true")
+		errOccurred := hasAppSetErrorOccurred(as)
+		if dropped && (!expected || errOccurred) {
+			detail := fmt.Sprintf("ApplicationSet/%s(prev=%d,curr=%d)", nsName, prev, curr)
+			rep.Emit(gitopsMassPruneAlertGauge, key, []string{"ApplicationSet", ns, name}, detail)
+			c.emitAnomalyEvent(ctx, log, now, "ApplicationSet", as, prev, curr)
+		} else {
+			c.prevInventory[key] = curr
+		}
+	}
+
+	if appsKnown {
+		c.warmedUp["ApplicationSet"] = true
+		for k := range c.prevInventory {
+			if strings.HasPrefix(k, "ApplicationSet/") && !seenKeys[k] {
+				delete(c.prevInventory, k)
+			}
+		}
+	}
+}
+
+func appSetPruneEnabled(as *unstructured.Unstructured) bool {
+	if prune, ok := kube.NestedBool(as.Object, "spec", "template", "spec", "syncPolicy", "automated", "prune"); ok && prune {
+		return true
+	}
+	appSync, _ := kube.NestedString(as.Object, "spec", "syncPolicy", "applicationsSync")
+	return appSync == "create-delete" || appSync == "sync"
+}
+
+func hasAppSetErrorOccurred(as *unstructured.Unstructured) bool {
+	cond, ok := kube.ConditionOf(as.Object, "ErrorOccurred")
+	return ok && strings.EqualFold(cond.Status, "True")
+}
+
+func (c *gitopsMassPruneGuardCheck) emitAppSetEvent(
+	ctx context.Context,
+	log logr.Logger,
+	now time.Time,
+	as *unstructured.Unstructured,
+	reason, note string,
+) {
+	ns, name := as.GetNamespace(), as.GetName()
+	ck := probefw.SelfHealKey(CheckNameGitOpsMassPruneGuard, "appset/"+reason+"/"+ns+"/"+name)
+	evNS := ns
+	if evNS == "" {
+		evNS = "default"
+	}
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, ck, gitopsMassPruneEventCooldown, now, kube.WarningEvent{
+		Name:      kube.TruncatedEventName("appset."+reason+"."+ns+"."+name, ns+"/"+name, now),
+		Namespace: evNS,
+		Regarding: corev1.ObjectReference{
+			APIVersion: as.GetAPIVersion(),
+			Kind:       "ApplicationSet",
+			Namespace:  ns,
+			Name:       name,
+			UID:        as.GetUID(),
+		},
+		Reason:            gitopsMassPruneEventReason,
+		Note:              note,
+		ReportingInstance: c.Name,
+	})
 }

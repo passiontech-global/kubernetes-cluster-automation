@@ -59,6 +59,10 @@ type hpaScalingGuardCheck struct {
 	emitted state.GaugeLedger[string]
 	// eventHealed dedupes the cluster Event per window.
 	eventHealed state.CooldownSet
+
+	maxSaturatedSeen    state.FirstSeenLedger
+	maxSaturatedEmitted state.GaugeLedger[string]
+	maxSaturatedEvents  state.CooldownSet
 }
 
 // NewHPAScalingGuardCheck builds the hpa-scaling-guard check.
@@ -70,10 +74,12 @@ const (
 	CheckNameHPAScalingGuard = "hpa-scaling-guard"
 
 	// hpa-scaling-guard knobs.
-	hpaUnhealthyMinAge   = 15 * time.Minute
-	hpaRescueCooldown    = 30 * time.Minute
-	hpaMSBounceCooldown  = 30 * time.Minute
-	hpaMSBounceNamespace = "kube-system"
+	hpaUnhealthyMinAge           = 15 * time.Minute
+	hpaMaxSaturatedMinAge        = 30 * time.Minute
+	hpaMaxSaturatedEventCooldown = 30 * time.Minute
+	hpaRescueCooldown            = 30 * time.Minute
+	hpaMSBounceCooldown          = 30 * time.Minute
+	hpaMSBounceNamespace         = "kube-system"
 )
 
 // hpaGVR is the autoscaling/v2 HorizontalPodAutoscaler GVR — no
@@ -88,10 +94,15 @@ var (
 		Name: "node_automation_hpa_scaling_unhealthy",
 		Help: "1 while the HorizontalPodAutoscaler reports AbleToScale=False or ScalingActive=False past the window — hpa-scaling-guard.",
 	}, []string{"namespace", "name", "reason"})
+
+	hpaMaxReplicasSaturatedGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_hpa_max_replicas_saturated",
+		Help: "1 while the HorizontalPodAutoscaler stays pinned at currentReplicas == maxReplicas with ScalingLimited=True >=30m — hpa-scaling-guard.",
+	}, []string{"namespace", "name"})
 )
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(hpaScalingUnhealthyGauge)
+	ctrlmetrics.Registry.MustRegister(hpaScalingUnhealthyGauge, hpaMaxReplicasSaturatedGauge)
 }
 
 // Run audits every autoscaling/v2 HPA for stuck scaling
@@ -101,13 +112,15 @@ func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 	log := logf.FromContext(ctx)
 	now := p.Now()
 	p.eventHealed.PruneExpired(now, hpaUnhealthyMinAge)
-	var rep probefw.SweepReport
+	p.maxSaturatedEvents.PruneExpired(now, hpaMaxSaturatedEventCooldown)
+	var rep, maxRep probefw.SweepReport
 
 	hpas, err := p.AllUnstructured(ctx, hpaGVR)
 	switch {
 	case kube.IsCRDAbsent(err):
-		var rep probefw.SweepReport
 		p.seen.Prune(func(string) bool { return false })
+		p.maxSaturatedSeen.Prune(func(string) bool { return false })
+		maxRep.Close(&p.maxSaturatedEmitted, hpaMaxReplicasSaturatedGauge.DeleteLabelValues)
 		return rep.Result(&p.emitted, hpaScalingUnhealthyGauge.DeleteLabelValues,
 			"hpas scaling-unhealthy: ", ", ")
 	case err != nil:
@@ -115,10 +128,14 @@ func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 	}
 
 	seenKeep := map[string]bool{}
+	maxKeep := map[string]bool{}
 	var unhealthy []*unstructured.Unstructured
 	for i := range hpas {
 		hpa := &hpas[i]
 		key := hpa.GetNamespace() + "/" + hpa.GetName()
+		if p.checkHPAMaxSaturated(ctx, log, now, hpa, key, &maxRep, &rep, maxKeep) {
+			maxKeep[key] = true
+		}
 		annoPatch := func(ctx context.Context, data []byte) error {
 			_, err := p.Dyn.Resource(hpaGVR).
 				Namespace(hpa.GetNamespace()).Patch(ctx, hpa.GetName(),
@@ -154,6 +171,8 @@ func (p *hpaScalingGuardCheck) Run(ctx context.Context) probefw.Result {
 		unhealthy = append(unhealthy, hpa)
 	}
 	p.seen.Prune(func(k string) bool { return seenKeep[k] })
+	p.maxSaturatedSeen.Prune(func(k string) bool { return maxKeep[k] })
+	maxRep.Close(&p.maxSaturatedEmitted, hpaMaxReplicasSaturatedGauge.DeleteLabelValues)
 
 	// The fleet heal budget is shared with every other module. One
 	// sweep of this check gets at most ONE budgeted action across
@@ -345,4 +364,57 @@ func (p *hpaScalingGuardCheck) emitHPAEvent(ctx context.Context,
 	}
 	p.eventHealed.Stamp(ck, now)
 	log.Info("EVENT: HPAScalingStuck", "detail", msg)
+}
+
+func (p *hpaScalingGuardCheck) checkHPAMaxSaturated(
+	ctx context.Context,
+	log logr.Logger,
+	now time.Time,
+	hpa *unstructured.Unstructured,
+	key string,
+	maxRep, summaryRep *probefw.SweepReport,
+	maxKeep map[string]bool,
+) bool {
+	if hpa.GetDeletionTimestamp() != nil {
+		return false
+	}
+	maxReplicas, hasMax := kube.NestedInt64(hpa.Object, "spec", "maxReplicas")
+	currReplicas, hasCurr := kube.NestedInt64(hpa.Object, "status", "currentReplicas")
+	if !hasMax || !hasCurr || maxReplicas <= 0 || currReplicas != maxReplicas {
+		return false
+	}
+	sl, ok := kube.ConditionOf(hpa.Object, "ScalingLimited")
+	if !ok || sl.Status != "True" {
+		return false
+	}
+	persisted := false
+	if !sl.LastTransitionTime.IsZero() {
+		persisted = now.Sub(sl.LastTransitionTime) >= hpaMaxSaturatedMinAge
+	} else {
+		maxKeep[key] = true
+		persisted = probefw.Persisted(&p.maxSaturatedSeen, key, now, hpaMaxSaturatedMinAge, log)
+	}
+	if !persisted {
+		return true
+	}
+	ns, name := hpa.GetNamespace(), hpa.GetName()
+	maxRep.Flag(hpaMaxReplicasSaturatedGauge, key, []string{ns, name})
+	summaryRep.Find(key + "(max_replicas_saturated)")
+	ck := probefw.SelfHealKey(CheckNameHPAScalingGuard, "maxsat/"+key)
+	probefw.EmitWarningDeduped(ctx, p.CS, log, &p.maxSaturatedEvents, ck, hpaMaxSaturatedEventCooldown, now, kube.WarningEvent{
+		Name:      kube.TruncatedEventName("hpa-max-sat."+name, key, now),
+		Namespace: ns,
+		Reason:    "HPAMaxReplicasSaturated",
+		Note: fmt.Sprintf("HPA %s pinned at currentReplicas == maxReplicas (%d) with ScalingLimited=True >=%s",
+			key, maxReplicas, hpaMaxSaturatedMinAge),
+		Regarding: corev1.ObjectReference{
+			APIVersion: hpa.GetAPIVersion(),
+			Kind:       "HorizontalPodAutoscaler",
+			Namespace:  ns,
+			Name:       name,
+			UID:        hpa.GetUID(),
+		},
+		ReportingInstance: p.Name,
+	})
+	return true
 }

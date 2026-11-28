@@ -412,6 +412,15 @@ var goldenMetricFamilies = []string{
 	"node_automation_apiserver_admission_token_anomaly",
 	"node_automation_k8s_upgrade_gang_issue",
 	"node_automation_cluster_hygiene_issue",
+	// Wave 7 extension metrics.
+	"node_automation_daemonset_rollout_deadlock",
+	"node_automation_rwo_rollingupdate_deadlock",
+	"node_automation_csinode_volume_pressure",
+	"node_automation_storageclass_default_anomaly",
+	"node_automation_gateway_route_conflict",
+	"node_automation_gitops_applicationset_unhealthy",
+	"node_automation_hpa_max_replicas_saturated",
+	"node_automation_certmanager_issuer_unhealthy",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key
