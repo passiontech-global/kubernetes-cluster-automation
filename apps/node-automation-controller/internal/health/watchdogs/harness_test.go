@@ -35,6 +35,11 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewWorkloadAdmissionBlockGuardCheck,
 	NewPodResizeWedgeGuardCheck,
 	NewIngressNginxRetirementGuardCheck,
+	NewReadinessGateWedgeGuardCheck,
+	NewSchedulingGateWedgeGuardCheck,
+	NewWorkloadDanglingRefsGuardCheck,
+	NewAPIServerAdmissionTokenGuardCheck,
+	NewK8sUpgradeGangGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

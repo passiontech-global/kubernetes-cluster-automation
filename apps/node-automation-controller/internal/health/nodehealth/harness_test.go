@@ -30,6 +30,7 @@ var harnessChecks = []func(*probefw.Deps) probefw.Check{
 	NewNodeConditionSweeperCheck,
 	NewImageResilienceAuditorCheck,
 	NewDRAClaimWedgeGuardCheck,
+	NewClusterHygieneGuardCheck,
 }
 
 func testProber(cs *fake.Clientset) *probetest.Prober {

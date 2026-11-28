@@ -171,6 +171,14 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"autoscaler-quota-posture-guard",
 		"zone-gray-failure-guard",
 		"init-container-wedge-guard",
+		// Wave 7 standalone checks — appended at end of healthRows.
+		"readiness-gate-wedge-guard",
+		"scheduling-gate-wedge-guard",
+		"workload-dangling-refs-guard",
+		"service-lb-lifecycle-guard",
+		"apiserver-admission-token-guard",
+		"k8s-upgrade-gang-guard",
+		"cluster-hygiene-guard",
 	}
 	var got []string
 	for _, m := range Modules {

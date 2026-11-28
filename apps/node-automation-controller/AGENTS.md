@@ -3,7 +3,7 @@
 controller-runtime operator replacing the shell-operator Deployment +
 bash hooks for node lifecycle automation. All logic is compiled in —
 no shell, no `kubectl`/`jq`/`curl` forks. One binary runs 32 wired
-modules plus a 90-check cluster-health sweep, grouped in six domain
+modules plus a 97-check cluster-health sweep, grouped in six domain
 trees; the interface contract is Prometheus metrics on
 `:9115/metrics` plus `/healthz`+`/readyz` on `:8081` (kept
 byte-stable with the shell-operator alerts).
@@ -114,9 +114,9 @@ byte-stable with the shell-operator alerts).
   nethealth); `health/nethealth/linkerd` is the oldest such
   subpackage (the linkerd checks + their shared markers behind one
   facade with `NewX` constructors — registry rows point there, duty
-  logic stays out of the nethealth root). The 32 Setup rows and 90
+  logic stays out of the nethealth root). The 32 Setup rows and 97
   health `CheckReg` rows are pinned by `registry_test.go`,
-  `TestCheckRegSweepOrder` and the 90-row `fleetCheckRegs` roster
+  `TestCheckRegSweepOrder` and the 97-row `fleetCheckRegs` roster
   in `clusterhealthprobes`' tests.
   Cross-TREE topology identifiers (linkerd control-plane names,
   dragonfly operator namespace) live once, in

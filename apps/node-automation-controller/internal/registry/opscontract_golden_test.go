@@ -169,6 +169,14 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"autoscaler-quota-posture-guard", "health"},
 	{"zone-gray-failure-guard", "health"},
 	{"init-container-wedge-guard", "health"},
+	// Wave 7 standalone checks — appended at end.
+	{"readiness-gate-wedge-guard", "health"},
+	{"scheduling-gate-wedge-guard", "health"},
+	{"workload-dangling-refs-guard", "health"},
+	{"service-lb-lifecycle-guard", "health"},
+	{"apiserver-admission-token-guard", "health"},
+	{"k8s-upgrade-gang-guard", "health"},
+	{"cluster-hygiene-guard", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -396,6 +404,14 @@ var goldenMetricFamilies = []string{
 	"node_automation_zone_gray_shed",
 	"node_automation_pdb_overlapping",
 	"node_automation_init_container_wedged",
+	// Wave 7 standalone check metrics.
+	"node_automation_pod_readiness_gate_wedged",
+	"node_automation_pod_scheduling_gate_wedged",
+	"node_automation_workload_dangling_ref",
+	"node_automation_service_lb_lifecycle_stuck",
+	"node_automation_apiserver_admission_token_anomaly",
+	"node_automation_k8s_upgrade_gang_issue",
+	"node_automation_cluster_hygiene_issue",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key

@@ -77,7 +77,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProb
 }
 
 // fleetCheckRegs mirrors the health section of registry.Modules —
-// the full 90-check roster in sweep order, which is what
+// the full 97-check roster in sweep order, which is what
 // SetupModules collects into Deps.CheckRegs on a default boot.
 // clusterhealthprobes may not import internal/registry (depguard:
 // domains never import the wiring layer — and a test-internal
@@ -182,6 +182,14 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: watchdogs.CheckNameAutoscalerQuotaPostureGuard, New: watchdogs.NewAutoscalerQuotaPostureGuardCheck},
 		{Name: nodehealth.CheckNameZoneGrayFailureGuard, New: nodehealth.NewZoneGrayFailureGuardCheck},
 		{Name: watchdogs.CheckNameInitContainerWedgeGuard, New: watchdogs.NewInitContainerWedgeGuardCheck},
+		// Wave 7 standalone checks — appended at end of healthRows.
+		{Name: watchdogs.CheckNameReadinessGateWedgeGuard, New: watchdogs.NewReadinessGateWedgeGuardCheck},
+		{Name: watchdogs.CheckNameSchedulingGateWedgeGuard, New: watchdogs.NewSchedulingGateWedgeGuardCheck},
+		{Name: watchdogs.CheckNameWorkloadDanglingRefsGuard, New: watchdogs.NewWorkloadDanglingRefsGuardCheck},
+		{Name: nethealth.CheckNameServiceLBLifecycleGuard, New: nethealth.NewServiceLBLifecycleGuardCheck},
+		{Name: watchdogs.CheckNameAPIServerAdmissionTokenGuard, New: watchdogs.NewAPIServerAdmissionTokenGuardCheck},
+		{Name: watchdogs.CheckNameK8sUpgradeGangGuard, New: watchdogs.NewK8sUpgradeGangGuardCheck},
+		{Name: nodehealth.CheckNameClusterHygieneGuard, New: nodehealth.NewClusterHygieneGuardCheck},
 	}
 }
 
@@ -339,8 +347,13 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// init-container-wedge-guard unconditionally call AllPods (+1 each),
 	// while the other 7 Wave 6 checks skip/return cleanly on empty/Prom-error
 	// fakes (+0) -> forty-four total.
-	if got := errCount() - before; got != 44 {
-		t.Fatalf("run errors delta = %v, want 44", got)
+	// Wave 7: readiness-gate-wedge-guard, scheduling-gate-wedge-guard,
+	// k8s-upgrade-gang-guard, and cluster-hygiene-guard call AllPods (+1 each),
+	// while workload-dangling-refs-guard, service-lb-lifecycle-guard, and
+	// apiserver-admission-token-guard return/skip cleanly on empty/Prom-error
+	// fakes (+0) -> forty-eight total.
+	if got := errCount() - before; got != 48 {
+		t.Fatalf("run errors delta = %v, want 48", got)
 	}
 }
 
