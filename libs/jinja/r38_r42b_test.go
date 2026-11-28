@@ -436,7 +436,7 @@ func TestFilterToYAMLStreamingCap(t *testing.T) {
 				measure(fmt.Sprintf("%dMiB_scalar_%s", sizeMiB, filt), func() error {
 					_, err := Render("{{ s | "+filt+" }}", map[string]any{"s": s}, nil)
 					if err != nil && !strings.Contains(err.Error(), "exceeds") {
-						return fmt.Errorf("unexpected error: %v", err)
+						return fmt.Errorf("unexpected error: %w", err)
 					}
 					return err
 				}, 8<<20, 2*time.Second)
@@ -459,7 +459,7 @@ func TestFilterToYAMLStreamingCap(t *testing.T) {
 		measure("4000x8KiB_OMap_to_yaml", func() error {
 			_, err := Render("{{ m | to_yaml }}", map[string]any{"m": bigMap}, nil)
 			if err != nil && !strings.Contains(err.Error(), "exceeds") {
-				return fmt.Errorf("unexpected error: %v", err)
+				return fmt.Errorf("unexpected error: %w", err)
 			}
 			return err
 		}, 16<<20, 2*time.Second)
@@ -474,14 +474,14 @@ func TestFilterToYAMLStreamingCap(t *testing.T) {
 		measure("2M_list_to_nice_yaml", func() error {
 			_, err := Render("{{ l | to_nice_yaml }}", map[string]any{"l": &List{hugeAny}}, nil)
 			if err != nil && !strings.Contains(err.Error(), "steps") {
-				return fmt.Errorf("unexpected error: %v", err)
+				return fmt.Errorf("unexpected error: %w", err)
 			}
 			return err
 		}, 64<<20, 2*time.Second)
 		measure("2M_strings_to_yaml", func() error {
 			_, err := Render("{{ l | to_yaml }}", map[string]any{"l": hugeStr}, nil)
 			if err != nil && !strings.Contains(err.Error(), "steps") {
-				return fmt.Errorf("unexpected error: %v", err)
+				return fmt.Errorf("unexpected error: %w", err)
 			}
 			return err
 		}, 64<<20, 2*time.Second)
@@ -535,23 +535,23 @@ func TestRegexCachePrecomputedClassifications(t *testing.T) {
 				defer wg.Done()
 				for range 25 {
 					if out, err := Render(`{{ s | regex_replace('([a-z])([0-9])', '$1=$2') }}`, ctx, nil); err != nil || out != "a=1 b=2 c=3 a=1" {
-						errs <- fmt.Errorf("expand regex_replace = (%q, %v)", out, err)
+						errs <- fmt.Errorf("expand regex_replace = (%q, %w)", out, err)
 						return
 					}
 					if out, err := Render(`{{ s | regex_replace('a1', 'X') }}`, ctx, nil); err != nil || out != "X b2 c3 X" {
-						errs <- fmt.Errorf("lit regex_replace = (%q, %v)", out, err)
+						errs <- fmt.Errorf("lit regex_replace = (%q, %w)", out, err)
 						return
 					}
 					if out, err := Render(`{{ s | regex_findall('(a1)') }}`, ctx, nil); err != nil || out != "[a1, a1]" {
-						errs <- fmt.Errorf("litcap regex_findall = (%q, %v)", out, err)
+						errs <- fmt.Errorf("litcap regex_findall = (%q, %w)", out, err)
 						return
 					}
 					if out, err := Render(`{{ s | regex_search('b([0-9])') }}`, ctx, nil); err != nil || out != "[2]" {
-						errs <- fmt.Errorf("regex_search = (%q, %v)", out, err)
+						errs <- fmt.Errorf("regex_search = (%q, %w)", out, err)
 						return
 					}
 					if out, err := Render(`{{ s is search('c[0-9]') }}`, ctx, nil); err != nil || out != "True" {
-						errs <- fmt.Errorf("is search = (%q, %v)", out, err)
+						errs <- fmt.Errorf("is search = (%q, %w)", out, err)
 						return
 					}
 				}

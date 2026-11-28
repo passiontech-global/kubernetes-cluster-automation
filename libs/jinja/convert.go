@@ -463,7 +463,7 @@ func decodeJSON(raw string) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := dec.ReadToken(); err != io.EOF {
+	if _, err := dec.ReadToken(); !errors.Is(err, io.EOF) {
 		if err != nil {
 			return nil, err
 		}

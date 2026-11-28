@@ -654,14 +654,14 @@ func TestE2EReqTier2_F18_RegexCacheEvictionAndRace(t *testing.T) {
 					// 1. Hot shared literal/anchor/capture patterns across workers.
 					out1, err := jinja.Render(`{{ 'a.b' | regex_replace('\.', '_') }}|{{ 'FOO' | regex_findall('(?i)(foo)') | join(',') }}|{{ 'ab' | regex_replace('(a)(b)', '$2$1') }}`, nil, nil)
 					if err != nil || out1 != "a_b|FOO|ba" {
-						errs <- fmt.Errorf("shared render = (%q, %v)", out1, err)
+						errs <- fmt.Errorf("shared render = (%q, %w)", out1, err)
 						return
 					}
 					// 2. Rotating >512 distinct patterns triggering eviction under -race.
 					tpl2 := fmt.Sprintf(`{{ '%s' | regex_replace('(%s)', '[$1]') }}|{{ '%s' is search('^p_') }}`, pat, pat, pat)
 					out2, err := jinja.Render(tpl2, nil, nil)
 					if err != nil || out2 != fmt.Sprintf("[%s]|True", pat) {
-						errs <- fmt.Errorf("rotating render %d = (%q, %v)", idx, out2, err)
+						errs <- fmt.Errorf("rotating render %d = (%q, %w)", idx, out2, err)
 						return
 					}
 					// 3. Invalid pattern must never poison cache or race.

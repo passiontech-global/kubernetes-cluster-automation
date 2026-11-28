@@ -28,8 +28,9 @@ func DecodeYAML(data []byte) (any, error) {
 	steps := 0
 	for {
 		var extra yaml3.Node
-		switch err := dec.Decode(&extra); err {
-		case nil:
+		err := dec.Decode(&extra)
+		switch {
+		case err == nil:
 			v, verr := yamlNodeToValue(&extra, &steps)
 			if verr != nil {
 				return nil, verr
@@ -38,7 +39,7 @@ func DecodeYAML(data []byte) (any, error) {
 				return nil, errors.New("unexpected second yaml document")
 			}
 			// nil-decoding doc (bare `---`) — keep scanning.
-		case io.EOF:
+		case errors.Is(err, io.EOF):
 			return yamlNodeToValue(&node, &steps)
 		default:
 			return nil, err
