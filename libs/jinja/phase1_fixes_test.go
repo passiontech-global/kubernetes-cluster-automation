@@ -53,3 +53,36 @@ func TestFilterZipAndMapBudgets(t *testing.T) {
 		t.Fatal("expected map output-byte cap error, got nil")
 	}
 }
+
+func TestShortCircuitPrecedenceAndFilterEdges(t *testing.T) {
+	// Mixed and/or/arithmetic/comparison short-circuiting and precedence
+	// must be identical under iterative left-spine evaluation.
+	cases := []struct {
+		tpl  string
+		want string
+	}{
+		{"{{ true or (1 / 0) }}", "True"},
+		{"{{ false and (1 / 0) or 'ok' }}", "ok"},
+		{"{{ true or (1 / 0) and (2 / 0) }}", "True"},
+		{"{{ 0 and (1 / 0) }}", "0"},
+		{"{{ (false or true) and 42 }}", "42"},
+		{"{{ 1 + 2 * 3 == 7 and 'a' ~ 'b' == 'ab' }}", "True"},
+		{"{{ 1 in [1, 2] and false or true }}", "True"},
+		{"{{ [] | zip | length }}", "0"},
+		{"{{ [1, 2] | zip([]) | length }}", "0"},
+		{"{{ [] | map('upper') | length }}", "0"},
+		{"{{ [1, 2] | map('int') | join(',') }}", "1,2"},
+	}
+	for _, tc := range cases {
+		out, err := Render(tc.tpl, nil, nil)
+		if err != nil || out != tc.want {
+			t.Fatalf("Render(%q) = (%q, %v), want (%q, nil)", tc.tpl, out, err, tc.want)
+		}
+	}
+	if _, err := Render("{{ (1 / 0) and false }}", nil, nil); err == nil {
+		t.Fatal("expected division by zero error on LHS of and")
+	}
+	if _, err := Render("{{ false or (1 % 0) }}", nil, nil); err == nil {
+		t.Fatal("expected modulo by zero error on RHS of or")
+	}
+}
