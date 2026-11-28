@@ -230,7 +230,7 @@ func TestRunBindErrors(t *testing.T) {
 
 	occupyPort := func(t *testing.T) string {
 		t.Helper()
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -258,7 +258,7 @@ func TestRunBindErrors(t *testing.T) {
 		setValidRunEnv(t)
 		// Reserve a free port, close it, let run() bind publicSrv to it,
 		// and verify run() releases it when internalSrv fails to bind.
-		probe, err := net.Listen("tcp", "127.0.0.1:0")
+		probe, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -270,7 +270,7 @@ func TestRunBindErrors(t *testing.T) {
 		if err := run(t.Context(), nil); err == nil {
 			t.Fatal("expected metrics bind error")
 		}
-		rebind, err := net.Listen("tcp", pubAddr)
+		rebind, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", pubAddr)
 		if err != nil {
 			t.Fatalf("public socket leaked after metrics bind failure: %v", err)
 		}
@@ -358,7 +358,11 @@ func TestRunGracefulShutdown(t *testing.T) {
 		client := &http.Client{Timeout: 2 * time.Second}
 		getStatus := func(url string) (int, string) {
 			t.Helper()
-			resp, err := client.Get(url)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+			if err != nil {
+				t.Fatalf("NewRequestWithContext %s: %v", url, err)
+			}
+			resp, err := client.Do(req)
 			if err != nil {
 				t.Fatalf("GET %s: %v", url, err)
 			}

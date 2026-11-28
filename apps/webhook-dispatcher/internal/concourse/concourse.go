@@ -254,6 +254,7 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 		// the token into error logs. Return only the wrapped error.
 		return 0, stripURLError(err)
 	}
+	defer func() { _ = resp.Body.Close() }()
 	defer httpx.DrainAndClose(resp.Body, maxDrainBytes)
 	return resp.StatusCode, nil
 }
@@ -298,6 +299,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 				// connection survives into the retry instead of being
 				// dropped by the transport over unconsumed bytes.
 				httpx.DrainAndClose(resp.Body, maxDrainBytes)
+				_ = resp.Body.Close()
 				// Invalidate only the token THIS request carried — a
 				// fresher token another worker already minted survives.
 				c.invalidateToken(usedToken)
@@ -305,9 +307,11 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 			}
 			if c.recoverBasicOn401() {
 				httpx.DrainAndClose(resp.Body, maxDrainBytes)
+				_ = resp.Body.Close()
 				continue
 			}
 		}
+		defer func() { _ = resp.Body.Close() }()
 		defer httpx.DrainAndClose(resp.Body, maxDrainBytes)
 		if resp.StatusCode/100 != 2 {
 			return &statusError{status: resp.StatusCode, path: path}

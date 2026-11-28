@@ -32,7 +32,7 @@ func signedRequest(t *testing.T, event, body string) *http.Request {
 	t.Helper()
 	mac := hmac.New(sha256.New, []byte(testSecret))
 	mac.Write([]byte(body))
-	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(body))
 	req.Header.Set("X-GitHub-Event", event)
 	req.Header.Set("X-GitHub-Delivery", "delivery-1")
 	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
@@ -277,7 +277,7 @@ func TestMalformedSignatureRejectsBeforeBodyRead(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := &errReader{}
-			req := httptest.NewRequest(http.MethodPost, "/webhook", body)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", body)
 			req.Header.Set("X-GitHub-Event", "push")
 			req.Header.Set("X-Hub-Signature-256", tc.sig)
 			rec := httptest.NewRecorder()
@@ -296,7 +296,7 @@ func TestOversizedBodyWithoutSignatureRejected(t *testing.T) {
 	// A payload over maxBodyBytes with no signature is still a fast
 	// 401, not a 413: the format check fires before MaxBytesReader.
 	h := New(testSecret, &fakeBackend{})
-	req := httptest.NewRequest(http.MethodPost, "/webhook",
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook",
 		strings.NewReader(strings.Repeat("x", maxBodyBytes+1)))
 	req.Header.Set("X-GitHub-Event", "push")
 	rec := httptest.NewRecorder()
@@ -311,7 +311,7 @@ func TestEmptySecretRejectsBeforeBodyRead(t *testing.T) {
 	// well-formed header dies before the body read.
 	h := New("", &fakeBackend{})
 	body := &errReader{}
-	req := httptest.NewRequest(http.MethodPost, "/webhook", body)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", body)
 	req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -1079,7 +1079,7 @@ func TestRegisterMetricsAndFailBodyRead(t *testing.T) {
 
 	t.Run("max_bytes_error", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", nil)
 		h.failBodyRead(rec, req, "del-1", "push", "push", &http.MaxBytesError{Limit: 10})
 		if rec.Code != http.StatusRequestEntityTooLarge {
 			t.Fatalf("status=%d want 413", rec.Code)
@@ -1088,7 +1088,7 @@ func TestRegisterMetricsAndFailBodyRead(t *testing.T) {
 
 	t.Run("generic_read_error", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/webhook", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", nil)
 		h.failBodyRead(rec, req, "del-2", "push", "push", errors.New("unexpected EOF"))
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d want 400", rec.Code)
@@ -1149,7 +1149,7 @@ func TestOversizedContentLengthWithValidFormatRejectedBeforeBodyOrAdmission(t *t
 	}()
 
 	body := &errReader{}
-	req := httptest.NewRequest(http.MethodPost, "/webhook", body)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", body)
 	req.ContentLength = maxBodyBytes + 1
 	req.Header.Set("X-GitHub-Event", "push")
 	req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
@@ -1170,7 +1170,7 @@ func TestOversizedContentLengthWithValidFormatRejectedBeforeBodyOrAdmission(t *t
 func TestChunkedOversizedBodyReturns413(t *testing.T) {
 	h := New(testSecret, &fakeBackend{})
 	oversized := strings.Repeat("x", maxBodyBytes+1)
-	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(oversized))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(oversized))
 	req.ContentLength = -1 // chunked / unknown length
 	req.Header.Set("X-GitHub-Event", "push")
 	req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
@@ -1194,7 +1194,7 @@ func TestUnauthenticatedSlowBodyDoesNotExhaustReqSem(t *testing.T) {
 	for i := range maxInflightRequests {
 		pr, pw := io.Pipe()
 		pipes[i] = pw
-		req := httptest.NewRequest(http.MethodPost, "/webhook", pr)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", pr)
 		req.Header.Set("X-GitHub-Event", "push")
 		req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 		slowWG.Go(func() {
@@ -1358,7 +1358,7 @@ func TestPreAuthConcurrencyCapRejectsWith503(t *testing.T) {
 	for i := range maxPreAuthRequests {
 		pr, pw := io.Pipe()
 		pipes[i] = pw
-		req := httptest.NewRequest(http.MethodPost, "/webhook", pr)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", pr)
 		req.Header.Set("X-GitHub-Event", "push")
 		req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 		slowWG.Go(func() {
@@ -1378,7 +1378,7 @@ func TestPreAuthConcurrencyCapRejectsWith503(t *testing.T) {
 	}
 
 	// 257th handled-event request must be rejected 503 immediately.
-	extraReq := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(pushBody))
+	extraReq := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(pushBody))
 	extraReq.Header.Set("X-GitHub-Event", "push")
 	extraReq.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 	extraRec := httptest.NewRecorder()
@@ -1436,7 +1436,7 @@ func TestPreAuthByteBudgetCapsLargeBogusPayloadsWithoutOOM(t *testing.T) {
 	overloadedBefore := testutil.ToFloat64(deliveriesTotal.WithLabelValues("push", "overloaded"))
 
 	pr, pw := io.Pipe()
-	req1 := httptest.NewRequest(http.MethodPost, "/webhook", pr)
+	req1 := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", pr)
 	req1.Header.Set("X-GitHub-Event", "push")
 	req1.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 
@@ -1465,7 +1465,7 @@ func TestPreAuthByteBudgetCapsLargeBogusPayloadsWithoutOOM(t *testing.T) {
 	}
 
 	// Second unauthenticated 300 KiB payload needs 512 KiB cap, exceeding 512 KiB budget.
-	req2 := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("x", 300<<10)))
+	req2 := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("x", 300<<10)))
 	req2.Header.Set("X-GitHub-Event", "push")
 	req2.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 	rec2 := httptest.NewRecorder()
@@ -1540,7 +1540,7 @@ func TestPreAuthBudgetNeverLeaks(t *testing.T) {
 	t.Run("401_small_and_large_bogus_sig", func(t *testing.T) {
 		h := New(testSecret, &fakeBackend{})
 		for _, sz := range []int{32, 128 << 10} {
-			req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("z", sz)))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("z", sz)))
 			req.Header.Set("X-GitHub-Event", "push")
 			req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 			rec := httptest.NewRecorder()
@@ -1554,7 +1554,7 @@ func TestPreAuthBudgetNeverLeaks(t *testing.T) {
 
 	t.Run("413_declared_and_chunked", func(t *testing.T) {
 		h := New(testSecret, &fakeBackend{})
-		reqDecl := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader("x"))
+		reqDecl := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader("x"))
 		reqDecl.ContentLength = maxBodyBytes + 1
 		reqDecl.Header.Set("X-GitHub-Event", "push")
 		reqDecl.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
@@ -1565,7 +1565,7 @@ func TestPreAuthBudgetNeverLeaks(t *testing.T) {
 		}
 		assertClean(t, h)
 
-		reqChunked := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("x", maxBodyBytes+1)))
+		reqChunked := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(strings.Repeat("x", maxBodyBytes+1)))
 		reqChunked.ContentLength = -1
 		reqChunked.Header.Set("X-GitHub-Event", "push")
 		reqChunked.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
@@ -1579,7 +1579,7 @@ func TestPreAuthBudgetNeverLeaks(t *testing.T) {
 
 	t.Run("400_read_error_and_bad_json", func(t *testing.T) {
 		h := New(testSecret, &fakeBackend{})
-		reqErr := httptest.NewRequest(http.MethodPost, "/webhook", &errReader{})
+		reqErr := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", &errReader{})
 		reqErr.Header.Set("X-GitHub-Event", "push")
 		reqErr.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 		recErr := httptest.NewRecorder()
@@ -1615,7 +1615,7 @@ func TestPreAuthBudgetNeverLeaks(t *testing.T) {
 
 	t.Run("panic_in_body_read", func(t *testing.T) {
 		h := New(testSecret, &fakeBackend{})
-		req := httptest.NewRequest(http.MethodPost, "/webhook", panicReadCloser{})
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", panicReadCloser{})
 		req.Header.Set("X-GitHub-Event", "push")
 		req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
 		rec := httptest.NewRecorder()

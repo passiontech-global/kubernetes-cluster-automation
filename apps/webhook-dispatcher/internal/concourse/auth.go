@@ -332,6 +332,7 @@ func (a *atcAuth) mint(ctx context.Context) (string, time.Time, bool, error) {
 		}
 		body, truncated, err := httpx.ReadBounded(resp.Body, maxTokenBody)
 		httpx.DrainAndClose(resp.Body, maxDrainBytes)
+		_ = resp.Body.Close()
 		if err != nil {
 			return "", time.Time{}, false, err
 		}

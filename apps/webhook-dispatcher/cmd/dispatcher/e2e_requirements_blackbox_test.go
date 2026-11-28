@@ -120,11 +120,13 @@ func reqStartDispatcherEnv(t *testing.T, bin string, envOverrides map[string]str
 		}
 
 		logs := &syncBuffer{}
-		cmd := exec.Command(bin)
+		cmdCtx, cancelCmd := context.WithCancel(context.Background())
+		cmd := exec.CommandContext(cmdCtx, bin)
 		cmd.Env = cleanChildEnv(envMap)
 		cmd.Stdout = logs
 		cmd.Stderr = logs
 		if err := cmd.Start(); err != nil {
+			cancelCmd()
 			t.Fatalf("start dispatcher: %v", err)
 		}
 
@@ -154,6 +156,7 @@ func reqStartDispatcherEnv(t *testing.T, bin string, envOverrides map[string]str
 				if attempt+1 < maxBindAttempts && reqShouldRetryBindCollision(logStr, autoListen, autoMetrics) {
 					retryBind = true
 				} else {
+					cancelCmd()
 					t.Fatalf("dispatcher exited prematurely (%v), logs:\n%s", rd.waitErr, logStr)
 				}
 			default:
@@ -161,12 +164,13 @@ func reqStartDispatcherEnv(t *testing.T, bin string, envOverrides map[string]str
 			if retryBind {
 				break
 			}
-			resp, err := client.Get("http://" + listenAddr + "/readyz")
+			resp, err := doGet(t.Context(), client, "http://"+listenAddr+"/readyz")
 			if err == nil {
 				body, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
 				if resp.StatusCode == http.StatusOK && string(body) == "ok" {
 					client.CloseIdleConnections()
+					t.Cleanup(cancelCmd)
 					t.Cleanup(func() {
 						rd.stopOnce.Do(func() {
 							select {
@@ -192,8 +196,10 @@ func reqStartDispatcherEnv(t *testing.T, bin string, envOverrides map[string]str
 		}
 		client.CloseIdleConnections()
 		if retryBind {
+			cancelCmd()
 			continue
 		}
+		cancelCmd()
 		_ = cmd.Process.Kill()
 		<-rd.doneCh
 		t.Fatalf("dispatcher /readyz did not become ready within 5s, logs:\n%s", logs.String())
@@ -315,7 +321,7 @@ func reqScrapeMetrics(t *testing.T, metricsAddr string) string {
 	t.Helper()
 	client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{}}
 	defer client.CloseIdleConnections()
-	resp, err := client.Get("http://" + metricsAddr + "/metrics")
+	resp, err := doGet(t.Context(), client, "http://"+metricsAddr+"/metrics")
 	if err != nil {
 		t.Fatalf("GET /metrics failed: %v", err)
 	}
@@ -330,8 +336,8 @@ func reqScrapeMetrics(t *testing.T, metricsAddr string) string {
 	return string(body)
 }
 
-func reqWriteSlowLorisConn(listenAddr, delivery string, writeBytes, declaredLen int, chunked bool) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", listenAddr, 2*time.Second)
+func reqWriteSlowLorisConn(ctx context.Context, listenAddr, delivery string, writeBytes, declaredLen int, chunked bool) (net.Conn, error) {
+	conn, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -429,7 +435,7 @@ func reqOpenSlowLorisFlood(t *testing.T, listenAddr string, largeCount, largeWri
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				c, err := reqWriteSlowLorisConn(listenAddr, fmt.Sprintf("slow-big-%d", idx), largeWriteBytes, declaredLen, chunked)
+				c, err := reqWriteSlowLorisConn(t.Context(), listenAddr, fmt.Sprintf("slow-big-%d", idx), largeWriteBytes, declaredLen, chunked)
 				if err != nil {
 					openErrCount.Add(1)
 					if c != nil {
@@ -469,7 +475,7 @@ func reqOpenSlowLorisFlood(t *testing.T, listenAddr string, largeCount, largeWri
 					var c net.Conn
 					var err error
 					for attempt := range maxTailDialAttempts {
-						c, err = reqWriteSlowLorisConn(listenAddr, fmt.Sprintf("slow-tail-%d", idx), 1, declaredLen, chunked)
+						c, err = reqWriteSlowLorisConn(t.Context(), listenAddr, fmt.Sprintf("slow-tail-%d", idx), 1, declaredLen, chunked)
 						if err == nil {
 							break
 						}
@@ -521,7 +527,7 @@ func reqOpenSlowLorisFlood(t *testing.T, listenAddr string, largeCount, largeWri
 	defer client.CloseIdleConnections()
 	bogusSig := "sha256=" + strings.Repeat("0", 64)
 	pollOnce := func() (int, error) {
-		req, err := http.NewRequest(http.MethodPost, "http://"+listenAddr+"/webhook", strings.NewReader(`{}`))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+listenAddr+"/webhook", strings.NewReader(`{}`))
 		if err != nil {
 			return 0, err
 		}
@@ -682,7 +688,7 @@ func reqOpenSlowLorisFlood(t *testing.T, listenAddr string, largeCount, largeWri
 				if !chunked && topUpDeclared <= topUpSize {
 					topUpDeclared = 4 << 20
 				}
-				c, werr := reqWriteSlowLorisConn(listenAddr, fmt.Sprintf("slow-topup-%d", round), topUpSize, topUpDeclared, chunked)
+				c, werr := reqWriteSlowLorisConn(t.Context(), listenAddr, fmt.Sprintf("slow-topup-%d", round), topUpSize, topUpDeclared, chunked)
 				if werr != nil {
 					if c != nil {
 						_ = c.Close()
@@ -817,7 +823,7 @@ func reqOpenSlowLorisFlood(t *testing.T, listenAddr string, largeCount, largeWri
 					twg.Add(1)
 					go func(slot int) {
 						defer twg.Done()
-						c, werr := reqWriteSlowLorisConn(listenAddr, fmt.Sprintf("slow-tail-topup-%d-%d", round, slot), 1, topUpDeclared, chunked)
+						c, werr := reqWriteSlowLorisConn(t.Context(), listenAddr, fmt.Sprintf("slow-tail-topup-%d-%d", round, slot), 1, topUpDeclared, chunked)
 						if werr != nil {
 							if c != nil {
 								_ = c.Close()
@@ -938,7 +944,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		client := reqNewHTTPClient(t, 3*time.Second)
 
 		for _, route := range []string{"/healthz", "/readyz"} {
-			resp, err := client.Get("http://" + rd.listenAddr + route)
+			resp, err := doGet(t.Context(), client, "http://"+rd.listenAddr+route)
 			if err != nil {
 				t.Fatalf("GET public %s: %v", route, err)
 			}
@@ -949,7 +955,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			}
 		}
 		for _, route := range []string{"/metrics", "/debug/pprof/"} {
-			resp, err := client.Get("http://" + rd.listenAddr + route)
+			resp, err := doGet(t.Context(), client, "http://"+rd.listenAddr+route)
 			if err != nil {
 				t.Fatalf("GET public %s: %v", route, err)
 			}
@@ -960,7 +966,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			}
 		}
 		for _, route := range []string{"/metrics", "/debug/pprof/"} {
-			resp, err := client.Get("http://" + rd.metricsAddr + route)
+			resp, err := doGet(t.Context(), client, "http://"+rd.metricsAddr+route)
 			if err != nil {
 				t.Fatalf("GET internal %s: %v", route, err)
 			}
@@ -971,7 +977,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			}
 		}
 		for _, route := range []string{"/healthz", "/readyz"} {
-			resp, err := client.Get("http://" + rd.metricsAddr + route)
+			resp, err := doGet(t.Context(), client, "http://"+rd.metricsAddr+route)
 			if err != nil {
 				t.Fatalf("GET internal %s: %v", route, err)
 			}
@@ -981,7 +987,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 				t.Fatalf("internal %s = %d, want 404", route, resp.StatusCode)
 			}
 		}
-		req, err := http.NewRequest(http.MethodPost, "http://"+rd.metricsAddr+"/webhook", strings.NewReader("{}"))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.metricsAddr+"/webhook", strings.NewReader("{}"))
 		if err != nil {
 			t.Fatalf("NewRequest: %v", err)
 		}
@@ -1275,7 +1281,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 				go func(idx int) {
 					defer wg.Done()
 					ev := events[idx%len(events)]
-					req, err := http.NewRequest(http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(ev.body))
+					req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(ev.body))
 					if err != nil {
 						errs <- err
 						return
@@ -1528,7 +1534,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		})
 
 		client := reqNewHTTPClient(t, 3*time.Second)
-		resp, err := client.Get("http://" + listenAddr + "/healthz")
+		resp, err := doGet(t.Context(), client, "http://"+listenAddr+"/healthz")
 		if err != nil || resp.StatusCode != http.StatusOK {
 			t.Fatalf("custom LISTEN_ADDR /healthz failed: resp=%v err=%v", resp, err)
 		}
@@ -1625,7 +1631,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			{http.MethodPost, "http://" + rd.metricsAddr + "/metrics"},
 		}
 		for _, tc := range cases {
-			req, err := http.NewRequest(tc.method, tc.url, nil)
+			req, err := http.NewRequestWithContext(t.Context(), tc.method, tc.url, nil)
 			if err != nil {
 				t.Fatalf("NewRequest: %v", err)
 			}
@@ -1715,7 +1721,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		reqOpenSlowLorisFlood(t, rd.listenAddr, 16, 2<<20, 4<<20, 0, false)
 
 		const overLimit = (8 << 20) + 1
-		req, err := http.NewRequest(http.MethodPost, "http://"+rd.listenAddr+"/webhook", io.LimitReader(reqZeroReader{}, overLimit))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.listenAddr+"/webhook", io.LimitReader(reqZeroReader{}, overLimit))
 		if err != nil {
 			t.Fatalf("NewRequest: %v", err)
 		}
@@ -1766,7 +1772,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				req, err := http.NewRequest(http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(validBody))
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(validBody))
 				if err != nil {
 					return
 				}
@@ -1833,7 +1839,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			go func(worker int) {
 				defer wg.Done()
 				for i := range 75 {
-					req, err := http.NewRequest(http.MethodPost, "http://"+rd.listenAddr+"/webhook", strings.NewReader(`{}`))
+					req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.listenAddr+"/webhook", strings.NewReader(`{}`))
 					if err != nil {
 						errs <- err
 						return
@@ -1985,7 +1991,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 	})
 
 	t.Run("Tier2_F21_PortCollisionListenAddrAbortsBoot", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("net.Listen: %v", err)
 		}
@@ -2012,7 +2018,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 	})
 
 	t.Run("Tier2_F21_PortCollisionMetricsAddrAbortsBoot", func(t *testing.T) {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("net.Listen: %v", err)
 		}
@@ -2118,7 +2124,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		}
 
 		client := reqNewHTTPClient(t, 3*time.Second)
-		isoResp, err := client.Get("http://" + rd.listenAddr + "/metrics")
+		isoResp, err := doGet(t.Context(), client, "http://"+rd.listenAddr+"/metrics")
 		if err != nil {
 			t.Fatalf("GET public /metrics: %v", err)
 		}
@@ -2240,7 +2246,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			}
 		}
 		client := reqNewHTTPClient(t, 3*time.Second)
-		resp, err := client.Get("http://" + rd.listenAddr + "/metrics")
+		resp, err := doGet(t.Context(), client, "http://"+rd.listenAddr+"/metrics")
 		if err != nil {
 			t.Fatalf("GET public /metrics: %v", err)
 		}
@@ -2399,7 +2405,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			pingWG.Add(1)
 			go func(idx int) {
 				defer pingWG.Done()
-				req, err := http.NewRequest(http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(pingBody))
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(pingBody))
 				if err != nil {
 					pingErrs <- err
 					return
@@ -2435,7 +2441,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			{"/readyz", http.StatusOK},
 			{"/metrics", http.StatusNotFound},
 		} {
-			resp, err := isoClient.Get("http://" + rd.listenAddr + chk.path)
+			resp, err := doGet(t.Context(), isoClient, "http://"+rd.listenAddr+chk.path)
 			if err != nil {
 				t.Fatalf("GET %s: %v", chk.path, err)
 			}
@@ -2491,7 +2497,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 			stormWG.Add(1)
 			go func(idx int, item stormReq) {
 				defer stormWG.Done()
-				req, err := http.NewRequest(http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(item.body))
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(item.body))
 				if err != nil {
 					stormErrs <- err
 					return
@@ -2584,7 +2590,7 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 				t.Fatalf("dispatcher exited prematurely (%v) during Phase C drain", rd.waitErr)
 			default:
 			}
-			resp, err := readyzClient.Get("http://" + rd.listenAddr + "/readyz")
+			resp, err := doGet(t.Context(), readyzClient, "http://"+rd.listenAddr+"/readyz")
 			if err == nil {
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()

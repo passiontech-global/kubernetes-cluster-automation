@@ -62,13 +62,21 @@ func waitForLogContains(t *testing.T, logs *syncBuffer, substr string, timeout t
 
 func reserveLoopbackAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve loopback port: %v", err)
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
 	return addr
+}
+
+func doGet(ctx context.Context, client *http.Client, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
 }
 
 func signPayload(secret string, body []byte) string {
@@ -129,7 +137,8 @@ func startDispatcher(t *testing.T, bin string, concourseURL string) *runningDisp
 	metricsAddr := reserveLoopbackAddr(t)
 	logs := &syncBuffer{}
 
-	cmd := exec.Command(bin)
+	cmdCtx, cancelCmd := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(cmdCtx, bin)
 	cmd.Env = cleanChildEnv(map[string]string{
 		"GITHUB_WEBHOOK_SECRET": e2eSecret,
 		"CI_WEBHOOK_TOKEN":      e2eWebhookToken,
@@ -143,6 +152,7 @@ func startDispatcher(t *testing.T, bin string, concourseURL string) *runningDisp
 	cmd.Stderr = logs
 
 	if err := cmd.Start(); err != nil {
+		cancelCmd()
 		t.Fatalf("start dispatcher: %v", err)
 	}
 
@@ -159,6 +169,7 @@ func startDispatcher(t *testing.T, bin string, concourseURL string) *runningDisp
 		close(doneCh)
 	}()
 
+	t.Cleanup(cancelCmd)
 	t.Cleanup(func() {
 		rd.stopOnce.Do(func() {
 			select {
@@ -185,7 +196,7 @@ func startDispatcher(t *testing.T, bin string, concourseURL string) *runningDisp
 			t.Fatalf("dispatcher exited prematurely (%v), logs:\n%s", rd.waitErr, logs.String())
 		default:
 		}
-		resp, err := client.Get("http://" + listenAddr + "/readyz")
+		resp, err := doGet(t.Context(), client, "http://"+listenAddr+"/readyz")
 		if err == nil {
 			body, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
@@ -201,7 +212,7 @@ func startDispatcher(t *testing.T, bin string, concourseURL string) *runningDisp
 
 func (rd *runningDispatcher) postWebhook(t *testing.T, event, delivery, sig string, body []byte) (int, string) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("new webhook request: %v", err)
 	}
@@ -384,7 +395,7 @@ func TestE2EDispatcher(t *testing.T) {
 
 		client := &http.Client{Timeout: 3 * time.Second}
 		for _, route := range []string{"/healthz", "/readyz"} {
-			resp, err := client.Get("http://" + rd.listenAddr + route)
+			resp, err := doGet(t.Context(), client, "http://"+rd.listenAddr+route)
 			if err != nil {
 				t.Fatalf("GET %s failed: %v", route, err)
 			}
@@ -417,14 +428,14 @@ func TestE2EDispatcher(t *testing.T) {
 		var lastMetricsErr error
 		for {
 			var missing string
-			resp, err := client.Get("http://" + rd.metricsAddr + "/metrics")
+			resp, err := doGet(t.Context(), client, "http://"+rd.metricsAddr+"/metrics")
 			if err != nil {
-				lastMetricsErr = fmt.Errorf("GET /metrics failed: %v", err)
+				lastMetricsErr = fmt.Errorf("GET /metrics failed: %w", err)
 			} else {
 				metricsBody, readErr := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
 				if readErr != nil {
-					lastMetricsErr = fmt.Errorf("read /metrics body: %v", readErr)
+					lastMetricsErr = fmt.Errorf("read /metrics body: %w", readErr)
 				} else if resp.StatusCode != http.StatusOK {
 					lastMetricsErr = fmt.Errorf("GET /metrics status = %d, want 200", resp.StatusCode)
 				} else {
@@ -447,7 +458,7 @@ func TestE2EDispatcher(t *testing.T) {
 			time.Sleep(25 * time.Millisecond)
 		}
 
-		pprofResp, err := client.Get("http://" + rd.metricsAddr + "/debug/pprof/")
+		pprofResp, err := doGet(t.Context(), client, "http://"+rd.metricsAddr+"/debug/pprof/")
 		if err != nil {
 			t.Fatalf("GET metrics /debug/pprof/ failed: %v", err)
 		}
@@ -460,7 +471,7 @@ func TestE2EDispatcher(t *testing.T) {
 		// Verify isolation: /debug/pprof/ and /metrics MUST return 404 on LISTEN_ADDR,
 		// and /healthz, /readyz, POST /webhook MUST return 404 on METRICS_ADDR.
 		for _, isolated := range []string{"/debug/pprof/", "/metrics"} {
-			isoResp, err := client.Get("http://" + rd.listenAddr + isolated)
+			isoResp, err := doGet(t.Context(), client, "http://"+rd.listenAddr+isolated)
 			if err != nil {
 				t.Fatalf("GET public %s failed: %v", isolated, err)
 			}
@@ -471,7 +482,7 @@ func TestE2EDispatcher(t *testing.T) {
 			}
 		}
 		for _, route := range []string{"/healthz", "/readyz"} {
-			isoResp, err := client.Get("http://" + rd.metricsAddr + route)
+			isoResp, err := doGet(t.Context(), client, "http://"+rd.metricsAddr+route)
 			if err != nil {
 				t.Fatalf("GET metrics %s failed: %v", route, err)
 			}
@@ -481,7 +492,7 @@ func TestE2EDispatcher(t *testing.T) {
 				t.Fatalf("metrics listener %s status = %d, want 404", route, isoResp.StatusCode)
 			}
 		}
-		whReq, err := http.NewRequest(http.MethodPost, "http://"+rd.metricsAddr+"/webhook", bytes.NewReader(payload))
+		whReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.metricsAddr+"/webhook", bytes.NewReader(payload))
 		if err != nil {
 			t.Fatalf("new metrics /webhook request: %v", err)
 		}
@@ -925,7 +936,7 @@ func TestE2EDispatcher(t *testing.T) {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				req, err := http.NewRequest(http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(body))
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+rd.listenAddr+"/webhook", bytes.NewReader(body))
 				if err != nil {
 					errs <- err
 					return
@@ -979,7 +990,7 @@ func TestE2EDispatcher(t *testing.T) {
 				t.Fatalf("dispatcher exited prematurely (%v) while check/webhook was still blocked", rd.waitErr)
 			default:
 			}
-			resp, err := readyzClient.Get("http://" + rd.listenAddr + "/readyz")
+			resp, err := doGet(t.Context(), readyzClient, "http://"+rd.listenAddr+"/readyz")
 			if err == nil {
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
@@ -1014,7 +1025,7 @@ func TestE2EDispatcher(t *testing.T) {
 				t.Fatalf("dispatcher exited prematurely (%v) while check/webhook was still blocked", rd.waitErr)
 			default:
 			}
-			resp, err := readyzClient.Get("http://" + rd.listenAddr + "/readyz")
+			resp, err := doGet(t.Context(), readyzClient, "http://"+rd.listenAddr+"/readyz")
 			if err == nil {
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()

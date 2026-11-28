@@ -105,22 +105,22 @@ func TestSameOriginRedirectPolicy(t *testing.T) {
 	policy := SameOriginRedirectPolicy("http://atc.internal:8080")
 
 	t.Run("same-origin redirect allowed", func(t *testing.T) {
-		via := []*http.Request{httptest.NewRequest(http.MethodPost, "http://atc.internal:8080/api/v1/x", nil)}
-		req := httptest.NewRequest(http.MethodPost, "http://atc.internal:8080/api/v1/rewritten", nil)
+		via := []*http.Request{httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://atc.internal:8080/api/v1/x", nil)}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://atc.internal:8080/api/v1/rewritten", nil)
 		if err := policy(req, via); err != nil {
 			t.Fatalf("same-origin redirect rejected: %v", err)
 		}
 	})
 	t.Run("cross-origin redirect blocked", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "http://evil.example/path", nil)
-		via := []*http.Request{httptest.NewRequest(http.MethodPost, "http://atc.internal:8080/api/v1/x", nil)}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://evil.example/path", nil)
+		via := []*http.Request{httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://atc.internal:8080/api/v1/x", nil)}
 		if err := policy(req, via); err == nil {
 			t.Fatal("cross-origin redirect allowed — webhook_token would leak")
 		}
 	})
 	t.Run("scheme change blocked", func(t *testing.T) {
-		via := []*http.Request{httptest.NewRequest(http.MethodPost, "http://atc.internal:8080/x", nil)}
-		req := httptest.NewRequest(http.MethodPost, "https://atc.internal:8080/x", nil)
+		via := []*http.Request{httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://atc.internal:8080/x", nil)}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://atc.internal:8080/x", nil)
 		if err := policy(req, via); err == nil {
 			t.Fatal("scheme-changing redirect allowed")
 		}
@@ -129,8 +129,8 @@ func TestSameOriginRedirectPolicy(t *testing.T) {
 		// DNS is case-insensitive — EqualFold must treat
 		// ATC.INTERNAL as the same origin or every capitalized
 		// redirect target would leak-block legitimate retries.
-		via := []*http.Request{httptest.NewRequest(http.MethodPost, "http://atc.internal:8080/x", nil)}
-		req := httptest.NewRequest(http.MethodPost, "http://ATC.INTERNAL:8080/x", nil)
+		via := []*http.Request{httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://atc.internal:8080/x", nil)}
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://ATC.INTERNAL:8080/x", nil)
 		if err := policy(req, via); err != nil {
 			t.Fatalf("case-different same host rejected: %v", err)
 		}
@@ -138,9 +138,9 @@ func TestSameOriginRedirectPolicy(t *testing.T) {
 	t.Run("credential-free error", func(t *testing.T) {
 		// The refusal message must not embed the full request URL —
 		// only the redirect target's host.
-		req := httptest.NewRequest(http.MethodPost,
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
 			"http://evil.example/p?webhook_token=secret", nil)
-		via := []*http.Request{httptest.NewRequest(http.MethodPost,
+		via := []*http.Request{httptest.NewRequestWithContext(t.Context(), http.MethodPost,
 			"http://atc.internal:8080/api/v1/x?webhook_token=secret", nil)}
 		err := policy(req, via)
 		if err == nil {
