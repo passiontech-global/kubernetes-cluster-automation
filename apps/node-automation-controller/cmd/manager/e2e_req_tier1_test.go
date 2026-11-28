@@ -82,7 +82,7 @@ func runTier1Tests(t *testing.T, binPath string, sem chan struct{}) {
 		t.Run("ContractSuitesPass", func(t *testing.T) {
 			t.Parallel()
 			acquireManagerSlot(t, sem)
-			cmd := exec.Command("go", "test", "-race", "./internal/envdoc", "./internal/releaseglob", "./internal/registry")
+			cmd := exec.CommandContext(t.Context(), "go", "test", "-race", "./internal/envdoc", "./internal/releaseglob", "./internal/registry")
 			cmd.Dir = "../.."
 			cmd.Env = append(scrubbedKubeEnv(), "GOWORK=off")
 			out, err := cmd.CombinedOutput()
@@ -1093,7 +1093,7 @@ func runTier1Tests(t *testing.T, binPath string, sem chan struct{}) {
 		t.Parallel()
 		t.Run("ReleaseWorkflowGlobsMatchCmdDeps", func(t *testing.T) {
 			t.Parallel()
-			cmd := exec.Command("go", "test", "-race", "./internal/releaseglob", "-run", "TestReleaseWorkflowGlobsMatchCmdDeps")
+			cmd := exec.CommandContext(t.Context(), "go", "test", "-race", "./internal/releaseglob", "-run", "TestReleaseWorkflowGlobsMatchCmdDeps")
 			cmd.Dir = "../.."
 			cmd.Env = append(scrubbedKubeEnv(), "GOWORK=off")
 			if out, err := cmd.CombinedOutput(); err != nil {
@@ -1103,7 +1103,7 @@ func runTier1Tests(t *testing.T, binPath string, sem chan struct{}) {
 
 		t.Run("DockerDetectMappingMatchesDeps", func(t *testing.T) {
 			t.Parallel()
-			cmd := exec.Command("go", "test", "-race", "./internal/releaseglob", "-run", "TestDockerDetectMappingMatchesDeps")
+			cmd := exec.CommandContext(t.Context(), "go", "test", "-race", "./internal/releaseglob", "-run", "TestDockerDetectMappingMatchesDeps")
 			cmd.Dir = "../.."
 			cmd.Env = append(scrubbedKubeEnv(), "GOWORK=off")
 			if out, err := cmd.CombinedOutput(); err != nil {
@@ -1123,7 +1123,7 @@ func runTier1Tests(t *testing.T, binPath string, sem chan struct{}) {
 
 		t.Run("HadolintZeroIssues", func(t *testing.T) {
 			t.Parallel()
-			cmd := exec.Command("hadolint", "Dockerfile")
+			cmd := exec.CommandContext(t.Context(), "hadolint", "Dockerfile")
 			cmd.Dir = "../.."
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("hadolint failed: %v\n%s", err, out)
@@ -1947,7 +1947,7 @@ func enableVeleroCRDs(srv *reqE2EAPIServer) {
 
 func readRepoFile(t *testing.T, relPath string) string {
 	t.Helper()
-	cmd := exec.Command("cat", relPath)
+	cmd := exec.CommandContext(t.Context(), "cat", relPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("read %s: %v\n%s", relPath, err, out)

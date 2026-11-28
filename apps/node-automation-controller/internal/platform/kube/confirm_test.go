@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"errors"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,7 +32,7 @@ func TestConfirmAbsent(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
 			}
-			if tt.wantErr && err != tt.getErr {
+			if tt.wantErr && (!errors.Is(err, tt.getErr) || err.Error() != tt.getErr.Error()) {
 				t.Fatal("a confirm failure should pass the Get error through verbatim")
 			}
 		})

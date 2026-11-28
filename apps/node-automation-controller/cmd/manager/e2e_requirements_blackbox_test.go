@@ -58,7 +58,7 @@ import (
 // TestE2ERequirements compiles ./cmd/manager once and runs all four E2E tiers.
 func TestE2ERequirements(t *testing.T) {
 	binPath := filepath.Join(t.TempDir(), "manager")
-	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	buildCmd := exec.CommandContext(t.Context(), "go", "build", "-o", binPath, ".")
 	buildCmd.Env = os.Environ()
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("compile manager binary: %v\n%s", err, out)
@@ -104,7 +104,7 @@ func reserveLoopbackPort(t *testing.T) string {
 		}
 	}()
 	for range 32 {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("allocate loopback port: %v", err)
 		}
@@ -467,7 +467,7 @@ type blackholeListener struct {
 
 func startBlackholeTCPListener(t *testing.T) *blackholeListener {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen blackhole tcp: %v", err)
 	}
@@ -604,7 +604,7 @@ func tryStartHealthyTLSListener(t *testing.T, ip string, port int32) (*healthyTL
 			go func(c net.Conn) {
 				defer func() { _ = c.Close() }()
 				if tc, ok := c.(*tls.Conn); ok {
-					_ = tc.Handshake()
+					_ = tc.HandshakeContext(t.Context())
 				}
 			}(conn)
 		}

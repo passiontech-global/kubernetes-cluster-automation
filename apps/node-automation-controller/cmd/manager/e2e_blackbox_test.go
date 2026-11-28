@@ -50,7 +50,7 @@ func TestE2EManager(t *testing.T) {
 	}
 
 	binPath := filepath.Join(t.TempDir(), "manager")
-	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	buildCmd := exec.CommandContext(t.Context(), "go", "build", "-o", binPath, ".")
 	buildCmd.Env = os.Environ()
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("compile manager binary: %v\n%s", err, out)
@@ -492,7 +492,9 @@ type managerProcess struct {
 
 func startManagerProcess(t *testing.T, binPath string, env []string, args ...string) *managerProcess {
 	t.Helper()
-	cmd := exec.Command(binPath, args...)
+	// Use Background so t.Context() cancellation does not SIGKILL the child
+	// before t.Cleanup sends SIGINT for graceful-shutdown assertions.
+	cmd := exec.CommandContext(context.Background(), binPath, args...)
 	if env != nil {
 		cmd.Env = env
 	} else {
@@ -620,7 +622,7 @@ users:
 
 func freeLoopbackPort(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("allocate loopback port: %v", err)
 	}
@@ -633,8 +635,12 @@ func freeLoopbackPort(t *testing.T) string {
 }
 
 func httpGetBody(rawURL string) (int, string, error) {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, "", err
+	}
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(rawURL)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, "", err
 	}

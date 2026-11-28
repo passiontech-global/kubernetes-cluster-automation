@@ -63,12 +63,12 @@ func runTier2Tests(t *testing.T, binPath string, sem chan struct{}) {
 		t.Run("GofmtAndVetClean", func(t *testing.T) {
 			t.Parallel()
 			acquireManagerSlot(t, sem)
-			fmtCmd := exec.Command("gofmt", "-l", "cmd/manager")
+			fmtCmd := exec.CommandContext(t.Context(), "gofmt", "-l", "cmd/manager")
 			fmtCmd.Dir = "../.."
 			if out, err := fmtCmd.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "" {
 				t.Errorf("gofmt unformatted files (%v):\n%s", err, out)
 			}
-			vetCmd := exec.Command("go", "vet", "./cmd/manager")
+			vetCmd := exec.CommandContext(t.Context(), "go", "vet", "./cmd/manager")
 			vetCmd.Dir = "../.."
 			vetCmd.Env = append(scrubbedKubeEnv(), "GOWORK=off")
 			if out, err := vetCmd.CombinedOutput(); err != nil {
@@ -1137,7 +1137,7 @@ func runTier2Tests(t *testing.T, binPath string, sem chan struct{}) {
 
 		t.Run("ReleaseWorkflowMatchesCmdDeps", func(t *testing.T) {
 			t.Parallel()
-			cmd := exec.Command("go", "list", "-deps", "./cmd/manager")
+			cmd := exec.CommandContext(t.Context(), "go", "list", "-deps", "./cmd/manager")
 			cmd.Dir = "../.."
 			cmd.Env = append(scrubbedKubeEnv(), "GOWORK=off")
 			out, err := cmd.CombinedOutput()

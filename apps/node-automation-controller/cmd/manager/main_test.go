@@ -89,7 +89,7 @@ func kubeScrubbedEnv() []string {
 func runMainInSubprocess(t *testing.T, args []string, extraEnv ...string) (stdout, stderr string, code int) {
 	t.Helper()
 	cmdArgs := append([]string{"-test.run=TestHelperProcess", "--"}, args...)
-	cmd := exec.Command(os.Args[0], cmdArgs...)
+	cmd := exec.CommandContext(t.Context(), os.Args[0], cmdArgs...)
 	cmd.Env = append(kubeScrubbedEnv(), append([]string{"GO_HELPER_PROCESS=1"}, extraEnv...)...)
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
@@ -251,7 +251,7 @@ func TestMainStartsManagerUntilSignal(t *testing.T) {
 
 	stderr := &lockedBuffer{}
 	var stdout bytes.Buffer
-	cmd := exec.Command(os.Args[0],
+	cmd := exec.CommandContext(t.Context(), os.Args[0],
 		"-test.run=TestHelperProcess", "--",
 		// :0 picks ephemeral ports so the child cannot collide with a
 		// real listener on :9115/:8081/:9116.
@@ -579,7 +579,7 @@ func TestMakeCRDCacheTransform(t *testing.T) {
 func TestPprofMuxAndMetricsServerSeparation(t *testing.T) {
 	mux := pprofMux()
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/heap?debug=1", nil))
+	mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/pprof/heap?debug=1", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("heap profile: got %d, want 200", rec.Code)
 	}
@@ -588,13 +588,13 @@ func TestPprofMuxAndMetricsServerSeparation(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/cmdline", nil))
+	mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/pprof/cmdline", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("cmdline: got %d, want 200", rec.Code)
 	}
 
 	rec = httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("/metrics on pprofMux: got %d, want 404", rec.Code)
 	}

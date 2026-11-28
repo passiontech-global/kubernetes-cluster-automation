@@ -474,7 +474,11 @@ func TestEndpointGuardTransportTLS(t *testing.T) {
 			t.Fatalf("transport: %v", err)
 		}
 		client := &http.Client{Transport: rt, Timeout: 5 * time.Second}
-		resp, err := client.Get(srv.URL + "/apis/coordination.k8s.io/v1/leases?limit=1")
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/apis/coordination.k8s.io/v1/leases?limit=1", nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("TLS request failed: %v", err)
 		}
@@ -513,7 +517,11 @@ func TestEndpointGuardTransportTLS(t *testing.T) {
 		if err != nil {
 			t.Fatalf("transport: %v", err)
 		}
-		resp, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Get(srv.URL)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		resp, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Do(req)
 		if err != nil {
 			t.Fatalf("TLS request with CAFile failed: %v", err)
 		}
@@ -542,7 +550,15 @@ func TestEndpointGuardTransportTLS(t *testing.T) {
 		if err != nil {
 			t.Fatalf("transport: %v", err)
 		}
-		if _, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Get(srv.URL); err == nil {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		resp, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		if err == nil {
 			t.Fatal("expected TLS verification error against untrusted CA")
 		}
 		if hits != 0 || gotAuth != "" {
@@ -569,7 +585,15 @@ func TestEndpointGuardTransportTLS(t *testing.T) {
 		if err != nil {
 			t.Fatalf("transport: %v", err)
 		}
-		if _, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Get(srv.URL); err == nil {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		resp, err := (&http.Client{Transport: rt, Timeout: 5 * time.Second}).Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		if err == nil {
 			t.Fatal("expected TLS SAN verification error when kubernetes.default.svc missing")
 		}
 		if hits != 0 || gotAuth != "" {

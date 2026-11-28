@@ -354,7 +354,7 @@ func TestZombieSidecarDeleteUIDPrecondition(t *testing.T) {
 // The /shutdown URL must bracket IPv6 podIPs — fmt's %s:%d produces
 // "http://::1:4191/", which is unparseable.
 func TestZombieSidecarShutdownIPv6(t *testing.T) {
-	l, err := net.Listen("tcp", "[::1]:4191")
+	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "[::1]:4191")
 	if err != nil {
 		t.Skipf("IPv6 loopback :4191 unavailable: %v", err)
 	}

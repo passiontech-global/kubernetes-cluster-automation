@@ -166,12 +166,12 @@ func TestSnapshotMemoizesErrorPerKind(t *testing.T) {
 
 	_, err1 := d.AllEvents(ctx)
 	_, err2 := d.AllEvents(ctx)
-	if !errors.Is(err1, boom) || !errors.Is(err2, boom) || err1 != err2 {
+	if !errors.Is(err1, boom) || !errors.Is(err2, boom) || !errors.Is(err1, err2) {
 		t.Fatalf("event errors %v/%v — second call must read the memoized error", err1, err2)
 	}
 	_, err1 = d.AllPVCs(ctx)
 	_, err2 = d.AllPVCs(ctx)
-	if !errors.Is(err1, boom) || err1 != err2 {
+	if !errors.Is(err1, boom) || !errors.Is(err1, err2) {
 		t.Fatalf("pvc errors %v/%v — second call must read the memoized error", err1, err2)
 	}
 	var eventLists int
@@ -683,7 +683,7 @@ func TestAllTypedReplicaSets(t *testing.T) {
 
 		_, err1 := d.AllTypedReplicaSets(ctx)
 		_, err2 := d.AllTypedReplicaSets(ctx)
-		if !errors.Is(err1, boom) || !errors.Is(err2, boom) || err1 != err2 {
+		if !errors.Is(err1, boom) || !errors.Is(err2, boom) || !errors.Is(err1, err2) {
 			t.Fatalf("errors = (%v, %v), want identical memoized %v", err1, err2, boom)
 		}
 		if got := lists.Load(); got != 1 {

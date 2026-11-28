@@ -354,7 +354,7 @@ func TestTCPTLSEndpointProber(t *testing.T) {
 // even when the parent context has no short deadline, and readyEndpointCounts
 // must record the service as Probed=true, Responsive=false.
 func TestTCPTLSEndpointProberHandshakeTimeout(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

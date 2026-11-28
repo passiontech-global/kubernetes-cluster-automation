@@ -251,7 +251,7 @@ func (p *controllerLeaseGuardCheck) ksmWedgeReason(ctx context.Context,
 	errs, err := p.ksmReflectorErrorIncrease(ctx, pod)
 	if err != nil {
 		if logErr != nil {
-			return "", fmt.Errorf("log tail: %w (prometheus: %v)", logErr, err)
+			return "", fmt.Errorf("log tail: %w (prometheus: %w)", logErr, err)
 		}
 		return "", fmt.Errorf("prometheus: %w", err)
 	}

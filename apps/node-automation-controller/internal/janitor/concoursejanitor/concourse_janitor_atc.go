@@ -86,6 +86,7 @@ func (c *atcClient) login(ctx context.Context, user, pass string) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = resp.Body.Close() }()
 	defer httpx.DrainAndClose(resp.Body, 64<<10)
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("atc token: status %s", resp.Status)
@@ -219,6 +220,7 @@ func (c *atcClient) atcDo(ctx context.Context, method, endpoint string, body []b
 	if err != nil {
 		return 0, err
 	}
+	defer func() { _ = resp.Body.Close() }()
 	defer httpx.DrainAndClose(resp.Body, 64<<10)
 	if resp.StatusCode/100 != 2 {
 		return resp.StatusCode, fmt.Errorf("atc %s %s: status %s", method, endpoint, resp.Status)

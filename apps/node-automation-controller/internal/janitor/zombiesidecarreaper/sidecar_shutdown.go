@@ -68,7 +68,7 @@ func (r *zombieSidecarReaper) shutdownPod(ctx context.Context, p *corev1.Pod, si
 	}
 	if err := r.proxyFn(ctx, p, sidecar); err != nil {
 		if directErr != nil {
-			return fmt.Errorf("direct shutdown: %v; proxy shutdown: %w",
+			return fmt.Errorf("direct shutdown: %w; proxy shutdown: %w",
 				directErr, err)
 		}
 		return fmt.Errorf("proxy shutdown: %w", err)

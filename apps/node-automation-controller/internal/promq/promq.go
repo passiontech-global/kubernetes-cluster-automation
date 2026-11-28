@@ -146,6 +146,7 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 		return nil, fmt.Errorf("prometheus query: %w",
 			&TransportError{err: err})
 	}
+	defer func() { _ = resp.Body.Close() }()
 	defer httpx.DrainAndClose(resp.Body, drainOnClose)
 	body, truncated, err := httpx.ReadBounded(resp.Body, maxResponseBytes)
 	if err != nil {

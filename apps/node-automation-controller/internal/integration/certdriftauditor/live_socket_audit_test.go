@@ -1097,7 +1097,7 @@ func genTLSTestCert(t *testing.T, serial int64, cn string, isCA bool, parent *x5
 
 func startLoopbackTLSServer(t *testing.T, cfg *tls.Config) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1119,7 +1119,7 @@ func startLoopbackTLSServer(t *testing.T, cfg *tls.Config) string {
 				defer wg.Done()
 				defer func() { _ = c.Close() }()
 				tc := tls.Server(c, cfg)
-				_ = tc.Handshake()
+				_ = tc.HandshakeContext(t.Context())
 			}(conn)
 		}
 	}()
@@ -1237,7 +1237,7 @@ func TestDefaultLiveCertProber(t *testing.T) {
 		{
 			name: "dial_error_closed_port",
 			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
-				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1253,7 +1253,7 @@ func TestDefaultLiveCertProber(t *testing.T) {
 		{
 			name: "non_tls_plaintext_server",
 			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
-				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1284,7 +1284,7 @@ func TestDefaultLiveCertProber(t *testing.T) {
 		{
 			name: "eof_immediate_close",
 			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
-				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1315,7 +1315,7 @@ func TestDefaultLiveCertProber(t *testing.T) {
 			name:         "handshake_timeout_via_context",
 			wantDuration: 500 * time.Millisecond,
 			setup: func(t *testing.T) (string, string, context.Context, func(*testing.T, *x509.Certificate, error)) {
-				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
 				}
