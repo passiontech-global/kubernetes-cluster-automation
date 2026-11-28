@@ -102,7 +102,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .moon/cache
-          key: moon-${{ runner.os }}-${{ inputs.app }}-${{ hashFiles('mise.toml', '.golangci.yml', '.moon/**', '**/moon.yml', '**/go.mod', '**/go.sum', '**/*.go', 'apps/*/docs/env.md', 'apps/*/ENV.md', '.github/workflows/**') }}
+          key: moon-${{ runner.os }}-${{ inputs.app }}-${{ hashFiles('mise.toml', '.golangci.yml', '.moon/**', '**/moon.yml', '**/go.mod', '**/go.sum', '**/*.go', 'apps/*/docs/env.md', 'apps/*/ENV.md', 'apps/node-host-agent/internal/subsystem/hostconfig/templates/**', 'apps/node-host-agent/internal/subsystem/hubsync/testdata/**', '.github/workflows/**') }}
           restore-keys: moon-${{ runner.os }}-
 
       - name: Compute version and changelog
