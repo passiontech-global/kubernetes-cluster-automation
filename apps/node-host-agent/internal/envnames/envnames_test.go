@@ -137,6 +137,7 @@ func TestEnableGatesDeclared(t *testing.T) {
 		"EnvEnableReporter":          "NODE_HOST_AGENT_ENABLE_REPORTER",
 		"EnvEnableControllerhygiene": "NODE_HOST_AGENT_ENABLE_CONTROLLERHYGIENE",
 		"EnvEnableHostconfig":        "NODE_HOST_AGENT_ENABLE_HOSTCONFIG",
+		"EnvEnableHubsync":           "NODE_HOST_AGENT_ENABLE_HUBSYNC",
 		"EnvEnableKinedb":            "NODE_HOST_AGENT_ENABLE_KINEDB",
 		"EnvEnableFeeder":            "NODE_HOST_AGENT_ENABLE_FEEDER",
 	}

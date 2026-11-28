@@ -142,7 +142,7 @@ func TestMainRendersGatesTable(t *testing.T) {
 	}
 	for _, want := range []string{
 		"| `NODE_HOST_AGENT_ENABLE_SWEEPER` | sweeper | `on` (pod) / `off` (standalone) |",
-		"| — | hubsync | — |",
+		"| `NODE_HOST_AGENT_ENABLE_HUBSYNC` | hubsync | `on` |",
 		"| `NODE_HOST_AGENT_ENABLE_FEEDER` | — | — |",
 	} {
 		if !strings.Contains(out, want) {

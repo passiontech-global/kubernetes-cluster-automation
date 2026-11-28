@@ -98,7 +98,7 @@ type Needs struct {
 type Descriptor struct {
 	Name string
 	// EnvFlag is the NODE_HOST_AGENT_ENABLE_* knob; empty means "no
-	// env gate" (hubsync — pod mode + pod name + kube client only).
+	// env gate".
 	EnvFlag string
 	// Default is the mode an unset, empty, "auto" or unrecognised
 	// flag resolves to; ModeAuto defers the decision to Auto.
@@ -386,15 +386,15 @@ func (w *wiring) descriptors() []Descriptor {
 		},
 		// hubsync: SSH converge of standalone targets.
 		// Pod-mode only (it IS the converge fleet's client side — a
-		// standalone target never converges other targets). The
-		// Syncer is wired unconditionally once its gates pass: the DS
-		// mounts the converge secret optional:true so the key may
-		// land after pod start — the key-missing info log is the
-		// startup fast-path only, and the Syncer re-checks the key on
-		// every trigger until it materializes.
+		// standalone target never converges other targets). Default
+		// ModeOn preserves legacy DaemonSet behaviour when unset;
+		// setting NODE_HOST_AGENT_ENABLE_HUBSYNC=false skips building
+		// hubsync completely so worker pods never start leaseLoop.
 		{
-			Name:  "hubsync",
-			Needs: Needs{Kube: true, PodName: true, PodModeOnly: true},
+			Name:    "hubsync",
+			EnvFlag: envnames.EnvEnableHubsync,
+			Default: envx.ModeOn,
+			Needs:   Needs{Kube: true, PodName: true, PodModeOnly: true},
 			Build: func(w *wiring, cs kubernetes.Interface) ([]agent.Subsystem, error) {
 				hsCfg := hubsync.ConfigFromEnv(hubsync.EnvDeps{
 					Deps:        w.Deps,

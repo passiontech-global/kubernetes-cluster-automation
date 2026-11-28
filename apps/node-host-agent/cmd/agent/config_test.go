@@ -125,11 +125,8 @@ users:
 		t.Setenv("KUBECONFIG", kubeconfig)
 		t.Setenv(envnames.EnvEnableSweeper, "true")
 		cfg, _ := testBuildAgentConfig("n", "p", false)
-		// hubsync joins: with a working client it is always wired in
-		// pod mode (it polls for the converge key itself).
-		if names := subsystemNames(cfg); len(names) != 2 ||
-			names[0] != "sweeper" || names[1] != "hubsync" {
-			t.Fatalf("subsystems=%v want [sweeper hubsync]", names)
+		if names := subsystemNames(cfg); len(names) != 1 || names[0] != "sweeper" {
+			t.Fatalf("subsystems=%v want [sweeper]", names)
 		}
 	})
 

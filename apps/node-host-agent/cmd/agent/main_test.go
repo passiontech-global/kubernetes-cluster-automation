@@ -136,6 +136,7 @@ func TestMainRunShutsDownOnSIGTERM(t *testing.T) {
 		envnames.EnvEnableReporter+"=false",
 		envnames.EnvEnableControllerhygiene+"=false",
 		envnames.EnvEnableHostconfig+"=false",
+		envnames.EnvEnableHubsync+"=false",
 		envnames.EnvEnableJanitor+"=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
@@ -211,6 +212,7 @@ func TestMainRunListenerError(t *testing.T) {
 		envnames.EnvEnableReporter+"=false",
 		envnames.EnvEnableControllerhygiene+"=false",
 		envnames.EnvEnableHostconfig+"=false",
+		envnames.EnvEnableHubsync+"=false",
 		envnames.EnvEnableJanitor+"=false",
 		"KUBERNETES_SERVICE_HOST=",
 		"KUBERNETES_SERVICE_PORT=",
@@ -243,6 +245,7 @@ func disableAllSubsystems(t *testing.T) {
 		envnames.EnvEnableReporter,
 		envnames.EnvEnableControllerhygiene,
 		envnames.EnvEnableHostconfig,
+		envnames.EnvEnableHubsync,
 		envnames.EnvEnableJanitor,
 	} {
 		t.Setenv(k, "false")
