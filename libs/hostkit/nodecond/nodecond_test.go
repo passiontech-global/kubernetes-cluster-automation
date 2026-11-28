@@ -9,12 +9,12 @@ import (
 // allConditionNames enumerates every exported condition constant BY
 // IDENTIFIER — a renamed or deleted constant breaks this file's
 // compilation instead of silently drifting out of the test's reach.
-// 69 latch-backed + 6 non-heartbeat-owned (4 kubelet/permanent +
+// 70 latch-backed + 6 non-heartbeat-owned (4 kubelet/permanent +
 // ReadonlyFilesystem + the LocalRemediationInProgress coordination
-// condition) = 75. The constant must be enumerated here or it silently
+// condition) = 76. The constant must be enumerated here or it silently
 // escapes every coverage assertion below.
 var allConditionNames = []string{
-	// Latch-backed (69).
+	// Latch-backed (70).
 	NodeOverloaded, WatchdogStale,
 	CiliumAgentDown, CiliumInitStuck,
 	KubeletRuntimeStall, DNSFallbackActive, DNSResolvStale,
@@ -43,6 +43,7 @@ var allConditionNames = []string{
 	CondSystemdOOMDKill, CondNetworkMountHung,
 	CondNodeLocalDNSNoTrackDrift,
 	CondK8s135ReadinessDrift, CondKMSv2Unhealthy,
+	CgroupMemoryHighThrottle,
 	// Monitor- and kubelet-owned (6) — HostNetworkProblems sits here
 	// by declaration block but IS heartbeat-managed now that the
 	// kernelfail NIC-health guard latches it (see notHeartbeatManaged).
@@ -82,8 +83,8 @@ var legacyControllerSpellings = []string{
 }
 
 func TestConstantsNonEmptyAndUnique(t *testing.T) {
-	if len(allConditionNames) != 75 {
-		t.Fatalf("allConditionNames = %d entries, want 75 (69 latch-backed + 6 non-heartbeat-owned)",
+	if len(allConditionNames) != 76 {
+		t.Fatalf("allConditionNames = %d entries, want 76 (70 latch-backed + 6 non-heartbeat-owned)",
 			len(allConditionNames))
 	}
 	seen := make(map[string]bool, len(allConditionNames))
@@ -212,6 +213,9 @@ var conditionClasses = map[string]conditionClass{
 	// (matching EtcdQuorumDegraded).
 	CondK8s135ReadinessDrift: {},
 	CondKMSv2Unhealthy:       {stormGate: true},
+	// Wave-7 self-healing classification: CgroupMemoryHighThrottle gates
+	// descheduler storms without triggering pre-cordon.
+	CgroupMemoryHighThrottle: {stormGate: true},
 }
 
 // TestAllConditionsExplicitlyClassified replaces the old
@@ -334,7 +338,7 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 	if !swept[InodePressure] {
 		t.Error("HeartbeatSweptNames must contain InodePressure (agent inode latch, inode-pressure)")
 	}
-	// Every remaining constant — exactly the 69 latch-backed — in.
+	// Every remaining constant — exactly the 70 latch-backed — in.
 	latchBacked := 0
 	for _, name := range allConditionNames {
 		if name == ReadonlyFilesystem {
@@ -355,8 +359,8 @@ func TestHeartbeatSweptCoversLatchBackedExactly(t *testing.T) {
 			t.Errorf("HeartbeatSweptNames must contain latch-backed condition %q", name)
 		}
 	}
-	if latchBacked != 69 {
-		t.Fatalf("latch-backed constants enumerated = %d, want 69", latchBacked)
+	if latchBacked != 70 {
+		t.Fatalf("latch-backed constants enumerated = %d, want 70", latchBacked)
 	}
 }
 

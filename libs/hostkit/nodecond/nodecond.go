@@ -127,6 +127,9 @@ const (
 	// Wave-5 self-healing additions.
 	CondK8s135ReadinessDrift = "K8s135ReadinessDrift" // K5: cgroup v2 & kubelet/k0s 1.35+ upgrade readiness drift (k8s135-readiness-drift latch)
 	CondKMSv2Unhealthy       = "KMSv2Unhealthy"       // K10: KMSv2 encryption plugin socket or /healthz/kms-provider-* unhealthy (kmsv2-unhealthy latch)
+
+	// Wave-7 self-healing additions.
+	CgroupMemoryHighThrottle = "CgroupMemoryHighThrottle" // cgroup v2 memory.high silent throttling + memory PSI pressure (cgroup-memory-high-throttle latch)
 )
 
 // Node/Pod annotation keys carrying the L1 ↔ L3 cooperative
@@ -182,7 +185,7 @@ const (
 )
 
 // HeartbeatSweptNames is every NodeCondition the nodereporter owns
-// and re-stamps LastHeartbeatTime on each cycle while alive: all 69
+// and re-stamps LastHeartbeatTime on each cycle while alive: all 70
 // latch-backed conditions plus ReadonlyFilesystem (the NPD mount
 // monitor rides the same heartbeat patch). InodePressure is in since
 // inode-pressure: the hostmetrics inode-pressure latch sets/clears it and
@@ -238,6 +241,8 @@ var HeartbeatSweptNames = []string{
 	CondNodeLocalDNSNoTrackDrift,
 	// Wave-5 self-healing additions.
 	CondK8s135ReadinessDrift, CondKMSv2Unhealthy,
+	// Wave-7 self-healing additions.
+	CgroupMemoryHighThrottle,
 }
 
 // HangPreCordonNames are the hang-class conditions node-hang-
@@ -404,6 +409,10 @@ var StormGateNames = []string{
 	// fuse: while a worker is actively overloaded, descheduler must not
 	// pile additional pods onto it.
 	NodeOverloaded,
+	// Wave-7 self-healing additions: CgroupMemoryHighThrottle gates
+	// descheduler storms (pod-level cgroup memory.high throttling +
+	// PSI pressure) without triggering HangPreCordonNames.
+	CgroupMemoryHighThrottle,
 }
 
 // PartitionNames are the network-partition conditions the
