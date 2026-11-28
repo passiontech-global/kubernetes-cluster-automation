@@ -17,27 +17,40 @@
 package pvc
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
 
-const pvcResizeStallDefaultMinAge = 30 * time.Minute
+const (
+	pvcResizeStallDefaultMinAge = 30 * time.Minute
+	pvcResizeBounceCooldown     = 30 * time.Minute
+	pvcResizeBounceAnno         = "passiontech.dev/auto-bounce-for-fs-resize"
+)
 
 // pvcResizeStallGuardCheck is the pvc-resize PVC expansion watchdog.
 type pvcResizeStallGuardCheck struct {
 	*probefw.Deps
 
-	minAge time.Duration
+	minAge        time.Duration
+	bounceEnabled bool
 
 	// emitted is the emitted-gauge ledger — a tuple that stops
 	// being reported gets DeleteLabelValues'd rather than leaking a
@@ -52,11 +65,13 @@ type pvcResizeStallGuardCheck struct {
 }
 
 // NewPVCResizeStallGuardCheck builds the pvc-resize check — resolves
-// HEALTH_PVC_RESIZE_STALL_MIN_AGE and initializes the check ledgers.
+// HEALTH_PVC_RESIZE_STALL_MIN_AGE and NODE_AUTOMATION_PVC_RESIZE_BOUNCE_ENABLED
+// and initializes the check ledgers.
 func NewPVCResizeStallGuardCheck(d *probefw.Deps) probefw.Check {
 	return &pvcResizeStallGuardCheck{
-		Deps:   d,
-		minAge: envx.GetenvDuration("HEALTH_PVC_RESIZE_STALL_MIN_AGE", pvcResizeStallDefaultMinAge),
+		Deps:          d,
+		minAge:        envx.GetenvDuration("HEALTH_PVC_RESIZE_STALL_MIN_AGE", pvcResizeStallDefaultMinAge),
+		bounceEnabled: envx.Gate("NODE_AUTOMATION_PVC_RESIZE_BOUNCE_ENABLED", false),
 	}
 }
 
@@ -109,6 +124,7 @@ func (p *pvcResizeStallGuardCheck) Run(ctx context.Context) probefw.Result {
 
 	var rep probefw.SweepReport
 	live := map[string]bool{} // zero-timestamp ledger keys still holding
+	var fsResizeStalled []*corev1.PersistentVolumeClaim
 	for i := range pvcs {
 		pvc := &pvcs[i]
 		// A terminating claim's lingering resize conditions are
@@ -117,6 +133,7 @@ func (p *pvcResizeStallGuardCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		ns, name := pvc.Namespace, pvc.Name
+		fsStalled := false
 		for _, c := range pvc.Status.Conditions {
 			if c.Status != corev1.ConditionTrue ||
 				!pvcResizeStallConditions[c.Type] {
@@ -133,6 +150,9 @@ func (p *pvcResizeStallGuardCheck) Run(ctx context.Context) probefw.Result {
 			if !persisted {
 				continue
 			}
+			if c.Type == corev1.PersistentVolumeClaimFileSystemResizePending {
+				fsStalled = true
+			}
 			rep.Emit(pvcResizeStalledGauge, lk,
 				[]string{ns, name, string(c.Type)},
 				fmt.Sprintf("%s/%s %s=True held >=%s",
@@ -140,8 +160,135 @@ func (p *pvcResizeStallGuardCheck) Run(ctx context.Context) probefw.Result {
 			log.Info("pvc filesystem resize stalled",
 				"pvc", ns+"/"+name, "condition", string(c.Type))
 		}
+		if fsStalled {
+			fsResizeStalled = append(fsResizeStalled, pvc)
+		}
 	}
 	p.seen.Prune(func(k string) bool { return live[k] })
+
+	if len(fsResizeStalled) > 0 {
+		p.bounceStalledFSResizePods(ctx, log, fsResizeStalled, now)
+	}
+
 	return rep.Result(&p.emitted, pvcResizeStalledGauge.DeleteLabelValues,
 		"pvc resize stalled: ", ", ")
+}
+
+func (p *pvcResizeStallGuardCheck) bounceStalledFSResizePods(
+	ctx context.Context,
+	log logr.Logger,
+	stalledPVCs []*corev1.PersistentVolumeClaim,
+	now time.Time,
+) {
+	candidates := make([]*corev1.PersistentVolumeClaim, 0, len(stalledPVCs))
+	for _, pvc := range stalledPVCs {
+		if pvc.Namespace == "kube-system" {
+			continue
+		}
+		pvcAnno := strings.TrimSpace(kube.EffectiveAnno(ctx, pvc, pvcResizeBounceAnno))
+		if strings.EqualFold(pvcAnno, "false") {
+			continue
+		}
+		candidates = append(candidates, pvc)
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	pods, err := p.AllPods(ctx)
+	if err != nil {
+		metrics.IncError(p.Name)
+		log.Info("WARN: list pods failed — pvc resize bounce skipped", "error", err)
+		return
+	}
+
+	slices.SortFunc(candidates, func(a, b *corev1.PersistentVolumeClaim) int {
+		if d := cmp.Compare(a.Namespace, b.Namespace); d != 0 {
+			return d
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+
+	for _, pvc := range candidates {
+		pvcKey := pvc.Namespace + "/" + pvc.Name
+		pvcAnno := strings.TrimSpace(kube.EffectiveAnno(ctx, pvc, pvcResizeBounceAnno))
+
+		var eligible []*corev1.Pod
+		for i := range pods {
+			pod := &pods[i]
+			if pod.Namespace != pvc.Namespace || pod.Namespace == "kube-system" {
+				continue
+			}
+			if pod.DeletionTimestamp != nil ||
+				pod.Status.Phase == corev1.PodSucceeded ||
+				pod.Status.Phase == corev1.PodFailed {
+				continue
+			}
+			if pod.Annotations["kubernetes.io/config.mirror"] != "" {
+				continue
+			}
+			// Never kill unowned standalone pods.
+			if metav1.GetControllerOf(pod) == nil {
+				continue
+			}
+			if !slices.Contains(kube.PodClaimedPVCs(pod), pvc.Name) {
+				continue
+			}
+			podAnno := strings.TrimSpace(kube.EffectiveAnno(ctx, pod, pvcResizeBounceAnno))
+			if strings.EqualFold(podAnno, "false") {
+				continue
+			}
+			if !p.bounceEnabled &&
+				!strings.EqualFold(pvcAnno, "true") &&
+				!strings.EqualFold(podAnno, "true") {
+				continue
+			}
+			eligible = append(eligible, pod)
+		}
+		if len(eligible) == 0 {
+			continue
+		}
+
+		slices.SortFunc(eligible, func(a, b *corev1.Pod) int {
+			return cmp.Compare(a.Name, b.Name)
+		})
+		target := eligible[0]
+		podKey := target.Namespace + "/" + target.Name
+
+		ck := probefw.SelfHealKey(CheckNamePVCResizeStallGuard, pvcKey)
+		proceed, unverifiable := p.HealAllowed(ctx, log, &p.Heals, ck, pvcResizeBounceCooldown, now)
+		if unverifiable {
+			metrics.IncError(p.Name)
+			return
+		}
+		if !proceed {
+			continue
+		}
+
+		if allowed, reason := heal.TryAcquireTarget(CheckNamePVCResizeStallGuard, pvcKey, now); !allowed {
+			heal.RefundGrant(now)
+			log.Info("DEFER: pvc-resize bounce target circuit open",
+				"pvc", pvcKey, "pod", podKey, "reason", reason)
+			continue
+		}
+
+		evicted, refused, notFound, err := heal.EvictPodNotFound(ctx, p.CS, &p.Heals, ck, target, now)
+		switch {
+		case err != nil:
+			metrics.IncError(p.Name)
+			log.Error(err, "pvc-resize pod eviction failed", "pvc", pvcKey, "pod", podKey)
+		case refused:
+			heal.RefundTarget(CheckNamePVCResizeStallGuard, pvcKey, now)
+			heal.RefundGrant(now)
+			if notFound {
+				log.V(1).Info("DEFER: pvc-resize pod vanished before eviction", "pvc", pvcKey, "pod", podKey)
+			} else {
+				log.Info("DEFER: pvc-resize pod eviction refused (PDB/hold/quorum)", "pvc", pvcKey, "pod", podKey)
+			}
+		case evicted:
+			metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNamePVCResizeStallGuard).Inc()
+			log.Info("EVICT: bounced pod for offline FileSystemResizePending PVC",
+				"pvc", pvcKey, "pod", podKey)
+		}
+	}
 }

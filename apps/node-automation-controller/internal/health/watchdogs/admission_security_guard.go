@@ -7,6 +7,10 @@
 //  2. ClusterRoleBindings / RoleBindings granting non-allowlisted roles to
 //     system:anonymous or system:unauthenticated (respecting built-in safe
 //     defaults + NODE_AUTOMATION_ADMISSION_SEC_ALLOW_ANON_ROLES).
+//  3. Non-terminal Pods outside system namespaces (kube-system, kube-public,
+//     kube-node-lease, k0s-system) using system-cluster-critical or
+//     system-node-critical PriorityClass without opt-out annotation
+//     passiontech.dev/allow-system-priority-class: "true".
 //
 // All API reads gracefully skip on 403 Forbidden and 404/NoMatch without
 // incrementing error counters or false-flagging.
@@ -43,9 +47,12 @@ const (
 	// CheckNameAdmissionSecurityGuard is the registry check name for #3/#69.
 	CheckNameAdmissionSecurityGuard = "admission-security-guard"
 
-	admissionSecEventReason   = "AdmissionSecurityExposure"
-	admissionSecEventCooldown = 6 * time.Hour
-	admissionSecCRDPageSize   = 25
+	admissionSecEventReason      = "AdmissionSecurityExposure"
+	admissionSecEventCooldown    = 6 * time.Hour
+	admissionSecCRDPageSize      = 25
+	admissionSecAnnoAllowSysPrio = "passiontech.dev/allow-system-priority-class"
+	admissionSecSysClusterCrit   = "system-cluster-critical"
+	admissionSecSysNodeCrit      = "system-node-critical"
 )
 
 var (
@@ -58,12 +65,18 @@ var (
 		Name: "node_automation_anonymous_rbac_binding",
 		Help: "1 while a ClusterRoleBinding or RoleBinding grants a non-allowlisted role to system:anonymous or system:unauthenticated.",
 	}, []string{"kind", "namespace", "binding", "role"})
+
+	systemPriorityClassAbuseGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "node_automation_system_priorityclass_abuse",
+		Help: "1 while a non-terminal Pod outside system namespaces uses system-cluster-critical or system-node-critical without opt-out annotation.",
+	}, []string{"namespace", "pod", "priority_class"})
 )
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
 		admissionWebhookExposedGauge,
 		anonymousRBACBindingGauge,
+		systemPriorityClassAbuseGauge,
 	)
 }
 
@@ -73,9 +86,10 @@ type admissionSecurityGuardCheck struct {
 	exemptServices map[string]bool
 	allowAnonRoles map[string]bool
 
-	webhookEmitted state.GaugeLedger[string]
-	rbacEmitted    state.GaugeLedger[string]
-	eventCooldown  state.CooldownSet
+	webhookEmitted  state.GaugeLedger[string]
+	rbacEmitted     state.GaugeLedger[string]
+	priorityEmitted state.GaugeLedger[string]
+	eventCooldown   state.CooldownSet
 }
 
 // NewAdmissionSecurityGuardCheck constructs the admission-security-guard check.
@@ -117,13 +131,15 @@ func (c *admissionSecurityGuardCheck) Run(ctx context.Context) probefw.Result {
 	now := c.Now()
 	c.eventCooldown.PruneExpired(now, admissionSecEventCooldown)
 
-	var webhookRep, rbacRep, summaryRep probefw.SweepReport
+	var webhookRep, rbacRep, priorityRep, summaryRep probefw.SweepReport
 
 	c.auditWebhookExposure(ctx, log, now, &webhookRep, &summaryRep)
 	c.auditAnonymousRBAC(ctx, log, now, &rbacRep, &summaryRep)
+	c.auditSystemPriorityClass(ctx, log, now, &priorityRep, &summaryRep)
 
 	webhookRep.Close(&c.webhookEmitted, admissionWebhookExposedGauge.DeleteLabelValues)
 	rbacRep.Close(&c.rbacEmitted, anonymousRBACBindingGauge.DeleteLabelValues)
+	priorityRep.Close(&c.priorityEmitted, systemPriorityClassAbuseGauge.DeleteLabelValues)
 	return summaryRep.Verdict("admission security exposure: ", ", ")
 }
 
@@ -547,6 +563,74 @@ func (c *admissionSecurityGuardCheck) emitExposureEvent(
 	}
 	c.eventCooldown.Stamp(cooldownKey, now)
 	log.Info("EVENT: AdmissionSecurityExposure", "key", cooldownKey)
+}
+
+var admissionSecSystemNamespaces = map[string]bool{
+	"kube-system":     true,
+	"kube-public":     true,
+	"kube-node-lease": true,
+	"k0s-system":      true,
+}
+
+func isAdmissionSecSystemNamespace(ns string) bool {
+	return admissionSecSystemNamespaces[ns]
+}
+
+func (c *admissionSecurityGuardCheck) auditSystemPriorityClass(
+	ctx context.Context,
+	log logr.Logger,
+	now time.Time,
+	priorityRep *probefw.SweepReport,
+	summaryRep *probefw.SweepReport,
+) {
+	pods, err := c.AllPods(ctx)
+	if err != nil {
+		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
+			log.V(1).Info("Pod list skipped for PriorityClass audit", "error", err)
+		} else {
+			summaryRep.InfraErr(fmt.Errorf("list pods for priorityclass audit: %w", err))
+		}
+		for k, lv := range c.priorityEmitted.Last() {
+			priorityRep.Carry(k, lv)
+		}
+		return
+	}
+
+	for i := range pods {
+		pod := &pods[i]
+		if pod.DeletionTimestamp != nil ||
+			pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if isAdmissionSecSystemNamespace(pod.Namespace) {
+			continue
+		}
+		pc := pod.Spec.PriorityClassName
+		if pc != admissionSecSysClusterCrit && pc != admissionSecSysNodeCrit {
+			continue
+		}
+		if pod.Annotations[admissionSecAnnoAllowSysPrio] == "true" {
+			continue
+		}
+
+		podKey := pod.Namespace + "/" + pod.Name
+		tupleKey := podKey + "/" + pc
+		priorityRep.Flag(systemPriorityClassAbuseGauge, tupleKey,
+			[]string{pod.Namespace, pod.Name, pc})
+		summaryRep.Find(fmt.Sprintf("Pod/%s priorityClass=%s", podKey, pc))
+		c.emitExposureEvent(ctx, log, now, pod.Namespace,
+			corev1.ObjectReference{
+				APIVersion: "v1",
+				Kind:       "Pod",
+				Namespace:  pod.Namespace,
+				Name:       pod.Name,
+				UID:        pod.UID,
+			},
+			"priorityclass."+pod.Namespace+"."+pod.Name,
+			fmt.Sprintf("non-system Pod %s uses privileged PriorityClass %q without %s=true opt-out",
+				podKey, pc, admissionSecAnnoAllowSysPrio))
+	}
 }
 
 func isWebhookServiceIsolated(

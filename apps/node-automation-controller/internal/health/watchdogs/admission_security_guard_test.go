@@ -552,3 +552,94 @@ func TestAdmissionSecurityGuardListsUseRV0(t *testing.T) {
 		}
 	}
 }
+
+func TestAdmissionSecurityGuardPriorityClassAbuse(t *testing.T) {
+	// Non-system Pod using system-cluster-critical -> flagged.
+	badClusterCrit := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app-ns", Name: "greedy-api"},
+		Spec:       corev1.PodSpec{PriorityClassName: "system-cluster-critical"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	// Non-system Pod using system-node-critical -> flagged.
+	badNodeCrit := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "greedy-daemon"},
+		Spec:       corev1.PodSpec{PriorityClassName: "system-node-critical"},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	// Opt-out annotation -> allowed.
+	optedOut := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "app-ns",
+			Name:        "approved-agent",
+			Annotations: map[string]string{admissionSecAnnoAllowSysPrio: "true"},
+		},
+		Spec:   corev1.PodSpec{PriorityClassName: "system-node-critical"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	// System namespaces -> allowed.
+	sysKube := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "coredns"},
+		Spec:       corev1.PodSpec{PriorityClassName: "system-cluster-critical"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	sysK0s := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "k0s-system", Name: "konnectivity"},
+		Spec:       corev1.PodSpec{PriorityClassName: "system-node-critical"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	// Terminal Pod -> skipped.
+	terminalPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app-ns", Name: "done-job-pod"},
+		Spec:       corev1.PodSpec{PriorityClassName: "system-cluster-critical"},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	// Normal PriorityClass -> allowed.
+	normalPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app-ns", Name: "normal-web"},
+		Spec:       corev1.PodSpec{PriorityClassName: "high-priority"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	cs := fake.NewSimpleClientset(badClusterCrit, badNodeCrit, optedOut, sysKube, sysK0s, terminalPod, normalPod)
+	p := testProberDyn(cs, testutil.NewDynamicClientWithCRDs())
+	chk := probetest.MustCheck[*admissionSecurityGuardCheck](t, p)
+
+	res := probetest.RunCheck(ctx, chk.Deps, chk)
+	if res.Pass {
+		t.Fatal("expected FAIL for non-system Pods abusing system PriorityClass")
+	}
+	if !strings.Contains(res.Why, "Pod/app-ns/greedy-api priorityClass=system-cluster-critical") ||
+		!strings.Contains(res.Why, "Pod/prod/greedy-daemon priorityClass=system-node-critical") {
+		t.Fatalf("unexpected Why: %s", res.Why)
+	}
+	if m := probetest.FindMetric(t, "node_automation_system_priorityclass_abuse", map[string]string{
+		"namespace": "app-ns", "pod": "greedy-api", "priority_class": "system-cluster-critical",
+	}); m == nil || m.GetGauge().GetValue() != 1 {
+		t.Fatalf("expected system_priorityclass_abuse=1 for greedy-api, got %v", m)
+	}
+	if m := probetest.FindMetric(t, "node_automation_system_priorityclass_abuse", map[string]string{
+		"namespace": "app-ns", "pod": "approved-agent", "priority_class": "system-node-critical",
+	}); m != nil {
+		t.Fatalf("opted-out pod should not be flagged: %v", m)
+	}
+	if m := probetest.FindMetric(t, "node_automation_system_priorityclass_abuse", map[string]string{
+		"namespace": "kube-system", "pod": "coredns", "priority_class": "system-cluster-critical",
+	}); m != nil {
+		t.Fatalf("system namespace pod should not be flagged: %v", m)
+	}
+	assertValidRFC1123EventNames(t, cs, "app-ns")
+	assertValidRFC1123EventNames(t, cs, "prod")
+
+	// Delete abusive pods -> PASS and gauge series pruned.
+	_ = cs.CoreV1().Pods("app-ns").Delete(ctx, "greedy-api", metav1.DeleteOptions{})
+	_ = cs.CoreV1().Pods("prod").Delete(ctx, "greedy-daemon", metav1.DeleteOptions{})
+	res = probetest.RunCheck(ctx, chk.Deps, chk)
+	if !res.Pass {
+		t.Fatalf("expected PASS after abusive pods deleted, got %+v", res)
+	}
+	if m := probetest.FindMetric(t, "node_automation_system_priorityclass_abuse", map[string]string{
+		"namespace": "app-ns", "pod": "greedy-api", "priority_class": "system-cluster-critical",
+	}); m != nil {
+		t.Fatalf("stale priorityclass gauge not pruned: %v", m)
+	}
+}

@@ -868,5 +868,94 @@ func TestZombieSidecarZeroValueLiteralLazyArm(t *testing.T) {
 	}
 }
 
+// K8s 1.29+ native sidecar support:
+//   - Job pod with finished main container + still-running native sidecar
+//     (initContainer with restartPolicy: Always) is poked on cycle 1 and reaped
+//     after grace on cycle 2;
+//   - Normal running Job pod (main container still Running + native sidecar
+//     Running) is NOT poked or reaped;
+//   - Regular non-Always initContainer still Running (even if named like a
+//     mesh sidecar) is NOT misclassified as a native sidecar and NOT reaped.
+func TestZombieSidecarNativeSidecarReapAndVetoes(t *testing.T) {
+	testutil.CleanupMetric(t, metrics.ZombieSidecarPodsReapedTotal, "jobs")
+	always := corev1.ContainerRestartPolicyAlways
+
+	nativeZombie := zsrPod("jobs", "native-zombie", 10*time.Minute, 0)
+	nativeZombie.Spec.Containers = []corev1.Container{{Name: "app"}}
+	nativeZombie.Spec.InitContainers = []corev1.Container{
+		{Name: "linkerd-proxy", RestartPolicy: &always},
+	}
+	nativeZombie.Status.ContainerStatuses = nativeZombie.Status.ContainerStatuses[:1]
+	nativeZombie.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "linkerd-proxy",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+		}},
+	}}
+
+	normalRunning := zsrPod("jobs", "normal-running", 10*time.Minute, 0)
+	normalRunning.Spec.Containers = []corev1.Container{{Name: "app"}}
+	normalRunning.Spec.InitContainers = []corev1.Container{
+		{Name: "istio-proxy", RestartPolicy: &always},
+	}
+	normalRunning.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "app",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+		}},
+	}}
+	normalRunning.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "istio-proxy",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+		}},
+	}}
+
+	regularInit := zsrPod("jobs", "regular-init-running", 10*time.Minute, 0)
+	regularInit.Spec.Containers = []corev1.Container{{Name: "app"}}
+	regularInit.Spec.InitContainers = []corev1.Container{
+		{Name: "istio-proxy"}, // nil RestartPolicy => regular initContainer, NOT native sidecar
+	}
+	regularInit.Status.ContainerStatuses = regularInit.Status.ContainerStatuses[:1]
+	regularInit.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+		Name: "istio-proxy",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+			StartedAt: metav1.NewTime(time.Now().Add(-time.Hour)),
+		}},
+	}}
+
+	cs := fake.NewSimpleClientset(nativeZombie, normalRunning, regularInit)
+	probe := &zsrShutdownProbe{}
+	r := zsrReaper(cs, probe)
+
+	// Cycle 1: graceful shutdown sent to nativeZombie only; pod survives grace cycle.
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(probe.calls) != 1 {
+		t.Fatalf("cycle 1 /shutdown calls = %d, want 1", len(probe.calls))
+	}
+	if !testutil.PodExists(t, cs, "jobs", "native-zombie") {
+		t.Fatal("native sidecar pod deleted on graceful cycle")
+	}
+
+	// Cycle 2: nativeZombie still stuck -> reaped; normalRunning & regularInit untouched.
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if testutil.PodExists(t, cs, "jobs", "native-zombie") {
+		t.Fatal("native sidecar zombie pod was not reaped after grace")
+	}
+	if !testutil.PodExists(t, cs, "jobs", "normal-running") {
+		t.Fatal("normal running Job pod was falsely reaped")
+	}
+	if !testutil.PodExists(t, cs, "jobs", "regular-init-running") {
+		t.Fatal("regular non-Always initContainer pod was misclassified and reaped")
+	}
+	if got := ptestutil.ToFloat64(metrics.ZombieSidecarPodsReapedTotal.WithLabelValues("jobs")); got != 1 {
+		t.Fatalf("reaped counter = %v, want 1", got)
+	}
+}
+
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()

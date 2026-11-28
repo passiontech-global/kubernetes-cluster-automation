@@ -158,6 +158,17 @@ var goldenRegistryRows = []struct{ Name, Group string }{
 	{"pod-resize-wedge-guard", "health"},
 	{"ingress-nginx-retirement-guard", "health"},
 	{"workload-connection-skew-guard", "health"},
+	// Wave 6 checks — appended at end.
+	{"pvc-auto-expand", "health"},
+	{"oom-inplace-resize-guard", "health"},
+	{"netpol-egress-lockout-guard", "health"},
+	{"service-cidr-exhaustion-guard", "health"},
+	{"root-ca-drift-guard", "health"},
+	{"kms-secret-canary-guard", "health"},
+	{"crd-stored-versions-guard", "health"},
+	{"autoscaler-quota-posture-guard", "health"},
+	{"zone-gray-failure-guard", "health"},
+	{"init-container-wedge-guard", "health"},
 }
 
 // goldenMetricFamilies is the frozen set of metric family names the
@@ -370,6 +381,21 @@ var goldenMetricFamilies = []string{
 	"node_automation_velero_restore_stuck",
 	"node_automation_orphan_scrape_crd_count",
 	"node_automation_workload_connection_skew",
+	// Wave 6 metrics.
+	"node_automation_pvc_low_free_space",
+	"node_automation_oom_inplace_resize_burst",
+	"node_automation_netpol_egress_lockout",
+	"node_automation_service_cidr_exhaustion",
+	"node_automation_root_ca_drift",
+	"node_automation_kms_secret_canary_unhealthy",
+	"node_automation_crd_stored_versions_drift",
+	"node_automation_vpa_hpa_conflict",
+	"node_automation_quota_without_limitrange",
+	"node_automation_system_priorityclass_abuse",
+	"node_automation_zone_gray_failure",
+	"node_automation_zone_gray_shed",
+	"node_automation_pdb_overlapping",
+	"node_automation_init_container_wedged",
 }
 
 // goldenAnnoKeys freezes every exported annotation/label/taint key

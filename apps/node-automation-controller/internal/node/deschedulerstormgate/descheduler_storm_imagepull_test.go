@@ -122,3 +122,103 @@ func TestStormGateImagePullListError(t *testing.T) {
 		t.Fatalf("replicas changed on blind data: %d", got)
 	}
 }
+
+func stalledRegistryPod(ns, name, image, reason, msg string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: image}},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "app",
+				Image: image,
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  reason,
+					Message: msg,
+				}},
+			}},
+		},
+	}
+}
+
+// Registry 429 rate-limit across >= 3 pods and >= 2 namespaces against the
+// same normalized registry trips the gate and records the registry-outage signal.
+func TestStormGateRegistry429AcrossTwoNamespacesTripsGate(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil),
+		stalledRegistryPod("apps", "a", "nginx:1.25", "ImagePullBackOff", "toomanyrequests: rate limit"),
+		stalledRegistryPod("apps", "b", "library/alpine:3.19", "ErrImagePull", "429 Too Many Requests"),
+		stalledRegistryPod("jobs", "c", "docker.io/bitnami/kubectl:1.29", "ImagePullBackOff", "HTTP 429 rate limit"),
+	)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("registry 429 across 2 namespaces must trip gate, replicas=%d", got)
+	}
+	decision := getDescheduler(t, cs).Annotations[stormGateDecisionAnno]
+	if !strings.Contains(decision, "registry-outage: docker.io (3 pods in 2 namespaces)") {
+		t.Fatalf("decision missing registry-outage signal: %q", decision)
+	}
+}
+
+// Registry 503 / dial tcp across >= 5 pods in a single namespace against the
+// same registry trips the gate with registry-outage evidence.
+func TestStormGateRegistry503DialTCPFivePodsTripsGate(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		testutil.Node("n1", corev1.ConditionTrue, nil),
+		deschedulerDeploy(1, nil),
+		stalledRegistryPod("apps", "a", "ghcr.io/org/svc:v1", "ImagePullBackOff", "503 Service Unavailable"),
+		stalledRegistryPod("apps", "b", "ghcr.io/org/svc:v2", "ErrImagePull", "dial tcp 1.2.3.4:443: i/o timeout"),
+		stalledRegistryPod("apps", "c", "ghcr.io/org/svc:v3", "ImagePullBackOff", "502 Bad Gateway"),
+		stalledRegistryPod("apps", "d", "ghcr.io/org/svc:v4", "ErrImagePull", "TLS handshake timeout"),
+		stalledRegistryPod("apps", "e", "ghcr.io/org/svc:v5", "ImagePullBackOff", "unexpected EOF"),
+	)
+	r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+	if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getDeschedulerReplicas(t, cs); got != 0 {
+		t.Fatalf("registry 503/dial tcp across 5 pods must trip gate, replicas=%d", got)
+	}
+	decision := getDescheduler(t, cs).Annotations[stormGateDecisionAnno]
+	if !strings.Contains(decision, "registry-outage: ghcr.io (5 pods in 1 namespaces)") {
+		t.Fatalf("decision missing ghcr.io registry-outage signal: %q", decision)
+	}
+}
+
+// A single pod with manifest unknown or a single pod with 429 must NOT trip the gate.
+func TestStormGateSinglePodManifestUnknownOr429DoesNotTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		pod  *corev1.Pod
+	}{
+		{
+			name: "single pod manifest unknown",
+			pod:  stalledRegistryPod("apps", "bad-tag", "ghcr.io/org/app:missing", "ErrImagePull", "manifest unknown"),
+		},
+		{
+			name: "single pod 429",
+			pod:  stalledRegistryPod("apps", "one-429", "docker.io/library/nginx:latest", "ImagePullBackOff", "429 Too Many Requests"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset(
+				testutil.Node("n1", corev1.ConditionTrue, nil),
+				deschedulerDeploy(1, nil),
+				tc.pod,
+			)
+			r := &deschedulerStormGate{cs: cs, dyn: stormGateDynFake()}
+			if _, err := r.Reconcile(ctx, reconcile.Request{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := getDeschedulerReplicas(t, cs); got != 1 {
+				t.Fatalf("%s unexpectedly tripped gate, replicas=%d", tc.name, got)
+			}
+		})
+	}
+}

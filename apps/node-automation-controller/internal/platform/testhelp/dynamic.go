@@ -214,6 +214,9 @@ var dynCRDGVKs = []schema.GroupVersionKind{
 	{Group: "operator.victoriametrics.com", Version: "v1beta1", Kind: "VMPodScrape"},
 	{Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor"},
 	{Group: "monitoring.coreos.com", Version: "v1", Kind: "PodMonitor"},
+
+	// VerticalPodAutoscaler (autoscaler-quota-posture-guard).
+	{Group: "autoscaling.k8s.io", Version: "v1", Kind: "VerticalPodAutoscaler"},
 }
 
 // buildDynScheme assembles the scheme NewDynamicClient and DynScheme

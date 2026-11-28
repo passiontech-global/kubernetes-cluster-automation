@@ -160,6 +160,17 @@ func TestCheckRegSweepOrder(t *testing.T) {
 		"pod-resize-wedge-guard",
 		"ingress-nginx-retirement-guard",
 		"workload-connection-skew-guard",
+		// Wave 6 checks — appended at end of healthRows.
+		"pvc-auto-expand",
+		"oom-inplace-resize-guard",
+		"netpol-egress-lockout-guard",
+		"service-cidr-exhaustion-guard",
+		"root-ca-drift-guard",
+		"kms-secret-canary-guard",
+		"crd-stored-versions-guard",
+		"autoscaler-quota-posture-guard",
+		"zone-gray-failure-guard",
+		"init-container-wedge-guard",
 	}
 	var got []string
 	for _, m := range Modules {

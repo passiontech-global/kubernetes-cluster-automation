@@ -116,6 +116,13 @@ const (
 	// verdict).
 	stormImagePullMinPods       = 3
 	stormImagePullMinNamespaces = 2
+
+	// Registry-outage/429 thresholds against a single normalized
+	// registry host: >= 3 pods across >= 2 namespaces, or >= 5 pods in
+	// 1+ namespaces with unmistakable registry-level error signatures.
+	stormRegistryOutageMinPodsCrossNS  = 3
+	stormRegistryOutageMinNamespaces   = 2
+	stormRegistryOutageMinPodsSingleNS = 5
 )
 
 // stormConds mirrors STORM_CONDS (see package comment for sources) —

@@ -87,15 +87,18 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) string {
 		return "" // no app containers — nothing to prove the job finished
 	}
 
-	// Native sidecars (initContainers with restartPolicy:Always)
-	// hold the pod Running exactly like an injected regular
-	// container. Named mesh sidecars are the liveness candidates
-	// below; every OTHER init container must have finished — a
-	// plain init still running means the pod is not done starting,
-	// and a non-mesh always-restart init still running is a shape
-	// this reaper does not understand: fail closed either way.
+	// Native sidecars (K8s 1.29+: initContainers with
+	// restartPolicy:Always) hold the pod Running exactly like an
+	// injected regular container. Only init containers that carry BOTH
+	// RestartPolicy==Always AND a known mesh sidecar name qualify as
+	// native sidecar liveness candidates; every OTHER init container
+	// (including regular non-Always init containers even if named like
+	// a sidecar, and non-mesh always-restart init containers) must have
+	// terminated cleanly or we fail closed.
+	nativeMeshSidecars := make(map[string]bool)
 	for _, c := range p.Spec.InitContainers {
-		if zombieSidecarNames[c.Name] {
+		if isNativeSidecarContainer(c) && zombieSidecarNames[c.Name] {
+			nativeMeshSidecars[c.Name] = true
 			continue
 		}
 		st := initStatusByName[c.Name]
@@ -104,16 +107,28 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) string {
 		}
 	}
 
-	// At least one sidecar must still be Running — a pod whose
-	// sidecar also exited is just a finishing Job pod, not a zombie.
-	for _, statuses := range [][]corev1.ContainerStatus{
-		p.Status.ContainerStatuses, p.Status.InitContainerStatuses} {
-		for i := range statuses {
-			st := &statuses[i]
-			if zombieSidecarNames[st.Name] && st.State.Running != nil {
-				return st.Name
-			}
+	// At least one sidecar must still be Running — either a regular
+	// sidecar in status.containerStatuses or a K8s 1.29+ native sidecar
+	// (restartPolicy: Always) in status.initContainerStatuses. A pod
+	// whose sidecar also exited is just a finishing Job pod, not a
+	// zombie.
+	for i := range p.Status.ContainerStatuses {
+		st := &p.Status.ContainerStatuses[i]
+		if zombieSidecarNames[st.Name] && st.State.Running != nil {
+			return st.Name
+		}
+	}
+	for i := range p.Status.InitContainerStatuses {
+		st := &p.Status.InitContainerStatuses[i]
+		if nativeMeshSidecars[st.Name] && st.State.Running != nil {
+			return st.Name
 		}
 	}
 	return ""
+}
+
+// isNativeSidecarContainer reports whether c is a K8s 1.29+ native
+// sidecar (initContainer with restartPolicy: Always).
+func isNativeSidecarContainer(c corev1.Container) bool {
+	return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
 }

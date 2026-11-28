@@ -77,7 +77,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProb
 }
 
 // fleetCheckRegs mirrors the health section of registry.Modules —
-// the full 80-check roster in sweep order, which is what
+// the full 90-check roster in sweep order, which is what
 // SetupModules collects into Deps.CheckRegs on a default boot.
 // clusterhealthprobes may not import internal/registry (depguard:
 // domains never import the wiring layer — and a test-internal
@@ -171,6 +171,17 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: watchdogs.CheckNamePodResizeWedgeGuard, New: watchdogs.NewPodResizeWedgeGuardCheck},
 		{Name: watchdogs.CheckNameIngressNginxRetirementGuard, New: watchdogs.NewIngressNginxRetirementGuardCheck},
 		{Name: connectionskew.CheckNameWorkloadConnectionSkewGuard, New: connectionskew.NewWorkloadConnectionSkewGuardCheck},
+		// Wave 6 checks — appended at end of healthRows.
+		{Name: pvc.CheckNamePVCAutoExpand, New: pvc.NewPVCAutoExpandCheck},
+		{Name: watchdogs.CheckNameOOMInplaceResizeGuard, New: watchdogs.NewOOMInplaceResizeGuardCheck},
+		{Name: nethealth.CheckNameNetpolEgressLockoutGuard, New: nethealth.NewNetpolEgressLockoutGuardCheck},
+		{Name: nethealth.CheckNameServiceCIDRExhaustionGuard, New: nethealth.NewServiceCIDRExhaustionGuardCheck},
+		{Name: watchdogs.CheckNameRootCADriftGuard, New: watchdogs.NewRootCADriftGuardCheck},
+		{Name: watchdogs.CheckNameKMSCanaryGuard, New: watchdogs.NewKMSCanaryGuardCheck},
+		{Name: watchdogs.CheckNameCRDStoredVersionsGuard, New: watchdogs.NewCRDStoredVersionsGuardCheck},
+		{Name: watchdogs.CheckNameAutoscalerQuotaPostureGuard, New: watchdogs.NewAutoscalerQuotaPostureGuardCheck},
+		{Name: nodehealth.CheckNameZoneGrayFailureGuard, New: nodehealth.NewZoneGrayFailureGuardCheck},
+		{Name: watchdogs.CheckNameInitContainerWedgeGuard, New: watchdogs.NewInitContainerWedgeGuardCheck},
 	}
 }
 
@@ -323,8 +334,13 @@ func TestRunInfraErrorMarksFail(t *testing.T) {
 	// ingress-nginx-retirement-guard unconditionally call AllPods (+1 each),
 	// while volumesnapshot-lifecycle-guard and dra-claim-wedge-guard return
 	// early on empty OpDyn() (+0) -> forty total.
-	if got := errCount() - before; got != 40 {
-		t.Fatalf("run errors delta = %v, want 40", got)
+	// Wave 6: admission-security-guard (PriorityClass audit),
+	// oom-inplace-resize-guard, netpol-egress-lockout-guard, and
+	// init-container-wedge-guard unconditionally call AllPods (+1 each),
+	// while the other 7 Wave 6 checks skip/return cleanly on empty/Prom-error
+	// fakes (+0) -> forty-four total.
+	if got := errCount() - before; got != 44 {
+		t.Fatalf("run errors delta = %v, want 44", got)
 	}
 }
 

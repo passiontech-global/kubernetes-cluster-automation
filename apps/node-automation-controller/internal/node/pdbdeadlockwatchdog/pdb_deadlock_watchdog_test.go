@@ -1156,3 +1156,173 @@ func TestPodInReliefErrorState(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Overlapping PDB detection
+// ---------------------------------------------------------------------------
+
+func pdwOverlapCount(t *testing.T, ns, pdbs string) (float64, bool) {
+	t.Helper()
+	fams, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range fams {
+		if f.GetName() != "node_automation_pdb_overlapping" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			lbl := map[string]string{}
+			for _, l := range m.GetLabel() {
+				lbl[l.GetName()] = l.GetValue()
+			}
+			if lbl["namespace"] == ns && lbl["pdbs"] == pdbs {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
+func pdwSelectorPDB(ns, name string, matchLabels map[string]string) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: matchLabels},
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{
+			ExpectedPods:       1,
+			DesiredHealthy:     1,
+			CurrentHealthy:     1,
+			DisruptionsAllowed: 0,
+		},
+	}
+}
+
+func TestPDBOverlappingDetection(t *testing.T) {
+	t.Run("2 overlapping PDBs matching same pod flagged and throttled", func(t *testing.T) {
+		pdbOverlappingGauge.Reset()
+		pdbA := pdwSelectorPDB("apps", "pdb-a", map[string]string{"app": "web"})
+		pdbB := pdwSelectorPDB("apps", "pdb-b", map[string]string{"tier": "frontend"})
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "apps", Name: "web-0",
+				Labels: map[string]string{"app": "web", "tier": "frontend"},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		cs := fake.NewSimpleClientset(testutil.Node("n1", corev1.ConditionTrue, nil), pdbA, pdbB, pod)
+		clock := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+		w := newPDWWatchdog(cs, &clock)
+
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := pdwOverlapCount(t, "apps", "pdb-a,pdb-b"); !ok || v != 1 {
+			t.Fatalf("overlap gauge = (%v, %v), want (1, true)", v, ok)
+		}
+		evs, err := cs.EventsV1().Events("apps").List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evs.Items) != 1 || evs.Items[0].Reason != pdbOverlapEventReason {
+			t.Fatalf("events = %+v, want 1 %s", evs.Items, pdbOverlapEventReason)
+		}
+
+		// Repeat within cooldown: event must be throttled (still 1 event).
+		clock = clock.Add(10 * time.Minute)
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		evs2, err := cs.EventsV1().Events("apps").List(ctx, metav1.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evs2.Items) != 1 {
+			t.Fatalf("expected throttled events = 1, got %d", len(evs2.Items))
+		}
+	})
+
+	t.Run("2 disjoint PDBs not flagged", func(t *testing.T) {
+		pdbOverlappingGauge.Reset()
+		pdbA := pdwSelectorPDB("apps", "pdb-a", map[string]string{"app": "web"})
+		pdbB := pdwSelectorPDB("apps", "pdb-b", map[string]string{"app": "api"})
+		podWeb := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "web-0", Labels: map[string]string{"app": "web"}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		podAPI := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "api-0", Labels: map[string]string{"app": "api"}},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		cs := fake.NewSimpleClientset(testutil.Node("n1", corev1.ConditionTrue, nil), pdbA, pdbB, podWeb, podAPI)
+		clock := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+		w := newPDWWatchdog(cs, &clock)
+
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := pdwOverlapCount(t, "apps", "pdb-a,pdb-b"); ok {
+			t.Fatal("disjoint PDBs unexpectedly flagged as overlapping")
+		}
+		evs, _ := cs.EventsV1().Events("apps").List(ctx, metav1.ListOptions{})
+		if len(evs.Items) != 0 {
+			t.Fatalf("unexpected events for disjoint PDBs: %d", len(evs.Items))
+		}
+	})
+
+	t.Run("pod matching only 1 of 2 PDBs not flagged", func(t *testing.T) {
+		pdbOverlappingGauge.Reset()
+		pdbA := pdwSelectorPDB("apps", "pdb-a", map[string]string{"app": "web"})
+		pdbB := pdwSelectorPDB("apps", "pdb-b", map[string]string{"app": "web", "tier": "canary"})
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "apps", Name: "web-0",
+				Labels: map[string]string{"app": "web", "tier": "prod"},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		cs := fake.NewSimpleClientset(testutil.Node("n1", corev1.ConditionTrue, nil), pdbA, pdbB, pod)
+		clock := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+		w := newPDWWatchdog(cs, &clock)
+
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := pdwOverlapCount(t, "apps", "pdb-a,pdb-b"); ok {
+			t.Fatal("pod matching only 1 of 2 PDBs unexpectedly flagged")
+		}
+	})
+
+	t.Run("empty selector matching all pods caught", func(t *testing.T) {
+		pdbOverlappingGauge.Reset()
+		pdbEmpty := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "pdb-catchall"},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				Selector: &metav1.LabelSelector{}, // matches ALL pods in namespace
+			},
+		}
+		pdbScoped := pdwSelectorPDB("apps", "pdb-scoped", map[string]string{"app": "worker"})
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "apps", Name: "worker-0",
+				Labels: map[string]string{"app": "worker"},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		cs := fake.NewSimpleClientset(testutil.Node("n1", corev1.ConditionTrue, nil), pdbEmpty, pdbScoped, pod)
+		clock := time.Date(2026, 11, 28, 10, 0, 0, 0, time.UTC)
+		w := newPDWWatchdog(cs, &clock)
+
+		if err := w.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := pdwOverlapCount(t, "apps", "pdb-catchall,pdb-scoped"); !ok || v != 1 {
+			t.Fatalf("empty selector overlap gauge = (%v, %v), want (1, true)", v, ok)
+		}
+		evs, err := cs.EventsV1().Events("apps").List(ctx, metav1.ListOptions{})
+		if err != nil || len(evs.Items) != 1 || evs.Items[0].Reason != pdbOverlapEventReason {
+			t.Fatalf("expected 1 %s event for empty-selector overlap, got %+v (err=%v)", pdbOverlapEventReason, evs.Items, err)
+		}
+	})
+}

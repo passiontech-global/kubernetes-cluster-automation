@@ -121,21 +121,31 @@ func (r *deschedulerStormGate) clusterStormSignals(ctx context.Context,
 	}
 
 	// image-pull-storm-gate storm signal (e): a cluster-wide image-pull storm —
-	// enough pods stuck in ImagePullBackOff/ErrImagePull that
-	// rescheduling would just spread unrunnable pods onto more
+	// enough pods stuck in ImagePullBackOff/ErrImagePull (or hitting a
+	// registry-wide 429/outage signature against the same registry host)
+	// that rescheduling would just spread unrunnable pods onto more
 	// nodes. Same fail-closed posture as the events scan above: a
 	// pod-list error aborts the reconcile, never a "clear" verdict
 	// on blind data.
-	stallPods, stallNamespaces, err := kube.CountImagePullStalledPods(ctx, r.cs)
+	census, err := kube.ScanImagePullCensus(ctx, r.cs)
 	if err != nil {
 		return fmt.Errorf(
 			"list pods (image-pull storm census): %w", err)
 	}
-	if stallPods >= stormImagePullMinPods ||
-		stallNamespaces >= stormImagePullMinNamespaces {
+	if census.StallPods >= stormImagePullMinPods ||
+		census.StallNamespaces >= stormImagePullMinNamespaces {
 		ev.imagePull = append(ev.imagePull, fmt.Sprintf(
 			"image-pull-stall: %d pods in %d namespaces stuck on ImagePullBackOff/ErrImagePull",
-			stallPods, stallNamespaces))
+			census.StallPods, census.StallNamespaces))
+	}
+	for _, out := range census.RegistryOutages {
+		if (out.PodCount >= stormRegistryOutageMinPodsCrossNS &&
+			out.NamespaceCount >= stormRegistryOutageMinNamespaces) ||
+			out.PodCount >= stormRegistryOutageMinPodsSingleNS {
+			ev.imagePull = append(ev.imagePull, fmt.Sprintf(
+				"registry-outage: %s (%d pods in %d namespaces)",
+				out.Registry, out.PodCount, out.NamespaceCount))
+		}
 	}
 	return nil
 }
