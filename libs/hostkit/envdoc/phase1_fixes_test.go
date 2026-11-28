@@ -31,6 +31,22 @@ func main() {
 			_ = envx.Getenv(k, "1")
 		},
 	}
+	envx.Apply([]envx.Knob{
+		{Name: "SLICE_KNOB_ENV", Resolve: func(k string) {
+			_ = envx.Getenv(k, "1")
+		}},
+		{"UNKEYED_KNOB_ENV", func(k string) {
+			_ = envx.Getenv(k, "1")
+		}},
+	})
+	for _, k := range []string{"SHADOW_SAFE_ENV"} {
+		if true {
+			k := dynName()
+			k = dynName()
+			_ = k
+		}
+		_ = envx.Getenv(k, "")
+	}
 	for _, k := range []string{"REASSIGNED_ENV"} {
 		k = dynName()
 		_ = envx.Getenv(k, "")
@@ -48,7 +64,13 @@ func dynName() string { return "X" }
 	if err != nil {
 		t.Fatalf("ScanTree: %v", err)
 	}
-	for _, want := range []string{"MY_APP_RATIO", "KNOB_RESOLVE_ENV"} {
+	for _, want := range []string{
+		"MY_APP_RATIO",
+		"KNOB_RESOLVE_ENV",
+		"SLICE_KNOB_ENV",
+		"UNKEYED_KNOB_ENV",
+		"SHADOW_SAFE_ENV",
+	} {
 		if _, ok := res.Referenced[want]; !ok {
 			t.Errorf("Referenced missing %q (got %v)", want, res.Referenced)
 		}

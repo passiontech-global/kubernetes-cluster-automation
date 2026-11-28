@@ -133,10 +133,12 @@ func ListenLoopback(port int) (net.Listener, error) {
 }
 
 // ValidateLoopbackAddr checks that addr is a host:port whose host is
-// explicitly loopback ("localhost", 127.0.0.0/8, or ::1). Wildcards
-// (":9116", "0.0.0.0:9116", "[::]:9116") and non-loopback IPs or
-// hostnames are rejected so debug endpoints like /debug/pprof cannot
-// be accidentally exposed off-node.
+// explicitly loopback ("localhost", 127.0.0.0/8, or ::1) and whose
+// port is a valid TCP port (0..65535). Wildcards (":9116",
+// "0.0.0.0:9116", "[::]:9116"), IPv6 zone IDs, bracketed non-IPv6
+// hosts, invalid ports, and non-loopback IPs or hostnames are rejected
+// so debug endpoints like /debug/pprof cannot be accidentally exposed
+// off-node.
 func ValidateLoopbackAddr(addr string) error {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -145,14 +147,21 @@ func ValidateLoopbackAddr(addr string) error {
 	if port == "" {
 		return fmt.Errorf("loopback bind address %q must specify a port", addr)
 	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("loopback bind address %q has invalid port %q: %w", addr, port, err)
+	}
 	if host == "" {
 		return fmt.Errorf("loopback bind address %q must specify an explicit loopback host (wildcards rejected)", addr)
 	}
+	bracketed := strings.HasPrefix(addr, "[")
 	if strings.EqualFold(host, "localhost") {
+		if bracketed {
+			return fmt.Errorf("loopback bind address %q must not bracket hostname %q", addr, host)
+		}
 		return nil
 	}
 	ip, err := netip.ParseAddr(host)
-	if err != nil || !ip.Unmap().IsLoopback() {
+	if err != nil || ip.Zone() != "" || (bracketed && !ip.Is6()) || !ip.Unmap().IsLoopback() {
 		return fmt.Errorf("bind address %q is not loopback (only localhost, 127.0.0.0/8, or ::1 allowed)", addr)
 	}
 	return nil

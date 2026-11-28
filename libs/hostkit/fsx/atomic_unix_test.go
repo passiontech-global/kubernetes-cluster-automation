@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -346,4 +347,27 @@ func TestWriteFileAtomicEBUSYMemoCapBounded(t *testing.T) {
 	if n > bindMountMemoCap {
 		t.Fatalf("bindMountMemo len = %d > cap %d", n, bindMountMemoCap)
 	}
+}
+
+func TestSetRenameFileConcurrentRaceFree(t *testing.T) {
+	resetBindMountMemoForTest(t)
+	dir := t.TempDir()
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 50 {
+			restore := SetRenameFile(func(oldpath, newpath string) error {
+				return os.Rename(oldpath, newpath)
+			})
+			restore()
+		}
+	})
+	wg.Go(func() {
+		for i := range 50 {
+			p := filepath.Join(dir, fmt.Sprintf("f-%d", i%4))
+			if err := WriteFileAtomic(p, "ok"); err != nil {
+				t.Errorf("WriteFileAtomic: %v", err)
+			}
+		}
+	})
+	wg.Wait()
 }

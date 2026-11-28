@@ -238,6 +238,7 @@ func ScanTree(opts Options) (Result, error) {
 			// truncate keeps the backing arrays for reuse.
 			scan.stack = scan.stack[:0]
 			scan.scopes = scan.scopes[:0]
+			clear(scan.pendingKnobs)
 			visitor.frames = visitor.frames[:0]
 			ast.Walk(visitor, f)
 		}
@@ -279,21 +280,22 @@ type rangeFrame struct {
 // package const table, the registry/envx directory flags, the
 // lexical declaration scopes, and the live range-binding stack.
 type fileScan struct {
-	fset       *token.FileSet
-	res        *Result
-	consts     map[string]string
-	envxNames  []string
-	envxDot    bool
-	osNames    []string
-	osDot      bool
-	inEnvx     bool
-	inRegistry bool
-	allowRawOS bool
-	helpers    map[string]bool
-	site       func(fset *token.FileSet, pos token.Pos) string
-	record     func(fset *token.FileSet, value string, pos token.Pos)
-	stack      []*rangeFrame
-	scopes     []map[string]bool
+	fset         *token.FileSet
+	res          *Result
+	consts       map[string]string
+	envxNames    []string
+	envxDot      bool
+	osNames      []string
+	osDot        bool
+	inEnvx       bool
+	inRegistry   bool
+	allowRawOS   bool
+	helpers      map[string]bool
+	site         func(fset *token.FileSet, pos token.Pos) string
+	record       func(fset *token.FileSet, value string, pos token.Pos)
+	stack        []*rangeFrame
+	scopes       []map[string]bool
+	pendingKnobs map[*ast.CompositeLit]bool
 }
 
 type visitFrame struct {
@@ -417,6 +419,7 @@ func (s *fileScan) inspect(n ast.Node) visitFrame {
 	case *ast.RangeStmt:
 		frame.popRange = s.scanRange(e)
 	case *ast.CompositeLit:
+		s.markKnobContainerElems(e)
 		frame.popRange = s.scanKnobLit(e)
 	case *ast.AssignStmt:
 		if e.Tok == token.DEFINE && len(s.scopes) > 0 {
@@ -483,23 +486,67 @@ func (s *fileScan) isKnobType(t ast.Expr) bool {
 	return false
 }
 
+// markKnobContainerElems marks untyped element literals inside []envx.Knob{...},
+// [N]envx.Knob{...}, or map[K]envx.Knob{...} so elided `{Name, Resolve}` rows
+// are recognized by scanKnobLit when ast.Walk visits them next.
+func (s *fileScan) markKnobContainerElems(cl *ast.CompositeLit) {
+	mark := func(expr ast.Expr) {
+		elem, ok := expr.(*ast.CompositeLit)
+		if !ok || elem.Type != nil {
+			return
+		}
+		if s.pendingKnobs == nil {
+			s.pendingKnobs = map[*ast.CompositeLit]bool{}
+		}
+		s.pendingKnobs[elem] = true
+	}
+	switch t := cl.Type.(type) {
+	case *ast.ArrayType:
+		if !s.isKnobType(t.Elt) {
+			return
+		}
+		for _, elt := range cl.Elts {
+			if kv, ok := elt.(*ast.KeyValueExpr); ok {
+				mark(kv.Value)
+			} else {
+				mark(elt)
+			}
+		}
+	case *ast.MapType:
+		if !s.isKnobType(t.Value) {
+			return
+		}
+		for _, elt := range cl.Elts {
+			if kv, ok := elt.(*ast.KeyValueExpr); ok {
+				mark(kv.Value)
+			}
+		}
+	}
+}
+
 // scanKnobLit handles the documented `envx.Knob{Name: "ENV_VAR", Resolve: func(k string) { ... }}`
-// idiom: records the Name expression as an env key and, when Name resolved
-// cleanly and Resolve is a single-param FuncLit, pushes a rangeFrame binding
-// that parameter across Resolve.Body so `envx.String(k, ...)` inside Resolve
-// does not falsely report k as Unresolved.
+// (and elided-type slice/unkeyed variants) idiom: records the Name expression
+// as an env key and, when Name resolved cleanly and Resolve is a single-param
+// FuncLit, pushes a rangeFrame binding that parameter across Resolve.Body so
+// `envx.String(k, ...)` inside Resolve does not falsely report k as Unresolved.
 func (s *fileScan) scanKnobLit(cl *ast.CompositeLit) bool {
-	if !s.isKnobType(cl.Type) {
+	isPending := s.pendingKnobs[cl]
+	if isPending {
+		delete(s.pendingKnobs, cl)
+	}
+	if !isPending && !s.isKnobType(cl.Type) {
 		return false
 	}
 	var nameExpr ast.Expr
 	var namePos token.Pos
 	var resolveLit *ast.FuncLit
+	hasKV := false
 	for _, elt := range cl.Elts {
 		kv, ok := elt.(*ast.KeyValueExpr)
 		if !ok {
 			continue
 		}
+		hasKV = true
 		key, ok := kv.Key.(*ast.Ident)
 		if !ok {
 			continue
@@ -512,6 +559,13 @@ func (s *fileScan) scanKnobLit(cl *ast.CompositeLit) bool {
 			if fn, ok := kv.Value.(*ast.FuncLit); ok {
 				resolveLit = fn
 			}
+		}
+	}
+	if !hasKV && len(cl.Elts) == 2 {
+		nameExpr = cl.Elts[0]
+		namePos = cl.Elts[0].Pos()
+		if fn, ok := cl.Elts[1].(*ast.FuncLit); ok {
+			resolveLit = fn
 		}
 	}
 	if nameExpr == nil {
@@ -561,6 +615,10 @@ func (s *fileScan) taintReassignedRangeVars(e *ast.AssignStmt) {
 			pos, ok := f.names[id.Name]
 			if !ok || e.Pos() <= f.body.Pos() || e.Pos() >= f.body.End() {
 				continue
+			}
+			if s.localDeclDepth(id.Name) >= f.scopeDepth {
+				// Reassignment targets an inner shadowing variable, not the loop var.
+				break
 			}
 			if pos == bindKey {
 				f.dynKey = true

@@ -62,6 +62,16 @@ func SetRenameFile(fn func(oldpath, newpath string) error) func() {
 	}
 }
 
+func currentRenameFile() func(oldpath, newpath string) error {
+	renameSeamMu.RLock()
+	fn := RenameFile
+	renameSeamMu.RUnlock()
+	if fn == nil {
+		return os.Rename
+	}
+	return fn
+}
+
 func currentRenameSig() (uintptr, uint64) {
 	renameSeamMu.RLock()
 	fn := RenameFile
@@ -259,12 +269,19 @@ func writeFileDirect(path string, data []byte, syncFile, dirSyncOnCreate bool) e
 		werr = cerr
 	}
 	if werr == nil && created {
-		if d, derr := os.Open(filepath.Dir(path)); derr == nil {
-			_ = d.Sync()
-			_ = d.Close()
-		}
+		werr = syncDir(filepath.Dir(path))
 	}
 	return werr
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	_ = d.Close()
+	return err
 }
 
 // WriteFileDirect writes content straight onto path with an fsync —

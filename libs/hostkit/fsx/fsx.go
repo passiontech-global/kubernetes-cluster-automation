@@ -175,20 +175,14 @@ func Promote(f *os.File, path string, opts Opts) error {
 	}
 	rename := opts.Rename
 	if rename == nil {
-		rename = RenameFile
+		rename = currentRenameFile()
 	}
 	if err := rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}
 	if opts.DirSync && !opts.NoSync {
-		d, err := os.Open(filepath.Dir(path))
-		if err != nil {
-			return err
-		}
-		err = d.Sync()
-		_ = d.Close()
-		if err != nil {
+		if err := syncDir(filepath.Dir(path)); err != nil {
 			return err
 		}
 	}
