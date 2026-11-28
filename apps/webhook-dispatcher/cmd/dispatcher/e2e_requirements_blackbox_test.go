@@ -1314,9 +1314,12 @@ func TestE2ERequirementsDispatcher(t *testing.T) {
 		}
 		df := string(raw)
 		for _, want := range []string{
-			"FROM golang:1.27.4-alpine AS build",
+			"FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS build",
+			"ENV GOWORK=off",
 			"COPY libs/hostkit/go.*",
-			"CGO_ENABLED=0 go build -trimpath",
+			"ARG TARGETOS=linux",
+			"ARG TARGETARCH",
+			"CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath",
 			`-ldflags="-s -w -X main.version=${VERSION}"`,
 			"FROM gcr.io/distroless/static:nonroot",
 			"USER 65532:65532",

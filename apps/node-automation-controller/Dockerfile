@@ -7,7 +7,8 @@
 # the go.mod `replace ../../libs/hostkit` target resolves inside the
 # context at /src/libs/hostkit. No go.work is copied, so the build
 # runs in plain module mode (the release path).
-FROM golang:1.27.4-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS build
+ENV GOWORK=off
 WORKDIR /src
 # Dep manifests first so `go mod download` is a cacheable layer that only
 # busts when go.mod/go.sum (or the hostkit replace target's go.mod) change —
@@ -24,9 +25,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY libs/hostkit/ /src/libs/hostkit/
 COPY apps/node-automation-controller/ /src/apps/node-automation-controller/
 ARG VERSION=dev
+ARG TARGETOS=linux
+ARG TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/node-automation-controller ./cmd/manager
 
