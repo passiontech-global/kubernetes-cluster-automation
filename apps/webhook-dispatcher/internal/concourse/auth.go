@@ -79,7 +79,7 @@ const (
 // compare-and-clear never contends with the index mutex.
 type atcAuth struct {
 	client      *http.Client // token-endpoint transport (same as API calls)
-	baseURL     string       // trimmed BaseURL — token paths are root-relative
+	baseURL     string       // trimmed SafeBaseURL — token paths are root-relative
 	safeBaseURL string       // userinfo-stripped URL for logs
 	user        string
 	pass        string
@@ -123,10 +123,11 @@ type tokenFlight struct {
 // the pointer without taking any lock.
 func (c *Client) ensureAuth() *atcAuth {
 	c.authOnce.Do(func() {
+		safe := strings.TrimRight(c.SafeBaseURL(), "/")
 		c.authPtr.Store(&atcAuth{
 			client:      c.httpClient(),
-			baseURL:     strings.TrimRight(c.BaseURL, "/"),
-			safeBaseURL: strings.TrimRight(c.safeBaseURL(), "/"),
+			baseURL:     safe,
+			safeBaseURL: safe,
 			user:        c.User,
 			pass:        c.Password,
 			now:         c.now,
@@ -230,6 +231,23 @@ func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, err
 			context.WithoutCancel(ctx), tokenMintTimeout)
 		go func() {
 			defer cancel()
+			settled := false
+			defer func() {
+				if r := recover(); r != nil {
+					a.mu.Lock()
+					if a.flight == f {
+						a.flight = nil
+					}
+					if !settled {
+						f.err = fmt.Errorf("concourse token mint panicked: %v", r)
+						close(f.done)
+						settled = true
+					}
+					a.mu.Unlock()
+					logger().Error("concourse token mint panicked",
+						"concourse_url", a.safeBaseURL, "panic", r)
+				}
+			}()
 			token, expires, basic, err := a.mint(mintCtx)
 			a.mu.Lock()
 			defer a.mu.Unlock()
@@ -266,6 +284,7 @@ func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, err
 			}
 			f.token, f.expires, f.basic, f.err = token, expires, basic, err
 			close(f.done)
+			settled = true
 		}()
 	}
 	f := a.flight

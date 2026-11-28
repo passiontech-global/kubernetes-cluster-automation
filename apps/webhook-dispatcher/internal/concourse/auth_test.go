@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net"
@@ -732,4 +733,75 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.dst.Write(p)
+}
+
+func TestAuthMintPanicRecoversAndUnblocksWaiters(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	c := &Client{
+		BaseURL:  "http://atc.example",
+		User:     "u",
+		Password: "p",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if calls.Add(1) == 1 {
+					close(started)
+					<-release
+					panic("boom-mint")
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(tokenBody("1800"))),
+					Request:    r,
+				}, nil
+			}),
+		},
+	}
+
+	leaderErr := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://atc.example/x", nil)
+		_, err := c.authorize(t.Context(), req)
+		leaderErr <- err
+	}()
+	<-started
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://atc.example/x", nil)
+		_, err := c.authorize(t.Context(), req)
+		waiterErr <- err
+	}()
+	// Give the waiter goroutine a moment to join a.flight before releasing the panic.
+	time.Sleep(15 * time.Millisecond)
+	close(release)
+
+	for _, tc := range []struct {
+		name string
+		ch   <-chan error
+	}{
+		{"leader", leaderErr},
+		{"waiter", waiterErr},
+	} {
+		select {
+		case err := <-tc.ch:
+			if err == nil || !strings.Contains(err.Error(), "panicked") {
+				t.Fatalf("%s err = %v, want panic error", tc.name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s deadlocked after mint panic", tc.name)
+		}
+	}
+
+	// Subsequent authorize must clear the flight and mint cleanly.
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://atc.example/x", nil)
+	tok, err := c.authorize(t.Context(), req)
+	if err != nil {
+		t.Fatalf("post-panic authorize err = %v", err)
+	}
+	if tok != "tok" {
+		t.Fatalf("post-panic token = %q, want %q", tok, "tok")
+	}
 }

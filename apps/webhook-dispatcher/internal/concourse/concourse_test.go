@@ -403,3 +403,69 @@ func TestSafeBaseURL(t *testing.T) {
 		})
 	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestSafeBaseURLStripsUserinfoInRequests(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sky/issuer/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"tok","expires_in":1800}`))
+		case "/api/v1/teams/main/pipelines":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case "/api/v1/teams/main/pipelines/p1/resources/r1/check/webhook":
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	baseWithUserinfo := strings.Replace(srv.URL, "http://", "http://secretuser:secretpass@", 1)
+	var mu sync.Mutex
+	var seenURLs []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.User != nil {
+			t.Errorf("request %s carried URL userinfo %v", r.URL.Path, r.URL.User)
+		}
+		raw := r.URL.String()
+		if strings.Contains(raw, "secretuser") || strings.Contains(raw, "secretpass") {
+			t.Errorf("request URL leaked userinfo: %q", raw)
+		}
+		mu.Lock()
+		seenURLs = append(seenURLs, raw)
+		mu.Unlock()
+		return srv.Client().Transport.RoundTrip(r)
+	})
+
+	c := &Client{
+		BaseURL:      baseWithUserinfo + "/",
+		Team:         "main",
+		User:         "u",
+		Password:     "p",
+		WebhookToken: "whtok",
+		HTTP:         &http.Client{Transport: rt},
+	}
+
+	var out []any
+	if err := c.getJSON(t.Context(), "/api/v1/teams/main/pipelines", &out); err != nil {
+		t.Fatalf("getJSON: %v", err)
+	}
+	if a := c.ensureAuth(); a.baseURL != srv.URL || a.safeBaseURL != srv.URL {
+		t.Fatalf("ensureAuth URLs = (%q, %q), want (%q, %q)", a.baseURL, a.safeBaseURL, srv.URL, srv.URL)
+	}
+	code, err := c.CheckWebhook(t.Context(), Resource{Pipeline: "p1", Name: "r1"})
+	if err != nil || code != http.StatusCreated {
+		t.Fatalf("CheckWebhook = (%d, %v), want (201, nil)", code, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenURLs) != 3 {
+		t.Fatalf("saw %d requests (%v), want 3 (token, getJSON, CheckWebhook)", len(seenURLs), seenURLs)
+	}
+}

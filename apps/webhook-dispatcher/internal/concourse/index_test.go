@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1160,5 +1161,138 @@ func TestEnsureIndexAndRefreshIndex(t *testing.T) {
 	stub.fail("/api/v1/teams/main/pipelines", 500)
 	if err := c.RefreshIndex(t.Context()); err == nil {
 		t.Fatal("expected RefreshIndex error on 500")
+	}
+}
+
+func TestRunFetchPanicRecoversAndUnblocksWaiters(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var pipelineCalls atomic.Int32
+	c := &Client{
+		BaseURL: "http://atc.example",
+		Team:    "main",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if strings.HasPrefix(r.URL.Path, "/sky/") {
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Body:       http.NoBody,
+						Request:    r,
+					}, nil
+				}
+				if r.URL.Path == "/api/v1/teams/main/pipelines" {
+					if pipelineCalls.Add(1) == 1 {
+						close(started)
+						<-release
+						panic("boom-fetch")
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`[{"name":"p1"}]`)),
+						Request:    r,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(p1Body)),
+					Request:    r,
+				}, nil
+			}),
+		},
+	}
+
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := c.Resources(t.Context())
+		leaderErr <- err
+	}()
+	<-started
+
+	waiterErr := make(chan error, 1)
+	go func() {
+		_, err := c.Resources(t.Context())
+		waiterErr <- err
+	}()
+	// Give the cold-start waiter a moment to block on <-f.done before releasing the panic.
+	time.Sleep(15 * time.Millisecond)
+	close(release)
+
+	for _, tc := range []struct {
+		name string
+		ch   <-chan error
+	}{
+		{"leader", leaderErr},
+		{"waiter", waiterErr},
+	} {
+		select {
+		case err := <-tc.ch:
+			if err == nil || !strings.Contains(err.Error(), "panicked") {
+				t.Fatalf("%s err = %v, want panic error", tc.name, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s deadlocked after runFetch panic", tc.name)
+		}
+	}
+
+	// Subsequent call must start a fresh flight and succeed (c.flight cleared).
+	idx, err := c.Resources(t.Context())
+	if err != nil {
+		t.Fatalf("post-panic Resources err = %v", err)
+	}
+	if len(idx) == 0 {
+		t.Fatal("post-panic Resources returned empty index, want p1 resources")
+	}
+}
+
+func TestRefreshPanicRecovers(t *testing.T) {
+	clk := newFakeClock()
+	var pipelineCalls atomic.Int32
+	c := &Client{
+		BaseURL:  "http://atc.example",
+		Team:     "main",
+		IndexTTL: time.Hour,
+		now:      clk.Now,
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if strings.HasPrefix(r.URL.Path, "/sky/") {
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Body:       http.NoBody,
+						Request:    r,
+					}, nil
+				}
+				if r.URL.Path == "/api/v1/teams/main/pipelines" {
+					if pipelineCalls.Add(1) == 2 {
+						panic("boom-refresh")
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`[{"name":"p1"}]`)),
+						Request:    r,
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(p1Body)),
+					Request:    r,
+				}, nil
+			}),
+		},
+	}
+
+	if err := c.EnsureIndex(t.Context()); err != nil {
+		t.Fatalf("initial EnsureIndex: %v", err)
+	}
+	clk.Advance(c.minRefreshInterval() + time.Second)
+	if err := c.RefreshIndex(t.Context()); err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("RefreshIndex err = %v, want panic error", err)
+	}
+	clk.Advance(c.minRefreshInterval() + time.Second)
+	if err := c.RefreshIndex(t.Context()); err != nil {
+		t.Fatalf("post-panic RefreshIndex err = %v", err)
 	}
 }

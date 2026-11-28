@@ -17,6 +17,7 @@ package concourse
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 )
@@ -70,6 +71,24 @@ func (c *Client) runFetch(callerCtx context.Context, flight *fetchFlight, prev [
 	fetchCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(callerCtx), fetchFlightBudget)
 	defer cancel()
+	settled := false
+	defer func() {
+		if r := recover(); r != nil {
+			c.mu.Lock()
+			if c.flight == flight {
+				c.flight = nil
+			}
+			if !settled {
+				flight.err = fmt.Errorf("concourse index fetch panicked: %v", r)
+				close(flight.done)
+				settled = true
+			}
+			indexFetchErrorsTotal.Inc()
+			c.mu.Unlock()
+			logger().Error("concourse index fetch panicked",
+				"concourse_url", c.safeBaseURL(), "team", c.Team, "panic", r)
+		}
+	}()
 	index, err := c.fetchIndex(fetchCtx, prev)
 
 	c.mu.Lock()
@@ -103,6 +122,7 @@ func (c *Client) runFetch(callerCtx context.Context, flight *fetchFlight, prev [
 		indexLastRefreshSeconds.Set(float64(c.fetchedAt.Unix()))
 	}
 	close(flight.done)
+	settled = true
 }
 
 // serveIndex clones idx for a clone=true caller and returns nil for

@@ -288,7 +288,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	// is a credential problem, not a stale token.
 	for attempt := 0; ; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-			strings.TrimRight(c.BaseURL, "/")+path, nil)
+			strings.TrimRight(c.SafeBaseURL(), "/")+path, nil)
 		if err != nil {
 			return stripURLError(err)
 		}
