@@ -18,9 +18,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/nodecoord"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/subframe"
@@ -319,6 +322,9 @@ func TestDiskBloatWarnBandPreEviction(t *testing.T) {
 			"volumes", "kubernetes.io~empty-dir", "scratch")
 		wdepstest.WriteFile(t, filepath.Join(vol, "data"), "x")
 		pod := mkPod("app", "runaway", wdepstest.UIDA, false)
+		if _, err := cs.CoreV1().Pods("app").Create(context.Background(), &pod, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
 
 		size := int64(120 << 20)
 		run := func() {
@@ -585,6 +591,55 @@ func TestDiskBloatWarnBandPreEviction(t *testing.T) {
 		run()
 		if got := wdepstest.EvictActions(cs); len(got) != 1 || got[0] != "split-bloat" {
 			t.Fatalf("multi-volume split bloat evictions = %v, want [split-bloat]", got)
+		}
+		if !d.State.Exists(latchdefs.LatchDiskBloat) {
+			t.Fatal("LatchDiskBloat not entered for multi-volume split bloat")
+		}
+		logBytes, _ := os.ReadFile(d.Cfg.WatchdogLogFile)
+		if !strings.Contains(string(logBytes), "pod app/split-bloat total") {
+			t.Fatalf("missing synthetic pod-total hit in log:\n%s", string(logBytes))
+		}
+	})
+
+	t.Run("evict_error_does_not_emit_ACTION_log", func(t *testing.T) {
+		c, d, f, cs := setup(t)
+		vol := filepath.Join(d.Cfg.PodsDir, wdepstest.UIDA,
+			"volumes", "kubernetes.io~empty-dir", "scratch")
+		wdepstest.WriteFile(t, filepath.Join(vol, "data"), "x")
+		pod := mkPod("app", "pdb-protected", wdepstest.UIDA, false)
+		cs.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, kruntime.Object, error) {
+			if a.GetSubresource() == "eviction" {
+				return true, nil, errors.New("429 Too Many Requests: Cannot evict pod as it would violate the pod's disruption budget")
+			}
+			return false, nil, nil
+		})
+
+		size := int64(120 << 20)
+		run := func() {
+			c.Run(context.Background(), &wdeps.CycleEnv{
+				WorkerActive: true,
+				APIOK:        true,
+				Pods:         []corev1.Pod{pod},
+				WalkOnce: func(root string) (int64, bool) {
+					if root == vol {
+						return size, false
+					}
+					return 0, false
+				},
+			})
+		}
+		run()
+		f.Now = f.Now.Add(2 * time.Minute)
+		size = 420 << 20
+		run()
+
+		logBytes, _ := os.ReadFile(d.Cfg.WatchdogLogFile)
+		logs := string(logBytes)
+		if strings.Contains(logs, "ACTION: disk-bloat evicted pod") {
+			t.Fatalf("ACTION line emitted despite Evict failure:\n%s", logs)
+		}
+		if !strings.Contains(logs, "suspect: disk-bloat evict app/pdb-protected failed") {
+			t.Fatalf("missing suspect evict failure log:\n%s", logs)
 		}
 	})
 

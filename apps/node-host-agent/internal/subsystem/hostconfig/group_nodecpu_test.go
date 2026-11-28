@@ -117,3 +117,42 @@ func TestNodeCPUUnknownNodeSkipsQuota(t *testing.T) {
 		t.Fatal("nebula quota written for an unknown node")
 	}
 }
+
+// TestNodeCPURejectsShellMetacharDev — interdc_nebula_dev is
+// interpolated into ExecStartPre=/bin/sh -c; metacharacters must be
+// refused by shToken and skip the wait-nodeip drop-in while still
+// converging CPU weight.
+func TestNodeCPURejectsShellMetacharDev(t *testing.T) {
+	badDevs := []string{
+		"neb1;id",
+		"neb1|cat",
+		"neb1&whoami",
+		"neb1$(id)",
+		"neb1 foo",
+		"neb1`id`",
+	}
+	for _, dev := range badDevs {
+		t.Run(dev, func(t *testing.T) {
+			vars := writeVarsDir(t, "interdc_nebula_dev: "+`"`+dev+`"`+"\n")
+			sr := newScripted(nil, nil)
+			r, err := New(Config{NodeName: "node-b", HostRoot: t.TempDir(),
+				VarsDir: vars, NebulaCertsDir: t.TempDir(), Runner: sr}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hostWrite(t, r, "/etc/systemd/system/k0sworker.service",
+				"[Service]\nExecStart=/usr/bin/k0s worker\n")
+			c := loadCyc(t, r, vars, "node-b")
+			c.groupNodeCPU()
+			if hostExists(r, "/etc/systemd/system/k0sworker.service.d/20-wait-nodeip.conf") {
+				t.Fatalf("wait-nodeip drop-in written for unsafe dev %q", dev)
+			}
+			if c.errs == 0 {
+				t.Fatalf("expected cycle error for unsafe dev %q", dev)
+			}
+			if !hostExists(r, "/etc/systemd/system/k0sworker.service.d/30-cpu-weight.conf") {
+				t.Fatalf("CPU weight drop-in skipped when dev %q was refused", dev)
+			}
+		})
+	}
+}

@@ -10,13 +10,13 @@ import "fmt"
 func (c *cyc) groupNodeCPU() {
 	r, ctx := c.r, c.ctx
 	if c.worker() && !c.t.AmLighthouse {
-		// Both scalars render verbatim into a systemd drop-in — the
-		// dev inside an ExecStartPre sh -c single-quote pair, the net
-		// inside unit names and .d paths. cfgScalar keeps a quote,
-		// newline or '#' out of either; a refusal skips ONLY this
-		// drop-in (the CPU weight/quota blocks below still converge).
+		// dev renders inside an ExecStartPre sh -c single-quote pair,
+		// so shToken gates out shell metacharacters; net renders inside
+		// unit names and .d paths, where cfgScalar keeps a quote,
+		// newline or '#' out. A refusal skips ONLY this drop-in (the
+		// CPU weight/quota blocks below still converge).
 		dev, net := c.nebDev(), c.t.Vars.StrDef("interdc_nebula_net", "interdc")
-		if c.cfgScalar("interdc_nebula_dev", dev) &&
+		if c.shToken("interdc_nebula_dev", dev) &&
 			c.cfgScalar("interdc_nebula_net", net) {
 			unit := "nebula@" + net + ".service"
 			_ = r.ensureDir("/etc/systemd/system/k0sworker.service.d", 0o755)

@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strconv"
+	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
@@ -21,6 +23,14 @@ import (
 // scans into a single round-trip.
 type dirProber interface {
 	ProbeDirs(ctx context.Context, lsDirs, orphanDirs []string) (ls, orphans map[string][]string, err error)
+}
+
+// hostProber extends dirProber to also probe the active service's
+// running binary/start time inside the same single SSH session, so
+// steady-state syncTarget keeps its <=4 session budget while catching
+// partial-upgrade stale processes.
+type hostProber interface {
+	ProbeHost(ctx context.Context, lsDirs, orphanDirs []string, svc, remoteBin, unitPath string) (ls, orphans map[string][]string, stale bool, err error)
 }
 
 // syncTarget converges one host over SSH: binary, vars (+ nebula
@@ -58,13 +68,16 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 	}
 
 	dp, useDirProber := conn.(dirProber)
+	hp, useHostProber := conn.(hostProber)
+	useProber := useDirProber || useHostProber
+	svc := unitName(cfg.UnitPath)
 	orphanDirs := make([]string, 0, 5+len(mPlans))
 	{
 		dirs := []string{path.Dir(cfg.RemoteBinary), path.Dir(cfg.UnitPath)}
 		if prof.guard {
 			dirs = append(dirs, cfg.GuardDir)
 		}
-		if useDirProber {
+		if useProber {
 			dirs = append(dirs, cfg.RemoteVarsDir)
 			for _, mp := range mPlans {
 				dirs = append(dirs, mp.remote)
@@ -77,7 +90,7 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 			}
 			seen[dir] = true
 			orphanDirs = append(orphanDirs, dir)
-			if !useDirProber {
+			if !useProber {
 				// Conn-only fallback: sweep non-mirror orphans before step a.
 				_ = s.sweepTmpOrphans(tctx, conn, dir)
 			}
@@ -140,7 +153,7 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 	if err := syncMirrorFiles(tctx, conn, cfg.VarsDir, cfg.RemoteVarsDir, "0644", varsNames, remoteSums); err != nil {
 		return err
 	}
-	if !useDirProber {
+	if !useProber {
 		if err := s.pruneRemoteDir(tctx, conn, cfg.RemoteVarsDir, varsNames); err != nil {
 			return err
 		}
@@ -152,7 +165,7 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 		if err := syncMirrorFiles(tctx, conn, mp.local, mp.remote, mp.mode, mp.names, remoteSums); err != nil {
 			return err
 		}
-		if !useDirProber {
+		if !useProber {
 			if err := s.pruneRemoteDir(tctx, conn, mp.remote, mp.names); err != nil {
 				return err
 			}
@@ -169,9 +182,11 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 		}
 	}
 
-	// Read-only probe session 2 (batched dirProber fast path): one
-	// session gathers mirror ls -1pA + all orphan-tmp find scans.
-	if useDirProber {
+	// Read-only probe session 2 (batched dirProber/hostProber fast path): one
+	// session gathers mirror ls -1pA + all orphan-tmp find scans (+ service staleness).
+	staleRunning := false
+	staleChecked := false
+	if useProber {
 		if len(varsNames) == 0 {
 			return fmt.Errorf("prune %s: refusing to empty remote dir — local kept-set empty",
 				cfg.RemoteVarsDir)
@@ -185,7 +200,17 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 			}
 			lsDirs = append(lsDirs, mp.remote)
 		}
-		lsMap, orphanMap, err := dp.ProbeDirs(tctx, lsDirs, orphanDirs)
+		var (
+			lsMap     map[string][]string
+			orphanMap map[string][]string
+			err       error
+		)
+		if useHostProber {
+			lsMap, orphanMap, staleRunning, err = hp.ProbeHost(tctx, lsDirs, orphanDirs, svc, cfg.RemoteBinary, cfg.UnitPath)
+			staleChecked = true
+		} else {
+			lsMap, orphanMap, err = dp.ProbeDirs(tctx, lsDirs, orphanDirs)
+		}
 		if err != nil {
 			return err
 		}
@@ -225,8 +250,13 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 			return err
 		}
 	}
-	svc := unitName(cfg.UnitPath)
-	if binaryUpdated || (unitChanged && !freshUnit) {
+	if !binaryUpdated && !unitChanged && !staleChecked {
+		staleRunning, err = isRunningProcessStale(tctx, conn, svc, cfg.RemoteBinary, cfg.UnitPath)
+		if err != nil {
+			return err
+		}
+	}
+	if binaryUpdated || (unitChanged && !freshUnit) || staleRunning {
 		if _, err := conn.Run(tctx, "systemctl enable "+fsx.ShellQuote(svc)); err != nil {
 			return err
 		}
@@ -234,11 +264,74 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 			return err
 		}
 		s.cfg.Log.Info("hubsync: service restarted after update",
-			"target", t.Name, "unit", svc)
+			"target", t.Name, "unit", svc, "stale_running", staleRunning)
 	} else {
 		if _, err := conn.Run(tctx, "systemctl enable --now "+fsx.ShellQuote(svc)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// staleProcessProbeScript builds a read-only shell snippet checking whether
+// an active systemd service is still running an unlinked (" (deleted)")
+// binary or started before the on-disk binary or unit file mtime.
+func staleProcessProbeScript(svc, remoteBinary, unitPath string) string {
+	qSvc := fsx.ShellQuote(svc)
+	qBin := fsx.ShellQuote(remoteBinary)
+	qUnit := fsx.ShellQuote(unitPath)
+	return fmt.Sprintf(
+		`state=$(systemctl show -p ActiveState --value %s 2>/dev/null || true); `+
+			`pid=$(systemctl show -p MainPID --value %s 2>/dev/null || true); `+
+			`exe=""; start_s=""; `+
+			`if [ "$state" = "active" ] && [ -n "$pid" ] && [ "$pid" != "0" ]; then `+
+			`exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true); `+
+			`ts=$(systemctl show -p ExecMainStartTimestamp --value %s 2>/dev/null || true); `+
+			`if [ -n "$ts" ]; then start_s=$(date -d "$ts" +%%s 2>/dev/null || true); fi; `+
+			`fi; `+
+			`bin_mtime=$(stat -c %%Y %s 2>/dev/null || true); `+
+			`unit_mtime=$(stat -c %%Y %s 2>/dev/null || true); `+
+			`printf 'state=%%s\npid=%%s\nexe=%%s\nstart=%%s\nbin_mtime=%%s\nunit_mtime=%%s\n' "$state" "$pid" "$exe" "$start_s" "$bin_mtime" "$unit_mtime"`,
+		qSvc, qSvc, qSvc, qBin, qUnit)
+}
+
+func parseStaleProcessProbe(out string) bool {
+	var state, exe string
+	var startS, binMtime, unitMtime int64
+	for line := range strings.SplitSeq(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "state":
+			state = v
+		case "exe":
+			exe = v
+		case "start":
+			startS, _ = strconv.ParseInt(v, 10, 64)
+		case "bin_mtime":
+			binMtime, _ = strconv.ParseInt(v, 10, 64)
+		case "unit_mtime":
+			unitMtime, _ = strconv.ParseInt(v, 10, 64)
+		}
+	}
+	if state != "" && state != "active" {
+		return false
+	}
+	if strings.HasSuffix(exe, " (deleted)") {
+		return true
+	}
+	if startS > 0 && (binMtime > startS || unitMtime > startS) {
+		return true
+	}
+	return false
+}
+
+func isRunningProcessStale(ctx context.Context, conn Conn, svc, remoteBinary, unitPath string) (bool, error) {
+	out, err := conn.Run(ctx, "sh -c "+fsx.ShellQuote(staleProcessProbeScript(svc, remoteBinary, unitPath)))
+	if err != nil {
+		return false, err
+	}
+	return parseStaleProcessProbe(out), nil
 }

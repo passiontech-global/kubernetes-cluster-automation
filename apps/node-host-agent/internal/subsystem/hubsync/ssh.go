@@ -376,10 +376,17 @@ func (c *sshConn) PrepareHost(ctx context.Context, dirs []remoteDir) error {
 
 // ProbeDirs batches all mirror ls -1pA and orphan-tmp find listings into one SSH session.
 func (c *sshConn) ProbeDirs(ctx context.Context, lsDirs, orphanDirs []string) (ls, orphans map[string][]string, err error) {
+	ls, orphans, _, err = c.ProbeHost(ctx, lsDirs, orphanDirs, "", "", "")
+	return ls, orphans, err
+}
+
+// ProbeHost extends ProbeDirs to also inspect the active service's
+// running binary/unit freshness in the same single SSH session.
+func (c *sshConn) ProbeHost(ctx context.Context, lsDirs, orphanDirs []string, svc, remoteBin, unitPath string) (ls, orphans map[string][]string, stale bool, err error) {
 	ls = make(map[string][]string, len(lsDirs))
 	orphans = make(map[string][]string, len(orphanDirs))
-	if len(lsDirs) == 0 && len(orphanDirs) == 0 {
-		return ls, orphans, nil
+	if len(lsDirs) == 0 && len(orphanDirs) == 0 && svc == "" {
+		return ls, orphans, false, nil
 	}
 	tok := "__HS_" + c.nonce + "_" + nextStageNonce() + "__"
 	var sb strings.Builder
@@ -391,21 +398,36 @@ func (c *sshConn) ProbeDirs(ctx context.Context, lsDirs, orphanDirs []string) (l
 		fmt.Fprintf(&sb, "printf '%%s\\n' %s; find %s -maxdepth 1 -type f -name '.*.tmp*' -mmin +%d -printf '%%f\\n' 2>/dev/null || true; ",
 			fsx.ShellQuote(fmt.Sprintf("%sFIND:%d", tok, i)), fsx.ShellQuote(d), tmpOrphanMinAge)
 	}
+	if svc != "" {
+		fmt.Fprintf(&sb, "printf '%%s\\n' %s; %s ",
+			fsx.ShellQuote(tok+"SVC"), staleProcessProbeScript(svc, remoteBin, unitPath))
+	}
 	out, err := c.Run(ctx, "sh -c "+fsx.ShellQuote(sb.String()))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	seenLS := make([]bool, len(lsDirs))
 	seenFind := make([]bool, len(orphanDirs))
+	seenSVC := false
+	inSVC := false
+	var svcLines []string
 	var curMap map[string][]string
 	var curKey string
 	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if rest, ok := strings.CutPrefix(line, tok); ok {
+			inSVC = false
+			if rest == "SVC" {
+				seenSVC = true
+				inSVC = true
+				curMap = nil
+				curKey = ""
+				continue
+			}
 			if idxStr, isLS := strings.CutPrefix(rest, "LS:"); isLS {
 				idx, perr := strconv.Atoi(idxStr)
 				if perr != nil || idx < 0 || idx >= len(lsDirs) {
-					return nil, nil, fmt.Errorf("probeDirs: invalid LS section index %q", idxStr)
+					return nil, nil, false, fmt.Errorf("probeDirs: invalid LS section index %q", idxStr)
 				}
 				seenLS[idx] = true
 				curMap = ls
@@ -415,13 +437,17 @@ func (c *sshConn) ProbeDirs(ctx context.Context, lsDirs, orphanDirs []string) (l
 			if idxStr, isFind := strings.CutPrefix(rest, "FIND:"); isFind {
 				idx, perr := strconv.Atoi(idxStr)
 				if perr != nil || idx < 0 || idx >= len(orphanDirs) {
-					return nil, nil, fmt.Errorf("probeDirs: invalid FIND section index %q", idxStr)
+					return nil, nil, false, fmt.Errorf("probeDirs: invalid FIND section index %q", idxStr)
 				}
 				seenFind[idx] = true
 				curMap = orphans
 				curKey = orphanDirs[idx]
 				continue
 			}
+		}
+		if inSVC {
+			svcLines = append(svcLines, line)
+			continue
 		}
 		trimmed := strings.TrimSpace(line)
 		if trimmed != "" && curMap != nil {
@@ -430,15 +456,21 @@ func (c *sshConn) ProbeDirs(ctx context.Context, lsDirs, orphanDirs []string) (l
 	}
 	for i, seen := range seenLS {
 		if !seen {
-			return nil, nil, fmt.Errorf("probeDirs: truncated output (missing LS section for %s)", lsDirs[i])
+			return nil, nil, false, fmt.Errorf("probeDirs: truncated output (missing LS section for %s)", lsDirs[i])
 		}
 	}
 	for i, seen := range seenFind {
 		if !seen {
-			return nil, nil, fmt.Errorf("probeDirs: truncated output (missing FIND section for %s)", orphanDirs[i])
+			return nil, nil, false, fmt.Errorf("probeDirs: truncated output (missing FIND section for %s)", orphanDirs[i])
 		}
 	}
-	return ls, orphans, nil
+	if svc != "" {
+		if !seenSVC {
+			return nil, nil, false, fmt.Errorf("probeDirs: truncated output (missing SVC section for %s)", svc)
+		}
+		stale = parseStaleProcessProbe(strings.Join(svcLines, "\n"))
+	}
+	return ls, orphans, stale, nil
 }
 
 // streamCmd runs cmd on one session with r piped to its stdin —

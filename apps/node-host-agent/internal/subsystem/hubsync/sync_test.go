@@ -1350,6 +1350,7 @@ type batchedFakeConn struct {
 	readOnlyProbe int
 	prepareCalls  int
 	probeCalls    int
+	staleProcess  bool
 }
 
 func (b *batchedFakeConn) Run(ctx context.Context, cmd string) (string, error) {
@@ -1405,6 +1406,11 @@ func (b *batchedFakeConn) ProbeDirs(_ context.Context, lsDirs, orphanDirs []stri
 	return ls, orphans, nil
 }
 
+func (b *batchedFakeConn) ProbeHost(ctx context.Context, lsDirs, orphanDirs []string, _, _, _ string) (ls, orphans map[string][]string, stale bool, err error) {
+	ls, orphans, err = b.ProbeDirs(ctx, lsDirs, orphanDirs)
+	return ls, orphans, b.staleProcess, err
+}
+
 type batchedDialer struct{ conn Conn }
 
 func (d batchedDialer) Dial(context.Context, Target) (Conn, error) { return d.conn, nil }
@@ -1445,5 +1451,99 @@ func TestSyncTargetSteadyStateBatching(t *testing.T) {
 	}
 	if bc.prepareCalls != 1 || bc.probeCalls != 1 {
 		t.Fatalf("prepareCalls=%d probeCalls=%d want 1,1", bc.prepareCalls, bc.probeCalls)
+	}
+}
+
+// TestSyncTargetStaleRunningProcessRestarts verifies partial-upgrade
+// recovery: when remote binary + unit sha256 already match local
+// (remoteSum == localSum && !unitChanged), an active service still
+// running an unlinked binary (" (deleted)") or started before the
+// remote binary/unit mtime still triggers `systemctl restart`.
+func TestSyncTargetStaleRunningProcessRestarts(t *testing.T) {
+	local := []byte("same-binary")
+	tg := Target{Name: "hub-controller-01", IP: "10.0.0.25",
+		SSHUser: "root", InterDC: true}
+
+	cases := []struct {
+		name        string
+		probeOut    string
+		wantRestart bool
+	}{
+		{
+			name:        "deleted_exe_triggers_restart",
+			probeOut:    "state=active\npid=1234\nexe=/usr/local/bin/node-host-agent (deleted)\nstart=1000\nbin_mtime=1000\nunit_mtime=1000\n",
+			wantRestart: true,
+		},
+		{
+			name:        "bin_mtime_newer_than_start_triggers_restart",
+			probeOut:    "state=active\npid=1234\nexe=/usr/local/bin/node-host-agent\nstart=1000\nbin_mtime=1050\nunit_mtime=900\n",
+			wantRestart: true,
+		},
+		{
+			name:        "unit_mtime_newer_than_start_triggers_restart",
+			probeOut:    "state=active\npid=1234\nexe=/usr/local/bin/node-host-agent\nstart=1000\nbin_mtime=900\nunit_mtime=1050\n",
+			wantRestart: true,
+		},
+		{
+			name:        "fresh_running_process_uses_enable_now",
+			probeOut:    "state=active\npid=1234\nexe=/usr/local/bin/node-host-agent\nstart=1100\nbin_mtime=1000\nunit_mtime=1000\n",
+			wantRestart: false,
+		},
+		{
+			name:        "inactive_service_uses_enable_now",
+			probeOut:    "state=inactive\npid=0\nexe=/usr/local/bin/node-host-agent (deleted)\nstart=0\nbin_mtime=1050\nunit_mtime=1050\n",
+			wantRestart: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dialer := newFakeDialer()
+			s, err := New(testConfig(t, newClientsetWithSecret(), dialer, local), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := newFakeConn()
+			c.seedFile("/usr/local/bin/node-host-agent", local)
+			unitBytes, err := systemdUnit(tg, s.cfg.RemoteBinary, s.cfg.RemoteVarsDir, s.cfg.RemoteCertsDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.seedFile("/etc/systemd/system/node-host-agent.service", []byte(unitBytes))
+			c.runHook = func(cmd string) (string, error) {
+				if strings.Contains(cmd, "ExecMainStartTimestamp") {
+					return tc.probeOut, nil
+				}
+				c.runHook = nil // shouldn't recurse, but fakeConn calls runHook before switch
+				return "", nil
+			}
+			// Use failConn passOn so normal fakeConn emulation runs for sha256sum/ls/mv.
+			fc := &failConn{
+				fakeConn: c,
+				passOn:   map[string]string{"ExecMainStartTimestamp": tc.probeOut},
+			}
+			c.runHook = nil
+			s.dialer = fnDialer{fn: func(Target) (Conn, error) { return fc, nil }}
+
+			if err := s.syncTarget(context.Background(), tg, nil, nil, ""); err != nil {
+				t.Fatalf("syncTarget: %v", err)
+			}
+			ops := strings.Join(fc.opsLog(), "\n")
+			if tc.wantRestart {
+				if !strings.Contains(ops, "systemctl restart 'node-host-agent.service'") {
+					t.Fatalf("expected systemctl restart, got:\n%s", ops)
+				}
+				if strings.Contains(ops, "enable --now") {
+					t.Fatalf("expected enable + restart, not enable --now:\n%s", ops)
+				}
+			} else {
+				if strings.Contains(ops, "systemctl restart") {
+					t.Fatalf("unexpected systemctl restart:\n%s", ops)
+				}
+				if !strings.Contains(ops, "systemctl enable --now 'node-host-agent.service'") {
+					t.Fatalf("expected enable --now:\n%s", ops)
+				}
+			}
+		})
 	}
 }

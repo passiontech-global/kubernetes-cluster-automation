@@ -411,21 +411,21 @@ func (c *DiskBloatCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// race: a same-name pod is a different object and the apiserver
 	// refuses (kubeutil.EvictPodV1).
 	ev := kubeutil.EvictPodV1(victim)
-	if preEvict {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: disk-bloat evicted pod %s/%s - runaway +%d bytes (total %d bytes), /var/lib/k0s at %.1f%% (pre-DiskPressure)",
-			victim.Namespace, victim.Name, victimDelta, victimBytes, used*100))
-	} else {
-		c.d.State.AppendLog(fmt.Sprintf(
-			"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
-			victim.Namespace, victim.Name, victimBytes, used*100))
-	}
 	if err := c.d.Cfg.Client.PolicyV1().Evictions(victim.Namespace).
 		Evict(ctx, ev); err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: disk-bloat evict %s/%s failed: %v",
 			victim.Namespace, victim.Name, err))
 	} else {
+		if preEvict {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"ACTION: disk-bloat evicted pod %s/%s - runaway +%d bytes (total %d bytes), /var/lib/k0s at %.1f%% (pre-DiskPressure)",
+				victim.Namespace, victim.Name, victimDelta, victimBytes, used*100))
+		} else {
+			c.d.State.AppendLog(fmt.Sprintf(
+				"ACTION: disk-bloat evicted pod %s/%s - emptyDir holds %d bytes, /var/lib/k0s at %.1f%%",
+				victim.Namespace, victim.Name, victimBytes, used*100))
+		}
 		c.d.Actions.WithLabelValues(wdeps.CheckDiskBloat, "pod_evict").Inc()
 	}
 	c.d.CycleResult(wdeps.CheckDiskBloat, "ok")

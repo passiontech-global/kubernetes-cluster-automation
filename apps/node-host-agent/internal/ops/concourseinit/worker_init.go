@@ -360,11 +360,11 @@ func copyFileAtomic(src, dst string, perm os.FileMode) error {
 	}
 	defer func() { _ = in.Close() }()
 
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	out, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := out.Name()
 	if _, err := io.Copy(out, in); err != nil {
 		_ = out.Close()
 		_ = os.Remove(tmp)

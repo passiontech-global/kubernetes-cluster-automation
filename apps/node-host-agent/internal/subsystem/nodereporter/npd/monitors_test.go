@@ -206,10 +206,12 @@ func TestJournalFetchErrorKeepsCursor(t *testing.T) {
 // fetch time, so a refused Event emit cannot rely on the cursor —
 // the entry goes back on the subscriber's pending queue and the
 // NEXT sync retries it without any new journal line (the filelog
-// offset rollback's journal-side equivalent).
+// offset rollback's journal-side equivalent). Problem counter is only
+// bumped once EmitEvent succeeds, so requeued lines are never
+// double-counted (nodereporter/events.go parity).
 func TestJournalEmitErrorRequeues(t *testing.T) {
 	e := fixture(t)
-	s := newErrSink()
+	s := newFlakySink(1)
 	// The fixture's PollEvery=-1 maps every sync to a fetch — this
 	// test needs the throttle ON so the second sync drains ONLY the
 	// requeued pending entry (the static clock never crosses the
@@ -223,17 +225,17 @@ func TestJournalEmitErrorRequeues(t *testing.T) {
 	if err := e.m.SyncKubeletJournal(context.Background(), s); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.counter("KubeletNodeNotFound"); got != 1 {
-		t.Fatalf("counter = %v, want 1", got)
+	if got := s.counter("KubeletNodeNotFound"); got != 0 {
+		t.Fatalf("counter on failed emit = %v, want 0", got)
 	}
 	// Second sync: the fetch interval hasn't elapsed AND no new
 	// lines exist — the ONLY thing to process is the requeued
-	// pending entry. The counter recounts it (filelog parity).
+	// pending entry. Emit succeeds now, so counter bumps once.
 	if err := e.m.SyncKubeletJournal(context.Background(), s); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.counter("KubeletNodeNotFound"); got != 2 {
-		t.Fatalf("counter after requeue retry = %v, want 2", got)
+	if got := s.counter("KubeletNodeNotFound"); got != 1 {
+		t.Fatalf("counter after requeue retry = %v, want 1", got)
 	}
 	if calls != 1 {
 		t.Fatalf("journalFetch calls = %d, want 1 (pending retry needs no refetch)", calls)
@@ -766,9 +768,10 @@ func (s *flakySink) EmitEvent(ctx context.Context, reason, note string) error {
 	return s.fakeSink.EmitEvent(ctx, reason, note)
 }
 
-// TestKubeletJournalEmitErrorKeepsCounting: a refused Event emit must
-// neither drop the counter bump nor fail the scan.
-func TestKubeletJournalEmitErrorKeepsCounting(t *testing.T) {
+// TestKubeletJournalEmitErrorSkipsCounter: a refused Event emit
+// must not fail the scan AND must not bump problem_counter (since
+// the entry is requeued for retry).
+func TestKubeletJournalEmitErrorSkipsCounter(t *testing.T) {
 	e := fixture(t)
 	s := newErrSink()
 	e.journalFetch = func(_ context.Context, args ...string) (string, error) {
@@ -777,8 +780,8 @@ func TestKubeletJournalEmitErrorKeepsCounting(t *testing.T) {
 	if err := e.m.SyncKubeletJournal(context.Background(), s); err != nil {
 		t.Fatalf("sink errors must not fail the sync: %v", err)
 	}
-	if got := s.counter("KubeletNodeNotFound"); got != 1 {
-		t.Fatalf("counter = %v, want 1", got)
+	if got := s.counter("KubeletNodeNotFound"); got != 0 {
+		t.Fatalf("counter = %v, want 0 when EmitEvent fails", got)
 	}
 }
 

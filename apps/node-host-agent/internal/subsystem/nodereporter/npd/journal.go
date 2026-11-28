@@ -110,23 +110,24 @@ func (m *Monitor) SyncKubeletJournal(ctx context.Context, s Sink) error {
 }
 
 // matchEventRules applies a temporary rule set to one line: every
-// matching rule increments problem_counter and emits/aggregates an
-// Event — same semantics as the parent's filelog processLogLine.
-// Returns false when any matched Event write failed — the caller
-// requeues the entry so the emit is retried (the counter recounts
-// the replay, the same trade the filelog offset rollback makes).
+// matching rule emits/aggregates an Event and increments
+// problem_counter ONLY after EmitEvent succeeds (matching
+// nodereporter/events.go applyRules) so requeued lines are not
+// double-counted. Returns false when any matched Event write failed
+// so the caller requeues the entry.
 func (m *Monitor) matchEventRules(ctx context.Context, s Sink, rules []rule, msg string) bool {
 	ok := true
 	for _, r := range rules {
 		if !r.re.MatchString(msg) {
 			continue
 		}
-		s.BumpCounter(r.reason)
 		if err := s.EmitEvent(ctx, r.reason, msg); err != nil {
 			logger().Error("nodereporter: event emit failed",
 				"reason", r.reason, "error", err)
 			ok = false
+			continue
 		}
+		s.BumpCounter(r.reason)
 	}
 	return ok
 }
