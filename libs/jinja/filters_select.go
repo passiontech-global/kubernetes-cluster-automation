@@ -5,18 +5,23 @@ package jinja
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 )
 
 func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
+	items := ToIter(v)
+	if len(items) > maxSeqElems {
+		return nil, fmt.Errorf("map: input exceeds max %d elements", maxSeqElems)
+	}
 	// map(attribute='x'[, default=y]) — presence decides, not
 	// nil-ness: default=none maps missing attributes to a literal
 	// None, which the old kw["default"] != nil check dropped.
 	if attr, ok := kw["attribute"]; ok {
 		_, hasDefault := kw["default"]
-		var out []any
-		for _, it := range ToIter(v) {
+		out := make([]any, 0, len(items))
+		for _, it := range items {
 			got := selectAttrKey(it, Stringify(attr))
 			if _, u := got.(Undefined); u && hasDefault {
 				got = kw["default"]
@@ -28,7 +33,7 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 	if len(args) == 0 {
 		// Clone like `|list` — ToIter hands back the LIVE backing
 		// slice; wrapping it unchecked aliases the caller's value.
-		return &List{slices.Clone(ToIter(v))}, nil
+		return &List{slices.Clone(items)}, nil
 	}
 	name := Stringify(args[0])
 	// map('basename') / map('regex_replace', p, r) — filter by name.
@@ -37,8 +42,9 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 	// UNKNOWN filter falls back to the attribute/method read: a
 	// runtime error inside a known filter (bad regex, bad JSON,
 	// divide by zero) must surface, not degrade to Undefined.
-	var out []any
-	for _, it := range ToIter(v) {
+	out := make([]any, 0, len(items))
+	var totalBytes int
+	for _, it := range items {
 		fv, err := applyFilter(name, it, args[1:], kw, s)
 		if err != nil {
 			if errors.Is(err, errUnknownFilter) {
@@ -46,6 +52,12 @@ func filterMap(v any, args []any, kw map[string]any, s *scope) (any, error) {
 				continue
 			}
 			return nil, err
+		}
+		if str, ok := fv.(string); ok {
+			totalBytes += len(str)
+			if totalBytes > maxStringBytes {
+				return nil, fmt.Errorf("map(%s): cumulative output exceeds %d bytes", name, maxStringBytes)
+			}
 		}
 		out = append(out, fv)
 	}

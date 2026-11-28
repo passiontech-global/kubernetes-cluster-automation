@@ -22,11 +22,7 @@ type attrExpr struct {
 }
 
 func (e attrExpr) eval(s *scope) (any, error) {
-	v, err := e.obj.eval(s)
-	if err != nil {
-		return nil, err
-	}
-	return getAttr(v, e.key), nil
+	return evalPostfixChain(e, s)
 }
 
 type indexExpr struct {
@@ -35,15 +31,7 @@ type indexExpr struct {
 }
 
 func (e indexExpr) eval(s *scope) (any, error) {
-	v, err := e.obj.eval(s)
-	if err != nil {
-		return nil, err
-	}
-	k, err := e.key.eval(s)
-	if err != nil {
-		return nil, err
-	}
-	return getIndex(v, k)
+	return evalPostfixChain(e, s)
 }
 
 type callExpr struct {
@@ -58,15 +46,73 @@ type kwarg struct {
 }
 
 func (e callExpr) eval(s *scope) (any, error) {
-	fnv, err := e.fn.eval(s)
+	return evalPostfixChain(e, s)
+}
+
+// evalPostfixChain unwinds left-leaning postfix chains (.attr, [idx],
+// call(), |filter) iteratively so arbitrarily wide chains (e.g. thousands
+// of filters or attribute hops) evaluate in O(1) Go stack space instead
+// of recursing down the left spine.
+func evalPostfixChain(root expr, s *scope) (any, error) {
+	var chain []expr
+	cur := root
+	for {
+		switch x := cur.(type) {
+		case attrExpr:
+			chain = append(chain, x)
+			cur = x.obj
+		case indexExpr:
+			chain = append(chain, x)
+			cur = x.obj
+		case callExpr:
+			chain = append(chain, x)
+			cur = x.fn
+		case filterExpr:
+			chain = append(chain, x)
+			cur = x.in
+		default:
+			goto evalBase
+		}
+	}
+evalBase:
+	v, err := cur.eval(s)
 	if err != nil {
 		return nil, err
 	}
-	args, kw, err := evalCallArgs(e.args, e.kw, s)
-	if err != nil {
-		return nil, err
+	for i := len(chain) - 1; i >= 0; i-- {
+		switch x := chain[i].(type) {
+		case attrExpr:
+			v = getAttr(v, x.key)
+		case indexExpr:
+			k, err := x.key.eval(s)
+			if err != nil {
+				return nil, err
+			}
+			v, err = getIndex(v, k)
+			if err != nil {
+				return nil, err
+			}
+		case callExpr:
+			args, kw, err := evalCallArgs(x.args, x.kw, s)
+			if err != nil {
+				return nil, err
+			}
+			v, err = callValue(v, args, kw, s)
+			if err != nil {
+				return nil, err
+			}
+		case filterExpr:
+			args, kw, err := evalCallArgs(x.args, x.kw, s)
+			if err != nil {
+				return nil, err
+			}
+			v, err = applyFilter(x.name, v, args, kw, s)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	return callValue(fnv, args, kw, s)
+	return v, nil
 }
 
 // evalCallArgs evaluates a call site's positional args and kwargs —
@@ -106,15 +152,7 @@ type filterExpr struct {
 }
 
 func (e filterExpr) eval(s *scope) (any, error) {
-	v, err := e.in.eval(s)
-	if err != nil {
-		return nil, err
-	}
-	args, kw, err := evalCallArgs(e.args, e.kw, s)
-	if err != nil {
-		return nil, err
-	}
-	return applyFilter(e.name, v, args, kw, s)
+	return evalPostfixChain(e, s)
 }
 
 type unExpr struct {
@@ -142,29 +180,53 @@ type binExpr struct {
 }
 
 func (e binExpr) eval(s *scope) (any, error) {
-	switch e.op {
-	case "and":
-		l, err := e.l.eval(s)
-		if err != nil || !Truthy(l) {
-			return l, err
+	// Unwind the left-leaning binary spine iteratively so wide flat
+	// chains (e.g. 1 + 1 + ... or a or b or ...) run in O(1) Go stack.
+	var chain []binExpr
+	cur := expr(e)
+	for {
+		b, ok := cur.(binExpr)
+		if !ok {
+			break
 		}
-		return e.r.eval(s)
-	case "or":
-		l, err := e.l.eval(s)
-		if err != nil || Truthy(l) {
-			return l, err
-		}
-		return e.r.eval(s)
+		chain = append(chain, b)
+		cur = b.l
 	}
-	l, err := e.l.eval(s)
+	l, err := cur.eval(s)
 	if err != nil {
 		return nil, err
 	}
-	r, err := e.r.eval(s)
-	if err != nil {
-		return nil, err
+	for i := len(chain) - 1; i >= 0; i-- {
+		link := chain[i]
+		switch link.op {
+		case "and":
+			if !Truthy(l) {
+				continue
+			}
+			l, err = link.r.eval(s)
+			if err != nil {
+				return nil, err
+			}
+		case "or":
+			if Truthy(l) {
+				continue
+			}
+			l, err = link.r.eval(s)
+			if err != nil {
+				return nil, err
+			}
+		default:
+			r, err := link.r.eval(s)
+			if err != nil {
+				return nil, err
+			}
+			l, err = binOp(link.op, l, r)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	return binOp(e.op, l, r)
+	return l, nil
 }
 
 type compareOp struct {
@@ -218,26 +280,40 @@ type testExpr struct {
 }
 
 func (e testExpr) eval(s *scope) (any, error) {
-	v, err := e.in.eval(s)
+	var chain []testExpr
+	cur := expr(e)
+	for {
+		te, ok := cur.(testExpr)
+		if !ok {
+			break
+		}
+		chain = append(chain, te)
+		cur = te.in
+	}
+	v, err := cur.eval(s)
 	if err != nil {
 		return nil, err
 	}
-	var args []any
-	for _, a := range e.args {
-		x, err := a.eval(s)
+	for i := len(chain) - 1; i >= 0; i-- {
+		te := chain[i]
+		var args []any
+		for _, a := range te.args {
+			x, err := a.eval(s)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, x)
+		}
+		r, err := runTest(te.name, v, args)
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, x)
+		if te.neg {
+			r = !r
+		}
+		v = r
 	}
-	r, err := runTest(e.name, v, args)
-	if err != nil {
-		return nil, err
-	}
-	if e.neg {
-		return !r, nil
-	}
-	return r, nil
+	return v, nil
 }
 
 type condExpr struct {

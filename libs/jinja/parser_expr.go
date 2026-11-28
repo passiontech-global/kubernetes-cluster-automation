@@ -14,7 +14,10 @@ import (
 // ~ concat → additive → multiplicative → unary → postfix (filter |,
 // .attr, [idx], call) → primary.
 
-const exprMaxDepth = 100
+const (
+	exprMaxDepth = 100
+	exprMaxChain = 50_000
+)
 
 type parser struct {
 	toks  []tok
@@ -111,7 +114,10 @@ func (p *parser) parseOr() (expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.atName("or") {
+	for n := 0; p.atName("or"); n++ {
+		if n >= exprMaxChain {
+			return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+		}
 		p.next()
 		r, err := p.parseAnd()
 		if err != nil {
@@ -127,7 +133,10 @@ func (p *parser) parseAnd() (expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.atName("and") {
+	for n := 0; p.atName("and"); n++ {
+		if n >= exprMaxChain {
+			return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+		}
 		p.next()
 		r, err := p.parseNot()
 		if err != nil {
@@ -178,6 +187,9 @@ func (p *parser) parseCompare() (expr, error) {
 		if op == "" {
 			break
 		}
+		if len(ops) >= exprMaxChain {
+			return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+		}
 		rhs, err := p.parseTest()
 		if err != nil {
 			return nil, err
@@ -201,7 +213,10 @@ func (p *parser) parseTest() (expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.atName("is") {
+	for n := 0; p.atName("is"); n++ {
+		if n >= exprMaxChain {
+			return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+		}
 		p.next()
 		neg := false
 		if p.atName("not") {
@@ -251,7 +266,10 @@ func (p *parser) parseConcat() (expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.at("~") {
+	for n := 0; p.at("~"); n++ {
+		if n >= exprMaxChain {
+			return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+		}
 		p.next()
 		r, err := p.parseAdd()
 		if err != nil {
@@ -267,7 +285,10 @@ func (p *parser) parseAdd() (expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.at("+") || p.at("-") {
+	for n := 0; p.at("+") || p.at("-"); n++ {
+		if n >= exprMaxChain {
+			return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+		}
 		op := p.next().val
 		r, err := p.parseMul()
 		if err != nil {
@@ -283,7 +304,10 @@ func (p *parser) parseMul() (expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.at("*") || p.at("/") || p.at("//") || p.at("%") {
+	for n := 0; p.at("*") || p.at("/") || p.at("//") || p.at("%"); n++ {
+		if n >= exprMaxChain {
+			return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+		}
 		op := p.next().val
 		r, err := p.parseUnary()
 		if err != nil {
@@ -323,9 +347,12 @@ func (p *parser) parsePostfix() (expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for {
+	for n := 0; ; n++ {
 		switch {
 		case p.at("|"):
+			if n >= exprMaxChain {
+				return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+			}
 			p.next()
 			// The filter name must be a name token — `x | }` or
 			// `x | 1` used to consume the token blindly and build
@@ -346,6 +373,9 @@ func (p *parser) parsePostfix() (expr, error) {
 			}
 			e = filterExpr{in: e, name: name, args: args, kw: kw}
 		case p.at("."):
+			if n >= exprMaxChain {
+				return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+			}
 			p.next()
 			// Same contract after '.': the attribute must be a
 			// name token (`x.` at eof, `x.0`, `x."k"`), not an
@@ -355,6 +385,9 @@ func (p *parser) parsePostfix() (expr, error) {
 			}
 			e = attrExpr{e, p.next().val}
 		case p.at("["):
+			if n >= exprMaxChain {
+				return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+			}
 			p.next()
 			k, err := p.parseTernary()
 			if err != nil {
@@ -365,6 +398,9 @@ func (p *parser) parsePostfix() (expr, error) {
 			}
 			e = indexExpr{e, k}
 		case p.at("("):
+			if n >= exprMaxChain {
+				return nil, fmt.Errorf("expression chain exceeds %d links", exprMaxChain)
+			}
 			p.next()
 			var args []expr
 			var kw []kwarg

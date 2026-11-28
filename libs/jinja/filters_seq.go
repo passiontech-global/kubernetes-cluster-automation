@@ -402,7 +402,6 @@ func filterMinMax(v any, name string, wantMax bool) (any, error) {
 // filterZip pairs the i-th element of every operand into a tuple —
 // length is the SHORTEST input (python zip parity).
 func filterZip(v any, args []any) (any, error) {
-	var out []any
 	lists := [][]any{ToIter(v)}
 	for _, a := range args {
 		lists = append(lists, ToIter(a))
@@ -413,6 +412,10 @@ func filterZip(v any, args []any) (any, error) {
 			minLen = len(l)
 		}
 	}
+	if minLen > 0 && len(lists) > 0 && minLen > maxSeqElems/len(lists) {
+		return nil, fmt.Errorf("zip: result exceeds max %d elements", maxSeqElems)
+	}
+	out := make([]any, 0, max(minLen, 0))
 	for i := 0; i < minLen; i++ {
 		pair := make([]any, len(lists))
 		for j, l := range lists {
