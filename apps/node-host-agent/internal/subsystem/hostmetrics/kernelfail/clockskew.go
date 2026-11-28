@@ -351,14 +351,36 @@ func (r *Runner) checkClockSkew(ctx context.Context) {
 			// chronyc is absent or fails — fall back to restarting
 			// systemd-timesyncd ONLY when it is active or enabled so we
 			// never start a dormant timesyncd alongside chrony.
-			_, actErr := r.deps.RunHostCmd(ctx, "systemctl", "is-active", "--quiet", "systemd-timesyncd")
-			timesyncdManaged := actErr == nil
-			if !timesyncdManaged {
-				_, enErr := r.deps.RunHostCmd(ctx, "systemctl", "is-enabled", "--quiet", "systemd-timesyncd")
-				timesyncdManaged = enErr == nil
+			// Prefer systemd.Client (D-Bus) over forking 3 nsenter
+			// systemctl processes when available.
+			const timesyncdUnit = "systemd-timesyncd.service"
+			var (
+				timesyncdManaged bool
+				rout             string
+				rerr             error
+			)
+			if r.deps.Systemd != nil {
+				act, aerr := r.deps.Systemd.Active(ctx, timesyncdUnit)
+				timesyncdManaged = aerr == nil && act
+				if !timesyncdManaged {
+					en, eerr := r.deps.Systemd.Enabled(ctx, timesyncdUnit)
+					timesyncdManaged = eerr == nil && en
+				}
+				if timesyncdManaged {
+					rerr = r.deps.Systemd.Restart(ctx, timesyncdUnit)
+				}
+			} else {
+				_, actErr := r.deps.RunHostCmd(ctx, "systemctl", "is-active", "--quiet", "systemd-timesyncd")
+				timesyncdManaged = actErr == nil
+				if !timesyncdManaged {
+					_, enErr := r.deps.RunHostCmd(ctx, "systemctl", "is-enabled", "--quiet", "systemd-timesyncd")
+					timesyncdManaged = enErr == nil
+				}
+				if timesyncdManaged {
+					rout, rerr = r.deps.RunHostCmd(ctx, "systemctl", "restart", "systemd-timesyncd")
+				}
 			}
 			if timesyncdManaged {
-				rout, rerr := r.deps.RunHostCmd(ctx, "systemctl", "restart", "systemd-timesyncd")
 				if rerr != nil {
 					attrs := []any{
 						"triedChronyc", triedChrony,

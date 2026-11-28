@@ -197,6 +197,26 @@ type fsProbe struct {
 	ok      bool
 }
 
+type fsProbeSnapshot struct {
+	probes map[string]fsProbe
+}
+
+func (c *Collector) refreshFSProbes() map[string]fsProbe {
+	probes := c.scrapeFSProbes()
+	c.fsCached.Store(&fsProbeSnapshot{probes: probes})
+	return probes
+}
+
+// cachedFSProbes returns the latest Latches-populated filesystem probe
+// snapshot without blocking /metrics on slow or hung statfs syscalls.
+func (c *Collector) cachedFSProbes() map[string]fsProbe {
+	snap := c.fsCached.Load()
+	if snap == nil {
+		return nil
+	}
+	return snap.probes
+}
+
 // scrapeFSProbes probes every FilesystemTargets + FSBytesTargets
 // mount ONCE per scrape (config order, deduped) — the k0s data dir
 // and the OpenEBS local root sit in BOTH target lists, and two

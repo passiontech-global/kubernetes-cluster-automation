@@ -692,3 +692,28 @@ func TestDiskBloatWarnBandPreEviction(t *testing.T) {
 		}
 	})
 }
+
+func TestSnapshotPodUIDConsultsTasksOnceBeforeDisk(t *testing.T) {
+	d, _ := rtDeps(t)
+	d.Cfg.CtrTaskRoot = filepath.Join(t.TempDir(), "missing-ctr")
+	d.Cfg.SandboxCtlRoot = filepath.Join(t.TempDir(), "missing-sb")
+	d.Cfg.Disk.WLayerSnapshotsDir = filepath.Join(t.TempDir(), "snaps")
+	// Snapshot 42 is bound in mountinfo to task "t-42", which exists ONLY in TasksOnce.
+	ce := &wdeps.CycleEnv{
+		MountinfoOnce: func() ([]byte, error) {
+			line := "10 1 0:50 / " + d.Cfg.CtrTaskRoot + "/t-42/rootfs rw - overlay overlay rw,upperdir=" +
+				d.Cfg.Disk.WLayerSnapshotsDir + "/42/fs\n"
+			return []byte(line), nil
+		},
+		TasksOnce: func() (map[string][]wdeps.CtrTask, bool) {
+			return map[string][]wdeps.CtrTask{
+				wdepstest.UIDA: {{ID: "t-42", UID: wdepstest.UIDA}},
+			}, true
+		},
+	}
+	mountIDs := snapshotMountIDs(d, ce)
+	taskUIDs := cycleTaskUIDs(ce)
+	if got := snapshotPodUID(d, "42", mountIDs, taskUIDs); got != wdepstest.UIDA {
+		t.Fatalf("snapshotPodUID = %q, want %q via TasksOnce", got, wdepstest.UIDA)
+	}
+}

@@ -90,26 +90,39 @@ var descLocalPVDirBytes = prometheus.NewDesc(
 	"Bytes under the OpenEBS LocalPV pvc-* volume dir (bounded walk; emitted per pvc-* dir present).",
 	[]string{"node", "pvc_volume"}, nil)
 
-// collectLocalPVUsage emits node_host_agent_localpv_dir_bytes per
-// pvc-* volume dir under OpenEBSLocalDir. The du walk is cached
-// for LocalPVScanInterval — a node with hundreds of LocalPVs would
-// otherwise pay a full filesystem walk per PVC per scrape. A
-// missing/unreadable root emits nothing (absent, not 0 — "no
-// local-path volumes here" must stay distinguishable from "zero
-// bytes"). A root that turns unreadable keeps serving the last
-// good snapshot for localPVMaxStaleWalks failed walks, then stops
-// emitting until a walk succeeds — a deleted PVC's stale byte
-// count must not misreport disk pressure forever.
-func (c *Collector) collectLocalPVUsage(ch chan<- prometheus.Metric) {
-	bytes, stopped := c.lpv.get(c.cfg.Clock.Now(),
-		c.cfg.LocalPVScanInterval, c.walkLocalPVDirs)
+type localpvSnapshot struct {
+	bytes map[string]int64
+}
+
+func (c *Collector) refreshLocalPV() map[string]int64 {
+	now := c.cfg.Clock.Now()
+	bytes, stopped := c.lpv.get(now, c.cfg.LocalPVScanInterval, c.walkLocalPVDirs)
 	if stopped {
 		logger().Warn("hostmetrics: openebs local dir unreadable — "+
 			"localpv metrics stopped until the root is readable again",
 			"dir", c.cfg.OpenEBSLocalDir,
 			"walks", localPVMaxStaleWalks+1)
 	}
-	for pvc, b := range bytes {
+	c.lpvCached.Store(&localpvSnapshot{bytes: bytes})
+	return bytes
+}
+
+// cachedLocalPV returns the latest Latches-populated LocalPV du-walk
+// snapshot without blocking /metrics while holding snapMu.
+func (c *Collector) cachedLocalPV() map[string]int64 {
+	snap := c.lpvCached.Load()
+	if snap == nil {
+		return nil
+	}
+	return snap.bytes
+}
+
+// collectLocalPVUsage emits node_host_agent_localpv_dir_bytes per
+// pvc-* volume dir under OpenEBSLocalDir from the scrapeCtx snapshot
+// (background-refreshed on scrape-time Collect, synchronous on
+// WriteTextfile).
+func (c *Collector) collectLocalPVUsage(ch chan<- prometheus.Metric, sc scrapeCtx) {
+	for pvc, b := range sc.localpv {
 		ch <- prometheus.MustNewConstMetric(descLocalPVDirBytes,
 			prometheus.GaugeValue, float64(b), c.cfg.NodeName, pvc)
 	}

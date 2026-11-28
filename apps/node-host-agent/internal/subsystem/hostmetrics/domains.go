@@ -39,6 +39,8 @@ type scrapeCtx struct {
 	// fs holds one answer per probed mount — the keys are the mount
 	// paths of FilesystemTargets ∪ FSBytesTargets.
 	fs map[string]fsProbe
+	// localpv holds per-PVC dir byte sums from the background/fresh walk.
+	localpv map[string]int64
 }
 
 // descMeta carries one exported series family — the desc Describe()
@@ -315,7 +317,7 @@ var domainTable = []domainEntry{
 				"Highest per-UID keyring fill ratio from /proc/key-users."},
 		}},
 	{name: "localpv",
-		emit: (*Collector).collectLocalPVUsage,
+		emitCtx: (*Collector).collectLocalPVUsage,
 		families: []descMeta{
 			{descLocalPVDirBytes, "node_host_agent_localpv_dir_bytes",
 				"Bytes under the OpenEBS LocalPV pvc-* volume dir."},

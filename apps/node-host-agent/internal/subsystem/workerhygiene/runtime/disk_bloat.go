@@ -153,6 +153,7 @@ func (c *DiskBloatCheck) scanBloatChecked(e *wdeps.CycleEnv, pods []corev1.Pod) 
 	// writable-layer scan walks, not a second hardcoded derivation.
 	snapRoot := c.d.Cfg.Disk.WLayerSnapshotsDir
 	mountIDs := snapshotMountIDs(c.d, e)
+	taskUIDs := cycleTaskUIDs(e)
 	snaps, sErr := readDirNamesChecked(snapRoot)
 	if sErr {
 		scanErr = true
@@ -163,7 +164,7 @@ func (c *DiskBloatCheck) scanBloatChecked(e *wdeps.CycleEnv, pods []corev1.Pod) 
 		if size <= 0 {
 			continue
 		}
-		uid := snapshotPodUID(c.d, id, mountIDs)
+		uid := snapshotPodUID(c.d, id, mountIDs, taskUIDs)
 		if uid != "" {
 			podTotals[uid] += size
 		}
@@ -287,20 +288,49 @@ func taskDirPodUID(d *wdeps.Deps, id string) string {
 	return ""
 }
 
+// cycleTaskUIDs builds a taskID -> podUID index from the cycle-cached
+// e.TasksOnce map when wired so snapshotPodUID avoids re-reading
+// config.json per snapshot dir.
+func cycleTaskUIDs(e *wdeps.CycleEnv) map[string]string {
+	if e == nil || e.TasksOnce == nil {
+		return nil
+	}
+	tasks, _ := e.TasksOnce()
+	if len(tasks) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(tasks))
+	for uid, list := range tasks {
+		for _, t := range list {
+			if t.ID != "" && uid != "" {
+				out[t.ID] = uid
+			}
+		}
+	}
+	return out
+}
+
 // snapshotPodUID resolves a containerd snapshot id back to the pod
 // uid owning it. mountIDs (snapshotMountIDs) wins: snapshot dir
 // names are numeric, so the mountinfo upperdir→rootfs binding maps
 // them to the 64-hex task id first; the direct name-as-task-dir
 // lookup stays as the fallback for name-keyed snapshotters and
-// tests. "" when nothing resolves (leaked/orphan snapshot — no pod
-// to bill it to).
-func snapshotPodUID(d *wdeps.Deps, id string, mountIDs map[string]string) string {
+// tests. Cycle-cached taskUIDs (from e.TasksOnce) is consulted before
+// falling back to reading config.json. "" when nothing resolves
+// (leaked/orphan snapshot — no pod to bill it to).
+func snapshotPodUID(d *wdeps.Deps, id string, mountIDs, taskUIDs map[string]string) string {
+	resolveTask := func(taskID string) string {
+		if uid := taskUIDs[taskID]; uid != "" {
+			return uid
+		}
+		return taskDirPodUID(d, taskID)
+	}
 	if cid := mountIDs[id]; cid != "" {
-		if uid := taskDirPodUID(d, cid); uid != "" {
+		if uid := resolveTask(cid); uid != "" {
 			return uid
 		}
 	}
-	return taskDirPodUID(d, id)
+	return resolveTask(id)
 }
 
 // DiskBloatCheck is the disk-bloat runaway-dir detector as a Check. It

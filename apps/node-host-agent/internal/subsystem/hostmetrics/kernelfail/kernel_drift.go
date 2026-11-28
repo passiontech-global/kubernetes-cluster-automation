@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 )
@@ -39,8 +40,10 @@ const (
 	DefaultTHPEnabled = "madvise"
 	DefaultTHPDefrag  = "defer+madvise"
 
-	kernelDriftConfirmTicks = 2
-	thpSysfsPrefix          = "/sys/kernel/mm/transparent_hugepage/"
+	kernelDriftConfirmTicks   = 2
+	kernelDriftHealBudgetFile = "last-kernel-drift-heal"
+	kernelDriftHealInterval   = 10 * time.Minute
+	thpSysfsPrefix            = "/sys/kernel/mm/transparent_hugepage/"
 )
 
 type kernelDriftKind string
@@ -240,28 +243,34 @@ func (r *Runner) updateKernelDrift(ctx context.Context) {
 	}
 
 	if r.deps.KernelDriftHeal {
+		safe := make([]kernelDriftItem, 0, len(drifts))
 		for _, d := range drifts {
 			if !isSafeSysctlToken(d.want) || (d.kind == driftKindRPFilter && !isSafeSysctlToken(d.key)) {
 				logger().Warn("hostmetrics: kernel drift heal skipped unsafe token",
 					"kind", string(d.kind), "key", d.key, "want", d.want)
 				continue
 			}
-			switch d.kind {
-			case driftKindTHP:
-				// RunHostCmd executes in PID-1 mount ns (NSAll); never os.WriteFile /host/sys.
-				if out, err := r.deps.RunHostCmd(ctx, "sh", "-c", "printf '%s' \"$1\" > \"$2\"", "sh", d.want, d.sysfsPath); err != nil {
-					logger().Warn("hostmetrics: THP drift heal failed",
-						"key", d.key, "want", d.want, "out", out, "error", err)
-				} else {
-					r.logKernelDriftAction(fmt.Sprintf("healed THP %s %s->%s", d.key, d.got, d.want))
-				}
-			case driftKindRPFilter:
-				kv := fmt.Sprintf("net.ipv4.conf.%s.rp_filter=%s", d.key, d.want)
-				if out, err := r.deps.RunHostCmd(ctx, "sysctl", "-w", kv); err != nil {
-					logger().Warn("hostmetrics: rp_filter drift heal failed",
-						"key", d.key, "want", d.want, "out", out, "error", err)
-				} else {
-					r.logKernelDriftAction(fmt.Sprintf("healed %s (was %s)", kv, d.got))
+			safe = append(safe, d)
+		}
+		if len(safe) > 0 && (r.deps.Store == nil || r.deps.Store.RateTrySpend(kernelDriftHealBudgetFile, kernelDriftHealInterval)) {
+			for _, d := range safe {
+				switch d.kind {
+				case driftKindTHP:
+					// RunHostCmd executes in PID-1 mount ns (NSAll); never os.WriteFile /host/sys.
+					if out, err := r.deps.RunHostCmd(ctx, "sh", "-c", "printf '%s' \"$1\" > \"$2\"", "sh", d.want, d.sysfsPath); err != nil {
+						logger().Warn("hostmetrics: THP drift heal failed",
+							"key", d.key, "want", d.want, "out", out, "error", err)
+					} else {
+						r.logKernelDriftAction(fmt.Sprintf("healed THP %s %s->%s", d.key, d.got, d.want))
+					}
+				case driftKindRPFilter:
+					kv := fmt.Sprintf("net.ipv4.conf.%s.rp_filter=%s", d.key, d.want)
+					if out, err := r.deps.RunHostCmd(ctx, "sysctl", "-w", kv); err != nil {
+						logger().Warn("hostmetrics: rp_filter drift heal failed",
+							"key", d.key, "want", d.want, "out", out, "error", err)
+					} else {
+						r.logKernelDriftAction(fmt.Sprintf("healed %s (was %s)", kv, d.got))
+					}
 				}
 			}
 		}

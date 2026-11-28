@@ -5,6 +5,7 @@
 package wdeps
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
@@ -38,38 +39,43 @@ const StateJournalUnreadable = latchdefs.LatchJournalUnreadable
 // Held blind reads keep asserting the hold, which also refreshes the
 // latch mtime (the janitor's 24h reap must not retire a live
 // episode).
-func (d *Deps) NoteJournalRead(ok bool, detail string) {
+func (d *Deps) journalBlindnessConfig(disambiguate func(context.Context) (bool, string)) journalwatch.BlindnessConfig {
 	const owner = journalwatch.OwnerWorkerHygiene
 	name := StateJournalUnreadable
-	if ok || !d.JournalReads.Present() {
-		// A healthy read, or journald storage gone (config change,
-		// not blindness): end this owner's streak, and release the
-		// store hold REGARDLESS of the tracker's exit edge — an
-		// owner that joined an episode it never reached Needed on
-		// must still drop its hold; the store exits the FILE only
-		// when no owner is left.
-		_ = d.JournalReads.ExitFrom(owner, name)
-		d.State.ExitFrom(name, owner, nil)
-		return
+	return journalwatch.BlindnessConfig{
+		Tracker:           &d.JournalReads,
+		Store:             d.State,
+		Owner:             owner,
+		Latch:             name,
+		DisambiguateEmpty: disambiguate,
+		OnBlind: func(enter, latched bool, detail string, fails int) {
+			if enter && !d.State.Exists(name) {
+				// This owner's streak crossed Needed and the latch file is
+				// not on disk: enter + the one-shot suspect line + counter.
+				d.State.EnterFrom(name, owner, detail)
+				d.State.AppendLog(fmt.Sprintf(
+					"suspect: journal-unreadable %s — %d consecutive journal "+
+						"reads produced nothing while journal storage exists; "+
+						"every journal-grep check is blind",
+					detail, fails))
+				d.CycleResult(CheckJournald, "journal_unreadable")
+				return
+			}
+			if enter || latched {
+				// Held: re-assert the hold every blind read.
+				d.State.EnterFrom(name, owner, detail)
+			}
+		},
 	}
-	enter := d.JournalReads.EnterFrom(owner, name)
-	if enter && !d.State.Exists(name) {
-		// This owner's streak crossed Needed and the latch file is
-		// not on disk: enter + the one-shot suspect line + counter.
-		d.State.EnterFrom(name, owner, detail)
-		d.State.AppendLog(fmt.Sprintf(
-			"suspect: journal-unreadable %s — %d consecutive journal "+
-				"reads produced nothing while journal storage exists; "+
-				"every journal-grep check is blind",
-			detail, d.JournalReads.Fails()))
-		d.CycleResult(CheckJournald, "journal_unreadable")
-		return
-	}
-	if enter || d.JournalReads.Latched() {
-		// Held: re-assert the hold every blind read — Enter recreates
-		// a file the janitor reaped or a manual rm deleted mid-episode
-		// (the once-per-episode enter edge alone would leave the
-		// latch/metric dark) and refreshes its mtime while held.
-		d.State.EnterFrom(name, owner, detail)
-	}
+}
+
+func (d *Deps) NoteJournalRead(ok bool, detail string) {
+	journalwatch.TrackRead(d.journalBlindnessConfig(nil), ok, detail)
+}
+
+// ClassifyAndTrackJournal classifies (out, err) via journalwatch.ClassifyAndTrack
+// with optional ClassEmpty disambiguation, driving the shared blindness latch.
+func (d *Deps) ClassifyAndTrackJournal(ctx context.Context, out string, err error,
+	disambiguate func(context.Context) (bool, string)) {
+	journalwatch.ClassifyAndTrack(ctx, d.journalBlindnessConfig(disambiguate), out, err)
 }

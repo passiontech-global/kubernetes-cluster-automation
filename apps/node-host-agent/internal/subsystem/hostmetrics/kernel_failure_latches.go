@@ -66,6 +66,7 @@ func (c *Collector) kernelFailDeps() kernelfail.Deps {
 		FileNRFile:       c.cfg.FileNRFile,
 		OpenEBSLocalDir:  c.cfg.OpenEBSLocalDir,
 		Store:            c.state,
+		Systemd:          c.cfg.Systemd,
 		Clock:            c.cfg.Clock,
 		TickInterval:     c.cfg.LatchInterval,
 		Adjtimex: func(tx *unix.Timex) (int, error) {

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 )
 
@@ -320,21 +321,13 @@ func logindInhibitDelaySecs(grace string) int64 {
 // bind-mounted by the init container.
 func (c *cyc) selfStageBinary() {
 	r := c.r
-	src, err := os.Executable()
-	if err != nil || src == "" {
-		src = "/node-host-agent" // container image path (fallback)
-	}
-	// os.Executable reports "<path> (deleted)" when the binary was
-	// replaced in-place — strip the suffix and fall back to the path
-	// the DS ships when src is unreadable (same rule
-	// resolveLocalBinary uses for the hubsync mirror).
-	src = strings.TrimSuffix(src, " (deleted)")
+	src := hostctx.ResolveLocalBinary(hostctx.DefaultLocalBinary)
 	// Streamed sha + pagecache drop for BOTH sides of the compare:
 	// hashing ~30 MB through os.ReadFile every cycle pinned ~60 MB
 	// of page cache inside the pod cgroup permanently.
 	srcSum, err := pagecache.Sha256File(src)
-	if err != nil && src != "/node-host-agent" {
-		src = "/node-host-agent"
+	if err != nil && src != hostctx.DefaultLocalBinary {
+		src = hostctx.DefaultLocalBinary
 		srcSum, err = pagecache.Sha256File(src)
 	}
 	if err != nil {

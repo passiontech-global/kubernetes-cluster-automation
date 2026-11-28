@@ -106,6 +106,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -202,6 +203,8 @@ type Collector struct {
 	snapMu      sync.Mutex
 	snapAt      time.Time
 	snapMetrics []prometheus.Metric
+	fsCached    atomic.Pointer[fsProbeSnapshot]
+	lpvCached   atomic.Pointer[localpvSnapshot]
 	// kf is the kernel deep-failure engine (kernelfail
 	// subpackage) — the kmsg tail session + the steal jiffie
 	// baseline live inside it. Owned by the Collector directly:
@@ -296,7 +299,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		}
 		return
 	}
-	ms := c.collectFresh()
+	ms := c.collectFresh(false)
 	c.snapAt = now
 	c.snapMetrics = ms
 	for _, m := range ms {
@@ -306,33 +309,37 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 // collect is the real measurement pass — the side-effect probes
 // feed scrapeCtx into the domains (watchdog, nebula-cert, psi,
-// filesystem, fs-bytes). One statfs per mount per pass: the
-// filesystem and fs-bytes domains share overlapping targets (the
-// k0s data dir, the OpenEBS local root), and each used to probe
-// them separately; probeFS's singleflight still bounds in-flight
-// goroutines at one per mount. NO latch updaters run here —
-// updateOverloadLatch/updateCertLatch/updateFSReadonlyLatch/
-// updateInodePressureLatch all belong to refreshLatches.
-func (c *Collector) collect(ch chan<- prometheus.Metric) {
+// filesystem, fs-bytes, localpv). When fresh is false and
+// collectCacheTTL >= 0 (scrape-time Collect), filesystem statfs probes
+// and LocalPV disk walks read the latest background-refreshed
+// snapshots instead of blocking /metrics while holding snapMu;
+// WriteTextfile passes fresh=true so standalone renders stay fresh.
+func (c *Collector) collect(ch chan<- prometheus.Metric, fresh bool) {
 	var sc scrapeCtx
 	sc.avg60, sc.psiOK = c.psiAvg60()
 	c.maybeMeasureCPU()
 	// The cert is parsed once per pass and shared between the
 	// watchdog-state latch bookkeeping and the days-left gauge.
 	sc.certDays, sc.certOK = c.nebulaCertDaysLeft()
-	sc.fs = c.scrapeFSProbes()
+	if fresh || c.cfg.collectCacheTTL < 0 {
+		sc.fs = c.refreshFSProbes()
+		sc.localpv = c.refreshLocalPV()
+	} else {
+		sc.fs = c.cachedFSProbes()
+		sc.localpv = c.cachedLocalPV()
+	}
 	for _, d := range domainTable {
 		d.run(c, ch, sc)
 	}
 }
 
 // collectFresh drains one full collect() pass into a slice — the
-// uncached half Collect caches and WriteTextfile renders. The
-// drain runs on a goroutine because the domains push into ch.
-func (c *Collector) collectFresh() []prometheus.Metric {
+// uncached half Collect caches (fresh=false) and WriteTextfile renders
+// (fresh=true). The drain runs on a goroutine because the domains push into ch.
+func (c *Collector) collectFresh(fresh bool) []prometheus.Metric {
 	ch := make(chan prometheus.Metric, 64)
 	go func() {
-		c.collect(ch)
+		c.collect(ch, fresh)
 		close(ch)
 	}()
 	var out []prometheus.Metric
@@ -351,11 +358,11 @@ const TextfileName = "node-watchdog.prom"
 // collectAll drains a full fresh collect into a slice — the
 // textfile writer's scrape (collect pushes; a reader must consume
 // concurrently or the collector blocks on the channel). It
-// deliberately bypasses the 10s snapshot cache: the textfile
-// render is already interval-driven and must reflect the latest
-// host state, not a scrape-side cache entry.
+// deliberately bypasses the 10s snapshot cache and background fs/localpv
+// caches: the textfile render is already interval-driven and must
+// reflect the latest host state.
 func (c *Collector) collectAll() []prometheus.Metric {
-	return c.collectFresh()
+	return c.collectFresh(true)
 }
 
 // WriteTextfile renders the full metric set in node-exporter

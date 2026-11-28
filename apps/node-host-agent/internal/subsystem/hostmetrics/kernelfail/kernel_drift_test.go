@@ -413,3 +413,40 @@ func TestKernelDriftVarsDirAndConcurrentReload(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+func TestKernelDriftHealCooldownThrottlesPersistentDrift(t *testing.T) {
+	f := kfixture(t)
+	now := time.Unix(1760000000, 0)
+	f.deps.Clock.Set(func() time.Time { return now })
+	f.r.deps.KernelDriftHeal = true
+	seedTHP(t, f.deps.HostRoot, "[always] madvise never\n", "always defer [defer+madvise] madvise never\n")
+
+	var healCalls int
+	f.r.deps.RunHostCmd = func(_ context.Context, _ ...string) (string, error) {
+		healCalls++
+		return "", nil
+	}
+
+	// Tick 1: heals once and consumes the cooldown budget.
+	f.r.updateKernelDrift(context.Background())
+	if healCalls != 1 {
+		t.Fatalf("tick 1 healCalls=%d, want 1", healCalls)
+	}
+
+	// Tick 2 (30s later, drift reverted/persistent): cooldown blocks nsenter fork.
+	now = now.Add(30 * time.Second)
+	f.r.updateKernelDrift(context.Background())
+	if healCalls != 1 {
+		t.Fatalf("tick 2 within cooldown healCalls=%d, want 1", healCalls)
+	}
+	if _, err := os.Stat(f.deps.Store.Path(latchdefs.LatchHostKernelDrift)); err != nil {
+		t.Fatalf("latch not raised on tick 2 while heal throttled: %v", err)
+	}
+
+	// Tick 3 (past cooldown): heal forks again.
+	now = now.Add(kernelDriftHealInterval + time.Second)
+	f.r.updateKernelDrift(context.Background())
+	if healCalls != 2 {
+		t.Fatalf("tick 3 after cooldown healCalls=%d, want 2", healCalls)
+	}
+}

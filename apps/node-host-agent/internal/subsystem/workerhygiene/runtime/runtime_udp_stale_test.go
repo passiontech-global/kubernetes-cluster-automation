@@ -91,6 +91,8 @@ func seedDeadUDPBackend(t *testing.T, e *env, ce *wdeps.CycleEnv, name, ip strin
 		context.Background(), sl.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	// Advance simulated clock past udpEndpointSliceCacheTTL so subsequent cycles observe the deletion.
+	e.Now = e.Now.Add(3 * time.Minute)
 }
 
 func TestUDPStaleCheckMultiCycleStreakAndFailClosed(t *testing.T) {
@@ -143,7 +145,8 @@ func TestUDPStaleCheckMultiCycleStreakAndFailClosed(t *testing.T) {
 		t.Fatalf("destroyed on cycle 1, want streak >= 2: %v", destroyed)
 	}
 
-	// Simulate API failure between cycles -> fail closed, streak stays 1 (not reset, not destroyed).
+	// Simulate API failure between cycles -> advance past EndpointSlice TTL so the list fires.
+	e.Now = e.Now.Add(3 * time.Minute)
 	e.CS.PrependReactor("list", "endpointslices", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("apiserver unavailable")
 	})
@@ -153,6 +156,7 @@ func TestUDPStaleCheckMultiCycleStreakAndFailClosed(t *testing.T) {
 	}
 
 	// Restore API -> next cycle reaches streak 2 and destroys only sockIDDead.
+	e.Now = e.Now.Add(3 * time.Minute)
 	e.CS.ReactionChain = e.CS.ReactionChain[1:]
 	chk.Run(context.Background(), ce)
 	if len(destroyed) != 1 || destroyed[0] != sockIDDead {

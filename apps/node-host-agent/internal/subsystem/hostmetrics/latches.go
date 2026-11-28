@@ -79,24 +79,27 @@ func (l *Latches) refreshLatches(ctx context.Context) {
 	}
 	days, certOK := c.nebulaCertDaysLeft()
 	c.updateCertLatch(days, certOK)
-	// Filesystem read-only + inode-pressure inode pressure: probe each target
-	// like collectFilesystem but only for the latches (metrics are
-	// scrape-side).
+	// Filesystem read-only + inode-pressure: probe all configured
+	// FS targets once, populate the non-blocking Collect cache, and
+	// update the latches from the same statfs answers.
+	probes := c.refreshFSProbes()
 	anyRO, probed := false, false
 	var ie fsInodeEvidence
 	for _, mount := range c.cfg.FilesystemTargets {
-		st, _, ok := c.probeFS(mount)
-		if !ok {
+		pr := probes[mount]
+		if !pr.ok {
 			continue
 		}
 		probed = true
-		c.noteInodeEvidence(&ie, mount, st)
-		if st.Flags&1 != 0 { // unix.ST_RDONLY without importing unix twice
+		c.noteInodeEvidence(&ie, mount, pr.st)
+		if pr.st.Flags&1 != 0 { // unix.ST_RDONLY without importing unix twice
 			anyRO = true
 		}
 	}
 	c.updateFSReadonlyLatch(anyRO, probed)
 	c.updateInodePressureLatch(ie)
+	// Refresh the bounded LocalPV du walk off the scrape hotpath.
+	c.refreshLocalPV()
 	// kernel-keys-pressure: kernel keyring quota pressure.
 	if ratio, ok := c.kernelKeysUsedRatio(); ok {
 		l.updateKernelKeysLatch(ratio)

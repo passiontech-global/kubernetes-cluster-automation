@@ -71,6 +71,7 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 		}
 		if len(snaps) > 0 {
 			mountIDs := snapshotMountIDs(c.d, e)
+			taskUIDs := cycleTaskUIDs(e)
 			for _, snap := range snaps {
 				fsDir := filepath.Join(snap, "fs")
 				size, _ := c.d.WalkBudgeted(e, fsDir)
@@ -78,7 +79,7 @@ func (c *WritableLayerCheck) writableLayerScan(ctx context.Context, e *wdeps.Cyc
 					continue
 				}
 				var pod *corev1.Pod
-				if uid := snapshotPodUID(c.d, filepath.Base(snap), mountIDs); uid != "" {
+				if uid := snapshotPodUID(c.d, filepath.Base(snap), mountIDs, taskUIDs); uid != "" {
 					pod = podByUID[uid]
 				}
 				if podDeclaresEphemeralStorage(pod) {

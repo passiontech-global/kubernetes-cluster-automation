@@ -209,19 +209,15 @@ func (c *JournaldCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	// talking counts as blindness. A stood empty read is blindness
 	// exactly when the disambiguation gave a reason (the "" detail is
 	// the corrupt-warning answer — journald talked, A5 owns it).
-	unreadable := false
-	udetail := ""
-	// Shared blindness classes (journalwatch.ClassifyRead) cover
-	// the exec-error and files-gone halves with the same detail
-	// strings; the integrity classifier's Empty verdict keeps its
-	// own disambiguated detail.
-	switch class, detail := journalwatch.ClassifyRead(v.Out, v.Err); {
-	case class == journalwatch.ClassFailed || class == journalwatch.ClassFilesGone:
-		unreadable, udetail = true, detail
-	case v.Empty:
-		unreadable, udetail = v.Detail != "", v.Detail
-	}
-	c.d.NoteJournalRead(!unreadable, udetail)
+	// Shared blindness tracking via journalwatch.ClassifyAndTrack:
+	// exec-error and files-gone map directly; an empty read uses the
+	// integrity classifier's disambiguated detail.
+	c.d.ClassifyAndTrackJournal(ctx, v.Out, v.Err, func(context.Context) (bool, string) {
+		if v.Empty && v.Detail != "" {
+			return false, v.Detail
+		}
+		return true, ""
+	})
 	switch c.ig.Act(ctx, v) {
 	case journalwatch.OutcomePending, journalwatch.OutcomeHealthy,
 		journalwatch.OutcomeBudget, journalwatch.OutcomeRemediated:

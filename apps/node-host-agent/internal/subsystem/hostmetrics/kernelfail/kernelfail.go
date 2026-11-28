@@ -63,6 +63,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostexec"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/kmsg"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
@@ -229,6 +230,10 @@ type Deps struct {
 	// on-disk format stays the lib.sh parity every subsystem
 	// shares.
 	Store *hoststate.Store
+	// Systemd is the shared D-Bus-preferring host systemd client
+	// used to check/restart systemd-timesyncd without forking 3
+	// nsenter systemctl processes when D-Bus is available.
+	Systemd *systemd.Client
 	// Clock is the shared timex.Cell — the same pointer the
 	// Collector's cfg.Clock carries, so a post-New Clock.Set lands
 	// here exactly like the old cfg.Clock.Now() reads did.

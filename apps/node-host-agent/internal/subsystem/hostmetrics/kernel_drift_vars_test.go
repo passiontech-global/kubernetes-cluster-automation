@@ -53,13 +53,14 @@ func TestTHPVarsDirPrecedenceMatchesHostconfig(t *testing.T) {
 	t.Setenv(envnames.EnvHostconfigVarsDir, varsDir)
 
 	baseCfg, _ := fixture(t)
+	now := time.Unix(1760000000, 0)
 	deps := hostctx.Deps{
 		NodeName:         "node-a",
 		HostRoot:         hostRoot,
 		VarsDir:          varsDir,
 		WatchdogStateDir: stateDir,
 		WatchdogLogFile:  logFile,
-		Clock:            timex.NewCell(func() time.Time { return time.Unix(1760000000, 0) }),
+		Clock:            timex.NewCell(func() time.Time { return now }),
 	}
 	cfg := ConfigFromEnv(EnvDeps{Deps: deps})
 	// Keep all unrelated filesystem/proc probes hermetic like fixture(t).
@@ -168,6 +169,7 @@ func TestTHPVarsDirPrecedenceMatchesHostconfig(t *testing.T) {
 	if en, df := cFull.THPTargets(); en != "always" || df != "defer+madvise" {
 		t.Fatalf("full env override THPTargets() = (%q, %q), want (always, defer+madvise)", en, df)
 	}
+	now = now.Add(11 * time.Minute)
 	cFull.Latches().refreshLatches(context.Background())
 	if len(envHeals) != 2 || envHeals[0][4] != "always" || envHeals[1][4] != "defer+madvise" {
 		t.Fatalf("expected env override heals (always, defer+madvise), got %v", envHeals)

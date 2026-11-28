@@ -7,10 +7,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/netlinkx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
@@ -82,6 +85,7 @@ func TestUDPStaleEverSeenPrunedAfterVanished(t *testing.T) {
 	if _, err := f.CS.DiscoveryV1().EndpointSlices("default").Update(ctx, sl, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	f.Now = f.Now.Add(3 * time.Minute)
 	chk.Run(ctx, ce)
 	if !chk.everSeenUDP.Has("10.244.9.99:53") {
 		t.Fatal("active candidate backend 10.244.9.99:53 was prematurely pruned")
@@ -192,6 +196,7 @@ func TestUDPStaleCombinedDumpAndBatchedDestroy(t *testing.T) {
 	if _, err := f.CS.DiscoveryV1().EndpointSlices("default").Update(ctx, sl, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	f.Now = f.Now.Add(3 * time.Minute)
 	dumpCalls = map[int]int{}
 
 	// Cycle 2 & 3: build 2-cycle streak, then batched destroy triggers on cycle 3.
@@ -216,5 +221,78 @@ func TestUDPStaleCombinedDumpAndBatchedDestroy(t *testing.T) {
 	}
 	if d.Series.UDPStaleDestroyed != 2 {
 		t.Fatalf("UDPStaleDestroyed=%d want 2", d.Series.UDPStaleDestroyed)
+	}
+}
+
+func TestUDPStaleEndpointSliceListTTLCache(t *testing.T) {
+	d, f := rtDeps(t)
+	ctx := context.Background()
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node-a"},
+		Spec:       corev1.NodeSpec{PodCIDR: "10.244.0.0/16"},
+	}
+	if _, err := f.CS.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	proto := corev1.ProtocolUDP
+	port := int32(53)
+	sl := &discoveryv1.EndpointSlice{
+		ObjectMeta:  metav1.ObjectMeta{Namespace: "default", Name: "dns"},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Ports:       []discoveryv1.EndpointPort{{Port: &port, Protocol: &proto}},
+		Endpoints:   []discoveryv1.Endpoint{{Addresses: []string{"10.244.9.99"}}},
+	}
+	if _, err := f.CS.DiscoveryV1().EndpointSlices("default").Create(ctx, sl, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for pid, ino := range map[int]string{1: "40001", 200: "40002"} {
+		nsDir := filepath.Join(f.ProcDir, strconv.Itoa(pid), "ns")
+		if err := os.MkdirAll(nsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("net:["+ino+"]", filepath.Join(nsDir, "net")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var sock [48]byte
+	sock[0] = 0x55
+	d.Cfg.Seams.Host.DumpConnectedUDPFn = func(pid int) ([]netlinkx.ConnectedUDPSocket, error) {
+		if pid != 200 {
+			return nil, nil
+		}
+		return []netlinkx.ConnectedUDPSocket{
+			{Family: 2, SrcPort: 40002, DstIP: net.ParseIP("10.244.9.99"), DstPort: 53, ID: sock},
+		}, nil
+	}
+	listCalls := 0
+	f.CS.PrependReactor("list", "endpointslices", func(k8stesting.Action) (bool, kruntime.Object, error) {
+		listCalls++
+		return false, nil, nil
+	})
+	chk := NewUDPStale(d)
+	ce := &wdeps.CycleEnv{
+		WorkerActive: true,
+		APIOK:        true,
+		TasksOnce: func() (map[string][]wdeps.CtrTask, bool) {
+			return map[string][]wdeps.CtrTask{
+				"uid-a": {{Name: "pause", PID: 200, Live: true}},
+			}, true
+		},
+	}
+	chk.Run(ctx, ce)
+	if listCalls != 1 {
+		t.Fatalf("cycle 1 listCalls=%d, want 1", listCalls)
+	}
+	// Inside TTL -> cache hit, 0 additional EndpointSlice List calls.
+	f.Now = f.Now.Add(time.Minute)
+	chk.Run(ctx, ce)
+	if listCalls != 1 {
+		t.Fatalf("within TTL listCalls=%d, want 1", listCalls)
+	}
+	// Past TTL -> refreshes.
+	f.Now = f.Now.Add(2 * time.Minute)
+	chk.Run(ctx, ce)
+	if listCalls != 2 {
+		t.Fatalf("past TTL listCalls=%d, want 2", listCalls)
 	}
 }

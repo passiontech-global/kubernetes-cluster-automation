@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/testutil"
 )
 
@@ -371,6 +372,37 @@ func TestClockSkewProbeTimesyncdFallback(t *testing.T) {
 		}
 		if len(cmds) != 2 || cmds[0] != "chronyc tracking" || cmds[1] != "timedatectl timesync-status" {
 			t.Fatalf("cmds = %v, want [chronyc tracking, timedatectl timesync-status]", cmds)
+		}
+	})
+
+	t.Run("prefers systemd.Client over RunHostCmd systemctl forks", func(t *testing.T) {
+		f := kfixture(t)
+		f.r.deps.Adjtimex = func(tx *unix.Timex) (int, error) {
+			tx.Offset = 2_000_000 // +2s in us (> 0.5s)
+			tx.Status = 0
+			return 0, nil
+		}
+		var sdCalls []string
+		f.r.deps.Systemd = systemd.New(systemd.Config{
+			HostRoot: "/",
+			RunCmd: func(_ context.Context, argv []string) (string, error) {
+				sdCalls = append(sdCalls, strings.Join(argv, " "))
+				if len(argv) >= 3 && argv[1] == "is-active" {
+					return "active\n", nil
+				}
+				return "", nil
+			},
+		})
+		f.r.deps.RunHostCmd = func(_ context.Context, argv ...string) (string, error) {
+			t.Fatalf("RunHostCmd should not fork systemctl when Systemd client is wired: %v", argv)
+			return "", nil
+		}
+
+		f.r.checkClockSkew(context.Background())
+		if len(sdCalls) != 2 ||
+			!strings.Contains(sdCalls[0], "is-active systemd-timesyncd.service") ||
+			!strings.Contains(sdCalls[1], "restart systemd-timesyncd.service") {
+			t.Fatalf("sdCalls = %v, want is-active + restart via systemd.Client", sdCalls)
 		}
 	})
 }

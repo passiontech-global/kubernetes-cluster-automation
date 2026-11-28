@@ -7,6 +7,10 @@
 package journalwatch
 
 import (
+	"context"
+	"fmt"
+	"strings"
+
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hoststate"
 )
@@ -80,4 +84,79 @@ func NewUnreadableTrackerForOwner(state *hoststate.Store, dirs []string,
 			return state.Exists(latchdefs.LatchJournalUnreadable)
 		},
 	}
+}
+
+// BlindnessConfig configures ClassifyAndTrack / TrackRead for
+// driving the multi-owner state-journal-unreadable latch from any
+// journalctl reader.
+type BlindnessConfig struct {
+	Tracker           *Tracker
+	Store             *hoststate.Store
+	Owner             string
+	Latch             string
+	DisambiguateEmpty func(ctx context.Context) (ok bool, detail string)
+	OnExit            func()
+	OnBlind           func(entered, latched bool, detail string, fails int)
+}
+
+// ClassifyReadWith classifies one journalctl read and disambiguates
+// ClassEmpty with probeAny (e.g. `journalctl -n 1 --no-pager`).
+func ClassifyReadWith(ctx context.Context, out string, err error,
+	probeAny func(context.Context) (string, error)) (bool, string) {
+	class, detail := ClassifyRead(out, err)
+	switch class {
+	case ClassFailed, ClassFilesGone:
+		return false, detail
+	case ClassEmpty:
+		if probeAny != nil {
+			uout, uerr := probeAny(ctx)
+			switch {
+			case uerr != nil:
+				return false, fmt.Sprintf("unfiltered probe failed: %v", uerr)
+			case FilesGone(uout):
+				return false, "journalctl reports no journal files"
+			case strings.TrimSpace(uout) == "":
+				return false, "journald-wide empty reply"
+			}
+		}
+	}
+	return true, ""
+}
+
+// TrackRead drives Tracker + Store transitions from a pre-classified
+// (ok, detail) verdict.
+func TrackRead(cfg BlindnessConfig, ok bool, detail string) {
+	if cfg.Tracker == nil || cfg.Store == nil {
+		return
+	}
+	if ok || !cfg.Tracker.Present() {
+		_ = cfg.Tracker.ExitFrom(cfg.Owner, cfg.Latch)
+		cfg.Store.ExitFrom(cfg.Latch, cfg.Owner, cfg.OnExit)
+		return
+	}
+	enter := cfg.Tracker.EnterFrom(cfg.Owner, cfg.Latch)
+	if cfg.OnBlind != nil {
+		cfg.OnBlind(enter, cfg.Tracker.Latched(), detail, cfg.Tracker.Fails())
+		return
+	}
+	if enter || cfg.Tracker.Latched() {
+		cfg.Store.EnterFrom(cfg.Latch, cfg.Owner, detail)
+	}
+}
+
+// ClassifyAndTrack classifies (out, err) via ClassifyRead (plus
+// optional DisambiguateEmpty) and drives Tracker + Store via TrackRead.
+func ClassifyAndTrack(ctx context.Context, cfg BlindnessConfig, out string, err error) (bool, string) {
+	class, detail := ClassifyRead(out, err)
+	ok := true
+	switch class {
+	case ClassFailed, ClassFilesGone:
+		ok = false
+	case ClassEmpty:
+		if cfg.DisambiguateEmpty != nil {
+			ok, detail = cfg.DisambiguateEmpty(ctx)
+		}
+	}
+	TrackRead(cfg, ok, detail)
+	return ok, detail
 }
