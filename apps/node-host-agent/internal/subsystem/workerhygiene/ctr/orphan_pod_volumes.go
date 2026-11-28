@@ -39,7 +39,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
@@ -256,22 +255,21 @@ func isPodUIDDirName(name string) bool {
 // is not positive evidence that the pod dir is unmounted, so the
 // caller must fail closed rather than detach on it.
 func (c *OrphanPodVolsCheck) loadHostMounts(e *wdeps.CycleEnv, out *[]string) bool {
-	data, err := c.d.ReadMountinfo(e)
+	entries, _, err := c.d.MountinfoEntries(e)
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: orphan-pod-volumes read %s failed: %v — mount gate unverifiable",
 			c.d.Cfg.MountinfoFile, err))
 		return false
 	}
-	for ln := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(ln)
-		if len(f) < 5 {
+	for _, ent := range entries {
+		if !ent.HasMount {
 			continue
 		}
 		// Clean every path: mountinfo may carry a trailing slash or
 		// a ".." segment, and an unnormalized path would evade the
 		// subtree prefix match below.
-		p := filepath.Clean(procfs.UnescapeMountPath(f[4]))
+		p := filepath.Clean(ent.Mountpoint)
 		if p != "." && p != "" {
 			*out = append(*out, p)
 		}

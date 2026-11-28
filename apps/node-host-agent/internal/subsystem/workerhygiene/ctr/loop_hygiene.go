@@ -32,7 +32,7 @@ const (
 func (c *MountinfoCheck) reapOrphanLoops(
 	ctx context.Context,
 	e *wdeps.CycleEnv,
-	mountinfoData []byte,
+	entries []wdeps.MountEntry,
 	hostPodsDir string,
 	podLive map[string]bool,
 	tasksOnce func() (map[string][]wdeps.CtrTask, bool),
@@ -60,7 +60,7 @@ func (c *MountinfoCheck) reapOrphanLoops(
 		return true
 	}
 
-	pid1Sources := parseMountSources(mountinfoData)
+	pid1Sources := parseMountSourcesEntries(entries)
 	// The full namespace scan is built lazily — only when a candidate is
 	// actually about to be detached. Paths from every /proc/<pid>/mountinfo
 	// are merged (procfs.UnescapeMountPath inside parseMountSources) so a
@@ -313,6 +313,16 @@ func isLoopDevName(name string) bool {
 		}
 	}
 	return true
+}
+
+func parseMountSourcesEntries(entries []wdeps.MountEntry) map[string]bool {
+	sources := map[string]bool{}
+	for _, ent := range entries {
+		if ent.HasSep && ent.Source != "" {
+			sources[ent.Source] = true
+		}
+	}
+	return sources
 }
 
 func parseMountSources(mountinfoData []byte) map[string]bool {

@@ -129,14 +129,43 @@ func TestProbeTopHotkeysQueryFailKeepsSample(t *testing.T) {
 	}
 }
 
-// resHead answers 0 on a failed head read — callers treat it as "no
-// data" rather than an error.
-func TestResHeadQueryFailZeros(t *testing.T) {
-	k, _, _ := fixture(t, []testutil.ExecRule{
+// resHead returns an error on a failed head read, and probeTopChurn
+// preserves the existing watermark instead of overwriting it with 0
+// (which would turn the next window into a WHERE id > 0 full-table scan).
+func TestResHeadQueryFailPreservesWatermark(t *testing.T) {
+	k, _, dir := fixture(t, []testutil.ExecRule{
+		{Substr: "split_part(name", Out: "pods|120\n"},
 		{Substr: "MAX(id)", Err: errors.New("connection reset")},
 	})
-	if got := k.resHead(context.Background(), "pg", "postgres", "secret"); got != 0 {
-		t.Fatalf("resHead=%d want 0", got)
+	if _, err := k.resHead(context.Background(), "pg", "postgres", "secret"); err == nil {
+		t.Fatal("resHead succeeded on SQL error, want error")
+	}
+
+	gdir := filepath.Join(dir, "guard")
+	kdeps.WriteIntFile(filepath.Join(gdir, churnFileHead), 8000)
+	kdeps.WriteIntFile(filepath.Join(gdir, churnFileTS), kdepstest.TestNow-600)
+	var notes []string
+	k.probeTopChurn(context.Background(), "pg", "postgres", "secret",
+		func(s string) { notes = append(notes, s) })
+	if h, _ := kdeps.ReadIntFile(filepath.Join(gdir, churnFileHead)); h != 8000 {
+		t.Fatalf("churn head overwritten to %d on MAX(id) failure, want 8000", h)
+	}
+	if ts, _ := kdeps.ReadIntFile(filepath.Join(gdir, churnFileTS)); ts != kdepstest.TestNow-600 {
+		t.Fatalf("churn ts advanced to %d on MAX(id) failure", ts)
+	}
+
+	// Initial seed failure must not write head=0 + ts=now either.
+	k2, _, dir2 := fixture(t, []testutil.ExecRule{
+		{Substr: "MAX(id)", Err: errors.New("connection reset")},
+	})
+	gdir2 := filepath.Join(dir2, "guard")
+	k2.probeTopChurn(context.Background(), "pg", "postgres", "secret",
+		func(string) {})
+	if h, err := kdeps.ReadIntFile(filepath.Join(gdir2, churnFileHead)); err == nil || h != 0 {
+		t.Fatalf("initial seed wrote head=%d err=%v on MAX(id) failure", h, err)
+	}
+	if ts, err := kdeps.ReadIntFile(filepath.Join(gdir2, churnFileTS)); err == nil || ts != 0 {
+		t.Fatalf("initial seed wrote ts=%d err=%v on MAX(id) failure", ts, err)
 	}
 }
 

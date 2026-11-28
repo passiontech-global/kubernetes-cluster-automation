@@ -467,9 +467,9 @@ func (c *EphemeralPortsCheck) evictPortLeakers(ctx context.Context,
 	}
 	share := float64(topN) / float64(total)
 	if share*100 < float64(c.d.Cfg.Wave2.PortLeakMinPct) {
-		c.d.State.AppendLog(fmt.Sprintf(
+		c.d.State.SuspectLog(wdeps.CheckEphemeralPorts+"-diffuse", fmt.Sprintf(
 			"suspect: ephemeral-port-pressure no pod holds >=%d%% of %d leaking sockets - diffuse leak, no evict",
-			c.d.Cfg.Wave2.PortLeakMinPct, total))
+			c.d.Cfg.Wave2.PortLeakMinPct, total), time.Hour)
 		return true
 	}
 	pod := e.PodByUID()[topUID]

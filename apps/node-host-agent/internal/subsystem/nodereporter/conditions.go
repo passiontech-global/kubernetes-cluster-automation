@@ -417,16 +417,24 @@ func (r *Reporter) latchIndex() map[string]bool {
 // pre-batch behavior the unit tests exercise.
 func (r *Reporter) firstLatchIdx(present map[string]bool,
 	primary string, alts []string) (key, since string, ok bool) {
-
-	for _, k := range append([]string{primary}, alts...) {
+	probe := func(k string) (string, string, bool) {
 		if k == "" {
-			continue
+			return "", "", false
 		}
 		if present != nil && !present[k] {
-			continue
+			return "", "", false
 		}
 		if s, found := r.stateFileSince(k); found {
 			return k, s, true
+		}
+		return "", "", false
+	}
+	if k, s, found := probe(primary); found {
+		return k, s, true
+	}
+	for _, k := range alts {
+		if key, since, found := probe(k); found {
+			return key, since, true
 		}
 	}
 	return "", "", false

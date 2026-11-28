@@ -1086,3 +1086,18 @@ func TestWave5LatchEvents(t *testing.T) {
 		})
 	}
 }
+
+func TestSplitLogLineCRLF(t *testing.T) {
+	line := []byte("2026-11-28T10:00:00Z   ACTION: test-crlf\r")
+	msg, ts := splitLogLine(line)
+	if msg != "ACTION: test-crlf" {
+		t.Fatalf("msg = %q, want %q", msg, "ACTION: test-crlf")
+	}
+	if ts.IsZero() {
+		t.Fatal("expected parsed RFC3339 timestamp")
+	}
+	msg2, ts2 := splitLogLine([]byte("no-ts\r"))
+	if msg2 != "no-ts" || !ts2.IsZero() {
+		t.Fatalf("msg2=%q ts2=%v want %q zero", msg2, ts2, "no-ts")
+	}
+}

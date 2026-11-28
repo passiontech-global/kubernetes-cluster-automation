@@ -77,6 +77,10 @@ func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 	if err := os.WriteFile(staleTmp, []byte("PGD"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	unrelatedTmp := filepath.Join(bdir, "other-tool.tmp")
+	if err := os.WriteFile(unrelatedTmp, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	res := &Result{}
 	var notes []string
 	note := func(s string) { notes = append(notes, s) }
@@ -101,6 +105,9 @@ func TestBackupVerifyCreatesWhenStale(t *testing.T) {
 	}
 	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
 		t.Fatal("stale .tmp partial not swept by pruneDumps")
+	}
+	if _, err := os.Stat(unrelatedTmp); err != nil {
+		t.Fatalf("unrelated .tmp removed by pruneDumps: %v", err)
 	}
 }
 

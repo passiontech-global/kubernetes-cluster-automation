@@ -789,3 +789,20 @@ func TestRunPprofLoopbackServesWithZeroWriteTimeout(t *testing.T) {
 		t.Fatal("Run did not return after context cancel")
 	}
 }
+
+func TestRunRejectsNonLoopbackPprofAddr(t *testing.T) {
+	for _, bad := range []string{":9116", "0.0.0.0:9116", "[::]:9116", "10.0.0.1:9116", "example.com:9116", "127.0.0.1"} {
+		a := New(Config{
+			MetricsAddr: "127.0.0.1:0",
+			ProbeAddr:   "127.0.0.1:0",
+			PprofAddr:   bad,
+		})
+		err := a.Run(context.Background())
+		if err == nil {
+			t.Fatalf("Run(%q) succeeded, want loopback validation error", bad)
+		}
+		if !strings.Contains(err.Error(), "pprof loopback listener") {
+			t.Fatalf("Run(%q) err=%v want pprof loopback listener", bad, err)
+		}
+	}
+}

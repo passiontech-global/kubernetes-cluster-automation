@@ -9,9 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/domain/k0sconfig"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/hostconfig/converge"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/jinja"
 )
 
@@ -119,19 +122,28 @@ func kubeletCfgPathAllowed(p string) bool {
 // process/container spoofing comm=kubelet cannot redirect root writes
 // to arbitrary host files (e.g. /etc/sudoers) or block on a FIFO.
 func (c *cyc) kubeletCfgPath() string {
-	if out, err := c.r.run(c.ctx, "sh", "-c",
-		`for pid in $(pgrep -u 0 -x kubelet 2>/dev/null); do `+
-			`cg="/proc/$pid/cgroup"; `+
-			`if [ -r "$cg" ] && grep -qE '(k0sworker|k0scontroller)\.service' "$cg" && ! grep -q 'kubepods' "$cg"; then `+
-			`tr '\0' '\n' < "/proc/$pid/cmdline" `+
-			`| awk '/^--config=/{sub(/^--config=/,"");print;exit} /^--config$/{getline;print;exit}'; `+
-			`exit 0; fi; done`); err == nil {
-		if p := strings.TrimSpace(out); p != "" {
-			if kubeletCfgPathAllowed(p) {
-				return filepath.Clean(p)
-			}
-			logger().Warn("T7: ignoring kubelet --config outside allowlisted directories", "path", p)
+	var raw string
+	switch c.r.cfg.Runner.(type) {
+	case converge.NsenterRunner, converge.DirectRunner:
+		// In production (hostPID: true), scan /proc directly in-process
+		// instead of forking `sh -c pgrep|grep|tr|awk` every converge.
+		raw = kubeletCfgPathFromProc("/proc")
+	default:
+		if out, err := c.r.run(c.ctx, "sh", "-c",
+			`for pid in $(pgrep -u 0 -x kubelet 2>/dev/null); do `+
+				`cg="/proc/$pid/cgroup"; `+
+				`if [ -r "$cg" ] && grep -qE '(k0sworker|k0scontroller)\.service' "$cg" && ! grep -q 'kubepods' "$cg"; then `+
+				`tr '\0' '\n' < "/proc/$pid/cmdline" `+
+				`| awk '/^--config=/{sub(/^--config=/,"");print;exit} /^--config$/{getline;print;exit}'; `+
+				`exit 0; fi; done`); err == nil {
+			raw = strings.TrimSpace(out)
 		}
+	}
+	if raw != "" {
+		if kubeletCfgPathAllowed(raw) {
+			return filepath.Clean(raw)
+		}
+		logger().Warn("T7: ignoring kubelet --config outside allowlisted directories", "path", raw)
 	}
 	for _, p := range t7KubeletCfgCandidates {
 		if c.r.fileExists(p) {
@@ -139,6 +151,61 @@ func (c *cyc) kubeletCfgPath() string {
 		}
 	}
 	return ""
+}
+
+func kubeletCfgPathFromProc(procRoot string) string {
+	pfs := procfs.New(procRoot)
+	pids, err := pfs.PIDs()
+	if err != nil {
+		return ""
+	}
+	slices.Sort(pids)
+	for _, pid := range pids {
+		st, ok := pfs.Stat(pid)
+		if !ok || !st.HasComm || st.Comm != "kubelet" {
+			continue
+		}
+		if len(st.Fields) > 0 && (st.Fields[0] == "D" || st.Fields[0] == "Z" || st.Fields[0] == "X" || st.Fields[0] == "x") {
+			continue
+		}
+		if !procRealUIDZero(pfs.File(pid, "status")) {
+			continue
+		}
+		cgData, err := os.ReadFile(pfs.File(pid, "cgroup"))
+		if err != nil {
+			continue
+		}
+		cg := string(cgData)
+		if (!strings.Contains(cg, "k0sworker.service") && !strings.Contains(cg, "k0scontroller.service")) ||
+			strings.Contains(cg, "kubepods") {
+			continue
+		}
+		args := pfs.Cmdline(pid)
+		for i, a := range args {
+			if val, ok := strings.CutPrefix(a, "--config="); ok && val != "" {
+				return val
+			}
+			if a == "--config" && i+1 < len(args) && args[i+1] != "" {
+				return args[i+1]
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+func procRealUIDZero(statusPath string) bool {
+	data, err := os.ReadFile(statusPath)
+	if err != nil {
+		return false
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(line, "Uid:"); ok {
+			fields := strings.Fields(rest)
+			return len(fields) > 0 && fields[0] == "0"
+		}
+	}
+	return false
 }
 
 // evictionMinReclaimMap returns the expected evictionMinimumReclaim

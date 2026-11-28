@@ -11,8 +11,8 @@ import (
 // single-producer latches and unknown names return nil.
 func TestSharedOwners(t *testing.T) {
 	got := SharedOwners(LatchPodTeardownWedged)
-	if len(got) != 2 || got[0] != "pod-teardown" || got[1] != "ctr-tasks" {
-		t.Fatalf("SharedOwners(%q)=%v want [pod-teardown ctr-tasks]",
+	if len(got) != 3 || got[0] != "pod-teardown" || got[1] != "ctr-tasks" || got[2] != "mountinfo-hygiene" {
+		t.Fatalf("SharedOwners(%q)=%v want [pod-teardown ctr-tasks mountinfo-hygiene]",
 			LatchPodTeardownWedged, got)
 	}
 	if got := SharedOwners(LatchDiskSlowIO); got != nil {

@@ -29,16 +29,37 @@ import (
 // in a vars dir or binary path would silently rewrite the unit (or
 // fail it: "invalid specifier").
 func systemdEsc(s string) string {
+	s = strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(s)
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	return strings.ReplaceAll(s, "%", "%%")
+}
+
+func validateUnitValue(field, val string) error {
+	if strings.ContainsAny(val, "\r\n\x00") {
+		return fmt.Errorf("hubsync: %s contains invalid control characters", field)
+	}
+	return nil
 }
 
 // node-name is shell-quoted: systemd strips the quotes when splitting
 // ExecStart argv, so a config-derived name with spaces stays one
 // argument instead of smuggling extra flags. % still doubles inside
 // the quotes — specifier expansion precedes unquoting.
-func systemdUnit(t Target, remoteBinary, remoteVarsDir, remoteCertsDir string) string {
+func systemdUnit(t Target, remoteBinary, remoteVarsDir, remoteCertsDir string) (string, error) {
+	for _, chk := range []struct {
+		field string
+		val   string
+	}{
+		{"target.Name", t.Name},
+		{"remoteBinary", remoteBinary},
+		{"remoteVarsDir", remoteVarsDir},
+		{"remoteCertsDir", remoteCertsDir},
+	} {
+		if err := validateUnitValue(chk.field, chk.val); err != nil {
+			return "", err
+		}
+	}
 	name := fsx.ShellQuote(strings.ReplaceAll(t.Name, "%", "%%"))
 	return fmt.Sprintf(`[Unit]
 Description=node-host-agent (standalone host converge agent)
@@ -66,7 +87,7 @@ Environment="GOMEMLIMIT=400MiB"
 [Install]
 WantedBy=multi-user.target
 `, systemdEsc(remoteVarsDir), systemdEsc(remoteCertsDir),
-		systemdEsc(remoteBinary), name)
+		systemdEsc(remoteBinary), name), nil
 }
 
 // unitName derives the systemd unit name from UnitPath.

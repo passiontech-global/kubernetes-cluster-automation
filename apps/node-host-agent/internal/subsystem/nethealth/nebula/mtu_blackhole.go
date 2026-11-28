@@ -250,9 +250,6 @@ func (n *Deps) CheckNebulaMTUBlackhole(ctx context.Context,
 		out, err := dfPing(cachedPeer)
 		if err == nil {
 			n.markAlivePeer(cachedPeer)
-			st.Mu.Lock()
-			st.MTUFails = 0
-			st.Mu.Unlock()
 			reset()
 			return
 		}
@@ -289,9 +286,6 @@ func (n *Deps) CheckNebulaMTUBlackhole(ctx context.Context,
 		recordDFFail(peer, out, err)
 		return
 	}
-	st.Mu.Lock()
-	st.MTUFails = 0
-	st.Mu.Unlock()
 	reset()
 }
 
@@ -409,7 +403,7 @@ func (n *Deps) MaybeClampNebulaMSS(ctx context.Context,
 	wd *watchdogconf.Config, st *MTUProbeState) {
 	st.Mu.Lock()
 	if !st.LastClamp.IsZero() {
-		if elapsed := n.Clock().Now().Sub(st.LastClamp); elapsed >= 0 && elapsed < mtuClampEvery {
+		if elapsed := n.nowTime().Sub(st.LastClamp); elapsed >= 0 && elapsed < mtuClampEvery {
 			st.Mu.Unlock()
 			return
 		}
@@ -433,7 +427,7 @@ func (n *Deps) MaybeClampNebulaMSS(ctx context.Context,
 	// dev's outcome spends the budget.
 	_ = n.clampMSSOn(ctx, "cilium_wg0")
 	st.Mu.Lock()
-	st.LastClamp = n.Clock().Now()
+	st.LastClamp = n.nowTime()
 	st.Mu.Unlock()
 }
 
@@ -543,12 +537,11 @@ func (n *Deps) WriteMTUBHMetric(st *MTUProbeState) {
 		v = "1"
 	}
 	st.Mu.Lock()
-	if st.LastGauge == v {
-		st.Mu.Unlock()
+	last := st.LastGauge
+	st.Mu.Unlock()
+	if last == v {
 		return
 	}
-	st.LastGauge = v
-	st.Mu.Unlock()
 	// NODE_HOST_AGENT_TEXTFILE_DIR (Config.TextfileDir) wins — the
 	// HostRoot derivation only covers configs built without the
 	// hostctx bundle (tests, hand-rolled Configs).
@@ -574,5 +567,12 @@ func (n *Deps) WriteMTUBHMetric(st *MTUProbeState) {
 		[]byte(b.String())); err != nil {
 		logger().Debug("mtu metric: write failed",
 			"dir", dir, "error", err)
+		return
 	}
+	// Commit LastGauge only after promfile.Write succeeds so a
+	// transient write failure retries next cycle instead of
+	// poisoning the cache.
+	st.Mu.Lock()
+	st.LastGauge = v
+	st.Mu.Unlock()
 }

@@ -118,6 +118,7 @@ var ProbeOKRules = []testutil.ExecRule{
 	{Substr: "SHOW POOLS", Out: ShowPoolsOut},
 	{Substr: "logs --since", Out: "all quiet"},
 	{Substr: "MAX(id)", Out: "1000|200|290|1\n"},
+	{Substr: "churn_head", Out: "1000\n"},
 	{Substr: ProbeBatchSubstr, Out: ProbeBatchOKOut},
 	{Substr: "select 1", Out: "1\n"},
 }

@@ -417,6 +417,10 @@ func TestOwnerLatchLegacyFile(t *testing.T) {
 	// Every declared owner has now released → the stale latch
 	// exits on the SAME cycle, not the janitor's 24h reap.
 	s.ExitFrom(name, "ctr-tasks", nil)
+	if !s.Exists(name) {
+		t.Fatal("legacy shared latch cleared while mountinfo-hygiene still declared")
+	}
+	s.ExitFrom(name, "mountinfo-hygiene", nil)
 	if s.Exists(name) {
 		t.Fatal("legacy shared latch kept after all declared owners released")
 	}

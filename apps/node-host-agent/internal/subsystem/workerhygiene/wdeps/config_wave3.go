@@ -3,9 +3,6 @@
 package wdeps
 
 import (
-	"math"
-	"strconv"
-
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/envnames"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 )
@@ -32,25 +29,6 @@ type Wave3Config struct {
 	VMAMaxCeiling       int64
 }
 
-func float64Knob(name string, dst *float64, def float64) envx.Knob {
-	return envx.Knob{
-		Name: name,
-		Resolve: func(k string) {
-			*dst = def
-			if v := envx.String(k, ""); v != "" {
-				// Ratios must be finite and in (0, 1] — a NaN/Inf or a
-				// >1 value would silently disable every pressure guard.
-				if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 &&
-					!math.IsNaN(f) && !math.IsInf(f, 0) && f <= 1.0 {
-					*dst = f
-				} else {
-					envx.Warnf("invalid %s (want finite 0 < f <= 1): %q — using default", k, v)
-				}
-			}
-		},
-	}
-}
-
 func (g *Wave3Config) envKnobs(hostPath func(string) string) []envx.Knob {
 	g.HostDevDir = hostPath("/dev")
 	g.SysBlockDir = hostPath("/sys/block")
@@ -58,13 +36,13 @@ func (g *Wave3Config) envKnobs(hostPath func(string) string) []envx.Knob {
 		envx.BoolKnob(envnames.EnvUDPStaleDestroyEnabled, &g.UDPStaleDestroyEnabled, true),
 		envx.StringKnob(envnames.EnvUDPStalePodCIDRs, &g.UDPStalePodCIDRs, ""),
 		envx.IntKnob(envnames.EnvUDPStaleMaxKills, &g.UDPStaleMaxKills, 16),
-		float64Knob(envnames.EnvMountTableEnterRatio, &g.MountTableEnterRatio, 0.80),
+		envx.Float64RatioKnob(envnames.EnvMountTableEnterRatio, &g.MountTableEnterRatio, 0.80),
 		envx.IntKnob(envnames.EnvMountSharedStormMax, &g.MountSharedStormMax, 4096),
 		envx.Int64Knob(envnames.EnvMountMaxCeiling, &g.MountMaxCeiling, 200000),
 		envx.BoolKnob(envnames.EnvLoopGCEnabled, &g.LoopGCEnabled, true),
-		float64Knob(envnames.EnvCPUCFSThrottleRatio, &g.CPUCFSThrottleRatio, 0.50),
-		float64Knob(envnames.EnvCPUHostIdleMinRatio, &g.CPUHostIdleMinRatio, 0.40),
-		float64Knob(envnames.EnvVMAPressureRatio, &g.VMAPressureRatio, 0.85),
+		envx.Float64RatioKnob(envnames.EnvCPUCFSThrottleRatio, &g.CPUCFSThrottleRatio, 0.50),
+		envx.Float64RatioKnob(envnames.EnvCPUHostIdleMinRatio, &g.CPUHostIdleMinRatio, 0.40),
+		envx.Float64RatioKnob(envnames.EnvVMAPressureRatio, &g.VMAPressureRatio, 0.85),
 		envx.Int64Knob(envnames.EnvVMAMaxCeiling, &g.VMAMaxCeiling, 1048576),
 	}
 }

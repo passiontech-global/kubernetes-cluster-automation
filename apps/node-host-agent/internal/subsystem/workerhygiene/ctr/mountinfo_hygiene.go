@@ -31,7 +31,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
@@ -83,7 +82,7 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	if c.d.Gated(e, wdeps.CheckMountinfo) {
 		return
 	}
-	data, err := c.d.ReadMountinfo(e)
+	entries, lines, err := c.d.MountinfoEntries(e)
 	if err != nil {
 		c.d.State.AppendLog(fmt.Sprintf(
 			"suspect: mountinfo-hygiene read %s failed: %v — scan skipped",
@@ -141,12 +140,11 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	now := c.d.Cfg.Seams.Host.Clock.Now()
 
-	for ln := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(ln)
-		if len(f) < 5 {
+	for _, ent := range entries {
+		if !ent.HasMount {
 			continue
 		}
-		mount := procfs.UnescapeMountPath(f[4]) // field 5 is the mount point
+		mount := ent.Mountpoint // field 5 is the mount point
 		if strings.HasPrefix(mount, hostTaskRoot+"/") &&
 			strings.HasSuffix(mount, "/rootfs") {
 			id := filepath.Base(strings.TrimSuffix(mount, "/rootfs"))
@@ -293,12 +291,12 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		c.d.State.PruneMarkers("mi-vol-seen-", func(id string) bool { return pendingVol[id] })
 	}
 
-	if n := countLines(data); n > mountinfoBloatLines {
-		c.emitBloatEvent(ctx, n)
+	if lines > mountinfoBloatLines {
+		c.emitBloatEvent(ctx, lines)
 	}
-	pressureOK := c.checkMountPressure(ctx, data)
-	loopOK := c.reapOrphanLoops(ctx, e, data, hostPodsDir, podLive, tasksOnce)
-	shimWedgeOK := c.reconcileShimMountWedges(ctx, e, data, hostPodsDir, podLive)
+	pressureOK := c.checkMountPressure(ctx, entries, lines)
+	loopOK := c.reapOrphanLoops(ctx, e, entries, hostPodsDir, podLive, tasksOnce)
+	shimWedgeOK := c.reconcileShimMountWedges(ctx, e, entries, hostPodsDir, podLive)
 	if !pressureOK || !loopOK || !shimWedgeOK || sawTaskStatErr || sawVolScanErr || sawIncompleteTasks {
 		c.d.CycleResult(wdeps.CheckMountinfo, "abort")
 		return
@@ -306,9 +304,8 @@ func (c *MountinfoCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	c.d.CycleResult(wdeps.CheckMountinfo, "ok")
 }
 
-func (c *MountinfoCheck) checkMountPressure(ctx context.Context, data []byte) bool {
-	totalMounts := countLines(data)
-	maxShared, maxGroup, maxMount := maxSharedPeerGroup(data)
+func (c *MountinfoCheck) checkMountPressure(ctx context.Context, entries []wdeps.MountEntry, totalMounts int) bool {
+	maxShared, maxGroup, maxMount := maxSharedPeerGroup(entries)
 
 	enterRatio := c.d.Cfg.Wave3.MountTableEnterRatio
 	sharedMax := c.d.Cfg.Wave3.MountSharedStormMax
@@ -403,30 +400,22 @@ func (c *MountinfoCheck) checkMountPressure(ctx context.Context, data []byte) bo
 	return true
 }
 
-func maxSharedPeerGroup(data []byte) (maxCount int, maxGroup, maxMount string) {
+func maxSharedPeerGroup(entries []wdeps.MountEntry) (maxCount int, maxGroup, maxMount string) {
 	counts := map[string]int{}
 	repMount := map[string]string{}
-	for ln := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(ln)
-		if len(f) < 7 {
+	for _, ent := range entries {
+		if !ent.HasMount || len(ent.SharedGroups) == 0 {
 			continue
 		}
-		mount := procfs.UnescapeMountPath(f[4])
-		for _, opt := range f[6:] {
-			if opt == "-" {
-				break
+		for _, grp := range ent.SharedGroups {
+			counts[grp]++
+			if _, ok := repMount[grp]; !ok {
+				repMount[grp] = ent.Mountpoint
 			}
-			if strings.HasPrefix(opt, "shared:") {
-				grp := strings.TrimPrefix(opt, "shared:")
-				counts[grp]++
-				if _, ok := repMount[grp]; !ok {
-					repMount[grp] = mount
-				}
-				if counts[grp] > maxCount {
-					maxCount = counts[grp]
-					maxGroup = grp
-					maxMount = repMount[grp]
-				}
+			if counts[grp] > maxCount {
+				maxCount = counts[grp]
+				maxGroup = grp
+				maxMount = repMount[grp]
 			}
 		}
 	}
@@ -456,17 +445,6 @@ func taskDirStatus(root, id string) (listed, ok bool) {
 func taskDirListed(root, id string) bool {
 	listed, _ := taskDirStatus(root, id)
 	return listed
-}
-
-// countLines counts non-empty mountinfo lines.
-func countLines(data []byte) int {
-	n := 0
-	for ln := range strings.SplitSeq(string(data), "\n") {
-		if strings.TrimSpace(ln) != "" {
-			n++
-		}
-	}
-	return n
 }
 
 // umountOrphan lazily unmounts one orphan mountpoint inside the HOST

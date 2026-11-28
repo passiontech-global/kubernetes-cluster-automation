@@ -160,6 +160,23 @@ type CycleEnv struct {
 	walkSpent int
 
 	podByUID map[string]*corev1.Pod
+
+	mountEntries []MountEntry
+	mountLines   int
+	mountParsed  bool
+}
+
+// MountEntry is one pre-parsed line from /proc/1/mountinfo shared across
+// mountinfo-hygiene, loop_hygiene, shim_mount_wedge, disk_bloat,
+// orphan_pod_volumes, and network_mount_hung within one cycle.
+type MountEntry struct {
+	HasMount     bool
+	Mountpoint   string
+	SharedGroups []string
+	HasSep       bool
+	FSType       string
+	Source       string
+	SuperOpts    string
 }
 
 // PodByUID returns a lazy-cached map from pod UID string to *corev1.Pod

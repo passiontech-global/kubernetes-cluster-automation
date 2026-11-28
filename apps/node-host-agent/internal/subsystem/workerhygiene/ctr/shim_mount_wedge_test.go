@@ -336,6 +336,23 @@ func TestShimMountWedgeScenarios(t *testing.T) {
 			t.Fatal("shared latch stayed after all holders released")
 		}
 	})
+
+	t.Run("post_restart_teardown_and_ctr_tasks_clear_preserves_mountinfo_hold", func(t *testing.T) {
+		e := fixture(t)
+		// Simulate post-restart: latch exists on disk from prior run,
+		// no RAM holders entered yet; pod-teardown & ctr-tasks pass.
+		wdepstest.WriteFile(t, filepath.Join(e.StateDir, "state-"+latchdefs.LatchPodTeardownWedged), "1\n")
+		e.H.State.ExitFrom(latchdefs.LatchPodTeardownWedged, wdeps.CheckTeardown, nil)
+		e.H.State.ExitFrom(latchdefs.LatchPodTeardownWedged, wdeps.CheckCtrTasks, nil)
+		if !e.H.State.Exists(latchdefs.LatchPodTeardownWedged) {
+			t.Fatal("shared latch cleared prematurely before mountinfo-hygiene reported")
+		}
+		// Once mountinfo-hygiene also reports healthy, the latch clears.
+		e.H.State.ExitFrom(latchdefs.LatchPodTeardownWedged, wdeps.CheckMountinfo, nil)
+		if e.H.State.Exists(latchdefs.LatchPodTeardownWedged) {
+			t.Fatal("shared latch stayed after mountinfo-hygiene also released")
+		}
+	})
 }
 
 func TestShimMountWedgePID1Skipped(t *testing.T) {

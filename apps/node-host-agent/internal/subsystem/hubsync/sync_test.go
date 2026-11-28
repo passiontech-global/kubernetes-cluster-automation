@@ -162,8 +162,11 @@ func TestSyncTargetBinaryUpToDate(t *testing.T) {
 	// Pre-seed: binary + unit already converged.
 	c := newFakeConn()
 	c.seedFile("/usr/local/bin/node-host-agent", local)
-	c.seedFile("/etc/systemd/system/node-host-agent.service",
-		[]byte(systemdUnit(tg, s.cfg.RemoteBinary, s.cfg.RemoteVarsDir, s.cfg.RemoteCertsDir)))
+	unitBytes, err := systemdUnit(tg, s.cfg.RemoteBinary, s.cfg.RemoteVarsDir, s.cfg.RemoteCertsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.seedFile("/etc/systemd/system/node-host-agent.service", []byte(unitBytes))
 	dialer.conns[tg.IP] = c
 
 	if err := s.syncTarget(context.Background(), tg, nil, nil, ""); err != nil {
@@ -901,9 +904,12 @@ func TestSplitUserHostPort(t *testing.T) {
 // ExecStart and the env wiring the DaemonSet env block provides
 // in-cluster.
 func TestSystemdUnitContent(t *testing.T) {
-	u := systemdUnit(Target{Name: "db-vm"},
+	u, err := systemdUnit(Target{Name: "db-vm"},
 		"/usr/local/bin/node-host-agent",
 		"/etc/node-host-agent/vars", "/etc/node-host-agent/nebula-certs")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{
 		`ExecStart="/usr/local/bin/node-host-agent" --standalone --node-name='db-vm' --health-probe-bind-address=127.0.0.1:9117`,
 		`Environment="NODE_HOST_AGENT_HOST_ROOT=/"`,
@@ -920,6 +926,28 @@ func TestSystemdUnitContent(t *testing.T) {
 		if !strings.Contains(u, want) {
 			t.Fatalf("unit missing %q:\n%s", want, u)
 		}
+	}
+}
+
+func TestSystemdUnitRejectsNewlines(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tg   Target
+		bin  string
+		vars string
+		cert string
+	}{
+		{"name-lf", Target{Name: "db\nExecStart=/bin/sh"}, "/bin/a", "/v", "/c"},
+		{"name-cr", Target{Name: "db\rfoo"}, "/bin/a", "/v", "/c"},
+		{"bin-lf", Target{Name: "db"}, "/bin/a\nExecStartPost=/bin/sh", "/v", "/c"},
+		{"vars-cr", Target{Name: "db"}, "/bin/a", "/v\r\nEnvironment=X=1", "/c"},
+		{"certs-lf", Target{Name: "db"}, "/bin/a", "/v", "/c\nUser=nobody"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := systemdUnit(tc.tg, tc.bin, tc.vars, tc.cert); err == nil {
+				t.Fatalf("expected error for control characters in %s", tc.name)
+			}
+		})
 	}
 }
 

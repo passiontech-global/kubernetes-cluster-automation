@@ -16,11 +16,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // KubeconfigCertMinDays is the kubeconfig-cert-expiry warn window (plan: <14d).
@@ -48,12 +50,20 @@ func (c *KubeCertCheck) kubeconfigCertPaths() []string {
 	}
 }
 
+type cachedKubeCerts struct {
+	statKey  string
+	extStats map[string]string
+	certs    []*x509.Certificate
+}
+
 // KubeCertCheck is the kubeconfig-cert-expiry embedded kubeconfig client-cert
 // expiry check as a Check — stateless (the warn window needs no
 // streak bookkeeping). Like kineStorageCheck it rides cpFreezeCheck's
 // ungated slot rather than holding its own dispatch-table entry.
 type KubeCertCheck struct {
-	d *cdeps.Deps
+	d       *cdeps.Deps
+	kcMu    sync.Mutex
+	kcCache map[string]cachedKubeCerts
 }
 
 // Name returns the check label / log context.
@@ -71,7 +81,7 @@ func (c *KubeCertCheck) Run(_ context.Context) {
 	minDays := math.Inf(1)
 	seen := 0
 	for _, path := range c.kubeconfigCertPaths() {
-		certs, err := kubeconfigClientCerts(path)
+		certs, err := c.kubeconfigClientCertsCached(path)
 		if err != nil {
 			continue
 		}
@@ -112,24 +122,68 @@ func (c *KubeCertCheck) Run(_ context.Context) {
 	c.d.WriteTextfileProm("node-agent-kubeconfig-cert.prom", p.String())
 }
 
-// kubeconfigClientCerts extracts every embedded client certificate
-// from a kubeconfig: client-certificate-data fields (base64 PEM,
-// clientcmd-decoded) plus file-referenced client-certificate paths
-// resolved relative to the kubeconfig dir (loadCreds parity).
-// Unparseable files/certs are skipped, never fatal.
-func kubeconfigClientCerts(path string) ([]*x509.Certificate, error) {
-	kc, err := clientcmd.LoadFromFile(path)
+func (c *KubeCertCheck) kubeconfigClientCertsCached(path string) ([]*x509.Certificate, error) {
+	key, err := fsx.FileStatKey(path)
 	if err != nil {
 		return nil, err
 	}
+	c.kcMu.Lock()
+	ent, ok := c.kcCache[path]
+	c.kcMu.Unlock()
+	if ok && ent.statKey == key {
+		extMatch := true
+		for extPath, extKey := range ent.extStats {
+			k, kerr := fsx.FileStatKey(extPath)
+			if kerr != nil || k != extKey {
+				extMatch = false
+				break
+			}
+		}
+		if extMatch {
+			return ent.certs, nil
+		}
+	}
+
+	certs, extStats, err := kubeconfigClientCertsWithStats(path)
+	if err != nil {
+		return nil, err
+	}
+	c.kcMu.Lock()
+	if c.kcCache == nil {
+		c.kcCache = make(map[string]cachedKubeCerts)
+	}
+	c.kcCache[path] = cachedKubeCerts{statKey: key, extStats: extStats, certs: certs}
+	c.kcMu.Unlock()
+	return certs, nil
+}
+
+// kubeconfigClientCertsWithStats extracts every embedded client certificate
+// from a kubeconfig: client-certificate-data fields (base64 PEM,
+// clientcmd-decoded) plus file-referenced client-certificate paths
+// resolved relative to the kubeconfig dir (loadCreds parity), and
+// returns stat keys for any external cert files referenced.
+// Unparseable files/certs are skipped, never fatal.
+func kubeconfigClientCertsWithStats(path string) ([]*x509.Certificate, map[string]string, error) {
+	kc, err := clientcmd.LoadFromFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
 	var certs []*x509.Certificate
+	var extStats map[string]string
 	for _, a := range kc.AuthInfos {
 		var pemBytes []byte
 		switch {
 		case len(a.ClientCertificateData) > 0:
 			pemBytes = a.ClientCertificateData
 		case a.ClientCertificate != "":
-			b, rerr := os.ReadFile(cdeps.ResolveRel(path, a.ClientCertificate))
+			extPath := cdeps.ResolveRel(path, a.ClientCertificate)
+			if k, kerr := fsx.FileStatKey(extPath); kerr == nil {
+				if extStats == nil {
+					extStats = make(map[string]string)
+				}
+				extStats[extPath] = k
+			}
+			b, rerr := os.ReadFile(extPath)
 			if rerr != nil {
 				continue
 			}
@@ -151,5 +205,5 @@ func kubeconfigClientCerts(path string) ([]*x509.Certificate, error) {
 			}
 		}
 	}
-	return certs, nil
+	return certs, extStats, nil
 }

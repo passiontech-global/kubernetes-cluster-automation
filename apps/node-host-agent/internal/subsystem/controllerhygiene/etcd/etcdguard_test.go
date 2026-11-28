@@ -1132,6 +1132,10 @@ func TestEtcdGuardSnapshotHardeningDir0700AndAtomicTmp(t *testing.T) {
 	if err := os.WriteFile(staleTmp, []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	unrelatedTmp := filepath.Join(bdir, "other-tool.tmp")
+	if err := os.WriteFile(unrelatedTmp, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	g := &etcdGuardFake{
 		status: etcdStatusJSON(cdeps.DefaultEtcdDBSizeLimit+1, 1<<30),
@@ -1178,6 +1182,9 @@ func TestEtcdGuardSnapshotHardeningDir0700AndAtomicTmp(t *testing.T) {
 	}
 	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
 		t.Fatal("stale *.tmp not swept by prunePremaint")
+	}
+	if _, err := os.Stat(unrelatedTmp); err != nil {
+		t.Fatalf("unrelated *.tmp removed by prunePremaint: %v", err)
 	}
 	published := strings.TrimSuffix(saveTarget, ".tmp")
 	if fi, err := os.Stat(published); err != nil || fi.Mode().Perm() != 0o600 {

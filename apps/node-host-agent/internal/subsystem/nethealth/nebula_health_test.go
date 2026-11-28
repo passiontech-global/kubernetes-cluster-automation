@@ -742,7 +742,7 @@ func TestNebulaCoordHoldsEmergencyHealAndStampsRemediation(t *testing.T) {
 	if e.host.Ran("conntrack -D") {
 		t.Fatalf("flushed conntrack under nodecoord hold: %v", e.host.Cmds())
 	}
-	for _, budget := range []string{"last-nebula-restart", "last-ntp-restart", "last-conntrack-flush"} {
+	for _, budget := range []string{"last-nebula-restart", "last-ntp-restart", "last-conntrack-dns-flush"} {
 		if _, err := os.Stat(filepath.Join(e.state, budget)); err == nil {
 			t.Fatalf("cooldown budget %s spent while held", budget)
 		}

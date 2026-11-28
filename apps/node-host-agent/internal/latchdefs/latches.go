@@ -265,10 +265,12 @@ type LatchDef struct {
 var LatchDefs = []LatchDef{
 	// workerhygiene — pod-teardown-wedged is the shared latch:
 	// pods.PodTeardownCheck holds it for stuck Terminating pods,
-	// ctr.CtrTasksCheck for unkillable D/Z orphan shims. The
-	// ids match wdeps.CheckTeardown/wdeps.CheckCtrTasks.
+	// ctr.CtrTasksCheck for unkillable D/Z orphan shims, and
+	// ctr.MountinfoCheck (shim_mount_wedge) for EBUSY shim-pinned
+	// pod mounts. The ids match wdeps.CheckTeardown/wdeps.CheckCtrTasks/
+	// wdeps.CheckMountinfo.
 	{Name: LatchPodTeardownWedged, Owner: "workerhygiene",
-		Owners: []string{"pod-teardown", "ctr-tasks"}},
+		Owners: []string{"pod-teardown", "ctr-tasks", "mountinfo-hygiene"}},
 	{Name: LatchKonnectivityIPMismatch, Owner: "workerhygiene"},
 	{Name: LatchDNSResolvStale, Owner: "workerhygiene"},
 	{Name: LatchKubeletRuntimeStall, Owner: "workerhygiene"},

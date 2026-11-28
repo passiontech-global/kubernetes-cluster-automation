@@ -62,6 +62,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/hostctx"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/systemd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 var version = "dev"
@@ -296,6 +297,13 @@ func main() {
 	}
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	if pprofAddr != "" {
+		if err := httpx.ValidateLoopbackAddr(pprofAddr); err != nil {
+			logger().Error("invalid pprof-bind-address", "addr", pprofAddr, "error", err)
+			os.Exit(1)
+		}
+	}
 
 	ctx, stop := signalContext()
 	defer stop()

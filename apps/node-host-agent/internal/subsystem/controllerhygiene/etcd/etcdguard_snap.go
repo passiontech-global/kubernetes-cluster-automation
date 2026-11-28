@@ -200,13 +200,13 @@ func (c *GuardCheck) savePreMaintSnapshot(ctx context.Context) bool {
 	return true
 }
 
-// prunePremaint deletes stale *.tmp partials and all but the newest
-// etcdPremaintKeep premaint-*.db snapshots under dir — oldest first
+// prunePremaint deletes stale premaint-*.db.tmp partials and all but the
+// newest etcdPremaintKeep premaint-*.db snapshots under dir — oldest first
 // by name — and returns how many were removed. Best-effort: an
 // unremovable file is skipped, never fatal to the guard.
 func prunePremaint(dir string) int {
 	removed := 0
-	if tmps, err := filepath.Glob(filepath.Join(dir, "*.tmp")); err == nil {
+	if tmps, err := filepath.Glob(filepath.Join(dir, "premaint-*.db.tmp")); err == nil {
 		for _, f := range tmps {
 			if err := os.Remove(f); err == nil {
 				removed++

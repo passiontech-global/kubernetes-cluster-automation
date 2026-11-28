@@ -144,17 +144,19 @@ func Bind(hostRoot string) (int, error) {
 // runtime destroy the thread instead of reusing it (the safe setns
 // pattern). The goroutine's defers still run (the ns fds close).
 func BindInNetns(nsPath string) (int, error) {
+	runtime.LockOSThread()
 	self, err := unix.Open(threadSelfNetns(), unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
+		runtime.UnlockOSThread()
 		return -1, fmt.Errorf("self netns: %w", err)
 	}
 	defer func() { _ = unix.Close(self) }()
 	host, err := unix.Open(nsPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
+		runtime.UnlockOSThread()
 		return -1, fmt.Errorf("host netns %s: %w", nsPath, err)
 	}
 	defer func() { _ = unix.Close(host) }()
-	runtime.LockOSThread()
 	if err := unix.Setns(host, unix.CLONE_NEWNET); err != nil {
 		runtime.UnlockOSThread()
 		return -1, fmt.Errorf("%w: setns %s: %v", ErrSetns, nsPath, err)

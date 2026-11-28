@@ -207,7 +207,10 @@ func (s *Syncer) syncTarget(ctx context.Context, t Target, token, ca []byte, loc
 	// fresh-install path; `restart` is required when the binary was
 	// just updated or an EXISTING unit file drifted (enable --now
 	// leaves a running service on the old unit).
-	unit := systemdUnit(t, cfg.RemoteBinary, cfg.RemoteVarsDir, cfg.RemoteCertsDir)
+	unit, err := systemdUnit(t, cfg.RemoteBinary, cfg.RemoteVarsDir, cfg.RemoteCertsDir)
+	if err != nil {
+		return err
+	}
 	freshUnit := remoteUnitSum == ""
 	unitSum := sha256.Sum256([]byte(unit))
 	unitChanged := remoteUnitSum != hex.EncodeToString(unitSum[:])

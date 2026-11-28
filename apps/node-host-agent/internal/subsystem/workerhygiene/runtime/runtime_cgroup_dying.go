@@ -122,9 +122,9 @@ func (c *CgroupDyingCheck) Run(_ context.Context, e *wdeps.CycleEnv) {
 	c.d.State.Enter(latchdefs.LatchCgroupDyingLeak,
 		fmt.Sprintf("nr_dying_descendants=%d", dying))
 	if !c.d.State.RateTrySpend("last-cgroup-drop-caches", cgroupReclaimInterval) {
-		c.d.State.AppendLog(fmt.Sprintf(
+		c.d.State.SuspectLog(wdeps.CheckCgroupDying+"-cooldown", fmt.Sprintf(
 			"suspect: cgroup-dying-leak nr_dying_descendants=%d - reclaim cooldown (<30m), skip",
-			dying))
+			dying), cgroupReclaimInterval)
 		c.d.CycleResult(wdeps.CheckCgroupDying, "ok")
 		return
 	}

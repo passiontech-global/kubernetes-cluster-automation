@@ -56,9 +56,13 @@ func (p *Probe) probeTopChurn(ctx context.Context, pg, user, pass string,
 		// First sighting (or backward clock jump >60s) — seed the
 		// watermark only. A missing watermark treated as head=0 would
 		// group-by the WHOLE table (the COUNT(*) the probe budget forbids).
+		head, herr := p.resHead(ctx, pg, user, pass)
+		if herr != nil {
+			note(fmt.Sprintf("churn-head-query-fail: %v", herr))
+			return
+		}
 		kdeps.WriteIntFile(filepath.Join(dir, churnFileTS), now)
-		kdeps.WriteIntFile(filepath.Join(dir, churnFileHead),
-			p.resHead(ctx, pg, user, pass))
+		kdeps.WriteIntFile(filepath.Join(dir, churnFileHead), head)
 		return
 	}
 	if delta < int64(defaultChurnWindow.Seconds()) {
@@ -89,8 +93,15 @@ func (p *Probe) probeTopChurn(ctx context.Context, pg, user, pass string,
 	p.d.ChurnMu.Unlock()
 	p.probeTopHotkeys(ctx, pg, user, pass, prevHead, note)
 	// Advance the watermark — a churn-free window still moves it
-	// so the next window measures fresh ground.
-	kdeps.WriteIntFile(filepath.Join(dir, churnFileHead), p.resHead(ctx, pg, user, pass))
+	// so the next window measures fresh ground. On a failed MAX(id)
+	// query, keep the existing watermark instead of overwriting it
+	// with 0 (which would turn the next window into a full-table scan).
+	head, herr := p.resHead(ctx, pg, user, pass)
+	if herr != nil {
+		note(fmt.Sprintf("churn-head-query-fail: %v", herr))
+		return
+	}
+	kdeps.WriteIntFile(filepath.Join(dir, churnFileHead), head)
 	kdeps.WriteIntFile(filepath.Join(dir, churnFileTS), now)
 }
 
@@ -143,15 +154,18 @@ func (p *Probe) probeTopHotkeys(ctx context.Context, pg, user, pass string,
 	p.d.ChurnMu.Unlock()
 }
 
-// resHead re-reads MAX(id) for the watermark advance — best-effort:
-// a failed read writes 0, which makes the next window count "id>0"
-// and safely degrade to a full-table count once.
-func (p *Probe) resHead(ctx context.Context, pg, user, pass string) int64 {
+// resHead re-reads MAX(id) for the watermark advance. Callers must
+// preserve the previous watermark on error instead of advancing to 0
+// (which would force a WHERE id > 0 full-table scan on the next window).
+func (p *Probe) resHead(ctx context.Context, pg, user, pass string) (int64, error) {
 	out, err := p.d.PsqlQuery(ctx, pg, user, pass, kdeps.AppNameProbe, fmt.Sprintf(
-		"SELECT COALESCE((SELECT MAX(id) FROM %s),0)", kdeps.SQLIdent(p.d.Cfg.Table)))
+		"SELECT COALESCE((SELECT MAX(id) FROM %s),0) AS churn_head", kdeps.SQLIdent(p.d.Cfg.Table)))
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	v, _ := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
-	return v
+	v, err := strconv.ParseInt(kdeps.FirstLine(out), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
 }

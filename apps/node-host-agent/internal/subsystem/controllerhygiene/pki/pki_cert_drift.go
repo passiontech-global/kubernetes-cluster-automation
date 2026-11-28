@@ -23,11 +23,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/pagecache"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/promfile"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/controllerhygiene/cdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 // SAPubMetric/SAPubPromFile — the sa-pub-key-fingerprint ServiceAccount signer-key
@@ -65,11 +67,18 @@ func (c *DriftCheck) emitSAPubFingerprint() {
 	c.d.WriteTextfileProm(SAPubPromFile, p.String())
 }
 
+type cachedLeafCert struct {
+	statKey string
+	cert    *x509.Certificate
+}
+
 // DriftCheck is the pki-cert-drift PKI reload drift detector as a
 // Check — stateless: per-pair streaks live in the
 // consecutive-cp-cert-stale-<i> counters.
 type DriftCheck struct {
-	d *cdeps.Deps
+	d         *cdeps.Deps
+	certMu    sync.Mutex
+	certCache map[string]cachedLeafCert
 }
 
 // Name returns the check label / log context.
@@ -88,7 +97,7 @@ func (c *DriftCheck) Run(ctx context.Context) {
 	anyDrift := false
 	for i, pair := range c.d.Cfg.PKIDrift.Pairs {
 		ctr := cdeps.FileCtrPKIDriftPre + strconv.Itoa(i)
-		disk, err := readLeafCert(pair.CertFile)
+		disk, err := c.readLeafCertCached(pair.CertFile)
 		if err != nil {
 			// Cert absent — not a controller / pair not deployed on
 			// this host. Reset rather than carry a stale count.
@@ -162,6 +171,31 @@ func CertNewerThan(disk, sock *x509.Certificate) bool {
 		return true
 	}
 	return false
+}
+
+func (c *DriftCheck) readLeafCertCached(path string) (*x509.Certificate, error) {
+	key, err := fsx.FileStatKey(path)
+	if err != nil {
+		return nil, err
+	}
+	c.certMu.Lock()
+	if ent, ok := c.certCache[path]; ok && ent.statKey == key {
+		c.certMu.Unlock()
+		return ent.cert, nil
+	}
+	c.certMu.Unlock()
+
+	crt, err := readLeafCert(path)
+	if err != nil {
+		return nil, err
+	}
+	c.certMu.Lock()
+	if c.certCache == nil {
+		c.certCache = make(map[string]cachedLeafCert)
+	}
+	c.certCache[path] = cachedLeafCert{statKey: key, cert: crt}
+	c.certMu.Unlock()
+	return crt, nil
 }
 
 // readLeafCert parses the leaf certificate of a file: the first PEM

@@ -47,7 +47,7 @@ func statStartTime(st procfs.Stat) string {
 	return ""
 }
 
-func extractDeadPodMounts(mountinfoData []byte, hostPodsDir string, podLive map[string]bool) []deadPodMount {
+func extractDeadPodMountsEntries(entries []wdeps.MountEntry, hostPodsDir string, podLive map[string]bool) []deadPodMount {
 	cleanPodsDir := filepath.Clean(hostPodsDir)
 	if cleanPodsDir == "" || cleanPodsDir == "." || cleanPodsDir == "/" {
 		return nil
@@ -55,12 +55,11 @@ func extractDeadPodMounts(mountinfoData []byte, hostPodsDir string, podLive map[
 	prefix := cleanPodsDir + "/"
 	seen := map[string]bool{}
 	var out []deadPodMount
-	for ln := range strings.SplitSeq(string(mountinfoData), "\n") {
-		f := strings.Fields(ln)
-		if len(f) < 5 {
+	for _, ent := range entries {
+		if !ent.HasMount {
 			continue
 		}
-		mount := filepath.Clean(procfs.UnescapeMountPath(f[4]))
+		mount := filepath.Clean(ent.Mountpoint)
 		rel, ok := strings.CutPrefix(mount, prefix)
 		if !ok {
 			continue
@@ -94,7 +93,7 @@ func matchDeadPodMount(target string, deadMounts []deadPodMount) (deadPodMount, 
 func (c *MountinfoCheck) reconcileShimMountWedges(
 	ctx context.Context,
 	e *wdeps.CycleEnv,
-	mountinfoData []byte,
+	entries []wdeps.MountEntry,
 	hostPodsDir string,
 	podLive map[string]bool,
 ) bool {
@@ -104,7 +103,7 @@ func (c *MountinfoCheck) reconcileShimMountWedges(
 		return true
 	}
 
-	deadMounts := extractDeadPodMounts(mountinfoData, hostPodsDir, podLive)
+	deadMounts := extractDeadPodMountsEntries(entries, hostPodsDir, podLive)
 	if len(deadMounts) == 0 {
 		c.shimWedgeStreak = 0
 		c.d.State.ExitFrom(latchdefs.LatchPodTeardownWedged, wdeps.CheckMountinfo, nil)

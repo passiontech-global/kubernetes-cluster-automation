@@ -362,9 +362,10 @@ func (c *CgroupThrottleCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 				if sustained {
 					c.d.PodCgroupMemoryThrottled++
 					uid := podUIDFromSlice(dir)
-					c.d.State.AppendLog(fmt.Sprintf(
+					c.d.State.SuspectLog("cgroup-mem-"+strings.ReplaceAll(uid, "/", "_"), fmt.Sprintf(
 						"suspect: cgroup-pod-throttle pod uid=%s memory.pressure some_avg10=%.1f some_avg60=%.1f full_avg60=%.1f high_delta=+%d max_delta=+%d streak=%d — memory.high throttle stall without node PSI pressure (cgroup-pod-throttle)",
-						uid, psi.SomeAvg10, psi.SomeAvg60, psi.FullAvg60, highDelta, maxDelta, c.memStreak[dir]))
+						uid, psi.SomeAvg10, psi.SomeAvg60, psi.FullAvg60, highDelta, maxDelta, c.memStreak[dir]),
+						cgroupSuspectLogCadence)
 					if !c.evented[dir] && c.throttledEvent(ctx, e, uid,
 						psi, highDelta, maxDelta, podByUID[uid]) {
 						c.evented[dir] = true

@@ -147,6 +147,7 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 	}
 	d.State.RegisterActiveOwner(wdeps.CheckTeardown)
 	d.State.RegisterActiveOwner(wdeps.CheckCtrTasks)
+	d.State.RegisterActiveOwner(wdeps.CheckMountinfo)
 	// Streak contract lives in journalwatch.NewUnreadableTrackerForOwner:
 	// each hygiene persists its OWN consecutive-journal-unreadable-<owner>
 	// streak file and holds the shared state-journal-unreadable latch

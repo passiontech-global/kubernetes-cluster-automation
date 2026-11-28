@@ -402,6 +402,10 @@ func caPool(path string) (*x509.CertPool, error) {
 	if err != nil {
 		return nil, err
 	}
+	return caPoolFromPEM(path, pem)
+}
+
+func caPoolFromPEM(path string, pem []byte) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pem) {
 		return nil, fmt.Errorf("no certificates in %s", path)
@@ -416,12 +420,15 @@ func caClient(caFile string) (*http.Client, string, error) {
 	tlsCfg := &tls.Config{}
 	key := caFile
 	if caFile != "" {
-		pool, err := caPool(caFile)
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, "", fmt.Errorf("load CA %s: %w", caFile, err)
+		}
+		pool, err := caPoolFromPEM(caFile, pem)
 		if err != nil {
 			return nil, "", fmt.Errorf("load CA %s: %w", caFile, err)
 		}
 		tlsCfg.RootCAs = pool
-		pem, _ := os.ReadFile(caFile) // caPool already read it OK
 		sum := sha256.Sum256(pem)
 		key = caFile + "@" + hex.EncodeToString(sum[:])
 	}

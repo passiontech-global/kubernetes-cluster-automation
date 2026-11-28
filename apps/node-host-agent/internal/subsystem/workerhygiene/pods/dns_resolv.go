@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -257,14 +258,18 @@ func (c *DNSResolvCheck) emitLoopbackSuspectEvent(ctx context.Context, p *corev1
 	}
 }
 
+const (
+	dnsSuspectLogCadence = time.Hour
+)
+
 // suspectLoopback surfaces the one genuine loopback case — both sides
 // on the systemd-resolved stub — once per pod. It never kills: a stub
 // without an external upstream is not usable drift evidence.
 func (c *DNSResolvCheck) suspectLoopback(ctx context.Context, p *corev1.Pod,
 	uid string, podNS, hostNS []string) {
-	c.d.State.AppendLog(fmt.Sprintf(
+	c.d.State.SuspectLog("dns-resolv-loopback-"+uid, fmt.Sprintf(
 		"suspect: dns-resolv loopback nameserver on both host and DNS pod %s (pod_ns=%v host_ns=%v)",
-		p.Name, podNS, hostNS))
+		p.Name, podNS, hostNS), dnsSuspectLogCadence)
 	c.emitLoopbackSuspectEvent(ctx, p, uid, fmt.Sprintf(
 		"DNS pod %s and host /etc/resolv.conf both contain the systemd-resolved stub (%s) — plugin/loop risk",
 		p.Name, systemdStubNS))
@@ -280,9 +285,9 @@ func (c *DNSResolvCheck) suspectLoopback(ctx context.Context, p *corev1.Pod,
 // stopped by the !hostHasExternal rail above.
 func (c *DNSResolvCheck) suspectPodStubOnly(ctx context.Context, p *corev1.Pod,
 	uid string, podNS, hostNS []string) {
-	c.d.State.AppendLog(fmt.Sprintf(
+	c.d.State.SuspectLog("dns-resolv-pod-stub-"+uid, fmt.Sprintf(
 		"suspect: dns-resolv systemd stub in DNS pod %s but not on host (pod_ns=%v host_ns=%v)",
-		p.Name, podNS, hostNS))
+		p.Name, podNS, hostNS), dnsSuspectLogCadence)
 	c.emitLoopbackSuspectEvent(ctx, p, uid, fmt.Sprintf(
 		"DNS pod %s still contains the systemd-resolved stub (%s) while host /etc/resolv.conf uses a local stub with external upstreams — plugin/loop risk",
 		p.Name, systemdStubNS))

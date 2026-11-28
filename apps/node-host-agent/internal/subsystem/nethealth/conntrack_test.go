@@ -621,3 +621,25 @@ func TestFlushUnrepliedUDPConntrackBestEffort(t *testing.T) {
 		t.Fatalf("missing flush-skip log:\n%s", logLines(t, e))
 	}
 }
+
+func TestConntrackDNSFlushBudgetIndependentFromAllUDP(t *testing.T) {
+	e := fixture(t, nil)
+	ctx := context.Background()
+	// Spend the general all-UDP flush budget first.
+	e.n.flushStaleUDPConntrackAll(ctx, checkCT)
+	if !ranExactCmd(e, "conntrack -D -p udp") {
+		t.Fatalf("flush-all did not run: %v", e.host.Cmds())
+	}
+	// Surgical DNS --dport 53 flush must NOT be blocked by last-conntrack-flush.
+	e.host.ClearLog()
+	e.n.flushStaleUDPConntrack(ctx, checkDNSFB)
+	if !ranExactCmd(e, "conntrack -D -p udp --dport 53") {
+		t.Fatalf("DNS flush blocked by general flush budget, cmds=%v", e.host.Cmds())
+	}
+	// Second DNS flush within cooldown IS blocked by last-conntrack-dns-flush.
+	e.host.ClearLog()
+	e.n.flushStaleUDPConntrack(ctx, checkDNSFB)
+	if ranExactCmd(e, "conntrack -D -p udp --dport 53") {
+		t.Fatal("DNS flush refired inside its own cooldown")
+	}
+}

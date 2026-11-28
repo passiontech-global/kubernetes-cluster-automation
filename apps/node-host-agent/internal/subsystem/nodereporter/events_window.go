@@ -255,13 +255,13 @@ func readTailBytes(path string, offset, max int64) []byte {
 // pluginConfig parity): returns the message and the parsed RFC3339
 // timestamp (zero when absent/unparseable).
 func splitLogLine(line []byte) (msg string, ts time.Time) {
-	s := string(bytes.TrimRight(line, "\r"))
-	i := bytes.IndexByte(line, ' ')
+	trimmed := bytes.TrimRight(line, "\r")
+	i := bytes.IndexByte(trimmed, ' ')
 	if i < 0 {
-		return s, time.Time{}
+		return string(trimmed), time.Time{}
 	}
-	msg = string(bytes.TrimLeft(line[i+1:], " "))
-	if t, err := time.Parse(time.RFC3339, s[:i]); err == nil {
+	msg = string(bytes.TrimLeft(trimmed[i+1:], " "))
+	if t, err := time.Parse(time.RFC3339, string(trimmed[:i])); err == nil {
 		ts = t
 	}
 	return msg, ts

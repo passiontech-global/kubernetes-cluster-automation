@@ -121,8 +121,13 @@ func proxyAgentHost(d *wdeps.Deps, pid int, argv []string) string {
 }
 
 func proxyAgentHostChecked(d *wdeps.Deps, pid int, argv []string) (string, bool) {
+	st, ok := d.Proc.Stat(pid)
+	return proxyAgentHostWithStat(d, pid, argv, st, ok)
+}
+
+func proxyAgentHostWithStat(d *wdeps.Deps, pid int, argv []string, st procfs.Stat, stOK bool) (string, bool) {
 	canReadEnv := false
-	if st, ok := d.Proc.Stat(pid); ok {
+	if stOK {
 		canReadEnv = len(st.Fields) == 0 || !procStateMMUnsafe(st.Fields[0])
 	} else if procFileReadNonENOENT(d.Proc.File(pid, "stat")) {
 		return "", true
@@ -239,8 +244,8 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	stalePID := 0
 	procInconclusive := false
 	for _, pid := range pids {
-		// Comm pre-filter: only proxy/konnectivity comms can match
-		// isProxyAgent — every other pid skips the cmdline read.
+		// Comm pre-filter (fast-path via CycleEnv.StatsOnce): only
+		// proxy/konnectivity comms can match isProxyAgent.
 		match, state, known := proxyAgentComm(e, c.d, pid)
 		if known && !match {
 			continue
@@ -251,7 +256,11 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 			}
 			continue
 		}
-		if st, ok := c.d.Proc.Stat(pid); ok {
+		// Read live /proc/<pid>/stat ONCE for candidate PIDs so a stale
+		// StatsOnce snapshot cannot hide a transition to D-state or
+		// EACCES, and reuse st across cmdline/environ checks below.
+		st, stOK := c.d.Proc.Stat(pid)
+		if stOK {
 			if !known && st.HasComm {
 				match = isProxyAgentComm(st.Comm)
 				known = true
@@ -273,7 +282,7 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if len(argv) == 0 {
 			// Avoid touching mm-backed cmdline on D/Z/X processes; flag
 			// D-state proxy candidates and non-ENOENT cmdline errors.
-			if st, ok := c.d.Proc.Stat(pid); ok && len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
+			if stOK && len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
 				isCandidate := match
 				if !known {
 					isCandidate = !st.HasComm || isProxyAgentComm(st.Comm)
@@ -290,13 +299,13 @@ func (c *KonnCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		if !isProxyAgent(argv) {
 			continue
 		}
-		phost, hostStatInc := proxyAgentHostChecked(c.d, pid, argv)
+		phost, hostStatInc := proxyAgentHostWithStat(c.d, pid, argv, st, stOK)
 		if hostStatInc {
 			procInconclusive = true
 			continue
 		}
 		if phost == "" {
-			if st, ok := c.d.Proc.Stat(pid); ok && len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
+			if stOK && len(st.Fields) > 0 && procStateMMUnsafe(st.Fields[0]) {
 				if st.Fields[0] == "D" {
 					procInconclusive = true
 				}

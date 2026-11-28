@@ -260,8 +260,13 @@ func (c *Collector) collectARP(ch chan<- prometheus.Metric) {
 		return
 	}
 	var n float64
-	for i, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		if i == 0 || len(strings.Fields(line)) == 0 {
+	headerSkipped := false
+	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
+		if !headerSkipped {
+			headerSkipped = true
+			continue
+		}
+		if len(strings.Fields(line)) == 0 {
 			continue
 		}
 		n++

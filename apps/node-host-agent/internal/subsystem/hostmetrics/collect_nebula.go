@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -152,5 +151,5 @@ func (c *Collector) nebulaCertDaysLeft() (int64, bool) {
 	if !ok {
 		return 0, false
 	}
-	return (notAfter - time.Now().Unix()) / 86400, true
+	return (notAfter - c.cfg.Clock.Now().Unix()) / 86400, true
 }

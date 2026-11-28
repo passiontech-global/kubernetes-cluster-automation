@@ -457,3 +457,34 @@ func TestEvictionMinReclaimCustomAndNonString(t *testing.T) {
 		t.Fatal("emrMapEqual rejected a semantically equal block")
 	}
 }
+
+func TestKubeletCfgPathFromProc(t *testing.T) {
+	proc := t.TempDir()
+	mkProc := func(pid, stat, status, cgroup, cmdline string) {
+		t.Helper()
+		dir := filepath.Join(proc, pid)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for name, body := range map[string]string{
+			"stat":    stat,
+			"status":  status,
+			"cgroup":  cgroup,
+			"cmdline": cmdline,
+		} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// PID 10: spoofed kubelet inside kubepods + non-root -> skipped.
+	mkProc("10", "10 (kubelet) S 1 1 0 0", "Uid:\t1000\t1000\t1000\t1000\n",
+		"0::/kubepods.slice/cri-containerd-x.scope\n", "kubelet\x00--config=/etc/sudoers\x00")
+	// PID 20: real UID 0 kubelet under k0sworker.service -> matched.
+	mkProc("20", "20 (kubelet) S 1 1 0 0", "Uid:\t0\t0\t0\t0\n",
+		"0::/system.slice/k0sworker.service\n", "kubelet\x00--config=/etc/kubelet/custom.yaml\x00")
+
+	if got := kubeletCfgPathFromProc(proc); got != "/etc/kubelet/custom.yaml" {
+		t.Fatalf("kubeletCfgPathFromProc = %q, want /etc/kubelet/custom.yaml", got)
+	}
+}

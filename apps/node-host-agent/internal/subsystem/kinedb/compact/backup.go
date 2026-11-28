@@ -189,7 +189,7 @@ func (g *Guard) backupVerify(ctx context.Context, pg, user, pass string,
 // unremovable file is skipped, never fatal to the verify.
 func pruneDumps(dir string) {
 	// *.dump.tmp partials are never valid dumps — always sweep.
-	if tmps, err := filepath.Glob(filepath.Join(dir, "*.tmp")); err == nil {
+	if tmps, err := filepath.Glob(filepath.Join(dir, "*.dump.tmp")); err == nil {
 		for _, f := range tmps {
 			_ = os.Remove(f)
 		}

@@ -21,7 +21,6 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/ledger"
 )
@@ -70,7 +69,7 @@ func (c *NetworkMountHungCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 
-	data, err := c.d.ReadMountinfo(e)
+	entries, _, err := c.d.MountinfoEntries(e)
 	if err != nil {
 		c.d.State.SuspectLog(wdeps.CheckNetworkMountHung+"-mountinfo",
 			fmt.Sprintf("suspect: network-mount-hung read mountinfo %s failed: %v",
@@ -80,7 +79,7 @@ func (c *NetworkMountHungCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		return
 	}
 
-	targets := parseNetworkMounts(data)
+	targets := parseNetworkMounts(entries)
 	if len(targets) == 0 {
 		c.streaks.Clear()
 		c.d.Series.NetworkMountHung = nil
@@ -199,29 +198,13 @@ func (c *NetworkMountHungCheck) probeMount(ctx context.Context, mp string) mount
 	}
 }
 
-func parseNetworkMounts(data []byte) []wdeps.NetworkMountHungEntry {
+func parseNetworkMounts(entries []wdeps.MountEntry) []wdeps.NetworkMountHungEntry {
 	lastByMount := make(map[string]string)
-	for ln := range strings.SplitSeq(string(data), "\n") {
-		f := strings.Fields(ln)
-		if len(f) < 8 {
+	for _, ent := range entries {
+		if !ent.HasMount || !ent.HasSep || ent.Mountpoint == "" || ent.FSType == "" {
 			continue
 		}
-		sep := -1
-		for i := 6; i < len(f); i++ {
-			if f[i] == "-" {
-				sep = i
-				break
-			}
-		}
-		if sep < 0 || sep+1 >= len(f) {
-			continue
-		}
-		mp := procfs.UnescapeMountPath(f[4])
-		fsType := f[sep+1]
-		if mp == "" || fsType == "" {
-			continue
-		}
-		lastByMount[mp] = fsType
+		lastByMount[ent.Mountpoint] = ent.FSType
 	}
 	var out []wdeps.NetworkMountHungEntry
 	for mp, fsType := range lastByMount {

@@ -237,8 +237,8 @@ func (n *NetHealth) flushStaleUDPConntrack(ctx context.Context, check string) {
 		logger().Debug("conntrack udp/53 flush skipped — maintenance hold")
 		return
 	}
-	if !n.state.RateTrySpend("last-conntrack-flush", conntrackFlushCooldown) {
-		logger().Debug("conntrack udp/53 flush skipped — cooldown (last-conntrack-flush <" +
+	if !n.state.RateTrySpend("last-conntrack-dns-flush", conntrackFlushCooldown) {
+		logger().Debug("conntrack udp/53 flush skipped — cooldown (last-conntrack-dns-flush <" +
 			conntrackFlushCooldown.String() + ")")
 		return
 	}

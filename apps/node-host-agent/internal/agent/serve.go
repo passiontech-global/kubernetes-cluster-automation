@@ -115,6 +115,12 @@ var serverTimeouts = httpx.Opts{
 // supervision loop (panic recovery, restart backoff,
 // subUp/restarts metrics) lives in supervisor.go.
 func (a *Agent) Run(ctx context.Context) error {
+	if a.cfg.PprofAddr != "" {
+		if err := httpx.ValidateLoopbackAddr(a.cfg.PprofAddr); err != nil {
+			return fmt.Errorf("pprof loopback listener: %w", err)
+		}
+	}
+
 	now := time.Now()
 	a.started.Store(&now)
 

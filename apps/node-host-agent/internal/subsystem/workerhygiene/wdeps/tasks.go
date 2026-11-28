@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/procfs"
 )
 
 // Regexes shared by the CtrTask machinery and the snapshot→pod
@@ -153,6 +155,76 @@ func (d *Deps) ReadMountinfo(e *CycleEnv) ([]byte, error) {
 		return e.MountinfoOnce()
 	}
 	return os.ReadFile(d.Cfg.MountinfoFile)
+}
+
+// MountinfoEntries parses Cfg.MountinfoFile at most once per cycle
+// onto CycleEnv, avoiding 4+ redundant line-splits and path unescapes
+// across workerhygiene checks.
+func (d *Deps) MountinfoEntries(e *CycleEnv) ([]MountEntry, int, error) {
+	if e != nil && e.MountinfoOnce != nil && e.mountParsed {
+		return e.mountEntries, e.mountLines, nil
+	}
+	data, err := d.ReadMountinfo(e)
+	if err != nil {
+		return nil, 0, err
+	}
+	entries, lines := ParseMountinfo(data)
+	if e != nil && e.MountinfoOnce != nil {
+		e.mountEntries = entries
+		e.mountLines = lines
+		e.mountParsed = true
+	}
+	return entries, lines, nil
+}
+
+// ParseMountinfo parses raw /proc/<pid>/mountinfo bytes into structured
+// entries and returns the count of non-empty lines.
+func ParseMountinfo(data []byte) ([]MountEntry, int) {
+	var entries []MountEntry
+	nonEmpty := 0
+	for ln := range strings.SplitSeq(string(data), "\n") {
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		nonEmpty++
+		pre := ln
+		var post string
+		hasSep := false
+		if sep := strings.LastIndex(ln, " - "); sep >= 0 {
+			pre = ln[:sep]
+			post = ln[sep+3:]
+			hasSep = true
+		}
+		f := strings.Fields(pre)
+		if len(f) < 5 && !hasSep {
+			continue
+		}
+		var ent MountEntry
+		if len(f) >= 5 {
+			ent.HasMount = true
+			ent.Mountpoint = procfs.UnescapeMountPath(f[4])
+			for _, opt := range f[6:] {
+				if grp, ok := strings.CutPrefix(opt, "shared:"); ok {
+					ent.SharedGroups = append(ent.SharedGroups, grp)
+				}
+			}
+		}
+		if hasSep {
+			ent.HasSep = true
+			pf := strings.Fields(post)
+			if len(pf) >= 1 {
+				ent.FSType = pf[0]
+			}
+			if len(pf) >= 2 {
+				ent.Source = procfs.UnescapeMountPath(pf[1])
+			}
+			if len(pf) >= 3 {
+				ent.SuperOpts = pf[2]
+			}
+		}
+		entries = append(entries, ent)
+	}
+	return entries, nonEmpty
 }
 
 // CtrTask is one containerd task dir (runtime-v2 task or sandbox

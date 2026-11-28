@@ -8,6 +8,7 @@ package routewatch
 
 import (
 	"encoding/binary"
+	"slices"
 
 	"golang.org/x/sys/unix"
 )
@@ -57,18 +58,17 @@ func ScanMessages(buf []byte, isRelevant func(msgType uint16, payload []byte) bo
 // overruns the buffer is a clean end: the kernel need not pad the
 // final attribute of a message.
 func Attrs(buf []byte, wants ...uint16) (map[uint16]uint32, bool) {
-	found := map[uint16]uint32{}
-	want := map[uint16]bool{}
-	for _, w := range wants {
-		want[w] = true
-	}
+	var found map[uint16]uint32
 	for len(buf) >= unix.SizeofRtAttr {
 		ln := int(binary.NativeEndian.Uint16(buf[0:2]))
 		typ := binary.NativeEndian.Uint16(buf[2:4])
 		if ln < unix.SizeofRtAttr || ln > len(buf) {
 			return found, false
 		}
-		if want[typ] && ln >= unix.SizeofRtAttr+4 {
+		if ln >= unix.SizeofRtAttr+4 && slices.Contains(wants, typ) {
+			if found == nil {
+				found = make(map[uint16]uint32, len(wants))
+			}
 			found[typ] = binary.NativeEndian.Uint32(buf[4:8])
 		}
 		if next := RTAAlign(ln); next < len(buf) {

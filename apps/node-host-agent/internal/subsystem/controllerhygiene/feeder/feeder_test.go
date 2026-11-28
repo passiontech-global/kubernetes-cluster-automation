@@ -612,3 +612,29 @@ func TestRemediateG5SubMinuteClockStepBack(t *testing.T) {
 		t.Fatalf("sub-minute skew rewrote epoch: got %d want %d", got, skewed)
 	}
 }
+
+func TestRemediateG4bHoldCancelsPromptly(t *testing.T) {
+	e := fixture(t)
+	peer := "https://10.0.0.2:6443"
+	testutil.WriteFile(t, e.H.Cfg.Feeder.RemediatePeerFile,
+		"PEER_APISERVER=\""+peer+"\"\n")
+	// Force G4b secondary controller hold (SelfAPI > PeerAPI) with real time.Sleep.
+	e.H.Cfg.Hub.SelfAPI = "https://10.0.0.9:6443"
+	e.H.Cfg.Hub.PeerAPI = peer
+	e.H.Cfg.SleepFn = time.Sleep
+	e.Active["k0scontroller.service"] = "active"
+	e.SetUnitStart("k0scontroller.service", time.Hour)
+	e.Alive[e.H.Cfg.Feeder.ProbeURL] = false
+	e.Alive[peer] = false
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	e.H.Feeder().RunRemediate(ctx)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("G4b hold did not cancel promptly on ctx cancel (took %v)", elapsed)
+	}
+	if e.RstN() != 0 {
+		t.Fatalf("restarted after cancelled hold: %d", e.RstN())
+	}
+}

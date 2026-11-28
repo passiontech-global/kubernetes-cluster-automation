@@ -15,11 +15,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/latchdefs"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/platform/checkkit"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-host-agent/internal/subsystem/workerhygiene/wdeps"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/fsx"
 )
 
 const (
@@ -33,11 +35,20 @@ const (
 
 var errNoPEMCert = errors.New("no PEM certificate in bundle")
 
+type cachedCertBundle struct {
+	statKey     string
+	leaf        *x509.Certificate
+	minNotAfter time.Time
+	err         error
+}
+
 // CertCheck monitors kubelet client/server certs on disk and the live
 // serving cert presented on :10250 for imminent expiry and reload drift.
 type CertCheck struct {
 	d          *wdeps.Deps
 	DriftFails int
+	certMu     sync.Mutex
+	certCache  map[string]cachedCertBundle
 }
 
 // Name returns the check label / WD_SIG key.
@@ -61,8 +72,8 @@ func (c *CertCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 
 	clientPath := filepath.Join(c.d.Cfg.Kubelet.PKIDir, kubeletClientCertName)
 	serverPath := filepath.Join(c.d.Cfg.Kubelet.PKIDir, kubeletServerCertName)
-	_, clientNotAfter, clientErr := readCertBundle(clientPath)
-	serverLeaf, serverNotAfter, serverErr := readCertBundle(serverPath)
+	_, clientNotAfter, clientErr := c.readCertBundleCached(clientPath)
+	serverLeaf, serverNotAfter, serverErr := c.readCertBundleCached(serverPath)
 
 	clientAbsent := errors.Is(clientErr, os.ErrNotExist)
 	serverAbsent := errors.Is(serverErr, os.ErrNotExist)
@@ -190,6 +201,35 @@ func (c *CertCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 	}
 	c.d.State.ExitClearSuspect(latchdefs.LatchWorkerKubeletCertExpiring)
 	c.d.CycleResult(wdeps.CheckKubeletCert, "ok")
+}
+
+func (c *CertCheck) readCertBundleCached(path string) (*x509.Certificate, time.Time, error) {
+	key, err := fsx.FileStatKey(path)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	c.certMu.Lock()
+	if ent, ok := c.certCache[path]; ok && ent.statKey == key {
+		c.certMu.Unlock()
+		return ent.leaf, ent.minNotAfter, ent.err
+	}
+	c.certMu.Unlock()
+
+	leaf, minNotAfter, err := readCertBundle(path)
+	if err == nil || errors.Is(err, errNoPEMCert) {
+		c.certMu.Lock()
+		if c.certCache == nil {
+			c.certCache = make(map[string]cachedCertBundle)
+		}
+		c.certCache[path] = cachedCertBundle{
+			statKey:     key,
+			leaf:        leaf,
+			minNotAfter: minNotAfter,
+			err:         err,
+		}
+		c.certMu.Unlock()
+	}
+	return leaf, minNotAfter, err
 }
 
 // readCertBundle parses a PEM certificate bundle, returning the first

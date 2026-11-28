@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -62,6 +63,25 @@ type Feeder struct {
 
 // New returns the feeder bound to the shared deps surface.
 func New(d *cdeps.Deps) *Feeder { return &Feeder{d: d} }
+
+// sleepCtx sleeps using a ctx-cancellable timer when SleepFn is the
+// production time.Sleep default, or invokes custom test SleepFn seams
+// directly while still honoring context cancellation.
+func (f *Feeder) sleepCtx(ctx context.Context, d time.Duration) bool {
+	if f.d.Cfg.SleepFn == nil ||
+		reflect.ValueOf(f.d.Cfg.SleepFn).Pointer() == reflect.ValueOf(time.Sleep).Pointer() {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+	f.d.Cfg.SleepFn(d)
+	return ctx.Err() == nil
+}
 
 // peerAPIServerRe matches PEER_APISERVER="https://ip:6443" in the
 // remediate peer file.
@@ -233,7 +253,9 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 			return
 		}
 		if i < 2 {
-			f.d.Cfg.SleepFn(3 * time.Second)
+			if !f.sleepCtx(ctx, 3*time.Second) {
+				return
+			}
 		}
 	}
 	f.d.State.AppendLog("G1: apiserver failed 2 probes 3s apart — process-level wedge signature, continuing")
@@ -331,18 +353,11 @@ func (f *Feeder) RunRemediate(ctx context.Context) {
 		f.d.State.AppendLog(fmt.Sprintf(
 			"G4b: secondary controller (self=%s > peer=%s) and peer also dead — holding 90s so the primary recovers first",
 			hub.SelfAPI, hub.PeerAPI))
-		// SleepFn is the test seam — a real 90s block would make the
-		// hold path untestable; run it beside ctx.Done so cancel
-		// still aborts the wait promptly.
-		held := make(chan struct{})
-		go func() {
-			f.d.Cfg.SleepFn(90 * time.Second)
-			close(held)
-		}()
-		select {
-		case <-ctx.Done():
+		// SleepFn is the test seam — use a ctx-cancellable timer when
+		// running the production time.Sleep default so cancel stops
+		// immediately without leaking a 90s goroutine.
+		if !f.sleepCtx(ctx, 90*time.Second) {
 			return
-		case <-held:
 		}
 		// Post-hold recheck: 90s is long enough for the primary to
 		// recover, the shared datastore to die, or the local

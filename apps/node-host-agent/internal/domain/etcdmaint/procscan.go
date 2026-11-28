@@ -45,7 +45,7 @@ func (r *rescuer) waitPidExit(ctx context.Context, pid int) error {
 // Fields[0] regardless of what comm holds.
 func (r *rescuer) procZombie(pid int) bool {
 	st, ok := r.proc.Stat(pid)
-	return ok && st.Fields[0] == "Z"
+	return ok && len(st.Fields) > 0 && st.Fields[0] == "Z"
 }
 
 // matchEtcdCmdline reports whether a /proc/<pid>/cmdline blob belongs

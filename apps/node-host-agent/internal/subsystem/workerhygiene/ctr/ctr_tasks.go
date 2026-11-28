@@ -410,6 +410,8 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		wedged = append(wedged, d)
 	}
 	nClean := 0
+	var killablePIDs []int
+	killableBuilt := false
 	for _, d := range wedged {
 		id := filepath.Base(d)
 		if nClean >= c.d.Cfg.Ctr.MaxTaskClean {
@@ -456,14 +458,19 @@ func (c *CtrTasksCheck) Run(ctx context.Context, e *wdeps.CycleEnv) {
 		}
 		// pkill -9 -f "$id" parity: kill shim/runc leftovers holding
 		// the task id, then remove the dir — containerd GCs the task
-		// record once the shim is gone. The comm gate keeps the
-		// cmdline match honest: only runtime processes may eat the
-		// signal, never an unrelated process that happens to carry
-		// the id in argv.
-		for _, pid := range c.d.PidsWithCmdline(id, pids) {
-			if !c.commKillable(pid) {
-				continue
+		// record once the shim is gone. Filter commKillable FIRST so
+		// PidsWithCmdline only reads /proc/<pid>/cmdline for
+		// runc/containerd-shim* processes instead of touching every
+		// process's mm (including D-state tasks) on the node.
+		if !killableBuilt {
+			killableBuilt = true
+			for _, pid := range pids {
+				if c.commKillable(pid) {
+					killablePIDs = append(killablePIDs, pid)
+				}
 			}
+		}
+		for _, pid := range c.d.PidsWithCmdline(id, killablePIDs) {
 			if err := c.d.Cfg.Seams.Host.KillFn(pid, syscall.SIGKILL); err != nil {
 				c.d.State.AppendLog(fmt.Sprintf(
 					"suspect: kill leftover pid=%d holding task %.12s failed: %v",

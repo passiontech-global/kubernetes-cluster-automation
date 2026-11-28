@@ -673,3 +673,38 @@ func TestNebulaMTUBlackholeCacheExpiryAndConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestWriteMTUBHMetricRetriesAfterFailureAndNilClockSafe(t *testing.T) {
+	e := mtuEnv(t)
+	n := e.n
+	st := n.mtuState()
+	// Make TextfileDir a regular file so os.MkdirAll fails on first attempt.
+	badDir := filepath.Join(t.TempDir(), "not-a-dir")
+	testutil.WriteFile(t, badDir, "x")
+	n.cfg.TextfileDir = badDir
+	n.writeMTUBHMetric(st)
+	st.Mu.Lock()
+	lg := st.LastGauge
+	st.Mu.Unlock()
+	if lg != "" {
+		t.Fatalf("LastGauge committed to %q despite write failure", lg)
+	}
+
+	// Fix TextfileDir — the next call must write the .prom file.
+	goodDir := t.TempDir()
+	n.cfg.TextfileDir = goodDir
+	n.writeMTUBHMetric(st)
+	if _, err := os.Stat(filepath.Join(goodDir, "node-agent-nebula-mtu.prom")); err != nil {
+		t.Fatalf("metric file missing after write recovery: %v", err)
+	}
+
+	// Nil Clock in MaybeClampNebulaMSS must not panic.
+	nd := &nebula.Deps{
+		State:       n.state,
+		Actions:     n.actions,
+		RunMountCmd: n.cfg.runMountCmd,
+		TrimRunErr:  trimRunErr,
+	}
+	nd.MaybeClampNebulaMSS(context.Background(), nebulaWD(), st)
+	nd.MaybeClampNebulaMSS(context.Background(), nebulaWD(), st)
+}
