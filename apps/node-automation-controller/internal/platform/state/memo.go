@@ -52,10 +52,13 @@ func (m *SweepMemo[T]) Reset() {
 
 // KeyedSweepMemo caches per-key sweep results under a shared mutex,
 // memoizing both values and errors per key so repeated lookups for the
-// same GroupVersion/resource within one sweep execute load once.
+// same GroupVersion/resource within one sweep execute load once. Loads
+// for distinct keys still run concurrently: only same-key callers are
+// coalesced behind the first in-flight load (single-flight per key).
 type KeyedSweepMemo[K comparable, T any] struct {
-	mu      sync.Mutex
-	entries map[K]keyedMemoEntry[T]
+	mu       sync.Mutex
+	entries  map[K]keyedMemoEntry[T]
+	inflight map[K]*keyedMemoCall
 }
 
 type keyedMemoEntry[T any] struct {
@@ -63,28 +66,62 @@ type keyedMemoEntry[T any] struct {
 	err error
 }
 
+// keyedMemoCall is the completion signal shared by every caller that
+// arrived while the key's load was still running.
+type keyedMemoCall struct {
+	done chan struct{}
+}
+
 // Get returns the memoized result for key, running load on first access.
+// Concurrent callers for the same key wait for that single load instead
+// of running their own; the mutex is never held across load, so keys do
+// not block each other.
 func (m *KeyedSweepMemo[K, T]) Get(key K, load func() (T, error)) (T, error) {
-	m.mu.Lock()
-	if e, ok := m.entries[key]; ok {
+	for {
+		m.mu.Lock()
+		if e, ok := m.entries[key]; ok {
+			m.mu.Unlock()
+			return e.val, e.err
+		}
+		if c, ok := m.inflight[key]; ok {
+			m.mu.Unlock()
+			<-c.done
+			// The leader may have panicked and left no entry; loop
+			// and take over the load ourselves in that case.
+			continue
+		}
+		c := &keyedMemoCall{done: make(chan struct{})}
+		if m.inflight == nil {
+			m.inflight = map[K]*keyedMemoCall{}
+		}
+		m.inflight[key] = c
 		m.mu.Unlock()
-		return e.val, e.err
+		return m.load(key, c, load)
 	}
-	m.mu.Unlock()
+}
 
-	v, err := load()
-
-	m.mu.Lock()
-	if m.entries == nil {
-		m.entries = map[K]keyedMemoEntry[T]{}
-	}
-	if e, ok := m.entries[key]; ok {
+// load runs the caller's loader as the key's leader and publishes the
+// result to every waiter. A panic clears the in-flight marker and wakes
+// waiters (who retry) instead of leaving them blocked forever.
+func (m *KeyedSweepMemo[K, T]) load(key K, c *keyedMemoCall, load func() (T, error)) (v T, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.mu.Lock()
+			delete(m.inflight, key)
+			m.mu.Unlock()
+			close(c.done)
+			panic(r)
+		}
+		m.mu.Lock()
+		if m.entries == nil {
+			m.entries = map[K]keyedMemoEntry[T]{}
+		}
+		m.entries[key] = keyedMemoEntry[T]{val: v, err: err}
+		delete(m.inflight, key)
 		m.mu.Unlock()
-		return e.val, e.err
-	}
-	m.entries[key] = keyedMemoEntry[T]{val: v, err: err}
-	m.mu.Unlock()
-	return v, err
+		close(c.done)
+	}()
+	return load()
 }
 
 // Reset drops all cached entries.
