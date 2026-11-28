@@ -297,9 +297,11 @@ func TestPVCResizeBounceEnvAndAnnotationOptIn(t *testing.T) {
 		stsOwner2 := &metav1.OwnerReference{Kind: "StatefulSet", Name: "pg-2", UID: "sts-uid-2", Controller: &ctrlTrue}
 		pvcAnno := pvcWithCondition("db", "pvc-anno", corev1.PersistentVolumeClaimFileSystemResizePending, time.Hour)
 		pvcAnno.Annotations = map[string]string{pvcResizeBounceAnno: "true"}
+		pvcAnno.Status.Conditions[0].LastTransitionTime = metav1.NewTime(base.Add(-time.Hour))
 		pod1 := makePVCStallPod("db", "app-0", "pvc-anno", stsOwner, nil)
 
 		pvcPlain := pvcWithCondition("db", "pod-anno", corev1.PersistentVolumeClaimFileSystemResizePending, time.Hour)
+		pvcPlain.Status.Conditions[0].LastTransitionTime = metav1.NewTime(base.Add(-time.Hour))
 		pod2 := makePVCStallPod("db", "app-1", "pod-anno", stsOwner2, map[string]string{pvcResizeBounceAnno: "true"})
 
 		cs := fake.NewSimpleClientset(pvcAnno, pod1, pvcPlain, pod2)
@@ -329,8 +331,10 @@ func TestPVCResizeBouncePDBCooldownAndHold(t *testing.T) {
 		t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
 
 		pvcA := pvcWithCondition("db", "a-pvc", corev1.PersistentVolumeClaimFileSystemResizePending, time.Hour)
+		pvcA.Status.Conditions[0].LastTransitionTime = metav1.NewTime(base.Add(-time.Hour))
 		podA := makePVCStallPod("db", "a-0", "a-pvc", stsOwner, nil)
 		pvcB := pvcWithCondition("db", "b-pvc", corev1.PersistentVolumeClaimFileSystemResizePending, time.Hour)
+		pvcB.Status.Conditions[0].LastTransitionTime = metav1.NewTime(base.Add(-time.Hour))
 		podB := makePVCStallPod("db", "b-0", "b-pvc", &metav1.OwnerReference{
 			Kind: "StatefulSet", Name: "pg-b", UID: "sts-uid-2", Controller: &ctrlTrue,
 		}, nil)
