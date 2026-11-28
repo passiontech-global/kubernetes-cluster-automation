@@ -20,7 +20,8 @@ the inversion point), no knowledge of any consumer.
 | `num.go` | Numeric machinery — `asInt64`/`numMag`/`magCmp` exact compares, int64 fast paths, `numEq`/`numCmp`/`minMaxLess` |
 | `methods.go` | Attr/index lookup, bound-method dispatch, deep equality, mapping view |
 | `stringify.go` | `Stringify`/`writeStringify` (python repr) + `writeJSONAt` (`to_json` writer) — one `*strings.Builder` threaded through |
-| `filters.go` | Filter dispatch (`applyFilter`) + scalar/string/codec/regex cases, `parseMaxBytes` input cap |
+| `filters.go` | Filter dispatch (`applyFilter`) + scalar/string/codec cases, `parseMaxBytes` input cap |
+| `filters_regex.go` | `regex_escape`/`regex_replace`/`regex_findall`/`regex_search` + bounded/fast-path matchers |
 | `filters_seq.go` | `unique`/`difference`/`union`/`flatten`/`min`/`max`/`zip`/`dict2items`/`items2dict` |
 | `filters_sort.go` | `|sort` + `sortKey`/`numSortKind` key machinery (exact >2^53 integers) |
 | `filters_select.go` | `map`/`select`/`reject`/`selectattr`/`rejectattr` family |

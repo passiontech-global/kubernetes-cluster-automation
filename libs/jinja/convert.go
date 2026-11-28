@@ -42,6 +42,22 @@ func toJSON(v any) ([]byte, error) {
 
 // ---------------- to_yaml / to_nice_yaml ----------------
 
+var errYAMLSizeCap = errors.New("to_yaml: output size cap exceeded")
+
+type yamlLimitWriter struct {
+	b        strings.Builder
+	max      int
+	overflow bool
+}
+
+func (w *yamlLimitWriter) Write(p []byte) (int, error) {
+	if w.b.Len()+len(p) > w.max {
+		w.overflow = true
+		return 0, errYAMLSizeCap
+	}
+	return w.b.Write(p)
+}
+
 // toYAMLNode converts v into a yaml.Node tree for yaml3.Marshal.
 // *OMap insertion order survives as MappingNode Content order —
 // marshaling a plain map[string]any would sort the keys and
