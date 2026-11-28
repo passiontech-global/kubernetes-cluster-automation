@@ -315,7 +315,7 @@ func (c *workloadAdmissionBlockGuardCheck) Run(ctx context.Context) probefw.Resu
 			note := fmt.Sprintf("%s %s/%s blocked from pod creation (%s): %s",
 				cand.kind, cand.ns, cand.name, reason, msg)
 			if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-				Name:      fmt.Sprintf("%s.%x", sanitizeEventNamePrefix(cooldownKey), now.UnixNano()),
+				Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
 				Namespace: cand.ns,
 				Regarding: corev1.ObjectReference{
 					APIVersion: "apps/v1",

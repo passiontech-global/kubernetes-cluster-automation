@@ -262,7 +262,7 @@ func (s *natsSweep) logScan(ctx context.Context) {
 	scanKeys := make([]string, 0, len(s.census.memberByName))
 	for key, pod := range s.census.memberByName {
 		if pod.Status.Phase != corev1.PodRunning ||
-			s.now.Sub(pod.CreationTimestamp.Time) < natsLogScanMinPodAge {
+			!kube.AgeAtLeast(pod.CreationTimestamp.Time, s.now, natsLogScanMinPodAge) {
 			continue
 		}
 		scanKeys = append(scanKeys, key)

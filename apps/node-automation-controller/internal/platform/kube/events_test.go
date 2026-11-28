@@ -107,9 +107,10 @@ func TestCountRecentEventsSkipsFutureTimestamp(t *testing.T) {
 func TestEmitWarningEventClipsNameAndNote(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	lbl := strings.Repeat("a", 60)
 	err := EmitWarningEvent(t.Context(), cs, WarningEvent{
 		Namespace:         "apps",
-		Name:              strings.Repeat("a", 300),
+		Name:              strings.Join([]string{lbl, lbl, lbl, lbl, lbl}, "."),
 		Reason:            "ServiceSelectorBlackhole",
 		Note:              strings.Repeat("x", 1200),
 		ReportingInstance: "cluster-health-probes",
@@ -243,5 +244,55 @@ func TestClipEventNameTrimsSeparatorsWhenBudgetExhausted(t *testing.T) {
 	}
 	if got := clipEventName("ab-cd-", 5); got != "ab-cd" {
 		t.Fatalf("clipEventName = %q, want ab-cd", got)
+	}
+}
+
+func TestClipEventNameEnforces63CharLabelCap(t *testing.T) {
+	longA := strings.Repeat("a", 80)
+	longB := strings.Repeat("a", 79) + "b"
+	gotA := clipEventName("prefix."+longA+".1752890400", 253)
+	gotB := clipEventName("prefix."+longB+".1752890400", 253)
+	if len(gotA) > 253 {
+		t.Fatalf("clipped name too long: %d", len(gotA))
+	}
+	for _, lbl := range strings.Split(gotA, ".") {
+		if len(lbl) > 63 {
+			t.Fatalf("DNS label exceeds 63 chars: %q (%d)", lbl, len(lbl))
+		}
+	}
+	if !strings.HasSuffix(gotA, ".1752890400") {
+		t.Fatalf("timestamp suffix lost: %q", gotA)
+	}
+	if gotA == gotB {
+		t.Fatalf("distinct overlong labels collided: %q", gotA)
+	}
+	// Single overlong label with hyphens near the cut point trims cleanly.
+	hyphenated := strings.Repeat("x", 53) + "---" + strings.Repeat("y", 20)
+	gotH := clipEventName(hyphenated, 253)
+	if len(gotH) > 63 {
+		t.Fatalf("single overlong label len = %d, want <=63 (%q)", len(gotH), gotH)
+	}
+	if strings.Contains(gotH, "--") {
+		t.Fatalf("hyphenated cut left double dash before hash: %q", gotH)
+	}
+}
+
+func TestAgeSinceAndAgeAtLeast(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if age, ok := AgeSince(time.Time{}, now); ok || age != 0 {
+		t.Fatalf("AgeSince(zero) = (%v, %v), want (0, false)", age, ok)
+	}
+	if AgeAtLeast(time.Time{}, now, time.Minute) {
+		t.Fatal("AgeAtLeast(zero) = true, want false")
+	}
+	t5m := now.Add(-5 * time.Minute)
+	if age, ok := AgeSince(t5m, now); !ok || age != 5*time.Minute {
+		t.Fatalf("AgeSince(5m) = (%v, %v), want (5m, true)", age, ok)
+	}
+	if !AgeAtLeast(t5m, now, 5*time.Minute) {
+		t.Fatal("AgeAtLeast(5m, 5m) = false, want true")
+	}
+	if AgeAtLeast(t5m, now, 6*time.Minute) {
+		t.Fatal("AgeAtLeast(5m, 6m) = true, want false")
 	}
 }

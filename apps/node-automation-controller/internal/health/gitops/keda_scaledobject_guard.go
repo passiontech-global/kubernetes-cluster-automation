@@ -348,7 +348,7 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 	case "StatefulSet":
 		p.InvalidateStatefulSets(ctx)
 	case "Rollout":
-		p.InvalidateUnstructured(ctx)
+		p.InvalidateUnstructuredGVR(ctx, kube.GVRArgoRollout)
 	}
 	p.Heals.Stamp(ck, now)
 	log.Info("SCALE: keda cold-start rescue — target wedged at 0 while the scaler is unhealthy",

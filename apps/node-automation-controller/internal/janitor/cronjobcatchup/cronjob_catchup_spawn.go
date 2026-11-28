@@ -17,14 +17,22 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 )
 
-// capped enforces the in-memory 1-catchup-per-cronjob-per-day limit.
+// capped enforces the in-memory 1-catchup-per-cronjob-per-day limit
+// and prunes expired prior-day entries so lastCatchup stays bounded.
 func (c *cronJobCatchup) capped(key string) bool {
+	today := c.now.Now().UTC().Format("2006-01-02")
 	if c.lastCatchup == nil {
 		c.lastCatchup = map[string]string{}
+		return false
+	}
+	for k, day := range c.lastCatchup {
+		if day != today {
+			delete(c.lastCatchup, k)
+		}
 	}
 	// The day stamp comes from the clock seam so a pinned now really
 	// pins "today" — tests call capped() on a literally-built struct.
-	return c.lastCatchup[key] == c.now.Now().UTC().Format("2006-01-02")
+	return c.lastCatchup[key] == today
 }
 
 // spawn clones the CronJob's JobTemplate into a <cj>-catchup-<unix>
@@ -107,6 +115,9 @@ func (c *cronJobCatchup) spawn(ctx context.Context, log logr.Logger, cj *batchv1
 		log.Error(err, "create catch-up job failed",
 			"cronjob", liveCJ.Namespace+"/"+liveCJ.Name, "job", job.Name)
 		return false
+	}
+	if c.lastCatchup == nil {
+		c.lastCatchup = map[string]string{}
 	}
 	c.lastCatchup[key] = now.UTC().Format("2006-01-02")
 	log.Info("CATCHUP job", "job", job.Name,

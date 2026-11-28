@@ -420,6 +420,16 @@ func (d *Deps) sweepHealGate(ctx context.Context) (context.Context, *maintenance
 	return ctx, &d.verdictFallback
 }
 
+// EvictPodV runs heal.EvictPodV against the sweep-scoped maintenance
+// verdict so checks never read or mutate the process-global
+// Deps.Maintenance directly.
+func (d *Deps) EvictPodV(ctx context.Context, log logr.Logger,
+	heals *state.CooldownSet, key string, cooldown time.Duration,
+	pod *corev1.Pod, now time.Time) (proceed, unverifiable, evicted, refused bool, err error) {
+	ctx, v := d.sweepHealGate(ctx)
+	return heal.EvictPodV(ctx, log, v, d.CS, d.Dyn, heals, key, cooldown, pod, now)
+}
+
 // DeletePodHeal is the pod-delete heal shape the self-healing checks
 // share — this body was the reference internal/platform/heal was
 // extracted from, so it now delegates: heal.AllowedV runs the

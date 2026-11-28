@@ -67,9 +67,10 @@ type gatewayRouteCensus struct {
 	// from/to entries, a load attempted flag so one error does not
 	// re-list per ref, and an inconclusive flag so a list failure
 	// flags nothing ("can't tell" is not "not permitted").
-	grants      []routeGrant
-	grantsTried bool
-	grantsErr   bool
+	grants           []routeGrant
+	grantsTried      bool
+	grantsErr        bool
+	rolloutErrLogged bool
 }
 
 func newGatewayRouteCensus() *gatewayRouteCensus {

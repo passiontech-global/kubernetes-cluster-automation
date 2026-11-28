@@ -196,12 +196,19 @@ type pvcCensus struct {
 	pvcsErr      error
 	pvcsSet      bool
 	nsClaims     map[string]pvcUseProbe
+	nsPodClaims  map[string]nsPodClaimsProbe
 	vas          []storagev1.VolumeAttachment
 	vasErr       error
 	vasSet       bool
 	nodeReady    map[string]bool
 	nodeReadyErr error
 	nodeReadySet bool
+}
+
+type nsPodClaimsProbe struct {
+	inUseClaims        map[string]bool
+	deadFailedPodByPVC map[string]string
+	err                error
 }
 
 // listPVCs returns the shared cluster-wide PVC metadata census,
@@ -489,45 +496,71 @@ func (j *failedJobsJanitor) failedPodOnDeadNode(ctx context.Context,
 	return pod, err
 }
 
-func (j *failedJobsJanitor) failedPodOnDeadNodeWithCensus(ctx context.Context,
-	census *pvcCensus, ns, pvcName string) (string, error, bool) {
-	if census == nil {
-		census = &pvcCensus{}
-	}
-	// Nodes first: a pod on a live node released its volumes on
-	// failure, so only unreachable nodes are suspect.
-	ready, err, cached := census.readyNodes(ctx, j)
-	if err != nil {
-		return "", err, cached
-	}
+// probeNamespacePodClaims lists Pods in ns at most once per census, building
+// both the live/dead-node PVC in-use set and the first Failed pod on a
+// dead/unknown node per PVC so N stuck PVCs/PVs in one namespace pay O(1)
+// Pod lists instead of O(K).
+func (c *pvcCensus) probeNamespacePodClaims(ctx context.Context,
+	j *failedJobsJanitor, ns string) (nsPodClaimsProbe, error, bool) {
 
-	var stuckPod string
-	err = kube.ListEach(ctx,
+	ready, err, cached := c.readyNodes(ctx, j)
+	if err != nil {
+		return nsPodClaimsProbe{}, err, cached
+	}
+	if c.nsPodClaims != nil {
+		if pr, ok := c.nsPodClaims[ns]; ok {
+			return pr, pr.err, true
+		}
+	}
+	inUse := map[string]bool{}
+	deadFailed := map[string]string{}
+	listErr := kube.ListEach(ctx,
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.Pods(j.cs, ns),
 		func(page []corev1.Pod) error {
 			for i := range page {
 				p := &page[i]
-				if p.Status.Phase != corev1.PodFailed || p.Spec.NodeName == "" {
+				if p.Status.Phase == corev1.PodSucceeded {
 					continue
 				}
-				alive, known := ready[p.Spec.NodeName]
-				if known && alive {
-					continue // kubelet confirmed release on a live node
+				isDeadFailed := false
+				if p.Status.Phase == corev1.PodFailed {
+					if p.Spec.NodeName == "" || ready[p.Spec.NodeName] {
+						continue
+					}
+					isDeadFailed = true
 				}
 				for _, claim := range kube.PodClaimedPVCs(p) {
-					if claim == pvcName {
-						stuckPod = p.Name
-						return nil
+					inUse[claim] = true
+					if isDeadFailed && deadFailed[claim] == "" {
+						deadFailed[claim] = p.Name
 					}
 				}
 			}
 			return nil
 		})
-	if err != nil {
-		return "", err, false
+	pr := nsPodClaimsProbe{
+		inUseClaims:        inUse,
+		deadFailedPodByPVC: deadFailed,
+		err:                listErr,
 	}
-	return stuckPod, nil, false
+	if c.nsPodClaims == nil {
+		c.nsPodClaims = map[string]nsPodClaimsProbe{}
+	}
+	c.nsPodClaims[ns] = pr
+	return pr, pr.err, false
+}
+
+func (j *failedJobsJanitor) failedPodOnDeadNodeWithCensus(ctx context.Context,
+	census *pvcCensus, ns, pvcName string) (string, error, bool) {
+	if census == nil {
+		census = &pvcCensus{}
+	}
+	pr, err, cached := census.probeNamespacePodClaims(ctx, j, ns)
+	if err != nil {
+		return "", err, cached
+	}
+	return pr.deadFailedPodByPVC[pvcName], nil, cached
 }
 
 // nsFinalizerNames renders .spec.finalizers — the list that actually

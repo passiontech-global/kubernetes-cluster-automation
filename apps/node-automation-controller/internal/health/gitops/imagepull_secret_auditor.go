@@ -284,12 +284,7 @@ func (p *imagePullSecretAuditorCheck) collectPullSecretCensus(ctx context.Contex
 		add(pods[i].Namespace, pods[i].Spec.ImagePullSecrets)
 	}
 
-	sas, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			Limit:           probefw.HealthListPageSize,
-			ResourceVersion: "0",
-		},
-		kube.ServiceAccounts(p.CS, metav1.NamespaceAll))
+	sas, err := p.AllServiceAccounts(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list serviceaccounts: %w", err)
 	}
@@ -518,7 +513,7 @@ func (p *imagePullSecretAuditorCheck) emitMissingPullSecretEvent(
 		return
 	}
 	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
-		Name:      fmt.Sprintf("%s.%x", sanitizePullAuditEventPrefix(cooldownKey), now.UnixNano()),
+		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
 		Namespace: ns,
 		Regarding: corev1.ObjectReference{
 			APIVersion: apiVersion,
@@ -538,37 +533,6 @@ func (p *imagePullSecretAuditorCheck) emitMissingPullSecretEvent(
 	}
 	p.eventCooldown.Stamp(cooldownKey, now)
 	log.Info("EVENT: MissingImagePullSecret", "kind", kind, "object", ns+"/"+name, "registry", reg)
-}
-
-func sanitizePullAuditEventPrefix(s string) string {
-	s = strings.ToLower(s)
-	rawLabels := strings.Split(s, ".")
-	var cleanLabels []string
-	for _, raw := range rawLabels {
-		var b strings.Builder
-		b.Grow(len(raw))
-		prevDash := false
-		for i := 0; i < len(raw); i++ {
-			ch := raw[i]
-			if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
-				b.WriteByte(ch)
-				prevDash = false
-				continue
-			}
-			if b.Len() > 0 && !prevDash {
-				b.WriteByte('-')
-				prevDash = true
-			}
-		}
-		lbl := strings.Trim(b.String(), "-")
-		if lbl != "" {
-			cleanLabels = append(cleanLabels, lbl)
-		}
-	}
-	if len(cleanLabels) == 0 {
-		return "event"
-	}
-	return strings.Join(cleanLabels, ".")
 }
 
 // auditPullSecret classifies one referenced Secret — returns the

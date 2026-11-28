@@ -37,7 +37,7 @@ func (p *linkerdOutlierGuardCheck) maybeEvictOutlier(ctx context.Context,
 	// full 5m window (>=2 sweep cycles) and the pod must outlive
 	// startup churn before it can be called gray-failed.
 	if pod.Status.Phase != corev1.PodRunning ||
-		now.Sub(pod.CreationTimestamp.Time) < linkerdOutlierPodMinAge {
+		!kube.AgeAtLeast(pod.CreationTimestamp.Time, now, linkerdOutlierPodMinAge) {
 		return
 	}
 	if !probefw.Persisted(&p.seen,

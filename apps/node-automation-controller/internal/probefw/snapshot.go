@@ -343,18 +343,19 @@ func (m *memo[T]) resetForced() {
 type sweepSnapshot struct {
 	ctx context.Context
 
-	pods         memo[[]corev1.Pod]
-	nodes        memo[[]corev1.Node]
-	slices       memo[[]discoveryv1.EndpointSlice]
-	services     memo[[]corev1.Service]
-	namespaces   memo[[]corev1.Namespace]
-	events       memo[[]corev1.Event]
-	pvcs         memo[[]corev1.PersistentVolumeClaim]
-	pvs          memo[[]corev1.PersistentVolume]
-	statefulSets memo[[]appsv1.StatefulSet]
-	deployments  memo[[]appsv1.Deployment]
-	daemonSets   memo[[]appsv1.DaemonSet]
-	leases       memo[[]coordinationv1.Lease]
+	pods            memo[[]corev1.Pod]
+	nodes           memo[[]corev1.Node]
+	slices          memo[[]discoveryv1.EndpointSlice]
+	services        memo[[]corev1.Service]
+	serviceAccounts memo[[]corev1.ServiceAccount]
+	namespaces      memo[[]corev1.Namespace]
+	events          memo[[]corev1.Event]
+	pvcs            memo[[]corev1.PersistentVolumeClaim]
+	pvs             memo[[]corev1.PersistentVolume]
+	statefulSets    memo[[]appsv1.StatefulSet]
+	deployments     memo[[]appsv1.Deployment]
+	daemonSets      memo[[]appsv1.DaemonSet]
+	leases          memo[[]coordinationv1.Lease]
 	// Lazy workload censuses — populated only when a check actually
 	// asks (the plan's "lazy getters"): ReplicaSets ride the
 	// metadata-only path (ObjectMeta is all the ownership joins
@@ -393,12 +394,13 @@ type sweepSnapshot struct {
 	// census load: checks that never resolve a single workload pay
 	// nothing) and dropped WITH their census via the same resets
 	// list, so an invalidation can never leave a stale index behind.
-	deploymentsIdx  censusIndex[appsv1.Deployment]
-	statefulSetsIdx censusIndex[appsv1.StatefulSet]
-	daemonSetsIdx   censusIndex[appsv1.DaemonSet]
-	replicaSetsIdx  censusIndex[metav1.PartialObjectMetadata]
-	cronJobsIdx     censusIndex[batchv1.CronJob]
-	jobsIdx         censusIndex[batchv1.Job]
+	deploymentsIdx     censusIndex[appsv1.Deployment]
+	statefulSetsIdx    censusIndex[appsv1.StatefulSet]
+	daemonSetsIdx      censusIndex[appsv1.DaemonSet]
+	replicaSetsIdx     censusIndex[metav1.PartialObjectMetadata]
+	cronJobsIdx        censusIndex[batchv1.CronJob]
+	jobsIdx            censusIndex[batchv1.Job]
+	serviceAccountsIdx censusIndex[corev1.ServiceAccount]
 
 	// podPlacement/sliceSvc are the content indexes over the pod
 	// and EndpointSlice censuses (PodsIn/PodsOnNode/
@@ -499,7 +501,7 @@ func newSweepSnapshot(ctx context.Context, nowFn func() time.Time) *sweepSnapsho
 	s := &sweepSnapshot{ctx: ctx, nowFn: nowFn}
 	s.memos = []memoMember{
 		&s.pods, &s.nodes, &s.slices,
-		&s.services, &s.namespaces, &s.events,
+		&s.services, &s.serviceAccounts, &s.namespaces, &s.events,
 		&s.pvcs, &s.pvs, &s.statefulSets, &s.deployments,
 		&s.daemonSets, &s.leases,
 		&s.replicaSets, &s.typedReplicaSets, &s.cronJobs, &s.jobs, &s.pdbs,
@@ -515,6 +517,7 @@ func newSweepSnapshot(ctx context.Context, nowFn func() time.Time) *sweepSnapsho
 		s.deploymentsIdx.reset, s.statefulSetsIdx.reset,
 		s.daemonSetsIdx.reset, s.replicaSetsIdx.reset,
 		s.cronJobsIdx.reset, s.jobsIdx.reset,
+		s.serviceAccountsIdx.reset,
 		s.resetUnstructs,
 	}
 	return s
@@ -593,6 +596,17 @@ func (s *sweepSnapshot) resetUnstructs() {
 	}
 	s.muUnstructs.Unlock()
 	for _, m := range memos {
+		m.reset()
+	}
+}
+
+// resetUnstructGVR drops a single GVR's dynamic memo in place without
+// invalidating unrelated CR censuses held by concurrent workers.
+func (s *sweepSnapshot) resetUnstructGVR(gvr schema.GroupVersionResource) {
+	s.muUnstructs.Lock()
+	m := s.unstructReads[gvr]
+	s.muUnstructs.Unlock()
+	if m != nil {
 		m.reset()
 	}
 }

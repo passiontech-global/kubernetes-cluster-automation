@@ -4,6 +4,7 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
@@ -204,6 +205,14 @@ func (d *Deps) InvalidateCronJobs(ctx context.Context) {
 func (d *Deps) InvalidateUnstructured(ctx context.Context) {
 	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
 		s.resetUnstructs()
+	}
+}
+
+// InvalidateUnstructuredGVR drops only the named GVR's dynamic memo,
+// keeping unrelated CRD censuses warm across concurrent sweep workers.
+func (d *Deps) InvalidateUnstructuredGVR(ctx context.Context, gvr schema.GroupVersionResource) {
+	if s, ok := ctx.Value(sweepCtxKey{}).(*sweepSnapshot); ok {
+		s.resetUnstructGVR(gvr)
 	}
 }
 

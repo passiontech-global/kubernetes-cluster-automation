@@ -263,6 +263,13 @@ var VeleroDataMovementWedged = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "1 while a velero.io/v2alpha1 DataUpload/DataDownload is stuck in an in-flight phase (InProgress/Accepted/Prepared/Canceling) past 6h — cnpg-backup-audit.",
 }, []string{"namespace", "name", "kind"})
 
+// VeleroRestoreStuck marks (1) each velero.io/v1 Restore CR held in
+// status.phase == "InProgress" past 6h.
+var VeleroRestoreStuck = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "node_automation_velero_restore_stuck",
+	Help: "1 while a velero.io Restore is stuck InProgress past 6h.",
+}, []string{"namespace", "restore"})
+
 // integrationCollectors lists every vector declared in this file, in
 // declaration order; the single init() below registers the table, so
 // registration order stays byte-stable and adding a metric touches
@@ -283,7 +290,7 @@ var integrationCollectors = []prometheus.Collector{
 	VeleroBackupStuck, VeleroPodVolumeBackupWedged,
 	VeleroPodVolumeRestoreWedged,
 	VeleroWedgedObjectsCleanedTotal, VeleroRepoUnhealthy,
-	VeleroDataMovementWedged,
+	VeleroDataMovementWedged, VeleroRestoreStuck,
 }
 
 func init() {

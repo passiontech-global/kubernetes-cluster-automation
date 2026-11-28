@@ -127,7 +127,7 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 			if !kargoPhaseStuck(phase) {
 				continue
 			}
-			if now.Sub(pr.GetCreationTimestamp().Time) < kargoPromotionStuckMinAge {
+			if !kube.AgeAtLeast(pr.GetCreationTimestamp().Time, now, kargoPromotionStuckMinAge) {
 				continue
 			}
 			stage, _ := kube.NestedString(pr.Object, "spec", "stage")
@@ -184,7 +184,7 @@ func (p *kargoPromotionHealthCheck) Run(ctx context.Context) probefw.Result {
 			if !strings.EqualFold(phase, "Running") {
 				continue
 			}
-			if now.Sub(ar.GetCreationTimestamp().Time) < argoAnalysisRunStuckMinAge {
+			if !kube.AgeAtLeast(ar.GetCreationTimestamp().Time, now, argoAnalysisRunStuckMinAge) {
 				continue
 			}
 			ns, name := ar.GetNamespace(), ar.GetName()

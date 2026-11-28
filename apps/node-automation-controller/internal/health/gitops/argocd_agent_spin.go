@@ -171,7 +171,7 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 			pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
 			continue
 		}
-		if now.Sub(pod.CreationTimestamp.Time) < argocdAgentMinAge {
+		if !kube.AgeAtLeast(pod.CreationTimestamp.Time, now, argocdAgentMinAge) {
 			continue // a fresh pod has no spin history worth reading
 		}
 		key := pod.Namespace + "/" + pod.Name

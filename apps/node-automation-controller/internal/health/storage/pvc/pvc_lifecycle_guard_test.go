@@ -500,3 +500,65 @@ func TestPVCLifecycleStorageClassListUsesRV0(t *testing.T) {
 	}
 	pvcPendingDeadlockGauge.DeleteLabelValues("apps", "pvc-pend", pvcDeadlockPendingTimeout)
 }
+
+func TestPVCLifecycleImmediateSCNotMisclassifiedAsWaitForFirstConsumer(t *testing.T) {
+	now := time.Now()
+	scImm := &storagev1.StorageClass{
+		ObjectMeta:        metav1.ObjectMeta{Name: "fast-imm"},
+		Provisioner:       "rbd.csi.ceph.com",
+		VolumeBindingMode: ptr.To(storagev1.VolumeBindingImmediate),
+	}
+	pvcImm := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "apps",
+			Name:              "pvc-imm",
+			CreationTimestamp: metav1.NewTime(now.Add(-15 * time.Minute)),
+		},
+		Spec:   corev1.PersistentVolumeClaimSpec{StorageClassName: ptr.To("fast-imm")},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "apps",
+			Name:              "pod-imm",
+			CreationTimestamp: metav1.NewTime(now.Add(-15 * time.Minute)),
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name:         "data",
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc-imm"}},
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodScheduled,
+				Status: corev1.ConditionFalse,
+			}},
+		},
+	}
+	evSched := &corev1.Event{
+		ObjectMeta:     metav1.ObjectMeta{Namespace: "apps", Name: "ev-sched"},
+		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Namespace: "apps", Name: "pod-imm"},
+		Reason:         "FailedScheduling",
+		Message:        "0/3 nodes are available: Insufficient cpu.",
+	}
+	cs := fake.NewSimpleClientset(scImm, pvcImm, pod, evSched)
+	p := testProber(cs)
+	chk := probetest.MustCheck[*pvcLifecycleGuardCheck](t, p)
+	probetest.FreezeNow(p.Deps, now)
+	t.Cleanup(func() {
+		pvcPendingDeadlockGauge.DeleteLabelValues("apps", "pvc-imm", pvcDeadlockPendingTimeout)
+		pvcPendingDeadlockGauge.DeleteLabelValues("apps", "pvc-imm", pvcDeadlockWaitForFirstConsumer)
+	})
+	res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+	if res.Pass {
+		t.Fatalf("expected pending PVC failure, got %+v", res)
+	}
+	if _, ok := pvcDeadlockSeries(t, "apps", "pvc-imm", pvcDeadlockWaitForFirstConsumer); ok {
+		t.Fatal("Immediate StorageClass PVC misclassified as wait_for_first_consumer")
+	}
+	if v, ok := pvcDeadlockSeries(t, "apps", "pvc-imm", pvcDeadlockPendingTimeout); !ok || v != 1 {
+		t.Fatalf("expected provisioning_timeout=1 for Immediate SC, got v=%v ok=%v", v, ok)
+	}
+}

@@ -23,6 +23,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 )
@@ -117,7 +118,7 @@ func (p *onePasswordConnectSyncCheck) Run(ctx context.Context) probefw.Result {
 // Pods declaring no connect-sync container are skipped (a different
 // connect variant).
 func connectSyncDegraded(pod *corev1.Pod, now time.Time) (why string, bad bool) {
-	if now.Sub(pod.CreationTimestamp.Time) < esConnectStartGrace {
+	if !kube.AgeAtLeast(pod.CreationTimestamp.Time, now, esConnectStartGrace) {
 		return "", false
 	}
 	declared := false

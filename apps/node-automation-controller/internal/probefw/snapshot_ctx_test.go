@@ -403,3 +403,83 @@ func TestResetUnstructsDoesNotBlockOtherGVRs(t *testing.T) {
 		t.Fatal("InvalidateUnstructured did not finish after gvrA released")
 	}
 }
+
+func TestInvalidateUnstructuredGVRKeepsOtherGVRsWarm(t *testing.T) {
+	gvrA := kube.AutopilotPlanGVR
+	gvrB := kube.GVRSelfNodeRemediation
+
+	dyn := testhelp.NewDynamicClient()
+	var listsA, listsB int
+	dyn.PrependReactor("list", gvrA.Resource, func(ktesting.Action) (bool, runtime.Object, error) {
+		listsA++
+		return false, nil, nil
+	})
+	dyn.PrependReactor("list", gvrB.Resource, func(ktesting.Action) (bool, runtime.Object, error) {
+		listsB++
+		return false, nil, nil
+	})
+
+	d := &Deps{CS: fake.NewSimpleClientset(), Dyn: dyn}
+	sweepCtx := WithSweepSnapshot(t.Context(), d)
+
+	if _, err := d.AllUnstructured(sweepCtx, gvrA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AllUnstructured(sweepCtx, gvrB); err != nil {
+		t.Fatal(err)
+	}
+	if listsA != 1 || listsB != 1 {
+		t.Fatalf("warm-up lists = %d/%d, want 1/1", listsA, listsB)
+	}
+
+	d.InvalidateUnstructuredGVR(sweepCtx, gvrA)
+
+	if _, err := d.AllUnstructured(sweepCtx, gvrA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AllUnstructured(sweepCtx, gvrB); err != nil {
+		t.Fatal(err)
+	}
+	if listsA != 2 {
+		t.Fatalf("gvrA lists = %d, want 2 after InvalidateUnstructuredGVR(gvrA)", listsA)
+	}
+	if listsB != 1 {
+		t.Fatalf("gvrB lists = %d, want 1 (must stay cached)", listsB)
+	}
+}
+
+func TestAllServiceAccountsAndIndex(t *testing.T) {
+	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "worker"}}
+	cs := fake.NewSimpleClientset(sa)
+	var saLists int
+	cs.PrependReactor("list", "serviceaccounts", func(ktesting.Action) (bool, runtime.Object, error) {
+		saLists++
+		return false, nil, nil
+	})
+	d := &Deps{CS: cs, Dyn: testhelp.NewDynamicClient()}
+	sweepCtx := WithSweepSnapshot(t.Context(), d)
+
+	gotAll, err := d.AllServiceAccounts(sweepCtx)
+	if err != nil || len(gotAll) != 1 {
+		t.Fatalf("AllServiceAccounts = (%d, %v), want (1, nil)", len(gotAll), err)
+	}
+	gotOne, err := d.ServiceAccount(sweepCtx, "apps", "worker")
+	if err != nil || gotOne == nil || gotOne.Name != "worker" {
+		t.Fatalf("ServiceAccount hit = (%v, %v), want worker", gotOne, err)
+	}
+	gotMiss, err := d.ServiceAccount(sweepCtx, "apps", "absent")
+	if err != nil || gotMiss != nil {
+		t.Fatalf("ServiceAccount miss = (%v, %v), want (nil, nil)", gotMiss, err)
+	}
+	if saLists != 1 {
+		t.Fatalf("serviceaccounts listed %d times, want 1", saLists)
+	}
+
+	d.InvalidateSweep(sweepCtx)
+	if _, err := d.ServiceAccount(sweepCtx, "apps", "worker"); err != nil {
+		t.Fatal(err)
+	}
+	if saLists != 2 {
+		t.Fatalf("serviceaccounts listed %d times after InvalidateSweep, want 2", saLists)
+	}
+}

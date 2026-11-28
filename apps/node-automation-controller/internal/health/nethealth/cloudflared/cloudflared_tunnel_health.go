@@ -227,7 +227,7 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		p.podsSeen[key] = string(pod.UID)
 		seenKeep[key] = true
 		sig := key + "/" + string(pod.UID)
-		if now.Sub(pod.CreationTimestamp.Time) < cfTunnelPodMinAge {
+		if age, ok := kube.AgeSince(pod.CreationTimestamp.Time, now); !ok || age < cfTunnelPodMinAge {
 			continue // young pod — the wedge evaluation waits it out
 		}
 		bad := false

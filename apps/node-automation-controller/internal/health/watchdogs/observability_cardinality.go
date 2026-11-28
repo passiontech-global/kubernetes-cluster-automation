@@ -110,8 +110,8 @@ func (p *observabilityPipelineCheck) evalCardinality(
 	var headMax float64
 	if len(headSeries) > 0 {
 		headMax = headSeries[0].Value
-		prometheusHeadSeriesGauge.Set(headMax)
 	}
+	prometheusHeadSeriesGauge.Set(headMax)
 	headBreached := len(headSeries) > 0 && headMax > p.cardCfg.headSeriesWarn
 
 	var growthMax float64

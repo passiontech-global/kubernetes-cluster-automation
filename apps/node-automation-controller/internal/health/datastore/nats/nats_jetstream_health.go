@@ -191,7 +191,7 @@ func (p *natsJetstreamHealthCheck) Run(ctx context.Context) probefw.Result {
 
 	var rep probefw.SweepReport
 	s := newNatsSweep(p, log, now, census, &rep)
-	if _, err := p.PromEndpoint(); err == nil {
+	if _, err := p.PromEndpointCtx(ctx); err == nil {
 		s.promSignals(ctx)
 	} else {
 		// No Prometheus endpoint — every prom-derived signal is

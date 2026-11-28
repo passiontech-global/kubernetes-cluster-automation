@@ -65,6 +65,20 @@ func (d *Deps) AllServices(ctx context.Context) ([]corev1.Service, error) {
 	})
 }
 
+// AllServiceAccounts is the ServiceAccount twin — shared across
+// imagepull-secret-auditor and sprawl's SA-token history GC so both
+// pay one cluster-wide list per sweep.
+func (d *Deps) AllServiceAccounts(ctx context.Context) ([]corev1.ServiceAccount, error) {
+	s := sweepSnap(ctx)
+	return s.serviceAccounts.get(func(bool) ([]corev1.ServiceAccount, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.ServiceAccounts(d.CS, metav1.NamespaceAll))
+	})
+}
+
 // AllNamespaces is the namespace twin.
 func (d *Deps) AllNamespaces(ctx context.Context) ([]corev1.Namespace, error) {
 	s := sweepSnap(ctx)

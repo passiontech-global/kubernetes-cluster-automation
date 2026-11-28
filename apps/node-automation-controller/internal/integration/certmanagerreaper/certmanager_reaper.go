@@ -104,6 +104,10 @@ type certManagerReaper struct {
 	// namespace per sweep instead of one Order List per cert
 	// candidate (same shape and lifecycle as crCache).
 	orderCache map[string]*orderIndex
+	// challengeCache: per-run ACME Challenge list cache keyed by
+	// namespace — reapCert and reapStuckCR share one Challenge list
+	// per namespace per sweep (same lifecycle as crCache).
+	challengeCache map[string]crListResult
 }
 
 // crListResult is the cached outcome of one namespace's CR List.
@@ -142,14 +146,16 @@ func (r *certManagerReaper) run(ctx context.Context) error {
 	r.armResets()
 	r.crCache = map[string]crListResult{}
 	r.orderCache = map[string]*orderIndex{}
+	r.challengeCache = map[string]crListResult{}
 	// Release the per-cycle caches when the sweep ends — they are
 	// rebuilt fresh next run, and between cycles they held every
-	// listed CertificateRequest/Order object pinned for the full
-	// 15-minute idle window. Deferred so an early list error
+	// listed CertificateRequest/Order/Challenge object pinned for the
+	// full 15-minute idle window. Deferred so an early list error
 	// releases them too.
 	defer func() {
 		r.crCache = nil
 		r.orderCache = nil
+		r.challengeCache = nil
 	}()
 	now := r.now.Now()
 

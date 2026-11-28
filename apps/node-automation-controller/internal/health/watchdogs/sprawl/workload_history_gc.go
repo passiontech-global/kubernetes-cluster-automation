@@ -474,9 +474,7 @@ func (p *apiObjectSprawlReportGCCheck) collectOrphanSATokenSecrets(
 	historyRep *probefw.SweepReport,
 ) ([]historyGCTarget, bool, error) {
 	saCache := map[string]ownerUIDLookup{}
-	var saUIDs map[string]types.UID
-	saListed := false
-	saListOK := false
+	saListWarned := false
 	var targets []historyGCTarget
 
 	err := kube.ListEach(ctx,
@@ -506,27 +504,13 @@ func (p *apiObjectSprawlReportGCCheck) collectOrphanSATokenSecrets(
 				cacheKey := s.Namespace + "/" + saName
 				ol, cached := saCache[cacheKey]
 				if !cached {
-					if !saListed {
-						saListed = true
-						sas, lerr := kube.ListAll(ctx,
-							metav1.ListOptions{
-								Limit:           probefw.HealthListPageSize,
-								ResourceVersion: "0",
-							},
-							kube.ServiceAccounts(p.CS, metav1.NamespaceAll))
-						if lerr == nil {
-							saListOK = true
-							saUIDs = make(map[string]types.UID, len(sas))
-							for j := range sas {
-								sa := &sas[j]
-								saUIDs[sa.Namespace+"/"+sa.Name] = sa.UID
-							}
-						} else {
-							log.V(1).Info("WARN: serviceaccount snapshot list failed — falling back to live get", "error", lerr)
-						}
+					saSnap, lerr := p.ServiceAccount(ctx, s.Namespace, saName)
+					if lerr != nil && !saListWarned {
+						saListWarned = true
+						log.V(1).Info("WARN: serviceaccount snapshot list failed — falling back to live get", "error", lerr)
 					}
-					if uid, ok := saUIDs[cacheKey]; saListOK && ok {
-						ol = ownerUIDLookup{uid: uid}
+					if lerr == nil && saSnap != nil {
+						ol = ownerUIDLookup{uid: saSnap.UID}
 					} else {
 						sa, gerr := p.CS.CoreV1().ServiceAccounts(s.Namespace).Get(ctx, saName, metav1.GetOptions{})
 						switch {

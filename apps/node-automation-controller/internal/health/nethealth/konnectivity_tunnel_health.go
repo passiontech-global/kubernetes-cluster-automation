@@ -176,7 +176,7 @@ func (p *konnectivityTunnelHealthCheck) Run(ctx context.Context) probefw.Result 
 		return rep.Result(&p.emitted, konnAgentHalfOpenGauge.DeleteLabelValues,
 			"konnectivity-agent pods with half-open tunnels: ", ", ")
 	}
-	if _, err := p.PromEndpoint(); err != nil {
+	if _, err := p.PromEndpointCtx(ctx); err != nil {
 		return carry("konnectivity prometheus endpoint unavailable", err)
 	}
 	series, err := p.PromQuery(ctx,

@@ -134,7 +134,7 @@ type logSignals struct {
 func (p *linkerdH2StreamGuardCheck) linkerdSuspectPods(
 	ctx context.Context, log logr.Logger) map[string]bool {
 
-	if _, err := p.PromEndpoint(); err != nil {
+	if _, err := p.PromEndpointCtx(ctx); err != nil {
 		return nil
 	}
 	// Family presence: any live tcp_close_total series proves the

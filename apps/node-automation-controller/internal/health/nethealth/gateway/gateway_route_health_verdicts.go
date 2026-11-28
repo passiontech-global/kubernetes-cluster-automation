@@ -263,7 +263,8 @@ func (p *gatewayRouteHealthCheck) loadNamespaceWorkloads(ctx context.Context,
 		// IsCRDAbsent (not meta.IsNoMatchError) also covers the
 		// fake-dynamic-client "no kind registered" shape the
 		// CRD-aware test client produces.
-		if !kube.IsCRDAbsent(err) {
+		if !kube.IsCRDAbsent(err) && !c.rolloutErrLogged {
+			c.rolloutErrLogged = true
 			metrics.IncError(p.Name)
 			log.Info("WARN: gateway route health — rollout census failed, downscaler verdict off",
 				"namespace", ns, "error", err)

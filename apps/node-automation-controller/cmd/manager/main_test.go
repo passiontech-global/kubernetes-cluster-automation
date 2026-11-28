@@ -31,6 +31,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // ---- subprocess tests for main() -------------------------------------
@@ -613,8 +614,8 @@ func TestValidateLoopbackBindAddr(t *testing.T) {
 		"localhost:9116",
 		"LOCALHOST:0",
 	} {
-		if err := validateLoopbackBindAddr(valid); err != nil {
-			t.Errorf("validateLoopbackBindAddr(%q) unexpected error: %v", valid, err)
+		if err := httpx.ValidateLoopbackAddr(valid); err != nil {
+			t.Errorf("httpx.ValidateLoopbackAddr(%q) unexpected error: %v", valid, err)
 		}
 	}
 	for _, invalid := range []string{
@@ -627,8 +628,8 @@ func TestValidateLoopbackBindAddr(t *testing.T) {
 		"127.0.0.1:",
 		"bad-address",
 	} {
-		if err := validateLoopbackBindAddr(invalid); err == nil {
-			t.Errorf("validateLoopbackBindAddr(%q) = nil, want rejection", invalid)
+		if err := httpx.ValidateLoopbackAddr(invalid); err == nil {
+			t.Errorf("httpx.ValidateLoopbackAddr(%q) = nil, want rejection", invalid)
 		}
 	}
 }

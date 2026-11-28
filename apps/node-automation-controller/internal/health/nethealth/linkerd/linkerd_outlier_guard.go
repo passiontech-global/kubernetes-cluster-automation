@@ -289,7 +289,7 @@ func (p *linkerdOutlierGuardCheck) Run(ctx context.Context) probefw.Result {
 		return done()
 	}
 
-	if _, err := p.PromEndpoint(); err != nil {
+	if _, err := p.PromEndpointCtx(ctx); err != nil {
 		return doneInconclusive()
 	}
 	// `rollout` MUST stay in the sum-by list: dropping it makes

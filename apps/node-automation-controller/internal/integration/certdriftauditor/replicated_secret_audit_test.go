@@ -331,11 +331,34 @@ func TestReplicateToMissingTargetsDetection(t *testing.T) {
 		t.Fatalf("target gauge did not clear after secret created: %v", got)
 	}
 
-	// Namespace list errors skip gracefully without failing run().
+	// Namespace list errors carry forward previously-emitted drift series
+	// and preserve streaks without failing run().
+	cs.PrependReactor("list", "namespaces", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("namespaces list unavailable")
+	})
+	// Re-arm ns-missing drift (delete the secret we just created and run 2 scans without reactor).
+	cs.ReactionChain = cs.ReactionChain[1:]
+	if err := cs.CoreV1().Secrets("ns-missing").Delete(ctx, "wildcard-tls", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := a.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := driftGauge("ns-missing", "wildcard-tls", "default/wildcard-tls"); got != 1 {
+		t.Fatalf("pre-outage missing target gauge = %v, want 1", got)
+	}
 	cs.PrependReactor("list", "namespaces", func(ktesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("namespaces list unavailable")
 	})
 	if err := a.run(ctx); err != nil {
 		t.Fatalf("namespaces list error broke run(): %v", err)
+	}
+	if got := driftGauge("ns-missing", "wildcard-tls", "default/wildcard-tls"); got != 1 {
+		t.Fatalf("namespaces list error pruned active drift gauge = %v, want 1 (carried forward)", got)
+	}
+	if got := a.replicationMismatch.Count("ns-missing/wildcard-tls/default/wildcard-tls"); got < 2 {
+		t.Fatalf("namespaces list error wiped replicationMismatch streak = %d, want >=2", got)
 	}
 }

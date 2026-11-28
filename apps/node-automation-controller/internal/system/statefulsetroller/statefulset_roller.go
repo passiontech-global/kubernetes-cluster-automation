@@ -53,7 +53,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/dynamic"
@@ -454,34 +453,22 @@ func (r *statefulSetOnDeleteRoller) rollOne(ctx context.Context,
 	// state), and a 409 (the UID precondition fired — the pod was
 	// recreated since ownedPods listed it). All three retry cleanly
 	// next sweep; only a genuine API failure is an error.
-	if _, refused, err := heal.EvictPod(ctx, r.cs, nil, "", candidate, now); refused {
+	if _, refused, notFound, err := heal.EvictPodNotFound(ctx, r.cs, nil, "", candidate, now); notFound {
+		// The pod is already gone — another actor finished the roll,
+		// the goal state — but OUR eviction never executed, so the
+		// gate's grant goes back (refund-on-skip).
 		heal.RefundGrant(now)
-		log.Info("DEFER: PDB refused eviction — roll retries next sweep",
+		log.Info("SKIP: candidate pod already gone — roll objective met",
+			"statefulset", sts.Namespace+"/"+sts.Name,
+			"pod", candidate.Name)
+		return false, nil
+	} else if refused {
+		heal.RefundGrant(now)
+		log.Info("DEFER: eviction deferred (PDB/UID conflict/hold) — roll retries next sweep",
 			"statefulset", sts.Namespace+"/"+sts.Name,
 			"pod", candidate.Name)
 		return false, nil
 	} else if err != nil {
-		switch {
-		case apierrors.IsNotFound(err):
-			// The pod is already gone — another actor finished the
-			// roll, the goal state — but OUR eviction never
-			// executed, so the gate's grant goes back (refund-on-
-			// skip: no delete/patch/eviction actually ran).
-			heal.RefundGrant(now)
-			log.Info("SKIP: candidate pod already gone — roll objective met",
-				"statefulset", sts.Namespace+"/"+sts.Name,
-				"pod", candidate.Name)
-			return false, nil
-		case apierrors.IsConflict(err):
-			// The UID precondition fired — the pod was recreated
-			// since ownedPods listed it, so this eviction mutated
-			// nothing. Same refund-on-skip contract as the 404.
-			heal.RefundGrant(now)
-			log.Info("SKIP: candidate pod recreated since the list — UID precondition fired",
-				"statefulset", sts.Namespace+"/"+sts.Name,
-				"pod", candidate.Name)
-			return false, nil
-		}
 		return false, fmt.Errorf("evict pod %s/%s: %w", sts.Namespace, candidate.Name, err)
 	}
 	metrics.StatefulSetOnDeletePodsRolledTotal.

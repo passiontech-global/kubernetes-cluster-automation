@@ -348,8 +348,7 @@ func (r *corednsPatcher) Reconcile(ctx context.Context, _ reconcile.Request) (ct
 // release itself is the skeleton's spec patch above). Both keys go in
 // one patch so a crash between them can never leave a half stamp.
 func (r *corednsPatcher) clearExpiredBoost(ctx context.Context, now time.Time) error {
-	dep, err := r.cs.AppsV1().Deployments("kube-system").
-		Get(ctx, "coredns", metav1.GetOptions{})
+	dep, err := kube.GetDeploymentCached(ctx, r.reader, r.cs, "kube-system", "coredns")
 	switch {
 	case apierrors.IsNotFound(err):
 		return nil // cluster without this k0s addon
@@ -363,6 +362,27 @@ func (r *corednsPatcher) clearExpiredBoost(ctx context.Context, now time.Time) e
 	until, ok := kube.ParseAnnoTime(raw)
 	if !ok || now.Before(until) {
 		return nil // unreadable stamp is treated as no stamp; live window stays
+	}
+	// Confirm on the direct clientset before patching when the initial check
+	// read from the informer cache, so a concurrent stamp clear or update is
+	// never overwritten from a slightly stale watch view.
+	if r.reader != nil {
+		dep, err = r.cs.AppsV1().Deployments("kube-system").
+			Get(ctx, "coredns", metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			return nil
+		case err != nil:
+			return fmt.Errorf("confirm coredns for boost stamp cleanup: %w", err)
+		}
+		raw, stamped = kube.EffectiveAnnos(ctx, dep)[kube.AnnoCoreDNSBoostUntil]
+		if !stamped || raw == "" {
+			return nil
+		}
+		until, ok = kube.ParseAnnoTime(raw)
+		if !ok || now.Before(until) {
+			return nil
+		}
 	}
 	payload, err := kube.MergePatchAnnos(map[string]any{
 		kube.AnnoCoreDNSBoostUntil: nil,

@@ -190,11 +190,8 @@ func (r *certManagerReaper) reapCert(ctx context.Context, cert *unstructured.Uns
 		return false
 	}
 
-	chals, err := kube.ListAllUnstructured(ctx,
-		r.dyn.Resource(challengeGVR).Namespace(ns),
-		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+	chals, err := r.listChallenges(ctx, ns)
 	if err != nil {
-		metrics.IncError(r.queue)
 		log.Error(err, "challenge list failed", "cert", key)
 		return false
 	}

@@ -292,7 +292,7 @@ func (c *ingressNginxRetirementGuardCheck) emitRetirementEvent(
 		return
 	}
 	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:              fmt.Sprintf("%s.%x", sanitizeEventNamePrefix(cooldownKey), now.UnixNano()),
+		Name:              kube.TruncatedEventName(cooldownKey, cooldownKey, now),
 		Namespace:         eventNS,
 		Regarding:         regarding,
 		Reason:            ingressNginxEventReason,

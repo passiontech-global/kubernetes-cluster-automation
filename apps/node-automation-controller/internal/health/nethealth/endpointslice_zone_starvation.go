@@ -29,11 +29,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -266,18 +268,26 @@ func (p *endpointSliceZoneStarvationCheck) stripConflictingTopologyMode(
 		return
 	}
 	key := "topology-mode-strip:" + svc.Namespace + "/" + svc.Name
-	proceed, _ := heal.AllowedV(ctx, log, p.Maintenance, p.CS, p.Dyn,
-		&p.Heals, key, topologyModeStripCooldown, now)
+	proceed, unverifiable := p.HealAllowed(ctx, log, &p.Heals, key,
+		topologyModeStripCooldown, now)
+	if unverifiable {
+		metrics.IncError(p.Name)
+		return
+	}
 	if !proceed {
 		return
 	}
 	patch := []byte(`{"metadata":{"annotations":{"service.kubernetes.io/topology-mode":null}}}`)
 	if _, err := p.CS.CoreV1().Services(svc.Namespace).Patch(
 		ctx, svc.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		if apierrors.IsForbidden(err) || apierrors.IsNotFound(err) {
+			heal.RefundGrant(now)
+		}
 		log.Error(err, "strip conflicting topology-mode annotation failed",
 			"service", svc.Namespace+"/"+svc.Name)
 		return
 	}
+	kube.RecordAnnoPatch(ctx, svc, patch)
 	p.Heals.Stamp(key, now)
 	log.Info("stripped legacy service.kubernetes.io/topology-mode annotation conflicting with spec.trafficDistribution",
 		"service", svc.Namespace+"/"+svc.Name,

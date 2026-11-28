@@ -162,7 +162,7 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 				"node", name)
 			continue
 		}
-		if nodecond.EvaluateCoord(n.Annotations, nodeTaintKeys(n), now).Active {
+		if nodecond.EvaluateCoord(kube.EffectiveAnnos(ctx, n), nodeTaintKeys(n), now).Active {
 			log.Info("DEFER: node under maintenance/kured lock — overload shed deferred",
 				"node", name)
 			continue

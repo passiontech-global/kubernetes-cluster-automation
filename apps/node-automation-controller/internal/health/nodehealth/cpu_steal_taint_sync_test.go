@@ -365,3 +365,24 @@ func TestCPUStealPatchInvalidatesNodesOnly(t *testing.T) {
 		}
 	})
 }
+
+func TestCPUStealZeroLastTransitionTimeDoesNotTaint(t *testing.T) {
+	w1 := testutil.Node("w1", corev1.ConditionTrue, nil)
+	w1.Status.Conditions = append(w1.Status.Conditions, corev1.NodeCondition{
+		Type:              cpuStealCond,
+		Status:            corev1.ConditionTrue,
+		LastHeartbeatTime: metav1.NewTime(time.Now()),
+		// LastTransitionTime intentionally zero — must not read as ~290y old.
+	})
+	w2 := testutil.Node("w2", corev1.ConditionTrue, nil)
+	w3 := testutil.Node("w3", corev1.ConditionTrue, nil)
+	cs := fake.NewSimpleClientset(w1, w2, w3)
+	p := testProber(cs)
+	res := probetest.MustCheck[*cpuStealTaintSyncCheck](t, p).Run(probetest.SweepCtx(ctx, p.Deps))
+	if !res.Pass {
+		t.Fatalf("zero LastTransitionTime must not trigger failure/taint: %+v", res)
+	}
+	if kube.HasTaint(testutil.GetNode(t, cs, "w1").Spec.Taints, kube.TaintCPUSteal) {
+		t.Fatal("node with zero LastTransitionTime was tainted")
+	}
+}

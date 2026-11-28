@@ -277,3 +277,44 @@ func TestCiliumL2LeaseGuardAgentStreakPrunesGoneNodes(t *testing.T) {
 		t.Fatalf("present node streak must survive and accumulate, got %d", got)
 	}
 }
+
+// During a maxSurge RollingUpdate a node briefly hosts both a Ready
+// old cilium-agent pod and a NotReady new pod. Regardless of pod slice
+// order, the node has a Ready agent so its streak must stay 0.
+func TestCiliumL2LeaseGuardMaxSurgeDeterminism(t *testing.T) {
+	makeAgent := func(name string, ready bool) *corev1.Pod {
+		p := probetest.PodWithPhase("kube-system", name, corev1.PodRunning, ready, time.Hour)
+		p.Labels = map[string]string{"k8s-app": "cilium"}
+		p.Spec.NodeName = "w-surge"
+		return p
+	}
+	for _, tc := range []struct {
+		name     string
+		readyPod string
+		surgePod string
+	}{
+		{"ready-then-notready", "cilium-aaa", "cilium-zzz"},
+		{"notready-then-ready", "cilium-zzz", "cilium-aaa"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := l2Node("w-surge", false, false, false, false)
+			cs := fake.NewSimpleClientset(
+				l2Lease("cilium-l2announce-web_apps", "w-surge"),
+				node,
+				makeAgent(tc.readyPod, true),
+				makeAgent(tc.surgePod, false),
+			)
+			p := testProber(cs)
+			chk := probetest.MustCheck[*ciliumL2LeaseGuardCheck](t, p)
+			for range 3 {
+				res := chk.Run(probetest.SweepCtx(ctx, chk.Deps))
+				if !res.Pass {
+					t.Fatalf("maxSurge node with ready agent flagged: %+v", res)
+				}
+				if got := chk.agentNotReadyStreak.Count("w-surge"); got != 0 {
+					t.Fatalf("maxSurge streak = %d, want 0", got)
+				}
+			}
+		})
+	}
+}

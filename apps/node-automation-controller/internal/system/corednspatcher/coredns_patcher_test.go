@@ -1,6 +1,7 @@
 package corednspatcher
 
 import (
+	"context"
 	json "encoding/json/v2"
 	"errors"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -1245,5 +1247,34 @@ func TestCoreDNSEffectiveReplicas(t *testing.T) {
 				t.Fatalf("corednsEffectiveReplicas = %d, want %d", got, tc.wantReplicas)
 			}
 		})
+	}
+}
+
+type stubCoreDNSReader struct {
+	dep *appsv1.Deployment
+}
+
+func (s stubCoreDNSReader) Get(_ context.Context, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	out := obj.(*appsv1.Deployment)
+	*out = *s.dep.DeepCopy()
+	return nil
+}
+
+func TestClearExpiredBoostUsesCachedReaderInSteadyState(t *testing.T) {
+	cs := fake.NewSimpleClientset(corednsDeploy("DoNotSchedule", 2))
+	var gets int
+	cs.PrependReactor("get", "deployments", func(ktesting.Action) (bool, runtime.Object, error) {
+		gets++
+		return false, nil, nil
+	})
+	r := &corednsPatcher{
+		cs:     cs,
+		reader: stubCoreDNSReader{dep: corednsDeploy("DoNotSchedule", 2)},
+	}
+	if err := r.clearExpiredBoost(t.Context(), time.Now()); err != nil {
+		t.Fatalf("clearExpiredBoost steady-state: %v", err)
+	}
+	if gets != 0 {
+		t.Fatalf("steady-state clearExpiredBoost issued %d direct Deployment GETs, want 0", gets)
 	}
 }

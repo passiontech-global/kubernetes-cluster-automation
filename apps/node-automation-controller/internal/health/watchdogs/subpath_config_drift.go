@@ -507,6 +507,9 @@ func subPathReferencedObjects(podSpec *corev1.PodSpec) (cms, secs []string) {
 func subPathFreshPods(w subPathWorkload, pods []*corev1.Pod,
 	driftStart time.Time) (bool, int) {
 
+	if len(w.template) == 0 {
+		return false, 0
+	}
 	sel := labels.SelectorFromSet(w.template)
 	total, fresh := 0, 0
 	for _, p := range pods {

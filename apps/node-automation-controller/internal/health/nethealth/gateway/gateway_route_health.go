@@ -35,7 +35,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -455,8 +454,8 @@ func (p *gatewayRouteHealthCheck) maybeBounceGatewayController(ctx context.Conte
 		return
 	}
 	ck := probefw.SelfHealKey(CheckNameGatewayRouteHealth, "gw-controller/"+kube.PodControllerKey(target))
-	proceed, unverifiable, evicted, refused, err := heal.EvictPodV(
-		ctx, log, p.Maintenance, p.CS, p.Dyn, &p.Heals, ck, gwControllerHealCooldown, target, now)
+	proceed, unverifiable, evicted, refused, err := p.EvictPodV(
+		ctx, log, &p.Heals, ck, gwControllerHealCooldown, target, now)
 	if !proceed {
 		if unverifiable {
 			metrics.IncError(p.Name)

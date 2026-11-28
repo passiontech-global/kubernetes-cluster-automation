@@ -358,7 +358,7 @@ func (a *veleroBackupAuditor) cleanWedgedTransfer(ctx context.Context,
 			log.Error(derr, "node-agent bounce failed",
 				"pod", agent.Namespace+"/"+agent.Name)
 			metrics.IncError(a.queue)
-			return false, false
+			return objDeleted, false
 		} else if bounced {
 			podBounced = true
 			metrics.VeleroWedgedObjectsCleanedTotal.

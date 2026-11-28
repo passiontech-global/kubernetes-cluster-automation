@@ -142,9 +142,15 @@ type apiServiceSnapshot struct {
 // takeSnapshot lists the shared APIService set once — see
 // apiServiceSnapshot.
 func (g *apiServiceGuard) takeSnapshot(ctx context.Context) *apiServiceSnapshot {
-	items, err := kube.ListAll(ctx,
-		metav1.ListOptions{Limit: apiServiceListPageSize, ResourceVersion: "0"},
-		kube.DynamicPage(g.dyn.Resource(apiServiceGVR)))
+	var items []unstructured.Unstructured
+	var err error
+	if g.dyn == nil {
+		err = errors.New("dynamic client nil")
+	} else {
+		items, err = kube.ListAll(ctx,
+			metav1.ListOptions{Limit: apiServiceListPageSize, ResourceVersion: "0"},
+			kube.DynamicPage(g.dyn.Resource(apiServiceGVR)))
+	}
 	nss, nsErr := kube.ListAll(ctx,
 		metav1.ListOptions{Limit: apiServiceListPageSize, ResourceVersion: "0"},
 		kube.Namespaces(g.cs))

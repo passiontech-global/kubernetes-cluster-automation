@@ -203,7 +203,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		if pod.DeletionTimestamp != nil || pod.Spec.HostNetwork ||
 			pod.Spec.NodeName == "" ||
 			pod.Status.Phase != corev1.PodRunning ||
-			now.Sub(pod.CreationTimestamp.Time) < ciliumCEPPodMinAge {
+			!kube.AgeAtLeast(pod.CreationTimestamp.Time, now, ciliumCEPPodMinAge) {
 			continue
 		}
 		key := pod.Namespace + "/" + pod.Name
@@ -240,7 +240,7 @@ func (p *ciliumMissingEndpointsCheck) Run(ctx context.Context) probefw.Result {
 		// check's earlier delete or the DaemonSet's own
 		// reschedule) — its informer resync covers the node's
 		// missing CEPs; bouncing it again just churns.
-		if now.Sub(agent.CreationTimestamp.Time) < ciliumAgentFreshMinAge {
+		if age, ok := kube.AgeSince(agent.CreationTimestamp.Time, now); !ok || age < ciliumAgentFreshMinAge {
 			agentHealed[node] = true
 			continue
 		}

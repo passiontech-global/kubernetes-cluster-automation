@@ -374,7 +374,7 @@ func (c *draClaimWedgeGuardCheck) emitClaimEvent(
 		return
 	}
 	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      fmt.Sprintf("%s.%x", sanitizeNodeHealthEventPrefix(cooldownKey), now.UnixNano()),
+		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
 		Namespace: claim.Namespace,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "resource.k8s.io/v1",
@@ -477,7 +477,7 @@ func (c *draClaimWedgeGuardCheck) clearReservedFor(
 
 	c.Heals.Stamp(ck, now)
 	draClaimHealsTotal.WithLabelValues("clear_reserved_for").Inc()
-	c.InvalidateUnstructured(ctx)
+	c.InvalidateUnstructuredGVR(ctx, kube.GVRResourceClaim)
 	log.Info("PATCH: cleared dead status.reservedFor on wedged ResourceClaim", "claim", claimKey)
 	return true
 }
@@ -560,35 +560,4 @@ func hasDRAToken(s string) bool {
 		}
 	}
 	return false
-}
-
-func sanitizeNodeHealthEventPrefix(s string) string {
-	s = strings.ToLower(s)
-	rawLabels := strings.Split(s, ".")
-	var cleanLabels []string
-	for _, raw := range rawLabels {
-		var b strings.Builder
-		b.Grow(len(raw))
-		prevDash := false
-		for i := 0; i < len(raw); i++ {
-			ch := raw[i]
-			if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
-				b.WriteByte(ch)
-				prevDash = false
-				continue
-			}
-			if b.Len() > 0 && !prevDash {
-				b.WriteByte('-')
-				prevDash = true
-			}
-		}
-		lbl := strings.Trim(b.String(), "-")
-		if lbl != "" {
-			cleanLabels = append(cleanLabels, lbl)
-		}
-	}
-	if len(cleanLabels) == 0 {
-		return "event"
-	}
-	return strings.Join(cleanLabels, ".")
 }

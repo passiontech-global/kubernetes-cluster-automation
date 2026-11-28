@@ -7,6 +7,8 @@ package kube
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"strings"
 	"time"
 
@@ -15,6 +17,74 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
+
+// AgeSince returns (now.Sub(t), true) when t is non-zero, or (0, false)
+// when t is zero (missing CreationTimestamp / LastTransitionTime). Using
+// AgeSince prevents a zero timestamp from reading as ~290 years old and
+// bypassing min-age / persistence windows.
+func AgeSince(t, now time.Time) (time.Duration, bool) {
+	if t.IsZero() {
+		return 0, false
+	}
+	return now.Sub(t), true
+}
+
+// AgeAtLeast reports whether t is non-zero and at least minAge old at now.
+func AgeAtLeast(t, now time.Time, minAge time.Duration) bool {
+	return !t.IsZero() && now.Sub(t) >= minAge
+}
+
+// TruncatedEventName formats an RFC-1123-valid Kubernetes Event name
+// ("<sanitized-prefix>.<8-hex-hash>.<unix-nano-hex>") guaranteed to stay
+// within the 253-character subdomain limit and 63-character label limit.
+// uniqueKey is hashed so two long names that share the same truncated
+// prefix never collide.
+func TruncatedEventName(prefix, uniqueKey string, now time.Time) string {
+	const maxPrefix = 215
+	clean := sanitizeEventNamePrefix(prefix)
+	if len(clean) > maxPrefix {
+		clean = strings.TrimRight(clean[:maxPrefix], ".-")
+		if clean == "" {
+			clean = "event"
+		}
+	}
+	sum := sha256.Sum256([]byte(uniqueKey))
+	return fmt.Sprintf("%s.%x.%x", clean, sum[:4], now.UnixNano())
+}
+
+func sanitizeEventNamePrefix(s string) string {
+	s = strings.ToLower(s)
+	rawLabels := strings.Split(s, ".")
+	cleanLabels := make([]string, 0, len(rawLabels))
+	for _, raw := range rawLabels {
+		var b strings.Builder
+		b.Grow(len(raw))
+		prevDash := false
+		for i := 0; i < len(raw); i++ {
+			c := raw[i]
+			if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+				b.WriteByte(c)
+				prevDash = false
+				continue
+			}
+			if b.Len() > 0 && !prevDash {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+		lbl := strings.Trim(b.String(), "-")
+		if len(lbl) > 63 {
+			lbl = strings.TrimRight(lbl[:63], "-")
+		}
+		if lbl != "" {
+			cleanLabels = append(cleanLabels, lbl)
+		}
+	}
+	if len(cleanLabels) == 0 {
+		return "event"
+	}
+	return strings.Join(cleanLabels, ".")
+}
 
 // PreemptedEventReason is the scheduler's domino-eviction signal: a
 // high-PriorityClass pod that cannot land directly evicts lower-
@@ -161,6 +231,23 @@ func clipEventField(s string, max int) string {
 // shortened segment before re-attaching the suffix (also when the
 // suffix alone already exhausts the budget).
 func clipEventName(name string, max int) string {
+	// First enforce RFC-1123's 63-character limit on every DNS label:
+	// an event name under 253 bytes total still fails 422 Invalid if any
+	// single dot-separated segment exceeds 63 bytes.
+	if hasOverlongLabel(name, 63) {
+		labels := strings.Split(name, ".")
+		for i, lbl := range labels {
+			if len(lbl) > 63 {
+				sum := sha256.Sum256([]byte(lbl))
+				cut := strings.TrimRight(strings.ToValidUTF8(lbl[:54], ""), "-")
+				if cut == "" {
+					cut = "lbl"
+				}
+				labels[i] = fmt.Sprintf("%s-%x", cut, sum[:4])
+			}
+		}
+		name = strings.Join(labels, ".")
+	}
 	if len(name) <= max {
 		return name
 	}
@@ -182,6 +269,19 @@ func clipEventName(name string, max int) string {
 		base = "event"
 	}
 	return base + suffix
+}
+
+func hasOverlongLabel(s string, maxLabel int) bool {
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == '.' {
+			if i-start > maxLabel {
+				return true
+			}
+			start = i + 1
+		}
+	}
+	return false
 }
 
 func allDigits(s string) bool {

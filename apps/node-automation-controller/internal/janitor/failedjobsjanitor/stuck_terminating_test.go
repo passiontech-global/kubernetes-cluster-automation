@@ -491,3 +491,36 @@ func TestFailedPodOnDeadNode(t *testing.T) {
 		})
 	}
 }
+
+func TestPVCCensusSharesNamespacePodScanAcrossPVCsAndPVs(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		stReadyNode("n-ready", corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionTrue}),
+		stReadyNode("n-dead", corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionFalse}),
+		stClaimPod("apps", "p-dead", "n-dead", corev1.PodFailed, corev1.Volume{
+			Name: "d",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "pvc-a"},
+			},
+		}),
+	)
+	var podLists atomic.Int32
+	cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		podLists.Add(1)
+		return false, nil, nil
+	})
+	j := &failedJobsJanitor{cs: cs}
+	census := &pvcCensus{}
+
+	if pod, err, cached := j.failedPodOnDeadNodeWithCensus(ctx, census, "apps", "pvc-a"); err != nil || pod != "p-dead" || cached {
+		t.Fatalf("first dead-node scan = (%q, %v, cached=%v), want (p-dead, nil, false)", pod, err, cached)
+	}
+	if pod, err, cached := j.failedPodOnDeadNodeWithCensus(ctx, census, "apps", "pvc-b"); err != nil || pod != "" || !cached {
+		t.Fatalf("second dead-node scan = (%q, %v, cached=%v), want (\"\", nil, true)", pod, err, cached)
+	}
+	if inUse, err, cached := j.clusterPodUsesClaimRefWithCensus(ctx, &corev1.ObjectReference{Namespace: "apps", Name: "pvc-a"}, census); err != nil || !inUse || !cached {
+		t.Fatalf("PV claimRef scan = (%v, %v, cached=%v), want (true, nil, true)", inUse, err, cached)
+	}
+	if got := podLists.Load(); got != 1 {
+		t.Fatalf("Pod list calls = %d, want 1 across 3 probes sharing pvcCensus", got)
+	}
+}

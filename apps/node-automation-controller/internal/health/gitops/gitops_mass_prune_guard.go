@@ -16,7 +16,6 @@ package gitops
 
 import (
 	"context"
-	"crypto/sha256"
 	json "encoding/json/v2"
 	"fmt"
 	"strings"
@@ -34,6 +33,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -265,7 +265,7 @@ func (c *gitopsMassPruneGuardCheck) emitAnomalyEvent(
 		evNS = "default"
 	}
 	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      massPruneEventName(kind, ns, name, now),
+		Name:      kube.TruncatedEventName("mass-prune."+kind+"."+ns+"."+name, kind+"/"+ns+"/"+name, now),
 		Namespace: evNS,
 		Regarding: corev1.ObjectReference{
 			APIVersion: u.GetAPIVersion(),
@@ -319,6 +319,7 @@ func (c *gitopsMassPruneGuardCheck) maybeSuspendKustomization(
 		},
 	})
 	if err != nil {
+		heal.RefundGrant(now)
 		metrics.IncError(c.Name)
 		return false
 	}
@@ -326,9 +327,11 @@ func (c *gitopsMassPruneGuardCheck) maybeSuspendKustomization(
 		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 		switch {
 		case apierrors.IsForbidden(err):
+			heal.RefundGrant(now)
 			log.V(1).Info("WARN: Flux Kustomization mass-prune suspend forbidden (RBAC pending)",
 				"object", ns+"/"+name)
 		case kube.IsCRDAbsent(err):
+			heal.RefundGrant(now)
 			log.V(1).Info("WARN: Flux Kustomization mass-prune suspend target not found (404)",
 				"object", ns+"/"+name, "error", err)
 			return true
@@ -340,7 +343,7 @@ func (c *gitopsMassPruneGuardCheck) maybeSuspendKustomization(
 	}
 	c.suspendHealed.Stamp(ck, now)
 	kube.RecordAnnoPatch(ctx, u, patch)
-	c.InvalidateUnstructured(ctx)
+	c.InvalidateUnstructuredGVR(ctx, kube.GVRFluxKustomization)
 	gitopsMassPruneSuspendsTotal.WithLabelValues("Kustomization").Inc()
 	log.Info("ACTION: suspended Flux Kustomization via mass-prune circuit breaker",
 		"object", ns+"/"+name)
@@ -370,51 +373,4 @@ func isRenderOrSourceErrToken(s string) bool {
 	return strings.Contains(s, "artifactfailed") ||
 		strings.Contains(s, "comparisonerror") ||
 		strings.Contains(s, "sourceerror")
-}
-
-func massPruneEventName(kind, ns, name string, now time.Time) string {
-	const maxPrefix = 220
-	prefix := sanitizeMassPruneEventPrefix("mass-prune." + kind + "." + ns + "." + name)
-	if len(prefix) > maxPrefix {
-		prefix = strings.TrimRight(prefix[:maxPrefix], ".-")
-		if prefix == "" {
-			prefix = "mass-prune"
-		}
-	}
-	sum := sha256.Sum256([]byte(kind + "/" + ns + "/" + name))
-	return fmt.Sprintf("%s.%x.%x", prefix, sum[:4], now.UnixNano())
-}
-
-func sanitizeMassPruneEventPrefix(s string) string {
-	s = strings.ToLower(s)
-	rawLabels := strings.Split(s, ".")
-	cleanLabels := make([]string, 0, len(rawLabels))
-	for _, raw := range rawLabels {
-		var b strings.Builder
-		b.Grow(len(raw))
-		prevDash := false
-		for i := 0; i < len(raw); i++ {
-			c := raw[i]
-			if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-				b.WriteByte(c)
-				prevDash = false
-				continue
-			}
-			if b.Len() > 0 && !prevDash {
-				b.WriteByte('-')
-				prevDash = true
-			}
-		}
-		lbl := strings.Trim(b.String(), "-")
-		if len(lbl) > 63 {
-			lbl = strings.TrimRight(lbl[:63], "-")
-		}
-		if lbl != "" {
-			cleanLabels = append(cleanLabels, lbl)
-		}
-	}
-	if len(cleanLabels) == 0 {
-		return "mass-prune"
-	}
-	return strings.Join(cleanLabels, ".")
 }

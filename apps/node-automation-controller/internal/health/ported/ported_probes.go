@@ -273,7 +273,7 @@ func (p *podStatusCheck) Run(ctx context.Context) probefw.Result {
 	var bad []string
 	for i := range pods {
 		pod := pods[i]
-		if p.Now().Sub(pod.CreationTimestamp.Time) < p.cfg.SkipDuration {
+		if age, ok := kube.AgeSince(pod.CreationTimestamp.Time, p.Now()); !ok || age < p.cfg.SkipDuration {
 			continue // too young — still allowed to be Pending
 		}
 		if pod.Status.Phase != corev1.PodRunning &&

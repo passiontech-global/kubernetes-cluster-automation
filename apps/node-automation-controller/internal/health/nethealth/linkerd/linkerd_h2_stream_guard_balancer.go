@@ -336,7 +336,7 @@ func (p *linkerdH2StreamGuardCheck) scanOutboundBalancers(
 	// resolves — same "no endpoint configured, skip" gate the other
 	// metrics-backed signals use (PromQuery would resolve-and-fail
 	// the same way, this just skips the noise).
-	if _, err := p.PromEndpoint(); err != nil {
+	if _, err := p.PromEndpointCtx(ctx); err != nil {
 		return
 	}
 

@@ -912,3 +912,20 @@ func TestCertNameForCR(t *testing.T) {
 
 // Package-wide test context shared by this package's _test files.
 var ctx = context.Background()
+
+func TestCertManagerReaperCachesChallengesPerNamespace(t *testing.T) {
+	objs := append(stuckFixture("app", "tls-a", "order-a"), stuckFixture("app", "tls-b", "order-b")...)
+	dyn := testutil.NewDynamicClient(objs...)
+	var challengeLists int
+	dyn.PrependReactor("list", "challenges", func(clienttesting.Action) (bool, runtime.Object, error) {
+		challengeLists++
+		return false, nil, nil
+	})
+	r := &certManagerReaper{dyn: dyn, queue: "certmanager-reaper", resets: map[string]*certReset{}}
+	if err := r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if challengeLists != 1 {
+		t.Fatalf("challenges listed %d times for two certs in same namespace, want 1", challengeLists)
+	}
+}

@@ -223,7 +223,7 @@ func (p *olmHealthCheck) autoPatchOperatorCSVs(ctx context.Context,
 		p.csvPatched.Stamp(key, now) // delivered-only contract
 		// The CSV spec changed — later checks must not evaluate the
 		// pre-patch unstructured snapshot.
-		p.InvalidateUnstructured(ctx)
+		p.InvalidateUnstructuredGVR(ctx, olmCSVGVR)
 		log.Info("PATCH: olm csv durable spec patch re-applied",
 			"csv", csv.GetNamespace()+"/"+csv.GetName())
 	}

@@ -132,8 +132,8 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	base := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
 
 	t.Run("stuck_inprogress_emits_metric_event_and_bounces_wedged_velero_pod", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-fallback-ct")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-fallback-ct")
 		r1 := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		// Fallback to creationTimestamp when startTimestamp is absent.
 		r2 := veleroRestore("velero", "r-fallback-ct", "InProgress", time.Time{}, base.Add(-8*time.Hour))
@@ -198,9 +198,9 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("fresh_inprogress_or_terminal_restore_ignored", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-fresh")
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-done")
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-fail")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-fresh")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-done")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-fail")
 		rFresh := veleroRestore("velero", "r-fresh", "InProgress", base.Add(-2*time.Hour), base.Add(-2*time.Hour))
 		rDone := veleroRestore("velero", "r-done", "Completed", base.Add(-10*time.Hour), base.Add(-10*time.Hour))
 		rFail := veleroRestore("velero", "r-fail", "Failed", base.Add(-10*time.Hour), base.Add(-10*time.Hour))
@@ -230,7 +230,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("recently_restarted_ready_velero_pod_not_bounced", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 		r := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		srv := veleroServerPod("velero", "velero-fresh", base.Add(-1*time.Hour), true, true)
 		cs := kfake.NewSimpleClientset(srv)
@@ -255,7 +255,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("unready_velero_pod_bounced", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 		r := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		srv := veleroServerPod("velero", "velero-unready", base.Add(-1*time.Hour), false, true)
 		cs := kfake.NewSimpleClientset(srv)
@@ -273,7 +273,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("cooldown_prevents_second_bounce_and_event_deduped", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 		r := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		srv1 := veleroServerPod("velero", "velero-1", base.Add(-24*time.Hour), true, true)
 		cs := kfake.NewSimpleClientset(srv1)
@@ -324,7 +324,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("maintenance_hold_defers_bounce_keeps_metric", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 		r := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		srv := veleroServerPod("velero", "velero-0", base.Add(-24*time.Hour), true, true)
 		plan := &unstructured.Unstructured{Object: map[string]any{
@@ -370,7 +370,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("maintenance_unverifiable_incerrors_and_defers", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 		r := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		srv := veleroServerPod("velero", "velero-0", base.Add(-24*time.Hour), true, true)
 		cs := kfake.NewSimpleClientset(srv)
@@ -398,7 +398,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	t.Run("pdb_429_refusal_refunds_budget_and_skips_cooldown", func(t *testing.T) {
 		t.Cleanup(func() { heal.ConfigureBudget(0, 0) })
 		heal.ConfigureBudget(1, time.Hour)
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 
 		r := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		srv := veleroServerPod("velero", "velero-0", base.Add(-24*time.Hour), true, true)
@@ -429,7 +429,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("restore_crd_absent_404_auto_skips_and_prunes", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 		r := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		dyn := newDynFake(r)
 		a := newVeleroAuditor(dyn, base)
@@ -454,7 +454,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("restore_list_error_preserves_series_and_returns_err", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 		r := veleroRestore("velero", "r-stuck", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		dyn := newDynFake(r)
 		a := newVeleroAuditor(dyn, base)
@@ -475,7 +475,7 @@ func TestVeleroAuditorRestoreAudit(t *testing.T) {
 	})
 
 	t.Run("recovery_clears_restore_metric", func(t *testing.T) {
-		testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-recover")
+		testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-recover")
 		r := veleroRestore("velero", "r-recover", "InProgress", base.Add(-7*time.Hour), base.Add(-7*time.Hour))
 		dyn := newDynFake(r)
 		a := newVeleroAuditor(dyn, base)
@@ -506,7 +506,7 @@ func TestVeleroAuditorRestorePreservesBackupPVBAndPVR(t *testing.T) {
 	testutil.CleanupMetric(t, metrics.VeleroBackupStuck, "velero", "b-stuck")
 	testutil.CleanupMetric(t, metrics.VeleroPodVolumeBackupWedged, "app", "pvb-wedged")
 	testutil.CleanupMetric(t, metrics.VeleroPodVolumeRestoreWedged, "app", "pvr-wedged")
-	testutil.CleanupMetric(t, veleroRestoreStuckGauge, "velero", "r-stuck")
+	testutil.CleanupMetric(t, metrics.VeleroRestoreStuck, "velero", "r-stuck")
 
 	sched := veleroSchedule("velero", "daily", false, time.Hour)
 	backup := veleroBackup("velero", "b-stuck", "daily", "InProgress", 7*time.Hour, 0, 0, 0, 0)

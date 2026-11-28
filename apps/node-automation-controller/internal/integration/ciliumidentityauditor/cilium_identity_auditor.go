@@ -188,10 +188,13 @@ func (a *ciliumIdentityAuditor) run(ctx context.Context) error {
 		metav1.ListOptions{Limit: kube.DefaultListPageSize},
 		kube.DynamicPage(a.dyn.Resource(ciliumIdentityGVR)),
 		func(page []unstructured.Unstructured) error {
+			profilePage := totalIDs+len(page) > ciliumActiveIdentityWarn
 			for i := range page {
 				id := &page[i]
 				totalIDs++
-				profiler.observe(id)
+				if profilePage {
+					profiler.observe(id)
+				}
 				if reservedIdentity(id) {
 					continue
 				}

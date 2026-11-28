@@ -35,6 +35,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -250,6 +251,8 @@ func (p *ciliumL2LeaseGuardCheck) ciliumAgentStreak(
 	for i := range nodes {
 		onNode[nodes[i].Name] = true
 	}
+	nodeHasReadyAgent := map[string]bool{}
+	nodeHasAgent := map[string]bool{}
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Namespace != "kube-system" ||
@@ -268,11 +271,17 @@ func (p *ciliumL2LeaseGuardCheck) ciliumAgentStreak(
 		if !agent || pod.DeletionTimestamp != nil {
 			continue
 		}
+		nodeHasAgent[pod.Spec.NodeName] = true
 		if podReadyStatus(pod) {
-			p.agentNotReadyStreak.Reset(pod.Spec.NodeName)
-			continue
+			nodeHasReadyAgent[pod.Spec.NodeName] = true
 		}
-		p.agentNotReadyStreak.Hit(pod.Spec.NodeName)
+	}
+	for nodeName := range nodeHasAgent {
+		if nodeHasReadyAgent[nodeName] {
+			p.agentNotReadyStreak.Reset(nodeName)
+		} else {
+			p.agentNotReadyStreak.Hit(nodeName)
+		}
 	}
 	// A node that vanished while not-Ready is never revisited — its
 	// agent pod is gone with it, so the loop above can neither reset
@@ -309,9 +318,15 @@ func (p *ciliumL2LeaseGuardCheck) deleteStaleLease(
 	switch {
 	case apierrors.IsNotFound(err):
 		// Another actor (the Cilium agent itself) beat us to it —
-		// the stale holder is gone either way.
+		// the stale holder is gone either way. Refund our unused
+		// fleet budget grant since no delete landed.
+		heal.RefundGrant(now)
 		p.Heals.Stamp(key, now)
 		p.InvalidateLeases(ctx) // lease gone — drop the census + index
+	case apierrors.IsConflict(err):
+		// UID precondition fired — a fresh Lease replaced the stale one.
+		heal.RefundGrant(now)
+		p.InvalidateLeases(ctx)
 	case err != nil:
 		log.Info("WARN: stale cilium L2 announce lease delete failed",
 			"lease", lease.Name, "error", err)

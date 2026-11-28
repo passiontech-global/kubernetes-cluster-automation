@@ -249,7 +249,7 @@ func (c *volumeSnapshotLifecycleGuardCheck) emitStuckEvent(
 		evNS = "default"
 	}
 	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      fmt.Sprintf("%s.%x", sanitizeEventNamePrefix(cooldownKey), now.UnixNano()),
+		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
 		Namespace: evNS,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "snapshot.storage.k8s.io/v1",
@@ -419,35 +419,4 @@ func isSnapshotControllerPod(pod *corev1.Pod) bool {
 		}
 	}
 	return false
-}
-
-func sanitizeEventNamePrefix(s string) string {
-	s = strings.ToLower(s)
-	rawLabels := strings.Split(s, ".")
-	var cleanLabels []string
-	for _, raw := range rawLabels {
-		var b strings.Builder
-		b.Grow(len(raw))
-		prevDash := false
-		for i := 0; i < len(raw); i++ {
-			ch := raw[i]
-			if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
-				b.WriteByte(ch)
-				prevDash = false
-				continue
-			}
-			if b.Len() > 0 && !prevDash {
-				b.WriteByte('-')
-				prevDash = true
-			}
-		}
-		lbl := strings.Trim(b.String(), "-")
-		if lbl != "" {
-			cleanLabels = append(cleanLabels, lbl)
-		}
-	}
-	if len(cleanLabels) == 0 {
-		return "event"
-	}
-	return strings.Join(cleanLabels, ".")
 }

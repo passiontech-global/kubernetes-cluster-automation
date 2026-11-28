@@ -533,7 +533,7 @@ func (c *admissionSecurityGuardCheck) emitExposureEvent(
 		return
 	}
 	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:              fmt.Sprintf("%s.%x", sanitizeEventNamePrefix(cooldownKey), now.UnixNano()),
+		Name:              kube.TruncatedEventName(cooldownKey, cooldownKey, now),
 		Namespace:         eventNS,
 		Regarding:         regarding,
 		Reason:            admissionSecEventReason,
@@ -547,37 +547,6 @@ func (c *admissionSecurityGuardCheck) emitExposureEvent(
 	}
 	c.eventCooldown.Stamp(cooldownKey, now)
 	log.Info("EVENT: AdmissionSecurityExposure", "key", cooldownKey)
-}
-
-func sanitizeEventNamePrefix(s string) string {
-	s = strings.ToLower(s)
-	rawLabels := strings.Split(s, ".")
-	var cleanLabels []string
-	for _, raw := range rawLabels {
-		var b strings.Builder
-		b.Grow(len(raw))
-		prevDash := false
-		for i := 0; i < len(raw); i++ {
-			c := raw[i]
-			if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-				b.WriteByte(c)
-				prevDash = false
-				continue
-			}
-			if b.Len() > 0 && !prevDash {
-				b.WriteByte('-')
-				prevDash = true
-			}
-		}
-		lbl := strings.Trim(b.String(), "-")
-		if lbl != "" {
-			cleanLabels = append(cleanLabels, lbl)
-		}
-	}
-	if len(cleanLabels) == 0 {
-		return "event"
-	}
-	return strings.Join(cleanLabels, ".")
 }
 
 func isWebhookServiceIsolated(

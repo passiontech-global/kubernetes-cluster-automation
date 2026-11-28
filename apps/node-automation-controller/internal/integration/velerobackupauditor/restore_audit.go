@@ -14,12 +14,10 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
@@ -33,15 +31,6 @@ const (
 )
 
 var veleroRestoreGVR = kube.GVVeleroRestore
-
-var veleroRestoreStuckGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "node_automation_velero_restore_stuck",
-	Help: "1 while a velero.io Restore is stuck InProgress past 6h.",
-}, []string{"namespace", "restore"})
-
-func init() {
-	ctrlmetrics.Registry.MustRegister(veleroRestoreStuckGauge)
-}
 
 func (a *veleroBackupAuditor) auditRestores(ctx context.Context) error {
 	a.seenStuckRestore.Begin()
@@ -71,7 +60,7 @@ func (a *veleroBackupAuditor) auditRestores(ctx context.Context) error {
 			}
 			ns, name := r.GetNamespace(), r.GetName()
 			k := pausedKey{ns, name}
-			a.seenStuckRestore.Set(veleroRestoreStuckGauge, 1, k, ns, name)
+			a.seenStuckRestore.Set(metrics.VeleroRestoreStuck, 1, k, ns, name)
 			stuckCount++
 			if earliestStart.IsZero() || since.Before(earliestStart) {
 				earliestStart = since
@@ -114,13 +103,13 @@ func (a *veleroBackupAuditor) auditRestores(ctx context.Context) error {
 		return nil
 	})
 	if kube.IsCRDAbsent(err) {
-		a.seenStuckRestore.Prune(veleroRestoreStuckGauge.DeleteLabelValues)
+		a.seenStuckRestore.Prune(metrics.VeleroRestoreStuck.DeleteLabelValues)
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("list velero restores: %w", err)
 	}
-	a.seenStuckRestore.Prune(veleroRestoreStuckGauge.DeleteLabelValues)
+	a.seenStuckRestore.Prune(metrics.VeleroRestoreStuck.DeleteLabelValues)
 
 	if stuckCount > 0 && a.cs != nil {
 		a.bounceWedgedVeleroServer(ctx, log, earliestStart, stuckCount, now)

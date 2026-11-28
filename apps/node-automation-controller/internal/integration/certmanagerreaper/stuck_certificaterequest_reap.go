@@ -44,6 +44,27 @@ func (r *certManagerReaper) listCRs(ctx context.Context, ns string) (*unstructur
 	return list, err
 }
 
+// listChallenges returns the ACME Challenges of one namespace, caching
+// the result (and error) for the whole sweep when challengeCache is
+// armed so reapCert and reapStuckCR share one List per namespace.
+func (r *certManagerReaper) listChallenges(ctx context.Context, ns string) (*unstructured.UnstructuredList, error) {
+	if r.challengeCache != nil {
+		if res, ok := r.challengeCache[ns]; ok {
+			return res.list, res.err
+		}
+	}
+	list, err := kube.ListAllUnstructured(ctx,
+		r.dyn.Resource(challengeGVR).Namespace(ns),
+		metav1.ListOptions{Limit: kube.DefaultListPageSize})
+	if err != nil {
+		metrics.IncError(r.queue)
+	}
+	if r.challengeCache != nil {
+		r.challengeCache[ns] = crListResult{list: list, err: err}
+	}
+	return list, err
+}
+
 // reapStuckCR deletes a CertificateRequest wedged Ready=False
 // (Pending/Failed) >30m under a Ready=False or expiring Certificate —
 // cert-manager recreates the CR on the cert's next sync and issuance
@@ -121,11 +142,8 @@ func (r *certManagerReaper) reapStuckCR(ctx context.Context,
 		}
 	}
 	if liveOrder != nil {
-		chals, cerr := kube.ListAllUnstructured(ctx,
-			r.dyn.Resource(challengeGVR).Namespace(ns),
-			metav1.ListOptions{Limit: kube.DefaultListPageSize})
+		chals, cerr := r.listChallenges(ctx, ns)
 		if cerr != nil {
-			metrics.IncError(r.queue)
 			log.Error(cerr, "challenge list failed", "cert", key)
 			return false
 		}

@@ -125,7 +125,7 @@ func (p *argoCDAppStuckCheck) deploymentDownscaled(ctx context.Context,
 	if err != nil || dep == nil {
 		return false
 	}
-	return kube.IsIntentionallyDownscaled(dep.Annotations, dep.Spec.Replicas)
+	return kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, dep), dep.Spec.Replicas)
 }
 
 // statefulSetDownscaled is the StatefulSet twin over *probefw.Deps.
@@ -136,5 +136,5 @@ func (p *argoCDAppStuckCheck) statefulSetDownscaled(ctx context.Context,
 	if err != nil || sts == nil {
 		return false
 	}
-	return kube.IsIntentionallyDownscaled(sts.Annotations, sts.Spec.Replicas)
+	return kube.IsIntentionallyDownscaled(kube.EffectiveAnnos(ctx, sts), sts.Spec.Replicas)
 }

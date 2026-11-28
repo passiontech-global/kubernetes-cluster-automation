@@ -51,9 +51,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -160,7 +158,7 @@ func run(sigCtx context.Context, args []string) error {
 	log := ctrl.Log.WithName("main")
 
 	if pprofAddr != "" {
-		if err := validateLoopbackBindAddr(pprofAddr); err != nil {
+		if err := httpx.ValidateLoopbackAddr(pprofAddr); err != nil {
 			log.Error(err, "invalid -pprof-bind-address", "addr", pprofAddr)
 			return err
 		}
@@ -473,29 +471,6 @@ func pprofMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	pprofx.Register(mux)
 	return mux
-}
-
-// validateLoopbackBindAddr enforces that -pprof-bind-address targets
-// loopback only (127.0.0.0/8, ::1, or localhost) with a non-empty port.
-func validateLoopbackBindAddr(addr string) error {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("invalid pprof bind address %q: %w", addr, err)
-	}
-	if port == "" {
-		return fmt.Errorf("invalid pprof bind address %q: port must be specified", addr)
-	}
-	if host == "" {
-		return fmt.Errorf("pprof bind address %q must be loopback-only (wildcard bind disallowed)", addr)
-	}
-	if strings.EqualFold(host, "localhost") {
-		return nil
-	}
-	ip, err := netip.ParseAddr(host)
-	if err != nil || !ip.Unmap().IsLoopback() {
-		return fmt.Errorf("pprof bind address %q must be loopback-only (127.0.0.0/8, ::1, or localhost)", addr)
-	}
-	return nil
 }
 
 func canWatchCRDs(ctx context.Context, cs kubernetes.Interface, log logr.Logger) bool {

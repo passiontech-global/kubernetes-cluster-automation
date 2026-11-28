@@ -141,7 +141,7 @@ func (c *podResizeWedgeGuardCheck) Run(ctx context.Context) probefw.Result {
 				note := fmt.Sprintf("Pod %s stuck in resize (%s/%s): %s",
 					podKey, cond.Type, cond.Reason, cond.Message)
 				if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-					Name:      fmt.Sprintf("%s.%x", sanitizeEventNamePrefix(cooldownKey), now.UnixNano()),
+					Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
 					Namespace: pod.Namespace,
 					Regarding: corev1.ObjectReference{
 						APIVersion: "v1",

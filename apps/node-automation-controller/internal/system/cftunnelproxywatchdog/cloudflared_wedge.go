@@ -13,7 +13,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -327,9 +326,6 @@ func (w *cfTunnelProxyWatchdog) deleteConnectorPod(ctx context.Context,
 	deleted, err := heal.DeletePod(ctx, w.cs, nil,
 		kube.PodControllerKey(p), p, now)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil // already gone — not a delete we delivered
-		}
 		return false, err
 	}
 	if !deleted {

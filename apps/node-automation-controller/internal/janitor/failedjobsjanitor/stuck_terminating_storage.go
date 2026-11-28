@@ -247,35 +247,11 @@ func (j *failedJobsJanitor) clusterPodUsesClaimRefWithCensus(ctx context.Context
 	if census == nil {
 		census = &pvcCensus{}
 	}
-	ready, err, cached := census.readyNodes(ctx, j)
+	pr, err, cached := census.probeNamespacePodClaims(ctx, j, ref.Namespace)
 	if err != nil {
 		return true, err, cached
 	}
-
-	inUse := false
-	// Namespace-scoped read: the claimRef names ONE namespace, so a
-	// cluster-wide Pods("").List pulls every Pod in the cluster into the
-	// controller's heap just to throw almost all of it away.
-	err = kube.ListEach(ctx, metav1.ListOptions{Limit: kube.DefaultListPageSize},
-		kube.Pods(j.cs, ref.Namespace), func(page []corev1.Pod) error {
-			for i := range page {
-				p := &page[i]
-				if p.Status.Phase == corev1.PodSucceeded {
-					continue
-				}
-				if p.Status.Phase == corev1.PodFailed {
-					if p.Spec.NodeName == "" || ready[p.Spec.NodeName] {
-						continue
-					}
-				}
-				if slices.Contains(kube.PodClaimedPVCs(p), ref.Name) {
-					inUse = true
-					return nil
-				}
-			}
-			return nil
-		})
-	return inUse, err, false
+	return pr.inUseClaims[ref.Name], nil, cached
 }
 
 func (j *failedJobsJanitor) unstickVolumeSnapshot(ctx context.Context, vs *unstructured.Unstructured, finalizers []string) (bool, []string) {

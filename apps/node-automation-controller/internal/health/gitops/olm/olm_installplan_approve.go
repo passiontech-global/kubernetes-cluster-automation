@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -52,8 +53,8 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 			plan.Object, "spec", "approved"); approved {
 			continue // already approved — nothing to heal
 		}
-		if now.Sub(plan.GetCreationTimestamp().Time) <
-			olmInstallPlanApproveMinAge {
+		if age, ok := kube.AgeSince(plan.GetCreationTimestamp().Time, now); !ok ||
+			age < olmInstallPlanApproveMinAge {
 			continue
 		}
 		if resolutionFailed(plan.Object) {
@@ -91,6 +92,9 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		if _, err := p.Dyn.Resource(olmInstallPlanGVR).
 			Namespace(plan.GetNamespace()).Patch(ctx, plan.GetName(),
 			types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
+			if apierrors.IsForbidden(err) || apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+				heal.RefundGrant(now)
+			}
 			metrics.IncError(p.Name)
 			log.Error(err, "olm installplan auto-approve failed",
 				"installplan", plan.GetNamespace()+"/"+plan.GetName())
@@ -100,7 +104,7 @@ func (p *olmHealthCheck) autoApproveStuckInstallPlans(ctx context.Context,
 		p.plansApproved.Stamp(key, now) // delivered-only contract
 		// spec.approved flipped — later checks must not evaluate
 		// the pre-patch InstallPlan snapshot.
-		p.InvalidateUnstructured(ctx)
+		p.InvalidateUnstructuredGVR(ctx, olmInstallPlanGVR)
 		log.Info("PATCH: everest installplan auto-approved",
 			"installplan", plan.GetNamespace()+"/"+plan.GetName())
 	}

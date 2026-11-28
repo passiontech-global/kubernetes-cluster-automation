@@ -21,6 +21,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 )
 
 // ---------------------------------------------------------------------------
@@ -184,14 +185,28 @@ func (a *certDriftAuditor) auditMissingReplicateToTargets(ctx context.Context,
 	sources []replicateToSourceRef,
 	presentTLS map[secretMetricKey]bool) {
 	log := logf.FromContext(ctx)
-	nsList, err := a.cs.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+	nsList, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: kube.DefaultListPageSize, ResourceVersion: "0"},
+		kube.Namespaces(a.cs))
 	if err != nil {
-		log.Info("skip replicate-to target audit: list namespaces failed", "error", err)
+		// Transient namespace-list failure must not prune active
+		// replicate-to drift alerts or wipe mismatch streaks: carry
+		// forward previously-emitted target entries for these sources.
+		log.Info("skip replicate-to target audit: list namespaces failed — carrying prior series", "error", err)
+		srcRefs := make(map[string]bool, len(sources))
+		for _, src := range sources {
+			srcRefs[src.namespace+"/"+src.name] = true
+		}
+		for k, lv := range a.seenReplication.Last() {
+			if len(lv) >= 3 && srcRefs[lv[2]] {
+				a.seenReplication.Emit(k, lv...)
+			}
+		}
 		return
 	}
-	activeNS := make(map[string]bool, len(nsList.Items))
-	for i := range nsList.Items {
-		ns := &nsList.Items[i]
+	activeNS := make(map[string]bool, len(nsList))
+	for i := range nsList {
+		ns := &nsList[i]
 		if ns.DeletionTimestamp == nil && ns.Status.Phase != corev1.NamespaceTerminating {
 			activeNS[ns.Name] = true
 		}

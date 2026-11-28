@@ -1257,3 +1257,20 @@ func TestSubPathEmitDriftEvent(t *testing.T) {
 		}
 	})
 }
+
+func TestSubPathFreshPodsEmptyTemplateSelectorDoesNotMatchOtherPods(t *testing.T) {
+	driftStart := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	unrelatedFresh := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         "apps",
+			Name:              "other-pod",
+			Labels:            map[string]string{"app": "other"},
+			CreationTimestamp: metav1.NewTime(driftStart.Add(time.Minute)),
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	w := subPathWorkload{kind: "Deployment", ns: "apps", name: "empty-tpl", template: nil}
+	if allFresh, total := subPathFreshPods(w, []*corev1.Pod{unrelatedFresh}, driftStart); allFresh || total != 0 {
+		t.Fatalf("empty template selector matched unrelated pod: allFresh=%v total=%d", allFresh, total)
+	}
+}

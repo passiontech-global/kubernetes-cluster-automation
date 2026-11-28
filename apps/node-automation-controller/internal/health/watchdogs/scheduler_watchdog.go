@@ -159,7 +159,7 @@ func (p *schedulerWatchdogCheck) Run(ctx context.Context) probefw.Result {
 			// the gate) — a frozen scheduler must not be inferred
 			// from pods the scheduler is forbidden to touch.
 			len(pod.Spec.SchedulingGates) > 0 ||
-			now.Sub(pod.CreationTimestamp.Time) < schedulerPendingMinAge {
+			!kube.AgeAtLeast(pod.CreationTimestamp.Time, now, schedulerPendingMinAge) {
 			continue
 		}
 		scheduled := false

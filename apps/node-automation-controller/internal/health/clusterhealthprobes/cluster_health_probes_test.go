@@ -32,6 +32,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cilium"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/cloudflared"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/connectionskew"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/gateway"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/linkerd"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/health/nethealth/liqo"
@@ -76,7 +77,7 @@ func testProberDyn(cs *fake.Clientset, dyn dynamic.Interface) *clusterHealthProb
 }
 
 // fleetCheckRegs mirrors the health section of registry.Modules —
-// the full 68-check roster in sweep order, which is what
+// the full 80-check roster in sweep order, which is what
 // SetupModules collects into Deps.CheckRegs on a default boot.
 // clusterhealthprobes may not import internal/registry (depguard:
 // domains never import the wiring layer — and a test-internal
@@ -169,6 +170,7 @@ func fleetCheckRegs() []shared.CheckReg {
 		{Name: nodehealth.CheckNameDRAClaimWedgeGuard, New: nodehealth.NewDRAClaimWedgeGuardCheck},
 		{Name: watchdogs.CheckNamePodResizeWedgeGuard, New: watchdogs.NewPodResizeWedgeGuardCheck},
 		{Name: watchdogs.CheckNameIngressNginxRetirementGuard, New: watchdogs.NewIngressNginxRetirementGuardCheck},
+		{Name: connectionskew.CheckNameWorkloadConnectionSkewGuard, New: connectionskew.NewWorkloadConnectionSkewGuardCheck},
 	}
 }
 

@@ -168,7 +168,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		pod := &pods[i]
 		if pod.DeletionTimestamp != nil ||
 			pod.Status.Phase != corev1.PodRunning ||
-			now.Sub(pod.CreationTimestamp.Time) < linkerdH2PodMinAge ||
+			!kube.AgeAtLeast(pod.CreationTimestamp.Time, now, linkerdH2PodMinAge) ||
 			!kube.PodIsMeshed(&pod.Spec) {
 			continue
 		}

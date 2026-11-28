@@ -362,25 +362,34 @@ func classifyPendingPVC(
 			return pvcDeadlockWaitForFirstConsumer
 		}
 	}
-	for _, pod := range claimingPods {
-		for _, cond := range pod.Status.Conditions {
-			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
+	scKnownImmediate := false
+	if scKnown && scName != "" {
+		if sc := scMap[scName]; sc != nil && sc.VolumeBindingMode != nil {
+			if *sc.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer {
 				return pvcDeadlockWaitForFirstConsumer
 			}
-		}
-		for _, pev := range podEvents[pod.Namespace+"/"+pod.Name] {
-			msgLower := strings.ToLower(pev.Message)
-			if pev.Reason == "FailedScheduling" ||
-				strings.Contains(msgLower, "volume node affinity conflict") ||
-				strings.Contains(msgLower, "didn't match persistentvolume") {
-				return pvcDeadlockWaitForFirstConsumer
+			if *sc.VolumeBindingMode == storagev1.VolumeBindingImmediate {
+				scKnownImmediate = true
 			}
 		}
 	}
-	if scKnown && scName != "" {
-		if sc := scMap[scName]; sc != nil && sc.VolumeBindingMode != nil &&
-			*sc.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer {
-			return pvcDeadlockWaitForFirstConsumer
+	for _, pod := range claimingPods {
+		for _, pev := range podEvents[pod.Namespace+"/"+pod.Name] {
+			msgLower := strings.ToLower(pev.Message)
+			if strings.Contains(msgLower, "volume node affinity conflict") ||
+				strings.Contains(msgLower, "didn't match persistentvolume") {
+				return pvcDeadlockWaitForFirstConsumer
+			}
+			if !scKnownImmediate && pev.Reason == "FailedScheduling" {
+				return pvcDeadlockWaitForFirstConsumer
+			}
+		}
+		if !scKnownImmediate {
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
+					return pvcDeadlockWaitForFirstConsumer
+				}
+			}
 		}
 	}
 

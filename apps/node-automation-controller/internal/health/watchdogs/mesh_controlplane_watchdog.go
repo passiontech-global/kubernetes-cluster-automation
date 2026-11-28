@@ -173,7 +173,7 @@ func linkerdPodWedged(pod *corev1.Pod, now time.Time) bool {
 	if pod.Status.Phase != corev1.PodRunning || pod.DeletionTimestamp != nil {
 		return false
 	}
-	if now.Sub(pod.CreationTimestamp.Time) < linkerdWedgedMinAge {
+	if !kube.AgeAtLeast(pod.CreationTimestamp.Time, now, linkerdWedgedMinAge) {
 		return false
 	}
 	if len(pod.Status.ContainerStatuses) == 0 {

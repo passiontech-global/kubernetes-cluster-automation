@@ -271,14 +271,21 @@ func (p *dsRolloutWedgeCheck) newRevisionHashes(ctx context.Context,
 	// (or no matching CR) the target is UNKNOWN, so the caller must
 	// skip the heal rather than risk deleting a pod on the new
 	// revision.
-	crs, err := p.CS.AppsV1().ControllerRevisions(ds.Namespace).
-		List(ctx, metav1.ListOptions{})
+	crs, err := kube.ListAll(ctx,
+		metav1.ListOptions{Limit: probefw.HealthListPageSize, ResourceVersion: "0"},
+		func(ctx context.Context, opts metav1.ListOptions) ([]appsv1.ControllerRevision, string, error) {
+			l, lerr := p.CS.AppsV1().ControllerRevisions(ds.Namespace).List(ctx, opts)
+			if lerr != nil {
+				return nil, "", lerr
+			}
+			return l.Items, l.Continue, nil
+		})
 	if err != nil {
 		return nil, false
 	}
 	var target *appsv1.ControllerRevision
-	for i := range crs.Items {
-		cr := &crs.Items[i]
+	for i := range crs {
+		cr := &crs[i]
 		ref := metav1.GetControllerOf(cr)
 		if ref == nil || ref.Kind != "DaemonSet" || ref.Name != ds.Name {
 			continue

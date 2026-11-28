@@ -9,10 +9,8 @@ package nethealth
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"math"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -177,7 +175,7 @@ func (p *coreDNSForwardSaturationCheck) emitNdotsAuditEvent(
 		return
 	}
 	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
-		Name:      ndotsEventName(kind, ns, name, now),
+		Name:      kube.TruncatedEventName("coredns-ndots."+kind+"."+ns+"."+name, kind+"/"+ns+"/"+name, now),
 		Namespace: ns,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "apps/v1",
@@ -199,51 +197,4 @@ func (p *coreDNSForwardSaturationCheck) emitNdotsAuditEvent(
 	}
 	p.ndotsEventCooldown.Stamp(ck, now)
 	log.Info("EVENT: CoreDNSNdotsAmplification", "kind", kind, "object", ns+"/"+name)
-}
-
-func ndotsEventName(kind, ns, name string, now time.Time) string {
-	const maxPrefix = 220
-	evPrefix := sanitizeNdotsEventNamePrefix("coredns-ndots." + kind + "." + ns + "." + name)
-	if len(evPrefix) > maxPrefix {
-		evPrefix = strings.TrimRight(evPrefix[:maxPrefix], ".-")
-		if evPrefix == "" {
-			evPrefix = "coredns-ndots"
-		}
-	}
-	sum := sha256.Sum256([]byte(kind + "/" + ns + "/" + name))
-	return fmt.Sprintf("%s.%x.%x", evPrefix, sum[:4], now.UnixNano())
-}
-
-func sanitizeNdotsEventNamePrefix(s string) string {
-	s = strings.ToLower(s)
-	rawLabels := strings.Split(s, ".")
-	cleanLabels := make([]string, 0, len(rawLabels))
-	for _, raw := range rawLabels {
-		var b strings.Builder
-		b.Grow(len(raw))
-		prevDash := false
-		for i := 0; i < len(raw); i++ {
-			c := raw[i]
-			if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-				b.WriteByte(c)
-				prevDash = false
-				continue
-			}
-			if b.Len() > 0 && !prevDash {
-				b.WriteByte('-')
-				prevDash = true
-			}
-		}
-		lbl := strings.Trim(b.String(), "-")
-		if len(lbl) > 63 {
-			lbl = strings.TrimRight(lbl[:63], "-")
-		}
-		if lbl != "" {
-			cleanLabels = append(cleanLabels, lbl)
-		}
-	}
-	if len(cleanLabels) == 0 {
-		return "coredns-ndots"
-	}
-	return strings.Join(cleanLabels, ".")
 }

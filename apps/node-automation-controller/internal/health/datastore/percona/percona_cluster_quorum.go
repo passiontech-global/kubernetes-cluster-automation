@@ -249,7 +249,7 @@ func (p *perconaQuorumCheck) Run(ctx context.Context) probefw.Result {
 	wsrepThis := map[string]string{} // fresh wsrep emits this sweep
 	carriedWsrep := map[string]string{}
 	wsrepOK := true
-	if _, err := p.PromEndpoint(); err != nil {
+	if _, err := p.PromEndpointCtx(ctx); err != nil {
 		wsrepOK = false
 		carryWsrep(carriedWsrep)
 	} else {

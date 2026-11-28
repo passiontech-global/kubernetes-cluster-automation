@@ -151,6 +151,14 @@ func (d *Deps) Job(ctx context.Context, ns, name string) (*batchv1.Job, error) {
 		ns, name)
 }
 
+// ServiceAccount resolves one ServiceAccount from the shared census.
+func (d *Deps) ServiceAccount(ctx context.Context, ns, name string) (*corev1.ServiceAccount, error) {
+	s := sweepSnap(ctx)
+	return indexLookup(&s.serviceAccountsIdx,
+		func() ([]corev1.ServiceAccount, error) { return d.AllServiceAccounts(ctx) },
+		ns, name)
+}
+
 // ---------------------------------------------------------------------------
 // Pod placement + EndpointSlice service indexes
 // ---------------------------------------------------------------------------

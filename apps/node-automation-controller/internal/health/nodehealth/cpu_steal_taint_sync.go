@@ -128,9 +128,9 @@ func (p *cpuStealTaintSyncCheck) Run(ctx context.Context) probefw.Result {
 			continue
 		}
 		condTrue[n.Name] = true
-		if c.LastTransitionTime.IsZero() ||
-			now.Sub(c.LastTransitionTime.Time) >= cpuStealCondMinAge {
-			pressured[n.Name] = now.Sub(c.LastTransitionTime.Time)
+		if age, ok := kube.AgeSince(c.LastTransitionTime.Time, now); ok &&
+			age >= cpuStealCondMinAge {
+			pressured[n.Name] = age
 		}
 	}
 

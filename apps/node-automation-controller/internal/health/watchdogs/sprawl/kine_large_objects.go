@@ -66,7 +66,7 @@ func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context
 	// check makes, and only objects near the size guard ever earn
 	// an exact json.Marshal (approxObjectSize gates it).
 	err := kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		metav1.ListOptions{Limit: probefw.HealthListPageSize, ResourceVersion: "0"},
 		kube.ConfigMaps(p.CS, metav1.NamespaceAll),
 		func(items []corev1.ConfigMap) error {
 			for i := range items {
@@ -84,7 +84,7 @@ func (p *apiObjectSprawlReportGCCheck) auditKineLargeObjects(ctx context.Context
 		return fmt.Errorf("list configmaps: %w", err)
 	}
 	err = kube.ListEach(ctx,
-		metav1.ListOptions{Limit: probefw.HealthListPageSize},
+		metav1.ListOptions{Limit: probefw.HealthListPageSize, ResourceVersion: "0"},
 		kube.Secrets(p.CS, metav1.NamespaceAll),
 		func(items []corev1.Secret) error {
 			for i := range items {
@@ -192,7 +192,7 @@ func (p *apiObjectSprawlReportGCCheck) auditKineCRDSize(ctx context.Context,
 
 	poms, err := kube.ListPartialOrFallback(ctx, p.Meta, p.CS, p.Dyn,
 		kube.GVRCustomResourceDefinition, metav1.NamespaceAll,
-		metav1.ListOptions{Limit: 25})
+		metav1.ListOptions{Limit: 25, ResourceVersion: "0"})
 	switch {
 	case kube.IsCRDAbsent(err) || apierrors.IsForbidden(err):
 		return nil // CRD API absent or ungranted on this cluster — skip silently

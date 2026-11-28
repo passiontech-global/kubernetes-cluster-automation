@@ -167,10 +167,8 @@ func (u *unblockHealer) deleteBackingPods(ctx context.Context,
 		case !proceed:
 			return deleted // mutex held / budget denied — applies to all remaining targets
 		case refused:
-			log.Info("DEFER: PDB refused backing pod eviction — keeping pod alive",
+			log.Info("DEFER: backing pod eviction deferred (PDB/not-found/conflict/hold) — keeping pod alive",
 				"pod", p.Namespace+"/"+p.Name)
-			continue
-		case apierrors.IsNotFound(err):
 			continue
 		case err != nil:
 			metrics.IncError(g.queue)

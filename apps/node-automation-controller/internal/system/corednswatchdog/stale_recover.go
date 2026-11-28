@@ -225,22 +225,22 @@ func (w *coreDNSWatchdog) recover(ctx context.Context, suspects []string,
 				// yields to nobody.
 				Spec: corev1.PodSpec{NodeName: podNode[name]},
 			}
-			evicted, refused, err := heal.EvictPod(ctx, w.cs, nil, "",
+			evicted, refused, notFound, err := heal.EvictPodNotFound(ctx, w.cs, nil, "",
 				pod, w.now.Now())
 			switch {
-			case refused:
-				// PDB at its floor — a deferral, not a failure:
-				// the replica budget is spoken for, the pod stays,
-				// and nothing is metered (same contract as
-				// heal.EvictPodV's refund path).
-				log.Info("DEFER: PDB refused stale pod eviction — keeping pod alive",
-					"pod", corednsNS+"/"+name)
-				continue
-			case apierrors.IsNotFound(err):
+			case notFound:
 				// Already gone — a previous cycle's eviction (or the
 				// Deployment controller) got there first. Not a
 				// failure; the fleet is exactly where we wanted it.
 				log.Info("stale pod already gone", "pod", corednsNS+"/"+name)
+				continue
+			case refused:
+				// PDB at its floor or UID conflict — a deferral, not a failure:
+				// the replica budget is spoken for, the pod stays,
+				// and nothing is metered (same contract as
+				// heal.EvictPodV's refund path).
+				log.Info("DEFER: stale pod eviction deferred (PDB/conflict/hold) — keeping pod alive",
+					"pod", corednsNS+"/"+name)
 				continue
 			case err != nil:
 				evictErr = fmt.Errorf("evict stale pod %s/%s: %w", corednsNS, name, err)
@@ -430,7 +430,10 @@ loopPods:
 		case apierrors.IsNotFound(err), apierrors.IsConflict(err):
 			// Already gone, or a concurrent controller changed the
 			// object between our census and the preconditioned
-			// delete. Both are benign races, not heal failures.
+			// delete. Both are benign races, not heal failures —
+			// refund the per-target circuit strike so races cannot
+			// prematurely trip the breaker.
+			heal.RefundTarget(w.queue, coolKey, gateNow)
 			continue
 		case err != nil:
 			delErr = fmt.Errorf("delete loop-crashing coredns pod %s/%s: %w", corednsNS, name, err)

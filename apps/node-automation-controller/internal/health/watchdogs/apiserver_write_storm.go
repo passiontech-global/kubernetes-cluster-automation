@@ -322,6 +322,7 @@ func (p *apiserverWriteStormCheck) suspendStormFlux(ctx context.Context,
 		return strings.Compare(a.name, b.name)
 	})
 	patched := 0
+	mutatedGVRs := map[schema.GroupVersionResource]struct{}{}
 	for _, t := range targets {
 		if patched >= writeStormMaxSuspends {
 			log.Info("write storm suspend capped for this pass",
@@ -342,12 +343,15 @@ func (p *apiserverWriteStormCheck) suspendStormFlux(ctx context.Context,
 		log.Info("ACTION: suspended flux object for write-storm relief",
 			"kind", t.gvr.Resource, "object", t.ns+"/"+t.name)
 		kube.RecordAnnoPatch(ctx, t.obj, patch)
+		mutatedGVRs[t.gvr] = struct{}{}
 		patched++
 	}
 	if patched > 0 {
 		p.Heals.Stamp(ck, now)
 		p.suspended = true
-		p.InvalidateUnstructured(ctx)
+		for gvr := range mutatedGVRs {
+			p.InvalidateUnstructuredGVR(ctx, gvr)
+		}
 	}
 }
 
@@ -369,7 +373,7 @@ func (p *apiserverWriteStormCheck) restoreSuspendedFlux(ctx context.Context,
 		return false // census failed — inconclusive, keep armed
 	}
 	ok := true
-	restored := 0
+	mutatedGVRs := map[schema.GroupVersionResource]struct{}{}
 	for _, t := range targets {
 		patch := []byte(fmt.Sprintf(
 			`{"spec":{"suspend":false},"metadata":{"annotations":{%q:null}}}`,
@@ -385,10 +389,10 @@ func (p *apiserverWriteStormCheck) restoreSuspendedFlux(ctx context.Context,
 		log.Info("ACTION: restored flux object after write-storm relief",
 			"kind", t.gvr.Resource, "object", t.ns+"/"+t.name)
 		kube.RecordAnnoPatch(ctx, t.obj, patch)
-		restored++
+		mutatedGVRs[t.gvr] = struct{}{}
 	}
-	if restored > 0 {
-		p.InvalidateUnstructured(ctx)
+	for gvr := range mutatedGVRs {
+		p.InvalidateUnstructuredGVR(ctx, gvr)
 	}
 	return ok
 }
@@ -404,7 +408,14 @@ func (p *apiserverWriteStormCheck) stormFluxTargets(ctx context.Context,
 	log logr.Logger, stampedOnly bool) []*fluxWriteStormObject {
 
 	out := make([]*fluxWriteStormObject, 0)
-	for _, gvr := range []schema.GroupVersionResource{kube.GVRFluxKustomization, kube.GVRHelmReleaseV2} {
+	var gvrs []schema.GroupVersionResource
+	gvrs = append(gvrs, kube.GVRFluxKustomization)
+	if _, hrGVR, err := p.AllUnstructuredFirst(ctx, kube.HelmReleaseGVRs); err == nil {
+		gvrs = append(gvrs, hrGVR)
+	} else if !kube.IsCRDAbsent(err) {
+		gvrs = append(gvrs, kube.GVRHelmReleaseV2)
+	}
+	for _, gvr := range gvrs {
 		objs, err := p.AllUnstructured(ctx, gvr)
 		if kube.IsCRDAbsent(err) {
 			continue // this Flux kind not installed — nothing to do

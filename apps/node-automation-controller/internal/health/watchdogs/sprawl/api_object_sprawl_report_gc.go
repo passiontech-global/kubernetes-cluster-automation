@@ -238,7 +238,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		for i := range items {
 			obj := &items[i]
 			perNS[obj.GetNamespace()]++
-			if now.Sub(obj.GetCreationTimestamp().Time) < sprawlOrphanMinAge {
+			if !kube.AgeAtLeast(obj.GetCreationTimestamp().Time, now, sprawlOrphanMinAge) {
 				continue
 			}
 			if !p.reportOwnerGone(ctx, obj) {
@@ -307,6 +307,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 		}
 		perNS := map[string]int{}
 		completed := 0
+		deletedAny := false
 		for i := range items {
 			obj := &items[i]
 			perNS[obj.GetNamespace()]++
@@ -316,7 +317,7 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			// UID-preconditioned delete, same evidence surface. The
 			// phase test gates it — a Running/Pending analysis is a
 			// live canary gate.
-			if now.Sub(obj.GetCreationTimestamp().Time) < sprawlOrphanMinAge {
+			if !kube.AgeAtLeast(obj.GetCreationTimestamp().Time, now, sprawlOrphanMinAge) {
 				continue
 			}
 			phase, _ := kube.NestedString(obj.Object, "status", "phase")
@@ -330,7 +331,11 @@ func (p *apiObjectSprawlReportGCCheck) Run(ctx context.Context) probefw.Result {
 			if p.deleteOrphanReport(ctx, log,
 				sprawlKindRef{rk.gvr, rk.kind, rk.resource}, obj) {
 				orphanBudget--
+				deletedAny = true
 			}
+		}
+		if deletedAny {
+			p.InvalidateUnstructuredGVR(ctx, rk.gvr)
 		}
 		for ns, count := range perNS {
 			objects.Set(apiObjectCountGauge, float64(count),
