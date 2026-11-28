@@ -207,6 +207,11 @@ func (w *cfTunnelProxyWatchdog) scanConnectorTarget(ctx context.Context,
 		if seenController[key] {
 			continue
 		}
+		// Check controller cooldown (in-RAM first, then RS annotation)
+		// BEFORE fetching pod logs so cooled-down pods pay zero log reads.
+		if w.healCooledDown(ctx, p, now) {
+			continue
+		}
 		wedged, err := w.podLogWedged(ctx, p)
 		if err != nil {
 			// Log read failure is not proof of health — skip this
@@ -216,7 +221,7 @@ func (w *cfTunnelProxyWatchdog) scanConnectorTarget(ctx context.Context,
 				"pod", p.Namespace+"/"+p.Name, "error", err.Error())
 			continue
 		}
-		if !wedged || w.healCooledDown(ctx, p, now) {
+		if !wedged {
 			continue
 		}
 		wedges = append(wedges, cfTunnelWedge{pod: p, reason: "fatal_logs"})
@@ -257,6 +262,11 @@ func (w *cfTunnelProxyWatchdog) scanConnectorTarget(ctx context.Context,
 // never fail a heal over its cooldown's cheap half.
 func (w *cfTunnelProxyWatchdog) healCooledDown(ctx context.Context,
 	p *corev1.Pod, now time.Time) bool {
+	key := kube.PodControllerKey(p)
+	// Fast path: check in-RAM ledger before paying a ReplicaSet GET.
+	if w.lastHeal.CooledDown(key, cfTunnelHealCooldown, now) {
+		return true
+	}
 	var rs metav1.Object
 	// Only a ReplicaSet controller ref resolves to a ReplicaSet —
 	// a bare name match would GET/PATCH whatever kind actually
@@ -274,7 +284,7 @@ func (w *cfTunnelProxyWatchdog) healCooledDown(ctx context.Context,
 		}
 	}
 	return heal.PersistedCooledDown(ctx, &w.lastHeal, rs, cfTunnelHealAnno,
-		kube.PodControllerKey(p), cfTunnelHealCooldown, now)
+		key, cfTunnelHealCooldown, now)
 }
 
 // stampHealPersisted is the durable half of the heal cooldown: the

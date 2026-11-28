@@ -241,15 +241,11 @@ func (c *volumeSnapshotLifecycleGuardCheck) emitStuckEvent(
 ) {
 	ns, name := obj.GetNamespace(), obj.GetName()
 	cooldownKey := "vsstuck." + kind + "." + ns + "." + name + "." + reason
-	if c.eventCooldown.CooledDown(cooldownKey, volumeSnapshotEventCooldown, now) {
-		return
-	}
 	evNS := ns
 	if evNS == "" {
 		evNS = "default"
 	}
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, volumeSnapshotEventCooldown, now, kube.WarningEvent{
 		Namespace: evNS,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "snapshot.storage.k8s.io/v1",
@@ -261,14 +257,7 @@ func (c *volumeSnapshotLifecycleGuardCheck) emitStuckEvent(
 		Reason:            volumeSnapshotEventReason,
 		Note:              fmt.Sprintf("%s %s stuck (%s)", kind, objID, reason),
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: VolumeSnapshotStuck event create failed (RBAC?)",
-			"kind", kind, "object", objID, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: VolumeSnapshotStuck", "kind", kind, "object", objID, "reason", reason)
+	})
 }
 
 func (c *volumeSnapshotLifecycleGuardCheck) maybeBounceSnapshotController(
@@ -336,29 +325,30 @@ func (c *volumeSnapshotLifecycleGuardCheck) maybeBounceSnapshotController(
 
 	ctrl := metav1.GetControllerOf(pod)
 	targetKey := pod.Namespace + "." + ctrl.Name
-	if allowed, reason := heal.TryAcquireTarget(CheckNameVolumeSnapshotLifecycleGuard, targetKey, now); !allowed {
+	allowed, reason, _ := heal.WithTargetBreaker(CheckNameVolumeSnapshotLifecycleGuard, targetKey, now, func() (bool, error) {
+		evicted, refused, notFound, err := heal.EvictPodNotFound(ctx, c.CS, &c.Heals, ck, pod, now)
+		switch {
+		case err != nil:
+			metrics.IncError(c.Name)
+			log.Error(err, "snapshot-controller eviction failed", "pod", podKey)
+		case refused:
+			heal.RefundGrant(now)
+			if notFound {
+				log.V(1).Info("DEFER: snapshot-controller pod vanished before eviction", "pod", podKey)
+			} else {
+				log.Info("DEFER: snapshot-controller eviction refused (PDB/hold/quorum)", "pod", podKey)
+			}
+			return false, nil
+		case evicted:
+			metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameVolumeSnapshotLifecycleGuard).Inc()
+			log.Info("EVICT: hung CSI snapshot-controller pod evicted for reschedule", "pod", podKey)
+		}
+		return true, nil
+	})
+	if !allowed {
 		heal.RefundGrant(now)
 		log.Info("DEFER: snapshot-controller target circuit open",
 			"pod", podKey, "target", targetKey, "reason", reason)
-		return
-	}
-
-	evicted, refused, notFound, err := heal.EvictPodNotFound(ctx, c.CS, &c.Heals, ck, pod, now)
-	switch {
-	case err != nil:
-		metrics.IncError(c.Name)
-		log.Error(err, "snapshot-controller eviction failed", "pod", podKey)
-	case refused:
-		heal.RefundTarget(CheckNameVolumeSnapshotLifecycleGuard, targetKey, now)
-		heal.RefundGrant(now)
-		if notFound {
-			log.V(1).Info("DEFER: snapshot-controller pod vanished before eviction", "pod", podKey)
-		} else {
-			log.Info("DEFER: snapshot-controller eviction refused (PDB/hold/quorum)", "pod", podKey)
-		}
-	case evicted:
-		metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNameVolumeSnapshotLifecycleGuard).Inc()
-		log.Info("EVICT: hung CSI snapshot-controller pod evicted for reschedule", "pod", podKey)
 	}
 }
 

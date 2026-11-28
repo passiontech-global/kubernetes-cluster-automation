@@ -230,7 +230,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 	if p.Heals.CooledDown(key, ciliumIPAMNodeCool, now) {
 		return
 	}
-	pods, err := p.AllPods(ctx)
+	pods, err := p.PodsOnNode(ctx, node)
 	if err != nil {
 		// Tolerated sub-failure: the sweep still reports the IPAM
 		// finding; only the cleanup is deferred to the next pass.
@@ -240,11 +240,7 @@ func (p *ciliumNodeIPAMExhaustionCheck) reapTerminalPodsOnNode(ctx context.Conte
 		return
 	}
 	reaped := 0
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Spec.NodeName != node {
-			continue // the old spec.nodeName FieldSelector, client-side
-		}
+	for _, pod := range pods {
 		if pod.DeletionTimestamp != nil ||
 			(pod.Status.Phase != corev1.PodSucceeded &&
 				pod.Status.Phase != corev1.PodFailed) {

@@ -24,7 +24,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -200,12 +199,7 @@ func (c *pvcLifecycleGuardCheck) scanPVCsAndFSGroup(
 	var scMap map[string]*storagev1.StorageClass
 	scKnown := false
 	if len(pendingPVCs) > 0 {
-		scs, scErr := kube.ListAll(ctx,
-			metav1.ListOptions{
-				Limit:           kube.DefaultListPageSize,
-				ResourceVersion: "0",
-			},
-			kube.StorageClasses(c.CS))
+		scs, scErr := c.AllStorageClasses(ctx)
 		switch {
 		case scErr == nil:
 			scKnown = true

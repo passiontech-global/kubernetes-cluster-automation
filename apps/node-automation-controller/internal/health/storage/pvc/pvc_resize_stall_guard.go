@@ -204,6 +204,32 @@ func (p *pvcResizeStallGuardCheck) bounceStalledFSResizePods(
 		return
 	}
 
+	podsByPVC := make(map[string][]*corev1.Pod)
+	for i := range pods {
+		pod := &pods[i]
+		if pod.Namespace == "kube-system" ||
+			pod.DeletionTimestamp != nil ||
+			kube.IsPodDeleted(ctx, pod.UID) ||
+			pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Status.Phase == corev1.PodFailed ||
+			pod.Annotations["kubernetes.io/config.mirror"] != "" {
+			continue
+		}
+		// Never kill unowned standalone pods or run-to-completion Job pods.
+		ctrl := metav1.GetControllerOf(pod)
+		if ctrl == nil || ctrl.Kind == "Job" {
+			continue
+		}
+		podAnno := strings.TrimSpace(kube.EffectiveAnno(ctx, pod, pvcResizeBounceAnno))
+		if strings.EqualFold(podAnno, "false") {
+			continue
+		}
+		for _, claimName := range kube.PodClaimedPVCs(pod) {
+			key := pod.Namespace + "/" + claimName
+			podsByPVC[key] = append(podsByPVC[key], pod)
+		}
+	}
+
 	slices.SortFunc(candidates, func(a, b *corev1.PersistentVolumeClaim) int {
 		if d := cmp.Compare(a.Namespace, b.Namespace); d != 0 {
 			return d
@@ -214,38 +240,15 @@ func (p *pvcResizeStallGuardCheck) bounceStalledFSResizePods(
 	for _, pvc := range candidates {
 		pvcKey := pvc.Namespace + "/" + pvc.Name
 		pvcAnno := strings.TrimSpace(kube.EffectiveAnno(ctx, pvc, pvcResizeBounceAnno))
+		pvcOptIn := strings.EqualFold(pvcAnno, "true")
 
 		var eligible []*corev1.Pod
-		for i := range pods {
-			pod := &pods[i]
-			if pod.Namespace != pvc.Namespace || pod.Namespace == "kube-system" {
-				continue
-			}
-			if pod.DeletionTimestamp != nil ||
-				kube.IsPodDeleted(ctx, pod.UID) ||
-				pod.Status.Phase == corev1.PodSucceeded ||
-				pod.Status.Phase == corev1.PodFailed {
-				continue
-			}
-			if pod.Annotations["kubernetes.io/config.mirror"] != "" {
-				continue
-			}
-			// Never kill unowned standalone pods or run-to-completion Job pods.
-			ctrl := metav1.GetControllerOf(pod)
-			if ctrl == nil || ctrl.Kind == "Job" {
-				continue
-			}
-			if !slices.Contains(kube.PodClaimedPVCs(pod), pvc.Name) {
-				continue
-			}
-			podAnno := strings.TrimSpace(kube.EffectiveAnno(ctx, pod, pvcResizeBounceAnno))
-			if strings.EqualFold(podAnno, "false") {
-				continue
-			}
-			if !p.bounceEnabled &&
-				!strings.EqualFold(pvcAnno, "true") &&
-				!strings.EqualFold(podAnno, "true") {
-				continue
+		for _, pod := range podsByPVC[pvcKey] {
+			if !p.bounceEnabled && !pvcOptIn {
+				podAnno := strings.TrimSpace(kube.EffectiveAnno(ctx, pod, pvcResizeBounceAnno))
+				if !strings.EqualFold(podAnno, "true") {
+					continue
+				}
 			}
 			eligible = append(eligible, pod)
 		}
@@ -269,30 +272,32 @@ func (p *pvcResizeStallGuardCheck) bounceStalledFSResizePods(
 			continue
 		}
 
-		if allowed, reason := heal.TryAcquireTarget(CheckNamePVCResizeStallGuard, pvcKey, now); !allowed {
+		allowed, reason, _ := heal.WithTargetBreaker(CheckNamePVCResizeStallGuard, pvcKey, now, func() (bool, error) {
+			evicted, refused, notFound, err := heal.EvictPodNotFound(ctx, p.CS, &p.Heals, ck, target, now)
+			switch {
+			case err != nil:
+				metrics.IncError(p.Name)
+				log.Error(err, "pvc-resize pod eviction failed", "pvc", pvcKey, "pod", podKey)
+			case refused:
+				heal.RefundGrant(now)
+				if notFound {
+					log.V(1).Info("DEFER: pvc-resize pod vanished before eviction", "pvc", pvcKey, "pod", podKey)
+				} else {
+					log.Info("DEFER: pvc-resize pod eviction refused (PDB/hold/quorum)", "pvc", pvcKey, "pod", podKey)
+				}
+				return false, nil
+			case evicted:
+				metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNamePVCResizeStallGuard).Inc()
+				log.Info("EVICT: bounced pod for offline FileSystemResizePending PVC",
+					"pvc", pvcKey, "pod", podKey)
+			}
+			return true, nil
+		})
+		if !allowed {
 			heal.RefundGrant(now)
 			log.Info("DEFER: pvc-resize bounce target circuit open",
 				"pvc", pvcKey, "pod", podKey, "reason", reason)
 			continue
-		}
-
-		evicted, refused, notFound, err := heal.EvictPodNotFound(ctx, p.CS, &p.Heals, ck, target, now)
-		switch {
-		case err != nil:
-			metrics.IncError(p.Name)
-			log.Error(err, "pvc-resize pod eviction failed", "pvc", pvcKey, "pod", podKey)
-		case refused:
-			heal.RefundTarget(CheckNamePVCResizeStallGuard, pvcKey, now)
-			heal.RefundGrant(now)
-			if notFound {
-				log.V(1).Info("DEFER: pvc-resize pod vanished before eviction", "pvc", pvcKey, "pod", podKey)
-			} else {
-				log.Info("DEFER: pvc-resize pod eviction refused (PDB/hold/quorum)", "pvc", pvcKey, "pod", podKey)
-			}
-		case evicted:
-			metrics.ControlPlanePodHealsTotal.WithLabelValues(CheckNamePVCResizeStallGuard).Inc()
-			log.Info("EVICT: bounced pod for offline FileSystemResizePending PVC",
-				"pvc", pvcKey, "pod", podKey)
 		}
 	}
 }

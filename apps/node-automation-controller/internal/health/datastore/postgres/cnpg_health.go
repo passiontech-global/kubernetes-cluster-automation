@@ -251,6 +251,11 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 	for i := range nodes {
 		nodeByName[nodes[i].Name] = &nodes[i]
 	}
+	podsByNS := map[string][]*corev1.Pod{}
+	for i := range pods {
+		p := &pods[i]
+		podsByNS[p.Namespace] = append(podsByNS[p.Namespace], p)
+	}
 
 	// canUnfence requires the dynamic client — without it the patch
 	// half cannot run; detection above is unaffected.
@@ -319,7 +324,7 @@ func (p *postgresWALArchiveGuardCheck) checkCNPGFencedInstances(
 			// time.
 			if inst == curPrimary || inst == tgtPrimary || failoverInFlight ||
 				!canUnfence ||
-				!cnpgInstanceOnHealthyNode(ctx, pods, nodeByName, ns, name, inst) {
+				!cnpgInstanceOnHealthyNode(ctx, podsByNS[ns], nodeByName, name, inst) {
 				continue
 			}
 			// Keep the ledger key alive ONLY for instances whose
@@ -401,15 +406,11 @@ func cnpgFencedInstanceList(ctx context.Context, cr *unstructured.Unstructured) 
 // required because fencing stops postmaster (keeping Ready=False until
 // unfenced). A missing pod or node census, a non-Running pod, or an
 // unverifiable node all read false (fail closed).
-func cnpgInstanceOnHealthyNode(ctx context.Context, pods []corev1.Pod,
-	nodeByName map[string]*corev1.Node, ns, cluster, inst string) bool {
+func cnpgInstanceOnHealthyNode(ctx context.Context, nsPods []*corev1.Pod,
+	nodeByName map[string]*corev1.Node, cluster, inst string) bool {
 
 	var pod *corev1.Pod
-	for i := range pods {
-		p := &pods[i]
-		if p.Namespace != ns {
-			continue
-		}
+	for _, p := range nsPods {
 		// The unfence evidence must come from a pod that verifiably
 		// belongs to THIS cluster — a bare name match would let an
 		// unrelated same-named pod in the namespace prove a fenced

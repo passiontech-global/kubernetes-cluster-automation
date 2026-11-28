@@ -23,8 +23,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -107,12 +105,7 @@ func (c *ingressNginxRetirementGuardCheck) Run(ctx context.Context) probefw.Resu
 	classControllers := map[string]string{}
 	hasDefaultNginxClass := false
 
-	ics, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
-		},
-		ingressClassesPage(c.CS))
+	ics, err := c.AllIngressClasses(ctx)
 	icListOK := err == nil
 	if !icListOK {
 		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
@@ -152,12 +145,7 @@ func (c *ingressNginxRetirementGuardCheck) Run(ctx context.Context) probefw.Resu
 		}
 	}
 
-	ings, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
-		},
-		kube.Ingresses(c.CS, metav1.NamespaceAll))
+	ings, err := c.AllIngresses(ctx)
 	if err != nil {
 		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
 			log.V(1).Info("Ingress list skipped", "error", err)
@@ -212,16 +200,6 @@ func (c *ingressNginxRetirementGuardCheck) Run(ctx context.Context) probefw.Resu
 
 	return rep.Result(&c.emitted, ingressNginxDetectedGauge.DeleteLabelValues,
 		"ingress-nginx retirement detected: ", ", ")
-}
-
-func ingressClassesPage(cs kubernetes.Interface) kube.PageFunc[networkingv1.IngressClass] {
-	return func(ctx context.Context, opts metav1.ListOptions) ([]networkingv1.IngressClass, string, error) {
-		list, err := cs.NetworkingV1().IngressClasses().List(ctx, opts)
-		if err != nil {
-			return nil, "", err
-		}
-		return list.Items, list.Continue, nil
-	}
 }
 
 func carryIngressNginxByKind(rep *probefw.SweepReport, ledger *state.GaugeLedger[string], kind string) {
@@ -288,22 +266,11 @@ func (c *ingressNginxRetirementGuardCheck) emitRetirementEvent(
 	cooldownKey string,
 	note string,
 ) {
-	if c.eventCooldown.CooledDown(cooldownKey, ingressNginxEventCooldown, now) {
-		return
-	}
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:              kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, ingressNginxEventCooldown, now, kube.WarningEvent{
 		Namespace:         eventNS,
 		Regarding:         regarding,
 		Reason:            ingressNginxEventReason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: IngressNginxRetirement event create failed (RBAC?)",
-			"key", cooldownKey, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: IngressNginxRetirement", "key", cooldownKey)
+	})
 }

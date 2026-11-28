@@ -67,7 +67,10 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -373,6 +376,15 @@ type sweepSnapshot struct {
 	// dark nodes; memoized so N checks pay one LIST pair per sweep.
 	validatingWebhooks memo[[]admissionv1.ValidatingWebhookConfiguration]
 	mutatingWebhooks   memo[[]admissionv1.MutatingWebhookConfiguration]
+	// Lazy cluster/networking/RBAC/storage/quota censuses — populated
+	// only when a check asks, one watch-cache LIST per sweep.
+	ingresses           memo[[]networkingv1.Ingress]
+	ingressClasses      memo[[]networkingv1.IngressClass]
+	storageClasses      memo[[]storagev1.StorageClass]
+	networkPolicies     memo[[]networkingv1.NetworkPolicy]
+	clusterRoleBindings memo[[]rbacv1.ClusterRoleBinding]
+	roleBindings        memo[[]rbacv1.RoleBinding]
+	resourceQuotas      memo[[]corev1.ResourceQuota]
 
 	// Derived joins — memoized like the censuses: the derived error
 	// is the census's own, and each drops WITH its census (a join
@@ -411,6 +423,7 @@ type sweepSnapshot struct {
 	// the next lookup rebuilds on its own.
 	podPlacement podPlacementIndex
 	sliceSvc     sliceServiceIndex
+	svcNS        serviceNamespaceIndex
 
 	// AllUnstructured memoizes per GVR instead of per field — see
 	// the type comment above. Each entry is a full memo[T] so one
@@ -506,6 +519,9 @@ func newSweepSnapshot(ctx context.Context, nowFn func() time.Time) *sweepSnapsho
 		&s.daemonSets, &s.leases,
 		&s.replicaSets, &s.typedReplicaSets, &s.cronJobs, &s.jobs, &s.pdbs,
 		&s.validatingWebhooks, &s.mutatingWebhooks,
+		&s.ingresses, &s.ingressClasses, &s.storageClasses,
+		&s.networkPolicies, &s.clusterRoleBindings, &s.roleBindings,
+		&s.resourceQuotas,
 		&s.nodeZones, &s.podNodes, &s.nodeByName,
 		&s.leaseIndex, &s.serviceIndex,
 		&s.obsTarget, &s.promBackend,

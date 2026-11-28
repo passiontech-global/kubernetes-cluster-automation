@@ -240,16 +240,8 @@ func (p *controllerLeaseGuardCheck) ksmWedgeReason(ctx context.Context,
 		// fresh log evidence" and falls through to the metrics
 		// channel below.
 		key := pod.Namespace + "/" + pod.Name
-		if p.logScanAt == nil {
-			p.logScanAt = map[string]time.Time{}
-		}
-		prevScan, scanned := p.logScanAt[key]
-		if streamNewest.IsZero() {
-			p.logScanAt[key] = p.Now()
-		} else {
-			p.logScanAt[key] = streamNewest
-		}
-		if reason != "" && !newest.IsZero() && scanned && !newest.After(prevScan) {
+		prevScan, scanned := probefw.AdvanceLogScanAt(&p.logScanAt, key, streamNewest, p.Now())
+		if reason != "" && !probefw.LogLineFresh(scanned, newest, prevScan) {
 			reason = ""
 		}
 	}

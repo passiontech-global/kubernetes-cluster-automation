@@ -97,7 +97,7 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) string {
 	// terminated cleanly or we fail closed.
 	nativeMeshSidecars := make(map[string]bool)
 	for _, c := range p.Spec.InitContainers {
-		if isNativeSidecarContainer(c) && zombieSidecarNames[c.Name] {
+		if kube.IsNativeSidecarContainer(c) && zombieSidecarNames[c.Name] {
 			nativeMeshSidecars[c.Name] = true
 			continue
 		}
@@ -128,10 +128,4 @@ func (r *zombieSidecarReaper) zombiePod(p *corev1.Pod, now time.Time) string {
 		}
 	}
 	return ""
-}
-
-// isNativeSidecarContainer reports whether c is a K8s 1.29+ native
-// sidecar (initContainer with restartPolicy: Always).
-func isNativeSidecarContainer(c corev1.Container) bool {
-	return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
 }

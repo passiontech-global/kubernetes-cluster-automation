@@ -1449,3 +1449,36 @@ func TestPDBOverlappingDetection(t *testing.T) {
 		}
 	})
 }
+
+func TestPDBWatchdogReusesNamespacePodsAcrossBlockedAndOverlap(t *testing.T) {
+	ctx := t.Context()
+	clock := time.Now()
+	t.Cleanup(func() { pdwClearMetrics(t, [2]string{"app", "pdb-a"}, [2]string{"app", "pdb-b"}) })
+
+	sel := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}
+	pdbA := pdwBlockedPDB("app", "pdb-a", 3, 1, 1)
+	pdbA.Spec.Selector = sel
+	pdbB := pdwBlockedPDB("app", "pdb-b", 3, 1, 1)
+	pdbB.Spec.Selector = sel
+	pod := pdwUnreadyPod("app", "web-0", "node-cordoned", 10*time.Minute, "CrashLoopBackOff")
+	pod.Labels = map[string]string{"app": "web"}
+
+	cs := fake.NewSimpleClientset(pdwCordonedNode("node-cordoned"), pdbA, pdbB, pod)
+	var podLists atomic.Int32
+	cs.PrependReactor("list", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		podLists.Add(1)
+		return false, nil, nil
+	})
+	w := pdwReliefWatchdog(cs, &clock)
+	w.queue = "pdb-deadlock-watchdog-cache-test"
+
+	if err := w.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := podLists.Load(); got != 1 {
+		t.Fatalf("pod lists for blocked+overlap PDBs in same namespace = %d, want 1", got)
+	}
+	if v, ok := pdwOverlapCount(t, "app", "pdb-a,pdb-b"); !ok || v != 1 {
+		t.Fatalf("app overlap = (%v, %v), want (1, true)", v, ok)
+	}
+}

@@ -171,10 +171,7 @@ func (p *coreDNSForwardSaturationCheck) emitNdotsAuditEvent(
 	ratio, qps float64,
 ) {
 	ck := probefw.SelfHealKey(CheckNameCoreDNSForwardSaturation, "ndots/"+kind+"/"+ns+"/"+name)
-	if p.ndotsEventCooldown.CooledDown(ck, coreDNSNdotsEventCooldown, now) {
-		return
-	}
-	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
+	probefw.EmitWarningDeduped(ctx, p.CS, log, &p.ndotsEventCooldown, ck, coreDNSNdotsEventCooldown, now, kube.WarningEvent{
 		Name:      kube.TruncatedEventName("coredns-ndots."+kind+"."+ns+"."+name, kind+"/"+ns+"/"+name, now),
 		Namespace: ns,
 		Regarding: corev1.ObjectReference{
@@ -189,12 +186,5 @@ func (p *coreDNSForwardSaturationCheck) emitNdotsAuditEvent(
 			"CoreDNS NXDOMAIN ratio %.2f (>%.2f) at %.1f QPS; %s %s/%s (%d replicas) lacks spec.template.spec.dnsConfig.options[name=ndots] — consider setting ndots:2 to reduce search-path DNS amplification",
 			ratio, coreDNSNXDOMAINRatioThreshold, qps, kind, ns, name, replicas),
 		ReportingInstance: p.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: coredns ndots amplification event create failed (RBAC?)",
-			"kind", kind, "object", ns+"/"+name, "error", err)
-		return
-	}
-	p.ndotsEventCooldown.Stamp(ck, now)
-	log.Info("EVENT: CoreDNSNdotsAmplification", "kind", kind, "object", ns+"/"+name)
+	})
 }

@@ -426,14 +426,10 @@ func (c *svcCIDRCheck) svcCIDREmitWarning(
 	topNS string,
 ) {
 	cooldownKey := "svc-pool." + poolType + "." + poolLabel + "." + severity
-	if c.eventCooldown.CooledDown(cooldownKey, svcCIDREventCooldown, now) {
-		return
-	}
 	note := fmt.Sprintf("Service %s pool %s is at %.1f%% capacity (%d/%d allocated, severity=%s); top namespaces: %s",
 		poolType, poolLabel, pct, used, capacity, severity, topNS)
 
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, svcCIDREventCooldown, now, kube.WarningEvent{
 		Namespace: "kube-system",
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
@@ -443,11 +439,5 @@ func (c *svcCIDRCheck) svcCIDREmitWarning(
 		Reason:            svcCIDREventReason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: ServicePoolExhaustion event create failed (RBAC?)", "pool", poolLabel, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: ServicePoolExhaustion", "poolType", poolType, "pool", poolLabel, "severity", severity)
+	})
 }

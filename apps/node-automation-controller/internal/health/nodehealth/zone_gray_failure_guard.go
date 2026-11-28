@@ -500,19 +500,11 @@ func (c *zoneGrayFailureGuardCheck) zoneGrayEmitEvent(
 	slices.Sort(names)
 	note := fmt.Sprintf("Zone %s exhibits sustained gray failure (%d/%d workers degraded: %s)",
 		b.zone, len(b.degradedWorkers), len(b.workers), strings.Join(names, ", "))
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:              kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, zoneGrayEventCooldown, now, kube.WarningEvent{
 		Namespace:         "default",
 		Regarding:         ref,
 		Reason:            zoneGrayEventReason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: ZoneGrayFailureDetected event create failed (RBAC?)",
-			"zone", b.zone, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: ZoneGrayFailureDetected", "zone", b.zone)
+	})
 }

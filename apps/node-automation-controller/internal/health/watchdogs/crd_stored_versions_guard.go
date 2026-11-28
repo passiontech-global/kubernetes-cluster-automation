@@ -555,13 +555,9 @@ func (c *crdStoredVerCheck) crdStoredVerEmitEvent(
 	finding crdStoredVerFinding,
 ) {
 	cooldownKey := "crd.storedversions." + finding.name
-	if c.eventCooldown.CooledDown(cooldownKey, crdStoredVerEventCooldown, now) {
-		return
-	}
 	note := fmt.Sprintf("CRD %s has status.storedVersions=%v (%s); migrate CRs and prune unserved/stale storedVersions before Kubernetes upgrade",
 		finding.name, finding.stored, strings.Join(finding.reasons, ", "))
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, crdStoredVerEventCooldown, now, kube.WarningEvent{
 		Namespace: "default",
 		Regarding: corev1.ObjectReference{
 			APIVersion: "apiextensions.k8s.io/v1",
@@ -572,12 +568,5 @@ func (c *crdStoredVerCheck) crdStoredVerEmitEvent(
 		Reason:            crdStoredVerEventReason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: CRDStoredVersionsDrift event create failed (RBAC?)",
-			"crd", finding.name, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: CRDStoredVersionsDrift", "crd", finding.name, "reasons", finding.reasons)
+	})
 }

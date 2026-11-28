@@ -14,7 +14,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 
@@ -87,18 +86,6 @@ func TestHealAllowedVariantsAndDeletePodHealScoped(t *testing.T) {
 	}
 	if _, err := cs.CoreV1().Pods("default").Get(ctx, "dep-pod", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("dep-pod not deleted: %v", err)
-	}
-}
-
-func TestCensusHit(t *testing.T) {
-	pods := []corev1.Pod{
-		{ObjectMeta: metav1.ObjectMeta{Namespace: "ns1", Name: "p1", UID: types.UID("uid-1")}},
-	}
-	if found, uid := censusHit(pods, "ns1", "p1", func(p *corev1.Pod) metav1.Object { return p }); !found || uid != "uid-1" {
-		t.Fatalf("censusHit hit = (%v,%q), want (true,uid-1)", found, uid)
-	}
-	if found, _ := censusHit(pods, "ns1", "missing", func(p *corev1.Pod) metav1.Object { return p }); found {
-		t.Fatal("censusHit miss returned true")
 	}
 }
 

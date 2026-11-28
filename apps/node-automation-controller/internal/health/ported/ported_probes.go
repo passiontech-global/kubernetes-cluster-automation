@@ -15,7 +15,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
@@ -290,12 +289,7 @@ func (p *podStatusCheck) Run(ctx context.Context) probefw.Result {
 // THRESHOLD=0.9 — strictly greater, so exactly-at-threshold passes).
 // A resource absent from Status.Used counts as 0.
 func (p *resourceQuotaCheck) Run(ctx context.Context) probefw.Result {
-	quotas, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
-		},
-		kube.ResourceQuotas(p.CS, metav1.NamespaceAll))
+	quotas, err := p.AllResourceQuotas(ctx)
 	if err != nil {
 		return probefw.Result{Infra: fmt.Errorf("list resourcequotas: %w", err)}
 	}

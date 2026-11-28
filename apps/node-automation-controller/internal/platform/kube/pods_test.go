@@ -233,3 +233,13 @@ func TestPodMergePatcher(t *testing.T) {
 		t.Fatal("invalid patch data accepted")
 	}
 }
+
+func TestIsNativeSidecarContainer(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	if IsNativeSidecarContainer(corev1.Container{Name: "init"}) {
+		t.Fatal("nil RestartPolicy must not count as native sidecar")
+	}
+	if !IsNativeSidecarContainer(corev1.Container{Name: "proxy", RestartPolicy: &always}) {
+		t.Fatal("RestartPolicy=Always must count as native sidecar")
+	}
+}

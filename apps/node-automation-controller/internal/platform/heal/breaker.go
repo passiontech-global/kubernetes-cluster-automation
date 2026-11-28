@@ -360,3 +360,21 @@ func RefundTarget(module, targetKey string, now time.Time) {
 		b.Refund(module, targetKey, now)
 	}
 }
+
+// WithTargetBreaker acquires a per-(module, targetKey) grant via
+// TryAcquireTarget before invoking fn. If the target circuit is open it
+// returns (false, reason, nil) without calling fn. When fn returns
+// keepGrant=false, RefundTarget returns the acquired grant.
+func WithTargetBreaker(module, targetKey string, now time.Time,
+	fn func() (keepGrant bool, err error)) (allowed bool, reason string, err error) {
+
+	allowed, reason = TryAcquireTarget(module, targetKey, now)
+	if !allowed {
+		return false, reason, nil
+	}
+	keepGrant, err := fn()
+	if !keepGrant {
+		RefundTarget(module, targetKey, now)
+	}
+	return true, "", err
+}

@@ -235,11 +235,7 @@ func (p *argoCDAgentSpinCheck) Run(ctx context.Context) probefw.Result {
 	// the last real log read, and entries for pods that left
 	// candidacy entirely (renamed, deleted, too fresh) are dropped
 	// so a re-entering pod bootstraps against its own last scan.
-	for k := range p.logScanAt {
-		if !scanLive[k] {
-			delete(p.logScanAt, k)
-		}
-	}
+	probefw.PruneLogScanAt(p.logScanAt, scanLive)
 	return rep.Result(&p.emitted, argocdAgentSpinGauge.DeleteLabelValues,
 		"argocd-agent spin pods: ", ", ")
 }
@@ -286,10 +282,7 @@ func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
 	// The scan boundary advances on every SUCCESSFUL fetch — a
 	// failed read must not push it forward (the next good scan
 	// would then skip lines written during the outage).
-	if p.logScanAt == nil {
-		p.logScanAt = map[string]time.Time{}
-	}
-	prevScan, scanned := p.logScanAt[key]
+	prevScan, scanned := probefw.ReadLogScanAt(p.logScanAt, key)
 	// freshOnly makes the scanner count ONLY error lines newer than
 	// this pod's previous scan — the 15m tail overlaps across
 	// sweeps, so counting the whole window would double-count an
@@ -299,11 +292,7 @@ func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
 	// fallback for a stream with no parseable timestamp at all.
 	errs, recovered, newestErr, streamNewest := scanAgentSpinLines(
 		strings.NewReader(text), prevScan, scanned)
-	if streamNewest.IsZero() {
-		p.logScanAt[key] = now
-	} else {
-		p.logScanAt[key] = streamNewest
-	}
+	probefw.AdvanceLogScanAt(&p.logScanAt, key, streamNewest, now)
 	if errs < argocdAgentMinErrs || recovered {
 		return false, nil
 	}
@@ -311,7 +300,7 @@ func (p *argoCDAgentSpinCheck) logSpin(ctx context.Context,
 	// COUNTED (fresh) error lines — zero means the counted errors
 	// carried no parseable stamp, which counts as fresh (fail
 	// toward alerting, never toward silence).
-	if scanned && !newestErr.IsZero() && !newestErr.After(prevScan) {
+	if !probefw.LogLineFresh(scanned, newestErr, prevScan) {
 		return false, nil
 	}
 	return true, nil

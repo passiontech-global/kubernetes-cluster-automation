@@ -92,6 +92,14 @@ func (b *Breaker) bounceServiceKeys(ctx context.Context, snap *guardstate.Snapsh
 	// preamble itself (cooldown + mutex + budget grant) now rides
 	// inside deleteBouncePod's heal.EvictPodV call.
 	for _, key := range keys {
+		// Check in-RAM per-service cooldown BEFORE paying per-pod API
+		// Reads inside oldestLiveBackingPod so a cooled-down webhook
+		// never issues N Pods.Get calls on every 15s sweep.
+		if b.bounceAt.CooledDown(key, BounceCooldown, now) {
+			log.V(1).Info("webhook bounce: inside per-service cooldown — skipped",
+				"service", key, "reason", reason)
+			continue
+		}
 		target := b.oldestLiveBackingPod(ctx, snap, key, ready.BackingPods[key], now)
 		if target == nil {
 			log.Info("webhook bounce: no live Ready backing pod found — endpoint refs are stale",

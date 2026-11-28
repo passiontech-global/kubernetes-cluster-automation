@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -386,7 +387,7 @@ func findMissingNamedTargetPort(svcPorts []corev1.ServicePort, matchingPods []*c
 		// proxy that terminates the Service traffic. Missing them
 		// reported a false target_port_mismatch.
 		for _, ic := range p.Spec.InitContainers {
-			if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			if kube.IsNativeSidecarContainer(ic) {
 				addPorts([]corev1.Container{ic})
 			}
 		}
@@ -409,10 +410,7 @@ func findMissingNamedTargetPort(svcPorts []corev1.ServicePort, matchingPods []*c
 
 func (c *serviceSelectorBlackholeCheck) emitBlackholeEvent(ctx context.Context, svc *corev1.Service, reason, note string, now time.Time) {
 	key := svc.Namespace + "/" + svc.Name + "/" + reason
-	if c.eventCooldown.CooledDown(key, serviceBlackholeEventCooldown, now) {
-		return
-	}
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
+	probefw.EmitWarningDeduped(ctx, c.CS, logf.FromContext(ctx), &c.eventCooldown, key, serviceBlackholeEventCooldown, now, kube.WarningEvent{
 		Namespace: svc.Namespace,
 		Name:      fmt.Sprintf("%s.selector-blackhole.%d", svc.Name, now.Unix()),
 		Reason:    "ServiceSelectorBlackhole",
@@ -425,8 +423,5 @@ func (c *serviceSelectorBlackholeCheck) emitBlackholeEvent(ctx context.Context, 
 			UID:        svc.UID,
 		},
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err == nil {
-		c.eventCooldown.Stamp(key, now)
-	}
+	})
 }

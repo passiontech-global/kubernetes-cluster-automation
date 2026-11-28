@@ -236,18 +236,3 @@ func (d *Deps) OwnerGone(ctx context.Context, ns string,
 	}
 	return OwnerGone(ctx, d.CS, ns, ref, kinds...)
 }
-
-// censusHit scans one sweep census slice for a namespace+name match
-// and returns the object's UID — the census-side twin of the point
-// GET's liveUID read. found=false on no match (or empty items).
-func censusHit[T any](items []T, ns, name string,
-	meta func(*T) metav1.Object) (found bool, uid types.UID) {
-
-	for i := range items {
-		o := meta(&items[i])
-		if o.GetNamespace() == ns && o.GetName() == name {
-			return true, o.GetUID()
-		}
-	}
-	return false, ""
-}

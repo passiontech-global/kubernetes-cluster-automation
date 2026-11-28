@@ -600,3 +600,29 @@ func TestWebhookBreakerRestoreOnlyRecoversButNeverTrips(t *testing.T) {
 		t.Fatalf("restore mode patch calls = %d, want exactly the recover flip", got)
 	}
 }
+
+func TestBounceServiceKeysSkipsPodGetDuringCooldown(t *testing.T) {
+	now := time.Now()
+	cs := fake.NewSimpleClientset(wgPod("backend", "wh-old", time.Hour))
+	var podGets atomic.Int32
+	cs.PrependReactor("get", "pods", func(ktesting.Action) (bool, runtime.Object, error) {
+		podGets.Add(1)
+		return false, nil, nil
+	})
+	b := &Breaker{}
+	b.bounceAt.Stamp("backend/hung-svc", now.Add(-time.Minute))
+	g := &guardstate.Guard{
+		CS:  cs,
+		Now: func() time.Time { return now },
+	}
+	snap := &guardstate.Snapshot{G: g}
+	ready := guardstate.EndpointCensus{
+		BackingPods: map[string][]guardstate.PodRef{
+			"backend/hung-svc": {{Namespace: "backend", Name: "wh-old"}},
+		},
+	}
+	b.bounceServiceKeys(t.Context(), snap, ready, []string{"backend/hung-svc"}, "test")
+	if got := podGets.Load(); got != 0 {
+		t.Fatalf("cooled-down bounce issued %d Pods.Get calls, want 0", got)
+	}
+}

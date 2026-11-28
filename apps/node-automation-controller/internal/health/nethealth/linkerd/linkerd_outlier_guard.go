@@ -184,13 +184,12 @@ func linkerdPodTemplateHash(pod *corev1.Pod) string {
 // rollouts-pod-template-hash label). uniform=false means the members
 // carry >1 distinct hash (rollout or canary in flight → no valid
 // control group).
-func linkerdDeploymentPods(pods []corev1.Pod, ns, deploy string) (
+func linkerdDeploymentPods(nsPods []*corev1.Pod, deploy string) (
 	members []*corev1.Pod, hash string, uniform bool) {
 
 	hashes := map[string]bool{}
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Namespace != ns || pod.DeletionTimestamp != nil {
+	for _, pod := range nsPods {
+		if pod.DeletionTimestamp != nil {
 			continue
 		}
 		h := linkerdPodTemplateHash(pod)
@@ -358,8 +357,10 @@ func (p *linkerdOutlierGuardCheck) Run(ctx context.Context) probefw.Result {
 		s := c.s
 		// Condition 2a — cohort coherence: every live member of the
 		// Deployment must carry ONE pod-template-hash (a mid-rollout
-		// or canary cohort has no control group).
-		if _, _, uniform := linkerdDeploymentPods(pods, s.ns, s.deploy); !uniform {
+		// or canary cohort has no control group). Read only the
+		// candidate's namespace via PodsIn rather than rescanning all pods.
+		nsPods, _ := p.PodsIn(ctx, s.ns)
+		if _, _, uniform := linkerdDeploymentPods(nsPods, s.deploy); !uniform {
 			continue
 		}
 		pod := podByKey[s.ns+"/"+s.pod]

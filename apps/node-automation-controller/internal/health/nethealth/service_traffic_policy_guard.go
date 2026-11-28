@@ -31,7 +31,6 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -427,12 +426,7 @@ func (c *serviceTrafficPolicyGuardCheck) auditMissingPreStop(
 		}
 	}
 
-	ingresses, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
-		},
-		kube.Ingresses(c.CS, metav1.NamespaceAll))
+	ingresses, err := c.AllIngresses(ctx)
 	switch {
 	case err == nil:
 		for i := range ingresses {

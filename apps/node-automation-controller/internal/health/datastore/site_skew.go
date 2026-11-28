@@ -80,9 +80,10 @@ type siteSkewSweep struct {
 	censusOK  bool
 	infraErr  error
 	multiZone bool
-	nodeZone  map[string]string // node name → topology zone
-	podNode   map[string]string // "ns/pod" → node name
-	podItems  []corev1.Pod      // the sweep's pod census (stsReadyInZone scans live pods)
+	nodeZone  map[string]string        // node name → topology zone
+	podNode   map[string]string        // "ns/pod" → node name
+	podsByNS  map[string][]*corev1.Pod // namespace → pods (for O(ns_pods) zone checks)
+	stsSel    map[string]labels.Selector
 	// Trigger-B bookkeeping:
 	//   - totalMasters: candidates with a live master to place.
 	//   - lanitPinned: candidate key → label tuple, for masters
@@ -144,7 +145,15 @@ func (w *siteSkewWatch) begin(ctx context.Context, log logr.Logger,
 			}
 		}
 	}
-	s.podItems, _ = d.AllPods(ctx)
+	podItems, _ := d.AllPods(ctx)
+	s.podsByNS = make(map[string][]*corev1.Pod)
+	for i := range podItems {
+		p := &podItems[i]
+		if p.DeletionTimestamp == nil && kube.PodReadyCond(p) {
+			s.podsByNS[p.Namespace] = append(s.podsByNS[p.Namespace], p)
+		}
+	}
+	s.stsSel = map[string]labels.Selector{}
 	// The skew signatures only mean something on a multi-zone
 	// cluster where BOTH sites have live workers — a single-zone
 	// cluster or a dead site can't skew.
@@ -178,8 +187,7 @@ func (s *siteSkewSweep) evalMaster(c masterSvc, key string,
 		// Trigger A: the master lives in the standby zone
 		// while the workload still serves Ready replicas in the
 		// main zone — reads/writes pay the inter-DC RTT.
-		if workloadReadyInZone(c, s.podItems, s.podNode, s.nodeZone,
-			statefulMainSiteZone) {
+		if s.candidateReadyInZone(c, statefulMainSiteZone) {
 			s.rep.Flag(statefulMasterSiteSkewGauge,
 				key+"/"+statefulStandbySiteZone,
 				[]string{c.ns, c.svc, c.workloadName(),
@@ -256,6 +264,39 @@ func endpointZone(e kube.ReadyEndpoint, podNode, nodeZone map[string]string) str
 		return nodeZone[podNode[e.PodKey]]
 	}
 	return ""
+}
+
+func (s *siteSkewSweep) candidateSelector(c masterSvc) (labels.Selector, bool) {
+	if c.sts != nil {
+		cacheKey := "sts/" + c.ns + "/" + c.sts.Name
+		if sel, ok := s.stsSel[cacheKey]; ok {
+			return sel, sel != nil
+		}
+		sel, err := metav1.LabelSelectorAsSelector(c.sts.Spec.Selector)
+		if err != nil {
+			s.stsSel[cacheKey] = nil
+			return nil, false
+		}
+		s.stsSel[cacheKey] = sel
+		return sel, true
+	}
+	return labels.SelectorFromSet(labels.Set{cnpgClusterLabel: c.cnpg}), true
+}
+
+func (s *siteSkewSweep) candidateReadyInZone(c masterSvc, zone string) bool {
+	sel, ok := s.candidateSelector(c)
+	if !ok {
+		return false
+	}
+	for _, pod := range s.podsByNS[c.ns] {
+		if !sel.Matches(labels.Set(pod.Labels)) {
+			continue
+		}
+		if s.nodeZone[s.podNode[pod.Namespace+"/"+pod.Name]] == zone {
+			return true
+		}
+	}
+	return false
 }
 
 // workloadReadyInZone reports whether the candidate's workload has

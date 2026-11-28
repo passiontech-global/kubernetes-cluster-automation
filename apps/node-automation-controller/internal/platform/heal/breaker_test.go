@@ -172,3 +172,32 @@ func TestRefundTargetGlobal(t *testing.T) {
 		t.Fatalf("global acquire after RefundTarget = (%v,%q), want (true,\"\")", ok, reason)
 	}
 }
+
+func TestWithTargetBreaker(t *testing.T) {
+	resetTargetBreaker(t)
+	ConfigureTargetBreaker(1, time.Hour)
+	now := time.Now()
+
+	// Returning keepGrant=false refunds so next attempt still succeeds.
+	allowed, _, err := WithTargetBreaker("mod", "t1", now, func() (bool, error) {
+		return false, nil
+	})
+	if !allowed || err != nil {
+		t.Fatalf("first WithTargetBreaker = (%v, %v), want (true, nil)", allowed, err)
+	}
+	allowed, _, _ = WithTargetBreaker("mod", "t1", now.Add(time.Minute), func() (bool, error) {
+		return true, nil
+	})
+	if !allowed {
+		t.Fatal("second WithTargetBreaker should succeed after refund")
+	}
+	// Limit=1 is now exhausted — circuit must block without calling fn.
+	called := false
+	allowed, reason, _ := WithTargetBreaker("mod", "t1", now.Add(2*time.Minute), func() (bool, error) {
+		called = true
+		return true, nil
+	})
+	if allowed || reason == "" || called {
+		t.Fatalf("circuit open = (%v, %q, called=%v), want (false, non-empty, false)", allowed, reason, called)
+	}
+}

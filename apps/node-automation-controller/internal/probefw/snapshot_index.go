@@ -258,3 +258,39 @@ func (ix *sliceServiceIndex) lookup(
 	ix.src, ix.byKey, ix.built = slices, m, true
 	return m
 }
+
+// serviceNamespaceIndex lazily indexes AllServices by namespace so
+// per-namespace Service scans avoid O(STS * allServices) quadratic loops.
+// Self-validating on census slice identity like sliceServiceIndex.
+type serviceNamespaceIndex struct {
+	mu    sync.Mutex
+	src   []corev1.Service
+	byNS  map[string][]*corev1.Service
+	built bool
+}
+
+func (ix *serviceNamespaceIndex) lookup(svcs []corev1.Service) map[string][]*corev1.Service {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if ix.built && elemSliceSame(ix.src, svcs) {
+		return ix.byNS
+	}
+	m := make(map[string][]*corev1.Service)
+	for i := range svcs {
+		s := &svcs[i]
+		m[s.Namespace] = append(m[s.Namespace], s)
+	}
+	ix.src, ix.byNS, ix.built = svcs, m, true
+	return m
+}
+
+// ServicesByNS returns the Services in namespace ns backed by the shared
+// AllServices census, indexed once per sweep in O(1) after first build.
+// Elements alias snapshot state — read-only.
+func (d *Deps) ServicesByNS(ctx context.Context, ns string) ([]*corev1.Service, error) {
+	svcs, err := d.AllServices(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return sweepSnap(ctx).svcNS.lookup(svcs)[ns], nil
+}

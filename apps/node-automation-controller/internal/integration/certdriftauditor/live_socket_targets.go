@@ -502,7 +502,7 @@ func resolveContainerPort(sp *corev1.ServicePort, pod *corev1.Pod) int32 {
 		// e.g. a service-mesh proxy terminating the Service traffic.
 		for i := range pod.Spec.InitContainers {
 			ic := &pod.Spec.InitContainers[i]
-			if ic.RestartPolicy == nil || *ic.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			if !kube.IsNativeSidecarContainer(*ic) {
 				continue
 			}
 			if port := namedContainerPort(ic.Ports, sp.TargetPort.StrVal); port > 0 {

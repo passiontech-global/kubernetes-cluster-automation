@@ -246,7 +246,7 @@ func (c *draClaimWedgeGuardCheck) Run(ctx context.Context) probefw.Result {
 			}
 			if !cleared && driverBounces < draClaimMaxDriverBouncesPerSweep {
 				if pinned := pinnedNodeName(&claim); pinned != "" && (!nodesKnown || (nodeByName[pinned] != nil && !nodeDeadPastAge(nodeByName[pinned], now, minAge))) {
-					c.maybeBounceDRADriverPod(ctx, log, now, pods, pinned, &driverBounces)
+					c.maybeBounceDRADriverPod(ctx, log, now, pinned, &driverBounces)
 				}
 			}
 		}
@@ -370,11 +370,7 @@ func (c *draClaimWedgeGuardCheck) emitClaimEvent(
 	reason string,
 ) {
 	cooldownKey := "draclaim." + claim.Namespace + "." + claim.Name + "." + reason
-	if c.eventCooldown.CooledDown(cooldownKey, draClaimEventCooldown, now) {
-		return
-	}
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, draClaimEventCooldown, now, kube.WarningEvent{
 		Namespace: claim.Namespace,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "resource.k8s.io/v1",
@@ -386,14 +382,7 @@ func (c *draClaimWedgeGuardCheck) emitClaimEvent(
 		Reason:            draClaimEventReason,
 		Note:              fmt.Sprintf("ResourceClaim %s/%s wedged (%s)", claim.Namespace, claim.Name, reason),
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: DRAClaimWedged event create failed (RBAC?)",
-			"claim", claim.Namespace+"/"+claim.Name, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: DRAClaimWedged", "claim", claim.Namespace+"/"+claim.Name, "reason", reason)
+	})
 }
 
 func (c *draClaimWedgeGuardCheck) clearReservedFor(
@@ -486,14 +475,16 @@ func (c *draClaimWedgeGuardCheck) maybeBounceDRADriverPod(
 	ctx context.Context,
 	log logr.Logger,
 	now time.Time,
-	pods []corev1.Pod,
 	nodeName string,
 	bounces *int,
 ) {
+	nodePods, err := c.PodsOnNode(ctx, nodeName)
+	if err != nil {
+		return
+	}
 	var candidates []*corev1.Pod
-	for i := range pods {
-		pod := &pods[i]
-		if pod.Spec.NodeName == nodeName && isDRADriverDaemonSetPod(pod) {
+	for _, pod := range nodePods {
+		if isDRADriverDaemonSetPod(pod) {
 			candidates = append(candidates, pod)
 		}
 	}

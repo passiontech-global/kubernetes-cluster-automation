@@ -82,7 +82,7 @@ func (d *Deps) ObsTarget(ctx context.Context) (promq.ObsTarget, bool) {
 	if !d.Cfg.HTTPContent.AutoDetect || d.Cfg.HTTPContent.URLExplicit {
 		endpoint, _ := d.PromEndpoint()
 		return promq.ObsTarget{
-			Backend:      inferBackendFromURL(endpoint),
+			Backend:      promq.DetectBackendFromURL(endpoint),
 			HealthURL:    d.Cfg.HTTPContent.URL,
 			ExpectedBody: d.Cfg.HTTPContent.Expected,
 			QueryURL:     endpoint,
@@ -104,21 +104,6 @@ func (d *Deps) ObsTarget(ctx context.Context) (promq.ObsTarget, bool) {
 		target.QueryURL = d.promEndpointOverride
 	}
 	return target, res.detected
-}
-
-func inferBackendFromURL(endpoint string) promq.BackendKind {
-	lower := strings.ToLower(endpoint)
-	for _, hint := range []string{"vmauth", "vmsingle", "vmselect", "victoria-metrics"} {
-		if strings.Contains(lower, hint) {
-			return promq.BackendVictoriaMetrics
-		}
-	}
-	for _, hint := range []string{"prometheus-operator", "kube-prometheus-stack"} {
-		if strings.Contains(lower, hint) {
-			return promq.BackendPrometheus
-		}
-	}
-	return promq.BackendUnknown
 }
 
 // PromEndpointCtx resolves the /api/v1/query URL for ctx: an explicit

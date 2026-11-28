@@ -433,6 +433,15 @@ func Ingresses(cs kubernetes.Interface, namespace string) PageFunc[networkingv1.
 		func(l *networkingv1.IngressList) []networkingv1.Ingress { return l.Items })
 }
 
+// IngressClasses lists cluster-scoped Networking IngressClasses.
+func IngressClasses(cs kubernetes.Interface) PageFunc[networkingv1.IngressClass] {
+	return typedPage(
+		func(ctx context.Context, o metav1.ListOptions) (*networkingv1.IngressClassList, error) {
+			return cs.NetworkingV1().IngressClasses().List(ctx, o)
+		},
+		func(l *networkingv1.IngressClassList) []networkingv1.IngressClass { return l.Items })
+}
+
 // ClusterRoleBindings lists cluster-scoped RBAC ClusterRoleBindings.
 func ClusterRoleBindings(cs kubernetes.Interface) PageFunc[rbacv1.ClusterRoleBinding] {
 	return typedPage(

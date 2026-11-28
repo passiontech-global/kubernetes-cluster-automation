@@ -267,13 +267,9 @@ func (c *oomResizeGuardCheck) emitOOMWarningEvent(
 	now time.Time,
 ) {
 	cdKey := "oomresize." + pod.Namespace + "." + pod.Name + "." + container
-	if c.eventCooldown.CooledDown(cdKey, oomResizeEventCooldown, now) {
-		return
-	}
 	note := fmt.Sprintf("Container %s in Pod %s/%s hit %d OOMKilled restarts inside %s",
 		container, pod.Namespace, pod.Name, oomCount, oomResizeWindow)
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cdKey, cdKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cdKey, oomResizeEventCooldown, now, kube.WarningEvent{
 		Namespace: pod.Namespace,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
@@ -285,13 +281,7 @@ func (c *oomResizeGuardCheck) emitOOMWarningEvent(
 		Reason:            oomResizeEventReason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: OOMResizeBurst event create failed (RBAC?)",
-			"pod", pod.Namespace+"/"+pod.Name, "container", container, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cdKey, now)
+	})
 	log.Info("EVENT: OOMResizeBurst",
 		"pod", pod.Namespace+"/"+pod.Name, "container", container, "ooms", oomCount)
 }
@@ -510,7 +500,7 @@ func oomResizeNodeAllocatedMem(pods []corev1.Pod) map[string]int64 {
 		var appSum, sidecarSum, regularInitMax int64
 		for _, ic := range p.Spec.InitContainers {
 			mem := oomResizeContainerMem(ic)
-			if ic.RestartPolicy != nil && *ic.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			if kube.IsNativeSidecarContainer(ic) {
 				sidecarSum += mem
 			} else if mem > regularInitMax {
 				regularInitMax = mem

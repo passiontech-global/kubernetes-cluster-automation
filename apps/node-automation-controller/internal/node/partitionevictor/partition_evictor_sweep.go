@@ -237,18 +237,23 @@ func (s *partitionSweep) taintFlagged(ctx context.Context) {
 		// re-patch churn of a node that will not converge (each
 		// recovery untaint clears the history — see above).
 		// Defer semantics: log, skip this node, never an error.
-		if allowed, reason := heal.TryAcquireTarget(s.e.queue, name, s.now); !allowed {
+		allowed, reason, err := heal.WithTargetBreaker(s.e.queue, name, s.now, func() (bool, error) {
+			if terr := kube.TaintNode(ctx, s.e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); terr != nil {
+				return false, terr
+			}
+			return true, nil
+		})
+		if !allowed {
 			s.log.Info("DEFER: heal target circuit open — taint skipped",
 				"node", name, "reason", reason)
 			continue
 		}
-		s.breakerCharged[name] = true // grant consumed — evict rides it
-		if err := kube.TaintNode(ctx, s.e.cs, name, partitionTaintKey, "true", corev1.TaintEffectNoSchedule); err != nil {
-			heal.RefundTarget(s.e.queue, name, s.now)
+		if err != nil {
 			s.breakerCharged[name] = false
 			metrics.IncError(s.e.queue)
 			s.log.Error(err, "taint failed", "node", name)
 		} else {
+			s.breakerCharged[name] = true // grant consumed — evict rides it
 			s.taintedNode[name] = true
 			s.log.Info("TAINT: network partitioned -> NoSchedule", "node", name)
 		}

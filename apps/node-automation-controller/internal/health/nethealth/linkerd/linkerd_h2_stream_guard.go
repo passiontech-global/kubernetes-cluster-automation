@@ -250,24 +250,9 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 		// unparseable stamp counts as fresh — fail toward
 		// alerting. The scan boundary advances on every successful
 		// fetch (err==nil path only).
-		if p.logScanAt == nil {
-			p.logScanAt = map[string]time.Time{}
-		}
-		prevScan, scanned := p.logScanAt[key]
-		// The boundary advances in the KUBELET's clock domain —
-		// streamNewest is the newest stamp on any line read; `now`
-		// (controller clock) is only the fallback for a stream
-		// that carried no parseable timestamp at all.
-		if h2sigs[i].Value.streamNewest.IsZero() {
-			p.logScanAt[key] = now
-		} else {
-			p.logScanAt[key] = h2sigs[i].Value.streamNewest
-		}
-		fresh := func(ts time.Time) bool {
-			return !scanned || ts.IsZero() || ts.After(prevScan)
-		}
-		storm, identity := h2sigs[i].Value.storm && fresh(h2sigs[i].Value.stormTS),
-			h2sigs[i].Value.identity && fresh(h2sigs[i].Value.identityTS)
+		prevScan, scanned := probefw.AdvanceLogScanAt(&p.logScanAt, key, h2sigs[i].Value.streamNewest, now)
+		storm := h2sigs[i].Value.storm && probefw.LogLineFresh(scanned, h2sigs[i].Value.stormTS, prevScan)
+		identity := h2sigs[i].Value.identity && probefw.LogLineFresh(scanned, h2sigs[i].Value.identityTS, prevScan)
 		if !storm && !identity {
 			continue
 		}
@@ -316,11 +301,7 @@ func (p *linkerdH2StreamGuardCheck) Run(ctx context.Context) probefw.Result {
 	// for pods that left the scan universe (deleted, unmeshed,
 	// too fresh) are dropped so a re-entering pod bootstraps
 	// against its own last read.
-	for k := range p.logScanAt {
-		if !scanLive[k] {
-			delete(p.logScanAt, k)
-		}
-	}
+	probefw.PruneLogScanAt(p.logScanAt, scanLive)
 	rep.Close(&p.emitted, linkerdH2StreamStalledGauge.DeleteLabelValues)
 	identityRep.Close(&p.identityEmitted, linkerdProxyIdentityStalledGauge.DeleteLabelValues)
 	oomRep.Close(&p.oomEmitted, linkerdProxyOOMKilledGauge.DeleteLabelValues)

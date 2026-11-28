@@ -98,42 +98,28 @@ func (p *fluxKustomizationHealthCheck) fluxDeploymentReady(ctx context.Context,
 func (p *fluxKustomizationHealthCheck) fluxRolloutReady(ctx context.Context,
 	ns, name string) bool {
 
-	ros, err := p.AllUnstructured(ctx, kube.GVRArgoRollout)
-	if err != nil {
+	r, err := p.Unstructured(ctx, kube.GVRArgoRollout, ns, name)
+	if err != nil || r == nil {
 		return false
 	}
-	for i := range ros {
-		r := &ros[i]
-		if r.GetNamespace() != ns || r.GetName() != name {
-			continue
-		}
-		desired := int64(1)
-		if d, found := kube.NestedInt64(r.Object, "spec", "replicas"); found {
-			desired = d
-		}
-		ready, _ := kube.NestedInt64(r.Object, "status", "readyReplicas")
-		return ready >= desired
+	desired := int64(1)
+	if d, found := kube.NestedInt64(r.Object, "spec", "replicas"); found {
+		desired = d
 	}
-	return false
+	ready, _ := kube.NestedInt64(r.Object, "status", "readyReplicas")
+	return ready >= desired
 }
 
 // fluxStatefulSetReady is the StatefulSet twin over the shared
-// StatefulSet census.
+// StatefulSet census index.
 func (p *fluxKustomizationHealthCheck) fluxStatefulSetReady(ctx context.Context,
 	ns, name string) bool {
 
-	stss, err := p.AllStatefulSets(ctx)
-	if err != nil {
+	s, err := p.StatefulSet(ctx, ns, name)
+	if err != nil || s == nil {
 		return false
 	}
-	for i := range stss {
-		s := &stss[i]
-		if s.Namespace != ns || s.Name != name {
-			continue
-		}
-		return s.Status.ReadyReplicas >= desiredReplicas(s.Spec.Replicas)
-	}
-	return false
+	return s.Status.ReadyReplicas >= desiredReplicas(s.Spec.Replicas)
 }
 
 // desiredReplicas dereferences the workload replica pointer — a nil

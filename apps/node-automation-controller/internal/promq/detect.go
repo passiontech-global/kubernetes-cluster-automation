@@ -159,7 +159,7 @@ func DetectBackend(ctx context.Context, client *Client, endpoint string) (Backen
 	if endpoint == "" {
 		return BackendUnknown, errors.New("detect backend: empty endpoint")
 	}
-	if kind := detectBackendFromURL(endpoint); kind != BackendUnknown {
+	if kind := DetectBackendFromURL(endpoint); kind != BackendUnknown {
 		return kind, nil
 	}
 	if client == nil {
@@ -193,7 +193,10 @@ func DetectBackend(ctx context.Context, client *Client, endpoint string) (Backen
 	}
 }
 
-func detectBackendFromURL(endpoint string) BackendKind {
+// DetectBackendFromURL classifies endpoint as Prometheus or
+// VictoriaMetrics purely from URL host/path hints (BackendUnknown when
+// neither hint matches).
+func DetectBackendFromURL(endpoint string) BackendKind {
 	target := strings.ToLower(endpoint)
 	if u, err := url.Parse(endpoint); err == nil && (u.Host != "" || u.Path != "") {
 		target = strings.ToLower(u.Host + u.Path)

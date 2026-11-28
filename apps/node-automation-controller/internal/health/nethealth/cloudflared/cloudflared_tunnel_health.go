@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -200,7 +201,12 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 	var rep probefw.SweepReport
 	streakKeep := map[string]bool{}
 	seenKeep := map[string]bool{} // podsSeen rebuild set — Running connectors only
-	var degraded []*corev1.Pod
+	type cfCandidate struct {
+		pod *corev1.Pod
+		key string
+		sig string
+	}
+	var toProbe []cfCandidate
 	for i := range pods {
 		pod := &pods[i]
 		if pod.DeletionTimestamp != nil ||
@@ -230,12 +236,35 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 		if age, ok := kube.AgeSince(pod.CreationTimestamp.Time, now); !ok || age < cfTunnelPodMinAge {
 			continue // young pod — the wedge evaluation waits it out
 		}
-		bad := false
-		if ha, ok := p.cfTunnelHAConnections(ctx, pod); ok {
-			bad = ha == 0
-		} else if storm, lerr := p.cfTunnelLogQUICStorm(ctx, pod); lerr == nil {
-			bad = storm
-		} else {
+		toProbe = append(toProbe, cfCandidate{pod: pod, key: key, sig: sig})
+	}
+
+	type cfProbeResult struct {
+		bad  bool
+		lerr error
+	}
+	probeRes := make([]cfProbeResult, len(toProbe))
+	var g errgroup.Group
+	g.SetLimit(4)
+	for idx, cand := range toProbe {
+		g.Go(func() error {
+			if ha, ok := p.cfTunnelHAConnections(ctx, cand.pod); ok {
+				probeRes[idx].bad = ha == 0
+			} else if storm, lerr := p.cfTunnelLogQUICStorm(ctx, cand.pod); lerr == nil {
+				probeRes[idx].bad = storm
+			} else {
+				probeRes[idx].lerr = lerr
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	var degraded []*corev1.Pod
+	for idx, cand := range toProbe {
+		pod, key, sig := cand.pod, cand.key, cand.sig
+		res := probeRes[idx]
+		if res.lerr != nil {
 			// Both evidence paths failed — inconclusive, not clean.
 			// Carry the key through the keep-set so the Prune below
 			// cannot wipe a streak the sweep could not evaluate —
@@ -244,7 +273,7 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 			// carries too: "can't tell" is not "resolved", or one
 			// metrics+logs flap would prune a live degraded series.
 			log.Info("WARN: cloudflared metrics + logs both unreadable — wedge unverifiable",
-				"pod", key, "error", lerr)
+				"pod", key, "error", res.lerr)
 			streakKeep[sig] = true
 			if lv, held := p.emitted.Last()[key]; held {
 				rep.Carry(key, lv)
@@ -252,7 +281,7 @@ func (p *cloudflaredTunnelHealthCheck) Run(ctx context.Context) probefw.Result {
 			}
 			continue
 		}
-		if !bad {
+		if !res.bad {
 			p.streak.Reset(sig) // fresh evidence of health — re-arm
 			continue
 		}

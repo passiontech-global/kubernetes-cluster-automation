@@ -70,6 +70,12 @@ func PodSpecHasContainer(ps *corev1.PodSpec, name string) bool {
 	return false
 }
 
+// IsNativeSidecarContainer reports whether c is a K8s 1.29+ native
+// sidecar (an initContainer with restartPolicy: Always).
+func IsNativeSidecarContainer(c corev1.Container) bool {
+	return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
+}
+
 // PodReadySince returns the pod's PodReady=True LastTransitionTime —
 // the clock for stable-age fuses and "settled for >= min" gates.
 // ok=false when the pod is not Ready, or the Ready condition is

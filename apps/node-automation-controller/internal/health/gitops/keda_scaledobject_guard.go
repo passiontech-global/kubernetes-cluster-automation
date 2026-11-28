@@ -7,21 +7,18 @@ package gitops
 
 import (
 	"context"
-	json "encoding/json/v2"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
@@ -204,170 +201,17 @@ func (p *kedaScaledObjectGuardCheck) rescueZeroTarget(ctx context.Context,
 		return false
 	}
 	minReplicas, _ := kube.NestedInt64(so.Object, "spec", "minReplicaCount")
-	rescue := minReplicas
-	if rescue < 1 {
-		rescue = 1
-	}
-
-	// scaleTargetRef.kind names the workload kind KEDA scales — a
-	// ScaledObject targeting a StatefulSet whose name collides with a
-	// same-namespace Deployment must patch the StatefulSet, not the
-	// namesake. Resolve ONLY the declared kind; an unknown or missing
-	// kind keeps the old census order (Deployment → StatefulSet →
-	// Rollout) as a logged fallback — a guess, not an attribution. A
-	// census read failure stays inconclusive, not "not at zero".
-	declared, declaredOK := kube.NestedString(
-		so.Object, "spec", "scaleTargetRef", "kind")
-	want := ""
-	if declaredOK {
-		// EqualFold — a lowercase spelling ("deployment") must not
-		// fall into the census-order fallback and patch the wrong
-		// kind's namesake; canonical casing is kept so the want ==
-		// checks below stay literal.
-		switch {
-		case strings.EqualFold(declared, "Deployment"):
-			want = "Deployment"
-		case strings.EqualFold(declared, "StatefulSet"):
-			want = "StatefulSet"
-		case strings.EqualFold(declared, "Rollout"):
-			want = "Rollout"
-		}
-	}
-	if want == "" {
-		log.Info("WARN: keda zero-rescue — scaleTargetRef.kind unknown/missing, target resolution falls back to census order",
-			"scaledobject", ns+"/"+so.GetName(), "kind", declared)
-	}
-	var annotations map[string]string
-	var replicas *int32
-	var rv string
-	var targetObj metav1.Object // the census object FluxPatchGate inspects
-	kind := ""
-	if want == "" || want == "Deployment" {
-		dep, err := p.Deployment(ctx, ns, target)
-		if err != nil {
-			return false // census unreadable — inconclusive, retry next sweep
-		}
-		if dep != nil {
-			kind = "Deployment"
-			annotations = kube.EffectiveAnnos(ctx, dep)
-			replicas = dep.Spec.Replicas
-			rv = dep.ResourceVersion
-			targetObj = dep
-		}
-	}
-	if kind == "" && (want == "" || want == "StatefulSet") {
-		sts, serr := p.StatefulSet(ctx, ns, target)
-		if serr != nil {
-			return false // census unreadable — inconclusive
-		}
-		if sts != nil {
-			kind = "StatefulSet"
-			annotations = kube.EffectiveAnnos(ctx, sts)
-			replicas = sts.Spec.Replicas
-			rv = sts.ResourceVersion
-			targetObj = sts
-		}
-	}
-	if kind == "" && (want == "" || want == "Rollout") {
-		// argo-rollout-gates — argoproj.io Rollout fallback: KEDA scales Rollouts
-		// the same way (scaleTargetRef kind Rollout). Unstructured CR
-		// — spec.replicas comes off the census object; a failed
-		// census stays inconclusive, not "not at zero".
-		ros, rerr := p.AllUnstructured(ctx, kube.GVRArgoRollout)
-		if rerr != nil {
-			return false // census unreadable — inconclusive
-		}
-		for i := range ros {
-			r := &ros[i]
-			if r.GetNamespace() == ns && r.GetName() == target {
-				kind = "Rollout"
-				annotations = kube.EffectiveAnnos(ctx, r)
-				rv = r.GetResourceVersion()
-				targetObj = r
-				if reps, found := kube.NestedInt64(r.Object, "spec", "replicas"); found {
-					v := int32(reps)
-					replicas = &v
-				}
-				break
-			}
-		}
-	}
-	if kind == "" {
-		return false // target unresolvable this sweep — inconclusive
-	}
-	if replicas == nil || *replicas != 0 {
-		return false // not wedged at zero — nothing to rescue
-	}
-	if kube.IsIntentionallyDownscaled(annotations, replicas) {
-		return false // downscaler-managed zero — the workload is asleep on purpose
-	}
-	ck := probefw.SelfHealKey(CheckNameKedaScaledObjectGuard, ns+"/"+kind+"/"+target)
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.Heals, ck, kedaRescueCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return false
-	}
-	if !proceed {
-		return false
-	}
-	// spec.replicas is Git-owned on Flux-managed targets — gate the
-	// write so a Git-vs-heal ping-pong cannot storm the apiserver.
-	if targetObj != nil && !heal.FluxPatchGate(strings.ToLower(kind),
-		targetObj, CheckNameKedaScaledObjectGuard+":"+ns+"/"+kind+"/"+target, now) {
-		heal.RefundGrant(now) // Flux gate denied — no patch attempted
-		log.Info("SKIP: keda zero-rescue blocked by flux conflict gate",
-			"target", kind+" "+ns+"/"+target)
-		return false
-	}
-	// metadata.resourceVersion pins the write — a legitimate
-	// scale-up (HPA, GitOps, manual) landing between the census
-	// read and this patch becomes a 409 conflict instead of a
-	// silent revert to the rescue floor.
-	payload, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"resourceVersion": rv},
-		"spec":     map[string]any{"replicas": rescue},
-	})
-	if err != nil {
-		heal.RefundGrant(now) // no patch attempted — hand the token back
-		return false
-	}
-	switch kind {
-	case "Deployment":
-		_, err = p.CS.AppsV1().Deployments(ns).Patch(ctx, target,
-			types.MergePatchType, payload, metav1.PatchOptions{})
-	case "StatefulSet":
-		_, err = p.CS.AppsV1().StatefulSets(ns).Patch(ctx, target,
-			types.MergePatchType, payload, metav1.PatchOptions{})
-	case "Rollout":
-		_, err = p.Dyn.Resource(kube.GVRArgoRollout).Namespace(ns).
-			Patch(ctx, target, types.MergePatchType, payload, metav1.PatchOptions{})
-	}
-	if err != nil {
-		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
-			heal.RefundGrant(now)
-			log.Info("SKIP: keda zero-rescue raced (target changed or gone)",
-				"target", kind+" "+ns+"/"+target)
-			return false
-		}
-		metrics.IncError(p.Name)
-		log.Error(err, "keda zero-rescue scale patch failed",
-			"target", kind+" "+ns+"/"+target, "replicas", rescue)
-		return true
-	}
-	// The spec patch landed — drop the workload census memo so later
-	// checks this sweep see the rescued replica count, not the
-	// pre-patch zero.
-	switch kind {
-	case "Deployment":
-		p.InvalidateDeployments(ctx)
-	case "StatefulSet":
-		p.InvalidateStatefulSets(ctx)
-	case "Rollout":
-		p.InvalidateUnstructuredGVR(ctx, kube.GVRArgoRollout)
-	}
-	p.Heals.Stamp(ck, now)
-	log.Info("SCALE: keda cold-start rescue — target wedged at 0 while the scaler is unhealthy",
-		"target", kind+" "+ns+"/"+target, "replicas", rescue)
-	return true
+	rescue := max(int32(minReplicas), 1)
+	declared, _ := kube.NestedString(so.Object, "spec", "scaleTargetRef", "kind")
+	return rescueZeroScaleTarget(ctx, p.Deps, log, zeroTargetRescueOpts{
+		checkName:    CheckNameKedaScaledObjectGuard,
+		sourceLabel:  "keda",
+		ns:           ns,
+		declaredKind: declared,
+		targetName:   target,
+		rescue:       rescue,
+		allowRollout: true,
+		cooldownKey:  ns + "/{kind}/" + target,
+		cooldown:     kedaRescueCooldown,
+	}, now)
 }

@@ -11,6 +11,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
@@ -158,5 +159,18 @@ func (d *Deps) AllPDBs(ctx context.Context) ([]policyv1.PodDisruptionBudget, err
 		return kube.ListAll(lctx,
 			snapshotListOpts(),
 			kube.PodDisruptionBudgets(d.CS, metav1.NamespaceAll))
+	})
+}
+
+// AllStorageClasses is the storage.k8s.io/v1 StorageClass census shared
+// across PVC lifecycle and auto-expand checks. Read-only.
+func (d *Deps) AllStorageClasses(ctx context.Context) ([]storagev1.StorageClass, error) {
+	s := sweepSnap(ctx)
+	return s.storageClasses.get(func(bool) ([]storagev1.StorageClass, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.StorageClasses(d.CS))
 	})
 }

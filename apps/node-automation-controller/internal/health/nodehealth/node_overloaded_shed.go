@@ -240,10 +240,12 @@ func (p *nodeHangCheck) shedOverloadedNodes(ctx context.Context, log logr.Logger
 		}
 		podsByNode[pod.Spec.NodeName] = append(podsByNode[pod.Spec.NodeName], pod)
 	}
+	blockingPDBsByNS := indexBlockingPDBsByNS(pdbs)
+	colocatedByNode := colocatedWorkloadsByNode(pods, rsByKey)
 
 	for _, node := range activeNodes {
 		candidates := eligibleOverloadPods(
-			podsByNode[node.Name], pods, rsByKey, deployByKey, stsByKey, pdbs, liveCPU)
+			podsByNode[node.Name], colocatedByNode[node.Name], rsByKey, deployByKey, stsByKey, blockingPDBsByNS, liveCPU)
 		if len(candidates) == 0 {
 			continue
 		}
@@ -347,18 +349,13 @@ func podWorkloadKey(
 	}
 }
 
-// colocatedWorkloadsOnNode returns the set of podWorkloadKey identifiers
-// whose Running+Ready pods (>= 2) are 100% co-located on nodeName. Evicting
-// from these first immediately breaks single-node SPOFs before touching
-// already well-spread workloads.
-func colocatedWorkloadsOnNode(
+// colocatedWorkloadsByNode indexes workloads whose Running+Ready pods (>= 2)
+// are 100% co-located on a single node, keyed by that node name, in one
+// cluster-wide pod pass instead of rescanning all pods per overloaded node.
+func colocatedWorkloadsByNode(
 	allPods []corev1.Pod,
 	rsByKey map[string]*metav1.PartialObjectMetadata,
-	nodeName string,
-) map[string]bool {
-	if nodeName == "" {
-		return nil
-	}
+) map[string]map[string]bool {
 	type placement struct {
 		readyCount int
 		nodes      map[string]struct{}
@@ -366,7 +363,7 @@ func colocatedWorkloadsOnNode(
 	byWorkload := map[string]*placement{}
 	for i := range allPods {
 		pod := &allPods[i]
-		if !probefw.PodRunningReady(pod) {
+		if !probefw.PodRunningReady(pod) || pod.Spec.NodeName == "" {
 			continue
 		}
 		wlKey, ok := podWorkloadKey(pod, rsByKey)
@@ -381,15 +378,38 @@ func colocatedWorkloadsOnNode(
 		p.readyCount++
 		p.nodes[pod.Spec.NodeName] = struct{}{}
 	}
-	colocated := map[string]bool{}
+	byNode := map[string]map[string]bool{}
 	for wlKey, p := range byWorkload {
 		if p.readyCount >= 2 && len(p.nodes) == 1 {
-			if _, onNode := p.nodes[nodeName]; onNode {
-				colocated[wlKey] = true
+			for nodeName := range p.nodes {
+				if byNode[nodeName] == nil {
+					byNode[nodeName] = map[string]bool{}
+				}
+				byNode[nodeName][wlKey] = true
 			}
 		}
 	}
-	return colocated
+	return byNode
+}
+
+type blockingPDB struct {
+	sel labels.Selector
+}
+
+func indexBlockingPDBsByNS(pdbs []policyv1.PodDisruptionBudget) map[string][]blockingPDB {
+	byNS := map[string][]blockingPDB{}
+	for i := range pdbs {
+		pdb := &pdbs[i]
+		if pdb.Status.DisruptionsAllowed >= 1 {
+			continue
+		}
+		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			sel = labels.Everything() // unparseable selector -> fail closed
+		}
+		byNS[pdb.Namespace] = append(byNS[pdb.Namespace], blockingPDB{sel: sel})
+	}
+	return byNS
 }
 
 func podCPURequestMilli(pod *corev1.Pod) int64 {
@@ -411,16 +431,16 @@ func podCPUScoreMilli(pod *corev1.Pod, liveCPU map[string]float64) float64 {
 
 func eligibleOverloadPods(
 	nodePods []*corev1.Pod,
-	allPods []corev1.Pod,
+	colocated map[string]bool,
 	rsByKey map[string]*metav1.PartialObjectMetadata,
 	deployByKey map[string]*appsv1.Deployment,
 	stsByKey map[string]*appsv1.StatefulSet,
-	pdbs []policyv1.PodDisruptionBudget,
+	blockingPDBsByNS map[string][]blockingPDB,
 	liveCPU map[string]float64,
 ) []*corev1.Pod {
 	var out []*corev1.Pod
 	for _, pod := range nodePods {
-		if !podEligibleForOverloadShed(pod, rsByKey, deployByKey, stsByKey, pdbs) {
+		if !podEligibleForOverloadShed(pod, rsByKey, deployByKey, stsByKey, blockingPDBsByNS) {
 			continue
 		}
 		out = append(out, pod)
@@ -428,7 +448,6 @@ func eligibleOverloadPods(
 	if len(out) <= 1 {
 		return out
 	}
-	colocated := colocatedWorkloadsOnNode(allPods, rsByKey, out[0].Spec.NodeName)
 	slices.SortFunc(out, func(a, b *corev1.Pod) int {
 		aWL, _ := podWorkloadKey(a, rsByKey)
 		bWL, _ := podWorkloadKey(b, rsByKey)
@@ -458,7 +477,7 @@ func podEligibleForOverloadShed(
 	rsByKey map[string]*metav1.PartialObjectMetadata,
 	deployByKey map[string]*appsv1.Deployment,
 	stsByKey map[string]*appsv1.StatefulSet,
-	pdbs []policyv1.PodDisruptionBudget,
+	blockingPDBsByNS map[string][]blockingPDB,
 ) bool {
 	if !probefw.PodRunningReady(pod) {
 		return false
@@ -513,23 +532,16 @@ func podEligibleForOverloadShed(
 	default:
 		return false
 	}
-	return overloadPDBAllows(pdbs, pod)
+	return overloadPDBAllows(blockingPDBsByNS[pod.Namespace], pod)
 }
 
-func overloadPDBAllows(pdbs []policyv1.PodDisruptionBudget, pod *corev1.Pod) bool {
-	for i := range pdbs {
-		pdb := &pdbs[i]
-		if pdb.Namespace != pod.Namespace {
-			continue
-		}
-		sel, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
-		if err != nil {
-			sel = labels.Everything() // unparseable selector -> fail closed
-		}
-		if !sel.Matches(labels.Set(pod.Labels)) {
-			continue
-		}
-		if pdb.Status.DisruptionsAllowed < 1 {
+func overloadPDBAllows(blocking []blockingPDB, pod *corev1.Pod) bool {
+	if len(blocking) == 0 {
+		return true
+	}
+	podLabels := labels.Set(pod.Labels)
+	for _, pdb := range blocking {
+		if pdb.sel.Matches(podLabels) {
 			return false
 		}
 	}

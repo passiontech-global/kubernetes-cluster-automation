@@ -23,7 +23,6 @@ package gitops
 
 import (
 	"context"
-	json "encoding/json/v2"
 	"fmt"
 	"slices"
 	"strings"
@@ -32,7 +31,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -246,115 +244,19 @@ func (p *hpaScalingGuardCheck) rescueZeroTarget(ctx context.Context,
 		return false
 	}
 	minReplicas, _ := kube.NestedInt64(hpa.Object, "spec", "minReplicas")
-	rescue := int32(minReplicas)
-	if rescue < 1 {
-		rescue = 1
-	}
-
-	var annotations map[string]string
-	var replicas *int32
-	var rv string
-	var targetObj metav1.Object // the census object FluxPatchGate inspects
-	kind := ""
+	rescue := max(int32(minReplicas), 1)
 	declared, _ := kube.NestedString(hpa.Object, "spec", "scaleTargetRef", "kind")
-	if declared == "" || strings.EqualFold(declared, "Deployment") {
-		dep, err := p.Deployment(ctx, ns, target)
-		if err != nil {
-			return false
-		}
-		if dep != nil {
-			kind = "Deployment"
-			annotations = kube.EffectiveAnnos(ctx, dep)
-			replicas = dep.Spec.Replicas
-			rv = dep.ResourceVersion
-			targetObj = dep
-		}
-	}
-	if kind == "" && (declared == "" || strings.EqualFold(declared, "StatefulSet")) {
-		sts, serr := p.StatefulSet(ctx, ns, target)
-		if serr != nil {
-			return false
-		}
-		if sts != nil {
-			kind = "StatefulSet"
-			annotations = kube.EffectiveAnnos(ctx, sts)
-			replicas = sts.Spec.Replicas
-			rv = sts.ResourceVersion
-			targetObj = sts
-		}
-	}
-	if kind == "" {
-		return false
-	}
-	if replicas == nil || *replicas != 0 {
-		return false
-	}
-	if kube.IsIntentionallyDownscaled(annotations, replicas) {
-		return false
-	}
-	ck := probefw.SelfHealKey(CheckNameHPAScalingGuard, "rescue/"+ns+"/"+kind+"/"+target)
-	proceed, unverifiable := p.HealAllowed(ctx, log,
-		&p.Heals, ck, hpaRescueCooldown, now)
-	if unverifiable {
-		metrics.IncError(p.Name)
-		return false
-	}
-	if !proceed {
-		return false
-	}
-	// The gate consumed the grant — from here on every clean bailout
-	// must hand it back (below), otherwise it stays spent.
-	// spec.replicas is Git-owned on Flux-managed workloads. Writing
-	// it here without the loop gate would ping-pong with Flux every
-	// sweep on a workload Git intentionally parked at zero.
-	if targetObj != nil && !heal.FluxPatchGate(strings.ToLower(kind),
-		targetObj, CheckNameHPAScalingGuard+":"+ns+"/"+kind+"/"+target, now) {
-		heal.RefundGrant(now) // Flux gate denied — no patch attempted
-		log.Info("SKIP: hpa cold-start rescue blocked by flux conflict gate",
-			"target", kind+" "+ns+"/"+target)
-		return false
-	}
-	// metadata.resourceVersion pins the write — a legitimate
-	// scale-up landing between the census read and this patch
-	// becomes a 409 instead of a silent revert to the rescue floor.
-	payload, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"resourceVersion": rv},
-		"spec":     map[string]any{"replicas": rescue},
-	})
-	if err != nil {
-		heal.RefundGrant(now) // no patch attempted — hand the token back
-		return false
-	}
-	var patchErr error
-	if kind == "Deployment" {
-		_, patchErr = p.CS.AppsV1().Deployments(ns).Patch(ctx, target,
-			types.MergePatchType, payload, metav1.PatchOptions{})
-	} else {
-		_, patchErr = p.CS.AppsV1().StatefulSets(ns).Patch(ctx, target,
-			types.MergePatchType, payload, metav1.PatchOptions{})
-	}
-	if patchErr != nil {
-		if apierrors.IsConflict(patchErr) || apierrors.IsNotFound(patchErr) {
-			heal.RefundGrant(now)
-			log.Info("SKIP: hpa cold-start rescue raced (target changed or gone)",
-				"target", kind+" "+ns+"/"+target)
-			return false
-		}
-		metrics.IncError(p.Name)
-		log.Error(patchErr, "hpa cold-start rescue scale patch failed",
-			"target", kind+" "+ns+"/"+target, "replicas", rescue)
-		return true // attempted write spent the grant
-	}
-	switch kind {
-	case "Deployment":
-		p.InvalidateDeployments(ctx)
-	case "StatefulSet":
-		p.InvalidateStatefulSets(ctx)
-	}
-	p.Heals.Stamp(ck, now)
-	log.Info("SCALE: hpa cold-start rescue — target wedged at 0 while the HPA is unhealthy",
-		"target", kind+" "+ns+"/"+target, "replicas", rescue)
-	return true
+	return rescueZeroScaleTarget(ctx, p.Deps, log, zeroTargetRescueOpts{
+		checkName:    CheckNameHPAScalingGuard,
+		sourceLabel:  "hpa",
+		ns:           ns,
+		declaredKind: declared,
+		targetName:   target,
+		rescue:       rescue,
+		allowRollout: false,
+		cooldownKey:  "rescue/" + ns + "/{kind}/" + target,
+		cooldown:     hpaRescueCooldown,
+	}, now)
 }
 
 // maybeBounceMetricsServer deletes an isolated unready

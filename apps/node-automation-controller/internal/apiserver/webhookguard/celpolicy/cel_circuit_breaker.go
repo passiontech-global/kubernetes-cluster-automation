@@ -21,6 +21,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/heal"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
+	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/state"
 )
 
 const (
@@ -40,6 +41,7 @@ func (s *Sweeper) sweepCircuitBreaker(ctx context.Context, snap *guardstate.Snap
 	log := logf.FromContext(ctx)
 	now := g.Now.Now()
 	allowTrips := CircuitBreakerEnabled()
+	var discoveryMemo state.KeyedSweepMemo[string, *metav1.APIResourceList]
 
 	var errPolicies map[string]bool
 	var promErrs map[string]error
@@ -80,7 +82,7 @@ func (s *Sweeper) sweepCircuitBreaker(ctx context.Context, snap *guardstate.Snap
 				continue
 			}
 
-			paramMissing, paramUnverifiable := checkMissingParamRef(ctx, g, p, c.bindings[p.Name])
+			paramMissing, paramUnverifiable := checkMissingParamRef(ctx, g, p, c.bindings[p.Name], &discoveryMemo)
 			celErrActive := errPolicies[key]
 
 			var paramTripped, celErrTripped bool
@@ -268,12 +270,21 @@ func queryCELErrorPolicies(ctx context.Context, g *guardstate.Guard) (map[string
 }
 
 func resolveParamGVR(ctx context.Context, g *guardstate.Guard,
-	gv schema.GroupVersion, pk *admissionv1.ParamKind) (gvr schema.GroupVersionResource, namespaced bool, ok bool) {
+	gv schema.GroupVersion, pk *admissionv1.ParamKind,
+	discoveryMemo ...*state.KeyedSweepMemo[string, *metav1.APIResourceList]) (gvr schema.GroupVersionResource, namespaced bool, ok bool) {
 
 	if pk.Kind == "" {
 		return schema.GroupVersionResource{}, false, false
 	}
-	rl, err := g.CS.Discovery().ServerResourcesForGroupVersion(pk.APIVersion)
+	var rl *metav1.APIResourceList
+	var err error
+	if len(discoveryMemo) > 0 && discoveryMemo[0] != nil {
+		rl, err = discoveryMemo[0].Get(pk.APIVersion, func() (*metav1.APIResourceList, error) {
+			return g.CS.Discovery().ServerResourcesForGroupVersion(pk.APIVersion)
+		})
+	} else {
+		rl, err = g.CS.Discovery().ServerResourcesForGroupVersion(pk.APIVersion)
+	}
 	if err != nil {
 		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
 			logf.FromContext(ctx).V(1).Info("paramKind discovery unavailable — skipping (fail closed)",
@@ -301,7 +312,8 @@ func resolveParamGVR(ctx context.Context, g *guardstate.Guard,
 }
 
 func checkMissingParamRef(ctx context.Context, g *guardstate.Guard,
-	p *policyView, bindings []bindingView) (missing bool, unverifiable bool) {
+	p *policyView, bindings []bindingView,
+	discoveryMemo ...*state.KeyedSweepMemo[string, *metav1.APIResourceList]) (missing bool, unverifiable bool) {
 
 	if p.ParamKind == nil || len(bindings) == 0 {
 		return false, false
@@ -330,7 +342,7 @@ func checkMissingParamRef(ctx context.Context, g *guardstate.Guard,
 				return false, true
 			}
 			var ok bool
-			gvr, namespaced, ok = resolveParamGVR(ctx, g, gv, p.ParamKind)
+			gvr, namespaced, ok = resolveParamGVR(ctx, g, gv, p.ParamKind, discoveryMemo...)
 			if !ok {
 				return false, true
 			}

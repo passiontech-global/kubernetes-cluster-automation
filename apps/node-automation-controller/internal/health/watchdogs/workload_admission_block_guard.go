@@ -311,31 +311,21 @@ func (c *workloadAdmissionBlockGuardCheck) Run(ctx context.Context) probefw.Resu
 		rep.Find(fmt.Sprintf("%s (%s)", workloadKey, reason))
 
 		cooldownKey := "admblock." + cand.kind + "." + cand.ns + "." + cand.name + "." + reason
-		if !c.eventCooldown.CooledDown(cooldownKey, admissionBlockEventCooldown, now) {
-			note := fmt.Sprintf("%s %s/%s blocked from pod creation (%s): %s",
-				cand.kind, cand.ns, cand.name, reason, msg)
-			if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-				Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
-				Namespace: cand.ns,
-				Regarding: corev1.ObjectReference{
-					APIVersion: "apps/v1",
-					Kind:       cand.kind,
-					Namespace:  cand.ns,
-					Name:       cand.name,
-					UID:        cand.uid,
-				},
-				Reason:            admissionBlockEventReason,
-				Note:              note,
-				ReportingInstance: c.Name,
-				Now:               now,
-			}); err != nil {
-				log.Info("WARN: WorkloadAdmissionBlocked event create failed (RBAC?)",
-					"workload", workloadKey, "error", err)
-			} else {
-				c.eventCooldown.Stamp(cooldownKey, now)
-				log.Info("EVENT: WorkloadAdmissionBlocked", "workload", workloadKey, "reason", reason)
-			}
-		}
+		note := fmt.Sprintf("%s %s/%s blocked from pod creation (%s): %s",
+			cand.kind, cand.ns, cand.name, reason, msg)
+		probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, admissionBlockEventCooldown, now, kube.WarningEvent{
+			Namespace: cand.ns,
+			Regarding: corev1.ObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       cand.kind,
+				Namespace:  cand.ns,
+				Name:       cand.name,
+				UID:        cand.uid,
+			},
+			Reason:            admissionBlockEventReason,
+			Note:              note,
+			ReportingInstance: c.Name,
+		})
 	}
 
 	for kind := range holdKinds {

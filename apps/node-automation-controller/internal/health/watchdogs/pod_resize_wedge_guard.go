@@ -137,31 +137,21 @@ func (c *podResizeWedgeGuardCheck) Run(ctx context.Context) probefw.Result {
 				fmt.Sprintf("%s (%s)", podKey, reason))
 
 			cooldownKey := "podresize." + pod.Namespace + "." + pod.Name + "." + reason
-			if !c.eventCooldown.CooledDown(cooldownKey, podResizeEventCooldown, now) {
-				note := fmt.Sprintf("Pod %s stuck in resize (%s/%s): %s",
-					podKey, cond.Type, cond.Reason, cond.Message)
-				if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-					Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
-					Namespace: pod.Namespace,
-					Regarding: corev1.ObjectReference{
-						APIVersion: "v1",
-						Kind:       "Pod",
-						Namespace:  pod.Namespace,
-						Name:       pod.Name,
-						UID:        pod.UID,
-					},
-					Reason:            podResizeEventReason,
-					Note:              note,
-					ReportingInstance: c.Name,
-					Now:               now,
-				}); err != nil {
-					log.Info("WARN: PodResizeWedged event create failed (RBAC?)",
-						"pod", podKey, "error", err)
-				} else {
-					c.eventCooldown.Stamp(cooldownKey, now)
-					log.Info("EVENT: PodResizeWedged", "pod", podKey, "reason", reason)
-				}
-			}
+			note := fmt.Sprintf("Pod %s stuck in resize (%s/%s): %s",
+				podKey, cond.Type, cond.Reason, cond.Message)
+			probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, podResizeEventCooldown, now, kube.WarningEvent{
+				Namespace: pod.Namespace,
+				Regarding: corev1.ObjectReference{
+					APIVersion: "v1",
+					Kind:       "Pod",
+					Namespace:  pod.Namespace,
+					Name:       pod.Name,
+					UID:        pod.UID,
+				},
+				Reason:            podResizeEventReason,
+				Note:              note,
+				ReportingInstance: c.Name,
+			})
 
 			if c.evictEnabled && cond.Type == corev1.PodResizePending &&
 				cond.Reason == corev1.PodReasonDeferred && !seenEvict[podKey] {

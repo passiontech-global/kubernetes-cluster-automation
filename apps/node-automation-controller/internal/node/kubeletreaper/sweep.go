@@ -181,16 +181,20 @@ func (r *kubeletReaper) sweep(ctx context.Context, listed *corev1.Node,
 		// kubelet restart ends the episode instead of banking
 		// against the next one.
 		now := r.now.Now()
-		if allowed, reason := heal.TryAcquireTarget(r.queue, name, now); !allowed {
+		allowed, reason, err := heal.WithTargetBreaker(r.queue, name, now, func() (bool, error) {
+			if terr := kube.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
+				corev1.TaintEffectNoSchedule); terr != nil {
+				return false, fmt.Errorf("taint %s on node %s: %w", kubeletReaperTaint, name, terr)
+			}
+			return true, nil
+		})
+		if !allowed {
 			log.Info("DEFER: heal target circuit open — taint skipped",
 				"node", name, "reason", reason)
 			return nil
 		}
-		if err := kube.TaintNode(ctx, r.cs, name, kubeletReaperTaint, "true",
-			corev1.TaintEffectNoSchedule); err != nil {
-			heal.RefundTarget(r.queue, name, now)
-			return fmt.Errorf("taint %s on node %s: %w",
-				kubeletReaperTaint, name, err)
+		if err != nil {
+			return err
 		}
 		// Delivered — the persistence window's job is done; the next
 		// episode starts from zero.

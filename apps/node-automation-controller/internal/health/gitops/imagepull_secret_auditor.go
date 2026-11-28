@@ -509,11 +509,7 @@ func (p *imagePullSecretAuditorCheck) emitMissingPullSecretEvent(
 	reg string,
 ) {
 	cooldownKey := "missingpullsec." + kind + "." + ns + "." + name + "." + reg
-	if p.eventCooldown.CooledDown(cooldownKey, imagePullMissingSecretEventCooldown, now) {
-		return
-	}
-	if err := kube.EmitWarningEvent(ctx, p.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, p.CS, log, &p.eventCooldown, cooldownKey, imagePullMissingSecretEventCooldown, now, kube.WarningEvent{
 		Namespace: ns,
 		Regarding: corev1.ObjectReference{
 			APIVersion: apiVersion,
@@ -525,14 +521,7 @@ func (p *imagePullSecretAuditorCheck) emitMissingPullSecretEvent(
 		Reason:            imagePullMissingSecretEventReason,
 		Note:              fmt.Sprintf("%s %s/%s pulls private registry %s without imagePullSecrets on workload or ServiceAccount", kind, ns, name, reg),
 		ReportingInstance: p.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: MissingImagePullSecret event create failed (RBAC?)",
-			"kind", kind, "object", ns+"/"+name, "registry", reg, "error", err)
-		return
-	}
-	p.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: MissingImagePullSecret", "kind", kind, "object", ns+"/"+name, "registry", reg)
+	})
 }
 
 // auditPullSecret classifies one referenced Secret — returns the

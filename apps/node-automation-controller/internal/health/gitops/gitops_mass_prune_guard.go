@@ -257,14 +257,11 @@ func (c *gitopsMassPruneGuardCheck) emitAnomalyEvent(
 ) {
 	ns, name := u.GetNamespace(), u.GetName()
 	ck := probefw.SelfHealKey(CheckNameGitOpsMassPruneGuard, "event/"+kind+"/"+ns+"/"+name)
-	if c.eventCooldown.CooledDown(ck, gitopsMassPruneEventCooldown, now) {
-		return
-	}
 	evNS := ns
 	if evNS == "" {
 		evNS = "default"
 	}
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, ck, gitopsMassPruneEventCooldown, now, kube.WarningEvent{
 		Name:      kube.TruncatedEventName("mass-prune."+kind+"."+ns+"."+name, kind+"/"+ns+"/"+name, now),
 		Namespace: evNS,
 		Regarding: corev1.ObjectReference{
@@ -279,14 +276,7 @@ func (c *gitopsMassPruneGuardCheck) emitAnomalyEvent(
 			"GitOps mass-prune detected on %s %s/%s: tracked inventory dropped from %d to %d (>%d%%)",
 			kind, ns, name, prev, curr, gitopsMassPruneDropPercent),
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: GitOpsMassPruneDetected event create failed (RBAC?)",
-			"kind", kind, "object", ns+"/"+name, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(ck, now)
-	log.Info("EVENT: GitOpsMassPruneDetected", "kind", kind, "object", ns+"/"+name)
+	})
 }
 
 func (c *gitopsMassPruneGuardCheck) maybeSuspendKustomization(

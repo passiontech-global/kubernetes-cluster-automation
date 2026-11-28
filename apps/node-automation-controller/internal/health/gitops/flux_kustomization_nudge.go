@@ -240,21 +240,10 @@ func (p *fluxKustomizationHealthCheck) fluxKustDepsReady(ctx context.Context,
 		if ns == "" {
 			ns = kust.GetNamespace()
 		}
-		// Same memoized census as the HelmRelease twin — the
-		// dependsOn chain resolves against the paged LIST the
-		// sweep already paid for, not a per-object GET.
-		items, err := p.AllUnstructured(ctx, fluxKustomizationGVR)
-		if err != nil {
-			return false
-		}
-		var dep *unstructured.Unstructured
-		for i := range items {
-			if items[i].GetNamespace() == ns && items[i].GetName() == name {
-				dep = &items[i]
-				break
-			}
-		}
-		if dep == nil {
+		// Resolve against the shared per-GVR census via O(N) lookup helper
+		// Unstructured instead of scanning the slice per dependency.
+		dep, err := p.Unstructured(ctx, fluxKustomizationGVR, ns, name)
+		if err != nil || dep == nil {
 			return false
 		}
 		c, ok := kube.ConditionOf(dep.Object, "Ready")

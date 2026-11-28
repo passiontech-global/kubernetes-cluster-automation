@@ -295,11 +295,7 @@ func (c *kmsCanaryCheck) kmsCanaryEmitWarning(
 	note string,
 ) {
 	cooldownKey := "kms-canary." + c.canaryNS
-	if c.eventCooldown.CooledDown(cooldownKey, kmsCanaryEventCooldown, now) {
-		return
-	}
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, kmsCanaryEventCooldown, now, kube.WarningEvent{
 		Namespace: c.canaryNS,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
@@ -310,11 +306,5 @@ func (c *kmsCanaryCheck) kmsCanaryEmitWarning(
 		Reason:            kmsCanaryEventReason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: KMSSecretCanaryFailed event create failed (RBAC?)", "namespace", c.canaryNS, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: KMSSecretCanaryFailed", "namespace", c.canaryNS)
+	})
 }

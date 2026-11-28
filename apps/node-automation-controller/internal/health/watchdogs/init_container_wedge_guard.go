@@ -151,13 +151,9 @@ func (c *initWedgeGuardCheck) Run(ctx context.Context) probefw.Result {
 func (c *initWedgeGuardCheck) initWedgeEmitEvent(ctx context.Context, log logr.Logger, now time.Time, f initWedgeFinding) bool {
 	podKey := f.pod.Namespace + "/" + f.pod.Name
 	cooldownKey := "initwedge." + f.pod.Namespace + "." + f.pod.Name + "." + f.initContainer + "." + f.reason
-	if c.eventCooldown.CooledDown(cooldownKey, initWedgeEventCooldown, now) {
-		return false
-	}
 	note := fmt.Sprintf("Pod %s initContainer %q wedged (%s): %s",
 		podKey, f.initContainer, f.reason, f.detail)
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	return probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, initWedgeEventCooldown, now, kube.WarningEvent{
 		Namespace: f.pod.Namespace,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
@@ -169,16 +165,7 @@ func (c *initWedgeGuardCheck) initWedgeEmitEvent(ctx context.Context, log logr.L
 		Reason:            initWedgeEventReason,
 		Note:              note,
 		ReportingInstance: cmp.Or(c.Name, CheckNameInitContainerWedgeGuard),
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: InitContainerWedged event create failed (RBAC?)",
-			"pod", podKey, "initContainer", f.initContainer, "error", err)
-		return false
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: InitContainerWedged", "pod", podKey,
-		"initContainer", f.initContainer, "reason", f.reason)
-	return true
+	})
 }
 
 func initWedgeClassifyPod(pod *corev1.Pod, now time.Time, minAge time.Duration) []initWedgeFinding {
@@ -196,7 +183,7 @@ func initWedgeClassifyPod(pod *corev1.Pod, now time.Time, minAge time.Duration) 
 
 	nativeSidecars := make(map[string]bool, len(pod.Spec.InitContainers))
 	for _, ic := range pod.Spec.InitContainers {
-		if initWedgeIsNativeSidecar(ic) {
+		if kube.IsNativeSidecarContainer(ic) {
 			nativeSidecars[ic.Name] = true
 		}
 	}
@@ -265,10 +252,6 @@ func initWedgePodInInitPhase(pod *corev1.Pod) bool {
 		}
 	}
 	return false
-}
-
-func initWedgeIsNativeSidecar(c corev1.Container) bool {
-	return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
 }
 
 func initWedgeAnyRegularRunning(pod *corev1.Pod) bool {

@@ -276,11 +276,7 @@ func (s *natsSweep) logScan(ctx context.Context) {
 		for _, k := range scanKeys {
 			inScan[k] = true
 		}
-		for k := range s.p.logScanAt {
-			if !inScan[k] {
-				delete(s.p.logScanAt, k)
-			}
-		}
+		probefw.PruneLogScanAt(s.p.logScanAt, inScan)
 	}
 	pods := make([]*corev1.Pod, len(scanKeys))
 	for j, key := range scanKeys {
@@ -322,26 +318,14 @@ func (s *natsSweep) logScan(ctx context.Context) {
 			inconclusive[key] = true
 			continue
 		}
-		if s.p.logScanAt == nil {
-			s.p.logScanAt = map[string]time.Time{}
-		}
-		prevScan, scanned := s.p.logScanAt[key]
-		// The boundary advances in the KUBELET's clock domain —
-		// streamNewest is the newest stamp on any line read; s.now
-		// (controller clock) is only the fallback for a stream
-		// that carried no parseable timestamp at all.
-		if scan.Value.streamNewest.IsZero() {
-			s.p.logScanAt[key] = s.now
-		} else {
-			s.p.logScanAt[key] = scan.Value.streamNewest
-		}
+		prevScan, scanned := probefw.AdvanceLogScanAt(&s.p.logScanAt, key, scan.Value.streamNewest, s.now)
 		// Freshness gate: the marker must have a line newer than
 		// this pod's previous scan — the 360s window overlaps
 		// across 300s sweeps, so without it an error that stopped
 		// minutes ago re-flags for extra cycles. An unparseable
 		// stamp counts as fresh — fail toward alerting.
 		if scan.Value.reason != "" &&
-			(!scanned || scan.Value.newest.IsZero() || scan.Value.newest.After(prevScan)) {
+			probefw.LogLineFresh(scanned, scan.Value.newest, prevScan) {
 			s.addReason(key, scan.Value.reason, false)
 		}
 	}

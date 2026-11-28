@@ -442,12 +442,7 @@ func (c *autoscalerPostureCheck) autoscalerPostureAuditQuotas(
 	quotaRep *probefw.SweepReport,
 	summaryRep *probefw.SweepReport,
 ) {
-	rqs, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
-		},
-		kube.ResourceQuotas(c.CS, metav1.NamespaceAll))
+	rqs, err := c.AllResourceQuotas(ctx)
 	if err != nil {
 		if apierrors.IsForbidden(err) || kube.IsCRDAbsent(err) {
 			log.V(1).Info("ResourceQuota list skipped", "error", err)
@@ -612,22 +607,11 @@ func (c *autoscalerPostureCheck) autoscalerPostureEmitEvent(
 	cooldownKey string,
 	note string,
 ) {
-	if c.eventCooldown.CooledDown(cooldownKey, autoscalerPostureEventCooldown, now) {
-		return
-	}
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:              kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, autoscalerPostureEventCooldown, now, kube.WarningEvent{
 		Namespace:         eventNS,
 		Regarding:         regarding,
 		Reason:            reason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: autoscaler/quota event create failed (RBAC?)",
-			"reason", reason, "key", cooldownKey, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: "+reason, "key", cooldownKey)
+	})
 }

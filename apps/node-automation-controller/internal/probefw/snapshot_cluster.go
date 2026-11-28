@@ -14,6 +14,8 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -227,5 +229,79 @@ func (d *Deps) AllMutatingWebhookConfigurations(ctx context.Context) ([]admissio
 		return kube.ListAll(lctx,
 			snapshotListOpts(),
 			kube.MutatingWebhookConfigurations(d.CS))
+	})
+}
+
+// AllIngresses is the networking/v1 Ingress census shared across ingress
+// retirement and preStop checks. Read-only.
+func (d *Deps) AllIngresses(ctx context.Context) ([]networkingv1.Ingress, error) {
+	s := sweepSnap(ctx)
+	return s.ingresses.get(func(bool) ([]networkingv1.Ingress, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.Ingresses(d.CS, metav1.NamespaceAll))
+	})
+}
+
+// AllIngressClasses is the cluster-scoped IngressClass census. Read-only.
+func (d *Deps) AllIngressClasses(ctx context.Context) ([]networkingv1.IngressClass, error) {
+	s := sweepSnap(ctx)
+	return s.ingressClasses.get(func(bool) ([]networkingv1.IngressClass, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.IngressClasses(d.CS))
+	})
+}
+
+// AllNetworkPolicies is the networking/v1 NetworkPolicy census shared
+// by netpol-egress-lockout-guard and admission-security-guard. Read-only.
+func (d *Deps) AllNetworkPolicies(ctx context.Context) ([]networkingv1.NetworkPolicy, error) {
+	s := sweepSnap(ctx)
+	return s.networkPolicies.get(func(bool) ([]networkingv1.NetworkPolicy, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.NetworkPolicies(d.CS, metav1.NamespaceAll))
+	})
+}
+
+// AllClusterRoleBindings is the cluster-scoped RBAC ClusterRoleBinding census. Read-only.
+func (d *Deps) AllClusterRoleBindings(ctx context.Context) ([]rbacv1.ClusterRoleBinding, error) {
+	s := sweepSnap(ctx)
+	return s.clusterRoleBindings.get(func(bool) ([]rbacv1.ClusterRoleBinding, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.ClusterRoleBindings(d.CS))
+	})
+}
+
+// AllRoleBindings is the RBAC RoleBinding census across all namespaces. Read-only.
+func (d *Deps) AllRoleBindings(ctx context.Context) ([]rbacv1.RoleBinding, error) {
+	s := sweepSnap(ctx)
+	return s.roleBindings.get(func(bool) ([]rbacv1.RoleBinding, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.RoleBindings(d.CS, metav1.NamespaceAll))
+	})
+}
+
+// AllResourceQuotas is the core/v1 ResourceQuota census across all namespaces. Read-only.
+func (d *Deps) AllResourceQuotas(ctx context.Context) ([]corev1.ResourceQuota, error) {
+	s := sweepSnap(ctx)
+	return s.resourceQuotas.get(func(bool) ([]corev1.ResourceQuota, error) {
+		lctx, cancel := s.listCtx(ctx)
+		defer cancel()
+		return kube.ListAll(lctx,
+			snapshotListOpts(),
+			kube.ResourceQuotas(d.CS, metav1.NamespaceAll))
 	})
 }

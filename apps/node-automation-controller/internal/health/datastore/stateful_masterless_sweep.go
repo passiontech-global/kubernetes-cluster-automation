@@ -106,6 +106,16 @@ func (p *statefulMasterlessCheck) beginMasterlessSweep(ctx context.Context) (*ma
 // operator. Headless services are deliberately per-pod and skipped.
 func masterlessCandidates(stsList []appsv1.StatefulSet,
 	svcList []corev1.Service) []masterSvc {
+	svcByNS := make(map[string][]*corev1.Service)
+	for j := range svcList {
+		svc := &svcList[j]
+		if svc.Spec.ClusterIP == "" ||
+			svc.Spec.ClusterIP == corev1.ClusterIPNone ||
+			!masterRoleService(svc) {
+			continue // headless or non-master services cannot match
+		}
+		svcByNS[svc.Namespace] = append(svcByNS[svc.Namespace], svc)
+	}
 	var candidates []masterSvc
 	for i := range stsList {
 		sts := &stsList[i]
@@ -115,15 +125,8 @@ func masterlessCandidates(stsList []appsv1.StatefulSet,
 		if sts.Status.ReadyReplicas == 0 {
 			continue
 		}
-		for j := range svcList {
-			svc := &svcList[j]
-			if svc.Namespace != sts.Namespace ||
-				svc.Spec.ClusterIP == "" ||
-				svc.Spec.ClusterIP == corev1.ClusterIPNone {
-				continue // headless services are deliberately per-pod
-			}
-			if !masterRoleService(svc) ||
-				!selectorMatchesSTS(svc, sts.Spec.Template.Labels) {
+		for _, svc := range svcByNS[sts.Namespace] {
+			if !selectorMatchesSTS(svc, sts.Spec.Template.Labels) {
 				continue
 			}
 			candidates = append(candidates,
@@ -144,6 +147,16 @@ const cnpgClusterLabel = "cnpg.io/cluster"
 // masterlessCandidates for an operator that manages bare Pods.
 func cnpgMasterlessCandidates(pods []corev1.Pod,
 	svcList []corev1.Service) []masterSvc {
+	svcByNS := make(map[string][]*corev1.Service)
+	for j := range svcList {
+		svc := &svcList[j]
+		if svc.Spec.ClusterIP == "" ||
+			svc.Spec.ClusterIP == corev1.ClusterIPNone ||
+			!masterRoleService(svc) {
+			continue // headless or non-master services cannot match
+		}
+		svcByNS[svc.Namespace] = append(svcByNS[svc.Namespace], svc)
+	}
 	// clusterLabels: "ns/cluster" → representative pod labels (every
 	// pod of a cluster shares cnpg.io/cluster; role labels differ but
 	// selectorMatchesSTS strips them).
@@ -163,15 +176,8 @@ func cnpgMasterlessCandidates(pods []corev1.Pod,
 	var candidates []masterSvc
 	for key, podLabels := range clusterLabels {
 		ns, cluster, _ := strings.Cut(key, "/")
-		for j := range svcList {
-			svc := &svcList[j]
-			if svc.Namespace != ns ||
-				svc.Spec.ClusterIP == "" ||
-				svc.Spec.ClusterIP == corev1.ClusterIPNone {
-				continue // headless services are deliberately per-pod
-			}
-			if !masterRoleService(svc) ||
-				!selectorMatchesSTS(svc, podLabels) {
+		for _, svc := range svcByNS[ns] {
+			if !selectorMatchesSTS(svc, podLabels) {
 				continue
 			}
 			candidates = append(candidates, masterSvc{

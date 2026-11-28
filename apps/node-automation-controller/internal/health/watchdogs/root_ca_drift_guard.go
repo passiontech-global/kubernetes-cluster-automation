@@ -219,14 +219,10 @@ func (c *rootCADriftCheck) rootCAEmitWarning(
 	detail string,
 ) bool {
 	cooldownKey := "root-ca." + ns.Name + "." + reason
-	if c.eventCooldown.CooledDown(cooldownKey, rootCAEventCooldown, now) {
-		return false
-	}
 	note := fmt.Sprintf("Namespace %s has drifted %s ConfigMap compared to %s/%s: %s",
 		ns.Name, rootCAConfigMapName, rootCAReferenceNS, rootCAConfigMapName, detail)
 
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cooldownKey, cooldownKey, now),
+	return probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cooldownKey, rootCAEventCooldown, now, kube.WarningEvent{
 		Namespace: ns.Name,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
@@ -237,12 +233,5 @@ func (c *rootCADriftCheck) rootCAEmitWarning(
 		Reason:            rootCAEventReason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: RootCADrift event create failed (RBAC?)", "namespace", ns.Name, "error", err)
-		return false
-	}
-	c.eventCooldown.Stamp(cooldownKey, now)
-	log.Info("EVENT: RootCADrift", "namespace", ns.Name, "reason", reason)
-	return true
+	})
 }

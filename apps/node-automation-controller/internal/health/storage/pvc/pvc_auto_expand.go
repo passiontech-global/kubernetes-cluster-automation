@@ -237,35 +237,21 @@ func (c *pvcAutoExpandCheck) emitLowFreeEvent(
 	now time.Time,
 ) {
 	cdKey := "lowspace." + b.ns + "." + b.name
-	if c.eventCooldown.CooledDown(cdKey, pvcAutoExpandEventCooldown, now) {
-		return
-	}
-	regarding := corev1.ObjectReference{
-		APIVersion: "v1",
-		Kind:       "PersistentVolumeClaim",
-		Namespace:  b.ns,
-		Name:       b.name,
-	}
-	if pvc != nil {
-		regarding.UID = pvc.UID
-	}
 	note := fmt.Sprintf("PVC %s/%s has %.1f%% free space (<15%%) sustained >=%s",
 		b.ns, b.name, b.freeRatio*100, pvcAutoExpandMinDuration)
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:              kube.TruncatedEventName(cdKey, cdKey, now),
-		Namespace:         b.ns,
-		Regarding:         regarding,
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cdKey, pvcAutoExpandEventCooldown, now, kube.WarningEvent{
+		Namespace: b.ns,
+		Regarding: corev1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "PersistentVolumeClaim",
+			Namespace:  b.ns,
+			Name:       b.name,
+			UID:        pvc.UID,
+		},
 		Reason:            pvcLowFreeEventReason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: PVCLowFreeSpace event create failed (RBAC?)",
-			"pvc", b.ns+"/"+b.name, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cdKey, now)
-	log.Info("EVENT: PVCLowFreeSpace", "pvc", b.ns+"/"+b.name, "freePct", fmt.Sprintf("%.1f", b.freeRatio*100))
+	})
 }
 
 func (c *pvcAutoExpandCheck) emitPausedEvent(
@@ -277,11 +263,7 @@ func (c *pvcAutoExpandCheck) emitPausedEvent(
 	now time.Time,
 ) {
 	cdKey := "pvc-expand-pause." + reason + "." + pvc.Namespace + "." + pvc.Name
-	if c.eventCooldown.CooledDown(cdKey, pvcAutoExpandEventCooldown, now) {
-		return
-	}
-	if err := kube.EmitWarningEvent(ctx, c.CS, kube.WarningEvent{
-		Name:      kube.TruncatedEventName(cdKey, cdKey, now),
+	probefw.EmitWarningDeduped(ctx, c.CS, log, &c.eventCooldown, cdKey, pvcAutoExpandEventCooldown, now, kube.WarningEvent{
 		Namespace: pvc.Namespace,
 		Regarding: corev1.ObjectReference{
 			APIVersion: "v1",
@@ -293,14 +275,7 @@ func (c *pvcAutoExpandCheck) emitPausedEvent(
 		Reason:            reason,
 		Note:              note,
 		ReportingInstance: c.Name,
-		Now:               now,
-	}); err != nil {
-		log.Info("WARN: PVC auto-expand pause event failed",
-			"pvc", pvc.Namespace+"/"+pvc.Name, "reason", reason, "error", err)
-		return
-	}
-	c.eventCooldown.Stamp(cdKey, now)
-	log.Info("EVENT: "+reason, "pvc", pvc.Namespace+"/"+pvc.Name, "note", note)
+	})
 }
 
 func (c *pvcAutoExpandCheck) expandCandidates(
@@ -417,12 +392,7 @@ func (c *pvcAutoExpandCheck) expandCandidates(
 }
 
 func (c *pvcAutoExpandCheck) loadStorageClasses(ctx context.Context, log logr.Logger) (map[string]*storagev1.StorageClass, *storagev1.StorageClass, bool) {
-	scs, err := kube.ListAll(ctx,
-		metav1.ListOptions{
-			Limit:           kube.DefaultListPageSize,
-			ResourceVersion: "0",
-		},
-		kube.StorageClasses(c.CS))
+	scs, err := c.AllStorageClasses(ctx)
 	if err != nil {
 		log.Info("WARN: storageclass list failed — pvc-auto-expand heal skipped", "error", err)
 		return nil, nil, false
