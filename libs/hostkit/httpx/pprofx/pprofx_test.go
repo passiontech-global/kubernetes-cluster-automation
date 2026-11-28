@@ -12,7 +12,7 @@ func TestRegister(t *testing.T) {
 	Register(mux)
 
 	for _, path := range []string{"/debug/pprof/", "/debug/pprof/cmdline", "/debug/pprof/symbol"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 		if rec.Code == http.StatusNotFound {
@@ -43,7 +43,7 @@ func TestHandlers(t *testing.T) {
 		mux.Handle(path, h)
 	}
 	for _, path := range []string{want, "/debug/pprof/cmdline", "/debug/pprof/symbol"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 		if rec.Code == http.StatusNotFound {
@@ -57,7 +57,7 @@ func TestHandlers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	for _, path := range []string{"/debug/pprof/profile", "/debug/pprof/trace"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+		req := httptest.NewRequestWithContext(ctx, http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
 		if rec.Code == http.StatusNotFound {

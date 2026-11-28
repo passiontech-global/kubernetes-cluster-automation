@@ -92,7 +92,7 @@ type Server struct {
 // collision before anything listens. handler is injected by the caller
 // (promhttp mux, plain http.ServeMux, …).
 func New(addr string, handler http.Handler, opts Opts) (*Server, error) {
-	ln, err := net.Listen("tcp", addr)
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +129,7 @@ func New(addr string, handler http.Handler, opts Opts) (*Server, error) {
 // address is widened by mistake. Port 0 resolves to an ephemeral
 // port; the real address is available via ln.Addr().
 func ListenLoopback(port int) (net.Listener, error) {
-	return net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	return (&net.ListenConfig{}).Listen(context.Background(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 }
 
 // ValidateLoopbackAddr checks that addr is a host:port whose host is

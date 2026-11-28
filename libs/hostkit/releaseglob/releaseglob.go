@@ -52,7 +52,7 @@ func RepoRoot(t *testing.T) string {
 // httpx/pprofx is covered by the libs/hostkit/httpx/ glob).
 func appLibImports(t *testing.T, root, app string) map[string]bool {
 	t.Helper()
-	cmd := exec.Command("go", "list", "-deps", "./cmd/...")
+	cmd := exec.CommandContext(t.Context(), "go", "list", "-deps", "./cmd/...")
 	cmd.Dir = filepath.Join(root, "apps", app)
 	cmd.Env = append(os.Environ(), "GOWORK=off")
 	out, err := cmd.Output()

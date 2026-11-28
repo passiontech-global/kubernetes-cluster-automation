@@ -33,7 +33,11 @@ func TestBindsAndServes(t *testing.T) {
 	}
 
 	served := srv.Serve()
-	resp, err := http.Get("http://" + srv.Addr() + "/probe")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+srv.Addr()+"/probe", nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -79,7 +83,12 @@ func TestShutdownDrainsInFlightRequest(t *testing.T) {
 	resCh := make(chan result, 1)
 	go func() {
 		cl := &http.Client{Timeout: 5 * time.Second}
-		resp, err := cl.Get("http://" + srv.Addr() + "/slow")
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+srv.Addr()+"/slow", nil)
+		if err != nil {
+			resCh <- result{err: err}
+			return
+		}
+		resp, err := cl.Do(req)
 		if err != nil {
 			resCh <- result{err: err}
 			return
@@ -124,9 +133,12 @@ func TestShutdownBudgetRespected(t *testing.T) {
 	go func() {
 		defer close(clientDone)
 		cl := &http.Client{Timeout: 5 * time.Second}
-		resp, _ := cl.Get("http://" + srv.Addr() + "/stuck")
-		if resp != nil {
-			resp.Body.Close()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+srv.Addr()+"/stuck", nil)
+		if err == nil {
+			resp, _ := cl.Do(req)
+			if resp != nil {
+				resp.Body.Close()
+			}
 		}
 	}()
 	<-started
@@ -168,7 +180,11 @@ func TestTimeoutWrapsRoute(t *testing.T) {
 		<-served
 	}()
 
-	resp, err := http.Get(fmt.Sprintf("http://%s/slow", srv.Addr()))
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, fmt.Sprintf("http://%s/slow", srv.Addr()), nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -216,7 +232,7 @@ func TestShutdownBeforeServeClosesListener(t *testing.T) {
 		t.Fatal("serve channel never resolved")
 	}
 	// The port must actually be released.
-	if conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+	if conn, err := (&net.Dialer{Timeout: 200 * time.Millisecond}).DialContext(t.Context(), "tcp", addr); err == nil {
 		_ = conn.Close()
 		t.Fatal("listener still accepting after Shutdown")
 	}
@@ -262,7 +278,7 @@ func TestCloseImmediate(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("serve channel never resolved after Close")
 	}
-	if conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+	if conn, err := (&net.Dialer{Timeout: 200 * time.Millisecond}).DialContext(t.Context(), "tcp", addr); err == nil {
 		_ = conn.Close()
 		t.Fatal("listener still accepting after Close")
 	}
@@ -326,7 +342,7 @@ func TestOptsTimeoutsAndPooledTransport(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}), 5*time.Millisecond, "")
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
 	if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != "request timed out" {
 		t.Fatalf("Timeout default msg: code=%d body=%q", rec.Code, rec.Body.String())
 	}
@@ -402,9 +418,12 @@ func TestShutdownNilReceiverContextAndZeroServer(t *testing.T) {
 	go func() {
 		defer close(clientDone)
 		cl := &http.Client{Timeout: 5 * time.Second}
-		resp, _ := cl.Get("http://" + srv.Addr() + "/slow")
-		if resp != nil {
-			resp.Body.Close()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+srv.Addr()+"/slow", nil)
+		if err == nil {
+			resp, _ := cl.Do(req)
+			if resp != nil {
+				resp.Body.Close()
+			}
 		}
 	}()
 	<-started
@@ -484,7 +503,7 @@ func TestCloseNilReceiverAndZeroServer(t *testing.T) {
 
 	// Hand-assembled Server with done channel but nil srv must also
 	// resolve Serve cleanly rather than panicking on srv.Serve(ln).
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +541,7 @@ func TestCloseBeforeServeClosesListener(t *testing.T) {
 	if got := srv.Addr(); got != "" {
 		t.Fatalf("Addr after Close = %q, want empty", got)
 	}
-	if conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+	if conn, err := (&net.Dialer{Timeout: 200 * time.Millisecond}).DialContext(t.Context(), "tcp", addr); err == nil {
 		_ = conn.Close()
 		t.Fatal("listener still accepting after Close")
 	}
