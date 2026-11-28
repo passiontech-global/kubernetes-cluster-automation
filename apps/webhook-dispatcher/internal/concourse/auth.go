@@ -27,12 +27,13 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // tokenRefreshMargin is how early before expiry a cached token is
@@ -306,6 +307,11 @@ func (a *atcAuth) authorize(ctx context.Context, req *http.Request) (string, err
 	return f.token, nil
 }
 
+// maxTokenBody caps a token-endpoint response at 64 KiB (a JWT plus a
+// little metadata) — anything longer is a wedged/hostile peer, not a
+// bigger token.
+const maxTokenBody = 64 << 10
+
 // mint performs the token request, returning (token, expiry, basic,
 // err). basic=true means both token endpoints 404/405'd — latch
 // basic-auth mode.
@@ -324,13 +330,14 @@ func (a *atcAuth) mint(ctx context.Context) (string, time.Time, bool, error) {
 		if err != nil {
 			return "", time.Time{}, false, stripURLError(err)
 		}
-		// 64 KiB is generous for a token response (a JWT plus a
-		// little metadata) — anything longer is a wedged/hostile
-		// peer, not a bigger token.
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
+		body, truncated, err := httpx.ReadBounded(resp.Body, maxTokenBody)
+		httpx.DrainAndClose(resp.Body, maxDrainBytes)
 		if err != nil {
 			return "", time.Time{}, false, err
+		}
+		if truncated {
+			return "", time.Time{}, false,
+				fmt.Errorf("token endpoint %s: response exceeds %d bytes", path, maxTokenBody)
 		}
 		if resp.StatusCode == http.StatusNotFound ||
 			resp.StatusCode == http.StatusMethodNotAllowed {

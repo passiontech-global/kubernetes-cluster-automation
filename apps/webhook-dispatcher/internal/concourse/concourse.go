@@ -22,6 +22,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // Resource is one Concourse resource pinned to a GitHub repo. Repo is
@@ -252,22 +254,11 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 		// the token into error logs. Return only the wrapped error.
 		return 0, stripURLError(err)
 	}
-	defer drainAndClose(resp.Body)
+	defer httpx.DrainAndClose(resp.Body, maxDrainBytes)
 	return resp.StatusCode, nil
 }
 
 const maxDrainBytes = 64 << 10
-
-// drainAndClose drains up to maxDrainBytes from body before closing it
-// so keep-alive connections can be reused without letting an endless
-// peer stream stall the caller.
-func drainAndClose(body io.ReadCloser) {
-	if body == nil {
-		return
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrainBytes))
-	_ = body.Close()
-}
 
 func (c *Client) apiPath(p string) string {
 	return "/api/v1/teams/" + url.PathEscape(c.Team) + "/" + p
@@ -306,18 +297,18 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 				// Drain (bounded) BEFORE closing so the keep-alive
 				// connection survives into the retry instead of being
 				// dropped by the transport over unconsumed bytes.
-				drainAndClose(resp.Body)
+				httpx.DrainAndClose(resp.Body, maxDrainBytes)
 				// Invalidate only the token THIS request carried — a
 				// fresher token another worker already minted survives.
 				c.invalidateToken(usedToken)
 				continue
 			}
 			if c.recoverBasicOn401() {
-				drainAndClose(resp.Body)
+				httpx.DrainAndClose(resp.Body, maxDrainBytes)
 				continue
 			}
 		}
-		defer drainAndClose(resp.Body)
+		defer httpx.DrainAndClose(resp.Body, maxDrainBytes)
 		if resp.StatusCode/100 != 2 {
 			return &statusError{status: resp.StatusCode, path: path}
 		}

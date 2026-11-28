@@ -805,3 +805,17 @@ func TestAuthMintPanicRecoversAndUnblocksWaiters(t *testing.T) {
 		t.Fatalf("post-panic token = %q, want %q", tok, "tok")
 	}
 }
+
+func TestMintOversizedBodyRejected(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"` + strings.Repeat("a", maxTokenBody) + `"}`))
+	}))
+	defer srv.Close()
+
+	_, _, _, err := mintAuth(srv).mint(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("mint oversized body err = %v, want exceeds error", err)
+	}
+}
