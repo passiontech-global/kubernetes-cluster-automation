@@ -31,6 +31,16 @@ func (h *Handler) fanoutDone() {
 	h.wg.Done()
 }
 
+// StartDrain marks the handler draining so new webhook deliveries fail
+// fast with 503 during HTTP listener shutdown instead of starting new
+// index waits or fan-outs. Safe to call before Wait (which sets the
+// same flag idempotently).
+func (h *Handler) StartDrain() {
+	h.drainMu.Lock()
+	h.draining = true
+	h.drainMu.Unlock()
+}
+
 // Wait blocks until every in-flight background fan-out has finished,
 // or ctx's budget expires — the graceful-shutdown path calls it once
 // the HTTP server has drained so the last check POSTs land before the
@@ -46,9 +56,7 @@ func (h *Handler) Wait(ctx context.Context) int {
 	// normally, but anything reaching admit() from here on is
 	// rejected 503 — Wait's WaitGroup observation can't be raced by
 	// a request that slipped its Add in after the check.
-	h.drainMu.Lock()
-	h.draining = true
-	h.drainMu.Unlock()
+	h.StartDrain()
 	done := make(chan struct{})
 	go func() {
 		h.wg.Wait()
@@ -225,12 +233,8 @@ func (h *Handler) dispatch(resources []concourse.Resource,
 	}
 	close(jobs)
 	wg.Wait()
-	fanoutDuration.Observe(time.Since(start).Seconds())
-	logger().Info("webhook fan-out complete",
-		"delivery", delivery, "event", event, "repo", repo,
-		"resources_matched", len(resources),
-		"resources_checked", checked.Load(),
-		"duration", time.Since(start).Round(time.Millisecond))
+	h.finishDispatch(start, delivery, event, repo,
+		int64(len(resources)), checked.Load())
 }
 
 // checkOne runs one resource's check webhook through the semaphore
@@ -285,8 +289,8 @@ func (h *Handler) checkOne(ctx context.Context, res concourse.Resource,
 	return 0
 }
 
-// finishDispatch closes out the direct single-resource path — the
-// multi-resource path inlines the same metric+log at its tail.
+// finishDispatch records the fanoutDuration metric and completion log
+// for both the direct single-resource and worker-pool dispatch paths.
 func (h *Handler) finishDispatch(start time.Time,
 	delivery, event, repo string, matched, checked int64) {
 	fanoutDuration.Observe(time.Since(start).Seconds())

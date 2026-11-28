@@ -278,11 +278,18 @@ func (h *Handler) isDraining() bool {
 	return d
 }
 
-// refuseAdmission answers 503 for either drain or semaphore saturation.
+const (
+	refusalDraining     = "draining"
+	refusalReqSem       = "req_sem"
+	refusalPreAuthSem   = "preauth_sem"
+	refusalPreAuthBytes = "preauth_bytes"
+)
+
+// refuseAdmission answers 503 for drain, reqSem, or pre-auth saturation.
 func (h *Handler) refuseAdmission(w http.ResponseWriter, r *http.Request,
-	delivery, eventMetric string, draining bool) {
+	delivery, eventMetric, reason string) {
 	status := "overloaded"
-	if draining {
+	if reason == refusalDraining {
 		status = "draining"
 	}
 	code := http.StatusServiceUnavailable
@@ -290,7 +297,7 @@ func (h *Handler) refuseAdmission(w http.ResponseWriter, r *http.Request,
 	logger().Warn("webhook rejected: admission refused",
 		"remote_addr", r.RemoteAddr,
 		"delivery", delivery, "event", eventMetric,
-		"status", code)
+		"reason", reason, "status", code)
 	http.Error(w, "service unavailable", code)
 }
 
@@ -299,22 +306,22 @@ func (h *Handler) refuseAdmission(w http.ResponseWriter, r *http.Request,
 // unauthenticated slow-loris requests cannot hold reqSem slots for
 // ReadTimeout (10s), while drainMu still ensures Wait cannot observe
 // an empty WaitGroup ahead of an in-flight admission. ok=false means
-// the caller answers 503; draining reports WHICH refusal (shutdown vs
-// capacity) for the metric label.
-func (h *Handler) admit() (ok, draining bool) {
+// the caller answers 503; reason reports WHICH refusal (draining vs
+// req_sem) for the log and metric label.
+func (h *Handler) admit() (ok bool, reason string) {
 	select {
 	case h.reqSem <- struct{}{}:
 	default:
-		return false, false
+		return false, refusalReqSem
 	}
 	h.drainMu.Lock()
 	defer h.drainMu.Unlock()
 	if h.draining {
 		<-h.reqSem
-		return false, true
+		return false, refusalDraining
 	}
 	h.wg.Add(1)
-	return true, false
+	return true, ""
 }
 
 // release pairs admit — called once per admitted request via defer.
@@ -372,145 +379,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Fast-reject draining servers before reading/hashing the body.
 	if h.isDraining() {
-		h.refuseAdmission(w, r, delivery, eventMetric, true)
+		h.refuseAdmission(w, r, delivery, eventMetric, refusalDraining)
 		return
 	}
 
 	wantType, handledEvent := resourceTypeForEvent[event]
 	if !handledEvent {
-		// Events outside the four handled types are acknowledged on
-		// the signature alone — the payload is never parsed, so
-		// stream it through the HMAC instead of buffering up to
-		// 8 MiB for a delivery that only earns a 202. The response
-		// ordering is identical to the buffered path: the
-		// MaxBytesReader still produces 413/400 before the 401
-		// verdict, and the metric outcomes are the same.
-		matched, err := verify.SignatureReader(h.secret,
-			http.MaxBytesReader(w, r.Body, maxBodyBytes), sig)
-		if err != nil {
-			h.failBodyRead(w, r, delivery, event, eventMetric, err)
-			return
-		}
-		if !matched {
-			h.rejectSignature(w, r, delivery, eventMetric)
-			return
-		}
-		if ok, draining := h.admit(); !ok {
-			h.refuseAdmission(w, r, delivery, eventMetric, draining)
-			return
-		}
-		defer h.release()
-		deliveriesTotal.WithLabelValues(eventMetric, "ignored").Inc()
-		logger().Info("webhook delivery ignored: unhandled event",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event)
-		writeJSON(w, http.StatusAccepted, summary{})
+		h.verifyUnhandled(w, r, delivery, event, eventMetric, sig)
 		return
 	}
 
-	// The four handled events DO parse the payload — bound pre-auth
-	// concurrency and aggregate buffered bytes before borrowing from
-	// bodyPool and streaming through SignatureTee so an unauthenticated
-	// flood cannot OOM the process, while keeping reqSem isolated.
-	select {
-	case h.preAuthSem <- struct{}{}:
-	default:
-		h.refuseAdmission(w, r, delivery, eventMetric, false)
-		return
-	}
-
-	bp := bodyPool.Get().(*[]byte)
-	cw := cappedBodyWriter{buf: (*bp)[:0], max: maxBodyBytes}
-	releaseBuf := func() {
-		if bp == nil {
-			return
-		}
-		if cap(cw.buf) <= maxPooledBodyCap {
-			*bp = cw.buf[:0]
-			if h.onBodyPut != nil {
-				h.onBodyPut(bp)
-			} else {
-				bodyPool.Put(bp)
-			}
-		}
-		cw.buf = nil
-		bp = nil
-	}
-	defer releaseBuf()
-
-	initCap := int64(cap(cw.buf))
-	if !h.tryReservePreAuthBytes(initCap) {
-		<-h.preAuthSem
-		h.refuseAdmission(w, r, delivery, eventMetric, false)
-		return
-	}
-	cw.reserved = initCap
-	cw.reserve = h.tryReservePreAuthBytes
-	preAuthHeld := true
-	releasePreAuth := func() {
-		if !preAuthHeld {
-			return
-		}
-		preAuthHeld = false
-		if cw.reserved > 0 {
-			h.preAuthBytes.Add(-cw.reserved)
-			cw.reserved = 0
-		}
-		<-h.preAuthSem
-	}
-	defer releasePreAuth()
-
-	matched, err := verify.SignatureTee(h.secret,
-		http.MaxBytesReader(w, r.Body, maxBodyBytes), &cw, sig)
-	if err != nil {
-		if errors.Is(err, errPreAuthBudget) {
-			h.refuseAdmission(w, r, delivery, eventMetric, false)
-			return
-		}
-		h.failBodyRead(w, r, delivery, event, eventMetric, err)
-		return
-	}
-	if !matched {
-		h.rejectSignature(w, r, delivery, eventMetric)
-		return
-	}
-
-	// Admission gate after HMAC verification so unauthenticated slow
-	// readers cannot exhaust reqSem across ReadTimeout.
-	if ok, draining := h.admit(); !ok {
-		h.refuseAdmission(w, r, delivery, eventMetric, draining)
+	p, ok := h.readAndVerifyHandled(w, r, delivery, event, eventMetric, sig)
+	if !ok {
 		return
 	}
 	defer h.release()
-
-	var p payload
-	err = json.Unmarshal(cw.buf, &p,
-		jsontext.AllowInvalidUTF8(true),
-		jsontext.AllowDuplicateNames(true),
-	)
-	// Return the pooled buffer and release pre-auth budget immediately
-	// once JSON decode finishes so neither is held across h.accept()'s
-	// 7s index wait.
-	releaseBuf()
-	releasePreAuth()
-	if err != nil {
-		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
-		logger().Warn("webhook rejected: malformed JSON payload",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event, "error", err,
-			"status", http.StatusBadRequest)
-		http.Error(w, "bad payload", http.StatusBadRequest)
-		return
-	}
-	if p.Repository.FullName == "" {
-		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
-		logger().Warn("webhook rejected: missing repository.full_name",
-			"remote_addr", r.RemoteAddr,
-			"delivery", delivery, "event", event,
-			"status", http.StatusBadRequest)
-		http.Error(w, "bad payload", http.StatusBadRequest)
-		return
-	}
 
 	// release fires for many actions — only publishing one means a
 	// new tag for git resources to see; create fires for branches and
@@ -558,4 +441,157 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Signature verified, payload parsed and actionable — hand the
 	// delivery to the index/match/fan-out half (dispatch.go).
 	h.accept(w, r, delivery, event, eventMetric, wantType, p)
+}
+
+// verifyUnhandled streams an unhandled event through the HMAC check
+// without buffering up to 8 MiB, admits the request for shutdown-drain
+// tracking, and acknowledges 202.
+func (h *Handler) verifyUnhandled(w http.ResponseWriter, r *http.Request,
+	delivery, event, eventMetric, sig string) {
+	// Events outside the four handled types are acknowledged on
+	// the signature alone — the payload is never parsed, so
+	// stream it through the HMAC instead of buffering up to
+	// 8 MiB for a delivery that only earns a 202. The response
+	// ordering is identical to the buffered path: the
+	// MaxBytesReader still produces 413/400 before the 401
+	// verdict, and the metric outcomes are the same.
+	matched, err := verify.SignatureReader(h.secret,
+		http.MaxBytesReader(w, r.Body, maxBodyBytes), sig)
+	if err != nil {
+		h.failBodyRead(w, r, delivery, event, eventMetric, err)
+		return
+	}
+	if !matched {
+		h.rejectSignature(w, r, delivery, eventMetric)
+		return
+	}
+	if ok, reason := h.admit(); !ok {
+		h.refuseAdmission(w, r, delivery, eventMetric, reason)
+		return
+	}
+	defer h.release()
+	deliveriesTotal.WithLabelValues(eventMetric, "ignored").Inc()
+	logger().Info("webhook delivery ignored: unhandled event",
+		"remote_addr", r.RemoteAddr,
+		"delivery", delivery, "event", event)
+	writeJSON(w, http.StatusAccepted, summary{})
+}
+
+// readAndVerifyHandled bounds pre-auth buffering, verifies the HMAC
+// via SignatureTee, admits the request onto reqSem, decodes the JSON
+// payload, and releases the pre-auth buffer/budget before returning.
+// When ok is true, the caller owns h.release() via defer.
+func (h *Handler) readAndVerifyHandled(w http.ResponseWriter, r *http.Request,
+	delivery, event, eventMetric, sig string) (payload, bool) {
+	// The four handled events DO parse the payload — bound pre-auth
+	// concurrency and aggregate buffered bytes before borrowing from
+	// bodyPool and streaming through SignatureTee so an unauthenticated
+	// flood cannot OOM the process, while keeping reqSem isolated.
+	select {
+	case h.preAuthSem <- struct{}{}:
+	default:
+		h.refuseAdmission(w, r, delivery, eventMetric, refusalPreAuthSem)
+		return payload{}, false
+	}
+
+	bp := bodyPool.Get().(*[]byte)
+	cw := cappedBodyWriter{buf: (*bp)[:0], max: maxBodyBytes}
+	releaseBuf := func() {
+		if bp == nil {
+			return
+		}
+		if cap(cw.buf) <= maxPooledBodyCap {
+			*bp = cw.buf[:0]
+			if h.onBodyPut != nil {
+				h.onBodyPut(bp)
+			} else {
+				bodyPool.Put(bp)
+			}
+		}
+		cw.buf = nil
+		bp = nil
+	}
+	defer releaseBuf()
+
+	initCap := int64(cap(cw.buf))
+	if !h.tryReservePreAuthBytes(initCap) {
+		<-h.preAuthSem
+		h.refuseAdmission(w, r, delivery, eventMetric, refusalPreAuthBytes)
+		return payload{}, false
+	}
+	cw.reserved = initCap
+	cw.reserve = h.tryReservePreAuthBytes
+	preAuthHeld := true
+	releasePreAuth := func() {
+		if !preAuthHeld {
+			return
+		}
+		preAuthHeld = false
+		if cw.reserved > 0 {
+			h.preAuthBytes.Add(-cw.reserved)
+			cw.reserved = 0
+		}
+		<-h.preAuthSem
+	}
+	defer releasePreAuth()
+
+	matched, err := verify.SignatureTee(h.secret,
+		http.MaxBytesReader(w, r.Body, maxBodyBytes), &cw, sig)
+	if err != nil {
+		if errors.Is(err, errPreAuthBudget) {
+			h.refuseAdmission(w, r, delivery, eventMetric, refusalPreAuthBytes)
+			return payload{}, false
+		}
+		h.failBodyRead(w, r, delivery, event, eventMetric, err)
+		return payload{}, false
+	}
+	if !matched {
+		h.rejectSignature(w, r, delivery, eventMetric)
+		return payload{}, false
+	}
+
+	// Admission gate after HMAC verification so unauthenticated slow
+	// readers cannot exhaust reqSem across ReadTimeout.
+	if ok, reason := h.admit(); !ok {
+		h.refuseAdmission(w, r, delivery, eventMetric, reason)
+		return payload{}, false
+	}
+	admitted := true
+	returnedOK := false
+	defer func() {
+		if admitted && !returnedOK {
+			h.release()
+		}
+	}()
+
+	var p payload
+	err = json.Unmarshal(cw.buf, &p,
+		jsontext.AllowInvalidUTF8(true),
+		jsontext.AllowDuplicateNames(true),
+	)
+	// Return the pooled buffer and release pre-auth budget immediately
+	// once JSON decode finishes so neither is held across h.accept()'s
+	// 7s index wait.
+	releaseBuf()
+	releasePreAuth()
+	if err != nil {
+		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
+		logger().Warn("webhook rejected: malformed JSON payload",
+			"remote_addr", r.RemoteAddr,
+			"delivery", delivery, "event", event, "error", err,
+			"status", http.StatusBadRequest)
+		http.Error(w, "bad payload", http.StatusBadRequest)
+		return payload{}, false
+	}
+	if p.Repository.FullName == "" {
+		deliveriesTotal.WithLabelValues(eventMetric, "bad_request").Inc()
+		logger().Warn("webhook rejected: missing repository.full_name",
+			"remote_addr", r.RemoteAddr,
+			"delivery", delivery, "event", event,
+			"status", http.StatusBadRequest)
+		http.Error(w, "bad payload", http.StatusBadRequest)
+		return payload{}, false
+	}
+	returnedOK = true
+	return p, true
 }

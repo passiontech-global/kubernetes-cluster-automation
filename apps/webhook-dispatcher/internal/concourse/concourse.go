@@ -229,7 +229,7 @@ func (c *Client) negCacheTTL() time.Duration {
 // the ATC status code so the caller can classify warn vs error;
 // transport errors return 0.
 func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
-	u := strings.TrimSuffix(c.BaseURL, "/") + c.apiPath(
+	u := strings.TrimRight(c.SafeBaseURL(), "/") + c.apiPath(
 		"pipelines/"+url.PathEscape(r.Pipeline)+
 			"/resources/"+url.PathEscape(r.Name)+"/check/webhook") +
 		"?webhook_token=" + url.QueryEscape(c.WebhookToken)
@@ -252,10 +252,21 @@ func (c *Client) CheckWebhook(ctx context.Context, r Resource) (int, error) {
 		// the token into error logs. Return only the wrapped error.
 		return 0, stripURLError(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	// Drain (bounded) so the keep-alive connection can be reused.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	defer drainAndClose(resp.Body)
 	return resp.StatusCode, nil
+}
+
+const maxDrainBytes = 64 << 10
+
+// drainAndClose drains up to maxDrainBytes from body before closing it
+// so keep-alive connections can be reused without letting an endless
+// peer stream stall the caller.
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrainBytes))
+	_ = body.Close()
 }
 
 func (c *Client) apiPath(p string) string {
@@ -277,7 +288,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	// is a credential problem, not a stale token.
 	for attempt := 0; ; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-			strings.TrimSuffix(c.BaseURL, "/")+path, nil)
+			strings.TrimRight(c.BaseURL, "/")+path, nil)
 		if err != nil {
 			return stripURLError(err)
 		}
@@ -295,40 +306,28 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 				// Drain (bounded) BEFORE closing so the keep-alive
 				// connection survives into the retry instead of being
 				// dropped by the transport over unconsumed bytes.
-				_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
-				_ = resp.Body.Close()
+				drainAndClose(resp.Body)
 				// Invalidate only the token THIS request carried — a
 				// fresher token another worker already minted survives.
 				c.invalidateToken(usedToken)
 				continue
 			}
 			if c.recoverBasicOn401() {
-				_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
-				_ = resp.Body.Close()
+				drainAndClose(resp.Body)
 				continue
 			}
 		}
-		defer func() { _ = resp.Body.Close() }()
+		defer drainAndClose(resp.Body)
 		if resp.StatusCode/100 != 2 {
-			// Drain (bounded) so the keep-alive connection can be reused.
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			return &statusError{status: resp.StatusCode, path: path}
 		}
 		// Bound the decode: without LimitReader a 2xx body longer than
 		// maxJSONBody (an ATC streaming forever) would be buffered whole.
-		err = json.UnmarshalRead(
+		return json.UnmarshalRead(
 			io.LimitReader(resp.Body, maxJSONBody),
 			out,
 			jsontext.AllowInvalidUTF8(true),
 			jsontext.AllowDuplicateNames(true),
 		)
-		// Drain whatever the decoder left before the body closes: a decode
-		// that finished before EOF (trailing newline, whitespace, extra
-		// documents) or one that failed at the maxJSONBody cap would
-		// otherwise strand the keep-alive connection, forcing every later
-		// call to re-dial. Bounded like the error path — an endless
-		// hostile stream is abandoned, not drained forever.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		return err
 	}
 }

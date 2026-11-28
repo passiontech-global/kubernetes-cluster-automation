@@ -1630,3 +1630,80 @@ func TestPreAuthBudgetNeverLeaks(t *testing.T) {
 		assertClean(t, h)
 	})
 }
+
+func TestRefuseAdmissionLogsStructuredReason(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	t.Run("draining", func(t *testing.T) {
+		buf.Reset()
+		h := New(testSecret, &fakeBackend{})
+		h.StartDrain()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want 503", rec.Code)
+		}
+		if !strings.Contains(buf.String(), "reason=draining") {
+			t.Fatalf("log missing reason=draining: %s", buf.String())
+		}
+	})
+
+	t.Run("req_sem", func(t *testing.T) {
+		buf.Reset()
+		h := New(testSecret, &fakeBackend{})
+		for range maxInflightRequests {
+			h.reqSem <- struct{}{}
+		}
+		defer func() {
+			for range maxInflightRequests {
+				<-h.reqSem
+			}
+		}()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want 503", rec.Code)
+		}
+		if !strings.Contains(buf.String(), "reason=req_sem") {
+			t.Fatalf("log missing reason=req_sem: %s", buf.String())
+		}
+	})
+
+	t.Run("preauth_sem", func(t *testing.T) {
+		buf.Reset()
+		h := New(testSecret, &fakeBackend{})
+		for range maxPreAuthRequests {
+			h.preAuthSem <- struct{}{}
+		}
+		defer func() {
+			for range maxPreAuthRequests {
+				<-h.preAuthSem
+			}
+		}()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want 503", rec.Code)
+		}
+		if !strings.Contains(buf.String(), "reason=preauth_sem") {
+			t.Fatalf("log missing reason=preauth_sem: %s", buf.String())
+		}
+	})
+
+	t.Run("preauth_bytes", func(t *testing.T) {
+		buf.Reset()
+		h := New(testSecret, &fakeBackend{})
+		h.preAuthMaxBytes = 1024 // smaller than bodyPool initial 16 KiB slab
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signedRequest(t, "push", pushBody))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want 503", rec.Code)
+		}
+		if !strings.Contains(buf.String(), "reason=preauth_bytes") {
+			t.Fatalf("log missing reason=preauth_bytes: %s", buf.String())
+		}
+	})
+}

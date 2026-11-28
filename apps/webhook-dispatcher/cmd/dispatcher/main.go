@@ -52,6 +52,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -204,7 +205,11 @@ func run(ctx context.Context, args []string) error {
 	transport.MaxIdleConns = 64
 	transport.MaxConnsPerHost = 32
 
-	concourseURL := envx.String("CONCOURSE_URL", "http://concourse-web:8080")
+	concourseURL, err := validateConcourseURL(envx.String("CONCOURSE_URL", "http://concourse-web:8080"))
+	if err != nil {
+		logger().Error("invalid CONCOURSE_URL", "error", err)
+		return err
+	}
 	client := &concourse.Client{
 		BaseURL:      concourseURL,
 		Team:         envx.String("CONCOURSE_TEAM", "main"),
@@ -323,34 +328,47 @@ func run(ctx context.Context, args []string) error {
 	select {
 	case err := <-publicErr:
 		logger().Error("public server exited", "error", err)
+		ready.Store(false)
+		wh.StartDrain()
 		_ = publicSrv.Close()
 		_ = internalSrv.Close()
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), handler.WaitBudget)
+		wh.Wait(waitCtx)
+		waitCancel()
+		client.HTTP.CloseIdleConnections()
 		return fmt.Errorf("public server exited: %w", err)
 	case err := <-internalErr:
 		logger().Error("metrics server exited", "error", err)
+		ready.Store(false)
+		wh.StartDrain()
 		_ = publicSrv.Close()
 		_ = internalSrv.Close()
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), handler.WaitBudget)
+		wh.Wait(waitCtx)
+		waitCancel()
+		client.HTTP.CloseIdleConnections()
 		return fmt.Errorf("metrics server exited: %w", err)
 	case <-ctx.Done():
 	}
 
-	// Shutdown: flip readiness OFF first — the pod must leave the
-	// load-balancer's targets before connections drain, or new
-	// deliveries land on a listener that is about to close. Then
-	// drain both listeners in PARALLEL (10s public, 5s internal),
-	// then the fan-out wait (Handler.waitBudget, 15s). Total ~25s
-	// worst case — under the pod's 30s SIGKILL grace period, so the
-	// process exits on its own terms instead of being killed with
-	// check POSTs half-written.
+	// Shutdown: flip readiness OFF and start admission drain FIRST —
+	// the pod leaves the load-balancer's targets and any keep-alive
+	// request arriving during listener shutdown gets 503 instead of
+	// spawning a fresh 7s index wait / 30s fan-out. Then drain both
+	// listeners in PARALLEL (10s public, 5s internal), then wait for
+	// in-flight fan-outs (Handler.WaitBudget, 15s). Total ~25s worst
+	// case — under the pod's 30s SIGKILL grace period.
 	logger().Info("shutdown signal received — draining connections")
 	ready.Store(false)
+	wh.StartDrain()
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := publicSrv.Shutdown(shutdownCtx); err != nil {
-			logger().Warn("graceful shutdown failed — connections dropped",
+			logger().Warn("graceful shutdown failed — closing public listener",
 				"error", err)
+			_ = publicSrv.Close()
 		}
 	})
 	wg.Go(func() {
@@ -358,6 +376,7 @@ func run(ctx context.Context, args []string) error {
 		defer cancel()
 		if err := internalSrv.Shutdown(shutdownCtx); err != nil {
 			logger().Warn("metrics server shutdown failed", "error", err)
+			_ = internalSrv.Close()
 		}
 	})
 	wg.Wait()
@@ -374,4 +393,23 @@ func run(ctx context.Context, args []string) error {
 	// exits without lingering sockets.
 	client.HTTP.CloseIdleConnections()
 	return nil
+}
+
+// validateConcourseURL verifies CONCOURSE_URL at boot: must be an
+// http/https URL with a non-empty host. Trailing slashes are trimmed.
+// Embedded userinfo is tolerated for legacy/redaction configs (SafeBaseURL
+// strips it from logs and from CheckWebhook requests).
+func validateConcourseURL(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("CONCOURSE_URL invalid: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("CONCOURSE_URL must use http or https scheme, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", errors.New("CONCOURSE_URL must include a host")
+	}
+	return strings.TrimRight(trimmed, "/"), nil
 }

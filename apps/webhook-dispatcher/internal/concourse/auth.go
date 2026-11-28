@@ -125,8 +125,8 @@ func (c *Client) ensureAuth() *atcAuth {
 	c.authOnce.Do(func() {
 		c.authPtr.Store(&atcAuth{
 			client:      c.httpClient(),
-			baseURL:     strings.TrimSuffix(c.BaseURL, "/"),
-			safeBaseURL: strings.TrimSuffix(c.safeBaseURL(), "/"),
+			baseURL:     strings.TrimRight(c.BaseURL, "/"),
+			safeBaseURL: strings.TrimRight(c.safeBaseURL(), "/"),
 			user:        c.User,
 			pass:        c.Password,
 			now:         c.now,
