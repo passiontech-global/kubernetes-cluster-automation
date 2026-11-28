@@ -29,10 +29,16 @@ linters:
   default: standard
 
   enable:
+    - bodyclose       # ensure HTTP response bodies are closed
     - copyloopvar     # unneeded loop-var copies (pre-1.22 idiom)
     - depguard        # import-layer rules (see settings.depguard)
+    - durationcheck   # catch multiplying two time.Duration values
+    - errorlint       # enforce %w and errors.Is/errors.As
+    - fatcontext      # detect nested context.WithValue in loops
+    - makezero        # catch non-zero-length slice append bugs
     - misspell        # comment/doc typos
     - nilerr          # `if err != nil { return nil }` swallows errors
+    - noctx           # require context-aware HTTP/exec calls
     - perfsprint      # faster drop-ins for fmt.Sprintf & friends
     - unconvert       # redundant type conversions
     - usestdlibvars   # http.MethodGet etc. instead of string literals
