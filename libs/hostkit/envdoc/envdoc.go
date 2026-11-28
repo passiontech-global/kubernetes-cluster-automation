@@ -41,6 +41,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -415,9 +416,13 @@ func (s *fileScan) inspect(n ast.Node) visitFrame {
 		s.pushScope()
 	case *ast.RangeStmt:
 		frame.popRange = s.scanRange(e)
+	case *ast.CompositeLit:
+		frame.popRange = s.scanKnobLit(e)
 	case *ast.AssignStmt:
 		if e.Tok == token.DEFINE && len(s.scopes) > 0 {
 			frame.assignDecl = e
+		} else if e.Tok == token.ASSIGN {
+			s.taintReassignedRangeVars(e)
 		}
 	case *ast.ValueSpec:
 		if len(s.scopes) > 0 {
@@ -463,6 +468,108 @@ func (s *fileScan) scanRange(e *ast.RangeStmt) bool {
 		scopeDepth: len(s.scopes),
 	})
 	return true
+}
+
+// isKnobType reports whether t names envx.Knob (or bare Knob when
+// dot-imported or inside the envx package).
+func (s *fileScan) isKnobType(t ast.Expr) bool {
+	switch x := t.(type) {
+	case *ast.SelectorExpr:
+		recv, ok := x.X.(*ast.Ident)
+		return ok && x.Sel.Name == "Knob" && slices.Contains(s.envxNames, recv.Name) && s.localDeclDepth(recv.Name) < 0
+	case *ast.Ident:
+		return (s.inEnvx || s.envxDot) && x.Name == "Knob" && s.localDeclDepth(x.Name) < 0
+	}
+	return false
+}
+
+// scanKnobLit handles the documented `envx.Knob{Name: "ENV_VAR", Resolve: func(k string) { ... }}`
+// idiom: records the Name expression as an env key and, when Name resolved
+// cleanly and Resolve is a single-param FuncLit, pushes a rangeFrame binding
+// that parameter across Resolve.Body so `envx.String(k, ...)` inside Resolve
+// does not falsely report k as Unresolved.
+func (s *fileScan) scanKnobLit(cl *ast.CompositeLit) bool {
+	if !s.isKnobType(cl.Type) {
+		return false
+	}
+	var nameExpr ast.Expr
+	var namePos token.Pos
+	var resolveLit *ast.FuncLit
+	for _, elt := range cl.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		switch key.Name {
+		case "Name":
+			nameExpr = kv.Value
+			namePos = kv.Pos()
+		case "Resolve":
+			if fn, ok := kv.Value.(*ast.FuncLit); ok {
+				resolveLit = fn
+			}
+		}
+	}
+	if nameExpr == nil {
+		return false
+	}
+	unresolvedBefore := len(s.res.Unresolved)
+	s.addKey(nameExpr, namePos)
+	clean := len(s.res.Unresolved) == unresolvedBefore
+	if resolveLit == nil || resolveLit.Body == nil || resolveLit.Type == nil || resolveLit.Type.Params == nil {
+		return false
+	}
+	var paramName string
+	for _, field := range resolveLit.Type.Params.List {
+		for _, n := range field.Names {
+			if paramName != "" {
+				return false
+			}
+			paramName = n.Name
+		}
+	}
+	if paramName == "" || paramName == "_" {
+		return false
+	}
+	// Resolve's FuncLit pushes its own scope (+1) when entered, so the
+	// binding's scopeDepth must exceed the FuncLit param scope (+1) so
+	// addKey recognizes k as knob-bound rather than shadowed by the param.
+	s.stack = append(s.stack, &rangeFrame{
+		body:       resolveLit.Body,
+		names:      map[string]bindPos{paramName: bindValue},
+		coverValue: clean,
+		dynValue:   !clean,
+		scopeDepth: len(s.scopes) + 2,
+	})
+	return true
+}
+
+// taintReassignedRangeVars marks an enclosing range variable unclean if
+// reassigned via `=` inside the loop body (e.g. `k = dynamic()`).
+func (s *fileScan) taintReassignedRangeVars(e *ast.AssignStmt) {
+	for _, lhs := range e.Lhs {
+		id, ok := lhs.(*ast.Ident)
+		if !ok || id.Name == "_" {
+			continue
+		}
+		for i := len(s.stack) - 1; i >= 0; i-- {
+			f := s.stack[i]
+			pos, ok := f.names[id.Name]
+			if !ok || e.Pos() <= f.body.Pos() || e.Pos() >= f.body.End() {
+				continue
+			}
+			if pos == bindKey {
+				f.dynKey = true
+			} else {
+				f.dynValue = true
+			}
+			break
+		}
+	}
 }
 
 // scanRangeLit walks a ranged composite literal: every literal
@@ -634,6 +741,8 @@ func (s *fileScan) scanCall(e *ast.CallExpr) {
 // the scanner cannot name is one docs/env.md cannot be checked against.
 func (s *fileScan) addKey(expr ast.Expr, pos token.Pos) {
 	switch k := expr.(type) {
+	case *ast.ParenExpr:
+		s.addKey(k.X, pos)
 	case *ast.BasicLit:
 		if k.Kind != token.STRING {
 			return
@@ -641,6 +750,13 @@ func (s *fileScan) addKey(expr ast.Expr, pos token.Pos) {
 		if v, err := strconv.Unquote(k.Value); err == nil {
 			s.record(s.fset, v, pos)
 		}
+	case *ast.BinaryExpr:
+		if v, ok := s.evalStaticString(k); ok {
+			s.record(s.fset, v, pos)
+			return
+		}
+		s.res.Unresolved = append(s.res.Unresolved,
+			s.site(s.fset, pos)+" (computed)")
 	case *ast.Ident:
 		localDepth := s.localDeclDepth(k.Name)
 		if bound, clean, scopeDepth := s.rangeResolve(k.Name, k.Pos()); bound && localDepth < scopeDepth {
@@ -671,6 +787,32 @@ func (s *fileScan) addKey(expr ast.Expr, pos token.Pos) {
 		s.res.Unresolved = append(s.res.Unresolved,
 			fmt.Sprintf("%s (%s)", s.site(s.fset, pos), k.Name))
 	default:
-		// Selector, concatenation, call result — a computed key.
+		// Selector (e.g. envnames.EnvFoo) or call result — kept quiet
+		// when another package owns the constant table.
 	}
+}
+
+func (s *fileScan) evalStaticString(expr ast.Expr) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.ParenExpr:
+		return s.evalStaticString(e.X)
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(e.Value)
+		return v, err == nil
+	case *ast.Ident:
+		return s.resolvePkgConst(e)
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		l, lok := s.evalStaticString(e.X)
+		r, rok := s.evalStaticString(e.Y)
+		if lok && rok {
+			return l + r, true
+		}
+	}
+	return "", false
 }

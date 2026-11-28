@@ -77,11 +77,15 @@ func EnvxHelpers(envxDir string) (map[string]bool, error) {
 
 // PackageStringConsts collects a package's string consts so an env
 // key written as `envx.String(someConst, ...)` still resolves to a
-// name. Bare rows in a const block repeat the previous expression,
-// handled by carrying `vals` forward. files must be the parsed
-// non-test sources of ONE directory (one package).
+// PackageStringConsts collects package-level string constants
+// (literals, string concatenations, parenthesized expressions, and
+// same-package const aliases) mapped from identifier name to value.
+// Bare rows in a const block repeat the previous expression, handled
+// by carrying `vals` forward. files must be the parsed non-test
+// sources of ONE directory (one package).
 func PackageStringConsts(files []*ast.File) map[string]string {
 	consts := make(map[string]string)
+	pending := make(map[string]ast.Expr)
 	for _, f := range files {
 		for _, decl := range f.Decls {
 			gen, ok := decl.(*ast.GenDecl)
@@ -101,18 +105,55 @@ func PackageStringConsts(files []*ast.File) map[string]string {
 					if i >= len(vals) {
 						continue
 					}
-					lit, ok := vals[i].(*ast.BasicLit)
-					if !ok || lit.Kind != token.STRING {
-						continue
-					}
-					if v, err := strconv.Unquote(lit.Value); err == nil {
+					if v, ok := evalStaticStringExpr(vals[i], consts); ok {
 						consts[n.Name] = v
+					} else {
+						pending[n.Name] = vals[i]
 					}
 				}
 			}
 		}
 	}
+	for len(pending) > 0 {
+		progressed := false
+		for name, expr := range pending {
+			if v, ok := evalStaticStringExpr(expr, consts); ok {
+				consts[name] = v
+				delete(pending, name)
+				progressed = true
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
 	return consts
+}
+
+func evalStaticStringExpr(expr ast.Expr, consts map[string]string) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(e.Value)
+		return v, err == nil
+	case *ast.ParenExpr:
+		return evalStaticStringExpr(e.X, consts)
+	case *ast.Ident:
+		v, ok := consts[e.Name]
+		return v, ok
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		l, lok := evalStaticStringExpr(e.X, consts)
+		r, rok := evalStaticStringExpr(e.Y, consts)
+		if lok && rok {
+			return l + r, true
+		}
+	}
+	return "", false
 }
 
 // importLocalNames collects every identifier a file binds importPath

@@ -39,6 +39,17 @@ func BoolKnob(name string, p *bool, def bool) Knob {
 	return Knob{name, func(k string) { *p = Bool(k, def) }}
 }
 
+// ModeKnob binds env name → *p via ModeEnv (env → def).
+func ModeKnob(name string, p *Mode, def Mode) Knob {
+	return Knob{name, func(k string) { *p = ModeEnv(k, def) }}
+}
+
+// Float64RatioKnob binds env name → *p via Float64Ratio (finite
+// 0 < f <= 1, env → def).
+func Float64RatioKnob(name string, p *float64, def float64) Knob {
+	return Knob{name, func(k string) { *p = Float64Ratio(k, def) }}
+}
+
 // IntKnob binds env name → *p via Int (env → def).
 func IntKnob(name string, p *int, def int) Knob {
 	return Knob{name, func(k string) { *p = Int(k, def) }}

@@ -16,9 +16,12 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -127,6 +130,32 @@ func New(addr string, handler http.Handler, opts Opts) (*Server, error) {
 // port; the real address is available via ln.Addr().
 func ListenLoopback(port int) (net.Listener, error) {
 	return net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+}
+
+// ValidateLoopbackAddr checks that addr is a host:port whose host is
+// explicitly loopback ("localhost", 127.0.0.0/8, or ::1). Wildcards
+// (":9116", "0.0.0.0:9116", "[::]:9116") and non-loopback IPs or
+// hostnames are rejected so debug endpoints like /debug/pprof cannot
+// be accidentally exposed off-node.
+func ValidateLoopbackAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid loopback bind address %q: %w", addr, err)
+	}
+	if port == "" {
+		return fmt.Errorf("loopback bind address %q must specify a port", addr)
+	}
+	if host == "" {
+		return fmt.Errorf("loopback bind address %q must specify an explicit loopback host (wildcards rejected)", addr)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil || !ip.Unmap().IsLoopback() {
+		return fmt.Errorf("bind address %q is not loopback (only localhost, 127.0.0.0/8, or ::1 allowed)", addr)
+	}
+	return nil
 }
 
 // Addr returns the bound listener's address — usable before Serve, so

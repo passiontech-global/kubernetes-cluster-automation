@@ -194,11 +194,19 @@ type FirstSeenLedger struct {
 // observation. seen=false on the first sighting — callers treat it
 // as "inside the window", so a flapping signature that resolves and
 // recurs re-arms instead of instantly reading as persistent.
+// If an existing stamp lies further in the future than cooldownFutureSkew
+// (backward clock step or corrupt persisted stamp), Observe self-heals
+// it to now and returns (now, false) so the persistence window re-arms
+// cleanly instead of staying negative indefinitely.
 func (l *FirstSeenLedger) Observe(key string, now time.Time) (first time.Time, seen bool) {
 	if l.seen == nil {
 		l.seen = map[string]time.Time{}
 	}
 	if t, ok := l.seen[key]; ok {
+		if now.Sub(t) < -cooldownFutureSkew {
+			l.seen[key] = now
+			return now, false
+		}
 		return t, true
 	}
 	l.seen[key] = now
@@ -228,12 +236,17 @@ func (l *FirstSeenLedger) Seed(key string, first time.Time) {
 // Seen reports how long key has been tracked — (age, true) for a
 // tracked key, (0, false) otherwise. Unlike Observe it never stamps,
 // so it suits read-only checks that must not create ledger entries.
+// Future-skewed stamps (now.Sub(t) < 0) clamp age to 0.
 func (l *FirstSeenLedger) Seen(key string, now time.Time) (time.Duration, bool) {
 	t, ok := l.seen[key]
 	if !ok {
 		return 0, false
 	}
-	return now.Sub(t), true
+	delta := now.Sub(t)
+	if delta < 0 {
+		return 0, true
+	}
+	return delta, true
 }
 
 // Forget drops key's entry — the next Observe re-arms the window.

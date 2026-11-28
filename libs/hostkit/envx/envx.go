@@ -87,6 +87,20 @@ func ModeEnv(key string, def Mode) Mode {
 	return def
 }
 
+// Float64Ratio parses a finite ratio env var in (0, 1]; unset/empty
+// falls back to def. Unparseable, non-finite (NaN/±Inf), <=0, or >1
+// values warn through Warnf and fall back to def.
+func Float64Ratio(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, ok := parseFiniteFloat(v); ok && f > 0 && f <= 1.0 {
+			return f
+		}
+		Warnf("invalid ratio env value (want finite 0 < f <= 1) — using default",
+			"env", key, "value", v, "default", def)
+	}
+	return def
+}
+
 // intValue parses v as an int, falling back to def — the shared tail
 // of Int and IntOr (an unset env never reaches it: IntOr only calls
 // it for a non-empty value, where "" would parse-fail to def anyway).

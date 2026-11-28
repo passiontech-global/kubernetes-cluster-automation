@@ -593,3 +593,105 @@ func TestIntListKnob(t *testing.T) {
 		t.Fatalf("set: got %v", l)
 	}
 }
+
+func TestModeKnob(t *testing.T) {
+	const key = "ENVX_TEST_MODE_KNOB"
+	var m Mode
+	Apply([]Knob{ModeKnob(key, &m, ModeAuto)})
+	if m != ModeAuto {
+		t.Fatalf("unset: got %d want ModeAuto", m)
+	}
+	t.Setenv(key, "on")
+	Apply([]Knob{ModeKnob(key, &m, ModeAuto)})
+	if m != ModeOn {
+		t.Fatalf("on: got %d want ModeOn", m)
+	}
+	t.Setenv(key, "0")
+	Apply([]Knob{ModeKnob(key, &m, ModeAuto)})
+	if m != ModeOff {
+		t.Fatalf("0: got %d want ModeOff", m)
+	}
+	t.Setenv(key, "auto")
+	Apply([]Knob{ModeKnob(key, &m, ModeOn)})
+	if m != ModeOn {
+		t.Fatalf("auto with default ModeOn: got %d want ModeOn", m)
+	}
+}
+
+func TestFloat64RatioAndKnob(t *testing.T) {
+	const key = "ENVX_TEST_FLOAT64_RATIO"
+	const def = 0.85
+
+	type warnCall struct {
+		msg string
+		kv  []any
+	}
+	var warns []warnCall
+	SetWarnf(func(msg string, kv ...any) {
+		warns = append(warns, warnCall{msg: msg, kv: kv})
+	})
+	t.Cleanup(func() { SetWarnf(nil) })
+
+	var r float64
+	Apply([]Knob{Float64RatioKnob(key, &r, def)})
+	if r != def || len(warns) != 0 {
+		t.Fatalf("unset: got (%v, warns=%d), want (%v, 0)", r, len(warns), def)
+	}
+
+	for _, tc := range []struct {
+		name string
+		val  string
+		want float64
+	}{
+		{"fraction", "0.5", 0.5},
+		{"upper_bound_one", "1", 1.0},
+		{"upper_bound_one_dot", "1.0", 1.0},
+		{"small_positive", "0.001", 0.001},
+	} {
+		t.Run("valid/"+tc.name, func(t *testing.T) {
+			warns = nil
+			t.Setenv(key, tc.val)
+			Apply([]Knob{Float64RatioKnob(key, &r, def)})
+			if r != tc.want || len(warns) != 0 {
+				t.Fatalf("%q: got (%v, warns=%d), want (%v, 0)", tc.val, r, len(warns), tc.want)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		val  string
+	}{
+		{"zero", "0"},
+		{"negative", "-0.25"},
+		{"above_one", "1.01"},
+		{"nan", "NaN"},
+		{"pos_inf", "+Inf"},
+		{"neg_inf", "-Inf"},
+		{"unparseable", "abc"},
+		{"whitespace", " 0.5"},
+	} {
+		t.Run("invalid/"+tc.name, func(t *testing.T) {
+			warns = nil
+			t.Setenv(key, tc.val)
+			Apply([]Knob{Float64RatioKnob(key, &r, def)})
+			if r != def {
+				t.Fatalf("%q: got %v want default %v", tc.val, r, def)
+			}
+			if len(warns) != 1 {
+				t.Fatalf("%q: warns = %d, want 1", tc.val, len(warns))
+			}
+			// Verify structured slog kv arguments: "env", key, "value", val, "default", def.
+			gotKV := warns[0].kv
+			wantKV := []any{"env", key, "value", tc.val, "default", def}
+			if len(gotKV) != len(wantKV) {
+				t.Fatalf("%q: kv len = %d (%v), want %d", tc.val, len(gotKV), gotKV, len(wantKV))
+			}
+			for i := range wantKV {
+				if gotKV[i] != wantKV[i] {
+					t.Fatalf("%q: kv[%d] = %v, want %v (full=%v)", tc.val, i, gotKV[i], wantKV[i], gotKV)
+				}
+			}
+		})
+	}
+}
