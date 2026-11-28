@@ -86,6 +86,54 @@ func (s *Ctr) RmLease(ctx context.Context, id string) error {
 		"k0s", "ctr", "-n", "k8s.io", "leases", "rm", id)
 }
 
+// CtrSnapshot is one `k0s ctr -n k8s.io snapshots ls` row.
+type CtrSnapshot struct {
+	Key    string
+	Parent string
+	Kind   string
+}
+
+// Snapshots lists containerd snapshots — `k0s ctr -n k8s.io snapshots ls`
+// over the ExecOut seam, ParseCtrSnapshots'd.
+func (s *Ctr) Snapshots(ctx context.Context) ([]CtrSnapshot, error) {
+	out, err := s.ExecOut(ctx,
+		"k0s", "ctr", "-n", "k8s.io", "snapshots", "ls")
+	if err != nil {
+		return nil, err
+	}
+	return ParseCtrSnapshots(out), nil
+}
+
+// ParseCtrSnapshots parses `ctr snapshots ls` table output: a header
+// row (`KEY PARENT KIND`) followed by snapshot rows. Rows with only
+// 2 fields (`KEY KIND`, empty parent) and rows with `PARENT == "-"`
+// yield Parent == "".
+func ParseCtrSnapshots(out string) []CtrSnapshot {
+	var snaps []CtrSnapshot
+	for line := range strings.SplitSeq(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 2 || (f[0] == "KEY" && f[len(f)-1] == "KIND") {
+			continue
+		}
+		var s CtrSnapshot
+		s.Key = f[0]
+		if len(f) == 2 {
+			s.Kind = f[1]
+		} else {
+			if f[1] != "-" {
+				s.Parent = f[1]
+			}
+			s.Kind = f[2]
+		}
+		snaps = append(snaps, s)
+	}
+	return snaps
+}
+
 // ParseCtrLeases parses `ctr leases ls` table output: a header row,
 // then one lease per line — "ID CREATED-AT-STAMP LABELS" where the
 // stamp is Go's time.String form ("2006-01-02 15:04:05.999999999

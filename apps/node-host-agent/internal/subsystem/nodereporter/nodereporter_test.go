@@ -251,6 +251,8 @@ func TestAllConditionDefaults(t *testing.T) {
 		// wave-5 self-healing latch→condition surface.
 		nodecond.CondK8s135ReadinessDrift: {"K8s135ReadinessOk", "cgroup v2 and kubelet/k0s configuration ready for Kubernetes 1.35+"},
 		nodecond.CondKMSv2Unhealthy:       {"KMSv2Healthy", "KMSv2 encryption provider socket and /healthz/kms-provider-* probes healthy"},
+		// wave-7 self-healing latch→condition surface.
+		nodecond.CgroupMemoryHighThrottle: {"CgroupMemoryHighNormal", "no pod cgroup silently throttling on memory.high without OOMKill"},
 	}
 	conds := e.node(t).Status.Conditions
 	if len(conds) != len(want) {

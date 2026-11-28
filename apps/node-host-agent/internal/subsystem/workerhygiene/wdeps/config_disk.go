@@ -70,6 +70,10 @@ type DiskConfig struct {
 	// threshold so the plan's parity does not alter eviction
 	// behavior.
 	WLayerBloatThresholdBytes int64
+	// OrphanSnapshotPruneEnabled enables opt-in pruning of confirmed
+	// aged orphaned containerd overlayfs snapshot directories (default
+	// false — hybrid Wave 5/6 detect-first posture).
+	OrphanSnapshotPruneEnabled bool
 }
 
 func (d *DiskConfig) applyDefaults() {
@@ -141,5 +145,7 @@ func (d *DiskConfig) envKnobs(hostPath func(string) string) []envx.Knob {
 			hostPath("/var/lib/systemd/coredump")),
 		envx.Int64Knob(envnames.EnvWLayerBloatThresholdBytes,
 			&d.WLayerBloatThresholdBytes, wlayerBloatThresholdBytes),
+		envx.BoolKnob(envnames.EnvOrphanSnapshotPruneEnabled,
+			&d.OrphanSnapshotPruneEnabled, false),
 	}
 }

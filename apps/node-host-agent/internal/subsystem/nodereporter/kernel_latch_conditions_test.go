@@ -172,8 +172,8 @@ func TestKernelHungTasksEvidenceLatches(t *testing.T) {
 // latch keys, a present latch flips the condition True with the
 // problem reason, and a removed latch flips it back to False.
 func TestCiliumLatchConditions(t *testing.T) {
-	if len(conditionDefs) != 69 {
-		t.Fatalf("conditionDefs has %d defs, want 69 (50 prior + 5 self-healing wave + 4 wave-2 + 3 wave-3 + 5 wave-4 + 2 wave-5 latch→condition surface)",
+	if len(conditionDefs) != 70 {
+		t.Fatalf("conditionDefs has %d defs, want 70 (50 prior + 5 self-healing wave + 4 wave-2 + 3 wave-3 + 5 wave-4 + 2 wave-5 + 1 wave-7 latch→condition surface)",
 			len(conditionDefs))
 	}
 	// The cilium pair sits before the inode-pressure + W21 tail —
@@ -425,6 +425,13 @@ func TestWave5LatchConditions(t *testing.T) {
 			defaultReason: "KMSv2Healthy",
 			defaultMsg:    "KMSv2 encryption provider socket and /healthz/kms-provider-* probes healthy",
 			problemReason: "KMSv2UnhealthyDetected",
+		},
+		{
+			latch:         latchdefs.LatchCgroupMemoryHighThrottle,
+			condType:      nodecond.CgroupMemoryHighThrottle,
+			defaultReason: "CgroupMemoryHighNormal",
+			defaultMsg:    "no pod cgroup silently throttling on memory.high without OOMKill",
+			problemReason: "CgroupMemoryHighThrottleDetected",
 		},
 	}
 

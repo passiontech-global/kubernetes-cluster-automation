@@ -227,4 +227,8 @@ type Deps struct {
 	CiliumLeaked    prometheus.Gauge       // allocated − in-use (38)
 	// CtrIngestsCleaned counts ingest dirs removed by the A3 GC.
 	CtrIngestsCleaned prometheus.Counter
+	// Wave-7 self-healing guards — Prometheus gauges registered on /metrics.
+	CgroupMemoryHighThrottledPods prometheus.Gauge // pods experiencing silent memory.high throttling
+	OrphanSnapshotBytes           prometheus.Gauge // bytes held by orphaned containerd overlayfs snapshots
+	OrphanSnapshotCount           prometheus.Gauge // count of orphaned containerd overlayfs snapshots
 }

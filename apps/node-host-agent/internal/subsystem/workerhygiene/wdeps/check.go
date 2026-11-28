@@ -93,6 +93,11 @@ const (
 	CheckCiliumFQDN       = "cilium-fqdn"        // #5A Cilium toFQDNs DNS-proxy & endpoint regen guard (detect-only)
 	CheckSystemdOOMD      = "systemd-oomd"       // #9 systemd-oomd pod/k0s slice kill guard (detect-only)
 	CheckNetworkMountHung = "network-mount-hung" // #10 hung NFS/CIFS/FUSE/CephFS mount statfs subprocess guard
+
+	// Wave-7 self-healing guards — appended at the tail so existing
+	// check labels keep their dispatch order.
+	CheckCgroupMemoryHighThrottle  = "cgroup-memory-high-throttle" // cgroup v2 memory.high silent throttle detector
+	CheckOrphanContainerdSnapshots = "containerd-orphan-snapshots" // orphaned containerd overlayfs snapshot leak detector
 )
 
 // CycleEnv is the per-cycle shared context Cycle hands to every

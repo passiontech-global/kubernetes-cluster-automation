@@ -122,6 +122,9 @@ func (h *Hygiene) initChecks() {
 	add(cilium.NewCiliumFQDN(d))        // wdeps.CheckCiliumFQDN
 	add(guards.NewSystemdOOMD(d))       // wdeps.CheckSystemdOOMD
 	add(runtime.NewNetworkMountHung(d)) // wdeps.CheckNetworkMountHung
+	// Wave-7 self-healing guards — appended at the tail.
+	add(runtime.NewCgroupMemoryHighThrottle(d))  // wdeps.CheckCgroupMemoryHighThrottle
+	add(runtime.NewOrphanContainerdSnapshots(d)) // wdeps.CheckOrphanContainerdSnapshots
 	// A single UNGATED group: the unit-file and uptime gates return
 	// early in Cycle and workerActive gates inside each check
 	// (per-check cycles{check,"gated"}) — none map onto

@@ -96,6 +96,11 @@ const (
 	// journal-read accounting (workerhygiene journald.go,
 	// controllerhygiene journal.go).
 	LatchJournalUnreadable = "journal-unreadable" // A5
+	// LatchCgroupMemoryHighThrottle is the Wave-7 cgroup v2 silent
+	// memory.high throttling latch — workerhygiene's
+	// cgroup-memory-high-throttle check raises it when pod slices suffer
+	// growing memory.events:high deltas plus memory PSI without OOMKill.
+	LatchCgroupMemoryHighThrottle = "cgroup-memory-high-throttle"
 	// LatchCiliumIPAMPrefix is the cilium IPAM latch family (38)
 	// — LatchCiliumIPAMExhausted is the member the checks
 	// currently mint; the prefix stays registered so a renamed
@@ -382,6 +387,9 @@ var LatchDefs = []LatchDef{
 	// Wave-5 self-healing latches.
 	{Name: LatchK8s135ReadinessDrift, Owner: "hostmetrics"},
 	{Name: LatchKMSv2Unhealthy, Owner: "controllerhygiene"},
+
+	// Wave-7 self-healing latches.
+	{Name: LatchCgroupMemoryHighThrottle, Owner: "workerhygiene"},
 
 	// apiprober
 	{Name: LatchAPIServerBackendStalePrefix, Owner: "apiprober", Prefix: true},

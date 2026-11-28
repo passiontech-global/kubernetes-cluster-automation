@@ -1050,6 +1050,11 @@ func TestWave5LatchEvents(t *testing.T) {
 			condType:      nodecond.CondKMSv2Unhealthy,
 			defaultReason: "KMSv2Healthy",
 		},
+		{
+			latch:         latchdefs.LatchCgroupMemoryHighThrottle,
+			condType:      nodecond.CgroupMemoryHighThrottle,
+			defaultReason: "CgroupMemoryHighNormal",
+		},
 	}
 
 	for _, tc := range cases {

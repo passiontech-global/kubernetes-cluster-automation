@@ -174,11 +174,24 @@ func New(cfg Config, reg prometheus.Registerer) (*Hygiene, error) {
 		Name: "node_host_agent_workerhygiene_ctr_ingests_cleaned_total",
 		Help: "Stale containerd content ingest dirs removed by the ingest GC (39).",
 	})
+	d.CgroupMemoryHighThrottledPods = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_cgroup_memory_high_throttled_pods",
+		Help: "Number of pod cgroups under kubepods.slice silently throttling on cgroup v2 memory.high.",
+	})
+	d.OrphanSnapshotBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_containerd_orphan_snapshot_bytes",
+		Help: "Total bytes held by orphaned containerd overlayfs snapshot directories past age threshold.",
+	})
+	d.OrphanSnapshotCount = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "node_host_agent_containerd_orphan_snapshot_count",
+		Help: "Count of orphaned containerd overlayfs snapshot directories past age threshold.",
+	})
 
 	h := &Hygiene{Deps: d, envCell: &wdeps.CycleEnv{}}
 	if err := subframe.RegisterAll(reg,
 		d.Cycles, d.Actions, d.CiliumAllocated, d.CiliumLeaked,
-		d.CtrIngestsCleaned); err != nil {
+		d.CtrIngestsCleaned, d.CgroupMemoryHighThrottledPods,
+		d.OrphanSnapshotBytes, d.OrphanSnapshotCount); err != nil {
 		return nil, fmt.Errorf("register workerhygiene metrics: %w", err)
 	}
 	h.initChecks()

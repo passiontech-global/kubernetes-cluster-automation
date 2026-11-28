@@ -125,4 +125,7 @@ const (
 	EnvCPUHostIdleMinRatio    = "NODE_HOST_AGENT_CPU_HOST_IDLE_MIN_RATIO"
 	EnvVMAPressureRatio       = "NODE_HOST_AGENT_VMA_PRESSURE_RATIO"
 	EnvVMAMaxCeiling          = "NODE_HOST_AGENT_VMA_MAX_CEILING"
+
+	// Wave-7 self-healing guards: orphan containerd snapshot opt-in prune.
+	EnvOrphanSnapshotPruneEnabled = "NODE_HOST_AGENT_ORPHAN_SNAPSHOT_PRUNE_ENABLED"
 )

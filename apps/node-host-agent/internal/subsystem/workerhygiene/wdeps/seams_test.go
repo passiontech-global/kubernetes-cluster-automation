@@ -105,6 +105,22 @@ func TestCtrMethodsBuildArgv(t *testing.T) {
 	if _, err := e.D.Cfg.Seams.Ctr.Leases(ctx); !errors.Is(err, wantErr) {
 		t.Fatalf("Leases error=%v want %v", err, wantErr)
 	}
+
+	// Snapshots reads over ExecOut and parses the table output.
+	snapTable := "KEY\tPARENT\tKIND\nsha256:base\t-\tCommitted\nc1\tsha256:base\tActive\nc2\tActive\n"
+	e.D.Cfg.Seams.Ctr.ExecOut = func(_ context.Context, a ...string) (string, error) {
+		if strings.Join(a, " ") != "k0s ctr -n k8s.io snapshots ls" {
+			t.Fatalf("Snapshots argv=%v", a)
+		}
+		return snapTable, nil
+	}
+	snaps, err := e.D.Cfg.Seams.Ctr.Snapshots(ctx)
+	if err != nil {
+		t.Fatalf("Snapshots: %v", err)
+	}
+	if len(snaps) != 3 || snaps[0].Key != "sha256:base" || snaps[0].Parent != "" || snaps[1].Parent != "sha256:base" || snaps[2].Kind != "Active" {
+		t.Fatalf("Snapshots=%+v", snaps)
+	}
 }
 
 // TestParseCtrLeases — table output: header and blank lines skipped,

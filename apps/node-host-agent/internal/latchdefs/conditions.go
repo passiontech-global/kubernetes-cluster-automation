@@ -480,4 +480,11 @@ var CondDefs = map[string]CondDef{
 		DefaultMessage: "KMSv2 encryption provider socket and /healthz/kms-provider-* probes healthy",
 		ProblemReason:  "KMSv2UnhealthyDetected",
 	},
+	// --- wave-7 self-healing wave ---
+	LatchCgroupMemoryHighThrottle: {
+		Type:           "CgroupMemoryHighThrottle",
+		DefaultReason:  "CgroupMemoryHighNormal",
+		DefaultMessage: "no pod cgroup silently throttling on memory.high without OOMKill",
+		ProblemReason:  "CgroupMemoryHighThrottleDetected",
+	},
 }

@@ -135,6 +135,9 @@ var conditionOrder = []string{
 	// existing conditions keep their rendered order.
 	latchdefs.LatchK8s135ReadinessDrift,
 	latchdefs.LatchKMSv2Unhealthy,
+	// Wave-7 self-healing wave — appended at the tail so the 69
+	// existing conditions keep their rendered order.
+	latchdefs.LatchCgroupMemoryHighThrottle,
 }
 
 // staleConditionDef is WatchdogStale's def — the one condition whose
