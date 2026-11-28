@@ -15,6 +15,8 @@ func TestValidateConcourseURL(t *testing.T) {
 		{"https://ci.example.com///", "https://ci.example.com"},
 		{"  http://atc:8080/  ", "http://atc:8080"},
 		{"http://user:pass@atc:8080/", "http://user:pass@atc:8080"},
+		{"https://user:pass@ci.example.com/prefix/", "https://user:pass@ci.example.com/prefix"},
+		{"http://[::1]:8080", "http://[::1]:8080"},
 	}
 	for _, tc := range good {
 		got, err := validateConcourseURL(tc.in)
@@ -31,6 +33,13 @@ func TestValidateConcourseURL(t *testing.T) {
 		"://broken",
 		"ftp://atc:8080",
 		"http://",
+		"http://:8080",
+		"http://atc:99999",
+		"http://atc:0",
+		"http://atc:abc",
+		"http://atc:8080?q=1",
+		"http://atc:8080?",
+		"http://atc:8080#frag",
 	}
 	for _, in := range bad {
 		if _, err := validateConcourseURL(in); err == nil {

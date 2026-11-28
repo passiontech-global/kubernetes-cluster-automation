@@ -55,6 +55,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -396,9 +397,11 @@ func run(ctx context.Context, args []string) error {
 }
 
 // validateConcourseURL verifies CONCOURSE_URL at boot: must be an
-// http/https URL with a non-empty host. Trailing slashes are trimmed.
-// Embedded userinfo is tolerated for legacy/redaction configs (SafeBaseURL
-// strips it from logs and from CheckWebhook requests).
+// http/https URL with a non-empty hostname, valid port (if specified),
+// and no query or fragment (endpoints append paths directly to BaseURL).
+// Trailing slashes are trimmed. Embedded userinfo is tolerated for
+// legacy/redaction configs (SafeBaseURL strips it from logs and from
+// CheckWebhook requests).
 func validateConcourseURL(raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	u, err := url.Parse(trimmed)
@@ -408,8 +411,17 @@ func validateConcourseURL(raw string) (string, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", fmt.Errorf("CONCOURSE_URL must use http or https scheme, got %q", u.Scheme)
 	}
-	if u.Host == "" {
+	if u.Hostname() == "" {
 		return "", errors.New("CONCOURSE_URL must include a host")
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.ParseUint(p, 10, 16)
+		if err != nil || n == 0 {
+			return "", fmt.Errorf("CONCOURSE_URL has invalid port %q", p)
+		}
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" {
+		return "", errors.New("CONCOURSE_URL must not include query parameters or a fragment")
 	}
 	return strings.TrimRight(trimmed, "/"), nil
 }
