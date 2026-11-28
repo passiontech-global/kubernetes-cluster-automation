@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 const (
@@ -21,15 +23,15 @@ const (
 	maxATCAPIBytes   = 4 << 20  // 4 MiB ATC API response cap
 )
 
-// decodeBoundedJSON reads at most maxBytes+1 bytes from r so an
-// oversized payload (even one with a valid JSON prefix) is rejected
-// explicitly rather than silently truncated or allowed to OOM.
+// decodeBoundedJSON reads at most maxBytes bytes from r (probing
+// maxBytes+1) so an oversized payload is rejected explicitly rather
+// than silently truncated or allowed to OOM.
 func decodeBoundedJSON(r io.Reader, maxBytes int64, out any) error {
-	body, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	body, truncated, err := httpx.ReadBounded(r, maxBytes)
 	if err != nil {
 		return err
 	}
-	if int64(len(body)) > maxBytes {
+	if truncated {
 		return fmt.Errorf("response body exceeds %d byte limit", maxBytes)
 	}
 	return json.Unmarshal(body, out)
@@ -84,13 +86,7 @@ func (c *atcClient) login(ctx context.Context, user, pass string) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		// Drain before Close so the keep-alive connection can be
-		// reused; bounded so a misbehaving endpoint cannot stall the
-		// return (same 64KiB cap as doJSON).
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-	}()
+	defer httpx.DrainAndClose(resp.Body, 64<<10)
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("atc token: status %s", resp.Status)
 	}
@@ -223,13 +219,7 @@ func (c *atcClient) atcDo(ctx context.Context, method, endpoint string, body []b
 	if err != nil {
 		return 0, err
 	}
-	defer func() {
-		// Drain so the connection can be reused (keep-alive);
-		// bounded like login's drain so a misbehaving endpoint
-		// cannot stall the return.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-	}()
+	defer httpx.DrainAndClose(resp.Body, 64<<10)
 	if resp.StatusCode/100 != 2 {
 		return resp.StatusCode, fmt.Errorf("atc %s %s: status %s", method, endpoint, resp.Status)
 	}

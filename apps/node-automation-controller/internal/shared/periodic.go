@@ -12,9 +12,6 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"runtime/debug"
-	"slices"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -30,6 +27,7 @@ import (
 
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/metrics"
 	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/timex"
 )
 
 const skipInitialJitterEnv = "NODE_AUTOMATION_TEST_NO_INITIAL_JITTER"
@@ -41,40 +39,22 @@ const skipInitialJitterEnv = "NODE_AUTOMATION_TEST_NO_INITIAL_JITTER"
 // DefaultLivenessFloor is the minimum staleness budget for any
 // active Periodic loop — keeps short-interval loops from tripping
 // /healthz during normal apiserver jitter.
-const DefaultLivenessFloor = 15 * time.Minute
-
-var monoEpoch = time.Now()
+const DefaultLivenessFloor = timex.DefaultLivenessFloor
 
 type livenessCtxKey struct{}
 
-type loopBeat struct {
-	name         string
-	staleAfter   atomic.Int64
-	lastProgress atomic.Int64
-}
-
-// Liveness tracks monotonic progress across active leader-elected
-// Periodic loops so /healthz can detect wedged run loops without
-// false-failing on standby replicas (0 registered loops) or NTP
-// wall-clock jumps.
+// Liveness adapts libs/hostkit/timex.Liveness to controller-runtime's
+// healthz.Checker signature so /healthz checks detect wedged run loops
+// without false-failing on standby replicas or NTP wall-clock jumps.
 type Liveness struct {
-	// Floor sets the minimum staleness budget; <= 0 uses
-	// DefaultLivenessFloor.
-	Floor time.Duration
-
-	mu    sync.Mutex
-	loops []*loopBeat
-
-	epoch time.Time
-	nowFn func() time.Duration
+	timex.Liveness
 }
 
 // NewLiveness constructs a Liveness tracker anchored to the
-// monotonic clock at creation time.
+// monotonic clock at creation time with DefaultLivenessFloor enforced.
 func NewLiveness() *Liveness {
 	return &Liveness{
-		Floor: DefaultLivenessFloor,
-		epoch: time.Now(),
+		Liveness: timex.Liveness{Floor: DefaultLivenessFloor},
 	}
 }
 
@@ -97,50 +77,11 @@ func LivenessFromContext(ctx context.Context) *Liveness {
 	return l
 }
 
-func (l *Liveness) monoNow() time.Duration {
-	if l != nil && l.nowFn != nil {
-		return l.nowFn()
-	}
-	epoch := monoEpoch
-	if l != nil && !l.epoch.IsZero() {
-		epoch = l.epoch
-	}
-	d := time.Since(epoch) + 1
-	if d < 1 {
-		return 1
-	}
-	return d
-}
-
 func (l *Liveness) floor() time.Duration {
 	if l != nil && l.Floor > 0 {
 		return l.Floor
 	}
 	return DefaultLivenessFloor
-}
-
-func (l *Liveness) register(name string, budget time.Duration) *loopBeat {
-	b := &loopBeat{name: name}
-	b.staleAfter.Store(int64(budget))
-	b.lastProgress.Store(int64(l.monoNow()))
-	l.mu.Lock()
-	l.loops = append(l.loops, b)
-	l.mu.Unlock()
-	return b
-}
-
-func (l *Liveness) unregister(b *loopBeat) {
-	if l == nil || b == nil {
-		return
-	}
-	l.mu.Lock()
-	for i, existing := range l.loops {
-		if existing == b {
-			l.loops = append(l.loops[:i], l.loops[i+1:]...)
-			break
-		}
-	}
-	l.mu.Unlock()
 }
 
 // Check implements controller-runtime's healthz.Checker signature:
@@ -150,25 +91,7 @@ func (l *Liveness) Check(_ *http.Request) error {
 	if l == nil {
 		return nil
 	}
-	l.mu.Lock()
-	loops := slices.Clone(l.loops)
-	l.mu.Unlock()
-	now := l.monoNow()
-	for _, b := range loops {
-		last := time.Duration(b.lastProgress.Load())
-		if last <= 0 {
-			continue
-		}
-		budget := time.Duration(b.staleAfter.Load())
-		if budget <= 0 {
-			continue
-		}
-		if elapsed := now - last; elapsed > budget {
-			return fmt.Errorf("periodic loop %q stale for %s (budget %s)",
-				b.name, elapsed.Round(time.Second), budget)
-		}
-	}
-	return nil
+	return l.Liveness.Check()
 }
 
 // Periodic replaces a shell-operator `schedule:` binding — a
@@ -236,15 +159,13 @@ func (p *Periodic) Start(ctx context.Context) error {
 	if liveness == nil {
 		liveness = LivenessFromContext(ctx)
 	}
-	var beat *loopBeat
+	var beat *timex.Beat
 	if liveness != nil {
-		beat = liveness.register(p.Name, p.livenessBudget(p.Interval, liveness.floor()))
-		defer liveness.unregister(beat)
+		beat = liveness.Register(p.Name, p.livenessBudget(p.Interval, liveness.floor()))
+		defer liveness.Unregister(beat)
 	}
 	stamp := func() {
-		if beat != nil {
-			beat.lastProgress.Store(int64(liveness.monoNow()))
-		}
+		beat.Beat()
 	}
 
 	// De-phase the sweep modules: every AddPeriodic caller begins at
@@ -284,7 +205,7 @@ func (p *Periodic) Start(ctx context.Context) error {
 				cur = p.Interval
 			}
 			if beat != nil {
-				beat.staleAfter.Store(int64(p.livenessBudget(cur, liveness.floor())))
+				beat.SetStaleAfter(p.livenessBudget(cur, liveness.floor()))
 			}
 			waitTimer := time.NewTimer(cur)
 			select {
@@ -311,7 +232,7 @@ func (p *Periodic) Start(ctx context.Context) error {
 			wait = time.Second
 		}
 		if beat != nil && wait > p.Interval {
-			beat.staleAfter.Store(int64(p.livenessBudget(wait, liveness.floor())))
+			beat.SetStaleAfter(p.livenessBudget(wait, liveness.floor()))
 		}
 		timer := time.NewTimer(wait)
 		select {

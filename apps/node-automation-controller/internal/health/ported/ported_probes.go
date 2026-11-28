@@ -7,7 +7,6 @@ package ported
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,6 +18,7 @@ import (
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/platform/kube"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/probefw"
 	"github.com/passiontech-global/kubernetes-cluster-automation/apps/node-automation-controller/internal/promq"
+	"github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/httpx"
 )
 
 // Check names — the exact HealthCheck metadata.name values the
@@ -171,29 +171,22 @@ func (p *httpContentCheck) Run(ctx context.Context) probefw.Result {
 	if err != nil {
 		return probefw.Result{Why: fmt.Sprintf("GET %s: %v", targetURL, err)}
 	}
-	defer func() {
-		// Drain before Close (bounded): an unread body makes the
-		// connection unreusable, killing keep-alive on the shared
-		// client — and the LimitReader read below may stop short of
-		// the real body.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-	}()
+	defer httpx.DrainAndClose(resp.Body, 64<<10)
 	if resp.StatusCode != http.StatusOK {
 		return probefw.Result{Why: fmt.Sprintf("GET %s: status %d, want 200",
 			targetURL, resp.StatusCode)}
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, httpBodyReadCap))
+	body, truncated, err := httpx.ReadBounded(resp.Body, httpBodyReadCap)
 	if err != nil {
 		return probefw.Result{Why: fmt.Sprintf("read body: %v", err)}
 	}
 	if !strings.Contains(string(body), expected) {
-		// The read is capped: a match miss at exactly the cap is
+		// The read is capped: a miss on a truncated body is
 		// inconclusive, not a clean FAIL — the expected string may
 		// sit past the byte cap, and reading further is not an
 		// option. Report infra so a huge healthy body never reads
 		// as a false content failure.
-		if len(body) == httpBodyReadCap {
+		if truncated {
 			return probefw.Result{Infra: fmt.Errorf(
 				"body truncated at cap (%d bytes), match inconclusive",
 				httpBodyReadCap)}

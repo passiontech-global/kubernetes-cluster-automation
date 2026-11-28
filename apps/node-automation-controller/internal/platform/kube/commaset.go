@@ -5,17 +5,16 @@
 // so non-webhook call sites stop re-splitting by hand.
 package kube
 
-import "strings"
+import "github.com/passiontech-global/kubernetes-cluster-automation/libs/hostkit/envx"
 
 // ParseCommaSet splits a comma-separated value into a trimmed,
 // non-empty name set. Order is not preserved (set semantics); an
-// empty or absent value yields an empty set.
+// empty or absent value yields a non-nil empty map so callers may
+// insert directly without nil-map panics.
 func ParseCommaSet(s string) map[string]bool {
-	out := map[string]bool{}
-	for n := range strings.SplitSeq(s, ",") {
-		if n = strings.TrimSpace(n); n != "" {
-			out[n] = true
-		}
+	set := envx.ParseCommaSet(s)
+	if set == nil {
+		return map[string]bool{}
 	}
-	return out
+	return set
 }

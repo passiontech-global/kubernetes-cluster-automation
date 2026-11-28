@@ -527,10 +527,7 @@ func TestPeriodicLiveness(t *testing.T) {
 			t.Fatalf("Start err = %v", err)
 		}
 		// Unregistered on exit: loops list must be empty and Check nil.
-		l.mu.Lock()
-		remaining := len(l.loops)
-		l.mu.Unlock()
-		if remaining != 0 {
+		if remaining := len(l.Beats()); remaining != 0 {
 			t.Fatalf("loops remaining after Start exit = %d, want 0", remaining)
 		}
 		if err := l.Check(nil); err != nil {
@@ -541,10 +538,9 @@ func TestPeriodicLiveness(t *testing.T) {
 	t.Run("hung Fn trips Check with loop name", func(t *testing.T) {
 		var fakeNow atomic.Int64
 		fakeNow.Store(int64(time.Second))
-		l := &Liveness{
-			Floor: 100 * time.Millisecond,
-			nowFn: func() time.Duration { return time.Duration(fakeNow.Load()) },
-		}
+		l := NewLiveness()
+		l.Floor = 100 * time.Millisecond
+		l.Now = func() time.Duration { return time.Duration(fakeNow.Load()) }
 		entered := make(chan struct{})
 		release := make(chan struct{})
 		p := &Periodic{
@@ -592,7 +588,7 @@ func TestPeriodicLiveness(t *testing.T) {
 		l.Floor = 50 * time.Millisecond
 		var fakeNow atomic.Int64
 		fakeNow.Store(int64(time.Second))
-		l.nowFn = func() time.Duration { return time.Duration(fakeNow.Load()) }
+		l.Now = func() time.Duration { return time.Duration(fakeNow.Load()) }
 
 		nextStarted := make(chan struct{})
 		p := &Periodic{

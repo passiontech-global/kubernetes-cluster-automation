@@ -10,7 +10,6 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -147,18 +146,13 @@ func (c *Client) InstantQuery(ctx context.Context, endpoint, query string) ([]Sa
 		return nil, fmt.Errorf("prometheus query: %w",
 			&TransportError{err: err})
 	}
-	defer func() {
-		// Drain before Close so the transport can reuse the
-		// connection — an early return still leaves a bounded tail.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainOnClose))
-		_ = resp.Body.Close()
-	}()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	defer httpx.DrainAndClose(resp.Body, drainOnClose)
+	body, truncated, err := httpx.ReadBounded(resp.Body, maxResponseBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read prometheus response: %w",
 			&TransportError{err: err})
 	}
-	if len(body) > maxResponseBytes {
+	if truncated {
 		return nil, fmt.Errorf("prometheus response exceeds %d MiB limit — "+
 			"refusing to decode a truncated vector", maxResponseBytes>>20)
 	}
